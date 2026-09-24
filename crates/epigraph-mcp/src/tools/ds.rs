@@ -98,6 +98,7 @@ pub async fn create_frame(
 
 pub async fn submit_ds_evidence(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: SubmitDsEvidenceParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
@@ -117,7 +118,7 @@ pub async fn submit_ds_evidence(
     let method_name = format!("{method:?}");
 
     // Get frame from DB
-    let frame_row = FrameRepository::get_by_id(&server.pool, frame_id)
+    let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
@@ -167,19 +168,8 @@ pub async fn submit_ds_evidence(
         }
     }
 
-    // Ensure claim-frame assignment exists
-    FrameRepository::assign_claim(
-        &server.pool,
-        claim_id,
-        frame_id,
-        Some(params.hypothesis_index),
-    )
-    .await
-    .map_err(internal_error)?;
-
     let agent_id = server.agent_id().await?;
 
-    // Store the BBA
     let masses_json = serde_json::to_value(
         mass_fn
             .masses()
@@ -189,13 +179,75 @@ pub async fn submit_ds_evidence(
     )
     .map_err(internal_error)?;
 
+    // ── THE TWO TIER-A WRITES AND THE RECOMPUTE, IN ONE STAMPED TRANSACTION ──
+    //
+    // `claim_frames` and `mass_functions` both carry migration 077's strict
+    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))` and neither
+    // has an orphan `*_privacy` policy to fall back on, so on the unstamped pool
+    // this tool was refused with `42501` on its FIRST write — MEASURED on both
+    // schema configurations, `new row violates row-level security policy for
+    // table "claim_frames"`. That is also why `mass_functions` stayed 0 through
+    // every e2e run.
+    //
+    // The two belong together: a `claim_frames` assignment with no BBA is a frame
+    // membership that moves no belief, and a BBA whose claim is not assigned to
+    // the frame is unreachable from `recompute_claim_belief_on_frame`'s own
+    // enumeration. Before this they were two pool checkouts and therefore two
+    // tenancy contexts.
+    //
+    // THE RECOMPUTE BELOW IS IN THE SAME TRANSACTION, and so is the commit. That
+    // makes the whole tool one unit: `claim_frames`, `mass_functions` and the
+    // claim's cached `belief`/`plausibility`/`pignistic_prob` either all land or
+    // none do (see the note at the recompute call for where it used to stop).
+    //
+    // HISTORY, kept short. An earlier revision of this block converted only the
+    // two writes above and left the recompute on `epigraph_engine::edge_factor`'s
+    // pool-bound DS machinery. On a cleanly-migrated schema the tool then
+    // committed `claim_frames` + `mass_functions` and failed afterwards at the
+    // recompute's `UPDATE claims`, leaving the cached belief stale behind an error
+    // response. The only repair for that window was out-of-band
+    // (`epigraph-cli recompute_claim_belief` on `MaintenancePool::connect`),
+    // because the in-band `recompute_beliefs` tool is hard-disabled
+    // (`maintenance.rs`'s `maintenance_tools_run_on_the_maintenance_connection()`
+    // is `const fn … { false }`). D2 moved the recompute onto this connection, so
+    // that window no longer exists and there is nothing to repair.
+    //
+    // Retry-safety is still worth recording, though it no longer carries a
+    // committed-partial argument. `assign_claim` is `ON CONFLICT … DO UPDATE` and
+    // `store_with_perspective` upserts on
+    // `(claim_id, frame_id, source_agent_id, perspective_id)`, so a repeat call
+    // re-states the same BBA rather than combining its mass twice.
+    //
+    // AND IT SUCCEEDS ONLY FOR CLAIMS THIS SERVER'S GROUP OWNS. Stated here because
+    // "the whole tool is one unit that lands" is true only of that case, and the
+    // reported e2e arm was run on the agent's own claim. `claim_frames` and
+    // `mass_functions` are CLAIM-DERIVED: migration 074's
+    // `epigraph_derived_require_tenancy` fills `(visibility, owner_group_id)` from
+    // the parent claim and 070 arm (c) re-stamps it, so the `WITH CHECK` asks about
+    // the CLAIM's group, not the evidence author's. The stamp here carries
+    // `server.agent_id()`'s writable set, so a BBA against ANOTHER group's claim is
+    // still refused on a cleanly-migrated schema. `tools/challenges.rs` states the
+    // same residual for `challenge_claim` in its doc header, and
+    // `epigraph-db/tests/tool_write_tables_require_a_stamp.rs::
+    // a_challenge_against_a_foreign_groups_claim_is_still_refused` pins it on the
+    // non-bypassing role. `tools/claims.rs::update_with_evidence` has the same shape
+    // for the same reason. Whether an admin scope should carry write authority into
+    // a group it is not a member of is a tenancy-model decision, not a bug here.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_ds_evidence")
+            .await?;
+
+    FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
+        .await
+        .map_err(internal_error)?;
+
     // source_strength stays NULL either way: the calibrated path derives
     // reliability dynamically from evidence_type at recompute time
     // (effective_source_strength), and the legacy path already baked the
     // raw `reliability` float into the pre-discounted masses above rather
     // than caching it here — unchanged from pre-change behavior.
     let mf_id = MassFunctionRepository::store_with_perspective(
-        &server.pool,
+        &mut *tx,
         claim_id,
         frame_id,
         Some(agent_id),
@@ -212,10 +264,13 @@ pub async fn submit_ds_evidence(
     .map_err(internal_error)?;
 
     // Count stored BBAs for the response (bba_count is informational only).
-    let bba_count = MassFunctionRepository::get_for_claim_frame(&server.pool, claim_id, frame_id)
-        .await
-        .map_err(internal_error)?
-        .len();
+    // Read INSIDE the transaction so it counts the row just stored rather than
+    // whatever a sibling connection can see.
+    let bba_count =
+        MassFunctionRepository::get_for_claim_frame(&mut *tx, viewer, claim_id, frame_id)
+            .await
+            .map_err(internal_error)?
+            .len();
 
     // Combine + persist the claim's cached belief via the SAME code path
     // `recompute_beliefs` uses (`recompute_claim_belief_on_frame` ->
@@ -232,27 +287,90 @@ pub async fn submit_ds_evidence(
     // path always resolves method adaptively (via `combine_multiple`) and
     // targets hypothesis index 0 (the canonical binary_truth convention).
     // This is the accepted consequence of unification, not a follow-up bug.
-    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(&server.pool, claim_id, frame_id)
-        .await
-        .map_err(internal_error)?;
+    //
+    // IT RUNS INSIDE THE SAME TRANSACTION, and the commit moved below it. Its
+    // `UPDATE claims SET belief/plausibility/pignistic_prob` is where
+    // `submit_ds_evidence` STOPPED on a cleanly-migrated schema: the statement
+    // ran on the unstamped pool, where `claims_tenancy`'s `WITH CHECK` refuses
+    // it. Errors here are propagated (DS is the primary belief authority on this
+    // path), so on the old shape a refusal returned an error with the BBA already
+    // committed and the claim's cached belief still describing the evidence
+    // before it — success-shaped state behind a failure-shaped response. Now the
+    // BBA and the belief it implies are one unit.
+    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+        &mut tx, viewer, claim_id, frame_id,
+    )
+    .await
+    .map_err(internal_error)?;
 
     // Read back exactly what the shared recompute path just wrote, so the
     // response can never drift from what a later `recompute_beliefs` call
     // (with no new evidence) would produce.
+    //
+    // ON THE WRITE TRANSACTION, BEFORE THE COMMIT (backlog F3, `15c00c7a`).
+    // This read used to run after `tx.commit()`, on `server.pool`, so every way
+    // it could fail — the claim invisible to the request viewer below, or
+    // invisible to the pool's UNSTAMPED `epigraph_app` connection, which hides
+    // every `group`-visibility row — returned an error for a frame assignment,
+    // BBA and recomputed belief that had already committed. The description's
+    // contract is "a refusal … writes nothing", so the read that can refuse now
+    // runs where a refusal still rolls everything back: `?` below drops `tx`
+    // uncommitted. MEASURED before the move
+    // (`tests/ds_evidence_no_error_after_commit.rs`): the server agent's OWN
+    // group-private claim on an `epigraph_app` pool answered "claim … not
+    // found" with 1 BBA and 1 `claim_frames` row committed, and so did a
+    // request viewer that cannot read the claim. On the transaction the read
+    // sees what the author's stamp sees, which is the row it just updated.
     let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing): (
         f64,
         f64,
         f64,
         Option<f64>,
         f64,
-    ) = sqlx::query_as(
-        "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
-         FROM claims WHERE id = $1",
-    )
-    .bind(claim_id)
-    .fetch_one(&server.pool)
-    .await
-    .map_err(internal_error)?;
+    ) = {
+        // PR-09: this is a per-id belief oracle over a caller-supplied uuid —
+        // it returns the BetP and mass distribution of any claim in the corpus.
+        // Filtered rather than exempted: the id comes from the request, so an
+        // unfiltered read here answers "what does this private claim believe?"
+        // for anyone who can guess an id. `fetch_optional` + the not-found
+        // branch below make an invisible claim indistinguishable from a
+        // nonexistent one (plan §8.5).
+        //
+        // NOTE that this refusal is DIFFERENT IN KIND from the other three
+        // per-id oracles PR-09 hardened. `ds_auto.rs`, `link_epistemic.rs` and
+        // `workflows.rs` all DEGRADE when the row is invisible (no prior, skip
+        // the best-effort recompute, skip the cascade child) and leave the
+        // write-half question to PR-16. This one aborts the whole call, so it
+        // DOES decide the write half for `submit_ds_evidence`: a viewer that
+        // cannot read the claim cannot submit evidence against it. That is the
+        // right answer under D3 — you may not assert about what you may not
+        // read — but it is a decision, not a side effect, and the ledger's
+        // D-PR16-per-id-claim-oracles-write-half is scoped to the other three
+        // for that reason.
+        //
+        // Reachable today, independently of PR-12: a caller passing a
+        // NONEXISTENT claim_id now gets `invalid_request` where the previous
+        // `fetch_one` gave `RowNotFound` -> internal_error. Strictly better,
+        // and recorded in the PR-09 ledger's behaviour_changes.
+        let sql = viewer.splice(
+            "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
+             FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(&mut *tx)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                rmcp::model::ErrorData::invalid_request(format!("claim {claim_id} not found"), None)
+            })?
+    };
+
+    tx.commit().await.map_err(internal_error)?;
+
     let betp = pignistic_prob.unwrap_or(0.0);
     let ign = plausibility - belief;
 
@@ -273,6 +391,7 @@ pub async fn submit_ds_evidence(
 
 pub async fn get_belief(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetBeliefParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
@@ -287,24 +406,30 @@ pub async fn get_belief(
         params.perspective_id.as_deref(),
     )?;
     if let Some((lens_frame, lens_perspective)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, lens_frame, lens_perspective)
-            .await?;
+        crate::tools::lens::validate_lens_exists(
+            &server.pool,
+            viewer,
+            lens_frame,
+            lens_perspective,
+        )
+        .await?;
     }
 
-    let interval = epigraph_engine::belief_query::get_belief(&server.pool, claim_id, frame_id)
-        .await
-        .map_err(|e| match e {
-            epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
-                invalid_params(format!("frame {id} not found"))
-            }
-            epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
-                invalid_params(format!("claim {id} not found"))
-            }
-            epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
-                invalid_params(format!("invalid mass function: {msg}"))
-            }
-            other => internal_error(other),
-        })?;
+    let interval =
+        epigraph_engine::belief_query::get_belief(&server.pool, viewer, claim_id, frame_id)
+            .await
+            .map_err(|e| match e {
+                epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
+                    invalid_params(format!("frame {id} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
+                    invalid_params(format!("claim {id} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+                    invalid_params(format!("invalid mass function: {msg}"))
+                }
+                other => internal_error(other),
+            })?;
 
     // Additive lensed interval, computed under the chosen (frame, perspective).
     // The top-level belief/plausibility/etc above stay the global (unlensed)
@@ -313,6 +438,7 @@ pub async fn get_belief(
         Some((lens_frame, lens_perspective)) => {
             let lensed = epigraph_engine::belief_query::get_perspective_belief(
                 &server.pool,
+                viewer,
                 claim_id,
                 lens_frame,
                 lens_perspective,
@@ -355,10 +481,11 @@ pub async fn get_belief(
 
 pub async fn list_frames(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ListFramesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
-    let frames = FrameRepository::list(&server.pool, limit, 0)
+    let frames = FrameRepository::list(&server.pool, viewer, limit, 0)
         .await
         .map_err(internal_error)?;
 
@@ -380,12 +507,13 @@ pub async fn list_frames(
 
 pub async fn compare_methods(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: CompareMethodsParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
     let frame_id = parse_uuid(&params.frame_id)?;
 
-    let frame_row = FrameRepository::get_by_id(&server.pool, frame_id)
+    let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
@@ -393,9 +521,10 @@ pub async fn compare_methods(
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;
 
-    let all_bbas = MassFunctionRepository::get_for_claim_frame(&server.pool, claim_id, frame_id)
-        .await
-        .map_err(internal_error)?;
+    let all_bbas =
+        MassFunctionRepository::get_for_claim_frame(&server.pool, viewer, claim_id, frame_id)
+            .await
+            .map_err(internal_error)?;
 
     if all_bbas.is_empty() {
         return Err(invalid_params("no BBAs stored for this claim/frame"));
@@ -476,6 +605,7 @@ pub async fn compare_methods(
 
 pub async fn scoped_belief(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ScopedBeliefParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
@@ -500,6 +630,7 @@ pub async fn scoped_belief(
             let frame_id = parse_uuid(frame_id_str)?;
             let interval = epigraph_engine::belief_query::get_perspective_belief(
                 &server.pool,
+                viewer,
                 claim_id,
                 frame_id,
                 scope_id,
@@ -533,14 +664,15 @@ pub async fn scoped_belief(
         }
     }
 
-    let row = ScopedBeliefRepository::get(&server.pool, claim_id, scope_type, Some(scope_id))
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| {
-            invalid_params(format!(
-                "no scoped belief for claim {claim_id} with {scope_type} {scope_id}"
-            ))
-        })?;
+    let row =
+        ScopedBeliefRepository::get(&server.pool, viewer, claim_id, scope_type, Some(scope_id))
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "no scoped belief for claim {claim_id} with {scope_type} {scope_id}"
+                ))
+            })?;
 
     success_json(&ScopedBeliefResponse {
         claim_id: claim_id.to_string(),
@@ -556,11 +688,12 @@ pub async fn scoped_belief(
 
 pub async fn get_divergence(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetDivergenceParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
 
-    let row = DivergenceRepository::get_latest(&server.pool, claim_id)
+    let row = DivergenceRepository::get_latest(&server.pool, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("no divergence data for claim {claim_id}")))?;

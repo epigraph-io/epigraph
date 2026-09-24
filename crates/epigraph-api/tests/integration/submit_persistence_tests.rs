@@ -32,6 +32,9 @@
 //! cargo test --package epigraph-api --test submit_persistence_tests
 //! ```
 
+#[path = "../viewer_fixture.rs"]
+mod fixture;
+
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -250,9 +253,10 @@ fn create_multi_evidence_packet(agent_id: Uuid, evidence_count: usize) -> Episte
 /// DB persistence logic without auth ceremony.
 fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        ..ApiConfig::default()
     };
     // Bypass signature verification for all routes in tests
     let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
@@ -268,13 +272,14 @@ fn create_test_router(pool: PgPool) -> Router {
 fn test_bearer_token() -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
+    let principal = Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
-            Uuid::new_v4(),
+            principal,
             vec!["epigraph:write".to_string(), "epigraph:read".to_string()],
             "service",
-            None,
-            None,
+            Some(principal),
+            Some(principal),
             chrono::Duration::seconds(300),
         )
         .expect("issue_access_token must succeed for tests");
@@ -336,6 +341,7 @@ async fn send_packet(router: &Router, packet: &EpistemicPacket) -> (StatusCode, 
 /// IMPLEMENTATION_PLAN.md requires atomic packet submission with persistence
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_submit_creates_evidence_records(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create an agent in the database (required for FK)
     let agent = create_test_agent(Some("Evidence Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -383,9 +389,10 @@ async fn test_submit_creates_evidence_records(pool: PgPool) {
 
     // Verify evidence exists in database
     for evidence_id in &response.evidence_ids {
-        let evidence = EvidenceRepository::get_by_id(&pool, EvidenceId::from_uuid(*evidence_id))
-            .await
-            .expect("Evidence query should succeed");
+        let evidence =
+            EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*evidence_id))
+                .await
+                .expect("Evidence query should succeed");
 
         assert!(
             evidence.is_some(),
@@ -396,7 +403,7 @@ async fn test_submit_creates_evidence_records(pool: PgPool) {
 
     // Verify evidence is linked to the claim
     let claim_id = ClaimId::from_uuid(response.claim_id);
-    let claim_evidence = EvidenceRepository::get_by_claim(&pool, claim_id)
+    let claim_evidence = EvidenceRepository::get_by_claim(&pool, &viewer, claim_id)
         .await
         .expect("Evidence query should succeed");
 
@@ -423,6 +430,7 @@ async fn test_submit_creates_evidence_records(pool: PgPool) {
 /// CLAUDE.md requires "Every claim requires a ReasoningTrace"
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_submit_creates_reasoning_trace_with_parent_links(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Trace Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -463,9 +471,10 @@ async fn test_submit_creates_reasoning_trace_with_parent_links(pool: PgPool) {
         serde_json::from_str(&body).expect("Failed to parse response");
 
     // Verify trace exists in database
-    let trace = ReasoningTraceRepository::get_by_id(&pool, TraceId::from_uuid(response.trace_id))
-        .await
-        .expect("Trace query should succeed");
+    let trace =
+        ReasoningTraceRepository::get_by_id(&pool, &viewer, TraceId::from_uuid(response.trace_id))
+            .await
+            .expect("Trace query should succeed");
 
     assert!(trace.is_some(), "Trace should exist in database");
     let trace = trace.unwrap();
@@ -478,10 +487,13 @@ async fn test_submit_creates_reasoning_trace_with_parent_links(pool: PgPool) {
     );
 
     // Verify trace is linked to claim
-    let claim_traces =
-        ReasoningTraceRepository::get_by_claim(&pool, ClaimId::from_uuid(response.claim_id))
-            .await
-            .expect("Trace query should succeed");
+    let claim_traces = ReasoningTraceRepository::get_by_claim(
+        &pool,
+        &viewer,
+        ClaimId::from_uuid(response.claim_id),
+    )
+    .await
+    .expect("Trace query should succeed");
 
     assert!(
         !claim_traces.is_empty(),
@@ -512,6 +524,7 @@ async fn test_submit_creates_reasoning_trace_with_parent_links(pool: PgPool) {
 /// CLAUDE.md: "Truth values are derived from evidence, not from agent reputation"
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_submit_creates_claim_with_calculated_truth(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Claim Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -540,7 +553,7 @@ async fn test_submit_creates_claim_with_calculated_truth(pool: PgPool) {
         serde_json::from_str(&body).expect("Failed to parse response");
 
     // Verify claim exists in database
-    let claim = ClaimRepository::get_by_id(&pool, ClaimId::from_uuid(response.claim_id))
+    let claim = ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response.claim_id))
         .await
         .expect("Claim query should succeed");
 
@@ -593,6 +606,7 @@ async fn test_submit_creates_claim_with_calculated_truth(pool: PgPool) {
 /// IMPLEMENTATION_PLAN.md requires atomic packet submission
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_submit_transaction_rollback_on_failure(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Transaction Test Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -600,7 +614,7 @@ async fn test_submit_transaction_rollback_on_failure(pool: PgPool) {
         .expect("Agent creation should succeed");
 
     // Record initial counts
-    let initial_claim_count = ClaimRepository::count(&pool, None)
+    let initial_claim_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -643,7 +657,7 @@ async fn test_submit_transaction_rollback_on_failure(pool: PgPool) {
     );
 
     // Verify NO claims were created (transaction rolled back)
-    let final_claim_count = ClaimRepository::count(&pool, None)
+    let final_claim_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -700,6 +714,7 @@ async fn test_submit_transaction_rollback_on_failure(pool: PgPool) {
 /// API contract requires returned IDs to be valid references
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_returned_ids_match_database_records(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("ID Match Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -717,7 +732,7 @@ async fn test_returned_ids_match_database_records(pool: PgPool) {
         serde_json::from_str(&body).expect("Failed to parse response");
 
     // Assert: Verify claim_id exists
-    let claim = ClaimRepository::get_by_id(&pool, ClaimId::from_uuid(response.claim_id))
+    let claim = ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response.claim_id))
         .await
         .expect("Claim query should succeed");
     assert!(
@@ -727,9 +742,10 @@ async fn test_returned_ids_match_database_records(pool: PgPool) {
     );
 
     // Assert: Verify trace_id exists
-    let trace = ReasoningTraceRepository::get_by_id(&pool, TraceId::from_uuid(response.trace_id))
-        .await
-        .expect("Trace query should succeed");
+    let trace =
+        ReasoningTraceRepository::get_by_id(&pool, &viewer, TraceId::from_uuid(response.trace_id))
+            .await
+            .expect("Trace query should succeed");
     assert!(
         trace.is_some(),
         "Returned trace_id {} must exist in database",
@@ -740,9 +756,10 @@ async fn test_returned_ids_match_database_records(pool: PgPool) {
     assert_eq!(response.evidence_ids.len(), 3, "Should have 3 evidence IDs");
 
     for (i, evidence_id) in response.evidence_ids.iter().enumerate() {
-        let evidence = EvidenceRepository::get_by_id(&pool, EvidenceId::from_uuid(*evidence_id))
-            .await
-            .expect("Evidence query should succeed");
+        let evidence =
+            EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*evidence_id))
+                .await
+                .expect("Evidence query should succeed");
         assert!(
             evidence.is_some(),
             "Returned evidence_id[{}] {} must exist in database",
@@ -767,6 +784,7 @@ async fn test_returned_ids_match_database_records(pool: PgPool) {
 /// CLAUDE.md: "All evidence ... are signed. Verify before trust."
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_evidence_content_hash_matches_raw_content(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Hash Verify Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -802,10 +820,11 @@ async fn test_evidence_content_hash_matches_raw_content(pool: PgPool) {
         .evidence_ids
         .first()
         .expect("Should have evidence ID");
-    let evidence = EvidenceRepository::get_by_id(&pool, EvidenceId::from_uuid(*evidence_id))
-        .await
-        .expect("Evidence query should succeed")
-        .expect("Evidence should exist");
+    let evidence =
+        EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*evidence_id))
+            .await
+            .expect("Evidence query should succeed")
+            .expect("Evidence should exist");
 
     // Verify stored hash matches expected
     assert_eq!(
@@ -845,6 +864,7 @@ async fn test_evidence_content_hash_matches_raw_content(pool: PgPool) {
 /// CLAUDE.md: "Every claim requires a ReasoningTrace"
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_claim_references_correct_trace_and_agent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("FK Reference Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -862,7 +882,7 @@ async fn test_claim_references_correct_trace_and_agent(pool: PgPool) {
         serde_json::from_str(&body).expect("Failed to parse response");
 
     // Assert: Retrieve claim and verify references
-    let claim = ClaimRepository::get_by_id(&pool, ClaimId::from_uuid(response.claim_id))
+    let claim = ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response.claim_id))
         .await
         .expect("Claim query should succeed")
         .expect("Claim should exist");
@@ -882,7 +902,7 @@ async fn test_claim_references_correct_trace_and_agent(pool: PgPool) {
     );
 
     // Verify the trace exists and is linked to claim
-    let trace = ReasoningTraceRepository::get_by_id(&pool, claim.trace_id.unwrap())
+    let trace = ReasoningTraceRepository::get_by_id(&pool, &viewer, claim.trace_id.unwrap())
         .await
         .expect("Trace query should succeed")
         .expect("Trace should exist");
@@ -910,6 +930,7 @@ async fn test_claim_references_correct_trace_and_agent(pool: PgPool) {
 /// API idempotency is standard for POST endpoints that create resources
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_idempotency_returns_same_ids_without_reinsert(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Idempotency Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -922,7 +943,7 @@ async fn test_idempotency_returns_same_ids_without_reinsert(pool: PgPool) {
     packet.claim.idempotency_key = Some(idempotency_key.clone());
 
     // Record initial counts
-    let initial_claim_count = ClaimRepository::count(&pool, None)
+    let initial_claim_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -983,7 +1004,7 @@ async fn test_idempotency_returns_same_ids_without_reinsert(pool: PgPool) {
     );
 
     // Assert: No additional records created
-    let final_claim_count = ClaimRepository::count(&pool, None)
+    let final_claim_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -1014,13 +1035,14 @@ async fn test_idempotency_returns_same_ids_without_reinsert(pool: PgPool) {
 /// Concurrent API calls must not crash the server or corrupt data
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_concurrent_submissions_no_duplicates(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Concurrency Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
         .await
         .expect("Agent creation should succeed");
 
-    let initial_count = ClaimRepository::count(&pool, None)
+    let initial_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -1076,7 +1098,7 @@ async fn test_concurrent_submissions_no_duplicates(pool: PgPool) {
     );
 
     // Assert: Correct number of claims created
-    let final_count = ClaimRepository::count(&pool, None)
+    let final_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -1102,12 +1124,13 @@ async fn test_concurrent_submissions_no_duplicates(pool: PgPool) {
 /// Database FK constraint: claims.agent_id -> agents.id
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_foreign_key_constraint_agent_must_exist(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create a packet with non-existent agent
     let fake_agent_id = Uuid::new_v4();
     let packet = create_valid_packet(fake_agent_id);
 
     // Record initial counts
-    let initial_claim_count = ClaimRepository::count(&pool, None)
+    let initial_claim_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -1122,7 +1145,7 @@ async fn test_foreign_key_constraint_agent_must_exist(pool: PgPool) {
     );
 
     // Assert: No records created
-    let final_claim_count = ClaimRepository::count(&pool, None)
+    let final_claim_count = ClaimRepository::count(&pool, &viewer, None)
         .await
         .expect("Count should succeed");
 
@@ -1153,6 +1176,7 @@ async fn test_foreign_key_constraint_agent_must_exist(pool: PgPool) {
 /// CLAUDE.md: "Reputation must not inflate truth!"
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_truth_value_calculated_by_bayesian_not_request(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Truth Calc Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -1198,10 +1222,11 @@ async fn test_truth_value_calculated_by_bayesian_not_request(pool: PgPool) {
         );
 
         // Verify database matches
-        let claim = ClaimRepository::get_by_id(&pool, ClaimId::from_uuid(response1.claim_id))
-            .await
-            .expect("Query should succeed")
-            .expect("Claim should exist");
+        let claim =
+            ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response1.claim_id))
+                .await
+                .expect("Query should succeed")
+                .expect("Claim should exist");
 
         assert!(
             claim.truth_value.value() < 0.3,
@@ -1274,6 +1299,7 @@ async fn test_truth_value_calculated_by_bayesian_not_request(pool: PgPool) {
 /// CLAUDE.md: "Cryptographic Integrity: All evidence and traces are signed"
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_evidence_signatures_stored_correctly(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Signature Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -1311,7 +1337,7 @@ async fn test_evidence_signatures_stored_correctly(pool: PgPool) {
     // Assert: Verify signed evidence has signature stored
     let signed_evidence_id = &response.evidence_ids[0];
     let signed_evidence =
-        EvidenceRepository::get_by_id(&pool, EvidenceId::from_uuid(*signed_evidence_id))
+        EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*signed_evidence_id))
             .await
             .expect("Evidence query should succeed")
             .expect("Evidence should exist");
@@ -1336,7 +1362,7 @@ async fn test_evidence_signatures_stored_correctly(pool: PgPool) {
     // Assert: Verify unsigned evidence has no signature
     let unsigned_evidence_id = &response.evidence_ids[1];
     let unsigned_evidence =
-        EvidenceRepository::get_by_id(&pool, EvidenceId::from_uuid(*unsigned_evidence_id))
+        EvidenceRepository::get_by_id(&pool, &viewer, EvidenceId::from_uuid(*unsigned_evidence_id))
             .await
             .expect("Evidence query should succeed")
             .expect("Evidence should exist");
@@ -1358,6 +1384,7 @@ async fn test_evidence_signatures_stored_correctly(pool: PgPool) {
 /// Validates that claim content is trimmed and stored correctly
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_claim_content_whitespace_handling(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Whitespace Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -1385,7 +1412,7 @@ async fn test_claim_content_whitespace_handling(pool: PgPool) {
         serde_json::from_str(&body).expect("Failed to parse response");
 
     // Assert: Verify content in database
-    let claim = ClaimRepository::get_by_id(&pool, ClaimId::from_uuid(response.claim_id))
+    let claim = ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response.claim_id))
         .await
         .expect("Query should succeed")
         .expect("Claim should exist");
@@ -1400,6 +1427,7 @@ async fn test_claim_content_whitespace_handling(pool: PgPool) {
 /// Validates that evidence types are correctly serialized and stored
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_evidence_type_variants_stored_correctly(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent
     let agent = create_test_agent(Some("Evidence Type Agent"));
     let created_agent = AgentRepository::create(&pool, &agent)
@@ -1451,17 +1479,25 @@ async fn test_evidence_type_variants_stored_correctly(pool: PgPool) {
         serde_json::from_str(&body).expect("Failed to parse response");
 
     // Assert: Verify evidence types
-    let ev1 = EvidenceRepository::get_by_id(&pool, EvidenceId::from_uuid(response.evidence_ids[0]))
-        .await
-        .expect("Query should succeed")
-        .expect("Evidence should exist");
+    let ev1 = EvidenceRepository::get_by_id(
+        &pool,
+        &viewer,
+        EvidenceId::from_uuid(response.evidence_ids[0]),
+    )
+    .await
+    .expect("Query should succeed")
+    .expect("Evidence should exist");
 
     assert_eq!(ev1.type_description(), "Observation");
 
-    let ev2 = EvidenceRepository::get_by_id(&pool, EvidenceId::from_uuid(response.evidence_ids[1]))
-        .await
-        .expect("Query should succeed")
-        .expect("Evidence should exist");
+    let ev2 = EvidenceRepository::get_by_id(
+        &pool,
+        &viewer,
+        EvidenceId::from_uuid(response.evidence_ids[1]),
+    )
+    .await
+    .expect("Query should succeed")
+    .expect("Evidence should exist");
 
     assert_eq!(ev2.type_description(), "Testimony");
 }
@@ -1473,6 +1509,7 @@ async fn test_evidence_type_variants_stored_correctly(pool: PgPool) {
 /// the database should reject it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_bad_actor_db_level_enforcement(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Arrange: Create agent with "high reputation" (simulated)
     let high_rep_agent = create_test_agent(Some("Famous Authority"));
     let created_agent = AgentRepository::create(&pool, &high_rep_agent)
@@ -1514,10 +1551,11 @@ async fn test_bad_actor_db_level_enforcement(pool: PgPool) {
         );
 
         // Verify database consistency
-        let claim = ClaimRepository::get_by_id(&pool, ClaimId::from_uuid(response.claim_id))
-            .await
-            .expect("Query should succeed")
-            .expect("Claim should exist");
+        let claim =
+            ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(response.claim_id))
+                .await
+                .expect("Query should succeed")
+                .expect("Claim should exist");
 
         assert!(
             claim.truth_value.value() < 0.3,

@@ -98,7 +98,31 @@ pub async fn drop_unique_constraint(pool: &PgPool) {
 
 /// Add the (content_hash, agent_id) UNIQUE constraint, deduping any
 /// existing duplicate rows first. Postgres has no `ADD CONSTRAINT IF NOT
-/// EXISTS`, so the DO block swallows duplicate_object.
+/// EXISTS`, so the DO block swallows the already-present cases.
+///
+/// # `duplicate_table` is not optional, and it is not the same as
+/// `duplicate_object`
+///
+/// MEASURED when `claim_helper_tests.rs` moved to `#[sqlx::test]`:
+/// `helper_post_107_idempotent` failed with `42P07 relation
+/// "uq_claims_content_hash_agent" already exists`, which is `duplicate_table`
+/// — Postgres reports the collision against the constraint's backing INDEX, not
+/// against the constraint — while the handler named only `duplicate_object`
+/// (`42710`). On the old shared database this never fired, because an earlier
+/// arm had always just DROPPED the constraint. On a freshly-migrated database
+/// migration 013 has already created it, so the ADD raises 42P07 EVERY time and
+/// the swallow is the normal path rather than the fallback.
+/// `epigraph-db/tests/claim_repo_helpers.rs` hit and fixed this first; this is
+/// the same fix, and the divergence between the two copies is exactly the class
+/// that made it survive.
+///
+/// # Why the post-condition is asserted rather than trusted
+///
+/// Because the ADD now always raises and is always caught, a future edit that
+/// renamed the constraint, named the wrong columns or targeted the wrong table
+/// would be swallowed identically, and every post-107 arm would go on asserting
+/// `DuplicateKey` against whatever migration 013 happens to provide. Reading
+/// `pg_constraint` makes the fixture prove the precondition it claims.
 pub async fn add_unique_constraint(pool: &PgPool) {
     sqlx::query(
         "DELETE FROM claims a USING claims b
@@ -114,12 +138,25 @@ pub async fn add_unique_constraint(pool: &PgPool) {
         r#"DO $$ BEGIN
               ALTER TABLE claims ADD CONSTRAINT uq_claims_content_hash_agent
                   UNIQUE (content_hash, agent_id);
-           EXCEPTION WHEN duplicate_object THEN NULL;
+           EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
            END $$"#,
     )
     .execute(pool)
     .await
     .expect("add constraint");
+
+    let present: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint
+         WHERE conname = 'uq_claims_content_hash_agent'
+           AND conrelid = 'claims'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("inspect pg_constraint");
+    assert_eq!(
+        present, 1,
+        "post-107 fixture requires uq_claims_content_hash_agent on `claims`"
+    );
 }
 
 pub async fn insert_test_agent(pool: &PgPool, agent_id: Uuid) {
@@ -161,6 +198,70 @@ pub fn build_test_server(pool: PgPool) -> EpiGraphMcpFull {
     EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
 }
 
+/// [`build_test_server`] plus the [`epigraph_db::ScopedPool`] that the canonical
+/// write path now REQUIRES.
+///
+/// # Why a second constructor rather than changing the first
+///
+/// `submit_claim`, `memorize`, `batch_submit_claims` and `resolve_backlog_item`
+/// run their claim + trace + evidence + `update_trace_id` in ONE transaction
+/// stamped from the author's viewer, and `ScopedPool::begin_as` is the only thing
+/// that can open one. A server with no `ScopedPool` REFUSES those tools outright,
+/// deliberately — falling back to the unstamped pool is how a `42501` on
+/// `reasoning_traces` becomes a committed claim with no provenance. So a write
+/// test needs this; a read test does not, and making the ~230 `build_test_server`
+/// call sites async to give every one of them a pool they will not use would be
+/// churn with a running cost (each `ScopedPool::connect` opens its own
+/// connections).
+///
+/// # Why `scoped` is a PARAMETER and not built in here
+///
+/// The pool has to come from `fixture::scoped_pool`, and this module cannot reach
+/// it. Two routes were tried and both are worse:
+///
+/// * `#[path]`-including the canonical fixture here as well — MEASURED to fail
+///   `clippy::duplicate_mod` under `-D warnings`, because every test binary that
+///   uses this helper also declares its own `mod fixture;` over the same file
+///   ("file is loaded as a module multiple times").
+/// * `crate::fixture::scoped_pool` — `mod fixture;` is declared per test BINARY,
+///   so this would compile in some binaries and not others, and the error would
+///   surface in THIS file rather than in the test that forgot the declaration.
+///
+/// Passing it in keeps the derivation single-sourced in the canonical fixture and
+/// makes each call site say where its pool came from:
+///
+/// ```ignore
+/// let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+/// ```
+/// # The pool is attached TWICE, and both are load-bearing
+///
+/// `EpiGraphMcpFull::with_scoped_pool` is what lets the claim write stamp a
+/// transaction; `McpEmbedder::with_scoped_pool` is what lets the post-commit
+/// embed stamp a connection. A server with the first and not the second writes
+/// claims correctly and embeds NONE of them, silently, because the embed is
+/// best-effort — which is the release gate this branch exists to close. Both are
+/// given the same pool here (`ScopedPool` is `Clone`, and the clone shares the
+/// underlying `PgPool`, so this opens no extra connections).
+pub fn build_scoped_test_server(pool: PgPool, scoped: epigraph_db::ScopedPool) -> EpiGraphMcpFull {
+    let signer = AgentSigner::from_bytes(&[0xA7u8; 32]).expect("signer");
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false).with_scoped_pool(scoped)
+}
+
+/// [`build_test_server_generated_signer`] plus a `ScopedPool`. See
+/// [`build_scoped_test_server`] for why the scoped variant exists and why the
+/// pool is a parameter.
+pub fn build_scoped_test_server_generated_signer(
+    pool: PgPool,
+    scoped: epigraph_db::ScopedPool,
+) -> EpiGraphMcpFull {
+    let signer = AgentSigner::generate();
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
+        .with_generated_signer_identity()
+        .with_scoped_pool(scoped)
+}
+
 /// A server in `main::select_signer`'s rung-4 configuration: neither
 /// `--agent-key` nor `--agent-model` was supplied, so the signer is a fresh
 /// random keypair belonging to this process alone. Both halves matter — the
@@ -189,6 +290,102 @@ pub async fn seed_agent(pool: &PgPool) -> Uuid {
     .await
     .expect("seed agent");
     id
+}
+
+/// Resolve `owner`'s personal group, minting it and the owner's live membership
+/// if absent, and return its id.
+///
+/// This is migration 071's fallback arm, lifted into a fixture. Until PR-22 the
+/// tests below reached it by writing a `partition_type = 'private'` row into
+/// `ownership` and letting the `ownership_transcribe` trigger resolve-or-mint
+/// the group and stamp the claim. Migration 084 retires that table, so the
+/// fixture does both halves itself.
+///
+/// **Two ways to identify a personal group, and both are needed.** The canonical
+/// one is the deterministic `did:epigraph:personal:<agent uuid>` key, but the
+/// semantics are `kind = 'personal'` created by this agent, and
+/// `tests/viewer_fixture.rs::seed_agent_with_group` mints one under a
+/// `did:epigraph:test:` key instead. **The membership targets the composite
+/// `(group_id, agent_id, epoch)` and REVIVES**, because an untargeted
+/// `DO NOTHING` no-ops against a revoked row and leaves the agent with no live
+/// membership in its own personal group.
+pub async fn personal_group_of(pool: &PgPool, owner: Uuid) -> Uuid {
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM groups \
+          WHERE (did_key = 'did:epigraph:personal:' || $1::text) \
+             OR (kind = 'personal' AND created_by_agent_id = $1) \
+          ORDER BY (did_key = 'did:epigraph:personal:' || $1::text) DESC, created_at ASC \
+          LIMIT 1",
+    )
+    .bind(owner)
+    .fetch_optional(pool)
+    .await
+    .expect("resolve personal group");
+
+    let group = match existing {
+        Some(g) => g,
+        None => sqlx::query_scalar(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ('personal:' || $1::text, 'did:epigraph:personal:' || $1::text, \
+                     ''::bytea, 'personal', $1) \
+             ON CONFLICT (did_key) DO UPDATE SET updated_at = now() RETURNING id",
+        )
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .expect("mint personal group"),
+    };
+
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin') \
+         ON CONFLICT (group_id, agent_id, epoch) \
+         DO UPDATE SET revoked_at = NULL, role = 'admin'",
+    )
+    .bind(group)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("revive personal group membership");
+
+    group
+}
+
+/// Make `claim_id` readable only by `owner`'s personal group, and CHECK that it
+/// landed.
+///
+/// The read-back is not decoration. Every caller asserts that a STRANGER sees
+/// less, and a fixture that silently failed to privatise the row would leave all
+/// of them green while testing nothing — the failure mode is invisible in
+/// exactly the tests that exist to catch it.
+pub async fn seed_private_tenancy(pool: &PgPool, claim_id: Uuid, owner: Uuid) -> Uuid {
+    let group = personal_group_of(pool, owner).await;
+    stamp_group_private(pool, claim_id, group).await;
+    group
+}
+
+/// `UPDATE claims SET visibility = 'group', owner_group_id = $2`, with the
+/// post-condition asserted. See [`seed_private_tenancy`] for why.
+pub async fn stamp_group_private(pool: &PgPool, claim_id: Uuid, group: Uuid) {
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(claim_id)
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("stamp the claim group-private");
+
+    let got: Option<(String, Uuid)> =
+        sqlx::query_as("SELECT visibility, owner_group_id FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_optional(pool)
+            .await
+            .expect("read the stamped claim back");
+    assert_eq!(
+        got,
+        Some(("group".to_string(), group)),
+        "the fixture must leave claim {claim_id} at ('group', {group}); a \
+         mis-stamped fixture makes every absence assertion vacuous"
+    );
 }
 
 pub async fn seed_claim(pool: &PgPool, content: &str, truth: f64) -> Uuid {

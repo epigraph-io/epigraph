@@ -14,6 +14,9 @@
 //! the OpenAI HTTP call is stubbed out, matching the precedent set by
 //! `find_workflow_semantic_test.rs` for the same embedder constraint.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[rustfmt::skip]
 use epigraph_mcp::tools::memory::__test_only::recall_with_pgvec;
 use epigraph_mcp::types::RecallParams;
@@ -75,6 +78,7 @@ async fn seed_claim_with_embedding(pool: &PgPool, content: &str, pgvec: &str) ->
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_include_workflows_true_returns_matching_workflow(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // A workflow whose goal text does NOT appear in any claim content, so a
     // lexical/claims-only path can never surface it — only the workflows ANN
     // leg can.
@@ -102,9 +106,17 @@ async fn recall_include_workflows_true_returns_matching_workflow(pool: PgPool) {
         include_workflows: true,
         exclude_contested: false,
         since: None,
+        // Theme scope / paging (backlog c95a2509) default to unscoped here: this
+        // fixture pins a different axis, and None/None/None is byte-identical to
+        // the pre-theme behaviour.
+        theme_id: None,
+        theme_label: None,
+        offset: None,
+        epistemic_partition: false,
+        diversity_radius: None,
     };
 
-    let out = recall_with_pgvec(&server, params, Some(pgvec))
+    let out = recall_with_pgvec(&server, &viewer, params, Some(pgvec))
         .await
         .expect("recall_with_pgvec ok");
     let json = first_text(&out);
@@ -137,6 +149,7 @@ async fn recall_include_workflows_true_returns_matching_workflow(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_include_workflows_false_excludes_workflow_only_match(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let goal = "orchestrate zylophonic beacon calibration";
     let pgvec = unit_pgvec_1536();
     let workflow_id = seed_workflow_with_goal_embedding(&pool, goal, &pgvec).await;
@@ -158,11 +171,19 @@ async fn recall_include_workflows_false_excludes_workflow_only_match(pool: PgPoo
         include_workflows: false,
         exclude_contested: false,
         since: None,
+        // Theme scope / paging (backlog c95a2509) default to unscoped here: this
+        // fixture pins a different axis, and None/None/None is byte-identical to
+        // the pre-theme behaviour.
+        theme_id: None,
+        theme_label: None,
+        offset: None,
+        epistemic_partition: false,
+        diversity_radius: None,
     };
 
     // include_workflows defaults false: the workflows leg must not even be
     // queried, so the workflow can never appear regardless of pgvec.
-    let out = recall_with_pgvec(&server, params, Some(pgvec))
+    let out = recall_with_pgvec(&server, &viewer, params, Some(pgvec))
         .await
         .expect("recall_with_pgvec ok");
     let json = first_text(&out);

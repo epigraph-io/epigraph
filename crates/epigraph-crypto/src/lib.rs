@@ -20,7 +20,6 @@ pub mod epoch;
 pub mod errors;
 pub mod hasher;
 pub mod key_exchange;
-pub mod proxy_re;
 pub mod signer;
 pub mod verifier;
 

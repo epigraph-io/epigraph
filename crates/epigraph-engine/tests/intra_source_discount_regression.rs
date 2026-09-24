@@ -30,6 +30,9 @@
 //! must be seeded with `belief = plausibility = 0.68` (a certain interval
 //! at the NEMS mean from the issue body), not just `truth_value = 0.68`.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -171,6 +174,7 @@ const NEMS_BELIEF: f64 = 0.68;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn intra_source_19_supporters_betp_in_band(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool, 0xA0_0001).await;
     let target_doi = "10.intra/p1";
     let paper = seed_paper(&pool, target_doi, "Synthesis paper").await;
@@ -221,10 +225,17 @@ async fn intra_source_19_supporters_betp_in_band(pool: PgPool) {
         // points use (HTTP edges, HTTP workflows, MCP ingestion,
         // MCP workflow_ingest, CLI backfill_factors).
         let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
-        let outcome =
-            auto_wire_ds_for_edge(&pool, edge_id, agent, supporter, target_id, "supports")
-                .await
-                .expect("auto_wire_ds_for_edge");
+        let outcome = auto_wire_ds_for_edge(
+            &mut pool.acquire().await.expect("acquire"),
+            &viewer,
+            edge_id,
+            agent,
+            supporter,
+            target_id,
+            "supports",
+        )
+        .await
+        .expect("auto_wire_ds_for_edge");
         assert_eq!(
             outcome,
             EdgeFactorOutcome::Wired,
@@ -339,9 +350,13 @@ async fn intra_source_19_supporters_betp_in_band(pool: PgPool) {
     .await
     .expect("set per-frame intra factor");
 
-    recompute_claim_belief_binary(&pool, target_id)
-        .await
-        .expect("recompute after per-frame override");
+    recompute_claim_belief_binary(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        target_id,
+    )
+    .await
+    .expect("recompute after per-frame override");
 
     let recal_betp = read_betp(&pool, target_id)
         .await
@@ -362,6 +377,7 @@ async fn intra_source_19_supporters_betp_in_band(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn cross_source_19_supporters_keeps_high_betp(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool, 0xB0_0001).await;
 
     // Target paper is distinct from all 19 supporter papers AND no supporter
@@ -403,10 +419,17 @@ async fn cross_source_19_supporters_keeps_high_betp(pool: PgPool) {
         insert_edge(&pool, paper, supporter, "paper", "claim", "asserts").await;
 
         let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
-        let outcome =
-            auto_wire_ds_for_edge(&pool, edge_id, agent, supporter, target_id, "supports")
-                .await
-                .expect("auto_wire_ds_for_edge");
+        let outcome = auto_wire_ds_for_edge(
+            &mut pool.acquire().await.expect("acquire"),
+            &viewer,
+            edge_id,
+            agent,
+            supporter,
+            target_id,
+            "supports",
+        )
+        .await
+        .expect("auto_wire_ds_for_edge");
         assert_eq!(
             outcome,
             EdgeFactorOutcome::Wired,
@@ -482,9 +505,13 @@ async fn cross_source_19_supporters_keeps_high_betp(pool: PgPool) {
     .await
     .expect("set per-frame intra factor (should be a no-op for cross-source)");
 
-    recompute_claim_belief_binary(&pool, target_id)
-        .await
-        .expect("recompute after per-frame override");
+    recompute_claim_belief_binary(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        target_id,
+    )
+    .await
+    .expect("recompute after per-frame override");
 
     let recal_betp = read_betp(&pool, target_id)
         .await
@@ -530,6 +557,7 @@ async fn cross_source_19_supporters_keeps_high_betp(pool: PgPool) {
 /// time.
 #[sqlx::test(migrations = "../../migrations")]
 async fn per_frame_locality_factor_override_applied(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     use epigraph_db::FrameRepository;
 
     let agent = seed_agent(&pool, 0xC0_0001).await;
@@ -567,9 +595,17 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     .await;
     seed_doi_evidence(&pool, primer, target_doi, 0x71_0000).await;
     let primer_edge = insert_edge(&pool, primer, target_id, "claim", "claim", "supports").await;
-    auto_wire_ds_for_edge(&pool, primer_edge, agent, primer, target_id, "supports")
-        .await
-        .expect("auto_wire primer");
+    auto_wire_ds_for_edge(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        primer_edge,
+        agent,
+        primer,
+        target_id,
+        "supports",
+    )
+    .await
+    .expect("auto_wire primer");
 
     // Capture the BetP at the default per-frame factor (calibration's
     // 0.3) — this is the Phase 2 baseline we'll later compare against.
@@ -579,7 +615,7 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     eprintln!("[per_frame_locality_factor_override_applied] baseline BetP (default factor 0.3) = {baseline_betp}");
 
     // Now binary_truth exists. Override its locality factor.
-    let frame = FrameRepository::get_by_name(&pool, "binary_truth")
+    let frame = FrameRepository::get_by_name(&pool, &viewer, "binary_truth")
         .await
         .expect("query binary_truth")
         .expect("binary_truth must exist after primer wire");
@@ -610,9 +646,17 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     .await;
     seed_doi_evidence(&pool, supporter, target_doi, 0x72_0000).await;
     let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
-    let outcome = auto_wire_ds_for_edge(&pool, edge_id, agent, supporter, target_id, "supports")
-        .await
-        .expect("auto_wire override");
+    let outcome = auto_wire_ds_for_edge(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        edge_id,
+        agent,
+        supporter,
+        target_id,
+        "supports",
+    )
+    .await
+    .expect("auto_wire override");
     assert_eq!(outcome, EdgeFactorOutcome::Wired);
 
     // ── Write-through cache assertion (carried forward from pre-Phase-2) ──
@@ -718,9 +762,13 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     )
     .await
     .expect("set frame property to 0.99");
-    recompute_claim_belief_binary(&pool, target_id)
-        .await
-        .expect("recompute after second override");
+    recompute_claim_belief_binary(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        target_id,
+    )
+    .await
+    .expect("recompute after second override");
     let nearly_undiscounted_betp = read_betp(&pool, target_id)
         .await
         .expect("BetP after second recalibration");
@@ -744,9 +792,13 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     )
     .await
     .expect("set frame property to 0.05");
-    recompute_claim_belief_binary(&pool, target_id)
-        .await
-        .expect("recompute after third override");
+    recompute_claim_belief_binary(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        target_id,
+    )
+    .await
+    .expect("recompute after third override");
     let deeply_discounted_betp = read_betp(&pool, target_id)
         .await
         .expect("BetP after deeper discount");
@@ -787,6 +839,7 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
 /// + restore round-trip is sufficient").
 #[sqlx::test(migrations = "../../migrations")]
 async fn per_frame_evidence_type_weight_override_applied(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     use epigraph_db::FrameRepository;
 
     let agent = seed_agent(&pool, 0xD0_0001).await;
@@ -826,10 +879,17 @@ async fn per_frame_evidence_type_weight_override_applied(pool: PgPool) {
         .await;
         seed_doi_evidence(&pool, supporter, target_doi, 0x73_0000 + i).await;
         let edge_id = insert_edge(&pool, supporter, target_id, "claim", "claim", "supports").await;
-        let outcome =
-            auto_wire_ds_for_edge(&pool, edge_id, agent, supporter, target_id, "supports")
-                .await
-                .expect("auto_wire");
+        let outcome = auto_wire_ds_for_edge(
+            &mut pool.acquire().await.expect("acquire"),
+            &viewer,
+            edge_id,
+            agent,
+            supporter,
+            target_id,
+            "supports",
+        )
+        .await
+        .expect("auto_wire");
         assert_eq!(outcome, EdgeFactorOutcome::Wired);
     }
 
@@ -886,9 +946,13 @@ async fn per_frame_evidence_type_weight_override_applied(pool: PgPool) {
 
     // Recompute — the helper reads the override at combine time.
     // **No BBA row rewrite** in between. This is the canary.
-    recompute_claim_belief_binary(&pool, target_id)
-        .await
-        .expect("recompute after per-frame evidence-type override");
+    recompute_claim_belief_binary(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        target_id,
+    )
+    .await
+    .expect("recompute after per-frame evidence-type override");
 
     let downshifted_betp = read_betp(&pool, target_id)
         .await
@@ -918,9 +982,13 @@ async fn per_frame_evidence_type_weight_override_applied(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("remove evidence_type_weights key");
-    recompute_claim_belief_binary(&pool, target_id)
-        .await
-        .expect("recompute after override removal");
+    recompute_claim_belief_binary(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        target_id,
+    )
+    .await
+    .expect("recompute after override removal");
 
     let restored_betp = read_betp(&pool, target_id)
         .await

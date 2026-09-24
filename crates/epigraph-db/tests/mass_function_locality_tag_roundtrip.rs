@@ -15,6 +15,9 @@
 //! `MassFunctionRow` struct or the INSERT column list doesn't silently drop
 //! the tag and pass only the higher-level integration test by accident.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::{MassFunctionRepository, MassFunctionRow};
 use serde_json::json;
 use sqlx::PgPool;
@@ -66,7 +69,8 @@ async fn seed_frame(pool: &PgPool, tag: u32) -> Uuid {
 }
 
 async fn fetch_row(pool: &PgPool, claim_id: Uuid, frame_id: Uuid) -> MassFunctionRow {
-    let rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
+    let viewer = fixture::public_viewer(pool).await;
+    let rows = MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
         .await
         .expect("get_for_claim_frame");
     assert_eq!(

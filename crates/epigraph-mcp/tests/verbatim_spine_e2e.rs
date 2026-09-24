@@ -14,6 +14,9 @@
 //! deterministic spine carries the `section_follows` edge between the two
 //! sections.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
@@ -22,10 +25,17 @@ use epigraph_mcp::tools::ingestion::{ingest_document_inline, structure_source};
 use epigraph_mcp::types::{IngestDocumentInlineParams, StructureSourceParams};
 use sqlx::PgPool;
 
-fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+/// Built FROM A `ScopedPool`: the document ingest walk now runs in one
+/// transaction stamped from the ingesting agent and refuses (nothing written) on
+/// a server that cannot stamp one. `#[sqlx::test]` connects as a BYPASSRLS
+/// superuser, so the stamp is inert here — what this buys is that the fixture
+/// drives the PRODUCTION code path (`begin_author_stamped_tx`) rather than the
+/// refusal.
+async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::generate();
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -35,7 +45,8 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn structure_then_ingest_yields_verbatim_spine(pool: PgPool) {
-    let server = make_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
     let src = "# Intro\n\nAlpha is a fact.\n\n## Body\n\nBeta follows alpha.";
 
     // 1) structure — deterministic, verbatim, atoms empty.
@@ -65,9 +76,10 @@ async fn structure_then_ingest_yields_verbatim_spine(pool: PgPool) {
     // 3) ingest inline; the writer re-verifies the threaded source_text + spans.
     //    ingest_document_inline is fire-and-forget: it spawns the write as a
     //    detached Tokio task and returns {"status":"queued"} immediately.
-    let result = ingest_document_inline(&server, IngestDocumentInlineParams { extraction })
-        .await
-        .unwrap();
+    let result =
+        ingest_document_inline(&server, &viewer, IngestDocumentInlineParams { extraction })
+            .await
+            .unwrap();
     let json: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
     assert_eq!(json["status"], "queued");
 

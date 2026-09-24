@@ -10,9 +10,73 @@ pub const HYBRID_CANDIDATE_POOL: i64 = 50;
 /// Reciprocal Rank Fusion constant `k` (canonical default 60).
 pub const HYBRID_RRF_K: i64 = 60;
 
+/// How this embedder is allowed to run its `UPDATE claims SET embedding`.
+///
+/// # Why the store path is a declared property and not a pool
+///
+/// `store_embedding(&self.pool, …)` was the release gate this type carried into
+/// every one of its nine callers. `claims_tenancy`'s
+/// `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))` refuses that
+/// UPDATE on an unstamped application session, the refusal is swallowed by design
+/// (embedding is best-effort), and the tool still reports success — so on a
+/// cleanly-migrated schema `store_workflow`, `ingest_workflow`,
+/// `improve_workflow_hierarchy`, `add_step`, `consolidate_claims` and both
+/// `ingest_document` paths would land `embedding = NULL` with **no error
+/// anywhere**, visible only as CLAUDE.md's `live_missing` climbing.
+///
+/// Fixing that at the six call sites would have left the type itself still able
+/// to do the wrong thing, and PR #494 had already shown what happens then: it
+/// converted `submit_claim` and `memorize` and the other seven callers kept the
+/// defect. So the capability is declared once, here, and the variant that can
+/// silently write unstamped does not exist.
+///
+/// [`Undeclared`](Self::Undeclared) is the DEFAULT, and it REFUSES rather than
+/// falling back — hard constraint #5 of the write-path brief: a refusal must stay
+/// loud, because a fallback to the unstamped pool is how a `42501` becomes a
+/// silent orphan.
+///
+/// # MEASURED, end to end, with the real binary as `epigraph_app`
+///
+/// `store_workflow` (4 executor-authored claims) + `add_step` (1), on the
+/// prod-faithful schema configuration:
+///
+/// | binary | outcome |
+/// |---|---|
+/// | this code | `all_claims=5 all_embedded=5`, no warning in the log |
+/// | one hunk reverted — `main` builds the embedder WITHOUT `with_scoped_pool` | `all_claims=5 all_embedded=0`, five `tenancy.scoped_write` ERRORs |
+/// | restored | `all_claims=5 all_embedded=5` again |
+///
+/// The mutation is the proof that the declaration is what stores the vectors, and
+/// it is run on the PROD-FAITHFUL configuration deliberately. On the clean
+/// configuration these tools never reach the embed at all — the executor's own
+/// unstamped `claims` INSERT is refused first (the D5 residual registered in
+/// `tests/residual_unstamped_writes.rs`), so a clean-schema arm would report
+/// `all_claims=0` and discriminate nothing. This is therefore the one
+/// configuration in which the seven executor-path callers' embed is observable,
+/// and the arm that makes it non-vacuous is the reverted hunk rather than the
+/// policies.
+pub enum StorePath {
+    /// No store capability was declared. Every store attempt is refused with a
+    /// named cause. This is what `McpEmbedder::new` yields, so a new construction
+    /// site cannot acquire an unstamped writer by omission.
+    Undeclared,
+    /// Stamp a connection from the CLAIM's author and store there. The
+    /// production arm: `main` attaches the same [`epigraph_db::ScopedPool`] the
+    /// write path uses.
+    AuthorStamped(epigraph_db::ScopedPool),
+    /// `self.pool` is already privileged — a `MaintenancePool`, whose role
+    /// bypasses RLS — so there is no stamp to take and none is needed. Carries
+    /// the caller's reason so the exemption is auditable rather than implicit;
+    /// `epigraph-cli/src/bin/ingest_document.rs` is the one production user, and
+    /// its own comment records that its whole ingest deliberately runs on the
+    /// maintenance pool.
+    PrivilegedPool(&'static str),
+}
+
 pub struct McpEmbedder {
     api_key: Option<String>,
     pool: PgPool,
+    store_path: StorePath,
     http: reqwest::Client,
 }
 
@@ -38,13 +102,52 @@ pub const fn model_for_dim(dim: u32) -> Option<&'static str> {
 }
 
 impl McpEmbedder {
+    /// Build an embedder with **no store capability** ([`StorePath::Undeclared`]).
+    ///
+    /// Generation and search work; every store is refused with a named cause
+    /// until one of [`with_scoped_pool`](Self::with_scoped_pool) or
+    /// [`on_a_privileged_pool`](Self::on_a_privileged_pool) is called. That
+    /// default is deliberate — see [`StorePath`] — and it is why the ~25 test
+    /// fixtures that call `new(pool, None)` needed no edit: a mock embedder has
+    /// no API key, so `generate` refuses before any store is attempted.
     #[must_use]
     pub fn new(pool: PgPool, api_key: Option<String>) -> Self {
         Self {
             api_key,
             pool,
+            store_path: StorePath::Undeclared,
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Declare that stores run on a connection stamped from the claim's author,
+    /// drawn from `scoped`.
+    ///
+    /// The production wiring: `main` passes the same `ScopedPool` it gives
+    /// `EpiGraphMcpFull::with_scoped_pool`, so the embedder and the write path
+    /// stamp through one pool. The two are attached at the same places on purpose
+    /// — `crates/epigraph-mcp/tests/residual_unstamped_writes.rs::
+    /// every_scoped_server_construction_also_scopes_its_embedder` is the ratchet
+    /// that keeps them from drifting, because a server with a `ScopedPool` and an
+    /// embedder without one would write claims correctly and embed none of them.
+    #[must_use]
+    pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
+        self.store_path = StorePath::AuthorStamped(scoped);
+        self
+    }
+
+    /// Declare that `self.pool` is already privileged, so stores may run on it
+    /// directly. `reason` is recorded in the refusal-free path's log line.
+    ///
+    /// The only sanctioned use is an embedder over a `MaintenancePool`, whose
+    /// role holds `BYPASSRLS`: there `epigraph_bypass()` is true, the tier-A
+    /// `WITH CHECK` admits the UPDATE, and a stamp would be meaningless. Calling
+    /// this over an ORDINARY application pool re-creates exactly the defect
+    /// [`StorePath`] documents, silently — do not.
+    #[must_use]
+    pub fn on_a_privileged_pool(mut self, reason: &'static str) -> Self {
+        self.store_path = StorePath::PrivilegedPool(reason);
+        self
     }
 
     #[must_use]
@@ -106,7 +209,108 @@ impl McpEmbedder {
         generate_openai_embedding_with_model(&self.http, api_key, &truncated, model).await
     }
 
+    /// Store an already-formatted pgvector on `claims.embedding`, through this
+    /// embedder's declared [`StorePath`].
+    ///
+    /// The single store mechanism behind every caller of this type — nine of them
+    /// at the time of writing — and the reason the conversion is a type change
+    /// rather than six call-site edits.
+    ///
+    /// # The author is read from the ROW, not supplied by the caller
+    ///
+    /// `claims_tenancy`'s `WITH CHECK` asks about the row's `owner_group_id`, and
+    /// `ClaimRepository::default_decl_for_author` sets that from the CLAIM
+    /// AUTHOR's personal group. The author is therefore the only viewer whose
+    /// writable set can satisfy the check, and it is NOT `server.agent_id()` for
+    /// most of this type's callers: `epigraph_ingest_executor`'s
+    /// `execute_workflow_ingest_plan`, `add_step` and `improve_workflow_hierarchy`
+    /// all author as `get_or_create_system_agent(pool)`. A signature that took the
+    /// author from the caller would have let `store_workflow` pass the MCP
+    /// server's agent, produce a session stamped with the WRONG writable group,
+    /// and be refused exactly as before — silently, because the embed is
+    /// best-effort. That is a worse outcome than the current defect, because it
+    /// looks converted.
+    ///
+    /// The lookup is `ClaimRepository::get_agent_id` under a viewer resolved over
+    /// the NIL principal, i.e. the public corpus. That read WORKS on an unstamped
+    /// application session, and the reason is specific rather than lucky:
+    /// migration 077's tier-A USING clause is
+    /// `bypass OR definer_bypass OR visibility = 'public' OR owner_group_id = ANY(session_groups)`,
+    /// and every claim these paths write is `visibility = 'public'` by
+    /// `default_decl_for_author`. (Contrast `groups_tenancy`, whose USING has no
+    /// public arm — which is why hard constraint #3 forbids read-then-mint helpers
+    /// on this connection.) A group-private claim therefore yields `None` here and
+    /// the store is REFUSED with a named cause rather than attempted with a viewer
+    /// that cannot satisfy the check.
+    ///
+    /// # Errors
+    /// `Err` when no vector could be stored and the cause is not "the row did not
+    /// match": an undeclared store path, an unresolvable author, a failed stamp,
+    /// or a database error. `Ok(false)` means the statement ran and matched no row
+    /// (claim missing, sealed, superseded, or not writable by its author).
+    pub async fn store_vector(&self, claim_id: uuid::Uuid, pgvec: &str) -> Result<bool, String> {
+        match &self.store_path {
+            StorePath::Undeclared => {
+                tracing::error!(
+                    target: "tenancy.scoped_write",
+                    claim_id = %claim_id,
+                    "embedding store refused: this McpEmbedder declared no StorePath, so there \
+                     is no connection it may run `UPDATE claims SET embedding` on. Refusing \
+                     rather than using the plain pool, where migration 077's claims_tenancy \
+                     WITH CHECK refuses the UPDATE and the swallowed failure leaves the claim \
+                     invisible to semantic recall with no error anywhere. Construct the embedder \
+                     with McpEmbedder::with_scoped_pool."
+                );
+                Err("McpEmbedder has no declared StorePath; nothing was stored".to_string())
+            }
+            StorePath::PrivilegedPool(reason) => {
+                tracing::debug!(
+                    claim_id = %claim_id,
+                    reason = reason,
+                    "storing the embedding directly on a privileged pool"
+                );
+                epigraph_db::ClaimRepository::store_embedding(&self.pool, claim_id, pgvec)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            StorePath::AuthorStamped(scoped) => {
+                let public =
+                    epigraph_db::visibility::Viewer::resolve(&self.pool, uuid::Uuid::nil())
+                        .await
+                        .map_err(|e| {
+                            format!("could not resolve a public viewer to read the author: {e}")
+                        })?;
+                let author =
+                    epigraph_db::ClaimRepository::get_agent_id(&self.pool, &public, claim_id)
+                        .await
+                        .map_err(|e| format!("could not read claim {claim_id}'s author: {e}"))?
+                        .ok_or_else(|| {
+                            format!(
+                        "claim {claim_id} is not readable as public, so its author — the only \
+                         viewer whose writable set can satisfy claims_tenancy's WITH CHECK on \
+                         this row — cannot be resolved. Nothing was stored."
+                    )
+                        })?;
+                crate::claim_helper::store_embedding_author_stamped(
+                    Some(scoped),
+                    &self.pool,
+                    author,
+                    claim_id,
+                    pgvec,
+                    "embedder",
+                )
+                .await
+            }
+        }
+    }
+
     /// Generate embedding and store it for a claim. Returns true if embedding succeeded.
+    ///
+    /// Best-effort by contract (CLAUDE.md's embedding policy): every failure is
+    /// warned and reported as `false`, never returned, because the claim is
+    /// already committed. The store half goes through
+    /// [`store_vector`](Self::store_vector), so this function can no longer reach
+    /// the unstamped pool.
     pub async fn embed_and_store(&self, claim_id: uuid::Uuid, text: &str) -> bool {
         let embedding = match self.generate(text).await {
             Ok(v) => v,
@@ -117,17 +321,18 @@ impl McpEmbedder {
         };
 
         let pgvec = format_pgvector(&embedding);
-        match epigraph_db::ClaimRepository::store_embedding(&self.pool, claim_id, &pgvec).await {
+        match self.store_vector(claim_id, &pgvec).await {
             Ok(true) => true,
             Ok(false) => {
                 tracing::warn!(
                     claim_id = %claim_id,
-                    "embedding store affected 0 rows (claim missing?)"
+                    "embedding store affected 0 rows (claim missing, sealed, superseded, or not \
+                     writable by its author's viewer)"
                 );
                 false
             }
             Err(e) => {
-                tracing::warn!("embedding store failed: {e}");
+                tracing::warn!(claim_id = %claim_id, "embedding store failed: {e}");
                 false
             }
         }
@@ -141,8 +346,13 @@ impl McpEmbedder {
     /// vectors). This previously called `EvidenceRepository::search_by_embedding`
     /// = `evidence.embedding`, which is unpopulated, so the `recall` tool's
     /// semantic path always returned empty.
-    pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<(uuid::Uuid, f64)>, String> {
-        self.search_scoped(query, limit, None, None).await
+    pub async fn search(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<(uuid::Uuid, f64)>, String> {
+        self.search_scoped(viewer, query, limit, None, None).await
     }
 
     /// Embedding search over current claims with optional scope pushed into
@@ -151,6 +361,7 @@ impl McpEmbedder {
     /// not restrict.
     pub async fn search_scoped(
         &self,
+        viewer: &epigraph_db::visibility::Viewer,
         query: &str,
         limit: i64,
         tags: Option<&[String]>,
@@ -160,7 +371,7 @@ impl McpEmbedder {
 
         let pgvec = format_pgvector(&embedding);
         let results = epigraph_db::ClaimRepository::search_by_embedding_scoped(
-            &self.pool, &pgvec, limit, tags, agent_id,
+            &self.pool, viewer, &pgvec, limit, tags, agent_id,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -176,6 +387,7 @@ impl McpEmbedder {
     /// fused hits; the caller (`recall`) degrades to lexical-only on `Err`.
     pub async fn search_hybrid_scoped(
         &self,
+        viewer: &epigraph_db::visibility::Viewer,
         query: &str,
         limit: i64,
         tags: Option<&[String]>,
@@ -185,6 +397,7 @@ impl McpEmbedder {
         let pgvec = format_pgvector(&embedding);
         epigraph_db::ClaimRepository::search_hybrid_scoped(
             &self.pool,
+            viewer,
             &pgvec,
             query,
             HYBRID_CANDIDATE_POOL,
@@ -241,18 +454,32 @@ impl EmbeddingService for McpEmbedder {
         Ok(results)
     }
 
-    /// Store an embedding on `claims.embedding` via `ClaimRepository::store_embedding`.
+    /// Store an embedding on `claims.embedding` through
+    /// [`McpEmbedder::store_vector`].
     ///
     /// Per the embedding-policy contract in CLAUDE.md, the canonical storage
     /// site for claim embeddings is `claims.embedding`. An earlier impl wrote
     /// to `evidence.embedding` keyed by `claim_id`, which silently no-op'd
     /// because evidence rows have their own ids.
+    ///
+    /// # This was the same unstamped write a THIRD time
+    ///
+    /// It used to call `ClaimRepository::store_embedding(&self.pool, …)` directly,
+    /// so it carried the refusal `embed_and_store` carried and the six converted
+    /// call sites did not cover it. It now shares the one declared
+    /// [`StorePath`], which also means it stamps from the claim's author rather
+    /// than from nothing.
+    ///
+    /// It has no production caller — the MCP paths use the inherent
+    /// `embed_and_store`, and `epigraph-api`'s `embedding_service` is one of the
+    /// `epigraph-embeddings` providers, never this type — but routing it was
+    /// cheaper than proving that property stays true.
     async fn store(&self, claim_id: uuid::Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
         let pgvec = format_pgvector(embedding);
-        epigraph_db::ClaimRepository::store_embedding(&self.pool, claim_id, &pgvec)
+        self.store_vector(claim_id, &pgvec)
             .await
             .map(|_| ())
-            .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))
+            .map_err(EmbeddingError::DatabaseError)
     }
 
     /// `McpEmbedder` does not expose a point-query for stored embeddings.
@@ -263,26 +490,30 @@ impl EmbeddingService for McpEmbedder {
         Err(EmbeddingError::NotFound { claim_id })
     }
 
-    /// Find similar claims via `EvidenceRepository::search_by_embedding`.
+    /// **Unimplemented as of PR-06, deliberately.**
     ///
-    /// Converts `f64` similarity from the DB row to `f32` for `SimilarClaim`.
+    /// `EmbeddingService` lives in `epigraph-interfaces`, which does not depend
+    /// on `epigraph-db` and therefore cannot name a `Viewer`. PR-06 makes
+    /// `EvidenceRepository::search_by_embedding` require one, so this method has
+    /// no way to be tenancy-correct through this trait, and returning unfiltered
+    /// rows through a trait object would be the exact fail-open the PR exists to
+    /// close. It has no production caller — the MCP novelty and recall paths go
+    /// through [`McpEmbedder::search_scoped`] and
+    /// [`McpEmbedder::search_hybrid_scoped`], both of which take a viewer.
+    ///
+    /// Widening the trait is PR-09's call, when `mcp_viewer` gives every tool a
+    /// viewer to hand down.
     async fn similar(
         &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
+        _embedding: &[f32],
+        _k: usize,
+        _min_similarity: f32,
     ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        let pgvec = format_pgvector(embedding);
-        let rows =
-            epigraph_db::EvidenceRepository::search_by_embedding(&self.pool, &pgvec, k as i64)
-                .await
-                .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| SimilarClaim::new(r.claim_id, r.similarity as f32))
-            .filter(|s| s.similarity >= min_similarity)
-            .collect())
+        Err(EmbeddingError::DatabaseError(
+            "McpEmbedder::similar is not tenancy-aware: EmbeddingService cannot carry a \
+             Viewer. Use McpEmbedder::search_scoped or ::search_hybrid_scoped."
+                .to_string(),
+        ))
     }
 
     /// `text-embedding-3-small` outputs 1536-dimensional vectors.

@@ -38,8 +38,36 @@ pub struct ChallengeRepository;
 
 impl ChallengeRepository {
     /// Insert a new challenge against a claim.
-    pub async fn create(
-        pool: &PgPool,
+    ///
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// `challenges` is in migration 062's tier-A array and 077 gives it the
+    /// strict `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`,
+    /// which no unstamped application session can satisfy — its writable set is
+    /// `{}`. The only connection that CAN satisfy it comes from
+    /// `ScopedPool::begin_as`, and that hands back a transaction rather than a
+    /// pool, so a `&PgPool` parameter made this function unreachable from the one
+    /// connection shape that works. `&PgPool` and `&mut PgConnection` both
+    /// satisfy [`sqlx::PgExecutor`], so the three `epigraph-api` callers compile
+    /// unchanged. Same change and same reasoning as
+    /// [`crate::repos::ReasoningTraceRepository::create`].
+    ///
+    /// # Whose group the row lands in is NOT the caller's choice
+    ///
+    /// `challenges` is claim-derived, so migration 074's
+    /// `epigraph_derived_require_tenancy` (BEFORE INSERT) fills
+    /// `(visibility, owner_group_id)` from the PARENT CLAIM, and 070 arm (c)
+    /// (AFTER INSERT STATEMENT) re-stamps it unconditionally — its own comment
+    /// says a BEFORE-row guard the statement trigger then overwrites would be a
+    /// control that reads green and does nothing. So the `WITH CHECK` this
+    /// INSERT must satisfy is about the CLAIM's owning group, not the
+    /// challenger's, and declaring the columns here would change nothing.
+    /// A challenger stamped with its own writable set can therefore write a
+    /// challenge against a claim in a group it can write, and is refused for one
+    /// it cannot. That refusal is a policy question about who may object to
+    /// whose claim; it is recorded rather than worked around here.
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         challenger_id: Option<Uuid>,
         challenge_type: &str,
@@ -55,37 +83,54 @@ impl ChallengeRepository {
         .bind(challenger_id)
         .bind(challenge_type)
         .bind(explanation)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(id)
     }
 
     /// Get a single challenge by ID.
-    pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<ChallengeRow>, sqlx::Error> {
-        sqlx::query_as::<_, ChallengeRow>(
+    ///
+    /// `challenges.explanation` is free prose about a claim's weaknesses and is
+    /// the surface plan §2.4 / §4.9 #23 flags: it leaks the substance of a claim
+    /// the caller may not be able to read. `challenges` carries its own tenancy
+    /// columns (migration 062), so the predicate applies to the row directly.
+    pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<ChallengeRow>, sqlx::Error> {
+        let sql = viewer.splice(
             "SELECT id, claim_id, challenger_id, challenge_type, explanation, state, \
                     resolved_by, resolution_details, resolved_at, created_at \
-             FROM challenges WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+             FROM challenges WHERE id = $1 /* {VISIBILITY:challenges} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ChallengeRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(executor).await
     }
 
     /// List all challenges for a given claim.
-    pub async fn list_for_claim(
-        pool: &PgPool,
+    pub async fn list_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<ChallengeRow>, sqlx::Error> {
-        sqlx::query_as::<_, ChallengeRow>(
+        let sql = viewer.splice(
             "SELECT id, claim_id, challenger_id, challenge_type, explanation, state, \
                     resolved_by, resolution_details, resolved_at, created_at \
              FROM challenges WHERE claim_id = $1 \
+             /* {VISIBILITY:challenges} */ \
              ORDER BY created_at DESC",
-        )
-        .bind(claim_id)
-        .fetch_all(pool)
-        .await
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ChallengeRow>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(executor).await
     }
 
     /// Update challenge state (e.g. pending -> accepted/rejected).
@@ -144,8 +189,11 @@ impl ChallengeRepository {
     }
 
     /// Query gap-originated challenges with optional filters.
-    pub async fn get_gap_challenges(
-        pool: &PgPool,
+    /// The change inventory expected this to join `claims`; it does not — the
+    /// query reads `challenges` alone. One alias, one marker.
+    pub async fn get_gap_challenges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         gap_type: Option<&str>,
         state: Option<&str>,
         limit: i64,
@@ -155,16 +203,21 @@ impl ChallengeRepository {
             .unwrap_or_else(|| "epistemic_gap_%".into());
         let state_filter = state.unwrap_or("%");
 
-        sqlx::query_as::<_, GapChallengeRow>(
+        let sql = viewer.splice(
             "SELECT id, claim_id, challenge_type, explanation, state, created_at \
              FROM challenges \
              WHERE challenge_type LIKE $1 AND state LIKE $2 \
+             /* {VISIBILITY:challenges} */ \
              ORDER BY created_at DESC LIMIT $3",
-        )
-        .bind(&type_filter)
-        .bind(state_filter)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
+            4,
+        );
+        let mut q = sqlx::query_as::<_, GapChallengeRow>(&sql)
+            .bind(&type_filter)
+            .bind(state_filter)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(executor).await
     }
 }

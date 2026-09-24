@@ -30,12 +30,42 @@ use uuid::Uuid;
 #[cfg(feature = "db")]
 use sqlx::Row;
 
+// PR-29: the two theme statements now go STRAIGHT to
+// `epigraph_db::ClaimThemeRepository` rather than through the
+// `epigraph_engine::diverse_retrieval` wrappers this file used to call.
+//
+// The wrappers take `pool: &PgPool` and are not generic, so keeping them would
+// have meant widening them — and `visibility_lint.rs::repos_dir()` is a
+// NON-RECURSIVE `read_dir` over `epigraph-db/src/repos`, so a connection-taking
+// form authored in `epigraph-engine` is invisible to BOTH connection-shape
+// lints. Calling the repo directly keeps every widened form inside the scan
+// root where a control can see it, and matches CLAUDE.md's "routes call the repo
+// layer" rule.
+//
+// What the wrappers add is `db_error_to_sqlx`, so pre-refactor callers keep
+// `sqlx::Error`. This route maps either error type through
+// `format!("{e}")` into `ApiError::InternalError`, so the flattening is not
+// observable here. The one variant the wrapper reshapes that this route could
+// otherwise surface is `DbError::InvalidData { unsupported centroid_dim }`, and
+// `centroid_dim` is validated against `1536 | 3072` at the request boundary
+// below before either call runs, so it is unreachable.
+//
+// NEITHER WRAPPER IS DELETED, but they are no longer symmetrical and saying
+// otherwise would be a false claim about what this diff leaves behind:
+//
+// - `find_similar_themes_at_dim` KEEPS callers — `run_diverse_pipeline` (which
+//   is how MCP `recall_with_context` reaches it; MCP does not call the wrapper
+//   directly) and `epigraph-engine/tests/diverse_retrieval_integration.rs`.
+// - `candidates_in_themes_at_dim` is left with NO caller anywhere in the
+//   workspace, tests included, by this change. `run_diverse_pipeline` calls the
+//   `_since` sibling, and the only remaining mentions of the name are comments.
+//   It is retained rather than removed because deleting a `pub` engine API is
+//   not a conversion shard's call; recorded here so the next shard finds it
+//   already measured instead of re-deriving it.
 #[cfg(feature = "db")]
-use epigraph_engine::diverse_retrieval::{
-    candidates_in_themes_at_dim, find_similar_themes_at_dim, DEFAULT_CANDIDATE_POOL,
-    MAX_CANDIDATE_POOL,
-};
+use epigraph_engine::diverse_retrieval::{DEFAULT_CANDIDATE_POOL, MAX_CANDIDATE_POOL};
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
 
 // ============================================================================
@@ -432,10 +462,8 @@ fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
 ///   to `client_id`); the route is on the optional-bearer public router, so an
 ///   anonymous caller is `None` and sees only public claims' text.
 pub async fn semantic_search(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     #[allow(unused_variables)] State(state): State<AppState>,
-    #[allow(unused_variables)] auth_ctx: Option<
-        axum::Extension<crate::middleware::bearer::AuthContext>,
-    >,
     Json(request): Json<SemanticSearchRequest>,
 ) -> Result<Json<SemanticSearchResponse>, ApiError> {
     let start_time = std::time::Instant::now();
@@ -519,15 +547,12 @@ pub async fn semantic_search(
     // Execute semantic search with pgvector
     #[cfg(feature = "db")]
     {
-        // SECURITY (§2.6): derive the requester from the authenticated
-        // AuthContext, never from `request.agent_id` (that stays a plain
-        // author filter). Both result paths redact through it below.
-        let requester = auth_ctx
-            .as_ref()
-            .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-
         // Validate centroid_dim hint up front (only meaningful when diverse=true,
         // but reject obvious garbage values regardless so callers get a clear error).
+        //
+        // This gate is also what makes the direct `ClaimThemeRepository` calls
+        // below unable to surface `DbError::InvalidData` — see the import note
+        // at the top of this file.
         if let Some(dim) = request.centroid_dim {
             if dim != 1536 && dim != 3072 {
                 return Err(ApiError::ValidationError {
@@ -536,6 +561,73 @@ pub async fn semantic_search(
                 });
             }
         }
+
+        // ---- The one viewer-stamped connection every read below runs on ----
+        //
+        // PR-29, conversion shard 3 against
+        // `D-PR17-request-path-never-stamps-session-gucs`. All six of this
+        // handler's reads run on this handle: the `frac_3072` auto-detect, the
+        // theme lookup, the candidate pull, the full-row fetch, the graph
+        // neighbours, and the flat search. `read_as` and not `acquire_as`: the
+        // latter hard-refuses `EPIGRAPH_SESSION_GUC_MODE=transaction`, the
+        // pooler fallback `bin/server.rs` advertises to operators.
+        //
+        // ACQUIRED HERE, AND THE PLACEMENT IS FORCED rather than chosen. This
+        // handler has two success paths — the diverse `return Ok(...)` and the
+        // flat tail — and the diverse path FALLS THROUGH to the flat one when
+        // the corpus has no themes. Acquiring separately per path would put the
+        // fall-through shape on two connections and two transactions, which is
+        // precisely the property the conversion exists to establish. One acquire
+        // above the branch is the only shape that holds for all three request
+        // shapes.
+        //
+        // THE COST, STATED, AND IT DIFFERS BY REQUEST SHAPE — the earlier
+        // wording said `frac_3072` runs before the embedding call full stop,
+        // which is true only of `diverse=true`:
+        //
+        // - `diverse=true`: the `frac_3072` auto-detect runs on this handle
+        //   BEFORE the outbound embedding round trip and the remaining reads
+        //   after it, so the hoist costs nothing that path would not pay anyway.
+        // - `diverse=false`, THE DEFAULT AND MORE COMMON SHAPE: no statement at
+        //   all runs before `generate_query_embedding` in the flat tail, so the
+        //   handle is held idle across that network call. That is an
+        //   unconditional cost accepted for the fall-through property above, not
+        //   one forced by this path; `voids.rs::embedding_density` shows the
+        //   acquire-after-embed alternative, which is not available here without
+        //   splitting the acquire the fall-through requires be single.
+        //
+        // The pool it is held against is the API request pool, whose size is
+        // `epigraph_db::ScopedPoolOptions::default()` — cited rather than
+        // transcribed so a sizing change invalidates the citation instead of
+        // silently invalidating this comment. (An earlier revision wrote "8",
+        // which is the background JOB pool; see `bin/server.rs`'s connection
+        // budget.) Bounded regardless: at most six statements on one handle, no
+        // per-node loop, no unbounded N. `detect_voids` in `routes/voids.rs` is
+        // the shape in this shard that is NOT bounded; its own doc says so.
+        // This shard does NOT discharge
+        // `F-PR26-lineage-holds-one-connection-for-n-round-trips`.
+        //
+        // The validation returns above are deliberately NOT covered: they answer
+        // without touching the database, and hoisting the acquire over them
+        // would hold a pooled connection across every 400. Nothing in the gate
+        // enforces that ordering — read it as an observation, not an invariant.
+        //
+        // THE ERROR SHAPE IS PART OF THE TEMPLATE (see `routes/claims_query.rs`).
+        // `read_as`'s refusal reason is a paragraph of internal design prose
+        // aimed at whoever mis-built the `AppState`; `errors.rs` serialises
+        // `ApiError::InternalError { message }` verbatim into the response body,
+        // so it is logged in full and answered with an opaque message.
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "semantic_search",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
 
         // Step 2a: Diverse hierarchical retrieval path (theme-based + coverage selection)
         // When `diverse=true`, navigate themes first, then apply submodular selection.
@@ -565,7 +657,7 @@ pub async fn semantic_search(
                       / NULLIF(COUNT(*), 0)::float8 \
                   FROM claim_themes",
             )
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *read)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("centroid_dim auto-detect failed: {e}"),
@@ -623,8 +715,8 @@ pub async fn semantic_search(
             // the corpus has themes at all. If empty, fall through to
             // flat ANN (matching pre-helper behaviour); otherwise run
             // the shared pipeline.
-            let themes = find_similar_themes_at_dim(
-                &state.db_pool,
+            let themes = epigraph_db::ClaimThemeRepository::find_similar_themes_at_dim(
+                &mut *read,
                 &embedding_str,
                 max_themes,
                 centroid_dim_used,
@@ -642,13 +734,21 @@ pub async fn semantic_search(
                 // SQL shape as before, plus the level-filter knob for
                 // MCP. REST passes `paragraph_only=false` to preserve
                 // pre-helper behaviour.
-                let candidates = candidates_in_themes_at_dim(
-                    &state.db_pool,
+                //
+                // `claims_in_themes_at_dim_since(.., since = None)` is exactly
+                // what the `candidates_in_themes_at_dim` wrapper this file used
+                // to call delegates to — the wrapper's whole body is that call
+                // with `None`. Calling it directly removes a hop rather than
+                // changing behaviour.
+                let candidates = epigraph_db::ClaimThemeRepository::claims_in_themes_at_dim_since(
+                    &mut *read,
+                    &viewer,
                     &theme_ids,
                     &embedding_str,
                     candidate_pool,
                     centroid_dim_used,
                     /*paragraph_only=*/ false,
+                    /*since=*/ None,
                 )
                 .await
                 .map_err(|e| ApiError::InternalError {
@@ -677,6 +777,22 @@ pub async fn semantic_search(
                 let selected_claim_ids: Vec<Uuid> =
                     selected_rows.iter().map(|(id, _, _)| *id).collect();
 
+                // NOTE (PR-07): this statement is deliberately NOT viewer-
+                // spliced, and that is safe by derivation rather than by
+                // oversight. It is bounded by `WHERE c.id = ANY($2)` over
+                // `selected_claim_ids`, every element of which came out of
+                // `ClaimThemeRepository::claims_in_themes_at_dim_since` —
+                // which IS viewer-filtered, splicing `{VISIBILITY:c}` onto the
+                // joined `claims`. (PR-29 re-pointed this call off the
+                // `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`
+                // wrapper it used to name here; the wrapper's whole body was
+                // that same call with `since = None`, so the derivation is
+                // unchanged — only the callee's name is.) A
+                // second predicate here would be redundant. Do not "harden" it
+                // by adding a marker without also re-checking that derivation:
+                // if the source of `selected_claim_ids` ever changes, this
+                // needs a real predicate, not a marker.
+                //
                 // Fetch full claim data for the selected IDs (including CDST
                 // columns + theme_id and the latest cluster_id from
                 // claim_cluster_membership). #49: surface the partition
@@ -704,62 +820,51 @@ pub async fn semantic_search(
                 let full_rows = sqlx::query(&full_sql)
                     .bind(&embedding_str)
                     .bind(&selected_claim_ids)
-                    .fetch_all(&state.db_pool)
+                    .fetch_all(&mut *read)
                     .await
                     .map_err(|e| ApiError::InternalError {
                         message: format!("Claim fetch failed: {e}"),
                     })?;
 
-                // Fetch graph neighbors for all selected claims
-                let neighbor_sql = format!(
-                    r#"
-                    SELECT
-                        e.source_id, e.target_id, e.relationship,
-                        c.id as neighbor_id, left(c.content, 200) as content,
-                        c.truth_value, c.belief as nb_belief, c.plausibility as nb_plausibility,
-                        (1 - (c.{claim_embedding_col} <=> $1::vector))::float8 as similarity,
-                        CASE WHEN e.source_id = ANY($2) THEN 'outbound' ELSE 'inbound' END as direction
-                    FROM edges e
-                    JOIN claims c ON c.id = CASE WHEN e.source_id = ANY($2) THEN e.target_id ELSE e.source_id END
-                    WHERE (e.source_id = ANY($2) OR e.target_id = ANY($2))
-                      AND e.source_type = 'claim' AND e.target_type = 'claim'
-                      AND e.relationship IN ('CORROBORATES', 'supports', 'refines', 'continues_argument', 'contradicts')
-                    ORDER BY c.{claim_embedding_col} <=> $1::vector
-                    LIMIT 50
-                    "#
-                );
-                let neighbor_rows = sqlx::query(&neighbor_sql)
-                    .bind(&embedding_str)
-                    .bind(&selected_claim_ids)
-                    .fetch_all(&state.db_pool)
-                    .await
-                    .unwrap_or_default();
+                // Fetch graph neighbors for all selected claims.
+                //
+                // PR-07: this ran unfiltered inline. The neighbour ids are the
+                // FAR side of each edge — they are not in `selected_claim_ids`
+                // and were never viewer-checked — so 200 characters of
+                // arbitrary out-of-tenant claim content rode out attached to
+                // every result. The repo now splices the predicate onto the
+                // joined `claims`, dropping invisible neighbours entirely.
+                let neighbor_rows = epigraph_db::ClaimRepository::semantic_graph_neighbors(
+                    &mut *read,
+                    &viewer,
+                    claim_embedding_col,
+                    &embedding_str,
+                    &selected_claim_ids,
+                )
+                .await
+                .unwrap_or_default();
 
                 // Group neighbors by the selected claim they connect to
                 let mut neighbor_map: HashMap<Uuid, Vec<GraphNeighbor>> = HashMap::new();
-                for row in &neighbor_rows {
-                    let source_id: Uuid = row.get("source_id");
-                    let target_id: Uuid = row.get("target_id");
-                    let direction: String = row.get("direction");
-
+                for row in neighbor_rows {
                     // Determine which selected claim this neighbor connects to
-                    let parent_id = if selected_claim_ids.contains(&source_id) {
-                        source_id
+                    let parent_id = if selected_claim_ids.contains(&row.source_id) {
+                        row.source_id
                     } else {
-                        target_id
+                        row.target_id
                     };
 
                     let neighbor = GraphNeighbor {
-                        claim_id: row.get("neighbor_id"),
-                        statement: row.get::<String, _>("content"),
-                        similarity: row.get("similarity"),
+                        claim_id: row.neighbor_id,
+                        statement: row.content,
+                        similarity: row.similarity,
                         epistemic: EpistemicState::from_row(
-                            row.get("truth_value"),
-                            row.get("nb_belief"),
-                            row.get("nb_plausibility"),
+                            row.truth_value,
+                            row.nb_belief,
+                            row.nb_plausibility,
                         ),
-                        edge_type: row.get("relationship"),
-                        direction,
+                        edge_type: row.relationship,
+                        direction: row.direction,
                     };
 
                     neighbor_map.entry(parent_id).or_default().push(neighbor);
@@ -803,27 +908,10 @@ pub async fn semantic_search(
                 // Both `statement` fields are `claims.content`: the selected
                 // claim's, and the 200-char excerpt of each graph neighbour.
                 // One batch lookup covers the union.
-                let redact_targets: Vec<(Uuid, &mut String)> = results
-                    .iter_mut()
-                    .flat_map(|r| {
-                        let mut fields = vec![(r.claim_id, &mut r.statement)];
-                        if let Some(neighbors) = r.graph_neighbors.as_mut() {
-                            fields.extend(
-                                neighbors.iter_mut().map(|n| (n.claim_id, &mut n.statement)),
-                            );
-                        }
-                        fields
-                    })
-                    .collect();
-                crate::access_control::redact_claim_fields(
-                    &state.db_pool,
-                    requester,
-                    redact_targets,
-                )
-                .await;
-
                 let total = results.len() as u64;
                 let query_time_ms = start_time.elapsed().as_millis() as u64;
+
+                crate::routes::finish_scoped_read(read, "semantic_search").await?;
 
                 return Ok(Json(SemanticSearchResponse {
                     results,
@@ -832,7 +920,10 @@ pub async fn semantic_search(
                     centroid_dim_used: Some(centroid_dim_used),
                 }));
             }
-            // No themes yet — fall through to flat search below
+            // No themes yet — fall through to flat search below, ON THE SAME
+            // `read`. This fall-through is why the acquire is above the branch:
+            // the flat search this shape reaches must be the same stamped
+            // session the theme lookup ran on.
         }
 
         // Flat-path uses the legacy 1536d `claims.embedding` column directly,
@@ -841,65 +932,43 @@ pub async fn semantic_search(
         let query_embedding = generate_query_embedding(&state, query).await;
         let embedding_str = format_embedding_for_pgvector(&query_embedding);
 
-        // Step 2b: Flat pgvector similarity search (default path)
-        // Uses parameterized query to prevent SQL injection.
-        // The <=> operator computes cosine distance; we subtract from 1 to get similarity.
-        let rows = sqlx::query(
-            r#"
-            WITH query_vec AS (
-                SELECT $1::vector AS vec
-            )
-            SELECT
-                c.id as claim_id,
-                c.content as statement,
-                1 - (c.embedding <=> q.vec) as similarity,
-                c.truth_value,
-                c.belief,
-                c.plausibility,
-                c.agent_id,
-                c.trace_id,
-                c.labels[1] as claim_type,
-                c.created_at
-            FROM claims c, query_vec q
-            WHERE c.embedding IS NOT NULL
-              AND 1 - (c.embedding <=> q.vec) >= $2
-              AND ($3::text IS NULL OR $3 = ANY(c.labels))
-              AND ($4::timestamptz IS NULL OR c.created_at >= $4)
-              AND ($5::timestamptz IS NULL OR c.created_at <= $5)
-              AND ($6::uuid IS NULL OR c.agent_id = $6)
-            ORDER BY similarity DESC
-            LIMIT $7
-            "#,
+        // Step 2b: Flat pgvector similarity search (DEFAULT path)
+        //
+        // PR-07: this is reached whenever `diverse` is absent — i.e. the
+        // default request shape — and whenever `diverse=true` but the corpus
+        // has no themes. It ran unfiltered and returned `claims.content`, with
+        // no `check_content_access` pass behind it: an authenticated principal
+        // could submit an arbitrary probe vector and get other tenants' claim
+        // text back, ranked by relevance. The statement now lives in
+        // `ClaimRepository::semantic_search_flat` with the predicate spliced in.
+        let rows = epigraph_db::ClaimRepository::semantic_search_flat(
+            &mut *read,
+            &viewer,
+            &embedding_str,
+            min_similarity,
+            request.claim_type.as_deref(),
+            request.created_after,
+            request.created_before,
+            request.agent_id,
+            limit as i64,
         )
-        .bind(&embedding_str)
-        .bind(min_similarity)
-        .bind(request.claim_type.as_deref())
-        .bind(request.created_after)
-        .bind(request.created_before)
-        .bind(request.agent_id)
-        .bind(limit as i64)
-        .fetch_all(&state.db_pool)
         .await
         .map_err(|e| ApiError::InternalError {
-            message: format!("Database query failed: {}", e),
+            message: format!("Database query failed: {e}"),
         })?;
 
         // Step 3: Convert rows to response DTOs
-        let mut results: Vec<SemanticSearchResult> = rows
-            .iter()
+        let results: Vec<SemanticSearchResult> = rows
+            .into_iter()
             .map(|row| SemanticSearchResult {
-                claim_id: row.get("claim_id"),
-                statement: row.get("statement"),
-                similarity: row.get("similarity"),
-                epistemic: EpistemicState::from_row(
-                    row.get("truth_value"),
-                    row.get("belief"),
-                    row.get("plausibility"),
-                ),
-                agent_id: row.get("agent_id"),
-                trace_id: row.get("trace_id"),
-                claim_type: row.get("claim_type"),
-                created_at: row.get("created_at"),
+                claim_id: row.claim_id,
+                statement: row.statement,
+                similarity: row.similarity,
+                epistemic: EpistemicState::from_row(row.truth_value, row.belief, row.plausibility),
+                agent_id: row.agent_id,
+                trace_id: row.trace_id,
+                claim_type: row.claim_type,
+                created_at: row.created_at,
                 graph_neighbors: None,
                 theme_id: None,
                 cluster_id: None,
@@ -907,15 +976,10 @@ pub async fn semantic_search(
             .collect();
 
         // `statement` is `claims.content`; the flat path has no neighbours.
-        crate::access_control::redact_claim_fields(
-            &state.db_pool,
-            requester,
-            results.iter_mut().map(|r| (r.claim_id, &mut r.statement)),
-        )
-        .await;
-
         let total = results.len() as u64;
         let query_time_ms = start_time.elapsed().as_millis() as u64;
+
+        crate::routes::finish_scoped_read(read, "semantic_search").await?;
 
         Ok(Json(SemanticSearchResponse {
             results,
@@ -1156,37 +1220,40 @@ mod db_integration_tests {
     use super::*;
     use crate::state::{ApiConfig, AppState};
 
-    async fn try_test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(3)
-            .connect(&url)
+    /// Rebuild a connection URL for the database `pool` is connected to.
+    ///
+    /// `#[sqlx::test]` hands each arm a randomly-named private database but no
+    /// URL, and [`call_diverse_search`] needs one to build its `ScopedPool`.
+    /// Asking the database its own name and splicing that onto the ambient
+    /// `DATABASE_URL`'s authority is the same move
+    /// `tests/viewer_fixture.rs::database_url_for` makes; it is duplicated here
+    /// because this is an in-crate `#[cfg(test)]` module and cannot reach the
+    /// integration-test fixture.
+    ///
+    /// Without it the arms would seed the private database and the handler
+    /// would read the SHARED one -- a silent vacuous pass, which is strictly
+    /// worse than the flake being fixed.
+    async fn database_url_for(pool: &sqlx::PgPool) -> String {
+        let db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(pool)
             .await
-            .ok()?;
-        sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-        Some(pool)
-    }
-
-    macro_rules! test_pool_or_skip {
-        () => {{
-            match try_test_pool().await {
-                Some(p) => p,
-                None => {
-                    eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                    return;
-                }
-            }
-        }};
-    }
-
-    /// Wipe `claim_themes` and unassign all claims so each test starts with
-    /// a known empty theme table. Necessary because the DB is shared across
-    /// tests and prior k-means runs could otherwise leak themes.
-    async fn reset_themes(pool: &sqlx::PgPool) {
-        let _ = sqlx::query("UPDATE claims SET theme_id = NULL")
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM claim_themes").execute(pool).await;
+            .expect("current_database()");
+        let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        // Strip the query string before touching the path, or `?sslmode=require`
+        // would be mistaken for part of the database name.
+        let (authority, query) = match base.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (base.as_str(), None),
+        };
+        let prefix = authority
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("DATABASE_URL must carry a database path")
+            .0;
+        match query {
+            Some(q) => format!("{prefix}/{db}?{q}"),
+            None => format!("{prefix}/{db}"),
+        }
     }
 
     /// Insert a fresh agent for the test scope (returns its UUID).
@@ -1343,11 +1410,40 @@ mod db_integration_tests {
 
     /// Helper that invokes `semantic_search` with diverse mode on. Returns
     /// the parsed response or the raw `ApiError`.
+    ///
+    /// # Why this builds a `ScopedPool` and not `AppState::with_db`
+    ///
+    /// PR-29 moved `semantic_search`'s six reads onto `AppState::read_as`, and
+    /// `read_as` HARD-REFUSES a state whose `scoped` is `None` — that refusal is
+    /// the fail-closed behaviour the conversion exists to establish, not an
+    /// inconvenience to work around. `AppState::with_db` sets `scoped: None`, so
+    /// all three tests below would have failed against the converted handler,
+    /// and `diverse_search_rejects_when_3072d_centroids_missing` would have
+    /// failed QUIETLY: it asserts `ValidationError` and the `frac_3072` read
+    /// that precedes that rejection would have returned `InternalError` instead.
+    ///
+    /// These tests are about centroid-dimension selection, not tenancy, so they
+    /// want the cheapest state that satisfies `read_as`.
+    /// `AppState::with_scoped_pool` sets `db_pool = scoped.inner().clone()`,
+    /// which is the same connection posture they had before.
+    ///
+    /// The `DATABASE_URL` is read again rather than taken from `state.db_pool`
+    /// on purpose: `no_unscoped_pool.rs`'s scanner does not cut `#[cfg(test)]`
+    /// and its `SCAN_ROOT` is `crates/epigraph-api/src`, so a `state.db_pool` in
+    /// this helper would count as an unconverted site and silently break the
+    /// register this shard just lowered.
     async fn call_diverse_search(
         pool: sqlx::PgPool,
         centroid_dim: Option<u32>,
     ) -> Result<SemanticSearchResponse, ApiError> {
-        let state = AppState::with_db(pool, ApiConfig::default());
+        let viewer = epigraph_db::Viewer::resolve(&pool, uuid::Uuid::nil())
+            .await
+            .expect("resolve viewer");
+        let url = database_url_for(&pool).await;
+        let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
+            .await
+            .expect("connect a scoped pool");
+        let state = AppState::with_scoped_pool(scoped, ApiConfig::default());
         let request = SemanticSearchRequest {
             query: "test query for diverse search".to_string(),
             limit: Some(5),
@@ -1362,21 +1458,19 @@ mod db_integration_tests {
             centroid_dim,
             candidate_pool: None,
         };
-        // `None` auth_ctx = the anonymous caller the public router produces
-        // without a bearer; these fixtures use public claims, which redaction
-        // leaves untouched.
-        let response =
-            semantic_search(axum::extract::State(state), None, axum::Json(request)).await?;
+        let response = semantic_search(
+            crate::middleware::bearer::ViewerExtractor(viewer),
+            axum::extract::State(state),
+            axum::Json(request),
+        )
+        .await?;
         Ok(response.0)
     }
 
     /// Test 1 — explicit 3072d hint queries the 3072d centroids and
     /// surfaces `centroid_dim_used: 3072`.
-    #[tokio::test]
-    async fn diverse_search_uses_3072d_centroids_when_hinted() {
-        let pool = test_pool_or_skip!();
-        reset_themes(&pool).await;
-
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_uses_3072d_centroids_when_hinted(pool: sqlx::PgPool) {
         let agent = seed_agent(&pool, "diverse-3072-test").await;
         let theme_ids = seed_themes_with_3072_centroids(&pool, 5).await;
         let _claims = seed_claims_with_3072_embeddings(&pool, 50, &theme_ids, agent).await;
@@ -1398,11 +1492,8 @@ mod db_integration_tests {
 
     /// Test 2 — explicit 3072d hint with NO 3072d centroids populated:
     /// must reject with ValidationError on field=centroid_dim.
-    #[tokio::test]
-    async fn diverse_search_rejects_when_3072d_centroids_missing() {
-        let pool = test_pool_or_skip!();
-        reset_themes(&pool).await;
-
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_rejects_when_3072d_centroids_missing(pool: sqlx::PgPool) {
         let _ids = seed_themes_with_only_1536_centroids(&pool, 5).await;
 
         let result = call_diverse_search(pool.clone(), Some(3072)).await;
@@ -1420,11 +1511,8 @@ mod db_integration_tests {
 
     /// Test 3 — auto-detect: when ≥50% of themes have `centroid_3072`
     /// populated and the caller does NOT hint, the search picks 3072d.
-    #[tokio::test]
-    async fn diverse_search_auto_picks_3072d_when_majority_populated() {
-        let pool = test_pool_or_skip!();
-        reset_themes(&pool).await;
-
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_auto_picks_3072d_when_majority_populated(pool: sqlx::PgPool) {
         // 8/10 themes have centroid_3072 (80% > 50% threshold)
         let theme_ids = seed_themes_with_mixed_centroids(&pool, 10, 8).await;
         let agent = seed_agent(&pool, "diverse-auto-test").await;

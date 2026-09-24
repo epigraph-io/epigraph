@@ -52,6 +52,7 @@ fn not_found(workflow_id: Uuid) -> McpError {
 
 pub async fn find_workflow_hierarchical(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: FindWorkflowHierarchicalParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
@@ -136,7 +137,7 @@ pub async fn find_workflow_hierarchical(
 
         if resolve_to_latest {
             let resolved =
-                epigraph_db::WorkflowRepository::resolve_steps_to_heads(&server.pool, r.id)
+                epigraph_db::WorkflowRepository::resolve_steps_to_heads(&server.pool, viewer, r.id)
                     .await
                     .map_err(internal_error)?;
             entry["resolved_steps"] = serde_json::to_value(resolved).map_err(internal_error)?;
@@ -247,13 +248,27 @@ pub async fn do_report_hierarchical_outcome_via_pool(
         .map_err(internal_error)?;
 
     // 4. Resolve step_index → step_claim_id via this workflow's `executes`
-    //    edges, restricted to level=2 (steps), in plan/insertion order.
+    //    edges, restricted to level=2 (steps), in PLAN order.
+    //
+    //    The leading key is the `plan_index` ordinal the ingest executor records
+    //    on each `executes` edge — the same key `resolve_steps_to_heads` uses, so
+    //    "step N" means one step everywhere. `e.created_at` is only the fallback
+    //    for edges written before the ordinal existed (and for `add_step`'s,
+    //    which carry none). It CANNOT be the primary key any more: the executor
+    //    writes a whole plan in one transaction, `NOW()` is transaction-start
+    //    time, so every edge ties and `c.id` — a content-derived UUID — decided
+    //    the order. MEASURED on the real binary as `epigraph_app`, 6 steps
+    //    reported 0..5: 2 attached to the right step claim, 4 to the wrong one,
+    //    tool result `isError: false`.
     let step_claim_rows: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT c.id \
          FROM edges e \
          JOIN claims c ON c.id = e.target_id \
          WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
-         ORDER BY e.created_at ASC, c.id ASC",
+         ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                       THEN (e.properties->>'plan_index')::int \
+                       ELSE 2147483647 END, \
+                  e.created_at ASC, c.id ASC",
     )
     .bind(workflow_id)
     .fetch_all(pool)
@@ -361,7 +376,15 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_updates_counters_and_writes_step_rows(pool: sqlx::PgPool) {
         let ext = extraction("test-outcome-counters");
-        let ingest = do_ingest_workflow_via_pool(&pool, &ext).await.unwrap();
+        let ingest = do_ingest_workflow_via_pool(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &ext,
+        )
+        .await
+        .unwrap();
         let workflow_id = Uuid::parse_str(&ingest.workflow_id).unwrap();
 
         let steps = vec![

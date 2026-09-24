@@ -194,19 +194,44 @@ impl EgoRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any of the per-table queries fails.
-    pub async fn hydrate(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<EgoEntity>, DbError> {
+    /// Hydrate ego-graph node ids into entities, reading `claims` through the
+    /// caller's [`Viewer`].
+    ///
+    /// The viewer is NOT optional and NOT a post-filter: this projects
+    /// `claims.content`, so a claim the viewer may not read must never be
+    /// returned at all. The `/* {VISIBILITY:c} */` splice does that in SQL, so an
+    /// invisible node simply does not come back and the caller renders the ego
+    /// graph without it — absent, not blanked. Before the redaction model was
+    /// removed, this returned every row and the API layer overwrote the text
+    /// afterwards; that post-pass no longer exists.
+    ///
+    /// `agents` are not filtered: an agent row carries no claim content, and the
+    /// ids reaching here already survived the edge walk.
+    pub async fn hydrate(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<EgoEntity>, DbError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let mut out: Vec<EgoEntity> = Vec::new();
 
-        let claims: Vec<ClaimHydrationRow> = sqlx::query_as(
-            "SELECT id, content, truth_value, pignistic_prob, labels, is_current \
-             FROM claims WHERE id = ANY($1)",
-        )
-        .bind(ids)
-        .fetch_all(pool)
-        .await?;
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.content, c.truth_value, c.pignistic_prob, c.labels,
+                   c.is_current
+            FROM claims c
+            WHERE c.id = ANY($1)
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ClaimHydrationRow>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let claims: Vec<ClaimHydrationRow> = q.fetch_all(pool).await?;
         for row in claims {
             out.push(EgoEntity {
                 id: row.id,

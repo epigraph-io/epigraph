@@ -8,6 +8,43 @@
 //! - `POST /api/v1/bp/propagate`          - Run loopy belief propagation
 //! - `POST /api/v1/graph/compose`         - Compose two subgraphs via decorated cospans
 //! - `GET  /api/v1/claims/:id/belief-at`  - Reconstruct belief at a past timestamp
+//!
+//! # Tenancy: 5 of this file's 15 raw-pool sites are converted, and 10 are not
+//!
+//! Conversion shard 4 against `D-PR17-request-path-never-stamps-session-gucs`
+//! (`epigraph-db/tests/no_unscoped_pool.rs`). Unlike `routes/belief.rs`, the
+//! sites here are PER-STATEMENT rather than one alias per handler, so the file
+//! can end in a state `belief.rs` cannot: a partially-converted handler. It does
+//! not, and the reasons are recorded rather than left to inference.
+//!
+//! Converted (four read-only handlers, five sites): `sheaf_consistency`,
+//! `sheaf_cohomology`, `sheaf_reconcile` and `belief_at_time` each acquire ONE
+//! viewer-stamped connection through [`AppState::read_as`] and run every
+//! statement on it. `sheaf_reconcile` is a POST and is still a read — it returns
+//! computed proposals and persists nothing.
+//!
+//! Not converted, and NOT merely deferred:
+//!
+//! * `propagate_beliefs` (7 sites) writes through two of them. Converting only
+//!   its reads is the shape no shard in this series has reviewed — every prior
+//!   shard converted whole handlers — and a half-converted handler here would
+//!   change its own output silently and with a 200, so it is whole-handler work
+//!   or none. Converting the writes too is worse — `read_as` is
+//!   documented read-only, `ScopedRead::commit` is not called by `Drop`, and
+//!   under `SessionGucMode::Transaction` a write routed through it is rolled
+//!   back while still type-checking, because `ScopedRead` is
+//!   `DerefMut<Target = PgConnection>`. Its write side belongs to
+//!   `ScopedPool::begin_as` plus 16b's `Viewer::splice_write`, as a whole-handler
+//!   change with its own evidence. A separate question raised while classifying
+//!   this handler is registered as `F-SHARD4-A2`; analysis held outside this
+//!   repository, and its owner is NOT the conversion-shard series — see the
+//!   entry's `assigned` field.
+//! * `compose_subgraphs` (3 sites) is registered as `F-SHARD4-A1`; analysis
+//!   held outside this repository. Owner: the conversion-shard series. Two of
+//!   its three sites reach the database through [`extract_neighborhood`], which
+//!   takes a `&PgPool` PARAMETER — a shape `no_unscoped_pool.rs` already
+//!   enumerates as invisible to its `.db_pool` needle — so a change that moved
+//!   this file's counter would not by itself settle the entry.
 
 #[cfg(feature = "db")]
 use axum::{
@@ -23,6 +60,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 
@@ -82,14 +120,28 @@ pub struct BeliefAtQuery {
 /// GET /api/v1/sheaf/consistency - Check sheaf consistency across claims.
 #[cfg(feature = "db")]
 pub async fn sheaf_consistency(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<SheafConsistencyQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let min_radius = params.min_radius.unwrap_or(0.1);
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "sheaf_consistency",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows = epigraph_db::SheafRepository::get_claim_neighbor_betp_pairs(
-        &state.db_pool,
+        &mut *read,
+        &viewer,
         params.frame_id,
         limit * 10, // fetch more rows since multiple neighbors per claim
     )
@@ -97,6 +149,8 @@ pub async fn sheaf_consistency(
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to fetch sheaf data: {e}"),
     })?;
+
+    crate::routes::finish_scoped_read(read, "sheaf_consistency").await?;
 
     // Group rows by claim_id → (local_interval, neighbors)
     // neighbor entry: (EpistemicInterval, RestrictionKind)
@@ -210,17 +264,35 @@ pub async fn sheaf_consistency(
 /// GET /api/v1/sheaf/cohomology - Compute sheaf cohomology (global inconsistency).
 #[cfg(feature = "db")]
 pub async fn sheaf_cohomology(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<SheafCohomologyQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let threshold = params.threshold.unwrap_or(0.05);
 
-    let edge_pairs =
-        epigraph_db::SheafRepository::get_epistemic_edge_pairs(&state.db_pool, params.frame_id)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to fetch edge pairs: {e}"),
-            })?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "sheaf_cohomology",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let edge_pairs = epigraph_db::SheafRepository::get_epistemic_edge_pairs(
+        &mut *read,
+        &viewer,
+        params.frame_id,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to fetch edge pairs: {e}"),
+    })?;
+
+    crate::routes::finish_scoped_read(read, "sheaf_cohomology").await?;
 
     let profile = epigraph_engine::sheaf::RestrictionProfile::scientific();
 
@@ -309,17 +381,37 @@ pub async fn sheaf_cohomology(
 /// POST /api/v1/sheaf/reconcile - Reconcile sheaf obstructions via interval BP.
 #[cfg(feature = "db")]
 pub async fn sheaf_reconcile(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<ReconcileRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let threshold = 0.05_f64; // Use default cohomology threshold to discover obstructions.
 
     // Step 1: fetch all epistemic edges and build CDST obstructions.
-    let edge_pairs = epigraph_db::SheafRepository::get_epistemic_edge_pairs(&state.db_pool, None)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to fetch edge pairs for reconciliation: {e}"),
-        })?;
+    //
+    // A POST that writes nothing: reconciliation is computed in
+    // `epigraph_engine::reconcile` and returned as proposals, so this handler's
+    // one statement is a read and `read_as` is the right mechanism for it.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "sheaf_reconcile",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let edge_pairs =
+        epigraph_db::SheafRepository::get_epistemic_edge_pairs(&mut *read, &viewer, None)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to fetch edge pairs for reconciliation: {e}"),
+            })?;
+
+    crate::routes::finish_scoped_read(read, "sheaf_reconcile").await?;
 
     let profile = match request.profile.as_deref() {
         Some("regulatory") => epigraph_engine::sheaf::RestrictionProfile::regulatory(),
@@ -466,6 +558,7 @@ pub async fn sheaf_reconcile(
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
 #[cfg(feature = "db")]
 pub async fn propagate_beliefs(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<PropagateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -544,10 +637,13 @@ pub async fn propagate_beliefs(
         "scalar" | "interval" => false,
         _ => {
             // Auto: load mass functions and check coverage
-            let mf_rows =
-                epigraph_db::MassFunctionRepository::get_for_claims(&state.db_pool, &all_var_ids)
-                    .await
-                    .unwrap_or_default();
+            let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
+                &state.db_pool,
+                &viewer,
+                &all_var_ids,
+            )
+            .await
+            .unwrap_or_default();
             let claims_with_mf: std::collections::HashSet<Uuid> =
                 mf_rows.iter().map(|r| r.claim_id).collect();
             !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len()
@@ -555,12 +651,15 @@ pub async fn propagate_beliefs(
     };
 
     if use_cdst {
-        let mf_rows =
-            epigraph_db::MassFunctionRepository::get_for_claims(&state.db_pool, &all_var_ids)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to load mass functions: {e}"),
-                })?;
+        let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
+            &state.db_pool,
+            &viewer,
+            &all_var_ids,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to load mass functions: {e}"),
+        })?;
 
         // Combine multiple mass functions per claim via adaptive combination
         // (a claim may have evidence from multiple sources/agents)
@@ -781,12 +880,25 @@ pub async fn compose_subgraphs(
 /// GET /api/v1/claims/:id/belief-at - Reconstruct belief at a past timestamp.
 #[cfg(feature = "db")]
 pub async fn belief_at_time(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<BeliefAtQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "belief_at_time",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Verify claim exists
-    let _claim = epigraph_db::ClaimRepository::get_by_id(&state.db_pool, claim_id.into())
+    let _claim = epigraph_db::ClaimRepository::get_by_id(&mut *read, &viewer, claim_id.into())
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Failed to fetch claim: {e}"),
@@ -796,21 +908,27 @@ pub async fn belief_at_time(
             id: claim_id.to_string(),
         })?;
 
-    // Fetch all evidence up to the given timestamp
-    let evidence_rows: Vec<EvidenceAtRow> = sqlx::query_as(
-        "SELECT e.id, e.evidence_type, e.properties, e.created_at \
-         FROM evidence e \
-         JOIN edges ed ON ed.source_id = e.id AND ed.target_type = 'claim' AND ed.target_id = $1 \
-         WHERE e.created_at <= $2 \
-         ORDER BY e.created_at ASC",
+    // Fetch all evidence up to the given timestamp.
+    //
+    // PR-07 follow-up: this ran inline and unfiltered while the handler held a
+    // Viewer it had already spent on the existence check above. `evidence` and
+    // `edges` are both tier_a in migration 062, so both are filterable; the
+    // repo function now splices a predicate onto each. The exposure was an
+    // inference oracle rather than raw text — `evidence_count` plus a truth
+    // value replayed from `properties->confidence` — but it was gated only by
+    // the parent claim's visibility, not the evidence's own.
+    let evidence_rows = epigraph_db::EvidenceRepository::provided_for_claim_as_of(
+        &mut *read,
+        &viewer,
+        claim_id,
+        params.as_of,
     )
-    .bind(claim_id)
-    .bind(params.as_of)
-    .fetch_all(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to fetch evidence: {e}"),
     })?;
+
+    crate::routes::finish_scoped_read(read, "belief_at_time").await?;
 
     // Replay evidence through Bayesian updater
     // TODO: migrate to CDST pignistic probability (BayesianUpdater is deprecated)
@@ -870,17 +988,9 @@ struct FactorRow {
     description: Option<String>,
 }
 
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct EvidenceAtRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    #[allow(dead_code)]
-    evidence_type: String,
-    properties: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    created_at: chrono::DateTime<chrono::Utc>,
-}
+// `EvidenceAtRow` was deleted with the inline evidence read in
+// `belief_at_time`; its replacement is `epigraph_db::EvidenceAtTimeRow`, whose
+// query carries `/* {VISIBILITY:e} */` and `/* {VISIBILITY:ed} */`.
 
 // ── Internal helpers ──
 

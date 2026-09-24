@@ -26,8 +26,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::access_control::{batch_content_access, ContentAccess};
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 
 /// Default traversal depth when `max_depth` is absent, matching MCP
@@ -104,18 +104,12 @@ fn parse_relationships(raw: Option<&str>) -> Option<Vec<String>> {
 
 /// `GET /api/v1/claims/:id/provenance-chain`
 pub async fn claim_provenance_chain(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<ProvenanceChainQuery>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<ProvenanceChainResponse>, ApiError> {
     let pool = &state.db_pool;
-
-    // SECURITY: the requester comes from the validated bearer only; this route
-    // takes no `agent_id` query parameter precisely because it would be spoofable.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     let max_depth = params
         .max_depth
@@ -125,6 +119,7 @@ pub async fn claim_provenance_chain(
 
     let chain = epigraph_db::ProvenanceChainRepository::chain(
         pool,
+        &viewer,
         claim_id,
         max_depth,
         relationships.as_deref(),
@@ -140,33 +135,21 @@ pub async fn claim_provenance_chain(
         });
     }
 
-    let node_ids: Vec<Uuid> = chain.nodes.iter().map(|n| n.id).collect();
-    let access = batch_content_access(pool, &node_ids, requester).await;
-
     let nodes = chain
         .nodes
         .into_iter()
-        .map(|n| {
-            // An id missing from the map would be a bug in the batch check;
-            // treat it the way the check itself fails — closed.
-            let redacted = access
-                .get(&n.id)
-                .copied()
-                .unwrap_or(ContentAccess::Redacted)
-                == ContentAccess::Redacted;
-            let mut content = n.content;
-            if redacted {
-                crate::access_control::redact_claim_content(&mut content);
-            }
-            ChainNode {
-                id: n.id,
-                content,
-                truth_value: n.truth_value,
-                labels: n.labels,
-                is_current: n.is_current,
-                depth: n.depth,
-                redacted,
-            }
+        .map(|n| ChainNode {
+            id: n.id,
+            content: n.content,
+            truth_value: n.truth_value,
+            labels: n.labels,
+            is_current: n.is_current,
+            depth: n.depth,
+            // Always false now. `ProvenanceChainRepository::chain` is read as the
+            // caller's `Viewer`, so a node the viewer may not read is ABSENT from
+            // `chain.nodes` rather than present-and-blanked. The field is kept so
+            // the response shape does not change for existing clients.
+            redacted: false,
         })
         .collect();
 

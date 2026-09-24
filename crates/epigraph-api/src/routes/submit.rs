@@ -34,6 +34,7 @@ use epigraph_crypto::ContentHasher;
 use epigraph_events::EpiGraphEvent;
 
 // Database-related imports (only when db feature is enabled)
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use epigraph_core::{EvidenceId, EvidenceType, Methodology, TraceInput};
 #[cfg(feature = "db")]
@@ -416,6 +417,36 @@ async fn validate_packet(
         ));
     }
 
+    // 1b-ii. Reject labels carrying an unexpanded shell variable.
+    // `packet.claim.labels` is caller-supplied and is written by a raw
+    // `UPDATE claims SET labels` in `submit_packet`, NOT through
+    // `ClaimRepository`, so it does not inherit the repo-layer guard.
+    //
+    // Gated on `db` because `epigraph-db` is an optional dependency
+    // (`db = ["dep:epigraph-db", ...]`) while `validate_packet` itself is not
+    // feature-gated, so an unconditional reference here breaks the
+    // `--no-default-features` variant that CI checks. Gating loses nothing: the
+    // write this guard protects — `submit_packet`'s raw `UPDATE claims SET
+    // labels` — is itself `#[cfg(feature = "db")]`, so without `db` there is no
+    // persistence path for an unexpanded label to reach.
+    #[cfg(feature = "db")]
+    {
+        if let Err(e) = epigraph_db::reject_unexpanded_labels(&packet.claim.labels) {
+            let reason = match e {
+                epigraph_db::DbError::InvalidData { reason } => reason,
+                other => other.to_string(),
+            };
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ErrorResponse::with_details(
+                    "ValidationError",
+                    reason,
+                    serde_json::json!({ "field": "claim.labels" }),
+                ),
+            ));
+        }
+    }
+
     // 1c. Validate idempotency key length (DoS prevention)
     if let Some(ref key) = packet.claim.idempotency_key {
         if key.len() > MAX_IDEMPOTENCY_KEY_LENGTH {
@@ -686,7 +717,24 @@ async fn validate_packet(
     }
 
     // 7. Validate signature (if required)
-    if state.config.require_signatures {
+    //
+    // DELIBERATE: the six 401s in this block are raw
+    // `(StatusCode::UNAUTHORIZED, Json(ErrorResponse))` tuples and carry NO
+    // `WWW-Authenticate` challenge, unlike every 401 `ApiError` produces.
+    //
+    // PR-03's acceptance asked for "the challenge header on every 401 shape",
+    // and this is the exception, recorded rather than left implicit. An RFC
+    // 6750 challenge means *"your bearer credential is the problem; obtain a
+    // new one and retry"*. Here the bearer credential was already accepted by
+    // `bearer_auth_middleware` several layers out; what failed is the Ed25519
+    // signature over the PAYLOAD, a different mechanism at a different layer
+    // keyed to a different secret. Telling that client to re-mint its OAuth
+    // token would send it round a loop that cannot terminate — the packet
+    // would still be unsigned.
+    //
+    // (RFC 6750 §3 scopes the challenge to requests that fail *bearer* token
+    // authentication, so omitting it here is conformant, not a shortcut.)
+    if state.config.require_packet_signatures {
         // Validate signature format (128 hex chars for Ed25519)
         if packet.signature.len() != 128 {
             return Err((
@@ -718,26 +766,42 @@ async fn validate_packet(
         //
         // When the `db` feature is disabled, we have no public-key store to
         // verify against, so we fail closed: any request on the
-        // require_signatures path is rejected. Builds with `db` enabled
+        // require_packet_signatures path is rejected. Builds with `db` enabled
         // perform the real Ed25519 verification below.
         #[cfg(feature = "db")]
         {
+            // `AgentRepository::public_key_if_signer` filters
+            // `key_kind = 'ed25519'`, so the BLAKE3 placeholder keys that
+            // `ensure_for_client` writes for keyless OAuth principals can never
+            // reach the verifier. They are not forgeable (nobody knows a private
+            // key for a hash output), but they are indistinguishable from real
+            // keys to any reader that does not filter — and the SQL belongs in
+            // the repo layer regardless (CLAUDE.md).
             let agent_id: Uuid = packet.claim.agent_id;
-            let pub_key_row: Option<(Vec<u8>,)> =
-                sqlx::query_as("SELECT public_key FROM agents WHERE id = $1")
-                    .bind(agent_id)
-                    .fetch_optional(&state.db_pool)
-                    .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            ErrorResponse::with_details(
-                                "InternalError",
-                                "Failed to look up agent public key",
-                                serde_json::json!({ "error": e.to_string() }),
-                            ),
-                        )
-                    })?;
+            let mut conn = state.db_pool.acquire().await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::with_details(
+                        "InternalError",
+                        "Failed to acquire a database connection",
+                        serde_json::json!({ "error": e.to_string() }),
+                    ),
+                )
+            })?;
+            let pub_key_row = epigraph_db::repos::agent::AgentRepository::public_key_if_signer(
+                &mut conn, agent_id,
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::with_details(
+                        "InternalError",
+                        "Failed to look up agent public key",
+                        serde_json::json!({ "error": e.to_string() }),
+                    ),
+                )
+            })?;
 
             let pub_key_bytes: [u8; 32] = pub_key_row
                 .ok_or_else(|| {
@@ -745,12 +809,11 @@ async fn validate_packet(
                         StatusCode::UNAUTHORIZED,
                         ErrorResponse::with_details(
                             "SignatureError",
-                            "Agent not registered",
+                            "Agent not registered, or is not an Ed25519 signer",
                             serde_json::json!({ "field": "claim.agent_id" }),
                         ),
                     )
                 })?
-                .0
                 .try_into()
                 .map_err(|_| {
                     (
@@ -1002,9 +1065,45 @@ struct PersistOutcome {
     evidence_ids: Vec<EvidenceId>,
 }
 
+/// Map a failure to resolve the packet author's owner group.
+///
+/// Migration 105's two refusals (`DbError::is_personal_group_refusal`: the
+/// author's personal membership is REVOKED, or its did_key is squatted) are a
+/// DENIAL, not a server fault: 403, as on every other surface that reaches the
+/// definer (`errors.rs`'s `From<DbError>`). The function's text names the agent
+/// and the group, so it is LOGGED and kept out of the body, as the
+/// `From<DbError>` arm does too. This route builds its own `(StatusCode,
+/// ErrorResponse)` pairs, so it needs its own arm; before it, a revoked author
+/// got a 500 whose body carried both ids.
+#[cfg(feature = "db")]
+fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) {
+    if e.is_personal_group_refusal() {
+        tracing::warn!(
+            detail = %e,
+            "submit_packet refused: the author's personal group cannot own the claim"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            ErrorResponse::new(
+                "Forbidden",
+                "the author's personal-group membership is revoked, or its personal group is not \
+                 usable; restoring it is an operator action. Nothing was written.",
+            ),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorResponse::new(
+            "DatabaseError",
+            format!("Failed to resolve the author's tenancy: {e}"),
+        ),
+    )
+}
+
 #[cfg(feature = "db")]
 async fn persist_packet(
     pool: &epigraph_db::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     packet: &EpistemicPacket,
     claim_id: ClaimId,
     trace_id: TraceId,
@@ -1076,14 +1175,23 @@ async fn persist_packet(
         now,
     );
 
-    let (persisted, was_created) = epigraph_db::ClaimRepository::create_or_get(&mut tx, &claim)
+    // Tenancy declaration (PR-16), resolved from the packet's author inside
+    // the same transaction as the insert. `SubmitPacket` carries no visibility
+    // field; a signed packet's author is the principal, and its own personal
+    // group is the only owner this surface can name without inventing one.
+    let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut tx, agent_id.into())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
-            )
-        })?;
+        .map_err(author_tenancy_error)?;
+
+    let (persisted, was_created) =
+        epigraph_db::ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
+                )
+            })?;
     let canonical_id = persisted.id;
     // All dependent rows hang off the canonical claim id, not the
     // pre-generated one (which differs on a duplicate submit).
@@ -1373,7 +1481,7 @@ async fn persist_packet(
     let dedup_trace_id = if was_created {
         None
     } else {
-        let existing = epigraph_db::ClaimRepository::get_by_id(pool, canonical_id)
+        let existing = epigraph_db::ClaimRepository::get_by_id(pool, viewer, canonical_id)
             .await
             .map_err(|e| {
                 (
@@ -1455,6 +1563,7 @@ async fn persist_packet(
 /// - 401 Unauthorized: Invalid signature (when signatures required)
 /// - 201 Created: Success
 pub async fn submit_packet(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     payload: Result<Json<EpistemicPacket>, JsonRejection>,
 ) -> Response {
@@ -1541,6 +1650,7 @@ pub async fn submit_packet(
 
         match persist_packet(
             &state.db_pool,
+            &viewer,
             &packet,
             domain_claim_id,
             domain_trace_id,
@@ -1573,10 +1683,15 @@ pub async fn submit_packet(
         }
     };
     // Without the db feature there is no persistence step; the response simply
-    // echoes the pre-generated ids and is never a duplicate.
+    // echoes the pre-generated ids and is never a duplicate. The viewer is
+    // still REQUIRED to reach this handler (`ViewerExtractor` enforces the same
+    // two 401 branches in both builds); there is simply no repo read to thread
+    // it into here.
     #[cfg(not(feature = "db"))]
-    let (was_duplicate, response_trace_id, response_evidence_ids) =
-        (false, Some(trace_id), evidence_ids.clone());
+    let (was_duplicate, response_trace_id, response_evidence_ids) = {
+        let _ = &viewer;
+        (false, Some(trace_id), evidence_ids.clone())
+    };
 
     // 6. Create the claim object and register it for propagation
     //
@@ -2006,7 +2121,7 @@ mod event_tests {
     #[tokio::test]
     async fn test_submit_packet_publishes_claim_submitted_event() {
         let state = AppState::new(ApiConfig {
-            require_signatures: false,
+            require_packet_signatures: false,
             ..ApiConfig::default()
         });
 
@@ -2040,7 +2155,7 @@ mod event_tests {
     #[tokio::test]
     async fn test_submit_packet_no_event_on_validation_failure() {
         let state = AppState::new(ApiConfig {
-            require_signatures: false,
+            require_packet_signatures: false,
             ..ApiConfig::default()
         });
 
@@ -2083,8 +2198,8 @@ mod event_tests {
     }
 
     /// Test that submitting a packet without signature headers through the full
-    /// router (which includes the `require_signature` middleware) returns 401
-    /// when `require_signatures` is enabled.
+    /// router (which layers `bearer_auth_middleware` on `protected`) returns 401
+    /// when `require_packet_signatures` is enabled.
     ///
     /// This exercises the complete middleware stack: rate limiter -> signature
     /// verification -> handler, verifying that unauthenticated write requests
@@ -2092,7 +2207,7 @@ mod event_tests {
     #[tokio::test]
     async fn test_submit_without_signature_headers_returns_401_via_full_router() {
         let state = AppState::new(ApiConfig {
-            require_signatures: true,
+            require_packet_signatures: true,
             ..ApiConfig::default()
         });
         let router = crate::routes::create_router(state);
@@ -2122,6 +2237,7 @@ mod event_tests {
         let state = AppState::new(ApiConfig::default());
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let request = Request::builder()
@@ -2147,6 +2263,7 @@ mod event_tests {
         let state = AppState::new(ApiConfig::default());
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         // Valid JSON, but missing required fields (no reasoning_trace, no signature)
@@ -2176,12 +2293,13 @@ mod event_tests {
     #[tokio::test]
     async fn test_submit_packet_with_figure_evidence() {
         let state = AppState::new(ApiConfig {
-            require_signatures: false,
+            require_packet_signatures: false,
             ..ApiConfig::default()
         });
 
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let raw_content = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk";
@@ -2232,6 +2350,28 @@ mod event_tests {
 
 #[cfg(all(test, feature = "db"))]
 mod signature_verification_tests {
+
+    /// PR-06: `ViewerExtractor` requires an `AuthContext` on the request, which
+    /// the bearer middleware installs in production. Test routers built from a
+    /// bare `Router::new()` carry none, so they 401 before reaching the handler.
+    fn test_auth() -> crate::middleware::bearer::AuthContext {
+        let id = uuid::Uuid::new_v4();
+        crate::middleware::bearer::AuthContext {
+            client_id: id,
+            agent_id: Some(id),
+            owner_id: Some(id),
+            client_type: crate::middleware::bearer::ClientType::Service,
+            scopes: vec![
+                "claims:read".to_string(),
+                "claims:write".to_string(),
+                "edges:read".to_string(),
+                "edges:write".to_string(),
+                "workflows:read".to_string(),
+                "workflows:write".to_string(),
+            ],
+            jti: uuid::Uuid::new_v4(),
+        }
+    }
     use super::*;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
@@ -2243,12 +2383,12 @@ mod signature_verification_tests {
 
     // ── Test scaffolding ──
 
-    /// Build an `AppState` backed by `pool` with `require_signatures` enabled.
+    /// Build an `AppState` backed by `pool` with `require_packet_signatures` enabled.
     fn test_state_with_required_signatures(pool: PgPool) -> AppState {
         AppState::with_db(
             pool,
             ApiConfig {
-                require_signatures: true,
+                require_packet_signatures: true,
                 ..ApiConfig::default()
             },
         )
@@ -2298,6 +2438,7 @@ mod signature_verification_tests {
     ) -> axum::response::Response {
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let body = serde_json::to_string(&packet).unwrap();
@@ -2398,6 +2539,54 @@ mod signature_verification_tests {
             response.status(),
             StatusCode::UNAUTHORIZED,
             "Submission for an unregistered agent must be rejected"
+        );
+    }
+
+    /// `packet.claim.labels` is caller-supplied and is applied by a raw
+    /// `UPDATE claims SET labels` in `submit_packet`, bypassing the
+    /// `ClaimRepository` chokepoint — so this path needs (and now has) its own
+    /// unexpanded-shell-variable rejection. Backlog f6310444.
+    ///
+    /// The packet is otherwise fully valid and correctly signed, so a 400 here
+    /// can only come from the label check; and the claim must not be written.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn submit_packet_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool) {
+        let signer = epigraph_crypto::AgentSigner::generate();
+        let agent_id = seed_agent_with_pubkey(&pool, signer.public_key()).await;
+        let state = test_state_with_required_signatures(pool.clone());
+
+        let content = "Packet whose label array was never interpolated.";
+        let mut claim = build_test_claim_submission(agent_id, content);
+        claim.labels = vec![
+            "fine-label".to_string(),
+            "group:$EPICLAW_GROUP_ID".to_string(),
+        ];
+
+        let mut packet = EpistemicPacket {
+            claim,
+            evidence: vec![],
+            reasoning_trace: build_test_trace(),
+            signature: String::new(),
+        };
+        let canonical = packet.signable_bytes().unwrap();
+        packet.signature = hex::encode(signer.sign(&canonical));
+
+        let response = submit_packet_endpoint(state, packet).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an unexpanded shell variable in packet.claim.labels must be a 400"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = $1")
+            .bind(content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "the packet was persisted despite the 400 — validate_packet runs before \
+             the write, so a non-zero count means the check is in the wrong place"
         );
     }
 }

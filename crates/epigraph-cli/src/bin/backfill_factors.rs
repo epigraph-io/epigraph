@@ -53,21 +53,40 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
+    // bypass and a request handler does not.
+    //
+    // Built AFTER clap has parsed: an argv error must be reported as an argv
+    // error, not as a connection failure. And `_maint_conn` is held for the
+    // whole run — the lease attests to THAT connection, and the pre-PR-15
+    // template dropped it while the viewer lived on.
+    let maint = epigraph_cli::MaintenancePool::connect("backfill_factors")
+        .await
+        .expect("maintenance pool");
+    let session = maint
+        .viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance viewer");
+    let viewer = session.viewer();
+    if let Err(e) = run(cli, maint.pool().clone(), viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let pool = epigraph_cli::db_connect().await?;
-
+async fn run(
+    cli: Cli,
+    pool: sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cli.phase, Phase::All | Phase::Evidence) {
-        let summary = run_evidence_phase(&pool, cli.limit, cli.offset, cli.dry_run).await?;
+        let summary = run_evidence_phase(&pool, viewer, cli.limit, cli.offset, cli.dry_run).await?;
         println!("evidence phase: {summary}");
     }
     if matches!(cli.phase, Phase::All | Phase::Edges) {
-        let summary = run_edge_phase(&pool, cli.limit, cli.offset, cli.dry_run).await?;
+        let summary = run_edge_phase(&pool, viewer, cli.limit, cli.offset, cli.dry_run).await?;
         println!("edge phase: {summary}");
     }
     Ok(())
@@ -127,6 +146,7 @@ LIMIT $1 OFFSET $2
 
 async fn run_evidence_phase(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     limit: usize,
     offset: usize,
     dry_run: bool,
@@ -167,8 +187,21 @@ async fn run_evidence_phase(
 
     for (evidence_id, claim_id, signer_id, evidence_type, _extr) in eligible {
         let weight = load_evidence_type_weight(&evidence_type);
+        // An operator backfill on the DSN the operator supplies — in practice a
+        // superuser, where a tenancy stamp is inert. The acquire is mechanical: it
+        // moves each row's wiring onto ONE connection instead of a checkout per
+        // statement, which is also what makes the savepoint inside the helper
+        // meaningful.
+        let mut conn = match pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  skip: could not acquire a connection: {e}");
+                continue;
+            }
+        };
         match ds_auto::auto_wire_ds_update(
-            pool,
+            &mut conn,
+            viewer,
             claim_id,
             signer_id,
             1.0, // confidence: only evidence-type weight shapes the BBA
@@ -213,6 +246,7 @@ LIMIT $1 OFFSET $2
 
 async fn run_edge_phase(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     limit: usize,
     offset: usize,
     dry_run: bool,
@@ -242,8 +276,16 @@ async fn run_edge_phase(
     }
 
     for (edge_id, signer_id, source_id, target_id, relationship) in rows {
+        let mut conn = match pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  skip: could not acquire a connection: {e}");
+                continue;
+            }
+        };
         match ds_auto::auto_wire_ds_for_edge(
-            pool,
+            &mut conn,
+            viewer,
             edge_id,
             signer_id,
             source_id,

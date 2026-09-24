@@ -6,6 +6,7 @@
 //! and returns the full belief update in one response.
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -82,6 +83,7 @@ pub struct AssessClaimResponse {
 /// `POST /api/v1/claims/:id/assess`
 #[cfg(feature = "db")]
 pub async fn assess_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Json(request): Json<AssessClaimRequest>,
@@ -94,19 +96,32 @@ pub async fn assess_claim(
     let pool = &state.db_pool;
 
     // ── 1. Load claim ────────────────────────────────────────────────────
-    let claim_row: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT id, content FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: e.to_string(),
-            })?;
-
-    let (_, claim_content) = claim_row.ok_or(ApiError::NotFound {
-        entity: "claim".to_string(),
-        id: claim_id.to_string(),
-    })?;
+    //
+    // PR-07: this was a bare `SELECT id, content FROM claims WHERE id = $1`
+    // even though the handler holds a `Viewer` and threads it through every
+    // downstream repo call. Two things were wrong with that. It made the
+    // endpoint an existence-and-content oracle over arbitrary claim ids — the
+    // 404 branch distinguished "does not exist" from "exists but is another
+    // tenant's", and `claim_content` feeds the BBA build, so the response's
+    // belief numbers were derived from content the caller may not read. And
+    // because nothing between the path id and the write checked visibility, an
+    // authenticated stranger could attach evidence to and mutate the belief of
+    // another tenant's claim.
+    //
+    // `get_by_id` is viewer-filtered, so an invisible claim now takes the same
+    // `None` branch as a nonexistent one and both render as 404.
+    //
+    // This is the READ half only. Gating the subsequent write on
+    // `viewer.writable_bind()` (member-with-write-role, not merely
+    // member-who-can-read) is PR-16's scope; the read fix belongs here because
+    // the viewer was already in hand.
+    let claim = epigraph_db::ClaimRepository::get_by_id(pool, &viewer, claim_id.into())
+        .await?
+        .ok_or(ApiError::NotFound {
+            entity: "claim".to_string(),
+            id: claim_id.to_string(),
+        })?;
+    let claim_content = claim.content;
 
     // ── 2. Load calibration config ───────────────────────────────────────
     let calibration_config = CalibrationConfig::load(std::path::Path::new("calibration.toml"))
@@ -148,7 +163,7 @@ pub async fn assess_claim(
     // ── 6. Find or create frame ──────────────────────────────────────────
     let frame_id = if let Some(fid) = request.frame_id {
         // Verify it exists
-        let _ = epigraph_db::FrameRepository::get_by_id(pool, fid)
+        let _ = epigraph_db::FrameRepository::get_by_id(pool, &viewer, fid)
             .await?
             .ok_or(ApiError::NotFound {
                 entity: "frame".to_string(),
@@ -169,7 +184,7 @@ pub async fn assess_claim(
             "research_validity".to_string()
         };
 
-        match epigraph_db::FrameRepository::get_by_name(pool, &frame_name).await? {
+        match epigraph_db::FrameRepository::get_by_name(pool, &viewer, &frame_name).await? {
             Some(existing) => existing.id,
             None => {
                 let hypotheses = vec!["supported".to_string(), "unsupported".to_string()];
@@ -189,7 +204,7 @@ pub async fn assess_claim(
     };
 
     // Load the frame row for DS operations
-    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -249,7 +264,8 @@ pub async fn assess_claim(
 
     // Retrieve all user-submitted BBAs for this (claim, frame)
     let all_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
+            .await?;
 
     let mut indexed_rows: Vec<(Uuid, Option<Uuid>, MassFunction)> = all_rows
         .iter()
@@ -268,7 +284,7 @@ pub async fn assess_claim(
             indexed_rows.iter().map(|(_, _, m)| m.clone()).collect(),
         )
     } else {
-        super::independence::analyze_independence(pool, &indexed_rows, 5).await?
+        super::independence::analyze_independence(pool, &viewer, &indexed_rows, 5).await?
     };
 
     // Cautious-combine within each dependent group
@@ -313,7 +329,8 @@ pub async fn assess_claim(
 
     // Compute belief/plausibility for the claim's hypothesis
     let claim_assignment =
-        epigraph_db::FrameRepository::get_claim_assignment(pool, claim_id, frame_id).await?;
+        epigraph_db::FrameRepository::get_claim_assignment(pool, &viewer, claim_id, frame_id)
+            .await?;
     let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
 
     let (final_bel, final_pl, final_betp, m_missing) =
@@ -324,11 +341,14 @@ pub async fn assess_claim(
     epigraph_db::MassFunctionRepository::update_claim_belief(
         pool,
         claim_id,
-        final_bel,
-        final_pl,
-        m_empty,
-        Some(final_betp),
-        m_missing,
+        epigraph_db::CachedBelief {
+            belief: final_bel,
+            plausibility: final_pl,
+            mass_on_empty: m_empty,
+            pignistic_prob: Some(final_betp),
+            mass_on_missing: m_missing,
+            belief_frame_id: None,
+        },
     )
     .await?;
 

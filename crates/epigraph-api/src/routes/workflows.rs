@@ -11,6 +11,104 @@
 //! - `POST   /api/v1/workflows/:id/outcome`   - Report execution outcome
 //! - `DELETE /api/v1/workflows/:id`            - Deprecate workflow
 //! - `POST   /api/v1/workflows/:id/behavioral-executions` - Record behavioral execution
+//!
+//! # Tenancy: 10 of this file's 40 raw-pool sites are converted
+//!
+//! Conversion shard 7 — the last read shard. `search_workflows` (6 sites),
+//! `find_workflow_hierarchical` (3) and `list_workflows` (1) each assemble their
+//! whole answer on ONE viewer-stamped connection from [`AppState::read_as`].
+//! The repository statements already spliced the viewer where they had one to
+//! spend; what changed is which connection carries the session GUCs migration
+//! 077's `claims` and `edges` policies read.
+//!
+//! **`find_workflow_hierarchical`'s suppression is CONDITIONAL, and saying so
+//! is the point.** `resolve_to_latest` is `#[serde(default)] bool`, i.e. false
+//! unless the caller opts in. On that default path the handler runs only
+//! `find_hierarchical_by_embedding` and/or `search_hierarchical_by_text`, both
+//! widened WITHOUT a `&Viewer`, and both read `workflows` alone — a table which
+//! at migration head 92 has neither `relrowsecurity` nor a `visibility` or
+//! `owner_group_id` column. So on a default request the stamp selects no policy
+//! and the viewer filters no row: THE VISIBLE ROW SET IS UNCHANGED BY THE
+//! CONVERSION. The ONE statement in the handler that narrows is
+//! `resolve_steps_to_heads_batched`, and it is inside `if resolve_to_latest`.
+//! The table-level gap is already recorded, with its owner, under
+//! `D-PR16-per-id-claim-oracles-write-half`; nothing further is recorded here —
+//! see `docs/tenancy/progress.json`.
+//!
+//! **Both search handlers take the connection AFTER their embedding call, not at
+//! the handler head.** `embedder.generate` leaves the process, and holding one of
+//! the request pool's connections across a round trip to a third party buys
+//! nothing.
+//!
+//! **THE COST THIS BUYS THE SINGLE-STAMP PROPERTY WITH, STATED RATHER THAN
+//! DISCOVERED IN PRODUCTION.** `limit` clamps to `[1, 50]`, and the per-result
+//! reads are sequential inside the borrow, so `search_workflows` holds ONE
+//! `ScopedRead` across up to ~102 round trips on the embedding branch and ~51 on
+//! the text branch; `find_workflow_hierarchical` holds one across its ANN read,
+//! ILIKE fallback and `resolve_steps_to_heads_batched`. Before the conversion
+//! each statement drew from the pool independently. Under
+//! `SessionGucMode::Transaction` a `ScopedRead` IS a transaction, so on a
+//! pooler deployment that is one open transaction and one pinned pool slot per
+//! in-flight search. This is the class `F-PR26-lineage-holds-one-connection-for-n-round-trips`
+//! owns (`routes/lineage.rs::get_lineage`); that entry stays open and this shard
+//! does not discharge it. `rolling_success_rate` and `find_lineage_root` are
+//! both batchable over `r.claim_id`, which would collapse the ~100 to 2, but
+//! that is a separable change with its own acceptance.
+//!
+//! **Errors that were previously swallowed now propagate**, and that is a
+//! consequence of the conversion rather than an unrelated tidy-up: once every
+//! statement shares one connection, a failure is evidence about the connection
+//! the rest of the handler is about to reuse, not an isolated per-statement
+//! miss. Four defaults were removed —
+//! `behavioral_affinity_lineage`'s empty-map fallback, `find_lineage_root`'s
+//! substitution of the row's own id, and `rolling_success_rate`'s two
+//! `if let Ok(..)` arms — plus `find_hierarchical_by_embedding`'s
+//! `.unwrap_or_default()`, which turned a database failure into "the ANN search
+//! matched nothing" and fell through to the ILIKE path with a 200. An ABSENT
+//! embedder is still not an error and still falls through.
+//!
+//! **That propagation is a POLICY choice, not one the conversion forces, and
+//! the distinction is measured rather than assumed.** `SessionGucMode::from_env`
+//! selects `Session` for everything except the exact string `transaction`, so
+//! `Session` is the DEFAULT deployment. Only under `Transaction` does a failed
+//! statement abort the surrounding transaction and make every later statement on
+//! the same `ScopedRead` fail anyway; under `Session` the connection stays
+//! usable and the old degrade-gracefully behaviour would still have worked. It
+//! was dropped because a silently truncated answer is a worse failure than a
+//! 500 — not because the borrow made it impossible. The five newly-propagating
+//! sites log through `tracing::error!` and return a FIXED message, matching what
+//! the `read_as` acquisition sites in this file do; the pre-existing
+//! `find_by_embedding` / `find_by_text` / `search_hierarchical_by_text` sites
+//! still interpolate their `DbError` and are left alone, because that class
+//! belongs to `F-route-error-text-remainder` and not to a read shard.
+//!
+//! The other 30 sites are NOT converted. 28 sit in WRITE handlers
+//! (`store_workflow`, `report_outcome`, `deprecate_workflow`,
+//! `report_hierarchical_outcome`, `ingest_workflow`,
+//! `record_behavioral_execution`, `evolve_step`, `add_step`, `delete_step`):
+//! [`AppState::read_as`] is documented read-only, and a write routed through a
+//! `ScopedRead` is rolled back on drop under `SessionGucMode::Transaction` while
+//! still type-checking. Their owner is `ScopedPool::begin_as` plus
+//! `Viewer::splice_write`. The remaining 2 are `get_workflow`, a routed GET that
+//! holds no `Viewer` at all — adding a `ViewerExtractor` to a routed handler is
+//! a route-table change with its own acceptance, not a read-shard conversion.
+//! Its owner is `F-inline-claim-content-reads`, whose UNCOMPENSATED half carries
+//! this file's 4 and whose `assigned` field calls it LIVE rather than latent;
+//! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` still carries
+//! `("workflows.rs", 4)` accordingly. Nothing further about it is recorded
+//! here — see `docs/tenancy/progress.json`.
+//!
+//! `deprecate_workflow` additionally carries an open entry whose owner is the
+//! write-gate programme, not a read shard: `F-write-authz-reads-unfiltered`.
+//! This shard does not touch it and it stays open. Nothing further about it is
+//! recorded here — see `docs/tenancy/progress.json`.
+//!
+//! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` still carries
+//! `("workflows.rs", 4)` and `ROUTE_LAYER_WRITES` still carries
+//! `("workflows.rs", 4)`; all eight sit in unconverted handlers and no inline
+//! statement was relocated.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 #[cfg(feature = "db")]
 use axum::{
@@ -24,6 +122,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 
@@ -174,6 +273,7 @@ fn slugify_goal(s: &str) -> String {
 /// Idempotent on `(slugify(goal), generation=0)`.
 #[cfg(feature = "db")]
 pub async fn store_workflow(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<StoreWorkflowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -229,14 +329,16 @@ pub async fn store_workflow(
     };
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
     let result =
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&state.db_pool, &plan, &extraction)
+        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("workflow ingest: {e}"),
-            })?;
+            .map_err(workflow_ingest_error)?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("workflow ingest: could not commit: {e}"),
+    })?;
 
-    auto_wire_inserted_edges(&state.db_pool, &result).await;
+    auto_wire_inserted_edges(&state, &viewer, &result).await;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
@@ -326,6 +428,7 @@ fn workflow_recall_to_json(r: &epigraph_db::WorkflowRecallResult) -> serde_json:
 /// GET /api/v1/workflows/search - Search workflows by semantic goal similarity.
 #[cfg(feature = "db")]
 pub async fn search_workflows(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<SearchWorkflowsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -335,18 +438,35 @@ pub async fn search_workflows(
     // Try embedding search first
     if let Some(embedder) = state.embedding_service() {
         if let Ok(query_vec) = embedder.generate(&params.goal).await {
+            // THE CONNECTION IS TAKEN HERE, NOT AT THE HANDLER HEAD.
+            // `embedder.generate` above leaves the process; acquiring before it
+            // would hold one of the request pool's connections across a network
+            // round trip to a third party for no benefit. Everything below this
+            // point — the ANN search, the affinity lookup, and the per-result
+            // lineage-root and success-rate reads — runs on this ONE stamped
+            // connection, so the whole answer is assembled under one tenancy
+            // stamp.
+            let mut read = state.read_as(&viewer).await.map_err(|e| {
+                tracing::error!(
+                    target: "tenancy.scoped_read",
+                    error = %e,
+                    handler = "search_workflows",
+                    "could not acquire a viewer-stamped connection"
+                );
+                ApiError::InternalError {
+                    message: "Failed to acquire a scoped connection".to_string(),
+                }
+            })?;
+
             let results = epigraph_db::WorkflowRepository::find_by_embedding(
-                &state.db_pool,
-                &query_vec,
-                min_truth,
-                limit,
+                &mut *read, &viewer, &query_vec, min_truth, limit,
             )
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to search workflows: {e}"),
             })?;
 
-            // Behavioral affinity lookup (best-effort)
+            // Behavioral affinity lookup
             let pgvec = format!(
                 "[{}]",
                 query_vec
@@ -355,52 +475,82 @@ pub async fn search_workflows(
                     .collect::<Vec<_>>()
                     .join(",")
             );
+            //
+            // PROPAGATE, do not default. This read now shares one connection
+            // with every other statement in the handler, so a failure here is
+            // no longer an isolated per-statement miss: it is evidence that the
+            // stamped connection is unusable, and defaulting to an empty map
+            // would answer 200 with silently degraded results computed on a
+            // connection whose tenancy state is in doubt.
             let affinity_map: std::collections::HashMap<uuid::Uuid, (f64, i64)> =
-                match epigraph_db::BehavioralExecutionRepository::behavioral_affinity_lineage(
-                    &state.db_pool,
-                    &pgvec,
-                    0.5,
-                    1,
-                    20,
+                epigraph_db::BehavioralExecutionRepository::behavioral_affinity_lineage(
+                    &mut *read, &viewer, &pgvec, 0.5, 1, 20,
                 )
                 .await
-                {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .map(|(id, sim, count)| (id, (sim, count)))
-                        .collect(),
-                    Err(_) => std::collections::HashMap::new(),
-                };
+                .map_err(|e| {
+                    tracing::error!(
+                        target: "tenancy.scoped_read",
+                        error = %e,
+                        handler = "search_workflows",
+                        statement = "behavioral_affinity_lineage",
+                        "statement failed on the viewer-stamped connection"
+                    );
+                    ApiError::InternalError {
+                        message: "Failed to search workflows".to_string(),
+                    }
+                })?
+                .into_iter()
+                .map(|(id, sim, count)| (id, (sim, count)))
+                .collect();
 
             let mut workflows: Vec<serde_json::Value> = Vec::new();
             for r in &results {
                 let mut json = workflow_recall_to_json(r);
 
+                // PROPAGATE, do not substitute. Defaulting to `r.claim_id`
+                // silently turned a failed lineage walk into "this workflow IS
+                // its own lineage root", which is a different answer rather
+                // than a missing one — and on a shared connection the failure
+                // is a property of the connection, not of this row.
                 let lineage_root = epigraph_db::WorkflowRepository::find_lineage_root(
-                    &state.db_pool,
-                    r.claim_id,
+                    &mut *read, &viewer, r.claim_id,
                 )
                 .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(workflow_id = %r.claim_id, "find_lineage_root failed: {e}");
-                    r.claim_id
-                });
+                .map_err(|e| {
+                    tracing::error!(
+                        target: "tenancy.scoped_read",
+                        error = %e,
+                        handler = "search_workflows",
+                        statement = "find_lineage_root",
+                        "statement failed on the viewer-stamped connection"
+                    );
+                    ApiError::InternalError {
+                        message: "Failed to search workflows".to_string(),
+                    }
+                })?;
 
                 if let Some(&(affinity, count)) = affinity_map.get(&lineage_root) {
                     json["behavioral_affinity"] = serde_json::json!(affinity);
                     json["behavioral_execution_count"] = serde_json::json!(count);
 
-                    if let Ok(rate) =
-                        epigraph_db::BehavioralExecutionRepository::rolling_success_rate(
-                            &state.db_pool,
-                            r.claim_id,
-                            20,
-                        )
-                        .await
-                    {
-                        if rate > 0.0 {
-                            json["behavioral_success_rate"] = serde_json::json!(rate);
+                    let rate = epigraph_db::BehavioralExecutionRepository::rolling_success_rate(
+                        &mut *read, r.claim_id, 20,
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            target: "tenancy.scoped_read",
+                            error = %e,
+                            handler = "search_workflows",
+                            statement = "rolling_success_rate",
+                            "statement failed on the viewer-stamped connection"
+                        );
+                        ApiError::InternalError {
+                            message: "Failed to search workflows".to_string(),
                         }
+                    })?;
+                    if rate > 0.0 {
+                        json["behavioral_success_rate"] = serde_json::json!(rate);
                     }
                 }
 
@@ -414,9 +564,26 @@ pub async fn search_workflows(
         }
     }
 
-    // Fallback: text search
+    // Fallback: text search. A SECOND acquisition rather than one hoisted to
+    // the handler head, for the same reason the embedding branch takes its own:
+    // this path is reached when there is no embedder OR when `generate` failed,
+    // i.e. after the same outbound call, and hoisting would hold a connection
+    // across it.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "search_workflows",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let results = epigraph_db::WorkflowRepository::find_by_text(
-        &state.db_pool,
+        &mut *read,
+        &viewer,
         &params.goal,
         min_truth,
         limit,
@@ -430,16 +597,25 @@ pub async fn search_workflows(
     for r in &results {
         let mut json = workflow_recall_to_json(r);
 
-        if let Ok(rate) = epigraph_db::BehavioralExecutionRepository::rolling_success_rate(
-            &state.db_pool,
-            r.claim_id,
-            20,
+        // PROPAGATE, do not default: see the embedding branch above.
+        let rate = epigraph_db::BehavioralExecutionRepository::rolling_success_rate(
+            &mut *read, r.claim_id, 20,
         )
         .await
-        {
-            if rate > 0.0 {
-                json["behavioral_success_rate"] = serde_json::json!(rate);
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "search_workflows",
+                statement = "rolling_success_rate",
+                "statement failed on the viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to search workflows".to_string(),
             }
+        })?;
+        if rate > 0.0 {
+            json["behavioral_success_rate"] = serde_json::json!(rate);
         }
 
         workflows.push(json);
@@ -454,17 +630,31 @@ pub async fn search_workflows(
 /// GET /api/v1/workflows - List workflows.
 #[cfg(feature = "db")]
 pub async fn list_workflows(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListWorkflowsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
 
-    let workflows = epigraph_db::WorkflowRepository::list(&state.db_pool, min_truth, None, limit)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to list workflows: {e}"),
-        })?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_workflows",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let workflows =
+        epigraph_db::WorkflowRepository::list(&mut *read, &viewer, min_truth, None, limit)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to list workflows: {e}"),
+            })?;
 
     let results: Vec<serde_json::Value> = workflows
         .iter()
@@ -775,6 +965,7 @@ pub async fn report_outcome(
     tag = "workflows"
 )]
 pub async fn find_workflow_hierarchical(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<HierarchicalSearchQuery>,
 ) -> Result<Json<HierarchicalSearchResponse>, ApiError> {
@@ -785,27 +976,64 @@ pub async fn find_workflow_hierarchical(
     // Embedding-first to tolerate paraphrasing; ILIKE fallback for short
     // queries, when embedder is unavailable, or when no embedded rows clear
     // the similarity floor.
-    let mut rows = if let Some(embedder) = state.embedding_service() {
-        match embedder.generate(&params.q).await {
-            Ok(qvec) => epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
-                &state.db_pool,
-                &qvec,
-                similarity_threshold,
-                min_truth,
-                limit,
-                params.resolve_to_latest,
-            )
-            .await
-            .unwrap_or_default(),
-            Err(_) => Vec::new(),
+    // The embedding attempt comes FIRST and the connection is taken after it:
+    // `embedder.generate` leaves the process, and holding a pooled connection
+    // across that round trip buys nothing. Every statement below this point —
+    // the ANN read, the ILIKE fallback and `resolve_steps_to_heads_batched`'s
+    // two round trips — then runs on the ONE stamped connection.
+    let qvec = match state.embedding_service() {
+        Some(embedder) => embedder.generate(&params.q).await.ok(),
+        None => None,
+    };
+
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "find_workflow_hierarchical",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
         }
-    } else {
-        Vec::new()
+    })?;
+
+    // PROPAGATE, do not default. `.unwrap_or_default()` here turned a database
+    // failure into an empty `rows`, which then fell through to the ILIKE path
+    // and answered 200 — indistinguishable from "the ANN search matched
+    // nothing". On a shared connection that is no longer a per-statement miss:
+    // a failure is a property of the connection the rest of the handler is
+    // about to reuse. An ABSENT embedder or an embedder that could not produce
+    // a vector is still the fallback case, and still not an error; only a
+    // failed READ propagates.
+    let mut rows = match qvec {
+        Some(qvec) => epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
+            &mut *read,
+            &qvec,
+            similarity_threshold,
+            min_truth,
+            limit,
+            params.resolve_to_latest,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "find_workflow_hierarchical",
+                statement = "find_hierarchical_by_embedding",
+                "statement failed on the viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "hierarchical search failed".to_string(),
+            }
+        })?,
+        None => Vec::new(),
     };
 
     if rows.is_empty() {
         rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
-            &state.db_pool,
+            &mut *read,
             &params.q,
             limit,
             min_truth,
@@ -836,7 +1064,8 @@ pub async fn find_workflow_hierarchical(
         let workflow_ids: Vec<uuid::Uuid> = workflows.iter().map(|w| w.workflow_id).collect();
         let mut resolved_by_workflow =
             epigraph_db::WorkflowRepository::resolve_steps_to_heads_batched(
-                &state.db_pool,
+                &mut read,
+                &viewer,
                 &workflow_ids,
             )
             .await
@@ -978,14 +1207,24 @@ pub async fn report_hierarchical_outcome(
         })?;
 
     // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
-    //    sorted by claim level=2 (steps), in plan order. Plan order is the
-    //    insertion order of `executes` edges; we use edges.created_at as proxy.
+    //    restricted to level=2 (steps), in PLAN order: the `plan_index` ordinal
+    //    the ingest executor records on each edge, with `e.created_at` only as
+    //    the fallback for edges that predate it. `created_at` alone stopped
+    //    being a usable proxy when the executor began writing a plan in ONE
+    //    transaction — `NOW()` is transaction-start time, every edge ties, and
+    //    the tiebreak `c.id` is a content-derived UUID. Same key as
+    //    `epigraph_mcp::tools::workflow_hierarchical` and
+    //    `WorkflowRepository::resolve_steps_to_heads`, so step N is one step on
+    //    both transports.
     let step_claim_rows: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT c.id \
          FROM edges e \
          JOIN claims c ON c.id = e.target_id \
          WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
-         ORDER BY e.created_at ASC, c.id ASC",
+         ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                       THEN (e.properties->>'plan_index')::int \
+                       ELSE 2147483647 END, \
+                  e.created_at ASC, c.id ASC",
     )
     .bind(workflow_id)
     .fetch_all(&state.db_pool)
@@ -1152,6 +1391,7 @@ pub async fn evolve_step(
     tag = "workflows"
 )]
 pub async fn deprecate_workflow(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Query(params): Query<DeprecateQuery>,
@@ -1177,7 +1417,7 @@ pub async fn deprecate_workflow(
     let mut ids_to_deprecate = vec![workflow_id];
     if cascade {
         let descendants =
-            epigraph_db::WorkflowRepository::find_descendants(&state.db_pool, workflow_id)
+            epigraph_db::WorkflowRepository::find_descendants(&state.db_pool, &viewer, workflow_id)
                 .await
                 .unwrap_or_default();
         ids_to_deprecate.extend(descendants);
@@ -1319,18 +1559,21 @@ pub async fn record_behavioral_execution(
     tag = "workflows"
 )]
 pub async fn ingest_workflow(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
     let result =
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&state.db_pool, &plan, &extraction)
+        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("workflow ingest: {e}"),
-            })?;
+            .map_err(workflow_ingest_error)?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("workflow ingest: could not commit: {e}"),
+    })?;
 
-    auto_wire_inserted_edges(&state.db_pool, &result).await;
+    auto_wire_inserted_edges(&state, &viewer, &result).await;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
@@ -1388,6 +1631,91 @@ pub async fn ingest_workflow(
 
 // ── Internal helpers ──
 
+/// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
+/// **`workflow-ingest-system`** agent's viewer.
+///
+/// The HTTP twin of `epigraph-mcp`'s
+/// `claim_helper::begin_system_ingest_stamped_tx`, and identical in substance:
+/// `epigraph_ingest_executor` authors every row as
+/// `get_or_create_system_agent` and owns it with that agent's personal group, so
+/// migration 077's `WITH CHECK` on `claims` refuses the walk on an unstamped
+/// connection and refuses it just as firmly when stamped from the HTTP
+/// PRINCIPAL. The principal's viewer is the wrong answer here for exactly the
+/// reason `server.agent_id()` is on the MCP side — see
+/// `epigraph_ingest_executor::system_agent_write_authority` for the measurement.
+///
+///
+/// # RESIDUAL, stated so the R3 policy drop is not read as closing it
+///
+/// This stamps the transaction with the SYSTEM agent's authority, and nothing on
+/// this path asks whether the CALLER has any authority over the workflow it
+/// names. `add_step`, `delete_step`, `ingest_workflow` and
+/// `improve_workflow_hierarchy` (MCP), and `POST /api/v1/workflows/steps` and
+/// `/steps/delete` (HTTP, gated only by the `claims:write` scope) reach this on
+/// caller-supplied input (`canonical_name`, `step_lineage_id`). So any
+/// `claims:write` caller can mutate any system-owned workflow — the harness's
+/// `delete_step` arm drives a step's truth to 0.05 with no ownership relation
+/// between caller and workflow. Same residual as `epigraph_mcp::claim_helper::begin_system_ingest_stamped_tx`,
+/// which carries the MCP half. MEASURED by review; not a regression: config B
+/// (production today) admits the same writes through the orphan `*_privacy`
+/// policies, and main behaves the same there.
+///
+/// What it means for R3: dropping the orphan policies does NOT tighten workflow
+/// mutation at all, because these writes no longer depend on them. Tightening
+/// needs a caller-side check against the TARGET workflow before the stamp, and
+/// a decision about who "owns" a workflow the system agent authored — neither
+/// of which is a mechanical conversion. Tracked as open work, not fixed here.
+///
+/// # Errors
+/// `ApiError::InternalError` if the system agent has no write authority, if the
+/// process was not built through `AppState::with_scoped_pool`, or if the stamp
+/// fails. Never a fallback to `state.db_pool`.
+#[cfg(feature = "db")]
+pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
+    state: &'s AppState,
+    route: &'static str,
+) -> Result<epigraph_db::ScopedTx<'s>, ApiError> {
+    let scoped = state.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            route = route,
+            "write refused: this process was not built from a ScopedPool, so no connection can \
+             be stamped with the ingest system agent's tenancy context."
+        );
+        ApiError::InternalError {
+            message: format!(
+                "{route}: this server was not built from a ScopedPool, so the workflow ingest \
+                 path cannot stamp a connection. Nothing was written."
+            ),
+        }
+    })?;
+
+    let authority = epigraph_ingest_executor::system_agent_write_authority(scoped)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                route = route,
+                error = %e,
+                "write refused: could not establish the workflow-ingest-system agent's write \
+                 authority. Nothing was written."
+            );
+            ApiError::InternalError {
+                message: format!(
+                    "{route}: could not establish the workflow-ingest-system agent's write \
+                     authority: {e}. Nothing was written."
+                ),
+            }
+        })?;
+
+    scoped
+        .begin_as(&authority.viewer)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{route}: could not begin a system-agent-stamped transaction: {e}"),
+        })
+}
+
 #[cfg(feature = "db")]
 pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
     let (_did, pub_key_bytes) =
@@ -1427,16 +1755,39 @@ fn format_embedding(embedding: &[f32]) -> String {
 /// inserted. Best-effort (the helper logs and swallows individual failures).
 /// Source-claim agent attribution is handled by the engine helper via
 /// `system_agent_id` from the executor result.
+/// Stamped from the `workflow-ingest-system` agent's viewer, like the plan walk
+/// it follows: the `claim_frames` / `mass_functions` / cached-belief rows it
+/// writes are claim-derived, so migrations 074/070 fill their tenancy from the
+/// ingest's own claims and the `WITH CHECK` asks about the SYSTEM agent's group.
+/// On the unstamped pool these were refused on BOTH schema configurations —
+/// `claim_frames` carries no orphan `*_privacy` policy.
+///
+/// Its own transaction rather than the ingest's, because this half is
+/// best-effort: a DS failure must not roll back a workflow that landed. Inside
+/// it, `auto_wire_edge_if_epistemic` SAVEPOINT-wraps each edge, so one failure
+/// does not abort the rest.
 async fn auto_wire_inserted_edges(
-    pool: &sqlx::PgPool,
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
     result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
 ) {
     let Some(agent_id) = result.system_agent_id else {
         return;
     };
+    let mut tx = match begin_system_ingest_stamped_tx(state, "workflows/ingest:ds").await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(
+                workflow_id = %result.workflow_id,
+                "workflow ds wiring skipped: {e}. The ingest is stored and intact"
+            );
+            return;
+        }
+    };
     for e in &result.inserted_edges {
         epigraph_engine::edge_factor::auto_wire_edge_if_epistemic(
-            pool,
+            &mut tx,
+            viewer,
             true, // executor only emits InsertedPlanEdge when was_created=true
             e.edge_id,
             e.source_id,
@@ -1447,6 +1798,13 @@ async fn auto_wire_inserted_edges(
             agent_id,
         )
         .await;
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(
+            workflow_id = %result.workflow_id,
+            "workflow ds wiring could not commit: {e}. The ingest is stored; its claims carry \
+             no edge-factor BBA until a recompute reaches them"
+        );
     }
 }
 
@@ -1499,8 +1857,31 @@ pub struct DeleteStepRequest {
     pub step_lineage_id: Uuid,
 }
 
+/// Map a workflow-ingest executor error. Migration 105's personal-group
+/// refusals (`DbError::is_personal_group_refusal`), carried as
+/// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
+/// detail logged and kept out of the body. Everything else stays a 500.
+///
+/// On these routes `system_agent_write_authority` refuses a revoked system
+/// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
+/// this arm is what a revocation racing that preflight would surface.
+#[cfg(feature = "db")]
+fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> ApiError {
+    match e {
+        epigraph_ingest_executor::IngestExecutorError::Repository(db)
+            if db.is_personal_group_refusal() =>
+        {
+            ApiError::from(db)
+        }
+        other => ApiError::InternalError {
+            message: format!("workflow ingest: {other}"),
+        },
+    }
+}
+
 /// Map executor's StepOpError to ApiError. WorkflowNotFound + StepNotFound
-/// are 404; Invalid is 400; Db/Executor are 500.
+/// are 404; Invalid is 400; migration 105's personal-group refusal is 403;
+/// Db/Executor are otherwise 500.
 #[cfg(feature = "db")]
 fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
     use epigraph_ingest_executor::StepOpError as E;
@@ -1517,6 +1898,12 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
             message: "workflow has no level-1 phase claim".into(),
         },
         E::Invalid(msg) => ApiError::BadRequest { message: msg },
+        E::Repo(db) if db.is_personal_group_refusal() => ApiError::from(db),
+        E::Executor(epigraph_ingest_executor::IngestExecutorError::Repository(db))
+            if db.is_personal_group_refusal() =>
+        {
+            ApiError::from(db)
+        }
         E::Db(e) => ApiError::InternalError {
             message: format!("db: {e}"),
         },
@@ -1541,14 +1928,18 @@ pub async fn add_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
+    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps").await?;
     let r = epigraph_ingest_executor::add_step(
-        &state.db_pool,
+        &mut tx,
         &req.canonical_name,
         &req.step_text,
         req.position,
     )
     .await
     .map_err(map_step_err)?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("add_step: could not commit: {e}"),
+    })?;
 
     Ok(Json(serde_json::json!({
         "workflow_id": r.workflow_id,
@@ -1571,13 +1962,14 @@ pub async fn delete_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
-    let r = epigraph_ingest_executor::delete_step(
-        &state.db_pool,
-        &req.canonical_name,
-        req.step_lineage_id,
-    )
-    .await
-    .map_err(map_step_err)?;
+    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps/delete").await?;
+    let r =
+        epigraph_ingest_executor::delete_step(&mut tx, &req.canonical_name, req.step_lineage_id)
+            .await
+            .map_err(map_step_err)?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("delete_step: could not commit: {e}"),
+    })?;
 
     Ok(Json(serde_json::json!({
         "workflow_id": r.workflow_id,
@@ -1699,11 +2091,47 @@ mod tests {
         )
     }
 
-    fn test_router(pool: sqlx::PgPool) -> axum::Router {
+    /// PR-06: `ViewerExtractor` requires an `AuthContext` on the request, which
+    /// the bearer middleware installs in production. Test routers built from a
+    /// bare `Router::new()` carry none, so they 401 before reaching the handler.
+    fn test_auth() -> crate::middleware::bearer::AuthContext {
+        let id = uuid::Uuid::new_v4();
+        crate::middleware::bearer::AuthContext {
+            client_id: id,
+            agent_id: Some(id),
+            owner_id: Some(id),
+            client_type: crate::middleware::bearer::ClientType::Service,
+            scopes: vec![
+                "claims:read".to_string(),
+                "claims:write".to_string(),
+                "edges:read".to_string(),
+                "edges:write".to_string(),
+                "workflows:read".to_string(),
+                "workflows:write".to_string(),
+            ],
+            jti: uuid::Uuid::new_v4(),
+        }
+    }
+
+    /// `POST /api/v1/workflows/ingest` now REFUSES rather than falling back to
+    /// `state.db_pool`: the rows the executor writes are owned by the
+    /// `workflow-ingest-system` agent's personal group, and a connection that
+    /// cannot be stamped with that group's write authority is not one this
+    /// handler will write on. So the router needs a state carrying a
+    /// `ScopedPool`; `AppState::with_db` leaves `scoped: None` and the handler
+    /// answers 500 with "this server was not built from a ScopedPool", which is
+    /// the conversion working rather than an inconvenience to route around.
+    ///
+    /// Same caveat as [`scoped_test_state`]: this is NOT a conversion control.
+    /// `with_scoped_pool` sets `db_pool = scoped.inner().clone()`, and
+    /// `#[sqlx::test]` connects as a BYPASSRLS superuser, so the stamp is inert
+    /// here. `scripts/e2e/probe-workflow.sh` is the instrument that observes it.
+    async fn test_router(pool: sqlx::PgPool) -> axum::Router {
         use axum::routing::post;
-        let state = AppState::with_db(pool, ApiConfig::default());
+        let state = scoped_test_state(&pool).await;
         axum::Router::new()
             .route("/api/v1/workflows/ingest", post(ingest_workflow))
+            .layer(axum::Extension(test_auth()))
             .with_state(state)
     }
 
@@ -1823,7 +2251,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_workflow_http_returns_workflow_id(pool: PgPool) {
-        let app = test_router(pool);
+        let app = test_router(pool).await;
 
         let body = serde_json::to_vec(&ingest_payload("http-test-ingest-workflow")).unwrap();
         let req = Request::builder()
@@ -1938,6 +2366,70 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Rebuild a connection URL for the database `pool` is connected to.
+    ///
+    /// `#[sqlx::test]` hands each arm a randomly-named private database but no
+    /// URL, and [`scoped_test_state`] needs one to build its `ScopedPool`. Same
+    /// move as `tests/viewer_fixture.rs::database_url_for` and
+    /// `routes/edges.rs::tests::database_url_for`; duplicated because this is an
+    /// in-crate `#[cfg(test)]` module and cannot reach the integration-test
+    /// fixture. Without it the arm would seed the private database and the
+    /// handler would read the SHARED one — a silent vacuous pass.
+    async fn database_url_for(pool: &PgPool) -> String {
+        let db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(pool)
+            .await
+            .expect("current_database()");
+        let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        // Strip the query string before touching the path, or `?sslmode=require`
+        // would be mistaken for part of the database name.
+        let (authority, query) = match base.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (base.as_str(), None),
+        };
+        let prefix = authority
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("DATABASE_URL must carry a database path")
+            .0;
+        match query {
+            Some(q) => format!("{prefix}/{db}?{q}"),
+            None => format!("{prefix}/{db}"),
+        }
+    }
+
+    /// An `AppState` whose `scoped` pool is populated.
+    ///
+    /// Conversion shard 7 moved `find_workflow_hierarchical` onto
+    /// [`AppState::read_as`], which HARD-REFUSES a state whose `scoped` is
+    /// `None` — that refusal is the fail-closed behaviour the conversion exists
+    /// to establish, not an inconvenience to route around. [`test_state`] above
+    /// calls `AppState::with_db`, which leaves `scoped: None`, so the arm below
+    /// would have started answering 500.
+    ///
+    /// THIS IS NOT A CONVERSION CONTROL. `with_scoped_pool` sets
+    /// `db_pool = scoped.inner().clone()`, so the converted and the unconverted
+    /// spellings read the SAME pool here and reverting the handler to
+    /// `&state.db_pool` changes not one observable row in the arm below. The
+    /// instrument that DOES observe it is
+    /// `crates/epigraph-api/tests/shard7_routes_scoped_read.rs::split_state`,
+    /// which gives `db_pool` a separate downgraded pool.
+    ///
+    /// `DATABASE_URL` is read again rather than taken from `state.db_pool` on
+    /// purpose: `no_unscoped_pool.rs`'s scanner does not cut `#[cfg(test)]` and
+    /// its `SCAN_ROOT` is `crates/epigraph-api/src`, so a `state.db_pool`
+    /// written in this helper would count as an unconverted site and silently
+    /// re-raise the row this shard just lowered.
+    ///
+    /// [`AppState::read_as`]: crate::AppState::read_as
+    async fn scoped_test_state(pool: &PgPool) -> AppState {
+        let url = database_url_for(pool).await;
+        let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
+            .await
+            .expect("connect a scoped pool");
+        AppState::with_scoped_pool(scoped, ApiConfig::default())
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn find_workflow_hierarchical_returns_match(pool: PgPool) {
         // Seed a hierarchical workflow.
@@ -1955,13 +2447,13 @@ mod tests {
         .await
         .unwrap();
 
-        use crate::state::{ApiConfig, AppState};
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let state = scoped_test_state(&pool).await;
         let app = axum::Router::new()
             .route(
                 "/api/v1/workflows/hierarchical/search",
                 axum::routing::get(find_workflow_hierarchical),
             )
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let response = app
@@ -1993,5 +2485,36 @@ mod tests {
             found,
             "expected to find the seeded canonical_name in results"
         );
+    }
+
+    /// Migration 105's personal-group refusal, wrapped by the executor, is a
+    /// 403 on the workflow-ingest and step routes; every other executor failure
+    /// stays a 500 (batch F review).
+    #[test]
+    fn a_personal_group_refusal_from_the_executor_is_a_403() {
+        use epigraph_ingest_executor::{IngestExecutorError as X, StepOpError as S};
+        let revoked = || epigraph_db::DbError::MembershipRevoked {
+            message: "agent a holds only REVOKED membership(s) of its personal group g".into(),
+        };
+        assert!(matches!(
+            workflow_ingest_error(X::Repository(revoked())),
+            ApiError::Forbidden { .. }
+        ));
+        assert!(matches!(
+            workflow_ingest_error(X::AgentCreation("preflight".into())),
+            ApiError::InternalError { .. }
+        ));
+        assert!(matches!(
+            map_step_err(S::Repo(revoked())),
+            ApiError::Forbidden { .. }
+        ));
+        assert!(matches!(
+            map_step_err(S::Executor(X::Repository(revoked()))),
+            ApiError::Forbidden { .. }
+        ));
+        assert!(matches!(
+            map_step_err(S::Executor(X::AgentCreation("preflight".into()))),
+            ApiError::InternalError { .. }
+        ));
     }
 }

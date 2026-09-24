@@ -76,9 +76,12 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// embed-after-insert behavior (there is no vector to reuse).
 ///
 /// On `Some`, the returned `String` is the ALREADY-GENERATED embedding,
-/// pgvector-formatted, so the caller can store it directly
-/// (`ClaimRepository::store_embedding`) instead of calling `embed_and_store`
-/// again and paying for a second embedding call. (Only the formatted string
+/// pgvector-formatted, so the caller can hand it straight to
+/// `claim_helper::embed_claim_author_stamped`'s `pending_embedding` parameter
+/// instead of paying for a second embedding call. (Storing it "directly" through
+/// `ClaimRepository::store_embedding` — which this sentence used to recommend —
+/// is the unstamped write that `claims_tenancy` refuses; the stamped store is the
+/// only one that lands.) (Only the formatted string
 /// is returned, not the raw `Vec<f32>` — no caller needs the unformatted
 /// vector, and carrying a dead 1536-element `Vec<f32>` through every
 /// caller's match arm would be pure waste.)
@@ -90,13 +93,15 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// server-wide trait-object refactor.
 pub async fn decide(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn epigraph_embeddings::EmbeddingService,
     content: &str,
     novelty_threshold: f64,
 ) -> Option<(GateDecision, String)> {
     let vector = embedder.generate(content).await.ok()?;
     let pgvec = crate::embed::format_pgvector(&vector);
-    let nearest = match ClaimRepository::nearest_by_embedding(pool, &pgvec, NEAREST_K).await {
+    let nearest = match ClaimRepository::nearest_by_embedding(pool, viewer, &pgvec, NEAREST_K).await
+    {
         Ok(hits) => hits,
         Err(e) => {
             tracing::warn!("novelty gate: nearest_by_embedding failed: {e}");
@@ -267,9 +272,17 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(&pool, &embedder, text, DEFAULT_NOVELTY_THRESHOLD)
-            .await
-            .expect("decide must succeed with a working mock embedder");
+        let (decision, _pgvec) = decide(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &embedder,
+            text,
+            DEFAULT_NOVELTY_THRESHOLD,
+        )
+        .await
+        .expect("decide must succeed with a working mock embedder");
 
         assert_eq!(
             decision,
@@ -309,9 +322,17 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(&pool, &embedder, text, 0.0)
-            .await
-            .expect("decide must succeed with a working mock embedder");
+        let (decision, _pgvec) = decide(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            &embedder,
+            text,
+            0.0,
+        )
+        .await
+        .expect("decide must succeed with a working mock embedder");
 
         assert_eq!(
             decision,
@@ -330,6 +351,9 @@ mod tests {
 
         let (decision, _pgvec) = decide(
             &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
             &embedder,
             "an utterly unrelated claim with no corpus neighbors",
             DEFAULT_NOVELTY_THRESHOLD,

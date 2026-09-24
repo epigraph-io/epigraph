@@ -20,9 +20,12 @@
 //! Checking only (a) — "no BBA whose perspective_id lacks a live edge" — passes
 //! while (b) is still broken, which is why both invariants are asserted.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 
-use common::{admin_auth, build_test_server, seed_claim, seed_claim_with_belief};
+use common::{admin_auth, build_scoped_test_server, seed_claim, seed_claim_with_belief};
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
 use epigraph_mcp::tools::supersede::mark_duplicate;
 use epigraph_mcp::types::{LinkEpistemicParams, MarkDuplicateParams};
@@ -31,12 +34,14 @@ use uuid::Uuid;
 
 async fn wire(
     server: &epigraph_mcp::server::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     s: Uuid,
     t: Uuid,
     relationship: &str,
 ) {
     let result = do_link_epistemic(
         server,
+        viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -67,12 +72,14 @@ async fn wire(
 /// collision guards inspect, and it exists either way.
 async fn link_only(
     server: &epigraph_mcp::server::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     s: Uuid,
     t: Uuid,
     relationship: &str,
 ) {
     do_link_epistemic(
         server,
+        viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -98,11 +105,13 @@ fn body(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 
 async fn dedup(
     server: &epigraph_mcp::server::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     dup: Uuid,
     canonical: Uuid,
 ) -> serde_json::Value {
     let result = mark_duplicate(
         server,
+        viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
@@ -143,13 +152,22 @@ async fn edge_bba(
 /// The canonical combine pipeline's answer for `claim` on the binary frame,
 /// computed WITHOUT writing.
 async fn preview_betp(pool: &PgPool, claim_id: Uuid) -> Option<f64> {
-    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(pool)
-        .await
-        .expect("binary frame");
-    epigraph_engine::edge_factor::preview_claim_belief_on_frame(pool, claim_id, frame_id)
-        .await
-        .expect("preview")
-        .map(|p| p.pignistic_prob)
+    let viewer = fixture::public_viewer(pool).await;
+    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("binary frame");
+    epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        claim_id,
+        frame_id,
+    )
+    .await
+    .expect("preview")
+    .map(|p| p.pignistic_prob)
 }
 
 async fn cached_betp(pool: &PgPool, claim_id: Uuid) -> Option<f64> {
@@ -192,7 +210,11 @@ async fn stranded_bba_count(pool: &PgPool) -> i64 {
 /// recomputed AFTER those repairs.
 #[sqlx::test(migrations = "../../migrations")]
 async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
     let dup = seed_claim(&pool, "duplicate claim", 0.5).await;
@@ -201,9 +223,9 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
     // U supports only the duplicate — the plain migration case.
     let u = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
 
-    wire(&server, t, dup, "corroborates").await;
-    wire(&server, t, canonical, "corroborates").await;
-    wire(&server, u, dup, "supports").await;
+    wire(&server, &viewer, t, dup, "corroborates").await;
+    wire(&server, &viewer, t, canonical, "corroborates").await;
+    wire(&server, &viewer, u, dup, "supports").await;
 
     assert_eq!(orphaned_bba_count(&pool).await, 0, "fixture starts clean");
     assert_eq!(stranded_bba_count(&pool).await, 0, "fixture starts clean");
@@ -222,6 +244,7 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
 
     mark_duplicate(
         &server,
+        &viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
@@ -259,14 +282,21 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
     );
 
     // ...and canonical's cache must reflect that merged set, not the pre-repair one.
-    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool)
-        .await
-        .expect("binary frame");
-    let coherent =
-        epigraph_engine::edge_factor::preview_claim_belief_on_frame(&pool, canonical, frame_id)
-            .await
-            .expect("preview")
-            .expect("canonical has BBAs");
+    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("binary frame");
+    let coherent = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        canonical,
+        frame_id,
+    )
+    .await
+    .expect("preview")
+    .expect("canonical has BBAs");
     let cached: Option<f64> = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
         .bind(canonical)
         .fetch_one(&pool)
@@ -296,25 +326,29 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
 /// fixture that discriminates.
 #[sqlx::test(migrations = "../../migrations")]
 async fn resourced_outgoing_edge_bba_is_re_derived_from_canonical(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // `canonical` earns a HIGH interval from its own supporter W, so it is a
     // real (BBA-backed) interval rather than a hand-planted column value.
     let w = seed_claim_with_belief(&pool, 0.95, 0.98, Some(0.96)).await;
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
-    wire(&server, w, canonical, "supports").await;
+    wire(&server, &viewer, w, canonical, "supports").await;
 
     // `dup` carries a deliberately LOW interval, so a BBA frozen from it is
     // numerically distinguishable from one derived from `canonical`.
     let dup = seed_claim_with_belief(&pool, 0.15, 0.25, Some(0.2)).await;
     let v = seed_claim(&pool, "downstream claim V", 0.5).await;
-    wire(&server, dup, v, "supports").await;
+    wire(&server, &viewer, dup, v, "supports").await;
 
     let (edge_before, masses_before) = edge_bba(&pool, dup, v, "supports")
         .await
         .expect("fixture: dup --supports--> V carries a BBA on V");
 
-    let json = dedup(&server, dup, canonical).await;
+    let json = dedup(&server, &viewer, dup, canonical).await;
 
     // The edge itself moved to `canonical`...
     let (edge_after, masses_after) = edge_bba(&pool, canonical, v, "supports")
@@ -378,7 +412,11 @@ async fn resourced_outgoing_edge_bba_is_re_derived_from_canonical(pool: PgPool) 
 /// V afterwards.
 #[sqlx::test(migrations = "../../migrations")]
 async fn target_of_both_a_collision_delete_and_a_resourced_edge_is_recomputed_last(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Factorless canonical: NULL belief/plausibility, exactly as
     // `ClaimRepository::supersede` and a plain `submit_claim` leave a claim.
@@ -391,19 +429,19 @@ async fn target_of_both_a_collision_delete_and_a_resourced_edge_is_recomputed_la
     //     "outgoing dup-edge whose migrated triple already exists" pre-delete
     //     looks at. It drops `dup --supports--> V`, putting V into
     //     `DedupRepair::stale_claims`.
-    link_only(&server, canonical, v, "supports").await;
-    wire(&server, dup, v, "supports").await;
+    link_only(&server, &viewer, canonical, v, "supports").await;
+    wire(&server, &viewer, dup, v, "supports").await;
     // (2) The survivor: no `canonical --corroborates--> V` exists, so this edge
     //     is re-sourced rather than dropped, putting V into
     //     `DedupRepair::resourced_edges` as well.
-    wire(&server, dup, v, "corroborates").await;
+    wire(&server, &viewer, dup, v, "corroborates").await;
 
     assert!(
         cached_betp(&pool, v).await.is_some(),
         "fixture: V starts with a cached BetP derived from dup's BBAs"
     );
 
-    let json = dedup(&server, dup, canonical).await;
+    let json = dedup(&server, &viewer, dup, canonical).await;
 
     assert_eq!(orphaned_bba_count(&pool).await, 0);
     assert_eq!(stranded_bba_count(&pool).await, 0);
@@ -466,7 +504,11 @@ async fn target_of_both_a_collision_delete_and_a_resourced_edge_is_recomputed_la
 /// run.
 #[sqlx::test(migrations = "../../migrations")]
 async fn bba_free_dedup_leaves_the_survivors_derived_columns_alone(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
     let dup = seed_claim(&pool, "duplicate claim", 0.5).await;
@@ -500,7 +542,7 @@ async fn bba_free_dedup_leaves_the_survivors_derived_columns_alone(pool: PgPool)
          exactly why an unconditional clear is a mutation"
     );
 
-    let json = dedup(&server, dup, canonical).await;
+    let json = dedup(&server, &viewer, dup, canonical).await;
 
     let after = read(canonical, pool.clone()).await;
     assert_eq!(

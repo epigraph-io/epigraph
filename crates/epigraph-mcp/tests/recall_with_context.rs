@@ -15,10 +15,14 @@
 //!     against the entity-type allowlist; paper-attribution uses
 //!     `'paper'` / `'claim'`, all other edges `'claim'` / `'claim'`.
 
+#[path = "viewer_fixture.rs"]
+mod viewerfx;
+
 // rustfmt 1.8 sorts `NeighborPath` before `__test_only`; older CI rustfmt sorts
 // the reverse. #[rustfmt::skip] keeps both happy by opting out of the sort.
 #[rustfmt::skip]
 use epigraph_mcp::tools::recall::{
+    EdgeDirection,
     __test_only::{assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population},
     NeighborPath,
 };
@@ -29,6 +33,10 @@ mod fixture {
     use super::*;
 
     pub struct Fixture {
+        /// The agent every fixture claim is authored by. Exposed so tests that
+        /// add their own claims reuse it — `seed_agent` pins a fixed public_key
+        /// and `agents_public_key_unique` rejects a second call.
+        pub agent_id: Uuid,
         #[allow(dead_code)]
         pub paper_a: Uuid,
         #[allow(dead_code)]
@@ -56,7 +64,7 @@ mod fixture {
         format!("[{}]", v.join(","))
     }
 
-    async fn seed_agent(pool: &PgPool) -> Uuid {
+    pub async fn seed_agent(pool: &PgPool) -> Uuid {
         let agent_id = Uuid::new_v4();
         sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, decode($2, 'hex'))")
             .bind(agent_id)
@@ -75,7 +83,7 @@ mod fixture {
         h
     }
 
-    async fn insert_claim(
+    pub async fn insert_claim(
         pool: &PgPool,
         agent_id: Uuid,
         id: Uuid,
@@ -113,7 +121,7 @@ mod fixture {
         }
     }
 
-    async fn insert_edge(
+    pub async fn insert_edge(
         pool: &PgPool,
         source_id: Uuid,
         source_type: &str,
@@ -368,6 +376,7 @@ mod fixture {
         .await;
 
         Fixture {
+            agent_id,
             paper_a,
             paper_b,
             section,
@@ -386,9 +395,11 @@ async fn truncation_flags_when_siblings_limit_below_total(pool: PgPool) {
     let fx = fixture::build(&pool).await;
     let ctx = fetch_batched_context(
         &pool,
+        &viewerfx::public_viewer(&pool).await,
         &[fx.paragraphs[0]],
         /*siblings_limit=*/ 2,
         /*corroborates_limit=*/ 4,
+        /*epistemic_limit=*/ 4,
     )
     .await
     .expect("fetch_batched_context");
@@ -413,9 +424,16 @@ async fn truncation_flags_when_siblings_limit_below_total(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn bridge_to_paragraphs_populated(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .expect("fetch_batched_context");
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .expect("fetch_batched_context");
 
     let atoms = ctx
         .atoms_by_paragraph
@@ -446,9 +464,16 @@ async fn bridge_to_paragraphs_populated(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn corroborates_includes_paper_doi(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .expect("fetch_batched_context");
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .expect("fetch_batched_context");
 
     let corr = ctx
         .corroborates_by_paragraph
@@ -466,9 +491,16 @@ async fn corroborates_appears_on_both_endpoints_when_both_in_result_set(pool: Pg
     let fx = fixture::build(&pool).await;
     // paragraphs[0] -[CORROBORATES]-> corroborates_target.
     // Pass BOTH as paragraph_ids so each should see the other in its list.
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0], fx.corroborates_target], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0], fx.corroborates_target],
+        8,
+        4,
+        4,
+    )
+    .await
+    .unwrap();
 
     // paragraphs[0] sees corroborates_target as a neighbor.
     let p0_corr = ctx
@@ -513,6 +545,7 @@ async fn corroborates_appears_on_both_endpoints_when_both_in_result_set(pool: Pg
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_crypto::AgentSigner;
     use epigraph_mcp::embed::McpEmbedder;
     use epigraph_mcp::tools::recall::{recall_with_context, RecallWithContextParams};
@@ -522,7 +555,7 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
     let _fx = fixture::build(&pool).await;
 
     // Sanity: helper reports 0.0 for the unpopulated 3072 column.
-    let frac = paragraph_3072_population(&pool)
+    let frac = paragraph_3072_population(&pool, &viewerfx::public_viewer(&pool).await)
         .await
         .expect("paragraph_3072_population helper");
     assert_eq!(
@@ -542,6 +575,7 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
         paper_doi_filter: None,
         siblings_limit: None,
         corroborates_limit: None,
+        epistemic_limit: None,
         neighbor_paragraphs_limit: None,
         diverse: None,
         max_themes: None,
@@ -555,9 +589,11 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
         graph_expansion_depth: None,
         exclude_contested: false,
         since: None,
+        epistemic_partition: false,
+        diversity_radius: None,
     };
 
-    let result = recall_with_context(&server, params).await;
+    let result = recall_with_context(&server, &viewer, params).await;
     let err = result.expect_err("expected an error for centroid_dim=3072 with no population");
     let msg = format!("{err:?}");
     assert!(
@@ -569,9 +605,16 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_include_continues_argument(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .unwrap();
     let neighbors = ctx
         .continues_argument_by_paragraph
         .get(&fx.paragraphs[0])
@@ -590,9 +633,16 @@ async fn neighbor_paragraphs_include_continues_argument(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_include_atom_atom_bridge(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .unwrap();
     // shared_atom (paper A) -[same_as]-> paper_b_atom (paper B);
     // paper_b_atom is a child of corroborates_target.
     let links = ctx
@@ -620,9 +670,16 @@ async fn neighbor_paragraphs_include_atom_atom_bridge(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_dedupe_and_via_aggregation(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .unwrap();
 
     let atoms = ctx
         .atoms_by_paragraph
@@ -715,9 +772,16 @@ async fn neighbor_paragraphs_dedupe_and_via_aggregation(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_truncation_flag_when_over_limit(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
-        .await
-        .unwrap();
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .unwrap();
 
     let atoms = ctx
         .atoms_by_paragraph
@@ -937,6 +1001,7 @@ fn diverse_params_with_pool(
         paper_doi_filter: None,
         siblings_limit: None,
         corroborates_limit: None,
+        epistemic_limit: None,
         neighbor_paragraphs_limit: None,
         diverse: Some(diverse),
         max_themes,
@@ -950,6 +1015,8 @@ fn diverse_params_with_pool(
         graph_expansion_depth: None,
         exclude_contested: false,
         since: None,
+        epistemic_partition: false,
+        diversity_radius: None,
     }
 }
 
@@ -992,6 +1059,7 @@ fn parse_response(result: rmcp::model::CallToolResult) -> RecallResponseStruct {
 /// flat ANN and still return results. Mirrors the REST fallback.
 #[sqlx::test(migrations = "../../migrations")]
 async fn diverse_mode_falls_back_to_flat_when_themes_empty(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1015,7 +1083,7 @@ async fn diverse_mode_falls_back_to_flat_when_themes_empty(pool: PgPool) {
 
     let server = build_test_server(pool.clone());
     let params = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 10);
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &pgvec)
         .await
         .expect("diverse-on-empty-themes must succeed");
     let resp = parse_response(result);
@@ -1039,6 +1107,7 @@ async fn diverse_mode_falls_back_to_flat_when_themes_empty(pool: PgPool) {
 /// Compares against `ClaimRepository::search_by_embedding` directly.
 #[sqlx::test(migrations = "../../migrations")]
 async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1065,15 +1134,21 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     // Reference: direct call to the same repo function recall_with_context
     // uses in diverse=false mode. If diverse=false matches this ordering
     // verbatim, the diverse-routing change preserves the flat path.
-    let direct_hits =
-        epigraph_db::ClaimRepository::search_by_embedding(&pool, &query_pgvec, 1536, 10, None)
-            .await
-            .expect("direct flat ANN");
+    let direct_hits = epigraph_db::ClaimRepository::search_by_embedding(
+        &pool,
+        &viewer,
+        &query_pgvec,
+        1536,
+        10,
+        None,
+    )
+    .await
+    .expect("direct flat ANN");
     let direct_order: Vec<Uuid> = direct_hits.iter().map(|h| h.claim_id).collect();
 
     let server = build_test_server(pool.clone());
     let params = diverse_params(/*diverse=*/ false, None, None, 10);
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
         .await
         .expect("diverse=false");
     let resp = parse_response(result);
@@ -1095,6 +1170,7 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
 /// strictly excluded by SQL `LIMIT 20`) appear.
 #[sqlx::test(migrations = "../../migrations")]
 async fn candidate_pool_20_restricts_mcp_diverse_pool(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1132,7 +1208,7 @@ async fn candidate_pool_20_restricts_mcp_diverse_pool(pool: PgPool) {
         /*candidate_pool=*/ Some(20),
     );
 
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
         .await
         .expect("recall_with_context with candidate_pool=20");
     let resp = parse_response(result);
@@ -1165,6 +1241,7 @@ async fn candidate_pool_20_restricts_mcp_diverse_pool(pool: PgPool) {
 /// could never enter the candidate matrix.
 #[sqlx::test(migrations = "../../migrations")]
 async fn candidate_pool_200_widens_mcp_diverse_pool(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1201,7 +1278,7 @@ async fn candidate_pool_200_widens_mcp_diverse_pool(pool: PgPool) {
         /*candidate_pool=*/ Some(200),
     );
 
-    let result = recall_with_context_with_pgvec(&server, params, 1536, &query_pgvec)
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
         .await
         .expect("recall_with_context with candidate_pool=200");
     let resp = parse_response(result);
@@ -1227,6 +1304,7 @@ async fn candidate_pool_200_widens_mcp_diverse_pool(pool: PgPool) {
 /// pulls in ≥1 from theme_b for graph coverage.
 #[sqlx::test(migrations = "../../migrations")]
 async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1283,9 +1361,10 @@ async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
 
     // Flat baseline: hit count by theme.
     let flat_params = diverse_params(/*diverse=*/ false, None, None, 5);
-    let flat_result = recall_with_context_with_pgvec(&server, flat_params, 1536, &query_pgvec)
-        .await
-        .expect("flat baseline");
+    let flat_result =
+        recall_with_context_with_pgvec(&server, &viewer, flat_params, 1536, &query_pgvec)
+            .await
+            .expect("flat baseline");
     let flat_resp = parse_response(flat_result);
     assert_eq!(
         flat_resp.results.len(),
@@ -1315,7 +1394,7 @@ async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
     // Diverse path: budget 5, alpha 0.4 (MCP default).
     let diverse_params_v = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 5);
     let diverse_result =
-        recall_with_context_with_pgvec(&server, diverse_params_v, 1536, &query_pgvec)
+        recall_with_context_with_pgvec(&server, &viewer, diverse_params_v, 1536, &query_pgvec)
             .await
             .expect("diverse path");
     let diverse_resp = parse_response(diverse_result);
@@ -1358,6 +1437,7 @@ async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
 /// rather than relying on the plain-`recall` coverage.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1418,6 +1498,7 @@ async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let result = recall_with_context_with_pgvec(
         &server,
+        &viewer,
         diverse_params(false, None, None, 10),
         1536,
         &pgvec,
@@ -1478,6 +1559,14 @@ async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
 /// evidence that this surface does — they are separate handlers.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
+    // A viewer for a REAL principal, not the nil one: the audit row is owned by
+    // the request principal's personal group, and a principal that is not an
+    // agent has none — so the write correctly drops rather than widening. See
+    // `recall_audit_wiring.rs::principal_viewer`.
+    let (audit_principal, _audit_group) = viewerfx::seed_agent_with_group(&pool, "rwc-audit").await;
+    let viewer = epigraph_db::Viewer::resolve(&pool, audit_principal)
+        .await
+        .expect("resolve the request principal");
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;
@@ -1486,9 +1575,14 @@ async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
     let para =
         diverse_fixture::seed_paragraph(&pool, agent, paper, "audited para", &pgvec, None).await;
 
-    let server = build_test_server(pool.clone());
+    // WITH a `ScopedPool`: the audit owner is read on a transaction stamped from
+    // the principal's own viewer and never minted (#493); without one the row
+    // is dropped. See `recall_audit_wiring.rs::build_test_server`.
+    let server =
+        build_test_server(pool.clone()).with_scoped_pool(viewerfx::scoped_pool(&pool).await);
     let result = recall_with_context_with_pgvec(
         &server,
+        &viewer,
         diverse_params(false, None, None, 10),
         1536,
         &pgvec,
@@ -1532,5 +1626,208 @@ async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
     assert!(
         ids.contains(&para),
         "the audit row records the paragraph ids actually returned"
+    );
+}
+
+/// Regression guard for backlog claim 922a1e54.
+///
+/// `recall_with_context`'s structural context advertised epistemic-edge
+/// neighbours (the `EpistemicEdgeNeighbor` type and the
+/// `epistemic_edges_by_paragraph` field both shipped), but the field was bound
+/// with `let` rather than `let mut` and initialised to an empty map, so it was
+/// structurally incapable of ever being populated. A hit therefore arrived
+/// without the relationships that determine whether it should be believed.
+///
+/// Asserts BOTH directions, because direction carries the meaning: `refutes`
+/// read backwards is "is refuted by".
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_populated_in_both_directions(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let agent_id = fx.agent_id;
+
+    // Incoming: refuter --refutes--> paragraphs[0]
+    let refuter = Uuid::new_v4();
+    fixture::insert_claim(&pool, agent_id, refuter, "a refuting claim", 2, None).await;
+    fixture::insert_edge(
+        &pool,
+        refuter,
+        "claim",
+        fx.paragraphs[0],
+        "claim",
+        "refutes",
+        None,
+    )
+    .await;
+
+    // Outgoing: paragraphs[0] --supports--> supported
+    let supported = Uuid::new_v4();
+    fixture::insert_claim(&pool, agent_id, supported, "a supported claim", 2, None).await;
+    fixture::insert_edge(
+        &pool,
+        fx.paragraphs[0],
+        "claim",
+        supported,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .expect("fetch_batched_context");
+
+    let edges = ctx
+        .epistemic_edges_by_paragraph
+        .get(&fx.paragraphs[0])
+        .unwrap_or_else(|| {
+            panic!(
+                "no epistemic edges for paragraph {} — the context payload never traverses \
+                 supports/refutes/contradicts/specializes/elaborates/cites (claim 922a1e54)",
+                fx.paragraphs[0]
+            )
+        });
+
+    let incoming = edges
+        .iter()
+        .find(|e| e.claim_id == refuter)
+        .expect("incoming refutes neighbour missing");
+    assert_eq!(incoming.relationship, "refutes");
+    assert!(
+        matches!(incoming.direction, EdgeDirection::Incoming),
+        "refuter is the edge SOURCE, so from the paragraph's view it is Incoming"
+    );
+
+    let outgoing = edges
+        .iter()
+        .find(|e| e.claim_id == supported)
+        .expect("outgoing supports neighbour missing");
+    assert_eq!(outgoing.relationship, "supports");
+    assert!(
+        matches!(outgoing.direction, EdgeDirection::Outgoing),
+        "paragraph is the edge SOURCE, so from the paragraph's view it is Outgoing"
+    );
+
+    assert_eq!(
+        ctx.epistemic_edges_total_by_paragraph
+            .get(&fx.paragraphs[0])
+            .copied(),
+        Some(2),
+        "total must count every epistemic neighbour, not just the returned page"
+    );
+}
+
+/// `decomposes_to` and `continues_argument` are structural, not epistemic, and
+/// are already carried by their own fields. Including them here would double-count
+/// the document skeleton as argument.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_exclude_structural_relationships(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+
+    // The fixture already wires decomposes_to and continues_argument on paragraphs[0].
+    let edges = ctx_edges(&pool, fx.paragraphs[0]).await;
+    for e in &edges {
+        assert!(
+            !matches!(
+                e.relationship.as_str(),
+                "decomposes_to" | "continues_argument"
+            ),
+            "structural relationship {} leaked into the epistemic-edge payload",
+            e.relationship
+        );
+    }
+}
+
+async fn ctx_edges(
+    pool: &PgPool,
+    paragraph: Uuid,
+) -> Vec<epigraph_mcp::tools::recall::EpistemicEdgeNeighbor> {
+    let ctx = fetch_batched_context(
+        pool,
+        &viewerfx::public_viewer(pool).await,
+        &[paragraph],
+        8,
+        4,
+        4,
+    )
+    .await
+    .expect("fetch_batched_context");
+    ctx.epistemic_edges_by_paragraph
+        .get(&paragraph)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Tenancy guard for the epistemic-edge query.
+///
+/// The query in `7b. Epistemic-edge neighbours` was authored on a branch where
+/// `Viewer` did not exist, so it arrived carrying no visibility predicate while the
+/// other ten queries in `fetch_batched_context` all carry the static three-bind form.
+///
+/// Both branches merely ADDED a parameter to `fetch_batched_context`, so git
+/// conflicted only on the test call sites in this file. Resolving those the obvious
+/// way — passing both arguments — produces a tree that compiles, passes, and returns
+/// epistemic-edge neighbours across tenancy boundaries. Nothing in the merge surfaces
+/// that. This test is what surfaces it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_respect_the_viewer_boundary(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+
+    // A claim owned by a REAL group the public viewer is not a member of.
+    // `seed_group` returns the migration-062 seed sentinel, which the
+    // `claims_group_needs_real_group` CHECK rejects as an owner — the group has to
+    // be one an agent actually belongs to.
+    let (other_agent, other_group) =
+        viewerfx::seed_agent_with_group(&pool, "epistemic-edge-tenancy-guard").await;
+    let hidden = viewerfx::seed_group_claim(
+        &pool,
+        other_agent,
+        other_group,
+        "out-of-group refutation that must not leak through the context payload",
+    )
+    .await;
+
+    // It refutes a paragraph the viewer CAN see. The edge is legitimate; the
+    // question is only whether its far endpoint is disclosed.
+    fixture::insert_edge(
+        &pool,
+        hidden,
+        "claim",
+        fx.paragraphs[0],
+        "claim",
+        "refutes",
+        None,
+    )
+    .await;
+
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .expect("fetch_batched_context");
+
+    let leaked: Vec<_> = ctx
+        .epistemic_edges_by_paragraph
+        .get(&fx.paragraphs[0])
+        .map(|v| v.iter().filter(|e| e.claim_id == hidden).collect())
+        .unwrap_or_default();
+
+    assert!(
+        leaked.is_empty(),
+        "a public viewer received an epistemic-edge neighbour owned by another group: \
+         {leaked:?}. The query in `7b. Epistemic-edge neighbours` is missing the \
+         visibility predicate its ten sibling queries carry."
     );
 }

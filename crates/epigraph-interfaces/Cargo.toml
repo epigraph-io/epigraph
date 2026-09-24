@@ -1,10 +1,21 @@
 [package]
 name = "epigraph-interfaces"
-description = "Extension point traits for the EpiGraph open kernel (EncryptionProvider, PolicyGate, OrchestrationBackend)"
+description = "Extension point traits for the EpiGraph open kernel (PolicyGate, LlmProvider)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[features]
+# Compiles `policy::AllowAllPolicyGate`, which permits every write.
+#
+# NOTHING IN THIS WORKSPACE ENABLES IT, and nothing should: no [features] table
+# forwards it and no dev-dependencies entry requests it. It exists because plan
+# §2.7 prescribes `#[cfg(any(test, feature = "insecure-allow-all"))]` and
+# because `cfg(test)` alone does not cross a crate boundary. See the type's own
+# doc comment for the feature-unification hazard this inherits from
+# `progress.json`'s Q4.
+insecure-allow-all = []
 
 [dependencies]
 async-trait = { workspace = true }

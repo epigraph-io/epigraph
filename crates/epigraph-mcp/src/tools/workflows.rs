@@ -92,11 +92,12 @@ pub async fn get_workflow_executions(
 /// not promote (applying a promotion is a separate, deliberate step).
 pub async fn evaluate_workflow_promotion(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: EvaluateWorkflowPromotionParams,
 ) -> Result<CallToolResult, McpError> {
     let variant_id = parse_uuid(params.workflow_id.trim())?;
     let window = params.window.unwrap_or(50).clamp(1, 500);
-    let assessment = assess_workflow_promotion(server, variant_id, window).await?;
+    let assessment = assess_workflow_promotion(server, viewer, variant_id, window).await?;
     success_json(&assessment.to_json())
 }
 
@@ -154,6 +155,7 @@ impl PromotionAssessment {
 /// the Wilson gate. A lineage root yields `verdict: None`.
 async fn assess_workflow_promotion(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     variant_id: uuid::Uuid,
     window: i64,
 ) -> Result<PromotionAssessment, McpError> {
@@ -162,7 +164,7 @@ async fn assess_workflow_promotion(
     };
     let config = WorkflowPromotionConfig::default();
 
-    let parent_id = WorkflowRepository::immediate_variant_parent(&server.pool, variant_id)
+    let parent_id = WorkflowRepository::immediate_variant_parent(&server.pool, viewer, variant_id)
         .await
         .map_err(|e| internal_error(e.to_string()))?;
 
@@ -213,11 +215,12 @@ async fn assess_workflow_promotion(
 /// job calls this per candidate variant; `find_workflow` surfaces the flag.
 pub async fn refresh_workflow_promotion(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: EvaluateWorkflowPromotionParams,
 ) -> Result<CallToolResult, McpError> {
     let variant_id = parse_uuid(params.workflow_id.trim())?;
     let window = params.window.unwrap_or(50).clamp(1, 500);
-    let assessment = assess_workflow_promotion(server, variant_id, window).await?;
+    let assessment = assess_workflow_promotion(server, viewer, variant_id, window).await?;
 
     let Some(verdict) = &assessment.verdict else {
         return success_json(&serde_json::json!({
@@ -306,6 +309,7 @@ fn slugify_workflow_goal(s: &str) -> String {
 /// UUID from `(canonical_name, generation)`. Idempotent on `canonical_name`.
 pub async fn store_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: StoreWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
     use epigraph_ingest::common::schema::ThesisDerivation;
@@ -362,7 +366,8 @@ pub async fn store_workflow(
 
     let (response, inserted) =
         crate::tools::workflow_ingest::execute_workflow_ingest_with_inserted(
-            &server.pool,
+            server,
+            viewer,
             &extraction,
         )
         .await?;
@@ -407,6 +412,7 @@ pub async fn store_workflow(
 
 pub async fn find_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: FindWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
     // Generate embedding once — reused for both semantic search and behavioral
@@ -422,7 +428,7 @@ pub async fn find_workflow(
         }
     };
 
-    find_workflow_post_embed(server, &params, pgvec_opt).await
+    find_workflow_post_embed(server, viewer, &params, pgvec_opt).await
 }
 
 /// Post-embedding pipeline: shared by `find_workflow` and the
@@ -434,6 +440,7 @@ pub async fn find_workflow(
 /// sites cannot drift, mirroring recall.rs's wrapper pattern.
 async fn find_workflow_post_embed(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: &FindWorkflowParams,
     pgvec_opt: Option<String>,
 ) -> Result<CallToolResult, McpError> {
@@ -447,6 +454,7 @@ async fn find_workflow_post_embed(
     let semantic_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
         ClaimRepository::search_by_embedding_scoped(
             &server.pool,
+            viewer,
             pgvec,
             limit * 3,
             Some(&workflow_tag),
@@ -463,6 +471,7 @@ async fn find_workflow_post_embed(
         if let Some(pgvec) = pgvec_opt.as_deref() {
             match BehavioralExecutionRepository::behavioral_affinity_lineage(
                 &server.pool,
+                viewer,
                 pgvec,
                 0.5, // min_similarity
                 1,   // min_executions
@@ -483,30 +492,105 @@ async fn find_workflow_post_embed(
             std::collections::HashMap::new()
         };
 
-    // Build results, enriching with behavioral data
-    let mut results = Vec::new();
-    for hit in semantic_hits {
-        if let Ok(Some(claim)) = ClaimRepository::get_by_id(
+    // Hierarchical leg (backlog 18168514). `store_workflow` writes a row in the
+    // `workflows` table and labels its claims `workflow_thesis` / `workflow_step`
+    // — never `workflow` — so the label-scoped passes above could NEVER return
+    // anything `store_workflow` produced. Searching only the flat store made
+    // that tool's output permanently invisible to the tool named to find it,
+    // which is the long-standing convention in epiclaw scheduled-task prompts.
+    //
+    // Best-effort: a failure here degrades to the flat-only behaviour rather
+    // than blanking the whole tool.
+    let hierarchical_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
+        WorkflowRepository::search_hierarchical_by_embedding_scored(
             &server.pool,
-            epigraph_core::ClaimId::from_uuid(hit.claim_id),
+            pgvec,
+            min_truth,
+            limit * 3,
         )
         .await
-        {
-            if let Some(r) = enrich_workflow_result(
-                &server.pool,
-                hit.claim_id,
-                &claim,
-                hit.similarity,
-                min_truth,
-                &affinity_map,
-            )
+        .unwrap_or_else(|e| {
+            tracing::warn!("hierarchical workflow embedding search failed: {e}");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
+    // Step texts for the hierarchical candidates, resolved in ONE query before
+    // ranking. A `workflows` row carries no inline steps, and a result with an
+    // empty `steps` array is precisely what caused the 2026-08-18 incident, so
+    // rows whose steps cannot be resolved are dropped below rather than
+    // surfaced hollow.
+    let hierarchical_ids: Vec<uuid::Uuid> = hierarchical_hits.iter().map(|r| r.id).collect();
+    let mut hierarchical_steps =
+        WorkflowRepository::step_texts_for_hierarchical(&server.pool, viewer, &hierarchical_ids)
             .await
-            {
-                results.push(r);
-            }
-        }
+            .unwrap_or_else(|e| {
+                tracing::warn!("hierarchical step resolution failed: {e}");
+                std::collections::HashMap::new()
+            });
+
+    // Merge both stores onto ONE ranked list before truncating to `limit`.
+    // Appending the hierarchical leg after the flat leg had already consumed
+    // the budget would leave the measured failure untouched: the two
+    // content-free flat records (305050d2, d32ee4e8) outrank everything for
+    // theme-maintenance queries, so they would still fill the window. Both
+    // legs score `1 - cosine_distance` from the SAME query embedding, so the
+    // similarities are directly comparable.
+    enum Candidate {
+        Flat(epigraph_db::ClaimEmbeddingHit),
+        Hierarchical(epigraph_db::ScoredHierarchicalWorkflowRow),
+    }
+    let mut candidates: Vec<(f64, Candidate)> =
+        Vec::with_capacity(semantic_hits.len() + hierarchical_hits.len());
+    for hit in semantic_hits {
+        candidates.push((hit.similarity, Candidate::Flat(hit)));
+    }
+    for row in hierarchical_hits {
+        candidates.push((row.similarity, Candidate::Hierarchical(row)));
+    }
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    // Build results, enriching with behavioral data
+    let mut results = Vec::new();
+    for (_, candidate) in candidates {
         if results.len() >= limit as usize {
             break;
+        }
+        match candidate {
+            Candidate::Flat(hit) => {
+                if let Ok(Some(claim)) = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    epigraph_core::ClaimId::from_uuid(hit.claim_id),
+                )
+                .await
+                {
+                    if let Some(r) = enrich_workflow_result(
+                        &server.pool,
+                        viewer,
+                        hit.claim_id,
+                        &claim,
+                        hit.similarity,
+                        min_truth,
+                        &affinity_map,
+                    )
+                    .await
+                    {
+                        results.push(r);
+                    }
+                }
+            }
+            Candidate::Hierarchical(row) => {
+                let steps = hierarchical_steps.remove(&row.id).unwrap_or_default();
+                if let Some(r) =
+                    hierarchical_workflow_result(&server.pool, viewer, &row, steps, &affinity_map)
+                        .await
+                {
+                    results.push(r);
+                }
+            }
         }
     }
 
@@ -522,6 +606,7 @@ async fn find_workflow_post_embed(
     if results.len() < half {
         let text_hits = ClaimRepository::search_by_label_and_text(
             &server.pool,
+            viewer,
             &["workflow".to_string()],
             &params.goal,
             min_truth,
@@ -546,6 +631,7 @@ async fn find_workflow_post_embed(
             }
             if let Some(r) = enrich_workflow_result(
                 &server.pool,
+                viewer,
                 claim_uuid,
                 &claim,
                 0.0, // text-fallback hit; no semantic similarity score
@@ -559,7 +645,153 @@ async fn find_workflow_post_embed(
         }
     }
 
+    // Hierarchical half of the same fallback. Needed for more than symmetry:
+    // the embedding leg above is skipped entirely when the embedder is
+    // unavailable (`pgvec_opt` is None), which is also the configuration the
+    // integration tests run in — without this leg the union would be
+    // unreachable exactly where it is cheapest to verify.
+    if results.len() < half {
+        let text_rows = WorkflowRepository::search_hierarchical_by_text(
+            &server.pool,
+            &params.goal,
+            limit * 2,
+            min_truth,
+            false, // frozen steps, not lineage heads — see step_texts_for_hierarchical
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("search_hierarchical_by_text fallback failed: {e}");
+            Vec::new()
+        });
+
+        let already_seen: std::collections::HashSet<String> =
+            results.iter().map(|r| r.workflow_id.clone()).collect();
+        let text_ids: Vec<uuid::Uuid> = text_rows
+            .iter()
+            .filter(|r| !already_seen.contains(&r.id.to_string()))
+            .map(|r| r.id)
+            .collect();
+        let mut text_steps =
+            WorkflowRepository::step_texts_for_hierarchical(&server.pool, viewer, &text_ids)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("hierarchical step resolution failed: {e}");
+                    std::collections::HashMap::new()
+                });
+
+        for row in text_rows {
+            if results.len() >= limit_usize {
+                break;
+            }
+            if already_seen.contains(&row.id.to_string()) {
+                continue;
+            }
+            let scored = epigraph_db::ScoredHierarchicalWorkflowRow {
+                id: row.id,
+                canonical_name: row.canonical_name,
+                generation: row.generation,
+                goal: row.goal,
+                parent_id: row.parent_id,
+                metadata: row.metadata,
+                created_at: row.created_at,
+                truth_value: row.truth_value,
+                similarity: 0.0, // text-fallback hit; no semantic similarity score
+            };
+            let steps = text_steps.remove(&scored.id).unwrap_or_default();
+            if let Some(r) =
+                hierarchical_workflow_result(&server.pool, viewer, &scored, steps, &affinity_map)
+                    .await
+            {
+                results.push(r);
+            }
+        }
+    }
+
     success_json(&results)
+}
+
+/// Render a hierarchical `workflows` row into the same `FindWorkflowResult`
+/// shape the flat workflow claims use, so `find_workflow` can return both
+/// stores in one ranked list.
+///
+/// Returns `None` when `steps` is empty. That guard is the whole reason this
+/// function takes resolved steps rather than resolving them lazily: a
+/// `workflows` row holds no inline steps, and `FindWorkflowResult.steps` is a
+/// `Vec<String>` the caller is expected to execute. Emitting `[]` is exactly
+/// the shape that caused the 2026-08-18 incident — an agent instructed to
+/// "follow the best-matching workflow steps" got an empty array, fell back to
+/// a bare `theme_cluster` with `wipe_first=true`, and destroyed 76 themes. A
+/// step-less workflow is not a usable answer to "find me a workflow", so it is
+/// withheld rather than surfaced hollow.
+///
+/// The truth floor is NOT re-applied here: both hierarchical queries already
+/// filter on `truth_value >= min_truth` in SQL, which is also what drops
+/// `deprecate_workflow`'s 0.05 rows.
+async fn hierarchical_workflow_result(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    row: &epigraph_db::ScoredHierarchicalWorkflowRow,
+    steps: Vec<String>,
+    affinity_map: &std::collections::HashMap<uuid::Uuid, (f64, i64)>,
+) -> Option<FindWorkflowResult> {
+    if steps.is_empty() {
+        tracing::debug!(
+            workflow_id = %row.id,
+            "find_workflow: withholding hierarchical workflow with no resolvable steps"
+        );
+        return None;
+    }
+
+    // Counters live in `workflows.metadata`, written by
+    // `report_hierarchical_outcome`; the flat store keeps the equivalents
+    // inside the claim's JSON content.
+    let use_count = row
+        .metadata
+        .get("use_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let success_count = row
+        .metadata
+        .get("success_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+
+    let lineage_root = WorkflowRepository::find_lineage_root(pool, viewer, row.id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(workflow_id = %row.id, "find_lineage_root failed: {e}");
+            row.id
+        });
+    let (behavioral_affinity, behavioral_execution_count) = match affinity_map.get(&lineage_root) {
+        Some(&(sim, count)) => (Some(sim), Some(count)),
+        None => (None, None),
+    };
+
+    let behavioral_success_rate = if use_count > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        Some(success_count as f64 / use_count as f64)
+    } else {
+        None
+    };
+
+    Some(FindWorkflowResult {
+        workflow_id: row.id.to_string(),
+        goal: row.goal.clone(),
+        steps,
+        truth_value: row.truth_value,
+        similarity: row.similarity,
+        use_count,
+        success_count,
+        generation: i64::from(row.generation),
+        parent_id: row.parent_id.map(|id| id.to_string()),
+        behavioral_affinity,
+        behavioral_success_rate,
+        behavioral_execution_count,
+        // `promotable` is written by `refresh_workflow_promotion` onto the FLAT
+        // claim's `properties.promotion`; hierarchical rows have no equivalent
+        // field, so it stays absent rather than being faked as `false`.
+        promotable: None,
+    })
 }
 
 /// Build a `FindWorkflowResult` from a workflow claim, applying the shared
@@ -570,6 +802,7 @@ async fn find_workflow_post_embed(
 /// `find_workflow` to keep enrichment behavior identical.
 async fn enrich_workflow_result(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     workflow_id: uuid::Uuid,
     claim: &Claim,
     similarity: f64,
@@ -604,7 +837,7 @@ async fn enrich_workflow_result(
 
     // Look up behavioral data via lineage root (best-effort; reuse the
     // affinity_map already built from the original embedding query).
-    let lineage_root = WorkflowRepository::find_lineage_root(pool, workflow_id)
+    let lineage_root = WorkflowRepository::find_lineage_root(pool, viewer, workflow_id)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(workflow_id = %workflow_id, "find_lineage_root failed: {e}");
@@ -630,7 +863,7 @@ async fn enrich_workflow_result(
 
     // Promotion flag set by the refresh_workflow_promotion maintenance pass.
     // Advisory metadata; best-effort (a lookup failure must not drop the result).
-    let promotable = ClaimRepository::promotion_flag(pool, ClaimId::from_uuid(workflow_id))
+    let promotable = ClaimRepository::promotion_flag(pool, viewer, ClaimId::from_uuid(workflow_id))
         .await
         .unwrap_or(None);
 
@@ -653,6 +886,7 @@ async fn enrich_workflow_result(
 
 pub async fn report_workflow_outcome(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ReportWorkflowOutcomeParams,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
@@ -664,6 +898,14 @@ pub async fn report_workflow_outcome(
     // flat-workflow path only when the id is not a hierarchical workflow
     // (preserves backward-compat for the ~144 legacy flat-workflow claims).
     let is_hierarchical: bool =
+        // VISIBILITY-EXEMPT: `workflows` is not in migration 062's `tier_a`
+        // array and carries neither `visibility` nor `owner_group_id` (verified
+        // against `information_schema.columns`), so no predicate can be written
+        // here. Same category as `papers` in `recall.rs::compute_corpus_scope`.
+        // What leaves the function is one boolean routing decision — which of
+        // two outcome paths to take — and both paths perform their own
+        // viewer-scoped reads. Owner of the residual: the PR that gives
+        // `workflows` tenancy columns (plan §2.4's registration pass).
         sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM workflows WHERE id = $1)")
             .bind(workflow_id)
             .fetch_one(&server.pool)
@@ -697,15 +939,18 @@ pub async fn report_workflow_outcome(
         .await;
     }
 
-    let claim =
-        ClaimRepository::get_by_id(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| {
-                invalid_params(format!(
-                    "workflow {workflow_id} not found in `workflows` or `claims` tables"
-                ))
-            })?;
+    let claim = ClaimRepository::get_by_id(
+        &server.pool,
+        viewer,
+        epigraph_core::ClaimId::from_uuid(workflow_id),
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| {
+        invalid_params(format!(
+            "workflow {workflow_id} not found in `workflows` or `claims` tables"
+        ))
+    })?;
 
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
@@ -739,7 +984,67 @@ pub async fn report_workflow_outcome(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    EvidenceRepository::create(&server.pool, &evidence)
+    // ── HISTORY: WHY THE EVIDENCE WRITE WAS ONCE LEFT UNSTAMPED ─────────
+    //
+    // Superseded by the D2 block below, which stamps it; kept because the
+    // measurement is what D2 had to answer. Same site, same argument and the same
+    // measurement as `tools::claims::update_with_evidence`, which was unstamped
+    // for this reason earlier in this branch. `evidence` is tier-A under migration 077's strict
+    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, so on the
+    // unstamped pool this INSERT is refused on a cleanly-migrated schema — and
+    // that refusal is currently the tool's WHOLE outcome, because nothing has
+    // been written before it.
+    //
+    // Stamping it cannot make this tool whole, and the obstruction is structural:
+    // migration 046 gives `mass_functions.evidence_id` a FK to `evidence(id)`, and
+    // `ds_auto::auto_wire_ds_update` below runs on a SIBLING pool connection that
+    // cannot see an uncommitted row. So a stamped evidence INSERT is forced to
+    // COMMIT ON ITS OWN, and the DS wiring that follows is itself unconverted —
+    // it writes `claim_frames`, which carries no orphan `*_privacy` policy and is
+    // therefore refused on BOTH configurations.
+    //
+    // MEASURED with the real binary over a unix socket as `epigraph_app`
+    // (`rolbypassrls = false`), on a legacy flat workflow claim owned by the MCP
+    // server agent's own group — the only ownership shape this stamp could ever
+    // serve — via `scripts/e2e/probe-workflow.sh`:
+    //
+    //   CONFIG A, stamped:   `evidence_rows=1`, then
+    //                        `assign_claim: … row-level security policy for table
+    //                        "claim_frames"`.            ← committed orphan
+    //   CONFIG A, unstamped: `evidence_rows=0`, and
+    //                        `… policy for table "evidence"`. ← clean refusal
+    //   CONFIG B, either:    `evidence_rows=1`, then the same `claim_frames`
+    //                        failure.                     ← the stamp changes nothing
+    //
+    // So the stamp buys nothing on either configuration and, on the one this
+    // programme exists to make reachable, trades a clean refusal for a committed
+    // orphan. (An earlier form of this note also called it a retry amplifier,
+    // on the premise that a fresh `EvidenceId` plus no `ON CONFLICT` appends a
+    // row per retry. That is wrong for an IDENTICAL retry: `content_hash` is
+    // `blake3(evidence_text)`, a deterministic serialization of the call's
+    // arguments, and migration 001's `evidence_content_hash_claim_unique UNIQUE
+    // (content_hash, claim_id)` refuses it. Only a retry with different
+    // arguments adds a row. See `tools::claims::update_with_evidence`, where the
+    // same correction is measured.) Re-adding the stamp belongs in D2, which has
+    // to put evidence → BBA → truth_value into one unit anyway.
+    //
+    // ── D2 lands here too: evidence -> BBA -> truth_value, ONE STAMPED UNIT ──
+    //
+    // "the DS wiring that follows is itself unconverted" and "a SIBLING pool
+    // connection that cannot see an uncommitted row" were both true and are both
+    // now false. `ds_auto::auto_wire_ds_update` takes a connection, so it runs on
+    // THIS transaction, and migration 046's FK from `mass_functions.evidence_id`
+    // is checked against this transaction's own snapshot — an uncommitted evidence
+    // row in the same transaction satisfies it. The stamped INSERT is therefore no
+    // longer forced to commit alone, which removes the objection: nothing commits
+    // unless everything does, so a failed call leaves no BBA-less evidence row
+    // behind to make `evidence_content_hash_claim_unique` refuse the identical
+    // retry that would land it.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "report_workflow_outcome")
+            .await?;
+
+    EvidenceRepository::create(&mut *tx, &evidence)
         .await
         .map_err(internal_error)?;
 
@@ -750,7 +1055,8 @@ pub async fn report_workflow_outcome(
     // quality is the confidence signal; success determines supports/refutes direction.
     let weight = load_evidence_type_weight("observation");
     let ds = ds_auto::auto_wire_ds_update(
-        &server.pool,
+        &mut tx,
+        viewer,
         workflow_id,
         agent_id,
         quality,
@@ -762,15 +1068,27 @@ pub async fn report_workflow_outcome(
     .await
     .map_err(internal_error)?;
 
-    // Derive truth_value from CDST pignistic probability
+    // Derive truth_value from CDST pignistic probability. `UPDATE claims`, and it
+    // commits in the SAME stamped transaction as the evidence INSERT and the DS
+    // wiring above — there is no longer an unstamped write before it, and no
+    // self-committing unit of its own. It is the tool's last HARD write: what
+    // follows the commit is `BehavioralExecutionRepository::create`, which is
+    // warn-only and targets `behavioral_executions`: `relrowsecurity = f` with
+    // zero policies, so it is refused on neither configuration. That site is
+    // registered as a residual in
+    // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` with that reason.
+    // After the DS wiring necessarily, because the value comes from it.
     let after = TruthValue::clamped(ds.pignistic_prob);
-    ClaimRepository::update_truth_value(
-        &server.pool,
-        epigraph_core::ClaimId::from_uuid(workflow_id),
-        after,
-    )
-    .await
-    .map_err(internal_error)?;
+    {
+        ClaimRepository::update_truth_value_conn(
+            &mut tx,
+            epigraph_core::ClaimId::from_uuid(workflow_id),
+            after,
+        )
+        .await
+        .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+    }
 
     // Update use counts in workflow JSON
     let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
@@ -864,6 +1182,7 @@ pub async fn report_workflow_outcome(
 
 pub async fn deprecate_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DeprecateWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
@@ -871,18 +1190,91 @@ pub async fn deprecate_workflow(
 
     let mut deprecated_ids = Vec::new();
 
+    // ── THE WHOLE DEPRECATION, IN ONE AUTHOR-STAMPED TRANSACTION ────────
+    //
+    // `deprecate_claim` is an `UPDATE claims`, so `claims_tenancy`'s WITH CHECK
+    // governs it and an unstamped session is refused with `42501`. The cascade
+    // makes that worse than a single refusal: it walks a tree deprecating one
+    // claim at a time, so a refusal partway through used to leave a HALF-
+    // DEPRECATED hierarchy — some variants flipped, some still current, and
+    // `find_workflow_hierarchical` returning the ones that were missed.
+    //
+    // THE STAMP IS LOAD-BEARING, AND THAT IS MEASURED RATHER THAN ARGUED.
+    //
+    // A review finding held that this conversion is INERT for its own target
+    // population, because every workflow claim is authored by the
+    // `workflow-ingest-system` agent while this tool stamps from
+    // `server.agent_id()`. The authorship half is correct —
+    // `epigraph_ingest_executor::execute_workflow_ingest_plan` resolves
+    // `get_or_create_system_agent` and passes that id to
+    // `create_with_id_if_absent` — but the population half does not survive
+    // measurement. Taken as `epigraph_app` (`rolbypassrls = false`) with the real
+    // binary over a unix socket, via `scripts/e2e/probe-workflow.sh`, on a
+    // cleanly-migrated schema, differing only in the binary:
+    //
+    //   flat workflow claim owned by the server agent's OWN group
+    //     stamped   -> succeeds, `is_current = false`
+    //     unstamped -> `new row violates row-level security policy for table
+    //                   "claims"`, `is_current = true`
+    //   the same claim owned by a FOREIGN group
+    //     stamped   -> refused;  unstamped -> refused
+    //
+    // Revert the stamp and the write fails; restore it and the write lands. On
+    // CONFIG B both binaries succeed, so production sees no change.
+    //
+    // WHY THE FOREIGN CASE IS NOT THE ANSWER HERE. The reviewer reached it with
+    // raw SQL. Through the tool it is not reachable: `store_workflow` returns a
+    // `workflows` ROW id, and `find_workflow` and `find_workflow_hierarchical`
+    // both return that same id (MEASURED: the id they returned was present in
+    // `workflows` and absent from `claims`). No discovery tool in this surface
+    // hands `deprecate_workflow` a system-agent-owned CLAIM id.
+    //
+    // THE RESIDUAL THAT IS REAL, stated so the green above is not over-read: for a
+    // HIERARCHICAL workflow this tool deprecates nothing in `claims` at all. It is
+    // handed the `workflows` row id, `deprecate_claim` matches zero rows, and the
+    // thesis and step claims stay `is_current = true` while the response reports
+    // that id as deprecated. MEASURED: `deprecated_ids: ["3d99ce3a-…"]` with
+    // `SELECT … FROM claims WHERE id = '3d99ce3a-…'` returning no row and all four
+    // seeded workflow claims still current. Fixing that means deprecating claims
+    // the system agent owns, which is the author-stamping question (#493) rather
+    // than a rename — it is recorded here, not silently widened.
+    //
+    // TWO AUTHORITIES IN ONE LOOP, deliberately. The transaction's session GUCs
+    // carry the SERVER AGENT's groups (the write authority), while the traversal
+    // below splices the CALLER's `viewer` (the read authority). That divergence is
+    // intentional and neither half may take the other's: stamping the caller would
+    // refuse the write this tool exists to perform, and reading with the server
+    // agent's viewer would let a caller cascade into workflow claims it cannot
+    // see. The widened USING side does mean the cascade can ENUMERATE rows the
+    // caller's viewer would not reach on the unstamped pool; the `viewer.splice`
+    // label oracle below is what keeps that from turning into a write, and it is
+    // filtered rather than exempted for exactly this reason. On stdio the caller
+    // and the server agent coincide, so this only differs on authenticated HTTP.
+    //
+    // The traversal reads run on the same stamped connection as the writes, which
+    // is the correct direction: an unstamped read returns FEWER rows, so a
+    // cascade planned on one connection and executed on another could silently
+    // skip a child it was entitled to deprecate.
+    let agent_id = server.agent_id().await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "deprecate_workflow")
+            .await?;
+
     // Deprecate the target workflow (A4: also set is_current = false).
     // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same
     // statement — required by CLAUDE.md "Embedding policy → Cleanup paths"
     // so the deprecated workflow drops out of semantic recall and does not
     // inflate the `stale_present` audit count.
-    ClaimRepository::deprecate_claim(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
+    ClaimRepository::deprecate_claim(&mut *tx, epigraph_core::ClaimId::from_uuid(workflow_id))
         .await
         .map_err(internal_error)?;
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
-    epigraph_db::WorkflowRepository::set_truth_value(&server.pool, workflow_id, 0.05)
+    // `workflows` is NOT RLS-protected (measured: no policy, not in 062's
+    // tier-A), so this half was never refused — it is in the transaction so the
+    // two halves of one deprecation cannot land apart.
+    epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, workflow_id, 0.05)
         .await
         .map_err(internal_error)?;
     deprecated_ids.push(workflow_id.to_string());
@@ -897,9 +1289,38 @@ pub async fn deprecate_workflow(
         visited.insert(workflow_id);
         let mut queue = vec![workflow_id];
         while let Some(current) = queue.pop() {
-            let edges = EdgeRepository::get_by_target(&server.pool, current, "claim")
+            // PROPAGATED, not swallowed. This read was `.unwrap_or_default()`
+            // before the branch, and on `&server.pool` that was harmless: the
+            // target's deprecation had already autocommitted and a failed read
+            // merely skipped the children. INSIDE the transaction the same swallow
+            // is a poison pill, and the failure it produces is WORSE than the
+            // `25P02` one might expect.
+            //
+            // MEASURED, by dropping `edges` inside a `#[sqlx::test]` database and
+            // calling this tool with `cascade: true` on the swallowing revision:
+            //
+            //     {"deprecated_ids": ["dc975b42-…"], "reason": "cascade read failure"}
+            //     is_error: false
+            //
+            // — success, with nothing written. The mechanism is PostgreSQL's, not
+            // sqlx's: after an error inside a transaction block, `COMMIT` is
+            // accepted and returns the `ROLLBACK` command tag rather than an error
+            // (verified directly: `BEGIN; INSERT…; SELECT FROM <missing>; COMMIT;`
+            // leaves zero rows and raises nothing on the COMMIT). So the swallow
+            // aborts the transaction, the loop exits with an empty edge list,
+            // `tx.commit()` returns `Ok`, and the tool reports a deprecation that
+            // was discarded in full. A caller cannot tell, and neither can a log.
+            //
+            // That is the failure mode #494's SAVEPOINT discipline exists to
+            // prevent (`EventRepository::publish_or_log_conn` opens one;
+            // `create_or_get`'s duplicate-key re-find opens one). A SAVEPOINT would
+            // work here too, but propagation is the better answer for THIS read: a
+            // savepoint preserves the "skip the children" behaviour, and that
+            // behaviour was only ever an accident of running outside a transaction.
+            // A cascade that cannot enumerate its children has not completed.
+            let edges = EdgeRepository::get_by_target(&mut *tx, viewer, current, "claim")
                 .await
-                .unwrap_or_default();
+                .map_err(internal_error)?;
 
             for edge in edges {
                 if !DESCENDANT_REL.contains(&edge.relationship.as_str()) {
@@ -907,13 +1328,25 @@ pub async fn deprecate_workflow(
                 }
                 let child_id = edge.source_id;
                 // Filter to workflow-labeled claims only.
-                let is_workflow: bool =
-                    sqlx::query_scalar("SELECT 'workflow' = ANY(labels) FROM claims WHERE id = $1")
-                        .bind(child_id)
-                        .fetch_optional(&server.pool)
+                let is_workflow: bool = {
+                    // PR-09: a label-membership oracle over an id reached by
+                    // graph traversal. Filtered rather than exempted — a child
+                    // the viewer cannot read must not be cascaded into, and
+                    // `unwrap_or(false)` already means "not a workflow, skip".
+                    let sql = viewer.splice(
+                        "SELECT 'workflow' = ANY(c.labels) FROM claims c \
+                         WHERE c.id = $1 /* {VISIBILITY:c} */",
+                        2,
+                    );
+                    let mut q = sqlx::query_scalar(&sql).bind(child_id);
+                    if let Some(g) = viewer.group_bind() {
+                        q = q.bind(g);
+                    }
+                    q.fetch_optional(&mut *tx)
                         .await
                         .map_err(internal_error)?
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                };
                 if !is_workflow {
                     continue;
                 }
@@ -922,21 +1355,35 @@ pub async fn deprecate_workflow(
                     continue;
                 }
 
-                ClaimRepository::deprecate_claim(
-                    &server.pool,
+                let child_rows = ClaimRepository::deprecate_claim(
+                    &mut *tx,
                     epigraph_core::ClaimId::from_uuid(child_id),
                 )
                 .await
                 .map_err(internal_error)?;
                 // Mirror onto the hierarchical row, if any.
-                epigraph_db::WorkflowRepository::set_truth_value(&server.pool, child_id, 0.05)
+                epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, child_id, 0.05)
                     .await
                     .map_err(internal_error)?;
-                deprecated_ids.push(child_id.to_string());
+                // REPORT ONLY WHAT ACTUALLY FLIPPED. `deprecate_claim` returns
+                // `rows_affected`, and a cascade child can legitimately yield 0:
+                // `claims_tenancy`'s USING side filters the UPDATE's target, so a
+                // row this session may not write is silently not written rather
+                // than refused. Pushing the id regardless made the response assert
+                // a deprecation that did not happen — and unlike a `42501`, a
+                // USING-filtered miss raises nothing for the caller to notice.
+                // The traversal still descends: `is_workflow` above proved this is
+                // a workflow claim, and a child that was skipped here may still
+                // have descendants that are not.
+                if child_rows > 0 {
+                    deprecated_ids.push(child_id.to_string());
+                }
                 queue.push(child_id);
             }
         }
     }
+
+    tx.commit().await.map_err(internal_error)?;
 
     success_json(&DeprecateWorkflowResponse {
         deprecated_ids,
@@ -957,9 +1404,10 @@ pub mod __test_only {
     /// `find_workflow` runs after `embedder.generate`.
     pub async fn find_workflow_with_pgvec(
         server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
         params: FindWorkflowParams,
         pgvec: Option<String>,
     ) -> Result<CallToolResult, McpError> {
-        find_workflow_post_embed(server, &params, pgvec).await
+        find_workflow_post_embed(server, viewer, &params, pgvec).await
     }
 }

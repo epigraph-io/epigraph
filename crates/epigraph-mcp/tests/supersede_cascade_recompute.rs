@@ -14,9 +14,12 @@
 //! No test body calls `recompute_beliefs`: the whole claim under test is that
 //! retraction repairs downstream belief *without* a manual recompute.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 
-use common::{admin_auth, build_test_server, seed_claim, seed_claim_with_belief};
+use common::{admin_auth, build_scoped_test_server, seed_claim, seed_claim_with_belief};
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
 use epigraph_mcp::tools::supersede::supersede_claim;
 use epigraph_mcp::types::{LinkEpistemicParams, SupersedeClaimParams};
@@ -60,8 +63,10 @@ async fn wire_supports(
     s: Uuid,
     t: Uuid,
 ) {
+    let viewer = fixture::public_viewer(pool).await;
     let result = do_link_epistemic(
         server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: s.to_string(),
             target_claim_id: t.to_string(),
@@ -105,10 +110,12 @@ async fn wire_supports(
 
 async fn supersede(
     server: &epigraph_mcp::server::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     old: Uuid,
 ) -> Result<rmcp::model::CallToolResult, epigraph_mcp::errors::McpError> {
     supersede_claim(
         server,
+        viewer,
         SupersedeClaimParams {
             claim_id: old.to_string(),
             content: format!("replacement for {old}"),
@@ -123,13 +130,22 @@ async fn supersede(
 /// The canonical combine pipeline's answer for `claim` on the binary frame,
 /// computed WITHOUT writing. C2/C5 compare the cached scalar against this.
 async fn preview_betp(pool: &PgPool, claim_id: Uuid) -> Option<f64> {
-    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(pool)
-        .await
-        .expect("binary frame");
-    epigraph_engine::edge_factor::preview_claim_belief_on_frame(pool, claim_id, frame_id)
-        .await
-        .expect("preview")
-        .map(|p| p.pignistic_prob)
+    let viewer = fixture::public_viewer(pool).await;
+    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("binary frame");
+    epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        claim_id,
+        frame_id,
+    )
+    .await
+    .expect("preview")
+    .map(|p| p.pignistic_prob)
 }
 
 // ── C2 (ANCHOR) ─────────────────────────────────────────────────────────────
@@ -147,7 +163,11 @@ async fn preview_betp(pool: &PgPool, claim_id: Uuid) -> Option<f64> {
 /// be a coincidence of two identical supporters cancelling out.
 #[sqlx::test(migrations = "../../migrations")]
 async fn downstream_cache_drops_retracted_supporter(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
@@ -158,7 +178,7 @@ async fn downstream_cache_drops_retracted_supporter(pool: PgPool) {
 
     let betp_before = read_betp(&pool, b).await.expect("B has a cached BetP");
 
-    supersede(&server, a)
+    supersede(&server, &viewer, a)
         .await
         .expect("supersede_claim succeeds");
 
@@ -193,7 +213,11 @@ async fn downstream_cache_drops_retracted_supporter(pool: PgPool) {
 /// says nothing about whether the resulting number is right.
 #[sqlx::test(migrations = "../../migrations")]
 async fn cascade_does_not_touch_unrelated_bbas_or_claims(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
@@ -235,7 +259,7 @@ async fn cascade_does_not_touch_unrelated_bbas_or_claims(pool: PgPool) {
             .await
             .expect("read D updated_at");
 
-    supersede(&server, a)
+    supersede(&server, &viewer, a)
         .await
         .expect("supersede_claim succeeds");
 
@@ -279,7 +303,11 @@ async fn cascade_does_not_touch_unrelated_bbas_or_claims(pool: PgPool) {
 /// from "believed at 0.79".
 #[sqlx::test(migrations = "../../migrations")]
 async fn sole_supporter_retraction_does_not_leave_frozen_belief(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim(&pool, "sole-supported claim B", 0.5).await;
@@ -295,7 +323,7 @@ async fn sole_supporter_retraction_does_not_leave_frozen_belief(pool: PgPool) {
             .expect("count B BBAs");
     assert_eq!(bba_count_before, 1, "fixture: A->B must be B's only BBA");
 
-    supersede(&server, a)
+    supersede(&server, &viewer, a)
         .await
         .expect("supersede_claim succeeds");
 
@@ -340,7 +368,11 @@ async fn sole_supporter_retraction_does_not_leave_frozen_belief(pool: PgPool) {
 /// B ends up unbacked and the assertion would degenerate to `None == None`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn cyclic_support_terminates(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
@@ -361,9 +393,12 @@ async fn cyclic_support_terminates(pool: PgPool) {
             .await
             .expect("read B->A edge id");
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), supersede(&server, a))
-        .await
-        .expect("cascade must terminate on a mutually-supporting pair, not loop");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        supersede(&server, &viewer, a),
+    )
+    .await
+    .expect("cascade must terminate on a mutually-supporting pair, not loop");
     result.expect("supersede_claim succeeds on a cyclic fixture");
 
     // One hop forward: B was repaired and its cache is coherent with the C
@@ -403,7 +438,11 @@ async fn cyclic_support_terminates(pool: PgPool) {
 /// run" fault.
 #[sqlx::test(migrations = "../../migrations")]
 async fn cascade_failure_does_not_fail_the_write(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
@@ -426,7 +465,7 @@ async fn cascade_failure_does_not_fail_the_write(pool: PgPool) {
     .await
     .expect("corrupt surviving BBA");
 
-    let result = supersede(&server, a).await;
+    let result = supersede(&server, &viewer, a).await;
     assert!(
         result.is_ok(),
         "supersede must still report success when the belief subsystem cannot \
@@ -465,7 +504,11 @@ async fn cascade_failure_does_not_fail_the_write(pool: PgPool) {
 /// `B`'s BBA set changes and a second hop would invalidate `B --supports--> C`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn second_hop_downstream_of_the_retraction_is_not_touched(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so this
+    // fixture's `belief_wired` precondition needs the scoped variant.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim(&pool, "one hop out: B", 0.5).await;
@@ -501,7 +544,7 @@ async fn second_hop_downstream_of_the_retraction_is_not_touched(pool: PgPool) {
             .await
             .expect("read C updated_at");
 
-    supersede(&server, a)
+    supersede(&server, &viewer, a)
         .await
         .expect("supersede_claim succeeds");
 

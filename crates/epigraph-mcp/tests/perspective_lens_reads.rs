@@ -17,6 +17,9 @@
 //! global within 1e-9) and the back-compat leg (no lens → key absent) round it
 //! out, plus the validation errors (only-one-of, unknown id).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
@@ -254,6 +257,7 @@ fn rwc_params(
         paper_doi_filter: None,
         siblings_limit: None,
         corroborates_limit: None,
+        epistemic_limit: None,
         neighbor_paragraphs_limit: None,
         diverse: None,
         max_themes: None,
@@ -267,6 +271,8 @@ fn rwc_params(
         graph_expansion_depth: None,
         exclude_contested: false,
         since: None,
+        epistemic_partition: false,
+        diversity_radius: None,
     }
 }
 
@@ -274,18 +280,19 @@ fn rwc_params(
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_claim_lens_diverges_by_perspective_and_is_absent_without_lens(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let fx = seed_fixture(&pool, &unit_pgvec()).await;
     let server = build_test_server(pool.clone());
 
     // WITHOUT a lens → key absent (byte-identical back-compat).
     let plain = get_claim(
         &server,
+        &viewer,
         GetClaimParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: None,
             perspective_id: None,
         },
-        None,
     )
     .await
     .expect("get_claim plain");
@@ -298,12 +305,12 @@ async fn get_claim_lens_diverges_by_perspective_and_is_absent_without_lens(pool:
     // WITH the skeptic lens → lensed_belief present, carrying the three fields.
     let skeptic = get_claim(
         &server,
+        &viewer,
         GetClaimParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: Some(fx.frame_id.to_string()),
             perspective_id: Some(fx.skeptic_id.to_string()),
         },
-        None,
     )
     .await
     .expect("get_claim skeptic lens");
@@ -322,12 +329,12 @@ async fn get_claim_lens_diverges_by_perspective_and_is_absent_without_lens(pool:
     // WITH the believer lens → different belief from the SAME evidence.
     let believer = get_claim(
         &server,
+        &viewer,
         GetClaimParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: Some(fx.frame_id.to_string()),
             perspective_id: Some(fx.believer_id.to_string()),
         },
-        None,
     )
     .await
     .expect("get_claim believer lens");
@@ -353,12 +360,14 @@ async fn get_claim_lens_diverges_by_perspective_and_is_absent_without_lens(pool:
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_belief_lens_diverges_and_preserves_global(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let fx = seed_fixture(&pool, &unit_pgvec()).await;
     let server = build_test_server(pool.clone());
 
     // frame_id alone (no perspective) → framed-but-unlensed; no lensed_belief.
     let framed = get_belief(
         &server,
+        &viewer,
         GetBeliefParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: Some(fx.frame_id.to_string()),
@@ -377,6 +386,7 @@ async fn get_belief_lens_diverges_and_preserves_global(pool: PgPool) {
     // skeptic lens → lensed_belief present and != the global framed belief.
     let skeptic = get_belief(
         &server,
+        &viewer,
         GetBeliefParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: Some(fx.frame_id.to_string()),
@@ -402,6 +412,7 @@ async fn get_belief_lens_diverges_and_preserves_global(pool: PgPool) {
     // believer (neutral) lens → reduces to global within 1e-9.
     let believer = get_belief(
         &server,
+        &viewer,
         GetBeliefParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: Some(fx.frame_id.to_string()),
@@ -423,14 +434,16 @@ async fn get_belief_lens_diverges_and_preserves_global(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_with_context_lens_attaches_diverging_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let pgvec = unit_pgvec();
     let fx = seed_fixture(&pool, &pgvec).await;
     let server = build_test_server(pool.clone());
 
     // No lens → the recalled hit has NO lensed_belief key.
-    let plain = recall_with_context_with_pgvec(&server, rwc_params("q", None, None), 1536, &pgvec)
-        .await
-        .expect("recall plain");
+    let plain =
+        recall_with_context_with_pgvec(&server, &viewer, rwc_params("q", None, None), 1536, &pgvec)
+            .await
+            .expect("recall plain");
     let p_body = parse_json(&plain);
     let p_hit = p_body["results"]
         .as_array()
@@ -446,6 +459,7 @@ async fn recall_with_context_lens_attaches_diverging_belief(pool: PgPool) {
     // skeptic lens → hit carries a lensed_belief.
     let skeptic = recall_with_context_with_pgvec(
         &server,
+        &viewer,
         rwc_params("q", Some(fx.frame_id), Some(fx.skeptic_id)),
         1536,
         &pgvec,
@@ -457,6 +471,7 @@ async fn recall_with_context_lens_attaches_diverging_belief(pool: PgPool) {
     // believer lens → different belief for the SAME recalled claim.
     let believer = recall_with_context_with_pgvec(
         &server,
+        &viewer,
         rwc_params("q", Some(fx.frame_id), Some(fx.believer_id)),
         1536,
         &pgvec,
@@ -487,6 +502,7 @@ fn lensed_belief_for(body: &Value, claim_id: Uuid) -> f64 {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn unmapped_perspective_lens_equals_global(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let fx = seed_fixture(&pool, &unit_pgvec()).await;
     let server = build_test_server(pool.clone());
 
@@ -508,6 +524,7 @@ async fn unmapped_perspective_lens_equals_global(pool: PgPool) {
     let global = parse_json(
         &get_belief(
             &server,
+            &viewer,
             GetBeliefParams {
                 claim_id: fx.claim_id.to_string(),
                 frame_id: Some(fx.frame_id.to_string()),
@@ -523,6 +540,7 @@ async fn unmapped_perspective_lens_equals_global(pool: PgPool) {
     let lensed = parse_json(
         &get_belief(
             &server,
+            &viewer,
             GetBeliefParams {
                 claim_id: fx.claim_id.to_string(),
                 frame_id: Some(fx.frame_id.to_string()),
@@ -545,18 +563,19 @@ async fn unmapped_perspective_lens_equals_global(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let fx = seed_fixture(&pool, &unit_pgvec()).await;
     let server = build_test_server(pool.clone());
 
     // Only frame_id (no perspective) on get_claim → both-or-neither error.
     let only_frame = get_claim(
         &server,
+        &viewer,
         GetClaimParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: Some(fx.frame_id.to_string()),
             perspective_id: None,
         },
-        None,
     )
     .await;
     assert!(only_frame.is_err(), "only frame_id must be rejected");
@@ -564,12 +583,12 @@ async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
     // Only perspective_id (no frame) on get_claim → error.
     let only_persp = get_claim(
         &server,
+        &viewer,
         GetClaimParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: None,
             perspective_id: Some(fx.skeptic_id.to_string()),
         },
-        None,
     )
     .await;
     assert!(only_persp.is_err(), "only perspective_id must be rejected");
@@ -578,12 +597,12 @@ async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
     // to global, so the tool MUST surface it).
     let unknown_persp = get_claim(
         &server,
+        &viewer,
         GetClaimParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: Some(fx.frame_id.to_string()),
             perspective_id: Some(Uuid::new_v4().to_string()),
         },
-        None,
     )
     .await;
     assert!(
@@ -594,12 +613,12 @@ async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
     // Unknown frame UUID → not-found error.
     let unknown_frame = get_claim(
         &server,
+        &viewer,
         GetClaimParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: Some(Uuid::new_v4().to_string()),
             perspective_id: Some(fx.skeptic_id.to_string()),
         },
-        None,
     )
     .await;
     assert!(unknown_frame.is_err(), "unknown frame_id must be rejected");
@@ -607,6 +626,7 @@ async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
     // get_belief: perspective_id without frame_id → error (one-sided rule).
     let gb_only_persp = get_belief(
         &server,
+        &viewer,
         GetBeliefParams {
             claim_id: fx.claim_id.to_string(),
             frame_id: None,
@@ -629,12 +649,14 @@ async fn lens_validation_rejects_only_one_of_and_unknown_ids(pool: PgPool) {
 /// query it and assert the per-claim lensed_belief diverges skeptic-vs-believer.
 #[sqlx::test(migrations = "../../migrations")]
 async fn plain_recall_lens_attaches_diverging_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let fx = seed_fixture(&pool, &unit_pgvec()).await;
     let server = build_test_server(pool.clone());
 
     let recall_one = |frame: Option<Uuid>, perspective: Option<Uuid>| {
         recall(
             &server,
+            &viewer,
             RecallParams {
                 query: "lens".to_string(),
                 min_truth: Some(0.0),
@@ -646,6 +668,14 @@ async fn plain_recall_lens_attaches_diverging_belief(pool: PgPool) {
                 include_workflows: false,
                 exclude_contested: false,
                 since: None,
+                // Theme scope / paging (backlog c95a2509) default to unscoped here: this
+                // fixture pins a different axis, and None/None/None is byte-identical to
+                // the pre-theme behaviour.
+                theme_id: None,
+                theme_label: None,
+                offset: None,
+                epistemic_partition: false,
+                diversity_radius: None,
             },
         )
     };
@@ -702,6 +732,7 @@ async fn plain_recall_lens_attaches_diverging_belief(pool: PgPool) {
 /// corrupted one omitting the key (page still served, not aborted).
 #[sqlx::test(migrations = "../../migrations")]
 async fn plain_recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = insert_agent(&pool).await;
     let frame_row = FrameRepository::create(
         &pool,
@@ -762,6 +793,7 @@ async fn plain_recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgP
     let server = build_test_server(pool.clone());
     let result = recall(
         &server,
+        &viewer,
         RecallParams {
             query: "lens".to_string(),
             min_truth: Some(0.0),
@@ -773,6 +805,14 @@ async fn plain_recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgP
             include_workflows: false,
             exclude_contested: false,
             since: None,
+            // Theme scope / paging (backlog c95a2509) default to unscoped here: this
+            // fixture pins a different axis, and None/None/None is byte-identical to
+            // the pre-theme behaviour.
+            theme_id: None,
+            theme_label: None,
+            offset: None,
+            epistemic_partition: false,
+            diversity_radius: None,
         },
     )
     .await
@@ -814,6 +854,7 @@ async fn plain_recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgP
 /// and the corrupted one omitting the key.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let pgvec = unit_pgvec();
     let agent = insert_agent(&pool).await;
     let frame_row =
@@ -870,6 +911,7 @@ async fn recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let result = recall_with_context_with_pgvec(
         &server,
+        &viewer,
         rwc_params("q", Some(frame_row.id), Some(persp.id)),
         1536,
         &pgvec,
@@ -907,6 +949,7 @@ async fn recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgPool) {
 /// both branches of `PerspectiveRow::source_reliability()`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_perspectives_surfaces_reliability_maps(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // skeptic carries a source_reliability map; we add a second WITHOUT one.
     let fx = seed_fixture(&pool, &unit_pgvec()).await;
     let plain = PerspectiveRepository::create(
@@ -923,9 +966,13 @@ async fn list_perspectives_surfaces_reliability_maps(pool: PgPool) {
     .expect("plain perspective");
     let server = build_test_server(pool.clone());
 
-    let result = list_perspectives(&server, ListPerspectivesParams { limit: Some(100) })
-        .await
-        .expect("list_perspectives");
+    let result = list_perspectives(
+        &server,
+        &viewer,
+        ListPerspectivesParams { limit: Some(100) },
+    )
+    .await
+    .expect("list_perspectives");
     let body = parse_json(&result);
     let rows = body.as_array().expect("array of perspectives");
 
@@ -983,6 +1030,7 @@ async fn list_perspectives_surfaces_reliability_maps(pool: PgPool) {
 /// `FrameNotFound` nor a perspective quirk can be what makes leg A fail.
 #[sqlx::test(migrations = "../../migrations")]
 async fn scoped_belief_distinguishes_missing_claim_from_empty_evidence(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let fx = seed_fixture(&pool, &unit_pgvec()).await;
     let server = build_test_server(pool.clone());
 
@@ -990,6 +1038,7 @@ async fn scoped_belief_distinguishes_missing_claim_from_empty_evidence(pool: PgP
     let fabricated = Uuid::parse_str("00000000-0000-4000-8000-000000000000").unwrap();
     let err = scoped_belief(
         &server,
+        &viewer,
         ScopedBeliefParams {
             claim_id: fabricated.to_string(),
             scope_type: "perspective".to_string(),
@@ -1016,6 +1065,7 @@ async fn scoped_belief_distinguishes_missing_claim_from_empty_evidence(pool: PgP
     let evidence_free = insert_paragraph_claim(&pool, agent, &unit_pgvec()).await;
     let ok = scoped_belief(
         &server,
+        &viewer,
         ScopedBeliefParams {
             claim_id: evidence_free.to_string(),
             scope_type: "perspective".to_string(),

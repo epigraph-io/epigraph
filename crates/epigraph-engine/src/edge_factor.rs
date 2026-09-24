@@ -14,7 +14,7 @@
 //! NOT simply `was_created`, see that function's doc comment for why) for use
 //! at edge-creation call sites.
 
-use sqlx::PgPool;
+use sqlx::Acquire;
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
@@ -54,7 +54,8 @@ pub enum EdgeFactorOutcome {
 /// relationship maps to a `RestrictionKind::Neutral` (cheap short-circuit
 /// before any DB query).
 pub async fn auto_wire_ds_for_edge(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     edge_id: Uuid,
     edge_signer_agent_id: Uuid,
     source_id: Uuid,
@@ -70,7 +71,7 @@ pub async fn auto_wire_ds_for_edge(
     let source_row: Option<(Option<f64>, Option<f64>, Option<f64>)> =
         sqlx::query_as("SELECT belief, plausibility, open_world_mass FROM claims WHERE id = $1")
             .bind(source_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(|e| format!("fetch source interval: {e}"))?;
     let Some((Some(bel), Some(pl), ow_opt)) = source_row else {
@@ -144,7 +145,7 @@ pub async fn auto_wire_ds_for_edge(
     )
     .bind(source_id)
     .bind(target_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|e| format!("intra-source evidence lookup: {e}"))?;
     // Resolution order for the intra-evidence locality factor:
@@ -158,10 +159,11 @@ pub async fn auto_wire_ds_for_edge(
     // Edge BBAs all land on the binary_truth frame today (see ensure_binary_frame
     // below); if a future edge_factor path writes to a different frame, the
     // per-frame override naturally follows because we look up by frame_id.
-    let frame_id = ensure_binary_frame(pool).await?;
-    let per_frame_factor = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
-        .await
-        .map_err(|e| format!("per-frame locality factor lookup: {e}"))?;
+    let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
+    let per_frame_factor =
+        FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
+            .await
+            .map_err(|e| format!("per-frame locality factor lookup: {e}"))?;
     // Single calibration load for both the locality fallback AND the
     // Phase 2 canonical-key alias resolution below. Cheap on the local
     // filesystem; failure is recoverable (the helper's
@@ -182,10 +184,10 @@ pub async fn auto_wire_ds_for_edge(
         .map_err(|e| format!("interval_to_bba: {e}"))?;
     let masses_json = mass_to_json(&bba)?;
 
-    FrameRepository::assign_claim(pool, target_id, frame_id, Some(0))
+    FrameRepository::assign_claim(&mut *conn, target_id, frame_id, Some(0))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
-    PerspectiveRepository::ensure_edge_perspective(pool, edge_id, Some(edge_signer_agent_id))
+    PerspectiveRepository::ensure_edge_perspective(&mut *conn, edge_id, Some(edge_signer_agent_id))
         .await
         .map_err(|e| format!("ensure_edge_perspective: {e}"))?;
 
@@ -221,7 +223,7 @@ pub async fn auto_wire_ds_for_edge(
         .unwrap_or_else(|| relationship.to_string());
 
     MassFunctionRepository::store_with_perspective(
-        pool,
+        &mut *conn,
         target_id,
         frame_id,
         Some(edge_signer_agent_id),
@@ -237,7 +239,7 @@ pub async fn auto_wire_ds_for_edge(
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
 
-    recompute_combined_belief(pool, target_id, frame_id, &frame).await?;
+    recompute_combined_belief(&mut *conn, viewer, target_id, frame_id, &frame).await?;
     Ok(EdgeFactorOutcome::Wired)
 }
 
@@ -266,7 +268,8 @@ pub async fn auto_wire_ds_for_edge(
 /// fired.
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_edge_if_epistemic(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     was_created: bool,
     edge_id: Uuid,
     source_id: Uuid,
@@ -279,44 +282,102 @@ pub async fn auto_wire_edge_if_epistemic(
     if source_type != "claim" || target_type != "claim" {
         return None;
     }
+    // SAVEPOINT, because this function SWALLOWS every error below and its callers
+    // now hand it a transaction. Inside a PostgreSQL transaction a failed statement
+    // aborts the whole transaction, so swallowing does not preserve
+    // "best-effort" — it DEFERS the failure to `COMMIT`, which PostgreSQL then
+    // answers with `ROLLBACK` and no error at all. `link_epistemic` would report
+    // `belief_wired: false` (correct) while also silently discarding the edge its
+    // caller's transaction had written (not correct). Rolling back to a savepoint
+    // keeps both properties: the wiring lands or is undone alone, and the outer
+    // transaction stays usable either way.
+    //
+    // Opened BEFORE the two gate reads below, not after them: they swallow their
+    // errors too (`None` on `Err`), so a failed read outside the savepoint would
+    // abort the caller's transaction exactly as a failed write would. The first
+    // revision opened it after them.
+    let mut sp = match conn.begin().await {
+        Ok(sp) => sp,
+        Err(e) => {
+            tracing::warn!(
+                edge = %edge_id,
+                "edge auto-wire skipped: could not open a savepoint, so the caller's \
+                 transaction is already unusable: {e}",
+            );
+            return None;
+        }
+    };
     // A retracted edge must never be woken back into a BBA. Without this, a
     // recompute after retirement re-derives from the closed edge and undoes the
     // retraction silently — the failure mode that makes soft retraction useless
     // and is why retirement resorted to DELETE. Fail CLOSED on a lookup error:
     // re-wiring an edge we cannot prove is live is the worse outcome.
-    match EdgeRepository::is_in_force(pool, edge_id).await {
-        Ok(true) => {}
-        Ok(false) => return None,
+    let proceed = match EdgeRepository::is_in_force(&mut *sp, edge_id).await {
+        Ok(true) => true,
+        Ok(false) => false,
         Err(e) => {
             tracing::warn!(
                 edge = %edge_id,
                 "edge auto-wire skipped: in-force check failed: {e}",
             );
-            return None;
+            false
         }
+    };
+    let proceed = proceed
+        && (was_created
+            || match MassFunctionRepository::exists_for_perspective(&mut *sp, viewer, edge_id).await
+            {
+                Ok(true) => false,
+                Ok(false) => true, // never wired — attempt the wake-up below
+                Err(e) => {
+                    tracing::warn!(
+                        edge = %edge_id,
+                        "edge auto-wire wake-up check failed: {e}",
+                    );
+                    false
+                }
+            });
+    if !proceed {
+        // Roll back rather than release: a failed read leaves the savepoint
+        // aborted, and rolling it back is what restores the caller's
+        // transaction. On the Ok(false) arms it is equally correct — nothing
+        // was written.
+        if let Err(e) = sp.rollback().await {
+            tracing::warn!(edge = %edge_id, "savepoint rollback failed: {e}");
+        }
+        return None;
     }
-    if !was_created {
-        match MassFunctionRepository::exists_for_perspective(pool, edge_id).await {
-            Ok(true) => return None,
-            Ok(false) => {} // never wired — attempt the wake-up below
+    match auto_wire_ds_for_edge(
+        &mut sp,
+        viewer,
+        edge_id,
+        agent_id,
+        source_id,
+        target_id,
+        relationship,
+    )
+    .await
+    {
+        Ok(outcome) => match sp.commit().await {
+            Ok(()) => Some(outcome),
             Err(e) => {
                 tracing::warn!(
                     edge = %edge_id,
-                    "edge auto-wire wake-up check failed: {e}",
+                    "edge auto-wire computed but its savepoint could not be released: {e}",
                 );
-                return None;
+                None
             }
-        }
-    }
-    match auto_wire_ds_for_edge(pool, edge_id, agent_id, source_id, target_id, relationship).await {
-        Ok(outcome) => Some(outcome),
+        },
         Err(e) => {
             tracing::warn!(
                 edge = %edge_id,
                 target = %target_id,
                 relationship = %relationship,
-                "edge auto-wire failed: {e}",
+                "edge auto-wire failed: {e}; rolled back to savepoint",
             );
+            if let Err(e) = sp.rollback().await {
+                tracing::warn!(edge = %edge_id, "savepoint rollback failed: {e}");
+            }
             None
         }
     }
@@ -326,9 +387,13 @@ pub async fn auto_wire_edge_if_epistemic(
 /// combine, and write the resulting Bel/Pl/BetP/conflict/missing to the
 /// claim's row. Public so other belief-recompute paths (e.g. HTTP
 /// `propagate_to_dependents`) can share the cascade.
-pub async fn recompute_claim_belief_binary(pool: &PgPool, claim_id: Uuid) -> Result<bool, String> {
-    let frame_id = ensure_binary_frame(pool).await?;
-    recompute_claim_belief_on_frame(pool, claim_id, frame_id).await
+pub async fn recompute_claim_belief_binary(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<bool, String> {
+    let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
+    recompute_claim_belief_on_frame(&mut *conn, viewer, claim_id, frame_id).await
 }
 
 /// Generalized variant of [`recompute_claim_belief_binary`] for any frame.
@@ -349,23 +414,25 @@ pub async fn recompute_claim_belief_binary(pool: &PgPool, claim_id: Uuid) -> Res
 /// list can't be parsed into a `FrameOfDiscernment`, or any DS combination
 /// step fails.
 pub async fn recompute_claim_belief_on_frame(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
 ) -> Result<bool, String> {
-    let row = FrameRepository::get_by_id(pool, frame_id)
+    let row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
         .await
         .map_err(|e| format!("frame get_by_id: {e}"))?
         .ok_or_else(|| format!("frame {frame_id} not found"))?;
     let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
         .map_err(|e| format!("build frame {}: {e}", row.name))?;
-    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
-        .await
-        .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    let all_rows =
+        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
+            .await
+            .map_err(|e| format!("get_for_claim_frame: {e}"))?;
     if all_rows.is_empty() {
         return Ok(false);
     }
-    recompute_combined_belief(pool, claim_id, frame_id, &frame).await?;
+    recompute_combined_belief(&mut *conn, viewer, claim_id, frame_id, &frame).await?;
     Ok(true)
 }
 
@@ -389,17 +456,18 @@ pub async fn recompute_claim_belief_on_frame(
 /// # Errors
 /// Same failure modes as [`recompute_claim_belief_on_frame`].
 pub async fn preview_claim_belief_on_frame(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
-    let row = FrameRepository::get_by_id(pool, frame_id)
+    let row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
         .await
         .map_err(|e| format!("frame get_by_id: {e}"))?
         .ok_or_else(|| format!("frame {frame_id} not found"))?;
     let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
         .map_err(|e| format!("build frame {}: {e}", row.name))?;
-    compute_combined_belief(pool, claim_id, frame_id, &frame).await
+    compute_combined_belief(&mut *conn, viewer, claim_id, frame_id, &frame).await
 }
 
 /// Pure result of combining every BBA on a (claim, frame) pair: the same
@@ -716,14 +784,16 @@ fn warn_on_unknown_evidence_type_keys(
 /// see that function's doc comment for why a caller-side rolled-back
 /// transaction can't substitute for this split.
 async fn compute_combined_belief(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
-    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
-        .await
-        .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    let all_rows =
+        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
+            .await
+            .map_err(|e| format!("get_for_claim_frame: {e}"))?;
     if all_rows.is_empty() {
         return Ok(None);
     }
@@ -742,7 +812,7 @@ async fn compute_combined_belief(
     // to the synthetic config that mirrors the pre-Phase-2 hardcodes.
     let calibration = CalibrationConfig::from_workspace_root()
         .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
-    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
         .await
         .ok()
         .flatten();
@@ -755,7 +825,7 @@ async fn compute_combined_belief(
     // — recalibration overrides are operator-facing knobs, not
     // load-bearing for the BetP write.
     let per_frame_evidence_weights =
-        FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+        FrameRepository::get_per_frame_evidence_type_weights(&mut *conn, frame_id)
             .await
             .ok()
             .flatten();
@@ -813,13 +883,14 @@ async fn compute_combined_belief(
     //
     // Missing assignment or NULL index ⇒ 0, matching the read side's
     // `unwrap_or(0)`.
-    let hypothesis_index = FrameRepository::get_claim_assignment(pool, claim_id, frame_id)
-        .await
-        .map_err(|e| format!("get_claim_assignment: {e}"))?
-        .and_then(|a| a.hypothesis_index)
-        .and_then(|i| usize::try_from(i).ok())
-        .filter(|i| *i < frame.hypothesis_count())
-        .unwrap_or(0);
+    let hypothesis_index =
+        FrameRepository::get_claim_assignment(&mut *conn, viewer, claim_id, frame_id)
+            .await
+            .map_err(|e| format!("get_claim_assignment: {e}"))?
+            .and_then(|a| a.hypothesis_index)
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|i| *i < frame.hypothesis_count())
+            .unwrap_or(0);
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
     let bel = measures::belief(&combined, &target);
@@ -887,29 +958,35 @@ async fn compute_combined_belief(
 /// conflict_k, missing_mass}` (and `classification` on the binary frame).
 /// No-ops (does not write) when the claim has no BBAs on `frame_id`.
 async fn recompute_combined_belief(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
 ) -> Result<(), String> {
-    let Some(preview) = compute_combined_belief(pool, claim_id, frame_id, frame).await? else {
+    let Some(preview) =
+        compute_combined_belief(&mut *conn, viewer, claim_id, frame_id, frame).await?
+    else {
         return Ok(());
     };
 
     MassFunctionRepository::update_claim_belief(
-        pool,
+        &mut *conn,
         claim_id,
-        preview.belief,
-        preview.plausibility,
-        preview.conflict_k,
-        Some(preview.pignistic_prob),
-        preview.missing_mass,
+        epigraph_db::CachedBelief {
+            belief: preview.belief,
+            plausibility: preview.plausibility,
+            mass_on_empty: preview.conflict_k,
+            pignistic_prob: Some(preview.pignistic_prob),
+            mass_on_missing: preview.missing_mass,
+            belief_frame_id: Some(frame_id),
+        },
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
 
     if let Some(label) = preview.classification {
-        MassFunctionRepository::update_claim_classification(pool, claim_id, &label)
+        MassFunctionRepository::update_claim_classification(&mut *conn, claim_id, &label)
             .await
             .map_err(|e| format!("update_claim_classification: {e}"))?;
     }
@@ -917,29 +994,123 @@ async fn recompute_combined_belief(
     Ok(())
 }
 
+/// Recompute a claim's cached DS scalars, letting exactly ONE frame own them.
+///
+/// Backlog 696d3a1c. `recompute_claim_belief_on_frame` persists nothing per-frame —
+/// it writes only the five SHARED `claims.{belief, plausibility, mass_on_empty,
+/// pignistic_prob, mass_on_missing}` columns plus `claims.classification`. Callers
+/// that looped over every frame a claim has BBAs on therefore wrote that one cache
+/// repeatedly, and the last frame processed won.
+///
+/// `list_frames_for_claim` orders `BY f.name`, and the canonical `binary_truth`
+/// frame sorts FIRST (b < c < f < p < t). So the edge-derived belief that
+/// `auto_wire_ds_for_edge` writes there was reliably clobbered by any
+/// `claim_validity`, `paper_validity_*` or `textbook_veracity_*` frame the claim
+/// also carried — usually one holding the pre-edge intrinsic assessment. That is
+/// what silently reverted every `contradicts`/`refutes` edge written since the
+/// previous recompute, and it reported `errors: []` while doing it.
+///
+/// ## What this function is, and what it is NOT
+///
+/// It is NOT an assertion that a claim has one frame. Multi-frame claims are
+/// intended and already first-class: `claim_frames` is keyed
+/// `PRIMARY KEY (claim_id, frame_id)`, and the same claim legitimately carries
+/// different beliefs in different contexts.
+///
+/// The actual defect is narrower and lives in the schema: `claims` holds SIX
+/// belief columns — `belief`, `plausibility`, `mass_on_empty`, `pignistic_prob`,
+/// `mass_on_missing`, `open_world_mass` — and NO frame reference. So a
+/// denormalized single-valued cache is being asked to summarize N frames. The
+/// clobber was the symptom of that, not of multi-frame itself.
+///
+/// This function does not resolve the modeling error. It makes the cache
+/// deterministic and non-destructive by designating ONE frame as the summarized
+/// one, so the cached scalars stop silently reverting edge-derived belief.
+///
+/// **Per-frame belief is not lost and never was.** It is recomputed on demand from
+/// `mass_functions` by the framed `get_belief` path, which is correct today. The
+/// cache is a performance artifact for the unframed read; the framed read is the
+/// source of truth for any specific context.
+///
+/// `binary_truth` is the designated summary frame because it is what the
+/// edge-wiring path writes and what unframed `get_belief` serves. The claim row
+/// records which frame the cache summarizes in `belief_frame_id`, so the number is
+/// self-describing rather than an anonymous one-of-N.
+///
+/// When the claim has no `binary_truth` BBA there is no canonical opinion to
+/// preserve, so the previous last-frame-wins behaviour is kept rather than leaving
+/// the cache unwritten — this function never makes a claim's cache emptier than it
+/// was.
+///
+/// Returns whether the cache was written.
+pub async fn recompute_claim_cached_belief(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<bool, String> {
+    let frames = MassFunctionRepository::list_frames_for_claim(&mut *conn, viewer, claim_id)
+        .await
+        .map_err(|e| format!("list_frames_for_claim: {e}"))?;
+    let Some((last_frame, _)) = frames.last().cloned() else {
+        return Ok(false);
+    };
+
+    let canonical = ensure_binary_frame(&mut *conn, viewer).await?;
+    let owner = if frames.iter().any(|(id, _)| *id == canonical) {
+        canonical
+    } else {
+        last_frame
+    };
+
+    recompute_claim_belief_on_frame(&mut *conn, viewer, claim_id, owner).await
+}
+
 /// Get-or-create the canonical `binary_truth` frame.
-pub async fn ensure_binary_frame(pool: &PgPool) -> Result<Uuid, String> {
-    if let Some(row) = FrameRepository::get_by_name(pool, BINARY_FRAME_NAME)
+pub async fn ensure_binary_frame(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<Uuid, String> {
+    if let Some(row) = FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
         .await
         .map_err(|e| format!("get_by_name: {e}"))?
     {
         return Ok(row.id);
     }
     let hyps: Vec<String> = BINARY_HYPOTHESES.iter().map(|s| (*s).to_string()).collect();
-    match FrameRepository::create(
-        pool,
+    // Under its own SAVEPOINT because the failure below is swallowed into a
+    // fallback read, and callers hand this a transaction: an unsavepointed
+    // `23505` (a lost first-creation race, or a same-named frame the viewer
+    // cannot see) would abort the caller's transaction, fail the fallback with
+    // `25P02`, and turn the caller's COMMIT into a silent ROLLBACK. Same shape
+    // and reason as `epigraph_mcp::tools::ds_auto::ensure_axis_frame`.
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("binary_truth: could not open a savepoint for the create: {e}"))?;
+    let created = FrameRepository::create(
+        &mut *sp,
         BINARY_FRAME_NAME,
         Some("Canonical binary frame: {TRUE, FALSE}"),
         &hyps,
     )
-    .await
-    {
-        Ok(row) => Ok(row.id),
-        Err(_) => FrameRepository::get_by_name(pool, BINARY_FRAME_NAME)
-            .await
-            .map_err(|e| format!("fallback get_by_name: {e}"))?
-            .map(|r| r.id)
-            .ok_or_else(|| "binary_truth frame missing after create attempt".to_string()),
+    .await;
+    match created {
+        Ok(row) => {
+            sp.commit().await.map_err(|e| {
+                format!("binary_truth: could not release the create savepoint: {e}")
+            })?;
+            Ok(row.id)
+        }
+        Err(_) => {
+            sp.rollback()
+                .await
+                .map_err(|e| format!("binary_truth: could not roll back the failed create: {e}"))?;
+            FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
+                .await
+                .map_err(|e| format!("fallback get_by_name: {e}"))?
+                .map(|r| r.id)
+                .ok_or_else(|| "binary_truth frame missing after create attempt".to_string())
+        }
     }
 }
 

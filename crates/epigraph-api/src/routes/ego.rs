@@ -7,10 +7,13 @@
 //! no statement timeout, and `claim_neighborhood`'s 500-edge cut collects
 //! outgoing rows first, so a claim with many outlinks loses every backlink.
 //!
-//! Redaction follows `claim_neighborhood`: an edge touching a redacted
-//! *neighbour* claim is dropped along with that neighbour, because a raw
-//! `claim_id` plus a relationship name already says more than a redacted node
-//! should. A redacted *centre* answers with the centre alone.
+//! Visibility follows `claim_neighborhood`: an edge touching a neighbour claim
+//! this viewer may not read is dropped along with that neighbour, because a raw
+//! `claim_id` plus a relationship name already says more than a hidden node
+//! should. An unreadable *centre* is reported as absent (404), identically to a
+//! claim that does not exist — it is not answered with a blanked centre, which
+//! would confirm the claim is there. The filtering happens in
+//! `EgoRepository::hydrate`'s SQL, not in a post-pass over rows already read.
 //!
 //! `total_edges` is redaction-aware: `EgoRepository` counts the degree in the
 //! database, and this route subtracts the edges it then dropped for redaction
@@ -30,8 +33,8 @@ use epigraph_db::{EgoEntity, EgoRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::access_control::{batch_content_access, ContentAccess};
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 
 const DEFAULT_MAX_DEGREE: u32 = 40;
@@ -127,20 +130,17 @@ fn parse_relationships(raw: Option<&str>) -> Option<Vec<String>> {
     }
 }
 
-/// Build the wire node for a hydrated entity, applying redaction.
-fn to_node(entity: EgoEntity, redacted: bool) -> EgoNode {
+/// Build the wire node for a hydrated entity.
+///
+/// No redaction arm: every entity reaching here came back from a viewer-filtered
+/// `EgoRepository::hydrate`, so its content is content this viewer may read. The
+/// `redacted` field stays on the wire, always `false`, so the response shape does
+/// not change for existing clients.
+fn to_node(entity: EgoEntity) -> EgoNode {
     let is_claim = entity.entity_type == "claim";
-    let content = entity.content.map(|c| {
-        if redacted {
-            let mut c = c;
-            crate::access_control::redact_claim_content(&mut c);
-            c
-        } else {
-            c
-        }
-    });
-    // A claim's label IS its content, so it has to be rebuilt from the
-    // redacted text rather than the row's.
+    let content = entity.content;
+    // A claim's label IS its content, so prefer the hydrated text over the row's
+    // provisional label.
     let label = match (is_claim, content.as_deref()) {
         (true, Some(text)) => clip_label(text),
         _ => clip_label(&entity.label),
@@ -149,7 +149,7 @@ fn to_node(entity: EgoEntity, redacted: bool) -> EgoNode {
         id: entity.id,
         entity_type: entity.entity_type,
         label,
-        redacted,
+        redacted: false,
         content,
         truth_value: entity.truth_value,
         pignistic_prob: entity.pignistic_prob,
@@ -176,18 +176,12 @@ fn unhydrated_node(id: Uuid, entity_type: &str) -> EgoNode {
 
 /// `GET /api/v1/claims/:id/ego`
 pub async fn claim_ego(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<EgoQuery>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<EgoResponse>, ApiError> {
     let pool = &state.db_pool;
-
-    // SECURITY: requester from the validated bearer only; no `agent_id`
-    // parameter exists on this route because it would be spoofable.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     let max_degree = params
         .max_degree
@@ -195,7 +189,7 @@ pub async fn claim_ego(
         .clamp(MIN_MAX_DEGREE, MAX_MAX_DEGREE) as usize;
     let relationships = parse_relationships(params.relationships.as_deref());
 
-    let center_rows = EgoRepository::hydrate(pool, &[claim_id]).await?;
+    let center_rows = EgoRepository::hydrate(pool, &viewer, &[claim_id]).await?;
     let center_entity = center_rows
         .into_iter()
         .find(|e| e.entity_type == "claim")
@@ -204,24 +198,11 @@ pub async fn claim_ego(
             id: claim_id.to_string(),
         })?;
 
-    let center_redacted = batch_content_access(pool, &[claim_id], requester)
-        .await
-        .get(&claim_id)
-        .copied()
-        .unwrap_or(ContentAccess::Redacted)
-        == ContentAccess::Redacted;
-
-    if center_redacted {
-        // Not even the degree is reported: `total_edges` would leak how much
-        // of the graph hangs off a claim the caller cannot read.
-        return Ok(Json(EgoResponse {
-            center: to_node(center_entity, true),
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            total_edges: 0,
-            truncated: false,
-        }));
-    }
+    // No explicit centre check any more: `hydrate` is read through the viewer,
+    // so a claim this caller may not read produced no row above and the
+    // `NotFound` already fired — absent, not blanked. The old spelling answered
+    // with a redacted centre and an empty graph, which still confirmed the claim
+    // existed.
 
     let fetched =
         EgoRepository::edges(pool, claim_id, max_degree, relationships.as_deref()).await?;
@@ -256,36 +237,31 @@ pub async fn claim_ego(
     declared_type.remove(&claim_id);
 
     let neighbour_ids: Vec<Uuid> = declared_type.keys().copied().collect();
-    let hydrated = EgoRepository::hydrate(pool, &neighbour_ids).await?;
+    let hydrated = EgoRepository::hydrate(pool, &viewer, &neighbour_ids).await?;
 
-    // Only claim neighbours can be redacted; the batch check is scoped to them
-    // so a large agent/evidence fan-out costs nothing extra.
-    let claim_neighbour_ids: Vec<Uuid> = hydrated
+    // A neighbour the viewer may not read is now missing from `hydrated`
+    // entirely, because the filtering moved into `hydrate`'s SQL. Its id is still
+    // in `declared_type` though — the edge walk put it there — so without this it
+    // would fall through to `unhydrated_node` below and be rendered as a bare
+    // typed node, which discloses both that the claim exists and how it relates
+    // to the centre. Only ids the EDGE declares as claims are treated this way;
+    // an evidence or frame id legitimately has no hydration and must still
+    // render.
+    let hydrated_ids: HashSet<Uuid> = hydrated.iter().map(|e| e.id).collect();
+    let hidden: HashSet<Uuid> = declared_type
         .iter()
-        .filter(|e| e.entity_type == "claim")
-        .map(|e| e.id)
+        .filter(|(id, ty)| ty.as_str() == "claim" && !hydrated_ids.contains(id))
+        .map(|(id, _)| *id)
         .collect();
-    let access = batch_content_access(pool, &claim_neighbour_ids, requester).await;
 
     let mut nodes: Vec<EgoNode> = Vec::new();
-    let mut hidden: HashSet<Uuid> = HashSet::new();
     let mut seen: HashSet<Uuid> = HashSet::new();
     for entity in hydrated {
-        if entity.entity_type == "claim"
-            && access
-                .get(&entity.id)
-                .copied()
-                .unwrap_or(ContentAccess::Redacted)
-                == ContentAccess::Redacted
-        {
-            hidden.insert(entity.id);
-            continue;
-        }
         // An id can exist in more than one table (a uuid collision across
         // entity tables); keep the first hydration, matching the edge's
         // declared type where they agree.
         if seen.insert(entity.id) {
-            nodes.push(to_node(entity, false));
+            nodes.push(to_node(entity));
         }
     }
     for (id, entity_type) in &declared_type {
@@ -310,7 +286,7 @@ pub async fn claim_ego(
     let total_edges = fetched.total_edges.saturating_sub(dropped_for_redaction);
 
     Ok(Json(EgoResponse {
-        center: to_node(center_entity, false),
+        center: to_node(center_entity),
         nodes,
         edges,
         total_edges,

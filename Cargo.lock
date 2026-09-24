@@ -1231,6 +1231,7 @@ dependencies = [
  "dotenvy",
  "ed25519-dalek",
  "epigraph-auth",
+ "epigraph-authz",
  "epigraph-cli",
  "epigraph-core",
  "epigraph-crypto",
@@ -1244,6 +1245,7 @@ dependencies = [
  "epigraph-interfaces",
  "epigraph-jobs",
  "epigraph-mcp",
+ "epigraph-privacy",
  "futures",
  "hex",
  "hmac",
@@ -1274,6 +1276,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "tracing-test",
  "url",
  "utoipa",
  "uuid",
@@ -1291,6 +1294,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "epigraph-authz"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "epigraph-db",
+ "epigraph-interfaces",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "epigraph-cli"
 version = "0.3.0"
 dependencies = [
@@ -1303,6 +1318,7 @@ dependencies = [
  "clap",
  "csv",
  "dotenvy",
+ "ed25519-dalek",
  "epigraph-api",
  "epigraph-core",
  "epigraph-crypto",
@@ -1313,6 +1329,7 @@ dependencies = [
  "epigraph-ingest",
  "epigraph-interfaces",
  "epigraph-mcp",
+ "epigraph-privacy",
  "futures",
  "hex",
  "http-body-util",
@@ -1330,6 +1347,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -1368,6 +1386,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror 1.0.69",
+ "uuid",
  "x25519-dalek",
 ]
 
@@ -1381,7 +1400,9 @@ dependencies = [
  "epigraph-core",
  "epigraph-crypto",
  "epigraph-ds",
+ "epigraph-privacy",
  "futures",
+ "hex",
  "serde",
  "serde_json",
  "sqlx",
@@ -1547,6 +1568,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "epigraph-auth",
+ "epigraph-authz",
  "epigraph-core",
  "epigraph-crypto",
  "epigraph-db",
@@ -1573,6 +1595,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "uuid",
+]
+
+[[package]]
+name = "epigraph-privacy"
+version = "0.3.0"
+dependencies = [
+ "ed25519-dalek",
+ "epigraph-crypto",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
  "uuid",
 ]
 

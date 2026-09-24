@@ -14,6 +14,9 @@
 //! These tests seed claims with the ACTUAL legacy BBA format observed in
 //! production (c98b6dec, adf396a8) and verify the clamp holds.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 use common::*;
 
@@ -40,8 +43,10 @@ async fn add_evidence(
     evidence_type: &str,
     note: &str,
 ) -> f64 {
+    let viewer = fixture::public_viewer(pool).await;
     let res = epigraph_mcp::tools::claims::update_with_evidence(
         server,
+        &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,
@@ -64,9 +69,13 @@ async fn add_evidence(
 
 /// Seed the binary frame and return its id (creates it if absent).
 async fn get_or_create_binary_frame(pool: &PgPool) -> Uuid {
-    epigraph_mcp::tools::ds_auto::ensure_binary_frame(pool)
-        .await
-        .expect("ensure_binary_frame")
+    let viewer = fixture::public_viewer(pool).await;
+    epigraph_mcp::tools::ds_auto::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("ensure_binary_frame")
 }
 
 /// Insert a legacy mixed-format BBA directly into mass_functions.
@@ -141,7 +150,11 @@ async fn supporting_evidence_never_lowers_betp_with_legacy_mixed_bbas(pool: PgPo
         insert_legacy_mixed_bba(&pool, claim_id, frame_id).await;
     }
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Set an initial pignistic_prob to simulate the pre-bug state (~0.88).
     // auto_wire_ds_update will read this before combining and clamp against it.
@@ -179,6 +192,7 @@ async fn supporting_evidence_never_lowers_betp_with_legacy_mixed_bbas(pool: PgPo
 /// that was the prior regression target (b3d12e2a).
 #[sqlx::test(migrations = "../../migrations")]
 async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let claim_id = seed_claim(
         &pool,
@@ -188,7 +202,8 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
     .await;
 
     let (_frame_id, wired) = auto_wire_ds_batch(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
         &[
             BatchDsEntry {
                 claim_id,
@@ -218,7 +233,11 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
     .expect("auto_wire_ds_batch");
     assert_eq!(wired, 3);
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Add opposing evidence to create conflict.
     add_evidence(
@@ -255,11 +274,13 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
 /// Two opposing BBAs: tests deeper conflict regime.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supporting_evidence_never_lowers_betp_two_opposing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, "1c1360bb variant-2opp regression claim", 0.5).await;
 
     let (_frame_id, _wired) = auto_wire_ds_batch(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
         &[
             BatchDsEntry {
                 claim_id,
@@ -281,7 +302,11 @@ async fn supporting_evidence_never_lowers_betp_two_opposing(pool: PgPool) {
     .await
     .expect("batch 2 supports");
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     add_evidence(
         &server,
@@ -321,5 +346,106 @@ async fn supporting_evidence_never_lowers_betp_two_opposing(pool: PgPool) {
         betp_after >= betp_before - 1e-9,
         "Bug 1c1360bb variant: 2-opposing + strong support lowered BetP: \
          {betp_before:.6} → {betp_after:.6}"
+    );
+}
+
+/// Read the full persisted DS triple, not just BetP.
+async fn cached_triple(pool: &PgPool, claim_id: Uuid) -> (f64, f64, f64) {
+    let row: (Option<f64>, Option<f64>, Option<f64>) =
+        sqlx::query_as("SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_one(pool)
+            .await
+            .expect("query DS triple");
+    (
+        row.0.expect("belief populated"),
+        row.1.expect("plausibility populated"),
+        row.2.expect("pignistic_prob populated"),
+    )
+}
+
+/// The monotonicity clamp must not persist `pignistic_prob > plausibility`.
+///
+/// Backlog 0183a294. `auto_wire_ds_update` replaces `betp` with the prior when
+/// supporting evidence would lower it, but writes `bel`/`pl` from the CURRENT
+/// combined mass. When the prior exceeds the new plausibility, the row is
+/// persisted outside the DS interval — a state no mass function can represent.
+///
+/// This is a SEPARATE mechanism from the renormalizer in
+/// `measures::pignistic_probability`: it writes an out-of-bounds BetP even when
+/// the measure itself is correct, which is why fixing the measure alone leaves
+/// the defect live on this path.
+///
+/// The clamp is retained (30bfbb19's monotonicity intent still holds) but is
+/// now bounded by plausibility: where the two conflict, the DS bound wins,
+/// because a BetP above plausibility is not a weaker guarantee — it is an
+/// impossible one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn monotonicity_clamp_never_exceeds_plausibility(pool: PgPool) {
+    let claim_id = seed_claim(&pool, "0183a294: clamp must respect the DS bound", 0.5).await;
+    let frame_id = get_or_create_binary_frame(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) \
+         VALUES ($1, $2, 0) ON CONFLICT DO NOTHING",
+    )
+    .bind(claim_id)
+    .bind(frame_id)
+    .execute(&pool)
+    .await
+    .expect("assign claim to frame");
+
+    // Legacy mixed BBAs drive the prior BetP up and carry opposing + complement
+    // mass, so the combination that follows lands outside the Dempster branch
+    // and yields a plausibility below that prior.
+    for _ in 0..4 {
+        insert_legacy_mixed_bba(&pool, claim_id, frame_id).await;
+    }
+
+    // Seed an INFLATED cached prior. This is not a contrived value: it is the
+    // state `measures::pignistic_probability`'s `1/(1 - non_classical_mass)`
+    // renormalizer already leaves on conflicted claims throughout the corpus,
+    // and `prior_betp` reads this column verbatim
+    // (`SELECT pignistic_prob FROM claims WHERE id = $1`). The clamp therefore
+    // re-injects it on the next supporting write.
+    let prior = 0.99_f64;
+    sqlx::query("UPDATE claims SET pignistic_prob = $1 WHERE id = $2")
+        .bind(prior)
+        .bind(claim_id)
+        .execute(&pool)
+        .await
+        .expect("seed inflated prior");
+
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    // Weak supporting evidence: `supports=true` arms the clamp, and the legacy
+    // mixed BBAs' opposing + complement mass keeps the combined plausibility
+    // below the seeded prior.
+    add_evidence(
+        &server,
+        &pool,
+        claim_id,
+        true,
+        0.05,
+        "testimonial",
+        "0183a294 weak",
+    )
+    .await;
+    let (bel, pl, betp) = cached_triple(&pool, claim_id).await;
+
+    assert!(
+        betp <= pl + 1e-9,
+        "persisted pignistic_prob {betp} exceeds plausibility {pl} (belief {bel}, \
+         prior {prior}) — the monotonicity clamp wrote a value outside the DS \
+         interval, which no mass function can represent"
+    );
+    assert!(
+        betp >= bel - 1e-9,
+        "persisted pignistic_prob {betp} is below belief {bel} — BetP must lie \
+         within [Bel, Pl]"
     );
 }

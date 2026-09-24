@@ -33,6 +33,9 @@
 //! denial is asserted alongside the undeclared-signer grant: without it, this
 //! file could not tell a narrow fix from a blanket "stdio may do anything".
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::tools::claims::resolve_backlog_item;
@@ -42,7 +45,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 mod common;
-use common::{build_test_server, build_test_server_generated_signer};
+use common::{build_scoped_test_server, build_scoped_test_server_generated_signer};
 
 /// The reported defect. Rung-4 signer + no `AuthContext` + a claim owned by
 /// another agent: the supersede must go through, and must actually land
@@ -50,13 +53,15 @@ use common::{build_test_server, build_test_server_generated_signer};
 /// Ok.
 #[sqlx::test(migrations = "../../migrations")]
 async fn generated_signer_permits_cross_agent_supersede_without_auth(pool: PgPool) {
-    let server = build_test_server_generated_signer(pool.clone());
+    let server =
+        build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let foreign_claim = seed_claim(&pool, foreign_agent).await;
 
     supersede_claim(
         &server,
+        &fixture::public_viewer(&pool).await,
         SupersedeClaimParams {
             claim_id: foreign_claim.as_uuid().to_string(),
             content: "replacement authored on an unauthenticated transport".to_string(),
@@ -85,7 +90,8 @@ async fn generated_signer_permits_cross_agent_supersede_without_auth(pool: PgPoo
 /// dedup blocked while supersede worked.
 #[sqlx::test(migrations = "../../migrations")]
 async fn generated_signer_permits_cross_agent_mark_duplicate_without_auth(pool: PgPool) {
-    let server = build_test_server_generated_signer(pool.clone());
+    let server =
+        build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let duplicate = seed_claim(&pool, foreign_agent).await;
@@ -93,6 +99,7 @@ async fn generated_signer_permits_cross_agent_mark_duplicate_without_auth(pool: 
 
     mark_duplicate(
         &server,
+        &fixture::public_viewer(&pool).await,
         MarkDuplicateParams {
             claim_id: duplicate.as_uuid().to_string(),
             canonical_id: canonical.as_uuid().to_string(),
@@ -119,17 +126,20 @@ async fn generated_signer_permits_cross_agent_mark_duplicate_without_auth(pool: 
 /// the mandated verb blocked.
 #[sqlx::test(migrations = "../../migrations")]
 async fn generated_signer_permits_cross_agent_backlog_retirement_without_auth(pool: PgPool) {
-    let server = build_test_server_generated_signer(pool.clone());
+    let server =
+        build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let foreign_claim = seed_backlog_claim(&pool, foreign_agent).await;
 
     resolve_backlog_item(
         &server,
+        &fixture::public_viewer(&pool).await,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "retired by a stdio agent with no declared signer".to_string(),
             methodology: None,
+            basis_claim_ids: Vec::new(),
         },
         None,
     )
@@ -138,9 +148,10 @@ async fn generated_signer_permits_cross_agent_backlog_retirement_without_auth(po
 
     // Assert against the DB, not the response body: retirement is label-side,
     // and the point is that the ORIGINAL row was actually patched.
-    let labels = ClaimRepository::get_labels(&pool, foreign_claim)
-        .await
-        .expect("get_labels");
+    let labels =
+        ClaimRepository::get_labels(&pool, &fixture::public_viewer(&pool).await, foreign_claim)
+            .await
+            .expect("get_labels");
     assert!(
         labels.contains(&"resolved".to_string()),
         "the original backlog claim must carry 'resolved' after retirement: {labels:?}"
@@ -153,13 +164,14 @@ async fn generated_signer_permits_cross_agent_backlog_retirement_without_auth(po
 /// would make the change a blanket grant rather than a narrow one.
 #[sqlx::test(migrations = "../../migrations")]
 async fn declared_signer_still_denies_cross_agent_supersede_without_auth(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let foreign_claim = seed_claim(&pool, foreign_agent).await;
 
     let err = supersede_claim(
         &server,
+        &fixture::public_viewer(&pool).await,
         SupersedeClaimParams {
             claim_id: foreign_claim.as_uuid().to_string(),
             content: "must not be written".to_string(),
@@ -198,7 +210,8 @@ async fn declared_signer_still_denies_cross_agent_supersede_without_auth(pool: P
 async fn generated_signer_does_not_relax_the_authenticated_path(pool: PgPool) {
     use epigraph_auth::{AuthContext, ClientType};
 
-    let server = build_test_server_generated_signer(pool.clone());
+    let server =
+        build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let foreign_claim = seed_claim(&pool, foreign_agent).await;
@@ -215,6 +228,7 @@ async fn generated_signer_does_not_relax_the_authenticated_path(pool: PgPool) {
 
     let err = supersede_claim(
         &server,
+        &fixture::public_viewer(&pool).await,
         SupersedeClaimParams {
             claim_id: foreign_claim.as_uuid().to_string(),
             content: "must not be written".to_string(),

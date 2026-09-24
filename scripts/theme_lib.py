@@ -7,18 +7,44 @@ killed client cannot orphan a multi-minute server-side UPDATE), and the
 nearest-centroid boundary math.
 """
 import json
-import os
 import uuid
 
 import numpy as np
 import psycopg2
 
+from maintenance_dsn import maintenance_dsn as _maintenance_dsn
+
 DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
+
+
+def maintenance_dsn(default=DEFAULT_DATABASE_URL):
+    """Resolve the DSN a corpus-wide script should connect on.
+
+    A thin binding of `maintenance_dsn.maintenance_dsn` to this family's
+    default. The RULE — `MAINTENANCE_DATABASE_URL` wins, then `DATABASE_URL`,
+    then `default`, and a refusal when the two name different databases — lives
+    in `scripts/maintenance_dsn.py` and is stated once there, because nineteen
+    scripts share it and nineteen copies of a guard is nineteen places for it to
+    drift. Read that module for why the precedence needs a guard at all and why
+    privilege is deliberately not asserted in Python.
+
+    Why the theme pipeline in particular needs it: it enumerates, re-clusters
+    and UPDATEs the whole claim corpus, so once RLS is active (PR-17) an
+    ordinary application connection makes every one of those statements match a
+    subset — the SELECTs see less, the UPDATEs touch nothing, and the script
+    exits 0.
+
+    NOTE — pre-existing and NOT changed here: `DEFAULT_DATABASE_URL` hardcodes
+    a production role and database. That is a long-standing property of this
+    script family, not something PR-15 introduced, and changing it would alter
+    where a dozen operator scripts point by default. Flagged, not fixed.
+    """
+    return _maintenance_dsn(default)
 
 
 def connect(database_url=None):
     """Open a psycopg2 connection (admin role by default)."""
-    url = database_url or os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
+    url = database_url or maintenance_dsn()
     return psycopg2.connect(url)
 
 

@@ -23,6 +23,90 @@ const fn source_type_str(st: &SourceType) -> &'static str {
     }
 }
 
+/// Every value [`source_type_str`] can emit — i.e. the `properties.source_type`
+/// stamp that marks a persisted row as DOCUMENT ingest output.
+///
+/// Deliberately not "anything that is not `workflow`": `ClaimRepository::
+/// evolve_step` writes `properties = {"level": n, "step_lineage_id": …}` with no
+/// `source_type` at all, and those rows bind the plain content hash.
+/// Spelled through [`source_type_str`] so the mapping has exactly one
+/// definition; `every_source_type_stamp_is_listed` holds the other end of the
+/// drift guard with an exhaustive `match` that stops compiling when a
+/// [`SourceType`] variant is added.
+pub const DOCUMENT_SOURCE_TYPES: [&str; 7] = [
+    source_type_str(&SourceType::Paper),
+    source_type_str(&SourceType::Textbook),
+    source_type_str(&SourceType::InternalDocument),
+    source_type_str(&SourceType::Report),
+    source_type_str(&SourceType::Transcript),
+    source_type_str(&SourceType::Legal),
+    source_type_str(&SourceType::Tabular),
+];
+
+/// Whether a persisted claim's `properties` identify it as a row whose
+/// `claims.content_hash` is a [`compound_content_hash`] — a digest that is NOT
+/// `blake3(content)` and CANNOT be re-derived from the claim alone.
+///
+/// # Why a reader needs this
+///
+/// `build_ingest_plan` binds `compound_content_hash(blake3(text),
+/// artifact_seed)` on every level-0/1/2 node (see the `content_hash` field doc
+/// on [`PlannedClaim`](crate::common::plan::PlannedClaim)), so that migration
+/// 013's `UNIQUE (content_hash, agent_id)` cannot collapse two documents'
+/// "Introduction" rows. A reader that recomputes `blake3(content)` and compares
+/// it to the stored digest therefore gets a disagreement on every *untampered*
+/// structural row of every ingested document. That disagreement is not
+/// evidence of tampering and must not be reported as such — MCP `verify_claim`
+/// routes on this predicate to answer "not applicable" instead.
+///
+/// # What it deliberately does NOT do
+///
+/// It does not attempt to re-derive the stored digest. The artifact seed is
+/// `"{document title}\u{1f}{path}"`, which is not carried on the claim row, so
+/// recomputation would have to guess it — and a guessed seed that happened to
+/// match would manufacture exactly the false confidence this predicate exists
+/// to remove. The honest answer for this class is "undecided", not "verified".
+///
+/// # Class predicate, not a security boundary
+///
+/// The inputs are `claims.properties`, and reaching them does NOT require
+/// database access: `ClaimRepository::patch_claim_atomic_conn` merges
+/// caller-supplied properties with `properties = COALESCE(properties,'{}') || $1`,
+/// reachable from MCP `patch_claim` and HTTP `PATCH /claims/:id`. A caller with
+/// patch rights can therefore add `{"level":0,"source_type":"Paper"}` to a
+/// plain-hash claim and turn a future `mismatch` verdict into `not_applicable`.
+///
+/// That is a defence-in-depth degradation rather than a bypass, for one specific
+/// reason worth stating so a later reader does not have to re-derive it: no API
+/// surface can create the mismatch it would be masking. `PatchClaimInput` is
+/// only `{trace_id, properties, add_labels, remove_labels}`, and there is no
+/// `UPDATE claims SET content` anywhere in the workspace — so the attacker who
+/// could produce a body/digest disagreement is one with direct table access, and
+/// that attacker can rewrite `content_hash` regardless of this predicate.
+/// (`POST /claims` accepting a caller-supplied `content_hash` override is a
+/// separate, pre-existing gap — backlog 365bc9f0.)
+///
+/// Do not read a `true` here as an attestation of anything. It classifies, it
+/// does not verify.
+#[must_use]
+pub fn stored_content_hash_is_seed_scoped(properties: &serde_json::Value) -> bool {
+    // `level` is written as a JSON number by both builders, but every query in
+    // the repo reads it through `properties->>'level'` (text), so accept either
+    // spelling rather than silently failing the class check on a string.
+    let level = properties.get("level").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+    });
+    let is_compound_level = matches!(level, Some(0..=2));
+
+    let is_document = properties
+        .get("source_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|st| DOCUMENT_SOURCE_TYPES.contains(&st));
+
+    is_compound_level && is_document
+}
+
 fn enrichment_from_paragraph(paragraph: &Paragraph) -> serde_json::Value {
     serde_json::json!({
         "instruments_used": paragraph.instruments_used,
@@ -300,5 +384,62 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
 impl crate::common::walker::Walker for DocumentExtraction {
     fn build_ingest_plan(&self) -> IngestPlan {
         build_ingest_plan(self)
+    }
+}
+
+#[cfg(test)]
+mod source_type_guard {
+    use super::{source_type_str, DOCUMENT_SOURCE_TYPES};
+    use crate::document::schema::SourceType;
+
+    /// Every `SourceType` stamp must appear in [`DOCUMENT_SOURCE_TYPES`].
+    ///
+    /// The list is what MCP `verify_claim` consults to tell "this digest is not
+    /// `blake3(content)` by construction" from "this body was mutated". A stamp
+    /// missing from it makes every thesis/section/paragraph row of that source
+    /// type report a tampering mismatch.
+    ///
+    /// The `match` below is exhaustive on purpose: adding a `SourceType` variant
+    /// is a COMPILE error here until someone decides whether its stamp belongs
+    /// in the list (and adds it to `ALL` so this test still covers it).
+    #[test]
+    fn every_source_type_stamp_is_listed() {
+        const ALL: [SourceType; 7] = [
+            SourceType::Paper,
+            SourceType::Textbook,
+            SourceType::InternalDocument,
+            SourceType::Report,
+            SourceType::Transcript,
+            SourceType::Legal,
+            SourceType::Tabular,
+        ];
+
+        for st in &ALL {
+            match st {
+                SourceType::Paper
+                | SourceType::Textbook
+                | SourceType::InternalDocument
+                | SourceType::Report
+                | SourceType::Transcript
+                | SourceType::Legal
+                | SourceType::Tabular => {}
+            }
+            let stamp = source_type_str(st);
+            assert!(
+                DOCUMENT_SOURCE_TYPES.contains(&stamp),
+                "builder stamps source_type {stamp:?} but DOCUMENT_SOURCE_TYPES omits it — \
+                 verify_claim would report every structural row of this source type as tampered"
+            );
+        }
+        assert_eq!(
+            DOCUMENT_SOURCE_TYPES.len(),
+            ALL.len(),
+            "the stamp list and the variant list must stay the same size"
+        );
+        assert!(
+            !DOCUMENT_SOURCE_TYPES.contains(&"workflow"),
+            "the workflow builder binds the PLAIN content hash on its compound nodes; listing \
+             its stamp here would excuse a tampered workflow phase/step body"
+        );
     }
 }

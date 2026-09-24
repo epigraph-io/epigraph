@@ -336,7 +336,6 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     let endpoint = std::env::var("API_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let dry_run = std::env::args().any(|a| a == "--dry-run");
 
     // Parse --provider (default: epigraph auto-detect)
@@ -368,13 +367,13 @@ async fn main() {
     println!("Dry run:    {dry_run}");
     println!();
 
-    // Connect to database
+    // Connect to database. Corpus-wide, and it writes bridge edges.
+    // See `epigraph_cli::MaintenancePool`.
     println!("Connecting to PostgreSQL...");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&database_url)
+    let maint = epigraph_cli::MaintenancePool::connect("embed_bridge")
         .await
         .expect("Failed to connect to PostgreSQL");
+    let pool = maint.pool().clone();
 
     // Step 1: Find bridge candidates
     println!("Finding cross-component bridge candidates...");

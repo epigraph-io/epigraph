@@ -6,6 +6,9 @@
 //! path does NOT itself classify (only the recompute cascade does), so we then
 //! call recompute_beliefs and assert the label.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::types::{GetClaimParams, RecomputeBeliefsParams};
@@ -45,9 +48,20 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 }
 
 async fn wire(pool: &PgPool, claim: Uuid, agent: Uuid, confidence: f64, supports: bool) {
-    tools::ds_auto::auto_wire_ds_update(pool, claim, agent, confidence, 1.0, supports, None, None)
-        .await
-        .expect("auto_wire_ds_update");
+    let viewer = fixture::public_viewer(pool).await;
+    tools::ds_auto::auto_wire_ds_update(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        claim,
+        agent,
+        confidence,
+        1.0,
+        supports,
+        None,
+        None,
+    )
+    .await
+    .expect("auto_wire_ds_update");
 }
 
 /// Recompute classifies the claim and `get_classification` reads it back.
@@ -56,8 +70,10 @@ async fn recompute_and_label(
     pool: &PgPool,
     claim: Uuid,
 ) -> Option<String> {
+    let viewer = fixture::public_viewer(pool).await;
     tools::cdst_maintenance::recompute_beliefs(
         server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -67,7 +83,7 @@ async fn recompute_and_label(
     )
     .await
     .expect("recompute_beliefs");
-    ClaimRepository::get_classification(pool, claim)
+    ClaimRepository::get_classification(pool, &viewer, claim)
         .await
         .expect("get_classification")
 }
@@ -128,6 +144,7 @@ async fn no_bba_leaves_classification_null(pool: PgPool) {
 /// get_claim surfaces the cached classification on the flattened response.
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_claim_exposes_classification(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "classify-getclaim").await;
     let claim = insert_claim(&pool, agent, &format!("classify-gc-{}", Uuid::new_v4())).await;
@@ -136,12 +153,12 @@ async fn get_claim_exposes_classification(pool: PgPool) {
 
     let out = tools::claims::get_claim(
         &server,
+        &viewer,
         GetClaimParams {
             claim_id: claim.to_string(),
             frame_id: None,
             perspective_id: None,
         },
-        None,
     )
     .await
     .expect("get_claim");

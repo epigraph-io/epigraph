@@ -7,6 +7,9 @@
 //!    new body paragraphs in `new_paragraph_paths`.
 //! 3. Full re-spine of an already-ingested document: `already_ingested: true`, zero new paths.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
@@ -14,10 +17,17 @@ use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::ingestion::do_ingest_document_spine;
 use sqlx::PgPool;
 
-fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+/// Built FROM A `ScopedPool`: the document ingest walk now runs in one
+/// transaction stamped from the ingesting agent and refuses (nothing written) on
+/// a server that cannot stamp one. `#[sqlx::test]` connects as a BYPASSRLS
+/// superuser, so the stamp is inert here — what this buys is that the fixture
+/// drives the PRODUCTION code path (`begin_author_stamped_tx`) rather than the
+/// refusal.
+async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::generate();
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 /// Two-section paper, 3 paragraphs total, no atoms (spine mode).
@@ -82,7 +92,7 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 /// A fresh spine returns all paragraphs as new, in document order.
 #[sqlx::test(migrations = "../../migrations")]
 async fn spine_fresh_paper_returns_new_paragraph_paths(pool: PgPool) {
-    let server = make_server(pool);
+    let server = make_server(pool).await;
     let extraction: DocumentExtraction =
         serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
 
@@ -115,7 +125,7 @@ async fn spine_fresh_paper_returns_new_paragraph_paths(pool: PgPool) {
 /// the new body paragraphs appear in `new_paragraph_paths`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn abstract_then_full_paper_abstract_paras_deduped(pool: PgPool) {
-    let server = make_server(pool);
+    let server = make_server(pool).await;
     let abstract_extraction: DocumentExtraction =
         serde_json::from_str(ABSTRACT_FIXTURE).expect("abstract fixture parses");
     let full_extraction: DocumentExtraction =
@@ -164,7 +174,7 @@ async fn abstract_then_full_paper_abstract_paras_deduped(pool: PgPool) {
 /// with no new paragraph paths.
 #[sqlx::test(migrations = "../../migrations")]
 async fn full_reingest_returns_already_ingested(pool: PgPool) {
-    let server = make_server(pool);
+    let server = make_server(pool).await;
     let extraction: DocumentExtraction =
         serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
 

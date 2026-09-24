@@ -1,3 +1,38 @@
+//! Agent endpoints.
+//!
+//! # Tenancy: 5 of this file's 15 raw-pool sites are converted
+//!
+//! Conversion shard 6. `get_agent_reputation` (2 sites) and `agent_claims`
+//! (3 sites) each serve their whole request on one viewer-stamped connection
+//! from [`AppState::read_as`].
+//!
+//! **Only 3 of those 5 sites change what a caller can see, and the split is
+//! stated rather than averaged.** The `AgentRepository::get_by_id` site in each
+//! handler narrows nothing: `agents` carries RLS, but migration 077 section 9
+//! creates `agents_identity FOR SELECT TO PUBLIC USING (true)` on it and says
+//! why. The `ClaimRepository::get_by_agent` and the two
+//! `EdgeRepository::*_claims_attributed_to` sites read `claims` and `edges`,
+//! both FORCEd and both viewer-spliced, and those are the reads the stamp bears
+//! on. An earlier classification filed this whole file as convertible-and-inert;
+//! that is right about `get_agent`/`list_agents` and wrong about these five.
+//!
+//! NOT converted, with the blocker named per handler:
+//! * `create_agent`, `update_agent` — WRITE. [`AppState::read_as`] is read-only,
+//!   and a write routed through a `ScopedRead` type-checks and is then rolled
+//!   back on drop under `SessionGucMode::Transaction`. Owner is
+//!   `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//! * `get_agent`, `list_agents` — the HANDLER, not the site: neither takes a
+//!   `Viewer`, so there is nothing for `read_as` to stamp a connection with.
+//!   The residual is already on record as `F-TAILRLS-P1` in
+//!   `docs/tenancy/progress.json` and is owned by that entry, not by this shard,
+//!   which neither widens nor narrows it.
+//!
+//! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES`,
+//! `AUTH_OPTIONAL_PROVENANCE_SITES` and `AUTH_OPTIONAL_WRITE_SITES` rows for
+//! this file all sit in the write handlers above and are unchanged.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
+
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -10,6 +45,7 @@ use epigraph_engine::reputation::{ClaimOutcome, ReputationCalculator};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::routes::claims::{ClaimResponse, PaginatedResponse};
 use crate::services::ValidationService;
 use crate::{errors::ApiError, state::AppState};
@@ -128,16 +164,12 @@ fn parse_public_key(hex_key: &str) -> Result<[u8; ED25519_PUBLIC_KEY_BYTE_LENGTH
 
 /// Standard harvester-level scopes for auto-provisioned agent OAuth clients.
 /// These allow the agent to read/write claims, edges, and evidence.
+///
+/// Re-exported from `epigraph_core::canonical_scopes` (identical contents) so
+/// this is no longer one of three divergent private grant lists. It is
+/// deliberately NOT `read_write_scopes()` — see the constant's doc comment.
 #[cfg(feature = "db")]
-const AGENT_DEFAULT_SCOPES: &[&str] = &[
-    "claims:read",
-    "claims:write",
-    "edges:read",
-    "edges:write",
-    "evidence:read",
-    "evidence:write",
-    "agents:read",
-];
+const AGENT_DEFAULT_SCOPES: &[&str] = epigraph_core::canonical_scopes::AGENT_PROVISION_SCOPES;
 
 /// Create a new agent
 ///
@@ -188,6 +220,24 @@ pub async fn create_agent(
             let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");
             let scopes: Vec<String> = AGENT_DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
 
+            // This path passes a REAL agent_id at creation time, so it is not
+            // part of the "oauth_clients.agent_id is never populated" bug that
+            // `AgentRepository::ensure_for_client` fixes for the other three
+            // creation paths (`oauth/register.rs`, external provisioning,
+            // `bootstrap_clients`). `ensure_for_client` is a no-op for a client
+            // created here — it early-returns on the existing link.
+            //
+            // Do NOT "unify" the two: this one has a real Ed25519 agent whose
+            // public_key IS a signature verifier (key_kind='ed25519'), whereas
+            // ensure_for_client materialises a `derived` placeholder for a
+            // keyless OAuth principal. Collapsing them would either lose the
+            // real key or mark it derived.
+            //
+            // status="active" here, while /oauth/register's agent arm now
+            // registers "pending", is a deliberate asymmetry, not an oversight:
+            // reaching this line requires an authenticated caller holding
+            // `agents:write` (checked above) — which IS the admin approval that
+            // the anonymous registration endpoint lacks.
             if let Err(e) = OAuthClientRepository::create(
                 &state.db_pool,
                 &client_id_str,
@@ -352,21 +402,43 @@ pub async fn list_agents(
 /// This prevents the "Appeal to Authority" fallacy.
 #[cfg(feature = "db")]
 pub async fn get_agent_reputation(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AgentReputationResponse>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
 
-    // 1. Look up the agent (404 if not found)
-    let agent = AgentRepository::get_by_id(&state.db_pool, agent_id)
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_agent_reputation",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    // 1. Look up the agent (404 if not found).
+    //
+    // Stamping this statement narrows NOTHING and is not claimed to: migration
+    // 077 section 9 gives `agents` the policy `agents_identity FOR SELECT TO
+    // PUBLIC USING (true)`. It shares the connection so that the reputation this
+    // handler returns is computed under ONE tenancy stamp rather than two
+    // checkouts'. That is the property the shared connection delivers; it is NOT
+    // a shared snapshot, because a `ScopedRead` is a bare connection under
+    // `SessionGucMode::Session` and READ COMMITTED under `Transaction`.
+    let agent = AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
 
-    // 2. Fetch all claims by this agent
-    let claims = ClaimRepository::get_by_agent(&state.db_pool, agent_id).await?;
+    // 2. Fetch all claims by this agent. THIS is the read the stamp bears on:
+    // `claims` is FORCEd and `get_by_agent` splices the viewer.
+    let claims = ClaimRepository::get_by_agent(&mut *read, &viewer, agent_id).await?;
 
     // 3. Convert claims into ClaimOutcome structs
     let now = chrono::Utc::now();
@@ -484,15 +556,29 @@ pub struct AttributedClaimResponse {
 /// and optional minimum truth value filtering.
 #[cfg(feature = "db")]
 pub async fn agent_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Query(params): Query<AgentClaimsParams>,
 ) -> Result<Json<PaginatedResponse<AttributedClaimResponse>>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
 
-    // Verify agent exists
-    AgentRepository::get_by_id(&state.db_pool, agent_id)
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "agent_claims",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    // Verify agent exists. As in `get_agent_reputation`, `agents_identity`
+    // does not narrow, so this site shares the connection for coherence with
+    // the two `edges`/`claims` reads below rather than for suppression.
+    AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
@@ -504,14 +590,20 @@ pub async fn agent_claims(
     let offset = params.offset.max(0);
     let min_truth = params.min_truth.clamp(0.0, 1.0);
 
-    // Query claims via ATTRIBUTED_TO edges
+    // Query claims via ATTRIBUTED_TO edges.
+    //
+    // The page and its total now come off the SAME connection, which is what
+    // makes `total` describe the set `rows` was drawn from. On two checkouts
+    // they could disagree — and a total larger than the viewer's visible set is
+    // itself a cardinality disclosure.
     let rows =
-        EdgeRepository::get_claims_attributed_to(&state.db_pool, id, min_truth, limit, offset)
+        EdgeRepository::get_claims_attributed_to(&mut *read, &viewer, id, min_truth, limit, offset)
             .await?;
 
-    let total = EdgeRepository::count_claims_attributed_to(&state.db_pool, id, min_truth).await?;
+    let total =
+        EdgeRepository::count_claims_attributed_to(&mut *read, &viewer, id, min_truth).await?;
 
-    let mut items: Vec<AttributedClaimResponse> = rows
+    let items: Vec<AttributedClaimResponse> = rows
         .into_iter()
         .map(|row| {
             let claim = ClaimResponse {
@@ -539,18 +631,6 @@ pub async fn agent_claims(
     // SECURITY (§2.6): attribution to an agent says nothing about who may
     // read the claim — a private claim attributed to a public agent is still
     // private. One batch lookup for the page.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    crate::access_control::redact_claim_fields(
-        &state.db_pool,
-        requester,
-        items
-            .iter_mut()
-            .map(|it| (it.claim.id, &mut it.claim.content)),
-    )
-    .await;
-
     Ok(Json(PaginatedResponse {
         items,
         total,

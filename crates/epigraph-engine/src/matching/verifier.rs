@@ -93,6 +93,25 @@ impl MatchVerdict {
     }
 }
 
+/// [`Verdict::relationship`] for an EXPLICIT model rejection (`valid: false`).
+///
+/// Not an edge relationship and not a member of the reranker vocabulary — it is
+/// the one string a rejection is allowed to carry, precisely so a rejection is
+/// never confusable with an endorsement.
+///
+/// Before this existed, `epigraph_cli::matching_client::align_verdicts` stamped
+/// `valid: false` with the literal `"derives_from"`, which worked only because
+/// `derives_from` had no [`map_relationship`] arm and fell to
+/// [`MatchVerdict::Distinct`] alongside it. That coupling is what made issue
+/// #388 unfixable in isolation: giving `derives_from` its own arm would have
+/// dragged every explicit rejection along with it.
+///
+/// It must stay OUT of `epigraph_cli::rerank::candidates::VALID_RELATIONSHIPS`
+/// — asserted by
+/// `epigraph-cli/tests/reranker_vocabulary_coverage.rs`, which cannot live here
+/// because `epigraph-cli` depends on this crate and not the reverse.
+pub const REJECTED_RELATIONSHIP: &str = "llm_rejected";
+
 /// Edge relationship for a corroborating promotion.
 pub const CORROBORATES_RELATIONSHIP: &str = "CORROBORATES";
 
@@ -174,12 +193,37 @@ pub fn promotion_disposition_for_column(
 /// (`supports | contradicts | derives_from | refines | analogous`).
 /// `elaborates` is also accepted here for forward-compatibility — the spec
 /// lists it even though the current prompt does not emit it. Unknown strings
-/// default to [`MatchVerdict::Distinct`] (conservative: do not corroborate).
+/// default to [`MatchVerdict::Distinct`] (conservative: do not corroborate),
+/// and that is also where [`REJECTED_RELATIONSHIP`] lands.
+///
+/// # `derives_from` → `Overlapping` (issue #388)
+///
+/// Every member of the reranker vocabulary is offered to the model as a legal
+/// answer *when it endorses the pair*, so none of them may reach the `_` arm.
+/// `derives_from` did, and the prompt's own gloss — "A is a logical consequence
+/// or application of B" — describes a real relationship, not a non-match. It
+/// takes the same verdict as `refines`, which glosses the same way.
+///
+/// Both map to `Overlapping`, which routes to `PolicyAction::Reject` exactly as
+/// `Distinct` does (`matching::pipeline`), so no edge is written automatically
+/// and no existing edge changes. What moves is the persisted
+/// `match_candidates.verifier_verdict`: `'overlapping'` instead of `'distinct'`,
+/// and hence `PromotionDisposition::Corroborate` instead of `Drop` when a human
+/// later promotes the row — which is the point. A `distinct` row is permanently
+/// un-promotable, so an endorsed pair was being retired.
+///
+/// This is safe ONLY because explicit rejections no longer borrow the string:
+/// see [`REJECTED_RELATIONSHIP`]. Reversing that commit while keeping this arm
+/// would turn every `valid: false` answer into a promotable corroboration.
+///
+/// Already-stored rows are NOT rewritten by this change; re-verifying them needs
+/// a fresh reranker run, and `#384`'s `decided_at IS NOT NULL` freeze means
+/// human-decided rows will not move even then.
 pub fn map_relationship(rel: &str, _strength: f32) -> MatchVerdict {
     match rel {
         "supports" | "elaborates" => MatchVerdict::Same,
         "analogous" => MatchVerdict::Paraphrase,
-        "refines" => MatchVerdict::Overlapping,
+        "refines" | "derives_from" => MatchVerdict::Overlapping,
         "contradicts" => MatchVerdict::Contradicts,
         _ => MatchVerdict::Distinct,
     }

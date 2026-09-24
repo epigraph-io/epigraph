@@ -1,5 +1,44 @@
 //! /api/v1/graph/{overview, clusters/:id/expand, neighborhood} — read-only
 //! endpoints over the latest successful clustering run.
+//!
+//! # Tenancy: 1 of this file's 4 raw-pool sites is converted
+//!
+//! Conversion shard 7. `expand` is ONE register site whose alias was spent on
+//! FOUR statements, and all four now run on a viewer-stamped connection from
+//! [`AppState::read_as`]: two inline run/cluster-metadata probes, the
+//! viewer-spliced `GraphViewRepository::expand_cluster_nodes`, and the private
+//! helper `fetch_subgraph_edges`.
+//!
+//! **`fetch_subgraph_edges` changed signature in place rather than gaining a
+//! `_conn` primitive beside a pool-shaped wrapper.** Shard 6 needed the wrapper
+//! for `graph_query_utils::load_subgraph` because that spelling had other
+//! callers; this one has exactly one caller workspace-wide, so a wrapper would
+//! have zero call sites, and a new route-layer primitive that no register
+//! watches is a worse thing to create than a signature to change.
+//!
+//! **Only ONE of the four statements narrows, and that is stated rather than
+//! implied.** `graph_cluster_runs`, `graph_clusters` and the `edges` read carry
+//! no viewer predicate OF THEIR OWN; the first two carry no tenancy columns and
+//! no RLS at migration head 92. The `edges` case is different in kind and the
+//! difference matters: `fetch_subgraph_edges` runs
+//! `WHERE source_id = ANY($1) AND target_id = ANY($1)` over `node_ids` produced
+//! by the viewer-spliced `GraphViewRepository::expand_cluster_nodes`, so BOTH
+//! endpoints are already restricted to the visible node set and the statement
+//! needs no predicate of its own. A reader should not take the sentence above as
+//! naming an unowned route-layer gap to re-file or to "fix". The suppression
+//! `expand` offers comes from the node projection alone. In particular this
+//! shard does NOT discharge
+//! `F-edges-unfiltered` (`epigraph-db/src/repos/graph_view.rs`, owner: the
+//! conversion tail). Converting an executor is not that entry's remedy, it
+//! stays open, and nothing further about it is recorded here — see
+//! `docs/tenancy/progress.json`.
+//!
+//! The other 3 sites — `overview`, `themes_overview`, `themes_expand` — are
+//! routed GETs that hold no `Viewer` at all. Their owner is
+//! `D-PR16-theme-cluster-viewer-scope`, an open entry that explicitly has no
+//! control.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::{
     extract::{Path, Query, State},
@@ -9,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::AppState;
 
 /// Claim-level edge relationships exposed to the graph view.
@@ -241,34 +281,54 @@ pub async fn overview(
     }))
 }
 
-/// Expand one cluster of the latest run into its claim nodes.
+/// Expand one cluster into its member claims.
 ///
-/// Node `label` is `claims.content`, so it carries the same partition
-/// restrictions `GET /claims/:id` enforces: labels the requester may not read
-/// become `"[REDACTED]"` (§2.6). This route is on the protected router, so the
-/// bearer is required and `auth_ctx` is always present; it stays `Option` to
-/// match every other redacting handler and to fail closed (requester `None` ⇒
-/// public content only) if the layering ever changes.
+/// The node projection is read as the caller's `Viewer`. `label` here is
+/// `claims.content` verbatim, so before PR-07 this endpoint returned other
+/// tenants' claim text to any authenticated principal that knew (or guessed,
+/// from `/graph/overview`) a cluster id. The surrounding run/cluster metadata
+/// is not viewer-filtered — those tables carry no tenancy columns; see
+/// `GraphViewRepository`'s module docs.
 pub async fn expand(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(cluster_id): Path<Uuid>,
     Query(params): Query<ExpandParams>,
 ) -> Result<Json<ExpandResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
-    let pool: &PgPool = &state.db_pool;
-    let latest_run = epigraph_db::ClusterRunRepository::latest(pool)
-        .await
-        .map_err(internal)?;
-    let Some(run) = latest_run else {
+    // ONE viewer-stamped connection for all four statements this handler runs:
+    // the two run/cluster metadata probes below, `expand_cluster_nodes`, and
+    // `fetch_subgraph_edges`. Only the node projection is viewer-filtered —
+    // `graph_cluster_runs`, `graph_clusters` and the `edges` read carry no
+    // predicate here, and stamping the connection does not give them one. What
+    // the shared connection buys is that the filtered read runs under the same
+    // tenancy context as the unfiltered metadata it is joined to in the
+    // response, rather than under a different one.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "expand",
+            "could not acquire a viewer-stamped connection"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to acquire a scoped connection".to_string(),
+        )
+    })?;
+    let latest_run: Option<(Uuid,)> =
+        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
+            .fetch_optional(&mut *read)
+            .await
+            .map_err(internal)?;
+    let Some((run_id,)) = latest_run else {
         return Err((StatusCode::NOT_FOUND, "no completed run".into()));
     };
-    let run_id = run.run_id;
     let cluster_exists: Option<(i64,)> =
         sqlx::query_as("SELECT size::bigint FROM graph_clusters WHERE id = $1 AND run_id = $2")
             .bind(cluster_id)
             .bind(run_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *read)
             .await
             .map_err(internal)?;
     let Some((total_size,)) = cluster_exists else {
@@ -287,54 +347,44 @@ pub async fn expand(
             .map(|s| (*s).to_string())
             .collect(),
     };
-    let mut nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
-        "WITH degree AS (
-            SELECT m.claim_id, COUNT(e.*) AS deg
-            FROM claim_cluster_membership m
-            LEFT JOIN edges e ON (e.source_id = m.claim_id OR e.target_id = m.claim_id)
-                              AND e.relationship = ANY($3)
-            WHERE m.cluster_id = $1 AND m.run_id = $2
-            GROUP BY m.claim_id
-        )
-        SELECT c.id,
-               COALESCE(c.content, c.id::text) AS label,
-               'claim'::text AS entity_type,
-               c.pignistic_prob,
-               (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1) AS frame_id,
-               $1::uuid AS cluster_id,
-               NULL::float8 AS conflict_k
-        FROM degree d
-        JOIN claims c ON c.id = d.claim_id
-        ORDER BY d.deg DESC NULLS LAST, c.pignistic_prob DESC NULLS LAST
-        LIMIT $4",
+    let nodes: Vec<NodeOut> = epigraph_db::GraphViewRepository::expand_cluster_nodes(
+        &mut *read,
+        &viewer,
+        cluster_id,
+        run_id,
+        &degree_list,
+        budget,
     )
-    .bind(cluster_id)
-    .bind(run_id)
-    .bind(degree_list)
-    .bind(budget)
-    .fetch_all(pool)
     .await
-    .map_err(internal)?;
+    .map_err(internal_db)?
+    .into_iter()
+    .map(|r| NodeOut {
+        id: r.id,
+        label: r.label,
+        entity_type: r.entity_type,
+        pignistic_prob: r.pignistic_prob,
+        frame_id: r.frame_id,
+        cluster_id: r.cluster_id,
+        conflict_k: r.conflict_k,
+    })
+    .collect();
 
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
     let (edges, filtered_edge_count) =
-        fetch_subgraph_edges(pool, &node_ids, allowlist.as_deref()).await?;
+        fetch_subgraph_edges(&mut read, &node_ids, allowlist.as_deref()).await?;
 
-    // Every node here is a claim (the SELECT hard-codes `entity_type`), so the
-    // whole node set goes through one ownership lookup.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    crate::access_control::redact_claim_fields(
-        pool,
-        requester,
-        nodes.iter_mut().map(|n| (n.id, &mut n.label)),
-    )
-    .await;
-
+    // PR-07: `truncated` means "the budget cut this response short", so it is
+    // derived from the budget, not from `graph_clusters.size`.
+    //
+    // `total_size` is raw cluster metadata (`graph_clusters` carries no tenancy
+    // columns), while `nodes` is now viewer-filtered. `total_size > nodes.len()`
+    // therefore reports `true` for a response that is complete *for this
+    // viewer*, and a client paging on the flag would page forever without ever
+    // seeing another row. The difference `total_size - nodes.len()` was also an
+    // exact count of how many claims in the cluster the caller cannot see.
     Ok(Json(ExpandResponse {
         cluster_id,
-        truncated: total_size > nodes.len() as i64,
+        truncated: nodes.len() as i64 >= budget,
         total_size,
         nodes,
         edges,
@@ -358,8 +408,15 @@ pub async fn neighborhood(
 ///
 /// Single round-trip: tags each row with an `is_allowed` flag computed in
 /// the SELECT list, then partitions in Rust.
+///
+/// Takes a `&mut PgConnection` rather than a `&PgPool` so that its statement
+/// runs on the same viewer-stamped connection as the rest of [`expand`], its
+/// ONLY caller workspace-wide. Changed in place rather than split into a
+/// `_conn` primitive beside a pool-shaped wrapper: with one caller a wrapper
+/// would have zero call sites, and a route-layer helper that no register
+/// watches is a worse thing to create than a signature to change.
 async fn fetch_subgraph_edges(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     node_ids: &[Uuid],
     rel_list: Option<&[String]>,
 ) -> Result<(Vec<EdgeOut>, i64), (axum::http::StatusCode, String)> {
@@ -376,7 +433,7 @@ async fn fetch_subgraph_edges(
             )
             .bind(node_ids)
             .bind(allowlist)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await
         }
         None => {
@@ -386,7 +443,7 @@ async fn fetch_subgraph_edges(
              WHERE source_id = ANY($1) AND target_id = ANY($1)",
             )
             .bind(node_ids)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await
         }
     }
@@ -542,6 +599,12 @@ fn synthesize_pre_run_response(theme_id: Uuid) -> ThemeExpandResponse {
 }
 
 fn internal<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// `internal` for the repo layer, which surfaces `DbError` rather than a raw
+/// `sqlx::Error`.
+fn internal_db(e: epigraph_db::DbError) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 

@@ -27,6 +27,7 @@ struct ConsolidateResponse {
 
 pub async fn consolidate_claims(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ConsolidateClaimsParams,
 ) -> Result<CallToolResult, McpError> {
     let acting_agent_id = server.agent_id().await?;
@@ -48,9 +49,12 @@ pub async fn consolidate_claims(
         None => {
             let mut best: f64 = 0.0;
             for id in &source_ids {
-                if let Ok(Some(c)) =
-                    ClaimRepository::get_by_id(&server.pool, epigraph_core::ClaimId::from_uuid(*id))
-                        .await
+                if let Ok(Some(c)) = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    epigraph_core::ClaimId::from_uuid(*id),
+                )
+                .await
                 {
                     best = best.max(c.truth_value.value());
                 }
@@ -59,8 +63,28 @@ pub async fn consolidate_claims(
         }
     };
 
-    let result = ClaimRepository::consolidate(
-        &server.pool,
+    // ONE transaction stamped from the ACTING agent — the author of the merged
+    // row, and the identity whose writable set migration 077's `WITH CHECK` asks
+    // about for the merged INSERT and for the sources' retirement UPDATE.
+    //
+    // On the unstamped pool this was refused for every caller on a cleanly
+    // migrated schema (`new row violates row-level security policy for table
+    // "claims"` at the merged INSERT) — loud and atomic, but unavailable for its
+    // whole population. It is safe to stamp because it is safe to retry: the
+    // merge is one transaction, and a retried merge hits the `(content_hash,
+    // agent_id)` idempotent return rather than inserting a second row.
+    //
+    // Who it still refuses, by construction and loudly: a source owned by a
+    // group the acting agent cannot write. A PRIVATE foreign source is invisible
+    // under `claims_tenancy`'s USING, so the `FOR UPDATE` lock finds fewer rows
+    // than it was given and the merge refuses with NotFound before writing; a
+    // PUBLIC foreign source is visible but its retirement UPDATE fails `WITH
+    // CHECK`, which aborts the whole transaction — the merged row included.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, acting_agent_id, "consolidate_claims")
+            .await?;
+    let result = ClaimRepository::consolidate_conn(
+        &mut tx,
         &source_ids,
         &params.merged_content,
         merged_truth,
@@ -69,7 +93,26 @@ pub async fn consolidate_claims(
         acting_agent_id,
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(|e| match e {
+        // The cross-group refusal (PR-16, plan §4.6) is a CLIENT error: the
+        // caller asked for a merge whose sources span two owner groups, and
+        // the answer is "pick sources within one group", not "the server
+        // failed". `internal_error` would render it as INTERNAL_ERROR and an
+        // agent would retry it forever. The HTTP twin is 409
+        // (`DbError::Conflict` -> `ApiError::Conflict`); INVALID_PARAMS is the
+        // nearest JSON-RPC code that carries the message to the caller.
+        epigraph_db::DbError::Conflict { ref reason } => invalid_params(reason.clone()),
+        // Migration 105's refusal from the all-public branch's owner lookup
+        // (the acting agent's personal membership is revoked, or its did_key
+        // squatted): a denial, INVALID_REQUEST, as on every other write tool.
+        other if other.is_personal_group_refusal() => crate::errors::db_caller_error(other),
+        other => internal_error(other),
+    })?;
+    // The idempotent-return branch rolled its SAVEPOINT back and wrote nothing;
+    // committing the (then empty) outer transaction is harmless and uniform.
+    tx.commit()
+        .await
+        .map_err(|e| internal_error(format!("consolidate_claims: could not commit: {e}")))?;
 
     // Post-commit embedding, best-effort: warn but never fail the merge (the
     // CLAUDE.md write-path invariant). Skipped on the idempotent return, where

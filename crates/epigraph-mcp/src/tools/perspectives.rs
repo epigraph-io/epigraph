@@ -6,7 +6,7 @@ use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_db::{EdgeRepository, OwnershipRepository, PerspectiveRepository};
+use epigraph_db::{EdgeRepository, PerspectiveRepository};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -115,11 +115,12 @@ pub async fn set_source_reliability(
 /// List all perspectives with optional pagination.
 pub async fn list_perspectives(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ListPerspectivesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
-    let rows = PerspectiveRepository::list(&server.pool, limit, 0)
+    let rows = PerspectiveRepository::list(&server.pool, viewer, limit, 0)
         .await
         .map_err(internal_error)?;
 
@@ -150,11 +151,12 @@ pub async fn list_perspectives(
 /// Get a single perspective by ID.
 pub async fn get_perspective(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetPerspectiveParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.perspective_id)?;
 
-    let row = PerspectiveRepository::get_by_id(&server.pool, id)
+    let row = PerspectiveRepository::get_by_id(&server.pool, viewer, id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("perspective {id} not found")))?;
@@ -172,88 +174,18 @@ pub async fn get_perspective(
     }))
 }
 
-/// Assign ownership of a node to an agent with a partition type.
-pub async fn assign_ownership(
-    server: &EpiGraphMcpFull,
-    params: AssignOwnershipParams,
-) -> Result<CallToolResult, McpError> {
-    let node_id = parse_uuid(&params.node_id)?;
-    let owner_id = if let Some(ref id) = params.owner_id {
-        parse_uuid(id)?
-    } else {
-        server.agent_id().await?
-    };
-
-    let community_id = if let Some(ref id) = params.community_id {
-        Some(parse_uuid(id)?)
-    } else {
-        None
-    };
-
-    let partition = params.partition_type.as_deref().unwrap_or("public");
-    let node_type = params.node_type.as_deref().unwrap_or("claim");
-
-    let row = OwnershipRepository::assign_with_community(
-        &server.pool,
-        node_id,
-        node_type,
-        partition,
-        owner_id,
-        community_id,
-    )
-    .await
-    .map_err(internal_error)?;
-
-    success_json(&serde_json::json!({
-        "node_id": row.node_id.to_string(),
-        "node_type": row.node_type,
-        "partition_type": row.partition_type,
-        "owner_id": row.owner_id.to_string(),
-        "encryption_key_id": row.encryption_key_id,
-        "created_at": row.created_at.to_rfc3339(),
-    }))
-}
-
-/// Get ownership info for a node.
-pub async fn get_ownership(
-    server: &EpiGraphMcpFull,
-    params: GetOwnershipParams,
-) -> Result<CallToolResult, McpError> {
-    let node_id = parse_uuid(&params.node_id)?;
-
-    let row = OwnershipRepository::get(&server.pool, node_id)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("no ownership record for {node_id}")))?;
-
-    success_json(&serde_json::json!({
-        "node_id": row.node_id.to_string(),
-        "node_type": row.node_type,
-        "partition_type": row.partition_type,
-        "owner_id": row.owner_id.to_string(),
-        "encryption_key_id": row.encryption_key_id,
-        "created_at": row.created_at.to_rfc3339(),
-        "updated_at": row.updated_at.to_rfc3339(),
-    }))
-}
-
-/// Update the partition type of a node.
-pub async fn update_partition(
-    server: &EpiGraphMcpFull,
-    params: UpdatePartitionParams,
-) -> Result<CallToolResult, McpError> {
-    let node_id = parse_uuid(&params.node_id)?;
-
-    let row = OwnershipRepository::update_partition(&server.pool, node_id, &params.partition_type)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("no ownership record for {node_id}")))?;
-
-    success_json(&serde_json::json!({
-        "node_id": row.node_id.to_string(),
-        "node_type": row.node_type,
-        "partition_type": row.partition_type,
-        "owner_id": row.owner_id.to_string(),
-        "updated_at": row.updated_at.to_rfc3339(),
-    }))
-}
+// PR-14 deleted three tools from this file: `assign_ownership` (was here at
+// :297), `get_ownership` (:354) and `update_partition` (:386), together with
+// the `require_declassify_authority` gate helper that guarded the two writes.
+//
+// They were the last readers and writers of the legacy `ownership` ACL table,
+// a partition model that the tenancy columns replaced. Their read half
+// (`get_ownership`) took no `Viewer` and disclosed a node's owner and
+// partition to anyone who asked, which made it an oracle for the very input
+// the write gate decides on; deleting the surface is the resolution
+// `progress.json::F-PR11-ownership-reads-are-an-owner-oracle` names.
+//
+// Their deletion also closes the scope asymmetry PR-12 recorded: the MCP
+// `assign_ownership` entry sat at `claims:write` while the HTTP route with the
+// identical declassification power required `claims:admin`. With both surfaces
+// gone there is no longer a cheaper transport for the same power.

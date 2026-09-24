@@ -5,18 +5,26 @@
 //! (the three tools added alongside it are reads), and that the default
 //! confidence never exceeds the best source.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_mcp::tools::consolidate::consolidate_claims;
 use epigraph_mcp::types::ConsolidateClaimsParams;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-fn build_server(pool: PgPool, read_only: bool) -> epigraph_mcp::EpiGraphMcpFull {
+/// A server built FROM A `ScopedPool`, because `consolidate_claims` now runs its
+/// merge in a transaction stamped from the acting agent and refuses (nothing
+/// written) on a server that cannot stamp one. Without the pool this fixture
+/// measures the refusal, not the merge.
+async fn build_server(pool: PgPool, read_only: bool) -> epigraph_mcp::EpiGraphMcpFull {
     use epigraph_crypto::AgentSigner;
     use epigraph_mcp::embed::McpEmbedder;
     use epigraph_mcp::EpiGraphMcpFull;
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, read_only)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, read_only).with_scoped_pool(scoped)
 }
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
@@ -63,12 +71,13 @@ fn json_of(out: rmcp::model::CallToolResult) -> serde_json::Value {
 /// End-to-end merge through the tool, with the default confidence rule.
 #[sqlx::test(migrations = "../../migrations")]
 async fn tool_merges_and_caps_confidence_at_best_source(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let s1 = seed_claim(&pool, agent, "tool src one", 0.6).await;
     let s2 = seed_claim(&pool, agent, "tool src two", 0.9).await;
 
-    let server = build_server(pool.clone(), false);
-    let out = consolidate_claims(&server, params(&[s1, s2], "tool merged", None))
+    let server = build_server(pool.clone(), false).await;
+    let out = consolidate_claims(&server, &viewer, params(&[s1, s2], "tool merged", None))
         .await
         .expect("consolidate ok");
     let j = json_of(out);
@@ -114,16 +123,88 @@ fn consolidate_is_gated_as_a_write() {
 /// An unknown mode is a parameter error, not a 500.
 #[sqlx::test(migrations = "../../migrations")]
 async fn unknown_mode_is_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let s1 = seed_claim(&pool, agent, "mode a", 0.6).await;
     let s2 = seed_claim(&pool, agent, "mode b", 0.6).await;
 
-    let server = build_server(pool, false);
+    let server = build_server(pool, false).await;
     let mut p = params(&[s1, s2], "x", None);
     p.mode = "obliterate".to_string();
-    let err = consolidate_claims(&server, p)
+    let err = consolidate_claims(&server, &viewer, p)
         .await
         .expect_err("bad mode rejected");
     let msg = format!("{err:?}").to_lowercase();
     assert!(msg.contains("mode") || msg.contains("invalid"), "{msg}");
+}
+
+/// A merge by a server agent whose personal membership is REVOKED is refused as
+/// a DENIAL (`INVALID_REQUEST`), not a server fault, and writes nothing. The
+/// all-public branch's owner lookup reaches migration 105's definer, which
+/// raises RVK01; `consolidate_claims` used to map every non-conflict error to
+/// INTERNAL_ERROR (batch F review).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_acting_agent_is_refused_as_a_denial(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, agent, "revoked merge one", 0.6).await;
+    let s2 = seed_claim(&pool, agent, "revoked merge two", 0.7).await;
+
+    let server = build_server(pool.clone(), false).await;
+    let acting = server.server_agent_id().await.expect("resolve");
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(acting)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A LIVE writer membership elsewhere, so the author-stamped transaction
+    // opens (with NO writable group at all it refuses earlier, with its own
+    // error) and the merge reaches the owner lookup, the review's case.
+    let team: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('consolidate-team', 'did:test:team:' || gen_random_uuid()::text, \
+                 decode(repeat('ab', 32), 'hex'), 'team', $1) RETURNING id",
+    )
+    .bind(acting)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a team group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, '\\x00'::bytea, 0, 'writer')",
+    )
+    .bind(team)
+    .bind(acting)
+    .execute(&pool)
+    .await
+    .expect("live writer membership");
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let err = consolidate_claims(&server, &viewer, params(&[s1, s2], "revoked merged", None))
+        .await
+        .expect_err("a revoked acting agent must be refused");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_REQUEST,
+        "a revoked membership is a denial, not a server fault: {err:?}"
+    );
+    assert!(err.message.contains("REVOKED"), "{err:?}");
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before, "nothing may be written");
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships \
+          WHERE agent_id = $1 AND group_id <> $2 AND revoked_at IS NULL",
+    )
+    .bind(acting)
+    .bind(team)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 0, "the personal revocation must stand");
 }

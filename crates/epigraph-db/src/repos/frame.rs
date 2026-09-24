@@ -53,24 +53,30 @@ impl FrameRepository {
     /// # Errors
     /// Returns `DbError::DuplicateKey` if a frame with the same name exists.
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, hypotheses))]
-    pub async fn create(
-        pool: &PgPool,
+    #[instrument(skip(executor, hypotheses))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         name: &str,
         description: Option<&str>,
         hypotheses: &[String],
     ) -> Result<FrameRow, DbError> {
         let row: FrameRow = sqlx::query_as(
             r#"
-            INSERT INTO frames (name, description, hypotheses)
-            VALUES ($1, $2, $3)
+            INSERT INTO frames (name, description, hypotheses, visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             "#,
         )
         .bind(name)
         .bind(description)
         .bind(hypotheses)
-        .fetch_one(pool)
+        // Tenancy declaration (PR-16): a frame is a shared hypothesis space
+        // that Dempster-Shafer mass functions from every group hang off. Giving
+        // it an owner group would make cross-group belief combination
+        // unreadable for no gain. See `TenancyDecl::instance_wide`.
+        .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
+        .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
+        .fetch_one(executor)
         .await?;
 
         Ok(row)
@@ -80,18 +86,26 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<FrameRow>, DbError> {
-        let row: Option<FrameRow> = sqlx::query_as(
+    #[instrument(skip(executor))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<FrameRow>, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM frames
             WHERE id = $1
+              /* {VISIBILITY:frames} */
             "#,
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FrameRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<FrameRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -100,18 +114,26 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_name(pool: &PgPool, name: &str) -> Result<Option<FrameRow>, DbError> {
-        let row: Option<FrameRow> = sqlx::query_as(
+    #[instrument(skip(executor))]
+    pub async fn get_by_name<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        name: &str,
+    ) -> Result<Option<FrameRow>, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM frames
             WHERE name = $1
+              /* {VISIBILITY:frames} */
             "#,
-        )
-        .bind(name)
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FrameRow>(&sql).bind(name);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<FrameRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -120,20 +142,28 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list(pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<FrameRow>, DbError> {
-        let rows: Vec<FrameRow> = sqlx::query_as(
+    #[instrument(skip(executor))]
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<FrameRow>, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM frames
+            WHERE true /* {VISIBILITY:frames} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
             "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, FrameRow>(&sql).bind(limit).bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<FrameRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -144,21 +174,26 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_claims_in_frame(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_claims_in_frame<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         frame_id: Uuid,
     ) -> Result<Vec<ClaimFrameRow>, DbError> {
-        let rows: Vec<ClaimFrameRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT claim_id, frame_id, hypothesis_index
             FROM claim_frames
             WHERE frame_id = $1
+              /* {VISIBILITY:claim_frames} */
             "#,
-        )
-        .bind(frame_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ClaimFrameRow>(&sql).bind(frame_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<ClaimFrameRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -167,11 +202,30 @@ impl FrameRepository {
     ///
     /// Uses ON CONFLICT to update the hypothesis_index if the assignment exists.
     ///
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// `claim_frames` is in migration 062's tier-A array and carries 077's strict
+    /// `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, with no
+    /// orphan `*_privacy` policy anywhere to fall back on — so this INSERT is
+    /// refused with `42501` on an unstamped application session, in production as
+    /// well as on a clean migrate. MEASURED: `submit_ds_evidence` returned
+    /// `new row violates row-level security policy for table "claim_frames"` on
+    /// both schema configurations. Only a connection stamped by
+    /// `ScopedPool::begin_as` can satisfy that check, and it hands back a
+    /// transaction rather than a pool. `&PgPool` and `&mut PgConnection` both
+    /// satisfy [`sqlx::PgExecutor`], so every existing pool-taking caller compiles
+    /// unchanged. Same change and same reasoning as
+    /// [`crate::repos::ReasoningTraceRepository::create`].
+    ///
+    /// The row's `(visibility, owner_group_id)` is inherited from the CLAIM by
+    /// migration 074's BEFORE-row trigger and re-stamped by 070 arm (c), so the
+    /// group the session must be able to write is the claim's, not the caller's.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn assign_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn assign_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         frame_id: Uuid,
         hypothesis_index: Option<i32>,
@@ -187,7 +241,7 @@ impl FrameRepository {
         .bind(claim_id)
         .bind(frame_id)
         .bind(hypothesis_index)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(())
@@ -200,9 +254,9 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, hypotheses))]
-    pub async fn create_refinement(
-        pool: &PgPool,
+    #[instrument(skip(executor, hypotheses))]
+    pub async fn create_refinement<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         parent_frame_id: Uuid,
         name: &str,
         description: Option<&str>,
@@ -210,8 +264,9 @@ impl FrameRepository {
     ) -> Result<FrameRow, DbError> {
         let row: FrameRow = sqlx::query_as(
             r#"
-            INSERT INTO frames (name, description, hypotheses, parent_frame_id)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO frames (name, description, hypotheses, parent_frame_id,
+                                visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             "#,
         )
@@ -219,7 +274,14 @@ impl FrameRepository {
         .bind(description)
         .bind(hypotheses)
         .bind(parent_frame_id)
-        .fetch_one(pool)
+        // Tenancy declaration (PR-16). `parent_frame_id` is bound, but 074
+        // gives `frames` the ROOT trigger, not the derived one -- there is no
+        // frame-to-frame inheritance arm, deliberately: a refinement is a
+        // narrower hypothesis space, not a child row of its parent's content.
+        // So this declares, exactly as `create` above does.
+        .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
+        .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
+        .fetch_one(executor)
         .await?;
 
         Ok(row)
@@ -229,19 +291,27 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_children(pool: &PgPool, frame_id: Uuid) -> Result<Vec<FrameRow>, DbError> {
-        let rows: Vec<FrameRow> = sqlx::query_as(
+    #[instrument(skip(executor))]
+    pub async fn get_children<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        frame_id: Uuid,
+    ) -> Result<Vec<FrameRow>, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM frames
             WHERE parent_frame_id = $1
+              /* {VISIBILITY:frames} */
             ORDER BY created_at ASC
             "#,
-        )
-        .bind(frame_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FrameRow>(&sql).bind(frame_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<FrameRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -253,26 +323,38 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_ancestry(pool: &PgPool, frame_id: Uuid) -> Result<Vec<FrameRow>, DbError> {
-        let rows: Vec<FrameRow> = sqlx::query_as(
+    #[instrument(skip(executor))]
+    pub async fn get_ancestry<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        frame_id: Uuid,
+    ) -> Result<Vec<FrameRow>, DbError> {
+        // RECURSIVE CTE: BOTH the anchor and the recursive term are marked. A
+        // marker on the anchor alone lets an invisible ancestor re-enter the
+        // walk through the recursive arm and be returned in full.
+        let sql = viewer.splice(
             r#"
             WITH RECURSIVE ancestry AS (
                 SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
                 FROM frames
                 WHERE id = $1
+                  /* {VISIBILITY:frames} */
                 UNION ALL
                 SELECT f.id, f.name, f.description, f.hypotheses, f.parent_frame_id, f.is_refinable, f.version, f.created_at, f.properties
                 FROM frames f
                 JOIN ancestry a ON f.id = a.parent_frame_id
+                WHERE true /* {VISIBILITY:f} */
             )
             SELECT id, name, description, hypotheses, parent_frame_id, is_refinable, version, created_at, properties
             FROM ancestry
             "#,
-        )
-        .bind(frame_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FrameRow>(&sql).bind(frame_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<FrameRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -283,23 +365,29 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_claim_assignment(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_claim_assignment<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         frame_id: Uuid,
     ) -> Result<Option<ClaimFrameRow>, DbError> {
-        let row: Option<ClaimFrameRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT claim_id, frame_id, hypothesis_index
             FROM claim_frames
             WHERE claim_id = $1 AND frame_id = $2
+              /* {VISIBILITY:claim_frames} */
             "#,
-        )
-        .bind(claim_id)
-        .bind(frame_id)
-        .fetch_optional(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, ClaimFrameRow>(&sql)
+            .bind(claim_id)
+            .bind(frame_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<ClaimFrameRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -308,11 +396,20 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn count(pool: &PgPool) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM frames")
-            .fetch_one(pool)
-            .await?;
+    #[instrument(skip(executor))]
+    pub async fn count<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*) FROM frames WHERE true /* {VISIBILITY:frames} */",
+            1,
+        );
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: (i64,) = q.fetch_one(executor).await?;
 
         Ok(row.0)
     }
@@ -333,9 +430,10 @@ impl FrameRepository {
     /// Returns `DbError::QueryFailed` only on actual DB failure. Missing
     /// rows / missing keys return `Ok(None)`, not an error — the consumer
     /// is expected to use a calibration default in that case.
-    #[instrument(skip(pool))]
-    pub async fn get_intra_evidence_locality_factor(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    #[allow(clippy::doc_markdown)]
+    pub async fn get_intra_evidence_locality_factor<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         frame_id: Uuid,
     ) -> Result<Option<f64>, DbError> {
         // `properties->>'intra_evidence_locality_factor'` returns TEXT.
@@ -343,10 +441,16 @@ impl FrameRepository {
         // values; safer to fetch the TEXT and parse in Rust so the worst
         // case is a benign None.
         let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT properties->>'intra_evidence_locality_factor' FROM frames WHERE id = $1",
+            r#"
+            -- VISIBILITY-EXEMPT: reads one calibration scalar out of
+            -- `frames.properties` for the belief engine's own arithmetic. The
+            -- value never reaches a response and the frame id is one the caller
+            -- already holds; PR-16 revisits this with the write-side pass.
+            SELECT properties->>'intra_evidence_locality_factor' FROM frames WHERE id = $1
+            "#,
         )
         .bind(frame_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         let Some((Some(raw),)) = row else {
             return Ok(None);
@@ -418,16 +522,22 @@ impl FrameRepository {
     /// rows / missing keys / malformed JSON return `Ok(None)`, not an
     /// error — the consumer is expected to fall back to the global
     /// calibration in that case.
-    #[instrument(skip(pool))]
-    pub async fn get_per_frame_evidence_type_weights(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_per_frame_evidence_type_weights<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         frame_id: Uuid,
     ) -> Result<Option<HashMap<String, f64>>, DbError> {
-        let row: Option<(Option<serde_json::Value>,)> =
-            sqlx::query_as("SELECT properties->'evidence_type_weights' FROM frames WHERE id = $1")
-                .bind(frame_id)
-                .fetch_optional(pool)
-                .await?;
+        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
+            r#"
+                -- VISIBILITY-EXEMPT: per-frame calibration weights consumed by
+                -- the belief engine, not returned to a caller. Same reasoning
+                -- as `get_intra_evidence_locality_factor`.
+                SELECT properties->'evidence_type_weights' FROM frames WHERE id = $1
+                "#,
+        )
+        .bind(frame_id)
+        .fetch_optional(executor)
+        .await?;
         let Some((Some(value),)) = row else {
             return Ok(None);
         };
@@ -496,11 +606,17 @@ impl FrameRepository {
         // Read existing map (raw, NOT through the validating accessor — we
         // want to preserve any operator-written entries verbatim during
         // the merge, even ones the validator would drop on read).
-        let row: Option<(Option<serde_json::Value>,)> =
-            sqlx::query_as("SELECT properties->'evidence_type_weights' FROM frames WHERE id = $1")
-                .bind(frame_id)
-                .fetch_optional(pool)
-                .await?;
+        let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
+            r#"
+                -- VISIBILITY-EXEMPT: per-frame calibration weights consumed by
+                -- the belief engine, not returned to a caller. Same reasoning
+                -- as `get_intra_evidence_locality_factor`.
+                SELECT properties->'evidence_type_weights' FROM frames WHERE id = $1
+                "#,
+        )
+        .bind(frame_id)
+        .fetch_optional(pool)
+        .await?;
         let mut obj = match row {
             Some((Some(serde_json::Value::Object(map)),)) => map,
             _ => serde_json::Map::new(),

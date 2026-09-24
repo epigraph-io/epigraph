@@ -22,8 +22,8 @@ use epigraph_db::ClusterRunRepository;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::access_control::{check_content_access, ContentAccess};
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 
 /// Nulls are serialised, not omitted: "this claim has no neighbourhood" is the
@@ -41,15 +41,33 @@ pub struct PlacementResponse {
 
 /// `GET /api/v1/claims/:id/placement`
 pub async fn claim_placement(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<PlacementResponse>, ApiError> {
     let pool = &state.db_pool;
 
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    // There is no content here, but a theme or cluster id is a pointer into a
+    // view that renders the claim's text, so this still has to be gated on the
+    // VIEWER. Read through `get_by_id`, whose `/* {VISIBILITY:c} */` splice does
+    // the filtering in SQL — hence the plain pool rather than a stamped
+    // connection. A claim the viewer cannot read is reported ABSENT, identically
+    // to one that does not exist (the convention `claim_compound_neighborhood`
+    // sets); the pre-tenancy spelling returned the all-null body an unclustered
+    // claim gets, which told the caller the claim existed.
+    if epigraph_db::ClaimRepository::get_by_id(
+        pool,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(claim_id),
+    )
+    .await?
+    .is_none()
+    {
+        return Err(ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: claim_id.to_string(),
+        });
+    }
 
     let placement = ClusterRunRepository::claim_placement(pool, claim_id)
         .await?
@@ -57,20 +75,6 @@ pub async fn claim_placement(
             entity: "Claim".to_string(),
             id: claim_id.to_string(),
         })?;
-
-    // There is no content to redact here, but a theme or cluster id is a
-    // pointer into a view that renders the claim's text. A caller who may not
-    // read the claim gets the all-null answer an unclustered claim gets.
-    if check_content_access(pool, claim_id, requester).await == ContentAccess::Redacted {
-        return Ok(Json(PlacementResponse {
-            claim_id,
-            theme_id: None,
-            cluster_run_id: None,
-            cluster_id: None,
-            neighborhood_id: None,
-            run_completed_at: None,
-        }));
-    }
 
     Ok(Json(PlacementResponse {
         claim_id: placement.claim_id,

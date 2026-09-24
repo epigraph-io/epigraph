@@ -20,6 +20,9 @@
 //! Tracking the missing first-class capability: see the epigraph feature
 //! request for a configurable ingest target (per-call DB / document-ingest CLI).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
@@ -27,21 +30,38 @@ use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::ingestion::do_ingest_document;
 use sqlx::PgPool;
 
-fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+/// Built FROM A `ScopedPool`: the document ingest walk now runs in one
+/// transaction stamped from the ingesting agent and refuses (nothing written) on
+/// a server that cannot stamp one. `#[sqlx::test]` connects as a BYPASSRLS
+/// superuser, so the stamp is inert here — what this buys is that the fixture
+/// drives the PRODUCTION code path (`begin_author_stamped_tx`) rather than the
+/// refusal.
+async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::generate();
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 #[tokio::test]
 #[ignore = "operator-driven: needs INGEST_TARGET_DB + EXTRACTION_PATH"]
 async fn ingest_extraction_into_target_db() {
-    let db = std::env::var("INGEST_TARGET_DB")
-        .expect("set INGEST_TARGET_DB to the target graph connection string");
-    let path = std::env::var("EXTRACTION_PATH")
-        .expect("set EXTRACTION_PATH to the DocumentExtraction JSON file");
+    let Ok(db) = std::env::var("INGEST_TARGET_DB") else {
+        eprintln!(
+            "SKIP: INGEST_TARGET_DB not set — this is a dev ingest harness, not a regression test"
+        );
+        return;
+    };
+    let Ok(path) = std::env::var("EXTRACTION_PATH") else {
+        eprintln!(
+            "SKIP: EXTRACTION_PATH not set — this is a dev ingest harness, not a regression test"
+        );
+        return;
+    };
 
     let pool = PgPool::connect(&db).await.expect("connect to target DB");
+
+    let viewer = fixture::public_viewer(&pool).await;
     // Bring the chosen DB up to the repo schema; idempotent on an already-migrated DB.
     sqlx::migrate!("../../migrations")
         .run(&pool)
@@ -52,8 +72,8 @@ async fn ingest_extraction_into_target_db() {
     let extraction: DocumentExtraction =
         serde_json::from_str(&raw).expect("parse DocumentExtraction");
 
-    let server = make_server(pool.clone());
-    let result = do_ingest_document(&server, &extraction)
+    let server = make_server(pool.clone()).await;
+    let result = do_ingest_document(&server, &viewer, &extraction)
         .await
         .expect("do_ingest_document succeeds");
 

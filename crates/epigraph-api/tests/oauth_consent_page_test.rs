@@ -48,9 +48,14 @@ fn now() -> u64 {
 
 fn config() -> ApiConfig {
     ApiConfig {
-        require_signatures: false,
+        // Renamed from `require_signatures` to `require_packet_signatures` — the
+        // old name was ambiguous once the request-signing middleware was deleted.
+        // The WIRE name is unchanged, pinned by `#[serde(rename)]` on
+        // `ConfigSummary`, so `GET /admin/stats` still reports `require_signatures`.
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        ..ApiConfig::default()
     }
 }
 

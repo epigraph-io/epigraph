@@ -1,3 +1,6 @@
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 mod common;
 use common::*;
@@ -15,6 +18,7 @@ use common::*;
 /// and appear twice in `deprecated_ids`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn deprecate_workflow_diamond_dag_no_duplicates(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let root = seed_workflow_claim(&pool, "root workflow", &["step1"]).await;
     let a = seed_workflow_claim(&pool, "variant A", &["step1"]).await;
     let b = seed_workflow_claim(&pool, "variant B", &["step1"]).await;
@@ -26,9 +30,14 @@ async fn deprecate_workflow_diamond_dag_no_duplicates(pool: PgPool) {
     insert_claim_edge(&pool, c, a, "variant_of").await;
     insert_claim_edge(&pool, c, b, "variant_of").await;
 
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let result = epigraph_mcp::tools::workflows::deprecate_workflow(
         &server,
+        &viewer,
         epigraph_mcp::types::DeprecateWorkflowParams {
             workflow_id: root.to_string(),
             reason: "diamond test".into(),
