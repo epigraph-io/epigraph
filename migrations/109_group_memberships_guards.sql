@@ -75,7 +75,10 @@
 -- The trigger covers rows written AFTER the retire. A row that PREDATES it is
 -- 107's: `epigraph_link_retired_agent` refuses the retire while the agent holds
 -- a live `writer`/`admin` row in the operator's group, checked under row locks
--- (107 section 7), so between the two a retired identity never holds one.
+-- (107 section 7). Between the two, a retired identity holds no such row
+-- EXCEPT through one concurrent order 107 section 7 records as a reasoned,
+-- unmeasured residual: an INSERT whose BEFORE trigger (this one) ran while the
+-- retire was uncommitted and whose foreign-key check then waited on it.
 --
 -- Batch F has no counterpart to this rule, so it is kept. Its writers do not
 -- meet it: 106's `epigraph_community_add_member` restores a revoked row only at
