@@ -32,8 +32,14 @@
 //!   evidence row of the old claim, hidden ones included; PROBED in
 //!   [`the_surfaces_outside_the_content_reads_are_measured`] (the edge takes
 //!   the meet and is withheld). `epigraph_engine::edge_factor::auto_wire_ds_for_edge`
-//!   reads `properties` to WRITE a DS factor, not to return it. Not probed;
-//!   listed in the branch's not_done.
+//!   reads `properties->>'doi'` with no viewer predicate to WRITE a DS factor's
+//!   strength, not to return it: about one bit per edge write. Not probed; a
+//!   known limit, printed by `hide-evidence` as a `HIDE-SURFACE edge_factor`
+//!   line and listed in `epigraph_cli::operator::hide`'s B-H3 section. Stage-3
+//!   review audited the other unlisted read sites; all splice the viewer
+//!   predicate (`lineage.rs`, `political.rs::get_agent_evidence_distribution`,
+//!   `corpus_stats.rs`, `claim.rs::{count_all_evidence_for_claim,
+//!   claim_ids_by_evidence_type}`).
 //! * Maintenance and operator binaries on a privileged pool, which see every
 //!   row by design: `epigraph-cli`'s `analyze_graph`, `backfill_factors`,
 //!   `ingest_literature::build_packets`, `reembed`, and

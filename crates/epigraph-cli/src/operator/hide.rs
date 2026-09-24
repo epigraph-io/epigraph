@@ -89,6 +89,12 @@
 //!   readable where their endpoints were (a hide must not change other rows);
 //! * `mass_functions` rows naming the hidden row (`evidence_id`,
 //!   `evidence_type`): metadata, no content;
+//! * the intra-source check in `epigraph_engine::edge_factor::auto_wire_ds_for_edge`,
+//!   which reads a hidden row's `properties->>'doi'` with no viewer predicate
+//!   and uses the answer to set a DS factor's strength on a new edge: about one
+//!   bit per edge write (does some evidence of the source claim cite the target
+//!   claim's paper?), never the content itself. Known limit, not spliced: a
+//!   viewer-filtered answer would make belief depend on who wrote the edge;
 //! * any BYPASSRLS or superuser connection, and every maintenance binary on a
 //!   privileged pool, which read every row regardless;
 //! * anything emitted before the hide (events, caches, exports, search
@@ -610,6 +616,12 @@ async fn print_surfaces(
         out,
         "HIDE-SURFACE\tmass_functions\t{masses}\trows naming a hidden row keep evidence_id and \
          evidence_type readable (metadata, no content)"
+    )?;
+    writeln!(
+        out,
+        "HIDE-SURFACE\tedge_factor\t-\tthe intra-source DS discount \
+         (epigraph_engine::edge_factor::auto_wire_ds_for_edge) reads a hidden row's \
+         properties->>'doi' without a viewer predicate: about one bit per edge write, no content"
     )?;
     writeln!(
         out,

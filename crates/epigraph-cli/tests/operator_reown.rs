@@ -2749,6 +2749,11 @@ async fn hide_evidence_apply_hides_exactly_the_selected_rows_and_reverse_restore
         r.show()
     );
     assert!(r.stdout.contains("HIDE-SURFACE\tedges\t"), "{}", r.show());
+    assert!(
+        r.stdout.contains("HIDE-SURFACE\tedge_factor\t"),
+        "the DS intra-source read is a named surface: {}",
+        r.show()
+    );
     for ev in [h.ev_testimony, h.ev_labelled] {
         assert_eq!(
             tenancy_of(&pool, ev).await,
