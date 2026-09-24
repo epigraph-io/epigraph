@@ -88,19 +88,6 @@ use std::path::{Path, PathBuf};
 // ===========================================================================
 const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     (
-        "tools/dedup_sweep.rs",
-        "server.pool.acquire",
-        1,
-        "`sweep_semantic_duplicates`, one of the three MAINTENANCE tools. Hard-gated off by \
-         `maintenance.rs::maintenance_tools_run_on_the_maintenance_connection() == false`, which \
-         is checked before the pool is even consulted, so this line is unreachable. Converting \
-         the three tools' query plumbing is PR-17. \
-         REGISTERED UNDER `server.pool.acquire` RATHER THAN THE CASCADE CALLEE, and that rename \
-         is the point: the engine signature moved to `&mut PgConnection`, so the call no longer \
-         NAMES a pool and an argument-shaped scan stops seeing it. Keeping the site measured \
-         needed `acquire` in WRITE_TOKENS — see the note there.",
-    ),
-    (
         "tools/ds.rs",
         "FrameRepository::create",
         1,
@@ -115,16 +102,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "`create_frame`'s refinement arm. Same static registry arm as `FrameRepository::create` \
          above; same reason it is admitted.",
-    ),
-    (
-        "tools/embeddings.rs",
-        "ClaimRepository::store_embedding",
-        1,
-        "`backfill_embeddings`, the second of the three MAINTENANCE tools, and the ONE remaining \
-         unstamped `UPDATE claims SET embedding` in this crate — `McpEmbedder`'s store is now \
-         routed through a declared `StorePath`. Unreachable for the same gate reason as \
-         `dedup_sweep`; it converts with PR-17 onto the maintenance connection, not onto a \
-         stamped one, because a backfill is not authored by anyone.",
     ),
     (
         "tools/events.rs",
@@ -156,15 +133,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          one caller is the operator `ingest-document` CLI, which runs on `MaintenancePool` \
          (BYPASSRLS) where there is no tenancy context to stamp. A server on an ordinary pool \
          with neither never reaches it — it gets `begin_author_stamped_tx`'s refusal.",
-    ),
-    (
-        "tools/cdst_maintenance.rs",
-        "server.pool.acquire",
-        1,
-        "`recompute_beliefs`, one of the three MAINTENANCE tools, reached through `let pool = \
-         &server.pool` — invisible to this scan until it followed bindings. Hard-gated off like \
-         `dedup_sweep.rs` above, and its target is the maintenance connection, not a stamped one: \
-         a bulk recompute is authored by nobody. PR-17.",
     ),
     (
         "tools/matching.rs",
@@ -285,7 +253,8 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
 /// The monotone-decreasing rule is about the SITES, not about what the scanner can
 /// see. When `epigraph-engine`'s belief chain moved from `&PgPool` to
 /// `&mut PgConnection`, three unconverted sites stopped naming a pool
-/// (`supersede.rs` twice, `dedup_sweep.rs` once) and would have LEFT this
+/// (`supersede.rs` twice, `dedup_sweep.rs` once; the last has since moved onto
+/// the maintenance session and left the register) and would have LEFT this
 /// register while still reaching an unstamped connection — the register going
 /// blind on exactly what it exists to track. `acquire` keeps them visible, at the
 /// cost of naming the acquire rather than the write it feeds; each affected entry
@@ -657,14 +626,15 @@ fn the_scanner_strips_comments_and_would_otherwise_report_the_docs() {
 fn the_scanner_is_not_vacuous() {
     let measured = scan();
     assert!(
-        measured.len() >= 16,
-        "the residual scan found only {} sites; the tool layer had 27 when this lint was written \
-         and 18 after the ingest-executor and DS-substrate conversions, so a collapse below 16 \
-         means the matcher broke rather than that the surface was converted. LOWERED FROM 20 \
-         DELIBERATELY: the register fell 24 -> 18 in one change (five D2 sites converted, three \
-         cascade sites re-keyed onto `server.pool.acquire`), so a floor of 20 would have failed \
-         on a correct shrink. A floor is a matcher-broke tripwire, not a second ratchet — the \
-         exact-equality assertion above is the ratchet.",
+        measured.len() >= 10,
+        "the residual scan found only {} sites; the tool layer had 27 when this lint was written, \
+         18 after the ingest-executor and DS-substrate conversions, and 14 after batch H \
+         converted the edge tools, patch_claim, resolve_backlog_item and moved the three \
+         maintenance tools onto their session. A collapse below 10 means the matcher broke \
+         rather than that the surface was converted. LOWERED FROM 16 DELIBERATELY, for the same \
+         reason it was lowered from 20: a correct shrink must not fail a tripwire. A floor is a \
+         matcher-broke tripwire, not a second ratchet — the exact-equality assertion above is \
+         the ratchet.",
         measured.len()
     );
     // The method-call arm's calibration site MOVED. It was `patch_claim`'s

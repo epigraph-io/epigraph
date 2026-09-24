@@ -36,10 +36,10 @@ pub struct EpiGraphMcpFull {
     /// running `submit_claim` / `memorize` on an unstamped connection, where the
     /// claim commits and its trace is then refused with `42501`.
     ///
-    /// `Some` here does NOT license the three maintenance tools. They are gated
-    /// separately, on whether their own query plumbing has been converted — see
-    /// `crate::maintenance::maintenance_tools_run_on_the_maintenance_connection`
-    /// for why that gate deliberately does not key on this field.
+    /// `Some` here does NOT license the three maintenance tools. They require a
+    /// privileged maintenance pool attached to this `ScopedPool`, and a leased
+    /// connection that passes `MaintenanceSession::assert_privileged` on every
+    /// call. See `crate::maintenance::maintenance_viewer`.
     pub(crate) scoped: Option<epigraph_db::ScopedPool>,
     /// `Some(reason)` when the caller DECLARED that `pool` is a privileged
     /// (BYPASSRLS) maintenance pool — set only through
@@ -646,10 +646,12 @@ impl EpiGraphMcpFull {
     /// fifth:
     ///
     /// **This does NOT enable the three maintenance tools, and a reader
-    /// reasonably expects that it would.** `maintenance_viewer` checks a separate
-    /// gate first, because those tools still run their statements on
-    /// `self.pool`: a bypass viewer spent there returns zero rows with no error.
-    /// `main` calls this for the write path only, and
+    /// reasonably expects that it would.** Those tools run on a connection leased
+    /// from a separate, privileged maintenance pool that must be attached to the
+    /// `ScopedPool` itself (`ScopedPool::with_maintenance_pool`, done by `main`
+    /// only when the maintenance DSN's boot probe passes). Without one,
+    /// `maintenance_viewer` refuses them, because a bypass viewer spent on the
+    /// application pool returns zero rows with no error.
     /// `maintenance.rs::tests::attaching_a_scoped_pool_does_not_enable_the_maintenance_tools`
     /// is the pin.
     ///
@@ -1017,20 +1019,19 @@ impl EpiGraphMcpFull {
                        earliest wins ties). DRY RUN BY DEFAULT. Exact restatements are \
                        collapsed via mark_duplicate when dry_run=false; clusters that merely \
                        resemble each other are returned as merge_candidates for \
-                       consolidate_claims so no wording is discarded. Resumable via offset."
+                       consolidate_claims so no wording is discarded. Resumable via offset. The sweep sees every tenant's claims, so it can pair a duplicate that spans two groups. Requires this server to have a privileged maintenance connection: start it with MAINTENANCE_DATABASE_URL naming a role that is a member of epigraph_maintenance. Without one (unset, or set to a role that cannot bypass row-level security) the call is refused with nothing written, and the boot log says why; it never reports a successful no-op."
     )]
     async fn sweep_semantic_duplicates(
         &self,
         Parameters(params): Parameters<crate::types::SweepSemanticDuplicatesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = crate::maintenance::maintenance_viewer(
+        self.reject_if_read_only()?;
+        let mut session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::DedupSweep,
         )
         .await?;
-        let viewer = session.viewer();
-        self.reject_if_read_only()?;
-        tools::dedup_sweep::sweep_semantic_duplicates(self, viewer, params).await
+        tools::dedup_sweep::sweep_semantic_duplicates(self, &mut session, params).await
     }
 
     // ── Alternative-set candidate finder (1 tool) ──
@@ -1287,20 +1288,19 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path."
+        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path. Each claim's cache is recomputed in its own transaction; claims_recomputed and frame_writes count only claims whose cached belief columns (belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, belief_frame_id) were actually written and committed, and a per-claim failure is rolled back and listed in errors. Requires this server to have a privileged maintenance connection: start it with MAINTENANCE_DATABASE_URL naming a role that is a member of epigraph_maintenance. Without one (unset, or set to a role that cannot bypass row-level security) the call is refused with nothing written, and the boot log says why; it never reports a successful no-op."
     )]
     async fn recompute_beliefs(
         &self,
         Parameters(params): Parameters<RecomputeBeliefsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = crate::maintenance::maintenance_viewer(
+        self.reject_if_read_only()?;
+        let mut session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::BeliefRecomputation,
         )
         .await?;
-        let viewer = session.viewer();
-        self.reject_if_read_only()?;
-        tools::cdst_maintenance::recompute_beliefs(self, viewer, params).await
+        tools::cdst_maintenance::recompute_beliefs(self, &mut session, params).await
     }
 
     // ── Workflows (8 tools) ──
@@ -1801,20 +1801,19 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Requires claims:write."
+        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Requires claims:write. Covers every tenant's claims. A claim sealed or superseded between selection and store is not given a vector and is counted in failed. Requires this server to have a privileged maintenance connection: start it with MAINTENANCE_DATABASE_URL naming a role that is a member of epigraph_maintenance. Without one (unset, or set to a role that cannot bypass row-level security) the call is refused with nothing written, and the boot log says why; it never reports a successful no-op."
     )]
     async fn backfill_embeddings(
         &self,
         Parameters(params): Parameters<crate::tools::embeddings::BackfillEmbeddingsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = crate::maintenance::maintenance_viewer(
+        self.reject_if_read_only()?;
+        let mut session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::EmbeddingBackfill,
         )
         .await?;
-        let viewer = session.viewer();
-        self.reject_if_read_only()?;
-        crate::tools::embeddings::backfill_embeddings(self, viewer, params).await
+        crate::tools::embeddings::backfill_embeddings(self, &mut session, params).await
     }
 
     // ── Themes (3 tools) ──

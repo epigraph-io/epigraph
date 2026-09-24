@@ -699,6 +699,30 @@ plan's item pages and the embedding enumerator is mid-sweep was previously one
 request away from an acquire-timeout. If you are tuning `max_connections` on the
 server, the api process's share is now 22 per replica.
 
+**`epigraph-mcp` reads it too (batch H1), and treats it differently.** Its three
+maintenance tools (`recompute_beliefs`, `sweep_semantic_duplicates`,
+`backfill_embeddings`) run on a connection leased from a separate maintenance
+pool that `epigraph-mcp` builds from this variable, falling back to
+`--database-url` as above. Each `epigraph-mcp` process therefore opens
+app(10) + **maintenance(2)** = **12** connections. That includes every listening
+service AND every per-client stdio process, because each one is its own process
+with its own pools. Count each one when tuning `max_connections`.
+
+Unlike the api, **a bad value does not stop `epigraph-mcp` from booting.** When
+the variable names a different database, cannot connect, or names a role that
+does not satisfy `epigraph_bypass()` while row security is active, the pool is
+NOT attached. The boot log records why on the `tenancy.maintenance` target, and
+the three tools refuse each call by name with nothing written. Everything else
+serves normally. The asymmetry is deliberate: here maintenance is three tools
+out of the whole surface, not the process's job. On a least-privilege
+deployment the documented fallback (unset, so `--database-url`, so
+`epigraph_app`) is therefore a refusal, not a zero-row no-op. **To enable the
+three tools, set `MAINTENANCE_DATABASE_URL` in the `epigraph-mcp` units'
+environment to a role that is a member of `epigraph_maintenance`.** Each tool
+call also re-probes the connection it leased (`MaintenanceSession::assert_privileged`),
+so a role whose membership is revoked after boot is refused on its next call,
+not trusted on the strength of the boot probe.
+
 **Fleet-wide pool sizing changed.** `MaintenancePool` uses one cap of 11 (10 for
 work, 1 for the connection the bypass lease holds) for every converted CLI
 binary. Several bins previously chose 2, 4 or 5 explicitly. sqlx opens

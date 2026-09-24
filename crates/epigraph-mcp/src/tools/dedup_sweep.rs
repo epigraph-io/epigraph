@@ -100,11 +100,17 @@ struct SweepResponse {
     next_offset: i64,
 }
 
+/// Every statement, reads and the collapse alike, runs on `session`'s
+/// connection, which `maintenance::maintenance_viewer` has checked can bypass
+/// RLS. The sweep's value is the pair that spans two tenants, and only a
+/// connection that sees every tenant can find it. The server's application
+/// pool is never named here (`tests/maintenance_tools_spend_only_the_session.rs`).
 pub async fn sweep_semantic_duplicates(
-    server: &EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    _server: &EpiGraphMcpFull,
+    session: &mut epigraph_db::MaintenanceSession<'_>,
     params: SweepSemanticDuplicatesParams,
 ) -> Result<CallToolResult, McpError> {
+    let (conn, viewer) = session.split();
     let threshold = params.similarity_threshold.unwrap_or(0.10).clamp(0.0, 2.0);
     let limit = params.limit.unwrap_or(500).clamp(1, 2000);
     let offset = params.offset.unwrap_or(0).max(0);
@@ -120,7 +126,7 @@ pub async fn sweep_semantic_duplicates(
     };
 
     let candidates = ClaimRepository::enumerate_current_embedded(
-        &server.pool,
+        &mut *conn,
         viewer,
         agent_scope.as_deref(),
         params.labels_scope.as_deref(),
@@ -137,7 +143,7 @@ pub async fn sweep_semantic_duplicates(
 
     for c in &candidates {
         meta.insert(c.id, (c.truth_value, c.created_at));
-        let neighbors = ClaimRepository::nearest_neighbors_of_claim(&server.pool, viewer, c.id, 5)
+        let neighbors = ClaimRepository::nearest_neighbors_of_claim(&mut *conn, viewer, c.id, 5)
             .await
             .map_err(internal_error)?;
         for n in neighbors {
@@ -165,7 +171,7 @@ pub async fn sweep_semantic_duplicates(
     }
 
     let all_ids: Vec<Uuid> = meta.keys().copied().collect();
-    let hashes = ClaimRepository::content_hashes_for(&server.pool, viewer, &all_ids)
+    let hashes = ClaimRepository::content_hashes_for(&mut *conn, viewer, &all_ids)
         .await
         .map_err(internal_error)?;
 
@@ -226,20 +232,11 @@ pub async fn sweep_semantic_duplicates(
                 // errors land in `failures` alongside the mark failures; they
                 // do not undo an already-committed collapse, so `pairs_marked`
                 // still counts the pair.
-                // UNSTAMPED, for the same PR-17 reason recorded in
-                // `cdst_maintenance.rs`: `sweep_semantic_duplicates` is a
-                // MAINTENANCE tool, hard-gated off before the pool is consulted,
-                // and its target is the maintenance connection. The acquire below
-                // is a mechanical consequence of the engine signature change.
-                let mut conn = match server.pool.acquire().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("dedup sweep: could not acquire: {e}");
-                        continue;
-                    }
-                };
+                // On the maintenance connection. `mark_duplicate_with_cascade`
+                // opens its own transaction on it (the dedup repair), so one
+                // pair's failure is rolled back alone and reported.
                 match epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-                    &mut conn, viewer, *dup, *survivor,
+                    &mut *conn, viewer, *dup, *survivor,
                 )
                 .await
                 {

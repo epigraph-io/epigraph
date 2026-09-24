@@ -207,10 +207,10 @@ pub async fn submit_ds_evidence(
     // recompute's `UPDATE claims`, leaving the cached belief stale behind an error
     // response. The only repair for that window was out-of-band
     // (`epigraph-cli recompute_claim_belief` on `MaintenancePool::connect`),
-    // because the in-band `recompute_beliefs` tool is hard-disabled
-    // (`maintenance.rs`'s `maintenance_tools_run_on_the_maintenance_connection()`
-    // is `const fn … { false }`). D2 moved the recompute onto this connection, so
-    // that window no longer exists and there is nothing to repair.
+    // because the in-band `recompute_beliefs` tool was then hard-disabled (it now
+    // runs on the maintenance connection, batch H1). D2 moved the recompute onto
+    // this connection, so that window no longer exists and there is nothing to
+    // repair.
     //
     // Retry-safety is still worth recording, though it no longer carries a
     // committed-partial argument. `assign_claim` is `ON CONFLICT … DO UPDATE` and

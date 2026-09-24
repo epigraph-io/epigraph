@@ -437,15 +437,35 @@ pub fn maintenance_verdict(
 /// # Errors
 /// `DbError::QueryFailed` if the catalog cannot be read at all.
 pub async fn probe_maintenance_privilege(pool: &PgPool) -> Result<MaintenancePrivilege, DbError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|source| DbError::ConnectionFailed { source })?;
+    probe_maintenance_privilege_conn(&mut conn).await
+}
+
+/// [`probe_maintenance_privilege`] on one connection the caller already holds.
+///
+/// The same two statements, asked of the CONNECTION a maintenance job is about to
+/// spend its bypass viewer on, rather than of whichever connection a pool hands
+/// out. That is the form [`MaintenanceSession::assert_privileged`] needs: the
+/// boot-time probe vouches for a pool's DSN, and this one vouches for the leased
+/// connection itself.
+///
+/// # Errors
+/// `DbError::QueryFailed` if the catalog cannot be read at all.
+pub async fn probe_maintenance_privilege_conn(
+    conn: &mut PgConnection,
+) -> Result<MaintenancePrivilege, DbError> {
     let bypass_fn_exists: bool =
         sqlx::query_scalar("SELECT to_regprocedure('public.epigraph_bypass()') IS NOT NULL")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?;
 
     let bypass = if bypass_fn_exists {
         sqlx::query_scalar::<_, Option<bool>>("SELECT epigraph_bypass()")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?
             .unwrap_or(false)
@@ -464,7 +484,7 @@ pub async fn probe_maintenance_privilege(pool: &PgPool) -> Result<MaintenancePri
           WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') \
             AND (c.relrowsecurity OR c.relforcerowsecurity))",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|source| DbError::QueryFailed { source })?;
 
@@ -1588,6 +1608,34 @@ impl<'a> MaintenanceSession<'a> {
     /// call needs. See the type doc for why this is not a `DerefMut`.
     pub fn split(&mut self) -> (&mut PgConnection, &Viewer) {
         (&mut self.conn.0, &self.viewer)
+    }
+
+    /// Refuse unless THIS session's connection can actually spend the bypass
+    /// viewer it carries.
+    ///
+    /// A bypass viewer emits no SQL predicate, so what it sees is decided by the
+    /// connection alone. [`ScopedPool::maintenance_session`] draws from the
+    /// attached maintenance pool, or, with none attached, from the application
+    /// pool. Under row-level security an unprivileged connection makes every
+    /// corpus-wide statement return zero rows and update zero rows with no
+    /// error. That is the privileged-viewer / ordinary-pool hybrid, and it would
+    /// report success. This asks the leased connection itself, with the same two
+    /// questions and the same rule as the boot probe
+    /// ([`probe_maintenance_privilege_conn`], [`maintenance_verdict`]). Refused
+    /// when row security is active and the connection does not satisfy
+    /// `epigraph_bypass()`.
+    ///
+    /// A request-path caller (the MCP maintenance tools) runs this on every
+    /// session, so a misconfigured maintenance DSN is reported by the call that
+    /// would have been a silent no-op, not only in a boot log.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` from [`maintenance_verdict`], or
+    /// `DbError::QueryFailed` if the probe cannot run.
+    pub async fn assert_privileged(&mut self) -> Result<MaintenancePrivilege, DbError> {
+        let privilege = probe_maintenance_privilege_conn(&mut self.conn.0).await?;
+        maintenance_verdict(privilege, MaintenanceDsnSource::Configured)?;
+        Ok(privilege)
     }
 }
 

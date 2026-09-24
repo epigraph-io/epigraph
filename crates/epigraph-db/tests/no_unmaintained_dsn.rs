@@ -132,10 +132,14 @@ const MARKER: &str = "MAINTENANCE-DSN-EXEMPT:";
 /// a `42501` — so it constructs no unmaintained pool and
 /// `the_exemption_set_is_exactly_what_was_reviewed`'s "still needs the
 /// exemption" arm would now FAIL on the entry. The hybrid concern was real and
-/// is answered where it lives rather than by keeping a pool exemption for it:
-/// `epigraph-mcp/src/maintenance.rs::maintenance_tools_run_on_the_maintenance_connection`
-/// is a gate that does not key on the pool's presence, and that module's test
-/// pins that attaching a `ScopedPool` does not enable the three tools.
+/// is answered where it lives rather than by keeping a pool exemption for it.
+/// `main.rs` now also builds a SECOND, privileged maintenance pool through
+/// `ScopedPool::connect_with_options` on the DSN `maintenance_database_url`
+/// returned, which is this lint's converted shape, and attaches it only when
+/// its boot probe passes. `epigraph-mcp/src/maintenance.rs::maintenance_viewer`
+/// refuses the three tools when none is attached and re-probes every leased
+/// connection. That module's test pins that attaching a `ScopedPool` alone does
+/// not enable them.
 const EXEMPT: &[(&str, &str)] = &[
     (
         "crates/epigraph-cli/src/bin/compare_routes.rs",
