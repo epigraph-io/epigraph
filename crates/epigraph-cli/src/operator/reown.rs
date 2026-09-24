@@ -49,10 +49,20 @@
 //!
 //! `SET LOCAL lock_timeout`; `SELECT ... FOR UPDATE` on the batch's claims (a
 //! derived-row INSERT takes `FOR KEY SHARE` on its parent claim through the
-//! foreign key, which that lock blocks, so no derived row can appear mid-batch);
-//! re-classify under the lock; record any row the plan had not seen in the
-//! manifest (fsynced) BEFORE writing; then one `UPDATE claims`, the keep-writer
+//! foreign key, which that lock blocks); `LOCK TABLE ... IN SHARE ROW
+//! EXCLUSIVE MODE` on every cascade table whose `claim_id` has NO such key
+//! (`tables::unkeyed_tables`, read from `pg_constraint` at run time — review
+//! measured three), because the row lock does not exclude an INSERT there; so
+//! no derived row can appear mid-batch in any cascade table. Then re-classify
+//! under the locks; record any row the plan had not seen in the manifest
+//! (fsynced) BEFORE writing; then one `UPDATE claims`, the keep-writer
 //! restores, and the invariants. Any violation rolls the batch back.
+//!
+//! `edges` is not locked: its tenancy trigger (`epigraph_edges_tenancy`, 070/072)
+//! is a BEFORE row trigger that sets only the NEW row, from its endpoints, and
+//! for two public endpoints (the only kind this tool moves) the result is
+//! `(world, public)` whoever owns the claims — a concurrent edge INSERT can
+//! neither land stale nor rewrite a moved row.
 //!
 //! The invariants:
 //!
@@ -470,6 +480,8 @@ impl From<sqlx::Error> for BatchError {
 /// Fixed inputs to every batch.
 pub struct Ctx<'a> {
     pub specs: &'a [TableSpec],
+    /// Cascade tables with no immediate key to `claims`, locked per batch.
+    pub unkeyed: &'a [String],
     pub operator: Uuid,
     pub target: Uuid,
     pub mode: DerivedMode,
@@ -534,6 +546,7 @@ pub async fn run_batch(
         .execute(&mut *conn)
         .await?;
     let locked = fetch_claims(conn, batch, true).await?;
+    tables::lock_unkeyed_tables(conn, ctx.unkeyed).await?;
     let c = classify(
         conn,
         ctx.specs,
@@ -781,6 +794,7 @@ pub async fn run(
         ..Default::default()
     };
     let specs = tables::propagated_tables(conn).await?;
+    let unkeyed = tables::unkeyed_tables(conn, &specs).await?;
     let target = operator_group(conn, opts.operator).await?;
     tables::probe_session_switch(conn).await?;
     let mut caches = Caches::default();
@@ -829,6 +843,14 @@ pub async fn run(
     )?;
     for (id, h) in &plan.held {
         writeln!(out, "HELD\t{id}\t{h}")?;
+    }
+    if !unkeyed.is_empty() {
+        writeln!(
+            out,
+            "LOCKED-PER-BATCH\t{}\t(no key to claims, so each batch holds SHARE ROW EXCLUSIVE on \
+             them: writers to these tables wait for the batch)",
+            unkeyed.join(",")
+        )?;
     }
     for (t, n) in &report.plan_attached_by_table {
         writeln!(out, "PLAN-ROWS\t{t}\t{n}")?;
@@ -924,6 +946,7 @@ pub async fn run(
     // ---- batches ----
     let ctx = Ctx {
         specs: &specs,
+        unkeyed: &unkeyed,
         operator: opts.operator,
         target,
         mode: opts.mode,

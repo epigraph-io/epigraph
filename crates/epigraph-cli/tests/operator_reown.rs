@@ -1035,6 +1035,94 @@ async fn a_concurrent_derived_insert_lock_blocks_the_batch(pool: PgPool) {
     );
 }
 
+/// An IN-FLIGHT insert into a cascade table with NO foreign key to `claims`
+/// excludes the batch too (review finding: `FOR UPDATE` alone does not).
+///
+/// `claim_versions` has no key on `claim_id`, so its INSERT takes no lock on
+/// the parent claim, and `FOR UPDATE` does not see it. Review measured the
+/// consequence with a concurrent INSERT against a batch holding the claim: the
+/// new row landed on the claim's OLD owner, and (with a divergent sibling row)
+/// its statement-level inherit trigger rewrote a row the batch had moved and
+/// verified, after the batch committed. The batch now takes SHARE ROW
+/// EXCLUSIVE on every such table, so an uncommitted insert there makes it wait,
+/// hit `--lock-timeout` and roll back; the insert then commits against a claim
+/// that never moved, and the state is consistent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_in_flight_insert_into_an_unkeyed_table_blocks_the_batch(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let keyed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+          WHERE conrelid = 'public.claim_versions'::regclass AND contype = 'f' \
+            AND confrelid = 'public.claims'::regclass)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !keyed,
+        "PREMISE: claim_versions has no foreign key to claims; if it gains one, pick another \
+         unkeyed table for this test"
+    );
+    let dir = scratch_dir();
+    let cf = dir.join("one.txt");
+    std::fs::write(&cf, format!("{}\n", fx.c_world)).unwrap();
+    let mf = dir.join("m.jsonl");
+    let op = fx.operator.to_string();
+
+    let mut holder = pool.begin().await.expect("holder tx");
+    let in_flight: Uuid = sqlx::query_scalar(
+        "INSERT INTO claim_versions (claim_id, version_number, content, truth_value, created_by) \
+         VALUES ($1, 7, 'in-flight v7', 0.5, $2) RETURNING id",
+    )
+    .bind(fx.c_world)
+    .bind(fx.stranger)
+    .fetch_one(&mut *holder)
+    .await
+    .expect("an uncommitted claim_versions insert");
+    let r = run_op(
+        &pool,
+        &[
+            "reown-claims",
+            "--claims-file",
+            cf.to_str().unwrap(),
+            "--operator",
+            &op,
+            "--derived",
+            "follow-claim",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--lock-timeout",
+            "500ms",
+            "--apply",
+        ],
+    )
+    .await;
+    holder
+        .commit()
+        .await
+        .expect("the writer commits after the batch");
+
+    assert_eq!(
+        r.code,
+        2,
+        "the batch ran while a claim_versions insert for its claim was in flight: that row lands \
+         on the claim's OLD owner and is never moved: {}",
+        r.show()
+    );
+    assert!(r.stdout.contains("lock timeout"), "{}", r.show());
+    assert!(r.stdout.contains("LOCKED-PER-BATCH\t"), "{}", r.show());
+    assert_eq!(
+        tenancy(&pool, "claims", fx.c_world).await,
+        public(WORLD),
+        "the rolled-back batch moved nothing"
+    );
+    assert_eq!(
+        tenancy(&pool, "claim_versions", in_flight).await,
+        public(WORLD),
+        "the committed insert agrees with its (unmoved) claim"
+    );
+}
+
 /// A row can become unreadable to an unstamped application session without
 /// its visibility column changing — here a RESTRICTIVE policy that hides rows
 /// owned by the target group from `epigraph_app`. The readability census, taken

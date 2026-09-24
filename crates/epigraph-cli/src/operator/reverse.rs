@@ -2,7 +2,8 @@
 //!
 //! # Order inside a batch
 //!
-//! 1. Lock the batch's claims `FOR UPDATE`.
+//! 1. Lock the batch's claims `FOR UPDATE`, and the cascade tables with no key
+//!    to `claims` (`tables::lock_unkeyed_tables`), as the re-own does.
 //! 2. Put each claim back on its recorded owner. The tenancy trigger then
 //!    copies that owner onto EVERY row derived from the claim.
 //! 3. Put every recorded row back on ITS OWN recorded tenancy. This is the
@@ -120,6 +121,7 @@ pub struct Outcome {
 pub async fn run_batch(
     conn: &mut PgConnection,
     specs: &[TableSpec],
+    unkeyed: &[String],
     res: &Resolved,
     batch: &[(Uuid, Record)],
     lock_timeout: &str,
@@ -131,6 +133,7 @@ pub async fn run_batch(
         .await?;
     let ids: Vec<Uuid> = batch.iter().map(|(id, _)| *id).collect();
     let locked = fetch_claims(conn, &ids, true).await?;
+    tables::lock_unkeyed_tables(conn, unkeyed).await?;
     let now: BTreeMap<Uuid, _> = locked.iter().map(|c| (c.id, c)).collect();
     let mut work: Vec<(Uuid, &Record)> = Vec::new();
     for (id, rec) in batch {
@@ -354,6 +357,7 @@ pub async fn run(
     }
     let m = manifest::read(&opts.manifest)?;
     let specs = tables::propagated_tables(conn).await?;
+    let unkeyed = tables::unkeyed_tables(conn, &specs).await?;
     tables::probe_session_switch(conn).await?;
     let res = resolve(&m, &specs)?;
     writeln!(
@@ -371,7 +375,7 @@ pub async fn run(
     if opts.apply {
         for (i, batch) in batches.iter().enumerate() {
             let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-            let r = run_batch(&mut tx, &specs, &res, batch, &opts.lock_timeout).await;
+            let r = run_batch(&mut tx, &specs, &unkeyed, &res, batch, &opts.lock_timeout).await;
             if r.is_ok() {
                 tx.commit().await?;
             } else {
@@ -387,7 +391,7 @@ pub async fn run(
             sqlx::query("SAVEPOINT reverse_batch")
                 .execute(&mut *tx)
                 .await?;
-            let r = run_batch(&mut tx, &specs, &res, batch, &opts.lock_timeout).await;
+            let r = run_batch(&mut tx, &specs, &unkeyed, &res, batch, &opts.lock_timeout).await;
             let sp = if r.is_ok() {
                 "RELEASE SAVEPOINT reverse_batch"
             } else {

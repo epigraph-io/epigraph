@@ -635,6 +635,80 @@ pub async fn write_tenancy(
     Ok(res.rows_affected())
 }
 
+/// The cascade's `derived[]` tables whose `claim_id` has NO immediate foreign
+/// key to `claims(id)`, read from `pg_constraint` at run time.
+///
+/// A batch's `SELECT ... FOR UPDATE` on its claims excludes a concurrent
+/// derived INSERT only through that foreign key: the INSERT's RI check takes
+/// `FOR KEY SHARE` on the parent claim, which `FOR UPDATE` blocks. A table
+/// without the key (review measured three: `claim_versions`,
+/// `ds_combined_beliefs`, `claim_cluster_membership`) is not excluded, and a
+/// concurrent INSERT there both lands on the claim's OLD owner and, through
+/// migration 070's statement-level inherit trigger, can rewrite a row the
+/// batch already moved and verified after the batch commits. A deferrable key
+/// is checked at commit, after the batch's lock may be gone, so it counts as
+/// absent.
+///
+/// # Errors
+/// The catalog read fails.
+pub async fn unkeyed_tables(
+    conn: &mut PgConnection,
+    specs: &[TableSpec],
+) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for s in specs.iter().filter(|s| s.kind == Kind::Derived) {
+        let keyed: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM pg_constraint k \
+                  JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = k.conkey[1] \
+                 WHERE k.conrelid = to_regclass('public.' || $1) \
+                   AND k.contype = 'f' \
+                   AND k.confrelid = 'public.claims'::regclass \
+                   AND array_length(k.conkey, 1) = 1 \
+                   AND a.attname = 'claim_id' \
+                   AND NOT k.condeferrable)",
+        )
+        .bind(&s.name)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !keyed {
+            out.push(s.name.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Take `SHARE ROW EXCLUSIVE` on every table [`unkeyed_tables`] named, for the
+/// rest of the current transaction.
+///
+/// That mode blocks every concurrent INSERT/UPDATE/DELETE on the table (and
+/// every other holder of the same mode, so two batches cannot deadlock on
+/// upgrading it), and still admits plain reads. Held for one short batch. The
+/// transaction's `lock_timeout` applies, so a table held by a long writer rolls
+/// the batch back instead of stalling it.
+///
+/// # Errors
+/// The lock is not granted within `lock_timeout`.
+pub async fn lock_unkeyed_tables(conn: &mut PgConnection, tables: &[String]) -> anyhow::Result<()> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    for t in tables {
+        if !is_plain_ident(t) {
+            bail!("refusing table name {t:?}");
+        }
+    }
+    let list: Vec<String> = tables.iter().map(|t| format!("public.\"{t}\"")).collect();
+    sqlx::query(&format!(
+        "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+        list.join(", ")
+    ))
+    .execute(&mut *conn)
+    .await
+    .with_context(|| format!("locking the tables with no key to claims: {tables:?}"))?;
+    Ok(())
+}
+
 /// Row-change counters for the current transaction, per `public` table:
 /// `(inserted, updated, deleted)`, from `pg_stat_xact_user_tables`.
 ///
