@@ -8,9 +8,11 @@
 //! personal group, hanging off a claim that stays PUBLIC, with the
 //! `evidence → claim` edge left `('public', world)` — the hide changes exactly
 //! the selected rows' visibility and no other row's, so the edge keeps its
-//! tenancy. The write path that produces this state is not in this tree (see
-//! `epigraph-cli/src/operator/hide.rs`), so the fixture constructs it
-//! directly; the read side cannot tell the difference.
+//! tenancy. The write path that produces this state is `epigraph-operator
+//! hide-evidence --apply` (`epigraph-cli/src/operator/hide.rs`, which also
+//! pins the row under migration 110); a crate-level test cannot run that
+//! binary, so the fixture constructs the same state directly, and the read
+//! side cannot tell the difference.
 //!
 //! # The read paths, enumerated
 //!
@@ -26,10 +28,12 @@
 //!   through one of these, with the request's `Viewer`
 //!   (`routes/crud.rs`, `routes/edges.rs`, `routes/rag.rs`, `routes/claims.rs`,
 //!   `routes/graph_query_utils.rs`, `routes/staging.rs`). PROBED below.
-//! * `ClaimRepository::inherit_evidence` and
-//!   `epigraph_engine::edge_factor::auto_wire_ds_for_edge` read `properties`
-//!   to WRITE derived state (a merge; a DS factor), not to return it. Not
-//!   probed; listed in the branch's not_done.
+//! * `ClaimRepository::inherit_evidence` writes a `derived_from` edge to every
+//!   evidence row of the old claim, hidden ones included; PROBED in
+//!   [`the_surfaces_outside_the_content_reads_are_measured`] (the edge takes
+//!   the meet and is withheld). `epigraph_engine::edge_factor::auto_wire_ds_for_edge`
+//!   reads `properties` to WRITE a DS factor, not to return it. Not probed;
+//!   listed in the branch's not_done.
 //! * Maintenance and operator binaries on a privileged pool, which see every
 //!   row by design: `epigraph-cli`'s `analyze_graph`, `backfill_factors`,
 //!   `ingest_literature::build_packets`, `reembed`, and
@@ -51,11 +55,13 @@
 //! Each is CALIBRATED: the owner's viewer on the same executor does see the
 //! row, so "the stranger saw nothing" is not an empty table.
 //!
-//! What this does NOT cover is listed in not_done: content duplicated
-//! elsewhere (the claim's own text, `harvester_fragments.content_text`, edge
-//! `properties`, `mass_functions.evidence_type`), a BYPASSRLS or superuser
-//! connection with a bypass viewer, and anything emitted before a row was
-//! hidden. Hiding is forward-only.
+//! MEASURED as known surfaces in
+//! [`the_surfaces_outside_the_content_reads_are_measured`]: the claim's own
+//! text and an edge touching the hidden row stay readable to a non-member.
+//! NOT covered here: `harvester_fragments.content_text`,
+//! `mass_functions.evidence_type`, a BYPASSRLS or superuser connection with a
+//! bypass viewer, and anything emitted before a row was hidden. Hiding is
+//! forward-only.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -329,5 +335,102 @@ async fn a_hidden_evidence_row_is_withheld_on_an_app_session(pool: PgPool) {
         leaks(&as_stranger).is_empty(),
         "a stamped non-member received the hidden row through {:?}",
         leaks(&as_stranger)
+    );
+}
+
+/// Count of rows `sql` (one uuid bind) returns to `epigraph_app` stamped as
+/// `viewer`.
+async fn app_count(pool: &PgPool, viewer: &Viewer, sql: &str, id: Uuid) -> i64 {
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("SET SESSION AUTHORIZATION epigraph_app")
+        .execute(&mut *conn)
+        .await
+        .expect("become epigraph_app");
+    stamp(&mut conn, viewer).await;
+    let n: i64 = sqlx::query_scalar(sql)
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    sqlx::query("RESET SESSION AUTHORIZATION")
+        .execute(&mut *conn)
+        .await
+        .expect("reset");
+    n
+}
+
+/// B-H3's surfaces OUTSIDE the evidence content reads, MEASURED as a
+/// non-member on an `epigraph_app` session, so the operator tool's
+/// `HIDE-SURFACE` lines describe observed behaviour rather than a reading of
+/// the code:
+///
+/// * the hidden row itself (`raw_content`, `source_url`, `properties` by a
+///   direct SELECT): WITHHELD;
+/// * an edge touching the hidden row, left public by the hide: READABLE (ids,
+///   relationship and properties; no evidence content), a known surface;
+/// * the claim the row hangs off, and its text: READABLE, by design;
+/// * the `derived_from` edge `ClaimRepository::inherit_evidence` writes from a
+///   survivor claim to every evidence row of the old claim, hidden ones
+///   included: WITHHELD, because the edge tenancy trigger takes the meet of a
+///   public claim and a `group` evidence row, which is `group` in the hiding
+///   group.
+///
+/// If a surface changes, this test fails and the tool's lines must change
+/// with it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_surfaces_outside_the_content_reads_are_measured(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let stranger = Viewer::resolve(&pool, fx.stranger).await.expect("resolve");
+    let owner = Viewer::resolve(&pool, fx.owner).await.expect("resolve");
+
+    let direct = "SELECT count(*) FROM evidence WHERE id = $1 \
+                  AND (raw_content IS NOT NULL OR source_url IS NOT NULL OR properties IS NOT NULL)";
+    assert_eq!(
+        app_count(&pool, &owner, direct, fx.hidden).await,
+        1,
+        "calibration"
+    );
+    assert_eq!(
+        app_count(&pool, &stranger, direct, fx.hidden).await,
+        0,
+        "the hidden row's content is withheld from a non-member"
+    );
+
+    let touching = "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'evidence' \
+                    AND properties ? 'strength'";
+    assert_eq!(
+        app_count(&pool, &stranger, touching, fx.hidden).await,
+        1,
+        "KNOWN SURFACE: an edge touching a hidden row stays readable (ids, relationship, \
+         properties) where the hide left it"
+    );
+
+    let claim_text = "SELECT count(*) FROM claims WHERE id = $1 AND content IS NOT NULL";
+    assert_eq!(
+        app_count(&pool, &stranger, claim_text, fx.claim).await,
+        1,
+        "BY DESIGN: the claim and its text stay public; hiding evidence does not hide the claim"
+    );
+
+    let survivor =
+        fixture::seed_public_claim(&pool, fx.owner, "a survivor that inherits evidence").await;
+    let inherited = epigraph_db::ClaimRepository::inherit_evidence(&pool, fx.claim, survivor)
+        .await
+        .expect("inherit_evidence");
+    assert_eq!(
+        inherited, 1,
+        "the hidden row is inherited as a derived_from edge"
+    );
+    let derived = "SELECT count(*) FROM edges WHERE target_id = $1 AND target_type = 'evidence' \
+                   AND relationship = 'derived_from'";
+    assert_eq!(
+        app_count(&pool, &owner, derived, fx.hidden).await,
+        1,
+        "calibration: the hiding group's member reads the inherited edge"
+    );
+    assert_eq!(
+        app_count(&pool, &stranger, derived, fx.hidden).await,
+        0,
+        "the inherited derived_from edge takes the meet with the group row and is withheld"
     );
 }
