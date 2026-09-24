@@ -1608,3 +1608,65 @@ async fn reown_with_hide_flags_previews_and_refuses_apply_before_writing(pool: P
         "refused hide re-own",
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reown-reverse checks itself too, and the target group must be the operator's
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `reown-reverse` runs its own copy of the batch invariants. A trigger that
+/// writes a principal-scoped `recall_events` row on every claims UPDATE — a
+/// row outside the set — must make the reversal's census fail and roll the
+/// batch back, leaving the post-apply state exactly as it was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reverse_that_writes_outside_the_set_rolls_back(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    exec(
+        &pool,
+        "CREATE FUNCTION test_touch_recall() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN UPDATE recall_events SET query_text = query_text || '!'; RETURN NULL; END $$",
+    )
+    .await;
+    exec(
+        &pool,
+        "CREATE TRIGGER test_touch_recall AFTER UPDATE ON claims \
+         FOR EACH STATEMENT EXECUTE FUNCTION test_touch_recall()",
+    )
+    .await;
+    let moved = snapshot(&pool, false).await;
+    let rv = reverse(&pool, &dir.join("m.jsonl"), true).await;
+    assert_eq!(rv.code, 2, "{}", rv.show());
+    assert!(rv.stdout.contains("ROLLED BACK"), "{}", rv.show());
+    assert!(rv.stdout.contains("table recall_events"), "{}", rv.show());
+    assert!(rv.stdout.contains("STOPPED"), "{}", rv.show());
+    assert_same(&moved, &snapshot(&pool, false).await, "rolled-back reverse");
+}
+
+/// The target is refused unless it is a `personal` group the operator itself
+/// created — the creator test branch A applies to operator groups. A group
+/// carrying the operator's did_key but created by someone else is a squat, and
+/// nothing is written: no manifest, no row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_squatted_target_group_is_refused(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    sqlx::query("UPDATE groups SET created_by_agent_id = $2 WHERE id = $1")
+        .bind(fx.target)
+        .bind(fx.stranger)
+        .execute(&pool)
+        .await
+        .expect("make the target a squat (superuser: 103 admits a maintenance session)");
+    let before = snapshot(&pool, false).await;
+    let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", true).await;
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(
+        r.stderr
+            .contains("not a personal group created by the operator"),
+        "{}",
+        r.show()
+    );
+    assert!(!dir.join("m.jsonl").exists(), "refused before the manifest");
+    assert_same(&before, &snapshot(&pool, false).await, "squatted target");
+}
