@@ -280,6 +280,60 @@ async fn link_revoke_relink_stays_revoked(pool: PgPool) {
     );
 }
 
+/// A revocation survives the revoked row being ERASED.
+///
+/// Review's attack: `group_memberships_tenancy` (077) is FOR ALL and admits a
+/// DELETE of the session's own row, so a revoked agent X stamped from its own
+/// live set could `DELETE` its revoked membership, and the next stdio
+/// restart's `epigraph_link_operator` saw no history and inserted a fresh live
+/// writer row: the revocation was undone. The membership is now inserted only
+/// by the call that recorded the `operator_links` row, which no app session can
+/// touch.
+///
+/// The erase runs on the superuser harness on purpose: it stands for ANY way
+/// the history can disappear (an app DELETE before a later guard refused it, a
+/// maintenance clean-up, a cascade), so this pins the link function's own
+/// guard and not whichever layer happens to refuse the DELETE today.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hard_deleted_revocation_is_not_revived_by_a_relink(pool: PgPool) {
+    let operator = seed_bare_agent(&pool).await;
+    let x = seed_bare_agent(&pool).await;
+    let first = link(&pool, x, operator).await;
+    assert!(first.membership_created && first.link_live, "{first:?}");
+    let group = operator_group(&pool, operator).await;
+
+    GroupMembershipRepository::revoke_member_unless_last_admin(&pool, group, x)
+        .await
+        .expect("the operator revokes X");
+    let erased = sqlx::query("DELETE FROM group_memberships WHERE group_id = $1 AND agent_id = $2")
+        .bind(group)
+        .bind(x)
+        .execute(&pool)
+        .await
+        .expect("erase the revoked history row")
+        .rows_affected();
+    assert_eq!(erased, 1, "PREMISE: the revoked row existed and is now gone");
+
+    let relinked = link(&pool, x, operator).await;
+    assert!(
+        !relinked.membership_created && !relinked.membership_live && !relinked.link_live,
+        "a re-link after the revoked row was erased must not re-create the membership: \
+         {relinked:?}"
+    );
+    assert!(
+        membership_rows(&pool, group, x).await.is_empty(),
+        "the re-link wrote a membership row for a revoked agent whose history was erased"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    assert_eq!(
+        AgentRepository::operator_actor(&mut conn, x)
+            .await
+            .expect("actor read"),
+        None,
+        "the erased revocation was REVIVED: X acts for the operator again"
+    );
+}
+
 /// `link_live` reports what the authoring and ownership paths will actually
 /// read, not merely that a membership row is live.
 ///

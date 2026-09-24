@@ -52,14 +52,17 @@
 -- issue #493 if reused here. This file neither calls it nor copies its conflict
 -- clause:
 --
---   * the agent's membership is inserted ONLY when the roster holds NO row of
---     ANY state for (operator group, agent), AND with an untargeted
---     `ON CONFLICT DO NOTHING`. Two guards, on purpose: the conflict clause
---     alone lets a revoked row at a DIFFERENT epoch be shadowed by a fresh
---     epoch-0 insert (the composite UNIQUE is per-epoch and the partial
---     `group_memberships_one_live` index ignores revoked rows); the history
---     check alone races two concurrent first links. An operator who revokes an
---     agent's membership therefore keeps it revoked across every restart.
+--   * the agent's membership is inserted ONLY by the call whose
+--     `INSERT INTO operator_links ... ON CONFLICT (agent_id) DO NOTHING`
+--     affected a row, i.e. once per agent, ever. That is the primary guard,
+--     and it rests on `operator_links`, which no application session can
+--     update or delete (section 4). Two more guards stay as defense in depth:
+--     the roster must hold NO row of ANY state for (operator group, agent),
+--     and the insert carries an untargeted `ON CONFLICT DO NOTHING`. An
+--     operator who revokes an agent's membership therefore keeps it revoked
+--     across every restart, and ERASING the revoked row does not help either
+--     (review measured exactly that erase-then-restart revival before this
+--     guard existed; `operator_link.rs::a_hard_deleted_revocation_is_not_revived_by_a_relink`).
 --   * the role is `writer`, never `admin`, so an operated agent can write rows
 --     the operator's group owns and cannot manage that group's membership.
 --   * the operator's group is created (if absent) with
@@ -87,10 +90,13 @@
 --     exists between the pair IN ANY STATE, so a retracted edge is not
 --     re-asserted either.
 --
--- RESIDUAL: a membership row that is HARD-deleted (rather than soft-revoked)
--- leaves no history, and the next link re-creates it. MEASURED on this tree:
--- every removal in `crates/epigraph-db/src/repos/` is a soft `UPDATE ... SET
--- revoked_at = now()`, as 092 section 3 also records.
+-- A membership row that is HARD-deleted leaves no history. An earlier form of
+-- this file relied on that history alone, and review measured the hole at the
+-- RLS layer, not in repo code: `group_memberships_tenancy` (077) is FOR ALL
+-- and admits a DELETE of the session's own row, so `epigraph_app` stamped as a
+-- revoked agent X ran `DELETE FROM group_memberships WHERE agent_id = X` ->
+-- `DELETE 1`, and the next stdio restart's link re-created a live writer row.
+-- Gating the membership on the link-row insert closes it for this function.
 --
 -- ===================================================================
 -- 4. THE LINK RECORD IS A DEFINER-ONLY TABLE, NOT AN EDGE
@@ -369,6 +375,7 @@ DECLARE
     v_group     uuid;
     v_other     uuid;
     v_new_group uuid;
+    v_link_rows integer := 0;
     v_mem_rows  integer := 0;
     v_edge_rows integer := 0;
 BEGIN
@@ -457,20 +464,26 @@ BEGIN
     INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id)
     VALUES (p_agent, p_operator, v_group)
     ON CONFLICT (agent_id) DO NOTHING;
+    GET DIAGNOSTICS v_link_rows = ROW_COUNT;
 
-    -- (c) The agent's writer membership: recorded once. Both guards are
-    -- load-bearing -- see section 3. And NEVER for a RETIRED link (section 7):
-    -- a retired identity's key may be public, so the row being retired is
-    -- checked here, after the DO NOTHING above left any existing row as it was.
-    INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share,
-                                          epoch, role)
-    SELECT v_group, p_agent, ''::bytea, 0, 'writer'
-     WHERE NOT EXISTS (SELECT 1 FROM public.group_memberships m
-                        WHERE m.group_id = v_group AND m.agent_id = p_agent)
-       AND NOT EXISTS (SELECT 1 FROM public.operator_links l
-                        WHERE l.agent_id = p_agent AND l.retired)
-    ON CONFLICT DO NOTHING;
-    GET DIAGNOSTICS v_mem_rows = ROW_COUNT;
+    -- (c) The agent's writer membership: recorded once, and ONLY by the call
+    -- that recorded the link row (section 3). Keying on `v_link_rows` makes
+    -- "never revive" rest on the app-immutable `operator_links` table rather
+    -- than on membership history, which a hard DELETE can erase. The two
+    -- membership guards stay as defense in depth. A RETIRED row is never
+    -- promoted (section 7): its ON CONFLICT above affected nothing, so
+    -- `v_link_rows` is 0.
+    IF v_link_rows > 0 THEN
+        INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share,
+                                              epoch, role)
+        SELECT v_group, p_agent, ''::bytea, 0, 'writer'
+         WHERE NOT EXISTS (SELECT 1 FROM public.group_memberships m
+                            WHERE m.group_id = v_group AND m.agent_id = p_agent)
+           AND NOT EXISTS (SELECT 1 FROM public.operator_links l
+                            WHERE l.agent_id = p_agent AND l.retired)
+        ON CONFLICT DO NOTHING;
+        GET DIAGNOSTICS v_mem_rows = ROW_COUNT;
+    END IF;
 
     -- (d) The graph record, if no OPERATED_BY edge exists between the pair in
     -- any state. It grants nothing; see section 4.
