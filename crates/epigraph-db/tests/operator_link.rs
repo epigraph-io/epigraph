@@ -1197,6 +1197,89 @@ async fn a_retired_agent_gains_no_write_authority(pool: PgPool) {
     into_own.expect("a retired identity that runs again can still write in its own lane");
 }
 
+/// The operator cannot hand a retired identity write authority through an
+/// ordinary roster write (migration 104 section 2).
+///
+/// Review's attack: O, stamped as admin of its personal group, inserted a
+/// `writer` row for retired R, and R then wrote a claim owned by O's group,
+/// because `Viewer::resolve` derives writable groups from memberships alone.
+///
+/// * INSERT arm — O enrols R as `writer`: refused 42501, and R's writable set
+///   still excludes O's group;
+/// * UPDATE arm — O enrols R as `reader` (allowed: no write), then promotes it
+///   to `writer`: refused 42501;
+/// * CALIBRATION — O, in the same session shape, enrols an UNLINKED agent as
+///   `writer`: accepted, so the refusal is the retired link and not the
+///   session.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_cannot_enrol_a_retired_identity_as_a_writer(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let retired = seed_bare_agent(&pool).await;
+    let unlinked = seed_bare_agent(&pool).await;
+    link_retired(&pool, retired, operator).await;
+    let o_viewer = Viewer::resolve(&pool, operator).await.expect("resolve O");
+
+    let (as_writer, as_reader, promoted, calibration) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            set_gucs_from(&mut conn, &o_viewer).await;
+            let enrol = "INSERT INTO group_memberships \
+                           (group_id, agent_id, wrapped_key_share, epoch, role) \
+                         VALUES ($1, $2, ''::bytea, 0, $3)";
+            let as_writer = sqlx::query(enrol)
+                .bind(op_group)
+                .bind(retired)
+                .bind("writer")
+                .execute(&mut *conn)
+                .await;
+            let as_reader = sqlx::query(enrol)
+                .bind(op_group)
+                .bind(retired)
+                .bind("reader")
+                .execute(&mut *conn)
+                .await;
+            let promoted = sqlx::query(
+                "UPDATE group_memberships SET role = 'writer' \
+                  WHERE group_id = $1 AND agent_id = $2",
+            )
+            .bind(op_group)
+            .bind(retired)
+            .execute(&mut *conn)
+            .await;
+            let calibration = sqlx::query(enrol)
+                .bind(op_group)
+                .bind(unlinked)
+                .bind("writer")
+                .execute(&mut *conn)
+                .await;
+            (conn, (as_writer, as_reader, promoted, calibration))
+        })
+        .await;
+
+    calibration.expect("CALIBRATION: the operator, stamped as admin, can enrol an unlinked agent");
+    let err = as_writer.expect_err(
+        "INSERT arm: the operator enrolled a RETIRED identity as a writer in its group; a \
+         retired key may be public",
+    );
+    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+    as_reader.expect("a reader row grants no write and stays allowed");
+    let err = promoted.expect_err("UPDATE arm: a retired identity's reader row was promoted");
+    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+
+    assert_eq!(
+        membership_rows(&pool, op_group, retired).await,
+        vec![("reader".to_string(), false, 0)],
+        "only the reader row may exist"
+    );
+    let viewer = Viewer::resolve(&pool, retired)
+        .await
+        .expect("resolve retired");
+    assert!(
+        !viewer.writable_groups().contains(&op_group),
+        "the retired identity gained write authority in its operator's group"
+    );
+}
+
 /// `epigraph_link_operator` NEVER promotes a retired link: a retired identity
 /// that runs again with `EPIGRAPH_OPERATOR_ID` set gets no membership and is
 /// reported as retired.

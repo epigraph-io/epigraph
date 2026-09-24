@@ -296,7 +296,11 @@ Current reservation:
   and review used that to erase a revoked operated agent's history and to
   delete an operator's own admin row from under it. Removal is a soft
   `UPDATE ... SET revoked_at`, as every in-tree path already does; a cascaded
-  delete from `agents` fires the trigger too. Behaviour in
+  delete from `agents` fires the trigger too. `group_memberships_no_retired_writer`
+  raises `42501` on an INSERT or UPDATE that leaves a live `writer`/`admin` row
+  for an agent in the group its RETIRED operator link names (102 section 7):
+  review showed the operator could otherwise enrol a retired identity, whose key
+  may be public, as a writer by an ordinary roster write. Behaviour in
   `epigraph-db/tests/operator_link.rs`. Like 100–103 it sits inside internal's
   `060–112`. **No undo runbook ships**: undo is the `DROP TRIGGER` /
   `DROP FUNCTION` statements named in the file. Checked before claiming: no

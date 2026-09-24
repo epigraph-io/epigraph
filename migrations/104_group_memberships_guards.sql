@@ -1,8 +1,8 @@
 -- 104_group_memberships_guards.sql
 -- Roster guards on `group_memberships` that the tenancy policy cannot express.
 --
--- Invoker trigger functions and BEFORE triggers on `group_memberships`. No
--- table, no policy change, no rows written.
+-- Two invoker trigger functions and two BEFORE triggers on
+-- `group_memberships`. No table, no policy change, no rows written.
 --
 -- ===================================================================
 -- 1. A MEMBERSHIP IS REMOVED BY REVOKING IT, NEVER BY DELETING IT
@@ -50,10 +50,36 @@
 -- paths are test clean-ups on the superuser harness. SQLSTATE 42501.
 --
 -- ===================================================================
+-- 2. A RETIRED IDENTITY NEVER HOLDS WRITE AUTHORITY IN ITS OPERATOR'S GROUP
+--
+-- 102 section 7: a RETIRED link gives the operator ownership of a historical
+-- identity's claims and gives the identity ZERO write authority, because many
+-- retired keys are publicly recomputable or were printed to logs.
+-- `epigraph_link_retired_agent` creates no membership, but nothing stopped one
+-- being added LATER by an ordinary roster write. MEASURED by review: the
+-- operator O, stamped as admin of its personal group OG, inserted a `writer`
+-- row for a retired R (`INSERT 0 1`), and R, stamped from its live set, then
+-- inserted a claim owned by OG (`INSERT 0 1`) -- `Viewer::resolve` derives the
+-- writable set from memberships alone, while `epigraph_operator_actor(R)` still
+-- returned nothing. A routine "add my agents to my group" would thereby hand a
+-- public key write access to the operator's group.
+--
+-- So a BEFORE INSERT OR UPDATE row trigger refuses, outside the two escape
+-- hatches, any row that would leave a LIVE `writer`/`admin` membership for an
+-- agent in the group its RETIRED link names. INSERT and UPDATE both, because
+-- reviving a revoked row and promoting a `reader` are the same hole. A
+-- `reader` row is allowed: it grants no write. The `WHEN` clause keeps the
+-- trigger off every other row. The retired bit is read through
+-- `epigraph_operator_of_author` (102, EXECUTE granted to `epigraph_app`),
+-- because an app session cannot see `operator_links`.
+--
+-- ===================================================================
 -- UNDO
 --
 -- `DROP TRIGGER IF EXISTS group_memberships_no_hard_delete ON public.group_memberships;`
--- then `DROP FUNCTION IF EXISTS public.epigraph_group_memberships_no_hard_delete();`.
+-- then `DROP FUNCTION IF EXISTS public.epigraph_group_memberships_no_hard_delete();`,
+-- and `DROP TRIGGER IF EXISTS group_memberships_no_retired_writer ON public.group_memberships;`
+-- then `DROP FUNCTION IF EXISTS public.epigraph_group_memberships_no_retired_writer();`.
 -- No rows to un-write. **Applied to a throwaway database only, NOT to any
 -- deployed database.**
 -- ===================================================================
@@ -79,3 +105,28 @@ CREATE TRIGGER group_memberships_no_hard_delete
     BEFORE DELETE ON public.group_memberships
     FOR EACH ROW
     EXECUTE FUNCTION public.epigraph_group_memberships_no_hard_delete();
+
+CREATE OR REPLACE FUNCTION public.epigraph_group_memberships_no_retired_writer()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF public.epigraph_bypass() OR public.epigraph_definer_bypass() THEN
+        RETURN NEW;
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.epigraph_operator_of_author(NEW.agent_id) o
+                WHERE o.retired AND o.operator_group_id = NEW.group_id) THEN
+        RAISE EXCEPTION 'group_memberships: agent % has a RETIRED operator link to group %, '
+                        'and a retired identity may hold no live writer or admin membership '
+                        'there (migration 102 section 7)', NEW.agent_id, NEW.group_id
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS group_memberships_no_retired_writer ON public.group_memberships;
+CREATE TRIGGER group_memberships_no_retired_writer
+    BEFORE INSERT OR UPDATE ON public.group_memberships
+    FOR EACH ROW
+    WHEN (NEW.revoked_at IS NULL AND NEW.role IN ('writer', 'admin'))
+    EXECUTE FUNCTION public.epigraph_group_memberships_no_retired_writer();
