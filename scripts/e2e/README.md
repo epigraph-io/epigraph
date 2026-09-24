@@ -35,11 +35,17 @@ environment, and every script refuses with a usage message when either is unset.
 
 Both DSNs must name an **explicit port on the test cluster** (5433 on the
 reference host). Every script sources `dsn-guard.sh` first, which refuses a DSN
-with no port or on port 5432 (the production cluster) before any `psql` or
-server start, and passes the DSN's port to every `psql` call as `-p`. Before
+with no port, on port 5432 (the production cluster), or with no host before
+any `psql` or server start, and passes the DSN's port to every `psql` call as
+`-p` and its host as `-h` (a `?host=/socket/dir` query parameter is honoured
+for the unix-socket form). Before
 that guard the scripts ignored the DSN's port, so the superuser half
 (migrations, policy replay, `TRUNCATE`) went to libpq's default, 5432, unless
-the caller also exported `PGPORT`.
+the caller also exported `PGPORT`. The host had the same defect one field
+over, and outlived the port fix: every `psql` call hard-coded `-h 127.0.0.1`, so
+a DSN naming another host (a container network, a CI service host) had its
+verdict queries run against whatever listened on loopback while the server
+binary wrote to the host the DSN named.
 
 The database must be migrated `001 → head` from empty and its name should end in
 `_test`. `epigraph_db_repo_test` will **not** work: it has no tenancy migrations
