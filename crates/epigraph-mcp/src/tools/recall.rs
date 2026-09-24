@@ -368,6 +368,17 @@ pub(crate) async fn recall_audit_owner_group(
 ) -> Result<Uuid, AuditOwnerUnresolved> {
     let principal = principal.ok_or(AuditOwnerUnresolved::NoPrincipal)?;
     let scoped = scoped.ok_or(AuditOwnerUnresolved::NoScopedPool)?;
+    // Read-only here; dropping the transaction rolls it back.
+    let (group, _tx) = audit_owner_on_stamped_tx(scoped, principal).await?;
+    Ok(group)
+}
+
+/// [`recall_audit_owner_group`]'s body, returning the principal-stamped
+/// transaction it read on so that [`write_recall_audit`] can insert on it.
+async fn audit_owner_on_stamped_tx(
+    scoped: &epigraph_db::ScopedPool,
+    principal: Uuid,
+) -> Result<(Uuid, epigraph_db::ScopedTx<'_>), AuditOwnerUnresolved> {
     let viewer = epigraph_db::Viewer::resolve(scoped.inner(), principal)
         .await
         .map_err(AuditOwnerUnresolved::Lookup)?;
@@ -379,12 +390,62 @@ pub(crate) async fn recall_audit_owner_group(
         epigraph_db::GroupMembershipRepository::visible_personal_group_conn(&mut tx, principal)
             .await
             .map_err(AuditOwnerUnresolved::Lookup)?;
-    // Read-only; dropping the transaction rolls it back.
-    drop(tx);
     match group {
-        Some(g) if viewer.group_bind().is_some_and(|live| live.contains(&g)) => Ok(g),
+        Some(g) if viewer.group_bind().is_some_and(|live| live.contains(&g)) => Ok((g, tx)),
         _ => Err(AuditOwnerUnresolved::NoLivePersonalGroup),
     }
+}
+
+/// Why a recall audit row was not written. Either way the recall is served.
+#[derive(Debug)]
+pub(crate) enum RecallAuditNotWritten {
+    /// No owner could be resolved: the row is DROPPED, never widened.
+    Unresolved(AuditOwnerUnresolved),
+    /// The owner resolved and the insert (or its commit) failed.
+    Write(epigraph_db::DbError),
+}
+
+/// Write one recall audit row: resolve the owner group AND insert the row on
+/// ONE transaction stamped from the request principal's own viewer, then
+/// commit. Shared by both MCP recall surfaces.
+///
+/// # Why on the stamped transaction (batch F review)
+///
+/// The insert used to run on the UNSTAMPED pool
+/// (`RecallEventRepository::log(&pool, …)`), and `recall_events_tenancy`'s
+/// WITH CHECK is `epigraph_bypass() OR epigraph_definer_bypass() OR
+/// (epigraph_principal_id() IS NOT NULL AND agent_id =
+/// epigraph_principal_id())`. As `epigraph_app` that is false on an unstamped
+/// connection, so EVERY audit row was refused. The review measured this on the
+/// e2e harness, configs A and B: the server log showed "new row violates
+/// row-level security policy for table \"recall_events\"", and the
+/// `recall_events` count was 0. The owner is already resolved on a
+/// transaction stamped with principal = the row's `agent_id`. Writing there
+/// satisfies the policy by construction, and the owner decision and the write
+/// see one snapshot.
+///
+/// `build` receives the resolved owner group and returns the event.
+pub(crate) async fn write_recall_audit(
+    scoped: Option<&epigraph_db::ScopedPool>,
+    principal: Option<Uuid>,
+    build: impl FnOnce(Uuid) -> epigraph_db::NewRecallEvent,
+) -> Result<Uuid, RecallAuditNotWritten> {
+    let principal = principal
+        .ok_or(AuditOwnerUnresolved::NoPrincipal)
+        .map_err(RecallAuditNotWritten::Unresolved)?;
+    let scoped = scoped
+        .ok_or(AuditOwnerUnresolved::NoScopedPool)
+        .map_err(RecallAuditNotWritten::Unresolved)?;
+    let (group, mut tx) = audit_owner_on_stamped_tx(scoped, principal)
+        .await
+        .map_err(RecallAuditNotWritten::Unresolved)?;
+    let id = epigraph_db::RecallEventRepository::log(&mut *tx, build(group))
+        .await
+        .map_err(RecallAuditNotWritten::Write)?;
+    tx.commit()
+        .await
+        .map_err(RecallAuditNotWritten::Write)?;
+    Ok(id)
 }
 
 /// Spawn the fire-and-forget recall audit write (backlog 8cbffa0e).
@@ -407,38 +468,39 @@ fn spawn_recall_audit(
 ) {
     let query = query.to_string();
     let pgvec = pgvec.to_string();
-    let pool = server.pool.clone();
     let scoped = server.scoped.clone();
     tokio::spawn(async move {
         // Resolved inside the spawn: everything this needs is owned, so nothing
-        // here borrows the request, and the group lookup — a viewer resolve and
-        // one stamped SELECT, never a mint (#493) — stays off the response
-        // path. `058_recall_events.sql`'s own table comment is the contract:
-        // "never blocks a recall".
-        let owner_group_id = match recall_audit_owner_group(scoped.as_ref(), principal).await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(
-                    reason = %e,
-                    "recall_with_context audit skipped rather than widened"
-                );
-                return;
+        // here borrows the request. The group lookup (a viewer resolve and one
+        // stamped SELECT, never a mint, #493) and the insert on that same
+        // stamped transaction stay off the response path.
+        // `058_recall_events.sql`'s own table comment is the contract: "never
+        // blocks a recall".
+        let written = write_recall_audit(scoped.as_ref(), principal, |owner_group_id| {
+            epigraph_db::NewRecallEvent {
+                id: event_id,
+                // The REQUEST principal, not the process identity. See
+                // `recall_audit_owner_group`.
+                agent_id: principal,
+                tool: "recall_with_context".to_string(),
+                query_text: query,
+                query_pgvector: Some(pgvec),
+                params: params_json,
+                returned_claim_ids,
+                owner_group_id: Some(owner_group_id),
             }
-        };
-        let event = epigraph_db::NewRecallEvent {
-            id: event_id,
-            // The REQUEST principal, not the process identity. See
-            // `recall_audit_owner_group`.
-            agent_id: principal,
-            tool: "recall_with_context".to_string(),
-            query_text: query,
-            query_pgvector: Some(pgvec),
-            params: params_json,
-            returned_claim_ids,
-            owner_group_id: Some(owner_group_id),
-        };
-        if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
-            tracing::warn!(error = %e, "recall_with_context audit log failed; recall unaffected");
+        })
+        .await;
+        match written {
+            Ok(_) => {}
+            Err(RecallAuditNotWritten::Unresolved(e)) => tracing::warn!(
+                reason = %e,
+                "recall_with_context audit skipped rather than widened"
+            ),
+            Err(RecallAuditNotWritten::Write(e)) => tracing::warn!(
+                error = %e,
+                "recall_with_context audit log failed; recall unaffected"
+            ),
         }
     });
 }

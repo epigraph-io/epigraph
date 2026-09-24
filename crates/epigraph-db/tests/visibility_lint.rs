@@ -1313,6 +1313,18 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `epigraph_app` by `community_membership_integrity.rs`.",
     ),
     (
+        "recall_event.rs",
+        "log",
+        "ONE INSERT INTO `recall_events` with an explicit `(visibility, owner_group_id)` \
+         declaration; a WRITE with no FROM for a viewer splice. Generic since batch F so the MCP \
+         recall surfaces can write it on the transaction `ScopedPool::begin_as` stamped from the \
+         request principal (`tools/recall.rs::write_recall_audit`): `recall_events_tenancy`'s \
+         WITH CHECK admits an `epigraph_app` insert only when `agent_id = \
+         epigraph_principal_id()`, so on the unstamped pool every audit row was refused. The \
+         engine's agent-less library path still passes its pool. Pinned by \
+         `epigraph-mcp/tests/recall_audit_wiring.rs::the_audit_row_is_not_written_on_the_unstamped_pool`.",
+    ),
+    (
         "method.rs",
         "get",
         "Reads `methods` by primary key, and the statement's FROM is `methods` alone -- it joins \

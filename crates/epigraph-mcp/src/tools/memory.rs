@@ -902,34 +902,35 @@ async fn recall_post_embed(
             // it regroups the response without changing the set.
             "diversity_radius": params.diversity_radius,
         });
-        let pool = server.pool.clone();
         let scoped = server.scoped.clone();
         tokio::spawn(async move {
-            // Unresolvable ⇒ DROP, never widen, and never mint (#493). See
-            // `recall_audit_owner_group`.
-            let owner_group_id =
-                match super::recall::recall_audit_owner_group(scoped.as_ref(), principal).await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        tracing::warn!(reason = %e, "recall audit skipped rather than widened");
-                        return;
-                    }
-                };
-            let event = epigraph_db::NewRecallEvent {
-                id: event_id,
-                agent_id: principal,
-                tool: "recall".to_string(),
-                query_text,
-                query_pgvector,
-                params: params_json,
-                returned_claim_ids,
-                owner_group_id: Some(owner_group_id),
-            };
-            if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
-                tracing::warn!(
+            // Unresolvable ⇒ DROP, never widen, and never mint (#493). The row
+            // is written on the principal-stamped transaction that resolved its
+            // owner; see `recall::write_recall_audit`.
+            let written = super::recall::write_recall_audit(
+                scoped.as_ref(),
+                principal,
+                |owner_group_id| epigraph_db::NewRecallEvent {
+                    id: event_id,
+                    agent_id: principal,
+                    tool: "recall".to_string(),
+                    query_text,
+                    query_pgvector,
+                    params: params_json,
+                    returned_claim_ids,
+                    owner_group_id: Some(owner_group_id),
+                },
+            )
+            .await;
+            match written {
+                Ok(_) => {}
+                Err(super::recall::RecallAuditNotWritten::Unresolved(e)) => {
+                    tracing::warn!(reason = %e, "recall audit skipped rather than widened");
+                }
+                Err(super::recall::RecallAuditNotWritten::Write(e)) => tracing::warn!(
                     error = %e,
                     "recall audit log failed; recall itself unaffected"
-                );
+                ),
             }
         });
     }

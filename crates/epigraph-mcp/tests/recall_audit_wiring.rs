@@ -525,3 +525,54 @@ async fn recall_audit_row_is_owned_by_the_request_principal_not_the_process(pool
     );
     let _ = hit;
 }
+
+/// The audit row is written on the principal-stamped transaction, NOT on the
+/// server's unstamped pool (batch F review, #493-adjacent).
+///
+/// `recall_events_tenancy`'s WITH CHECK admits an `epigraph_app` insert only
+/// when `agent_id = epigraph_principal_id()`, so on the unstamped pool every
+/// audit row was refused. The e2e harness measured zero rows on both configs.
+/// This server's `pool` is `SET SESSION AUTHORIZATION epigraph_app` and
+/// UNSTAMPED, the production shape of that pool. Its `ScopedPool` cannot be
+/// downgraded in-process (`viewer_fixture::downgraded_pool`'s header says why),
+/// so the arm pins WHICH connection writes the row: on the unstamped app pool
+/// the insert is refused and no row appears.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_audit_row_is_not_written_on_the_unstamped_pool(pool: PgPool) {
+    use epigraph_crypto::AgentSigner;
+    use epigraph_mcp::embed::McpEmbedder;
+    use epigraph_mcp::EpiGraphMcpFull;
+    let viewer = principal_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    seed_claim(&pool, agent, "quorvantine audit fixture").await;
+
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let scoped = fixture::scoped_pool(&pool).await;
+    let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
+    let embedder = McpEmbedder::new(app.clone(), None);
+    let server = EpiGraphMcpFull::new(app, signer, embedder, false).with_scoped_pool(scoped);
+
+    recall(&server, &viewer, params("quorvantine"))
+        .await
+        .expect("recall ok");
+
+    let mut logged = 0i64;
+    for _ in 0..100 {
+        logged = sqlx::query_scalar(
+            "SELECT count(*) FROM recall_events WHERE query_text = 'quorvantine' AND agent_id = $1",
+        )
+        .bind(viewer.principal())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if logged > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    assert_eq!(
+        logged, 1,
+        "the audit row must be written on the principal-stamped transaction; on the unstamped \
+         epigraph_app pool recall_events_tenancy refuses it"
+    );
+}
