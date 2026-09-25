@@ -1244,6 +1244,34 @@ class UnitHelpersTest(unittest.TestCase):
         self.assertEqual(cfg.gh_repo, "o/r")
         self.assertTrue(kanban.Config(repo=HERE, port=0, env={"KANBAN_GH_REPO": "o/r --admin"}).gh_repo_invalid)
 
+    def test_checks_pass_only_on_affirmatively_green_results(self):
+        checks = kanban.App._checks
+        ok = {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        self.assertEqual(checks([ok]), "pass")
+        self.assertEqual(checks([ok, {"__typename": "StatusContext", "context": "ci/x", "state": "SUCCESS"}]), "pass")
+        self.assertEqual(checks([dict(ok, conclusion="SKIPPED"), dict(ok, name="b", conclusion="NEUTRAL")]), "pass")
+        # none of these is a green CI result
+        for rollup, want in (([dict(ok, conclusion="STALE")], "pending"),
+                             ([dict(ok, conclusion=None)], "pending"),
+                             ([dict(ok, conclusion="")], "pending"),
+                             ([dict(ok, conclusion="SOMETHING_NEW")], "pending"),
+                             ([{"status": "IN_PROGRESS", "conclusion": ""}], "pending"),
+                             ([{"state": "PENDING"}], "pending"),
+                             ([{"state": "WHATEVER"}], "pending"),
+                             (["garbage"], "none"),
+                             ([{"unrelated": 1}], "none"),
+                             ([], "none"),
+                             (None, "none"),
+                             ([ok, dict(ok, conclusion="FAILURE")], "fail"),
+                             ([dict(ok, conclusion="STALE"), {"state": "ERROR"}], "fail")):
+            self.assertEqual(checks(rollup), want, rollup)
+        # KANBAN_REQUIRED_CHECKS: a required context that has not reported yet is pending, not pass
+        self.assertEqual(checks([ok], ("test",)), "pass")
+        self.assertEqual(checks([ok], ("test", "lint")), "pending")
+        self.assertEqual(checks([ok, {"context": "lint", "state": "SUCCESS"}], ("test", "lint")), "pass")
+        cfg = kanban.Config(repo=HERE, port=0, env={"KANBAN_REQUIRED_CHECKS": "test, lint"})
+        self.assertEqual(cfg.required_checks, ("test", "lint"))
+
     def test_redact_token(self):
         line = '"GET /api/state?t=SECRETTOKEN&x=1 HTTP/1.1" 200 -'
         self.assertNotIn("SECRETTOKEN", kanban.redact_token(line))

@@ -412,6 +412,8 @@ class Config:
         # Tool lists for development agents: explicit, and overridable as comma-separated lists.
         self.agent_allowed_tools = split_list(env.get("KANBAN_AGENT_ALLOWED_TOOLS"), DEV_ALLOWED_TOOLS)
         self.agent_disallowed_tools = split_list(env.get("KANBAN_AGENT_DISALLOWED_TOOLS"), DEV_DISALLOWED_TOOLS)
+        # CI contexts (check-run names / status contexts) that must have reported green before "pass"
+        self.required_checks = split_list(env.get("KANBAN_REQUIRED_CHECKS"))
         self.resolve_tool = env.get("KANBAN_RESOLVE_TOOL") or "mcp__epigraph__resolve_backlog_item"
         self.backlog_tool = env.get("KANBAN_BACKLOG_TOOL") or "mcp__epigraph__query_claims_by_label"
         self.repo = os.path.abspath(repo) if repo else git_toplevel(os.getcwd(), self.git_bin)
@@ -433,6 +435,7 @@ class Config:
             "base_branch": self.base_branch,
             "remote": self.remote,
             "gh_repo": self.gh_repo,
+            "required_checks": list(self.required_checks),
             "agent_env_allow": list(self.agent_env_allow),
             "agent_allowed_tools": list(self.agent_allowed_tools),
             "agent_disallowed_tools": list(self.agent_disallowed_tools),
@@ -588,6 +591,10 @@ class ApiError(Exception):
         self.status = status
         self.message = message
         self.extra = extra or {}
+
+
+CHECK_GREEN_CONCLUSIONS = frozenset(("SUCCESS", "NEUTRAL", "SKIPPED"))
+CHECK_RED_CONCLUSIONS = frozenset(("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"))
 
 
 def override_checks_requested(body: Any) -> bool:
@@ -1192,7 +1199,7 @@ class App:
         sha = str(data.get("headRefOid") or "")
         if not HEAD_SHA_RE.fullmatch(sha):
             raise ApiError(409, "PR #%d has no usable head commit (%r); refusing an unpinned merge" % (number, sha))
-        return {"sha": sha, "checks": self._checks(data.get("statusCheckRollup")),
+        return {"sha": sha, "checks": self._checks(data.get("statusCheckRollup"), self.cfg.required_checks),
                 "url": valid_pr_url(data.get("url"))}
 
     def verify_item_pr(self, number: int, card: Dict[str, Any], integration: str) -> Dict[str, Any]:
@@ -1830,21 +1837,44 @@ class App:
     # ---- integration -----------------------------------------------------
 
     @staticmethod
-    def _checks(rollup: Any) -> str:
+    def _checks(rollup: Any, required: Tuple[str, ...] = ()) -> str:
+        """"pass" only when every recognised entry is affirmatively green and every `required` context reported.
+        An allow-list: a check-run counts only as COMPLETED with SUCCESS/NEUTRAL/SKIPPED, a status context only as
+        SUCCESS. Anything else that is not red (STALE, a COMPLETED run with no conclusion, a value GitHub adds
+        later) is "pending"; a rollup with no recognisable entry at all is "none"."""
         if not isinstance(rollup, list) or not rollup:
             return "none"
+        recognised = 0
         pending = False
+        names = set()
         for c in rollup:
             if not isinstance(c, dict):
                 continue
-            concl = str(c.get("conclusion") or "").upper()
-            state = str(c.get("state") or "").upper()
-            status = str(c.get("status") or "").upper()
-            if concl in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE") or \
-                    state in ("FAILURE", "ERROR"):
-                return "fail"
-            if (status and status != "COMPLETED") or state in ("PENDING", "EXPECTED"):
-                pending = True
+            kind = c.get("__typename")
+            if kind == "CheckRun" or (kind is None and ("status" in c or "conclusion" in c)):
+                concl = str(c.get("conclusion") or "").upper()
+                status = str(c.get("status") or "").upper()
+                if concl in CHECK_RED_CONCLUSIONS:
+                    return "fail"
+                if status != "COMPLETED" or concl not in CHECK_GREEN_CONCLUSIONS:
+                    pending = True
+                name = c.get("name")
+            elif kind == "StatusContext" or (kind is None and "state" in c):
+                state = str(c.get("state") or "").upper()
+                if state in ("FAILURE", "ERROR"):
+                    return "fail"
+                if state != "SUCCESS":
+                    pending = True
+                name = c.get("context")
+            else:
+                continue
+            recognised += 1
+            if name:
+                names.add(str(name))
+        if not recognised:
+            return "none"
+        if any(r not in names for r in required):
+            pending = True
         return "pending" if pending else "pass"
 
     def integration_members(self, branch: str) -> List[Dict[str, Any]]:
@@ -1871,7 +1901,7 @@ class App:
                     data = self.gh_pr_view(int(integ["pr_number"]))
                     view["pr_state"] = data.get("state")
                     view["mergeable"] = data.get("mergeable")
-                    view["checks"] = self._checks(data.get("statusCheckRollup"))
+                    view["checks"] = self._checks(data.get("statusCheckRollup"), self.cfg.required_checks)
                     view["pr_url"] = valid_pr_url(data.get("url")) or view["pr_url"]
                 except (CmdError, ValueError) as e:
                     errors.append("integration PR: %s" % e)
@@ -1882,7 +1912,7 @@ class App:
                     try:
                         data = self.gh_pr_view(int(card["pr_number"]))
                         m["state"] = data.get("state")
-                        m["checks"] = self._checks(data.get("statusCheckRollup"))
+                        m["checks"] = self._checks(data.get("statusCheckRollup"), self.cfg.required_checks)
                     except (CmdError, ValueError) as e:
                         errors.append("PR #%s: %s" % (card.get("pr_number"), e))
                 view["members"].append(m)
