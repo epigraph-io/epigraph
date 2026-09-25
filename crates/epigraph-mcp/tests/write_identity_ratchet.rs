@@ -142,3 +142,44 @@ fn every_tool_body_forwards_the_requests_own_token() {
         offenders.join("\n")
     );
 }
+
+/// The third hole: a tool module resolving the write identity with a literal
+/// `None` token. `write_identity(None, viewer)` is the stdio answer — the server
+/// agent — so a tool that wrote it would author every HTTP caller's write as the
+/// shared signer again while still "going through the resolver". Only the
+/// request's own `auth` may be handed to it under `src/tools/`.
+///
+/// Verified load-bearing by reverting: changing `tools/memory.rs`'s
+/// `server.write_identity(auth, viewer)` to `server.write_identity(None, viewer)`
+/// fails this scan.
+#[test]
+fn no_tool_module_resolves_the_write_identity_without_the_requests_token() {
+    let dir = src().join("tools");
+    let mut offenders = Vec::new();
+    let mut resolver_calls = 0usize;
+    for entry in std::fs::read_dir(&dir).expect("read src/tools") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let text = strip_line_comments(&std::fs::read_to_string(&path).expect("read"));
+        let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        resolver_calls += flat.matches("write_identity(").count();
+        for bad in ["write_identity(None", "write_identity( None"] {
+            if flat.contains(bad) {
+                offenders.push(format!("tools/{name}: {bad}"));
+            }
+        }
+    }
+    assert!(
+        resolver_calls >= 20,
+        "the scan must see the tool modules' resolver calls; saw {resolver_calls}"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a tool module resolves the write identity with a literal None token, which \
+         authors an HTTP caller's write as the server agent:\n{}",
+        offenders.join("\n")
+    );
+}
