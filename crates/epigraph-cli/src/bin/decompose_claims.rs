@@ -57,6 +57,28 @@
 //!   LLM call.
 //!
 //! Every writing mode resolves API auth BEFORE any LLM call (gh-375).
+//!
+//! # Running the writes in production
+//!
+//! * Pause the scheduled `decomposition-cycle` and avoid API redeploys while
+//!   `--apply-plan` or `--retarget --apply` runs. Selection/verification and
+//!   the write are not one transaction, and the scheduled cycle also selects
+//!   then persists, so overlapping runs can decompose one parent twice. An
+//!   API restart mid-run is recoverable (a failed plan line leaves its parent
+//!   undecomposed; a retarget entry records the error and is resumed) but
+//!   costs a re-run.
+//! * Runtime dependencies: the API's token mint (`/oauth/token`; other
+//!   branches add a `refuse_operated_agent` check there, which fails closed
+//!   before any LLM call), and for `--retarget` writes an `edges:write` GRANT
+//!   on the service client (the mint asks for `claims:write edges:write`).
+//!   Whether the API writes edge BBAs at all depends on the role it runs as
+//!   (see `epigraph_cli::retarget`, "When an atom edge carries no BBA"); a
+//!   `--retarget --apply --limit 1` run shows `atom_edges_not_ds_wired`.
+//! * The eligibility filters are ON by default for every `--priority`,
+//!   including the scheduled `oldest` crawl, whose head is ≈87k short 2026-03
+//!   extracts the filter skips; such a run may read `--max-scan` rows and
+//!   choose few. Point the schedule at `--priority conflict` (then `recent`)
+//!   before redeploying this binary.
 
 use clap::Parser;
 use epigraph_cli::decompose::{

@@ -61,6 +61,33 @@
 //! A RETIRED source→atom edge blocks the retarget for that atom: someone
 //! retracted exactly this claim, and `if_not_exists` would hand back the
 //! retired row, which never wires. The block is reported, never overridden.
+//!
+//! # What happens to the parent's belief (and the policy)
+//!
+//! Nothing: the parent edge is kept in force and its BBA on the parent is not
+//! touched; the atom edge adds a SEPARATE BBA on the atom. That is not
+//! per-claim double counting under current semantics:
+//! `sheaf.rs::restriction_kind_with_profile` maps `decomposes_to` to
+//! `Neutral`, so no belief flows between parent and atom, and the two BBAs sit
+//! on different claims and are never combined. Retiring the parent edge
+//! instead would make the parent look undisputed, because nothing propagates
+//! from atom to parent.
+//!
+//! Where double counting CAN happen, and how this module avoids it:
+//! * a second edge + BBA from the same source onto the same atom — the
+//!   `CONTRADICTS`-spelling split (so `contradicts` is held) and a reverse
+//!   `atom -contradicts-> source` edge (so the pre-create check looks in both
+//!   directions);
+//! * consumers that COUNT conflict rows (dispute counts, conflict density)
+//!   see two rows per retargeted dispute, one on the parent and one on the
+//!   atom. That is a reporting question, not a DS one.
+//!
+//! Recommended policy (no DS change in this batch): keep the parent BBA until
+//! a DS-semantics change adds atom→parent propagation through
+//! `decomposes_to`; after that, soft-retire (`valid_to`) parent edges whose
+//! `retargeted_to` is fully wired (`retarget_unwired == []`). Meanwhile,
+//! exclude parent edges carrying `retargeted_to` from row-count conflict
+//! metrics.
 
 use crate::decompose::strip_code_fence;
 use serde::{Deserialize, Serialize};
