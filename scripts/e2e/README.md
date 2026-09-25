@@ -191,6 +191,13 @@ below is `probe-batch-h.sh`, whose group-private rows are what discriminate.
 "own" = the server agent's personal group, "foreign" = a team group it is not
 in. Row counts are the database's, not the response's.
 
+"Tip" in the table below was first `0dc69ab3`. After the `PATCH /labels`
+conversion and the `types.rs` field-doc commit, drive, probe-tools and
+probe-batch-h were re-run on A and B with the new tip's MCP binary, and every
+verdict and row count in the table held. The only MCP change after `0dc69ab3`
+is schemars description text, so probe-embed, probe-workflow and probe-unit-e
+were not re-run; their last run is at `0dc69ab3`.
+
 | tool / case | A base | A tip | B base | B tip |
 |---|---|---|---|---|
 | patch_claim own public | ERR 42501, 0 rows | OK | OK | OK |
@@ -237,6 +244,22 @@ dir. `label` = whether the label is on the row afterwards.
 A mutation build with the admin author-stamp arm disabled turns "admin /
 another agent's public" on A into 403, label=f: the arm is what keeps a
 `claims:admin` relabel working once the orphan policies are gone.
+
+**This route is the only HTTP write this branch converts.** On the same
+server, config A, an owner acting on its OWN public claim got a `500` with 0
+rows written from three routes. `PATCH /api/v1/claims/:id` and
+`POST /api/v1/claims/:id/supersede` returned "new row violates row-level
+security policy for table claims"; `POST /api/v1/claims` returned the opaque
+"A database error occurred". Each still writes on the unstamped `db_pool` (see
+`crates/epigraph-db/tests/no_unscoped_pool.rs`'s register). They fail loudly and
+atomically, so they satisfy the letter of the R3 gate. But they stop working
+when the orphan policies are dropped, and the register's other raw-pool write
+sites should be expected to behave the same way. That second point is inferred
+from the register and `claims_tenancy`'s WITH CHECK, not measured. This was measured once with a scratch variant of
+`probe-http-labels.sh` that is not committed. On config B, supersede and
+`POST /claims` succeed. The B arm of `PATCH /claims/:id` measures nothing here:
+the probe's tokens name no `oauth_clients` row, so that route's provenance
+insert fails its foreign key on either config.
 
 ## What this harness does not cover
 
