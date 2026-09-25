@@ -47,6 +47,7 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 # A GitHub pull-request URL and nothing else. Used with fullmatch: `search` accepted any string that
 # merely CONTAINED /pull/<n> (newlines and prompt text included), and `$` would accept a trailing "\n".
+HEAD_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 PR_URL_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}/pull/([1-9][0-9]{0,9})")
 
 
@@ -921,33 +922,47 @@ class App:
                 return url, number
         return None, None
 
-    def verify_item_pr(self, number: int, card: Dict[str, Any], integration: str) -> str:
-        """Check PR `number` is an open PR from the card's branch into the current integration branch.
-        Returns its head commit sha; raises ApiError(409) otherwise."""
+    PR_VERIFY_FIELDS = "baseRefName,headRefName,state,url,headRefOid,isCrossRepository,statusCheckRollup"
+
+    def verify_pr(self, number: int, base: str, head: str, what: str) -> Dict[str, Any]:
+        """Check PR `number` is an OPEN, same-repository PR from `head` into `base`, in ONE `gh pr view`
+        so the head sha and the check state describe the same commit. Returns {"sha", "checks", "url"};
+        raises ApiError(409) on any mismatch, ApiError(502) if GitHub cannot be asked."""
         try:
-            data = self.gh_pr_view(number, "baseRefName,headRefName,state,url,headRefOid")
+            data = self.gh_pr_view(number, self.PR_VERIFY_FIELDS)
         except (CmdError, ValueError) as e:
             raise ApiError(502, "could not verify PR #%s: %s" % (number, e))
-        base, head = data.get("baseRefName"), data.get("headRefName")
+        pr_base, pr_head = data.get("baseRefName"), data.get("headRefName")
         state = str(data.get("state") or "").upper()
-        if base != integration:
-            raise ApiError(409, "PR #%d targets %r, not the integration branch %r; refusing to merge"
-                           % (number, base, integration))
-        if head != card.get("branch"):
-            raise ApiError(409, "PR #%d comes from %r, not this card's branch %r; refusing to merge"
-                           % (number, head, card.get("branch")))
+        if pr_base != base:
+            raise ApiError(409, "PR #%d targets %r, not %s %r; refusing to merge" % (number, pr_base, what, base))
+        if pr_head != head:
+            raise ApiError(409, "PR #%d comes from %r, not %r; refusing to merge" % (number, pr_head, head))
+        if data.get("isCrossRepository") is not False:
+            # a fork can open a PR from a branch with the same name
+            raise ApiError(409, "PR #%d is not confirmed to come from this repository (isCrossRepository=%r); "
+                           "refusing to merge" % (number, data.get("isCrossRepository")))
         if state != "OPEN":
             raise ApiError(409, "PR #%d is %s, not OPEN" % (number, state or "in an unknown state"))
-        return str(data.get("headRefOid") or "")
+        sha = str(data.get("headRefOid") or "")
+        if not HEAD_SHA_RE.fullmatch(sha):
+            raise ApiError(409, "PR #%d has no usable head commit (%r); refusing an unpinned merge" % (number, sha))
+        return {"sha": sha, "checks": self._checks(data.get("statusCheckRollup")),
+                "url": valid_pr_url(data.get("url"))}
 
-    def gh_merge(self, number: int, match_head: Optional[str] = None) -> None:
-        """Merge a PR; tolerate local-branch cleanup noise if GitHub reports it merged."""
+    def verify_item_pr(self, number: int, card: Dict[str, Any], integration: str) -> Dict[str, Any]:
+        """An item PR must come from the card's branch into the current integration branch."""
+        return self.verify_pr(number, integration, str(card.get("branch") or ""), "the integration branch")
+
+    def gh_merge(self, number: int, match_head: str) -> None:
+        """Merge a PR pinned to `match_head`; tolerate local-branch cleanup noise if GitHub reports it merged.
+        There is no unpinned merge: a missing or malformed sha is refused, never silently dropped."""
         n = valid_pr_number(number)
         if not n:
             raise CmdError(["gh", "pr", "merge"], None, "", "invalid PR number %r" % (number,))
-        args = ["pr", "merge", str(n), "--merge", "--delete-branch"]
-        if match_head and re.fullmatch(r"[0-9a-f]{7,64}", match_head):
-            args += ["--match-head-commit", match_head]
+        if not isinstance(match_head, str) or not HEAD_SHA_RE.fullmatch(match_head):
+            raise CmdError(["gh", "pr", "merge"], None, "", "refusing to merge PR #%d without a head sha pin" % n)
+        args = ["pr", "merge", str(n), "--merge", "--delete-branch", "--match-head-commit", match_head]
         try:
             self.gh(args, timeout=300)
         except CmdError as e:
@@ -1460,7 +1475,7 @@ class App:
             self.store.save()
             card_snapshot = dict(card)
         try:
-            head_sha = self.verify_item_pr(number, card_snapshot, current)
+            head_sha = self.verify_item_pr(number, card_snapshot, current)["sha"]
         except ApiError as e:
             with self.store.lock:
                 card = self.store.card(card_id)
@@ -1623,11 +1638,21 @@ class App:
         branch = integ.get("branch")
         if not branch:
             raise ApiError(409, "no integration branch yet; develop an item first")
-        if integ.get("pr_number"):
-            return integ
         base = integ.get("base") or self.cfg.base_branch
+        if integ.get("pr_number"):
+            try:
+                self.verify_pr(int(integ["pr_number"]), base, branch, "the base branch")
+                return integ
+            except (ApiError, ValueError) as e:
+                # the recorded PR is no longer an open PR branch -> base; forget it and find or open the right one
+                log("forgetting integration PR #%s: %s" % (integ.get("pr_number"), getattr(e, "message", e)))
+                with self.store.lock:
+                    live = self.store.state["integration"]
+                    if live.get("branch") == branch:
+                        live.update({"pr_url": None, "pr_number": None, "status": "open"})
+                        self.store.save()
         try:
-            url, number = self.gh_pr_for_head(branch)
+            url, number = self.gh_pr_for_head(branch, base)
             if not url:
                 members = [c for c in self.integration_members(branch) if c.get("column") == "accepted"]
                 lines = ["Integration branch `%s` staged by the EpiGraph kanban board." % branch, "",
@@ -1646,6 +1671,8 @@ class App:
             raise ApiError(502, "gh failed: %s" % e)
         if not number:
             raise ApiError(502, "could not determine integration PR number")
+        # adopt (or record) a PR only once GitHub confirms it is this branch into the configured base
+        self.verify_pr(number, base, branch, "the base branch")
         with self.store.lock:
             integ = self.store.state["integration"]
             if integ.get("branch") == branch:
@@ -1678,14 +1705,20 @@ class App:
             self.store.state["integration"]["status"] = "merging"
             self.store.save()
         number = valid_pr_number(integ["pr_number"])
+        base = integ.get("base") or self.cfg.base_branch
         try:
             if not number:
-                raise CmdError(["gh", "pr", "merge"], None, "", "invalid integration PR number")
-            self.gh_merge(number)
-        except CmdError as e:
+                raise ApiError(409, "invalid integration PR number %r" % (integ.get("pr_number"),))
+            # the same treatment action_accept gives an item PR: base/head/state verified, merge head-pinned
+            verified = self.verify_pr(number, base, branch, "the base branch")
+            log("integration merge: PR #%d %s -> %s at %s" % (number, branch, base, verified["sha"]))
+            self.gh_merge(number, verified["sha"])
+        except (ApiError, CmdError) as e:
             with self.store.lock:
                 self.store.state["integration"]["status"] = "pr_open"
                 self.store.save()
+            if isinstance(e, ApiError):
+                raise
             raise ApiError(502, "integration merge failed: %s" % e)
         shipped = self._complete_ship(integ, number, resolve)
         return {"ok": True, "shipped": [c["id"] for c in shipped], "integration_pr": integ.get("pr_url"),

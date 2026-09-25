@@ -56,7 +56,8 @@ if "--session-id" in argv or "--resume" in argv:
     reg = json.load(open(reg_path)) if os.path.exists(reg_path) else {}
     if head not in reg:
         base = prompt.split("--base ", 1)[1].split()[0] if "--base " in prompt else "main"
-        reg[head] = {"number": 101 + len(reg), "base": base, "head": head, "state": "OPEN"}
+        reg[head] = {"number": 101 + sum(1 for k in reg if not k.startswith("pr:")), "base": base, "head": head,
+                     "state": "OPEN"}
         json.dump(reg, open(reg_path, "w"))
     num = reg[head]["number"]
     with open(".kanban/report.json", "w") as fh:
@@ -76,25 +77,43 @@ import json, os, sys
 argv = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as fh:
     fh.write(json.dumps({"bin": "gh", "argv": argv}) + "\n")
+reg_path = os.environ["STUB_PRS"]
+def load():
+    return json.load(open(reg_path)) if os.path.exists(reg_path) else {}
+def opt(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+URL = "https://github.com/example/epigraph/pull/%s"
+ROLLUP = {"SUCCESS": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+          "FAILURE": [{"status": "COMPLETED", "conclusion": "SUCCESS"}, {"status": "COMPLETED", "conclusion": "FAILURE"}],
+          "PENDING": [{"status": "IN_PROGRESS", "conclusion": ""}],
+          "NONE": []}
 if argv[:2] == ["pr", "list"]:
-    print("[]")
+    head, base = opt("--head"), opt("--base")
+    hits = [{"url": URL % p["number"], "number": p["number"]} for p in load().values()
+            if p["head"] == head and p["state"] == "OPEN" and (base is None or p["base"] == base)]
+    print(json.dumps(hits[:1]))
 elif argv[:2] == ["pr", "create"]:
-    print("https://github.com/example/epigraph/pull/200")
+    reg = load()
+    head = opt("--head")
+    reg["pr:create:" + head] = {"number": 200 + sum(1 for k in reg if k.startswith("pr:create:")),
+                                "base": opt("--base"), "head": head, "state": "OPEN"}
+    json.dump(reg, open(reg_path, "w"))
+    print(URL % reg["pr:create:" + head]["number"])
 elif argv[:2] == ["pr", "view"]:
     n = argv[2]
-    reg_path = os.environ["STUB_PRS"]
-    reg = json.load(open(reg_path)) if os.path.exists(reg_path) else {}
-    pr = next((p for p in reg.values() if str(p["number"]) == n), {"base": "main", "head": "?", "state": "OPEN"})
+    pr = next((p for p in load().values() if str(p["number"]) == n), {"base": "main", "head": "?", "state": "OPEN"})
     print(json.dumps({"state": pr["state"], "mergeable": "MERGEABLE",
-                      "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+                      "statusCheckRollup": ROLLUP[pr.get("checks", "SUCCESS")],
                       "baseRefName": pr["base"], "headRefName": pr["head"],
-                      "headRefOid": "0123456789abcdef0123456789abcdef01234567",
-                      "url": "https://github.com/example/epigraph/pull/" + n}))
+                      "headRefOid": pr.get("sha", "0123456789abcdef0123456789abcdef01234567"),
+                      "isCrossRepository": pr.get("cross", False),
+                      "url": URL % n}))
 elif argv[:2] == ["pr", "merge"]:
-    reg_path = os.environ["STUB_PRS"]
-    reg = json.load(open(reg_path)) if os.path.exists(reg_path) else {}
+    reg = load()
     for p in reg.values():
         if str(p["number"]) == argv[2]:
+            if "--match-head-commit" in argv and opt("--match-head-commit") != p.get("sha", "0123456789abcdef0123456789abcdef01234567"):
+                print("head moved", file=sys.stderr); sys.exit(1)
             p["state"] = "MERGED"
     json.dump(reg, open(reg_path, "w"))
     print("merged")
@@ -233,6 +252,25 @@ class _ServerFixture(unittest.TestCase):
         reg[pr_branch].update(fields)
         with open(self.stub_prs, "w") as fh:
             json.dump(reg, fh)
+
+    def set_pr_number(self, number, **fields):
+        with open(self.stub_prs) as fh:
+            reg = json.load(fh)
+        next(p for p in reg.values() if p["number"] == number).update(fields)
+        with open(self.stub_prs, "w") as fh:
+            json.dump(reg, fh)
+
+    def add_pr(self, key, **pr):
+        reg = {}
+        if os.path.exists(self.stub_prs):
+            with open(self.stub_prs) as fh:
+                reg = json.load(fh)
+        reg[key] = pr
+        with open(self.stub_prs, "w") as fh:
+            json.dump(reg, fh)
+
+    def merge_calls(self, number):
+        return [c["argv"] for c in self.stub_calls("gh") if c["argv"][:3] == ["pr", "merge", str(number)]]
 
 
 class KanbanServerTest(_ServerFixture):
@@ -385,7 +423,8 @@ class KanbanServerTest(_ServerFixture):
         status, body = self.req("POST", "/api/integration/merge", body={"resolve_backlog": True})
         self.assertEqual(status, 200, body)
         self.assertEqual(body["shipped"], [CLAIM_A])
-        self.assertIn(["pr", "merge", "200", "--merge", "--delete-branch"],
+        self.assertIn(["pr", "merge", "200", "--merge", "--delete-branch",
+                       "--match-head-commit", "0123456789abcdef0123456789abcdef01234567"],
                       [c["argv"] for c in self.stub_calls("gh") if c["argv"][:2] == ["pr", "merge"]])
         shipped = self.card(CLAIM_A)
         self.assertEqual(shipped["column"], "shipped")
@@ -464,7 +503,7 @@ class KanbanGuardsTest(_ServerFixture):
         self.set_pr(card["branch"], base=card["integration_branch"], head="someone-else")
         status, body = self.req("POST", "/api/cards/%s/accept" % CLAIM_C, body={})
         self.assertEqual(status, 409, body)
-        self.assertIn("not this card's branch", body["error"])
+        self.assertIn("comes from 'someone-else', not %r" % card["branch"], body["error"])
         self.set_pr(card["branch"], head=card["branch"])
         self.assertFalse([c for c in self.stub_calls("gh") if c["argv"][:2] == ["pr", "merge"]])
 
@@ -525,6 +564,79 @@ class KanbanGuardsTest(_ServerFixture):
             resp.read()
             self.assertEqual(resp.status, 400, value)
             conn.close()
+
+
+CLAIM_F = "ffffffff-1111-4222-8333-444444444444"
+CLAIM_G = "abababab-1111-4222-8333-444444444444"
+CLAIM_H = "cdcdcdcd-1111-4222-8333-444444444444"
+
+
+class IntegrationMergeGuardsTest(_ServerFixture):
+    """The merge that reaches the base branch gets the same verification as an item merge."""
+
+    def accept_one(self, cid, title):
+        self.import_claim(cid, "BACKLOG: " + title)
+        card = self.develop_to_review(cid)
+        status, body = self.req("POST", "/api/cards/%s/accept" % cid, body={})
+        self.assertEqual(status, 200, body)
+        return card["integration_branch"]
+
+    def test_open_pr_adopts_only_a_pr_into_the_base_branch(self):
+        branch = self.accept_one(CLAIM_H, "adopt me")
+        # an open PR whose head is the integration branch but which targets another base is NOT adopted
+        self.add_pr("stray", number=300, base="release", head=branch, state="OPEN")
+        status, body = self.req("POST", "/api/integration/open-pr", body={})
+        self.assertEqual(status, 200, body)
+        self.assertNotEqual(body["pr_number"], 300)
+        create = [c["argv"] for c in self.stub_calls("gh") if c["argv"][:2] == ["pr", "create"]][-1]
+        self.assertEqual(create[create.index("--base") + 1], "main")
+        self.assertEqual(create[create.index("--head") + 1], branch)
+
+    def test_integration_merge_verifies_base_head_state_and_pins_head(self):
+        branch = self.accept_one(CLAIM_F, "ship me")
+        status, body = self.req("POST", "/api/integration/open-pr", body={})
+        self.assertEqual(status, 200, body)
+        integ_pr = body["pr_number"]
+
+        # base/head/state/fork are verified at merge time, and nothing is merged when they are wrong
+        for tamper, expect in (({"base": "release"}, "targets"), ({"head": "someone-else"}, "comes from"),
+                               ({"cross": True}, "isCrossRepository"), ({"state": "CLOSED"}, "not OPEN"),
+                               ({"sha": ""}, "head commit")):
+            self.set_pr_number(integ_pr, base="main", head=branch, cross=False, state="OPEN",
+                               sha="0123456789abcdef0123456789abcdef01234567")
+            self.set_pr_number(integ_pr, **tamper)
+            status, body = self.req("POST", "/api/integration/merge", body={"resolve_backlog": False})
+            self.assertEqual(status, 409, (tamper, body))
+            self.assertIn(expect, body["error"])
+            self.assertFalse(self.merge_calls(integ_pr), tamper)
+            _, state = self.req("GET", "/api/state")
+            self.assertEqual(state["integration"]["status"], "pr_open", tamper)
+            self.assertEqual(self.card(CLAIM_F)["column"], "accepted")
+
+        sha = "fedcba9876543210fedcba9876543210fedcba98"
+        self.set_pr_number(integ_pr, base="main", head=branch, cross=False, state="OPEN", sha=sha)
+        status, body = self.req("POST", "/api/integration/merge", body={"resolve_backlog": False})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.merge_calls(integ_pr),
+                         [["pr", "merge", str(integ_pr), "--merge", "--delete-branch", "--match-head-commit", sha]])
+        self.assertEqual(self.card(CLAIM_F)["column"], "shipped")
+
+    def test_item_pr_from_a_fork_branch_is_refused(self):
+        self.import_claim(CLAIM_G, "BACKLOG: fork me")
+        card = self.develop_to_review(CLAIM_G)
+        item = card["pr_number"]
+        self.set_pr_number(item, cross=True)
+        status, body = self.req("POST", "/api/cards/%s/accept" % CLAIM_G, body={})
+        self.assertEqual(status, 409, body)
+        self.assertIn("isCrossRepository", body["error"])
+        self.assertFalse(self.merge_calls(item))
+        self.assertEqual(self.card(CLAIM_G)["status"], "awaiting_review")
+
+    def test_gh_merge_refuses_without_a_head_pin(self):
+        for sha in (None, "", "abc123", "0123456789ABCDEF0123456789ABCDEF01234567"):
+            with self.assertRaises(kanban.CmdError):
+                self.app.gh_merge(999, sha)
+        self.assertFalse(self.merge_calls(999))
 
 
 RECORDING_CLAUDE = r'''#!/usr/bin/env python3
