@@ -96,6 +96,11 @@ pub struct ParentAtom {
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct TripleEdge {
     pub id: Uuid,
+    /// The stored source: tells the two orientations apart in
+    /// [`DecompositionPriorityRepository::find_edges_either_direction`].
+    pub source_id: Uuid,
+    /// The stored spelling.
+    pub relationship: String,
     pub in_force: bool,
     pub properties: serde_json::Value,
 }
@@ -416,7 +421,8 @@ impl DecompositionPriorityRepository {
     ) -> Result<Vec<TripleEdge>, DbError> {
         let sql = viewer.splice(
             r#"
-            SELECT e.id, (e.valid_to IS NULL OR e.valid_to > now()) AS in_force, e.properties
+            SELECT e.id, e.source_id, e.relationship::text AS relationship,
+                   (e.valid_to IS NULL OR e.valid_to > now()) AS in_force, e.properties
             FROM edges e
             WHERE e.source_id = $1 AND e.target_id = $2
               AND lower(e.relationship) = lower($3)
@@ -428,6 +434,45 @@ impl DecompositionPriorityRepository {
         let mut q = sqlx::query_as::<_, TripleEdge>(&sql)
             .bind(source_id)
             .bind(target_id)
+            .bind(relationship);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// [`Self::find_edges_by_triple`] for a SYMMETRIC relationship: every edge
+    /// `a -rel-> b` OR `b -rel-> a` (case-insensitive), live and retired,
+    /// oldest first. `contradicts` is one fact in either orientation (MCP
+    /// `link_epistemic`'s `SYMMETRIC_RELATIONSHIPS`), so a pre-create check that
+    /// looked in one direction would create a duplicate row and a second BBA
+    /// next to an existing reverse edge.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn find_edges_either_direction<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+    ) -> Result<Vec<TripleEdge>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT e.id, e.source_id, e.relationship::text AS relationship,
+                   (e.valid_to IS NULL OR e.valid_to > now()) AS in_force, e.properties
+            FROM edges e
+            WHERE ((e.source_id = $1 AND e.target_id = $2)
+                   OR (e.source_id = $2 AND e.target_id = $1))
+              AND lower(e.relationship) = lower($3)
+              /* {EDGE_VISIBILITY:e} */
+            ORDER BY e.created_at ASC, e.id ASC
+            "#,
+            4,
+        );
+        let mut q = sqlx::query_as::<_, TripleEdge>(&sql)
+            .bind(a)
+            .bind(b)
             .bind(relationship);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);

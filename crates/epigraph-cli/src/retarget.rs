@@ -491,9 +491,14 @@ pub fn read_retarget_manifest(
 
 #[cfg(feature = "db")]
 pub use db::{
-    apply_entry, apply_retarget, load_retarget_items, run_retarget, EdgeApiClient, RetargetOptions,
-    RetargetRun,
+    apply_entry, apply_retarget, existing_atom_edges, load_retarget_items, run_retarget,
+    EdgeApiClient, RetargetOptions, RetargetRun,
 };
+
+/// Conflict relationships that are one fact in either orientation (MCP
+/// `link_epistemic`'s `SYMMETRIC_RELATIONSHIPS` holds `contradicts` and
+/// `corroborates`; only `contradicts` is a conflict). `refutes` is directional.
+pub const SYMMETRIC_RELATIONSHIPS: [&str; 1] = ["contradicts"];
 
 #[cfg(feature = "db")]
 mod db {
@@ -651,6 +656,32 @@ mod db {
         }
     }
 
+    /// Every existing `source -rel- atom` edge the pre-create check must see,
+    /// live and retired. For a symmetric relationship
+    /// ([`super::SYMMETRIC_RELATIONSHIPS`]) both orientations count, because
+    /// `atom -contradicts-> source` is the same dispute as
+    /// `source -contradicts-> atom` and creating the second would add a
+    /// duplicate row and a second BBA. For a directional one (`refutes`) only
+    /// `source -> atom` counts.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn existing_atom_edges(
+        pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+        source_id: Uuid,
+        atom_id: Uuid,
+        relationship: &str,
+    ) -> Result<Vec<epigraph_db::repos::decomposition_priority::TripleEdge>, epigraph_db::DbError>
+    {
+        let rel = relationship.to_ascii_lowercase();
+        if super::SYMMETRIC_RELATIONSHIPS.contains(&rel.as_str()) {
+            R::find_edges_either_direction(pool, viewer, source_id, atom_id, relationship).await
+        } else {
+            R::find_edges_by_triple(pool, viewer, source_id, atom_id, relationship).await
+        }
+    }
+
     /// Apply one `atoms` plan entry. Entries of any other verdict are returned
     /// untouched as `None`.
     ///
@@ -741,7 +772,7 @@ mod db {
 
         for &atom in &entry.chosen_atom_ids {
             let matches =
-                R::find_edges_by_triple(pool, viewer, entry.source_id, atom, &entry.relationship)
+                existing_atom_edges(pool, viewer, entry.source_id, atom, &entry.relationship)
                     .await?;
             if let Some(live) = matches.iter().find(|e| e.in_force) {
                 applied.existing_edge_ids.push(live.id);

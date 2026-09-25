@@ -830,3 +830,38 @@ async fn an_atom_behind_a_retired_decomposes_to_edge_is_not_a_destination(pool: 
     assert_eq!(hits.load(Ordering::SeqCst), 0);
     assert!(edges_between(&pool, w.source, stale, REL).await.is_empty());
 }
+
+/// The pre-create check for a SYMMETRIC relationship sees a reverse edge:
+/// `atom -contradicts-> source` already records the dispute, so the check
+/// must return it (and `apply_entry` then adopts it instead of creating a
+/// duplicate row + second BBA). A directional `refutes` in reverse is a
+/// different fact and must NOT be returned.
+///
+/// Tested at the helper `apply_entry` calls, not end to end: `contradicts`
+/// retargets are held, so no apply reaches this check for them until the
+/// hold lifts.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_pre_create_check_sees_a_reverse_symmetric_edge_only(pool: PgPool) {
+    use epigraph_cli::retarget::existing_atom_edges;
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let w = seed_world(&pool).await;
+    let reverse_contra = seed_edge(&pool, w.atoms[1], w.source, "contradicts").await;
+    seed_edge(&pool, w.atoms[0], w.source, "refutes").await;
+
+    let contra = existing_atom_edges(&pool, &viewer, w.source, w.atoms[1], "contradicts")
+        .await
+        .unwrap();
+    assert_eq!(
+        contra.iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![reverse_contra],
+        "a reverse contradicts edge is the same dispute"
+    );
+    assert!(contra[0].in_force);
+    let refutes = existing_atom_edges(&pool, &viewer, w.source, w.atoms[0], "refutes")
+        .await
+        .unwrap();
+    assert!(
+        refutes.is_empty(),
+        "a reverse refutes edge is a different claim: {refutes:?}"
+    );
+}
