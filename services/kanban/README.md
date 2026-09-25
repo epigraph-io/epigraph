@@ -159,4 +159,4 @@ The tests create a temporary bare `origin` repo and a clone, plus stub `claude`/
 - `pr_url` validation and prompt escaping (`PrUrlSinkTest`)
 - the session secret (`SessionSecretTest`)
 
-Nothing in the suite talks to GitHub, the EpiGraph API or a real `claude`. `gh` and `claude` are stubs, and `urlopen` is patched.
+Nothing in the suite talks to GitHub, the EpiGraph API or a real `claude`. `gh` and `claude` are stubs, and `urlopen` is patched. CI runs the suite in the `kanban` job of `.github/workflows/ci.yml`.
