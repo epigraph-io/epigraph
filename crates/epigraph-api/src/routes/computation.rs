@@ -555,7 +555,89 @@ pub async fn sheaf_reconcile(
     })))
 }
 
+/// Write a BP run's results to `claims`, ALL OR NOTHING, on one transaction
+/// stamped with the caller's viewer.
+///
+/// Each entry is `(claim, betp, Some((belief, plausibility)))` for the CDST
+/// branch, or `(claim, betp, None)` for the scalar branch, which writes only
+/// `pignistic_prob` as it always has.
+///
+/// # Why this replaced two loops over the raw pool
+///
+/// The scalar branch ran `let _ = UPDATE ... .execute(&state.db_pool)`, and the
+/// CDST branch counted only `is_err()`. Neither saw an UPDATE that matched ZERO
+/// rows, which is what row security does to a row the session may not see: no
+/// error, nothing written. On a schema without the orphan `*_privacy` policies
+/// (config A) the route therefore answered `applied: true` with a list of
+/// `updated_beliefs` and wrote nothing (MEASURED, batch H-a review: 0 rows on A,
+/// 13-17 on B). Now a refusal (`42501`, 403) or a zero-row UPDATE (409) fails
+/// the request, and the transaction is never committed.
+#[cfg(feature = "db")]
+async fn apply_bp_updates(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    updates: &[(Uuid, f64, Option<(f64, f64)>)],
+) -> Result<(), ApiError> {
+    let mut tx = state.write_as(viewer, "propagate_beliefs").await?;
+    for (claim_id, betp, interval) in updates {
+        let result = match interval {
+            Some((bel, pl)) => {
+                sqlx::query(
+                    "UPDATE claims SET pignistic_prob = $1, belief = $2, plausibility = $3, \
+                     updated_at = NOW() WHERE id = $4",
+                )
+                .bind(betp)
+                .bind(bel)
+                .bind(pl)
+                .bind(claim_id)
+                .execute(&mut *tx)
+                .await
+            }
+            None => {
+                sqlx::query("UPDATE claims SET pignistic_prob = $1 WHERE id = $2")
+                    .bind(betp)
+                    .bind(claim_id)
+                    .execute(&mut *tx)
+                    .await
+            }
+        };
+        let done = result.map_err(|e| {
+            if crate::errors::is_insufficient_privilege(&e) {
+                tracing::warn!(
+                    target: "tenancy.scoped_write",
+                    handler = "propagate_beliefs",
+                    claim = %claim_id,
+                    error = %e,
+                    "the database refused a belief write"
+                );
+                crate::errors::write_refused("claim")
+            } else {
+                ApiError::InternalError {
+                    message: format!("Failed to apply the belief for claim {claim_id}: {e}"),
+                }
+            }
+        })?;
+        if done.rows_affected() != 1 {
+            return Err(ApiError::Conflict {
+                reason: format!(
+                    "the belief for claim {claim_id} could not be applied (no row updated); \
+                     nothing was written"
+                ),
+            });
+        }
+    }
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the belief updates: {e}"),
+    })
+}
+
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
+///
+/// With `apply_updates: true` the results are written all-or-nothing on a
+/// transaction stamped with the caller's viewer (`apply_bp_updates`): a claim
+/// the caller cannot write fails the request (403, or 409 for a row the update
+/// could not reach) and nothing is written. `applied: true` in a 200 means
+/// every listed belief was written.
 #[cfg(feature = "db")]
 pub async fn propagate_beliefs(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -723,26 +805,27 @@ pub async fn propagate_beliefs(
             &cdst_config,
         );
 
-        // Apply updates: write pignistic_prob, belief, plausibility to claims
-        let mut apply_failures = 0_usize;
+        // Apply updates: write pignistic_prob, belief, plausibility to claims,
+        // all-or-nothing on one transaction stamped with the caller's viewer
+        // (see `apply_bp_updates`). `apply_failures` stays in the response for
+        // its existing readers and is now always 0: a failed apply is an error
+        // with nothing written, not a count beside a 200.
+        let apply_failures = 0_usize;
         if apply {
-            for (claim_id, betp) in &result.updated_betps {
-                let iv = result
-                    .updated_intervals
-                    .iter()
-                    .find(|(id, _)| id == claim_id)
-                    .map(|(_, iv)| iv);
-                let (bel, pl) = iv.map(|i| (i.bel, i.pl)).unwrap_or((0.0, 1.0));
-                if sqlx::query(
-                    "UPDATE claims SET pignistic_prob = $1, belief = $2, plausibility = $3, updated_at = NOW() WHERE id = $4",
-                )
-                .bind(betp).bind(bel).bind(pl).bind(claim_id)
-                .execute(&state.db_pool)
-                .await
-                .is_err() {
-                    apply_failures += 1;
-                }
-            }
+            let updates: Vec<(Uuid, f64, Option<(f64, f64)>)> = result
+                .updated_betps
+                .iter()
+                .map(|(claim_id, betp)| {
+                    let (bel, pl) = result
+                        .updated_intervals
+                        .iter()
+                        .find(|(id, _)| id == claim_id)
+                        .map(|(_, iv)| (iv.bel, iv.pl))
+                        .unwrap_or((0.0, 1.0));
+                    (*claim_id, *betp, Some((bel, pl)))
+                })
+                .collect();
+            apply_bp_updates(&state, &viewer, &updates).await?;
         }
 
         return Ok(Json(serde_json::json!({
@@ -766,13 +849,12 @@ pub async fn propagate_beliefs(
     let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
 
     if apply && !result.updated_beliefs.is_empty() {
-        for (claim_id, new_betp) in &result.updated_beliefs {
-            let _ = sqlx::query("UPDATE claims SET pignistic_prob = $1 WHERE id = $2")
-                .bind(new_betp)
-                .bind(claim_id)
-                .execute(&state.db_pool)
-                .await;
-        }
+        let updates: Vec<(Uuid, f64, Option<(f64, f64)>)> = result
+            .updated_beliefs
+            .iter()
+            .map(|(claim_id, new_betp)| (*claim_id, *new_betp, None))
+            .collect();
+        apply_bp_updates(&state, &viewer, &updates).await?;
     }
 
     let updated: Vec<serde_json::Value> = result

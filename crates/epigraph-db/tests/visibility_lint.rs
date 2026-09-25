@@ -472,6 +472,16 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "claim.rs",
+        "supersede_conn",
+        "WRITE. The body of `supersede`, moved onto a caller-owned connection so the HTTP route \
+         can run it on a viewer-stamped transaction (batch H-a); the SQL is unchanged. Its one \
+         read (`SELECT agent_id, is_current, labels ... FOR the old claim`) is part of the \
+         mutation it guards, not a disclosure, and carries the same VISIBILITY-EXEMPT note it \
+         always had. Authorisation is claims_tenancy's / edges_tenancy's WITH CHECK against the \
+         connection's stamp; the route reads the target through the caller's viewer first.",
+    ),
+    (
         "claim_theme.rs",
         "delete_all_conn",
         "WRITE. The body of `delete_all` (unassign every claim, delete every theme), on a \
@@ -1311,6 +1321,19 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     // `trace.rs::create` below: the control on a write is the table's
     // `WITH CHECK` against the connection's stamp, not an in-query predicate.
     // SQL unchanged in every one.
+    (
+        "claim_version.rs",
+        "create",
+        "INSERT INTO `claim_versions` (RLS, FORCEd). Widened so HTTP supersede records the \
+         version inside its viewer-stamped transaction under a SAVEPOINT; on the raw pool the \
+         unstamped INSERT was refused on every configuration and the 201 went out with no row.",
+    ),
+    (
+        "behavioral_execution.rs",
+        "create",
+        "INSERT INTO `behavioral_executions` (no row security). Widened so HTTP report_outcome \
+         writes it on the same transaction as the counters it records, all or nothing.",
+    ),
     (
         "claim_theme.rs",
         "create",

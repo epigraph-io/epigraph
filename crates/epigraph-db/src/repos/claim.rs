@@ -4784,12 +4784,40 @@ impl ClaimRepository {
         new_truth: TruthValue,
         reason: &str,
     ) -> Result<(Uuid, Uuid), DbError> {
+        let mut tx = pool.begin().await?;
+        let ids =
+            Self::supersede_conn(&mut tx, old_claim_id, new_content, new_truth, reason).await?;
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    /// [`Self::supersede`] on a connection the CALLER owns, so it can run inside
+    /// a viewer-stamped transaction (`ScopedPool::begin_as`) and commit with
+    /// whatever else that transaction writes.
+    ///
+    /// Every statement is an `UPDATE`/`INSERT` on `claims` or `edges`, so
+    /// migration 077's `*_tenancy` `WITH CHECK` governs each one. On an
+    /// unstamped session the writable set is `{}` and the first UPDATE is
+    /// refused with `42501` on a schema without the orphan `*_privacy` policies.
+    /// Stamped, the database admits exactly the supersessions the stamp's
+    /// writable set covers. The caller must run this in a transaction: it issues
+    /// several statements that must land together, and it does not begin one.
+    ///
+    /// # Errors
+    /// As [`Self::supersede`]: `DbError::NotFound` for a missing (or, on a
+    /// filtered session, invisible) claim, `DbError::QueryFailed` for an
+    /// already-superseded one or any refused statement.
+    pub async fn supersede_conn(
+        conn: &mut sqlx::PgConnection,
+        old_claim_id: ClaimId,
+        new_content: &str,
+        new_truth: TruthValue,
+        reason: &str,
+    ) -> Result<(Uuid, Uuid), DbError> {
         let old_uuid: Uuid = old_claim_id.into();
         let new_uuid = Uuid::new_v4();
         let content_hash = ContentHasher::hash(new_content.as_bytes());
         let new_truth_val = new_truth.value();
-
-        let mut tx = pool.begin().await?;
 
         // Verify old claim exists and is current; also pull labels so the new
         // claim can inherit them. Without the label carry, downstream consumers
@@ -4807,7 +4835,7 @@ impl ClaimRepository {
              FROM claims WHERE id = $1"#,
         )
         .bind(old_uuid)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
 
         let (agent_id, is_current, old_labels) = old_row.ok_or(DbError::NotFound {
@@ -4834,7 +4862,7 @@ impl ClaimRepository {
              updated_at = NOW() WHERE id = $1",
         )
         .bind(old_uuid)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         // Insert new claim with supersedes link, carrying forward only labels
@@ -4855,7 +4883,7 @@ impl ClaimRepository {
         .bind(agent_id)
         .bind(old_uuid)
         .bind(&old_labels)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         // Insert supersedes edge for graph traversal
@@ -4866,7 +4894,7 @@ impl ClaimRepository {
         .bind(new_uuid)
         .bind(old_uuid)
         .bind(reason)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         // Edge migration. Both directions carry the STRENGTHENING relationships
@@ -4895,7 +4923,7 @@ impl ClaimRepository {
         .bind(new_uuid)
         .bind(old_uuid)
         .bind(&weakening)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         // Migrate outgoing edges: redirect edges FROM old claim to come from new claim
@@ -4909,10 +4937,8 @@ impl ClaimRepository {
         .bind(new_uuid)
         .bind(old_uuid)
         .bind(&weakening)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-
-        tx.commit().await?;
 
         Ok((new_uuid, old_uuid))
     }

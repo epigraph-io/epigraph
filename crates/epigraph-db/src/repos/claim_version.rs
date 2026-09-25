@@ -6,7 +6,6 @@
 
 use crate::errors::DbError;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// A single version snapshot of a claim.
@@ -25,7 +24,15 @@ pub struct ClaimVersionRepository;
 
 impl ClaimVersionRepository {
     /// Insert a new version snapshot for a claim.
-    pub async fn create(pool: &PgPool, row: &ClaimVersionRow) -> Result<ClaimVersionRow, DbError> {
+    ///
+    /// Executor-generic so the HTTP supersede can record the version inside its
+    /// viewer-stamped transaction: `claim_versions` has row security (FORCEd),
+    /// so on an unstamped session this INSERT is refused on a schema without the
+    /// orphan `*_privacy` policies. `&PgPool` callers compile unchanged.
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        row: &ClaimVersionRow,
+    ) -> Result<ClaimVersionRow, DbError> {
         let result = sqlx::query_as::<_, ClaimVersionRow>(
             "INSERT INTO claim_versions (id, claim_id, version_number, content, truth_value, created_by, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
@@ -38,7 +45,7 @@ impl ClaimVersionRepository {
         .bind(row.truth_value)
         .bind(row.created_by)
         .bind(row.created_at)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(result)
     }
@@ -79,11 +86,16 @@ impl ClaimVersionRepository {
              WHERE claim_id = $1 /* {VISIBILITY:claim_versions} */",
             2,
         );
-        let mut q = sqlx::query_as::<_, (i64,)>(&sql).bind(claim_id);
+        // `(i32,)`: `version_number` is INT4, and so is its MAX. The `(i64,)`
+        // this used to decode into failed EVERY call ("mismatched types; Rust
+        // type `i64` (as SQL type `INT8`) is not compatible with SQL type
+        // `INT4`"), which its only caller hid with `.unwrap_or(0)`, so every
+        // recorded version was numbered 1.
+        let mut q = sqlx::query_as::<_, (i32,)>(&sql).bind(claim_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: (i64,) = q.fetch_one(executor).await?;
-        Ok(row.0 as i32)
+        let row: (i32,) = q.fetch_one(executor).await?;
+        Ok(row.0)
     }
 }

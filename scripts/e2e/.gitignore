@@ -23,3 +23,7 @@ dsn
 ueh.*
 .bhlock.*
 bhh.*
+.hwlock.*
+.hw.*
+.hllock.*
+.hl.*

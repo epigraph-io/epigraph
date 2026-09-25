@@ -378,6 +378,47 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Is `err` PostgreSQL's `insufficient_privilege` (SQLSTATE `42501`)?
+///
+/// On a viewer-stamped write this is what a `*_tenancy` policy's `WITH CHECK`
+/// raises when the stamp's writable set does not hold the row's owner group:
+/// the database refused the write, and the transaction it ran in is aborted, so
+/// nothing was written. Handlers that stamp a write answer it
+/// [`write_refused`] (403) instead of letting it surface as an opaque 500.
+///
+/// Deliberately a helper a handler opts into, NOT an arm of
+/// `From<DbError> for ApiError`: changing the global mapping would change the
+/// error contract of every route at once, including ones whose `42501` means
+/// something else (a missing GRANT is also `42501`).
+#[cfg(feature = "db")]
+#[must_use]
+pub fn is_insufficient_privilege(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .as_deref()
+        == Some("42501")
+}
+
+/// [`is_insufficient_privilege`] for the repo layer's error type.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn db_is_insufficient_privilege(err: &DbError) -> bool {
+    matches!(err, DbError::QueryFailed { source } if is_insufficient_privilege(source))
+}
+
+/// The 403 a stamped write answers when the database refused it (`42501`).
+/// The body says nothing was written, which is true because the refusal aborts
+/// the transaction and it is never committed.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn write_refused(what: &str) -> ApiError {
+    ApiError::Forbidden {
+        reason: format!(
+            "no write authority over the group that owns this {what}; nothing was written"
+        ),
+    }
+}
+
 #[cfg(feature = "db")]
 impl From<DbError> for ApiError {
     fn from(err: DbError) -> Self {

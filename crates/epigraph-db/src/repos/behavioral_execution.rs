@@ -57,9 +57,13 @@ impl BehavioralExecutionRepository {
     /// # Errors
     /// Returns `DbError::DuplicateKey` if an execution with the same ID exists.
     /// Returns `DbError::QueryFailed` for other database errors.
-    #[instrument(skip(pool, row, goal_embedding_pgvec))]
-    pub async fn create(
-        pool: &PgPool,
+    ///
+    /// Executor-generic so HTTP `report_outcome` can write the row inside the
+    /// same stamped transaction as the counters it records; `&PgPool` callers
+    /// compile unchanged.
+    #[instrument(skip(executor, row, goal_embedding_pgvec))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         row: BehavioralExecutionRow,
         goal_embedding_pgvec: Option<&str>,
     ) -> Result<BehavioralExecutionRow, DbError> {
@@ -97,7 +101,7 @@ impl BehavioralExecutionRepository {
             .bind(row.created_at)
             .bind(row.step_claim_id)
             .bind(&row.run_label)
-            .fetch_one(pool)
+            .fetch_one(executor)
             .await
         } else {
             sqlx::query_as(
@@ -132,7 +136,7 @@ impl BehavioralExecutionRepository {
             .bind(row.created_at)
             .bind(row.step_claim_id)
             .bind(&row.run_label)
-            .fetch_one(pool)
+            .fetch_one(executor)
             .await
         }
         .map_err(|err| {
