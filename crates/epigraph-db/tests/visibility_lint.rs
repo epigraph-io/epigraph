@@ -472,6 +472,14 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "claim_theme.rs",
+        "delete_all_conn",
+        "WRITE. The body of `delete_all` (unassign every claim, delete every theme), on a \
+         caller-owned connection so `run_theme_kmeans` can wipe and rebuild in ONE transaction \
+         (batch H-a). A corpus-wide maintenance statement with no row to filter; the SQL is \
+         unchanged.",
+    ),
+    (
         "claim.rs",
         "update_labels_conn",
         "WRITE. Label mutation on a claim the caller has already fetched under a viewer predicate \
@@ -1298,6 +1306,33 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── Batch H-a: writes whose executor widened so a route or the theme
+    // clusterer can put them in ONE transaction. Same argument as
+    // `trace.rs::create` below: the control on a write is the table's
+    // `WITH CHECK` against the connection's stamp, not an in-query predicate.
+    // SQL unchanged in every one.
+    (
+        "claim_theme.rs",
+        "create",
+        "INSERT INTO `claim_themes` (no row security). Widened so a theme row commits only with \
+         its assignment; separately on a pool, a refused assignment left the theme behind.",
+    ),
+    (
+        "claim_theme.rs",
+        "set_centroid",
+        "UPDATE of `claim_themes` (no row security), in the same transaction as the theme row.",
+    ),
+    (
+        "claim_theme.rs",
+        "update_count",
+        "UPDATE of `claim_themes` (no row security), in the same transaction as the theme row.",
+    ),
+    (
+        "claim_theme.rs",
+        "bulk_assign",
+        "UPDATE claims SET theme_id. A WRITE governed by claims_tenancy's WITH CHECK against the \
+         connection's stamp; widened so the assignment and the theme row commit together.",
+    ),
     // ── THE THREE WRITES. Every other entry in this register is a READ with
     // nothing to filter; these are the first writes, and the argument is a
     // different one, so it is stated in full rather than borrowed.

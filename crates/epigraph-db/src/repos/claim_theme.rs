@@ -133,8 +133,14 @@ pub struct ClaimThemeRepository;
 
 impl ClaimThemeRepository {
     /// Create a new theme (centroid stored separately via raw SQL for vector type)
-    pub async fn create(
-        pool: &PgPool,
+    ///
+    /// Executor-generic, like the other writes `run_theme_kmeans` and the HTTP
+    /// `create-with-centroid` route make, so a caller can put the theme row, its
+    /// centroid and its claim assignment in ONE transaction. Written separately
+    /// on a pool, a refused assignment left the theme row behind (batch H-a
+    /// review: `claim_themes +1` with the call reported as failed).
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         label: &str,
         description: &str,
     ) -> Result<ClaimThemeRow, DbError> {
@@ -144,7 +150,7 @@ impl ClaimThemeRepository {
         )
         .bind(label)
         .bind(description)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
         .map_err(DbError::from)?;
         Ok(row)
@@ -152,8 +158,8 @@ impl ClaimThemeRepository {
 
     /// Store the centroid vector for a theme.
     /// `centroid_pgvec` is a pgvector string literal, e.g. "[0.1,0.2,...]"
-    pub async fn set_centroid(
-        pool: &PgPool,
+    pub async fn set_centroid<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         theme_id: Uuid,
         centroid_pgvec: &str,
     ) -> Result<(), DbError> {
@@ -162,7 +168,7 @@ impl ClaimThemeRepository {
         )
         .bind(theme_id)
         .bind(centroid_pgvec)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(DbError::from)?;
         Ok(())
@@ -232,8 +238,11 @@ impl ClaimThemeRepository {
     }
 
     /// Bulk assign a slice of claims to a theme
-    pub async fn bulk_assign(
-        pool: &PgPool,
+    ///
+    /// An `UPDATE claims`, so `claims_tenancy`'s `WITH CHECK` governs it: on an
+    /// unstamped session it is refused (`42501`) for any row it can see.
+    pub async fn bulk_assign<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_ids: &[Uuid],
         theme_id: Uuid,
     ) -> Result<u64, DbError> {
@@ -241,18 +250,22 @@ impl ClaimThemeRepository {
             sqlx::query("UPDATE claims SET theme_id = $2, updated_at = NOW() WHERE id = ANY($1)")
                 .bind(claim_ids)
                 .bind(theme_id)
-                .execute(pool)
+                .execute(executor)
                 .await
                 .map_err(DbError::from)?;
         Ok(result.rows_affected())
     }
 
     /// Update the denormalized claim count for a theme
-    pub async fn update_count(pool: &PgPool, theme_id: Uuid, count: i32) -> Result<(), DbError> {
+    pub async fn update_count<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        theme_id: Uuid,
+        count: i32,
+    ) -> Result<(), DbError> {
         sqlx::query("UPDATE claim_themes SET claim_count = $2, updated_at = NOW() WHERE id = $1")
             .bind(theme_id)
             .bind(count)
-            .execute(pool)
+            .execute(executor)
             .await
             .map_err(DbError::from)?;
         Ok(())
@@ -664,14 +677,24 @@ impl ClaimThemeRepository {
     ///
     /// Returns the number of deleted theme rows.
     pub async fn delete_all(pool: &PgPool) -> Result<u64, DbError> {
+        let mut tx = pool.begin().await.map_err(DbError::from)?;
+        let n = Self::delete_all_conn(&mut tx).await?;
+        tx.commit().await.map_err(DbError::from)?;
+        Ok(n)
+    }
+
+    /// [`Self::delete_all`] on a connection the caller owns, so a re-cluster
+    /// can wipe and rebuild in ONE transaction: a wipe that commits before a
+    /// rebuild that fails leaves the corpus with no themes at all.
+    pub async fn delete_all_conn(conn: &mut sqlx::PgConnection) -> Result<u64, DbError> {
         // Unassign claims first to satisfy the foreign-key constraint
         sqlx::query("UPDATE claims SET theme_id = NULL WHERE theme_id IS NOT NULL")
-            .execute(pool)
+            .execute(&mut *conn)
             .await
             .map_err(DbError::from)?;
 
         let result = sqlx::query("DELETE FROM claim_themes")
-            .execute(pool)
+            .execute(&mut *conn)
             .await
             .map_err(DbError::from)?;
 

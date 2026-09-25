@@ -21,6 +21,9 @@
 #                 to E2E_MAINT_DSN (a role that satisfies epigraph_bypass()),
 #                 and unset with the APPLICATION DSN itself bypass-capable
 #                 (the fallback, which must never enable them)
+#   theme         theme_cluster (wipe_first=true) over public claims the server
+#                 agent owns, with a pre-existing theme in place: the run must
+#                 commit whole or leave the previous themes exactly as they were
 #   maint_auth    the same tools over AUTHENTICATED HTTP (--jwt-secret, a
 #                 random per-run secret that is never written to disk): a
 #                 claims:write-only bearer with no membership must be refused
@@ -73,7 +76,7 @@ BIN="${1:?usage: probe-batch-h.sh <binary> <label> <a|b> [arm ...]}"
 LABEL="${2:?label}"
 CFG="${3:?a|b}"
 shift 3
-ARMS="${*:-patch_claim edges resolve submit_ds maintenance maint_auth}"
+ARMS="${*:-patch_claim edges resolve submit_ds theme maintenance maint_auth}"
 command -v jq >/dev/null || { echo "probe-batch-h.sh needs jq to read tool responses" >&2; exit 2; }
 E2E="$(cd "$(dirname "$0")" && pwd)"
 SOCK="$E2E/bh.sock.$LABEL"
@@ -306,6 +309,27 @@ if want submit_ds; then
   R=$(tool memorize '{"content":"Batch H memorize DS wiring probe","tags":["bh-memo"]}')
   C=$(field "$R" claim_id)
   echo "   memorize fresh: $(verdict "$R") belief=$(field "$R" belief) | claims=$(q "SELECT count(*) FROM claims WHERE content='Batch H memorize DS wiring probe'") bbas=$(q "SELECT count(*) FROM mass_functions WHERE claim_id='${C:-00000000-0000-0000-0000-000000000000}'")"
+fi
+
+# ── theme_cluster ──────────────────────────────────────────────────────────
+if want theme; then
+  echo
+  echo "=== theme_cluster: all or nothing, the previous themes survive a failed run ==="
+  q "UPDATE claims SET theme_id = NULL WHERE theme_id IS NOT NULL; DELETE FROM claim_themes" >/dev/null
+  PRIOR=$(q "INSERT INTO claim_themes (label, description) VALUES ('bh-prior-$LABEL', 'a theme from an earlier run') RETURNING id" | head -1)
+  # Two well-separated directions, three public claims each, all owned by the
+  # server agent's group: the population a stamp-free clusterer can reach.
+  for i in 1 2 3; do
+    for d in 0 1; do
+      if [ "$d" = 0 ]; then V="('[0.9,'||array_to_string(array_fill(0.01::float8, ARRAY[1535]),',')||']')::vector"
+      else V="('[0.01,0.9,'||array_to_string(array_fill(0.01::float8, ARRAY[1534]),',')||']')::vector"; fi
+      q "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels, visibility, owner_group_id, embedding)
+         VALUES (gen_random_uuid(), 'Batch H theme $d/$i $LABEL', decode(md5(random()::text)||md5(random()::text),'hex'), 0.6,
+                 '$MA', ARRAY['bh-theme']::text[], 'public', '$OG', $V)" >/dev/null
+    done
+  done
+  R=$(tool theme_cluster '{"k":2,"min_claims_per_theme":1,"wipe_first":true,"label_prefix":"bh"}')
+  echo "   theme_cluster: $(verdict "$R") themes_created=$(field "$R" themes_created) claims_assigned=$(field "$R" claims_assigned) | themes=$(q "SELECT count(*) FROM claim_themes") prior_survives=$(q "SELECT count(*) FROM claim_themes WHERE id='$PRIOR'") themed_claims=$(q "SELECT count(*) FROM claims WHERE theme_id IS NOT NULL")"
 fi
 
 # ── maintenance tools ──────────────────────────────────────────────────────
