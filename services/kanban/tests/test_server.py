@@ -738,7 +738,7 @@ class IntegrationMergeGuardsTest(_ServerFixture):
     def test_gh_merge_refuses_without_a_head_pin(self):
         for sha in (None, "", "abc123", "0123456789ABCDEF0123456789ABCDEF01234567"):
             with self.assertRaises(kanban.CmdError):
-                self.app.gh_merge(999, sha)
+                self.app.gh_merge(999, sha, "main")
         self.assertFalse(self.merge_calls(999))
 
 
@@ -857,6 +857,84 @@ class ChecksGateTest(_ServerFixture):
         self.assertEqual(len(self.merge_calls(integ_pr)), 1)
         self.assertTrue(any(h["event"] == "checks_overridden" for h in self.card(CLAIM_J)["history"]))
         self.assertEqual(self.app.store.state["integration_history"][-1]["checks_at_merge"], "pending")
+
+
+CLAIM_M = "acacacac-1111-4222-8333-444444444444"
+CLAIM_N = "adadadad-1111-4222-8333-444444444444"
+CLAIM_O = "aeaeaeae-1111-4222-8333-444444444444"
+
+
+class PostMergeConfirmTest(_ServerFixture):
+    """After gh pr merge -- and inside the "it says MERGED anyway" fallback -- the board reads the PR back and moves
+    cards only if GitHub merged exactly the pinned head into the expected base."""
+
+    def race_after_verify(self, method, **change):
+        """Run the real verification, then change the PR on the fake GitHub before the merge call."""
+        original = getattr(self.app, method)
+
+        def wrapped(number, *args, **kwargs):
+            out = original(number, *args, **kwargs)
+            self.set_pr_number(number, **change)
+            return out
+        return mock.patch.object(self.app, method, wrapped)
+
+    def test_h_item_pr_retargeted_between_verify_and_merge_is_not_recorded_as_accepted(self):
+        self.import_claim(CLAIM_M, "BACKLOG: retarget race")
+        item = self.develop_to_review(CLAIM_M)["pr_number"]
+        head = self.req("GET", "/api/cards/%s/pr" % CLAIM_M)[1]["head_sha"]
+        with self.race_after_verify("verify_item_pr", base="main"):
+            status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_M, body={"expected_head": head})
+        self.assertEqual((status, resp.get("code")), (409, "merged_unverified"), resp)
+        self.assertIn("main", resp["error"])
+        card = self.card(CLAIM_M)
+        self.assertEqual((card["column"], card["status"]), ("review", "awaiting_review"))
+        self.assertTrue(any(h["event"] == "merged_unverified" for h in card["history"]))
+        self.assertTrue([b for b in kanban.unresolved_blockers(card, "blocker") if "PR #%d" % item in b["text"]])
+        # the read-back happened after the merge call
+        views = [c["argv"] for c in self.stub_calls("gh") if c["argv"][:3] == ["pr", "view", str(item)]]
+        self.assertIn("baseRefName,headRefOid,mergeCommit,state", [v[v.index("--json") + 1] for v in views])
+
+    def test_i_external_merge_of_a_different_head_is_not_claimed_by_the_board(self):
+        self.import_claim(CLAIM_N, "BACKLOG: external merge")
+        item = self.develop_to_review(CLAIM_N)["pr_number"]
+        # someone pushes B and merges it right after the board verified A: the pinned merge fails ("head moved")
+        head = self.req("GET", "/api/cards/%s/pr" % CLAIM_N)[1]["head_sha"]
+        with self.race_after_verify("verify_item_pr", sha="b" * 40, state="MERGED"):
+            status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_N, body={"expected_head": head})
+        self.assertEqual((status, resp.get("code")), (409, "merged_unverified"), resp)
+        self.assertIn("b" * 40, resp["error"])
+        card = self.card(CLAIM_N)
+        self.assertEqual(card["column"], "review")
+        self.assertFalse(any(h["event"] == "accepted" for h in card["history"]), card["history"])
+
+    def test_ship_of_a_different_head_is_not_recorded_as_shipped(self):
+        self.import_claim(CLAIM_O, "BACKLOG: ship race")
+        self.develop_to_review(CLAIM_O)
+        self.assertEqual(self.accept(CLAIM_O)[0], 200)
+        status, resp = self.req("POST", "/api/integration/open-pr", body={})
+        self.assertEqual(status, 200, resp)
+        integ_pr = resp["pr_number"]
+        self.app._integ_cache = None
+        head = self.req("GET", "/api/integration")[1]["head_sha"]
+        with self.race_after_verify("verify_pr", sha="e" * 40, state="MERGED"):
+            # force: cards the tests above left in review still target this branch
+            status, resp = self.req("POST", "/api/integration/merge",
+                                    body={"resolve_backlog": False, "expected_head": head, "force": True})
+        self.assertEqual((status, resp.get("code")), (409, "merged_unverified"), resp)
+        self.assertEqual(self.card(CLAIM_O)["column"], "accepted")
+        integ = self.app.store.state["integration"]
+        self.assertEqual(integ["pr_number"], integ_pr)
+        self.assertIn("e" * 40, integ["merged_unverified"]["problem"])
+        self.assertNotEqual(integ["status"], "merging")
+
+    def test_a_confirmed_merge_still_moves_the_card(self):
+        # control for the three above: an undisturbed accept reads the PR back and succeeds
+        cid = "afafafaf-1111-4222-8333-444444444444"
+        self.import_claim(cid, "BACKLOG: clean merge")
+        self.develop_to_review(cid)
+        status, resp = self.accept(cid)
+        self.assertEqual(status, 200, resp)
+        self.assertEqual(resp["column"], "accepted")
 
 
 CLAIM_K = "56565656-1111-4222-8333-444444444444"
@@ -1231,6 +1309,27 @@ class RecoverTest(unittest.TestCase):
             self.assertFalse(kanban.unresolved_blockers(app.store.cards[CLAIM_C], "blocker"))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class RecoverShipTest(unittest.TestCase):
+    def test_restart_completes_an_interrupted_ship_only_if_github_merged_the_pinned_head(self):
+        for head, completes in (("b" * 40, False), ("a" * 40, True)):
+            tmp = tempfile.mkdtemp(prefix="kanban-recover-ship-")
+            self.addCleanup(shutil.rmtree, tmp, True)
+            home = os.path.join(tmp, "home")
+            os.makedirs(home)
+            card = dict(kanban.new_card({"id": CLAIM_C, "content": "x"}), column="accepted", status="merged",
+                        integration_branch="integration/kanban-x", pr_url="https://github.com/o/r/pull/3")
+            with open(os.path.join(home, "state.json"), "w") as fh:
+                json.dump({"cards": {CLAIM_C: card}, "integration": {
+                    "branch": "integration/kanban-x", "base": "main", "pr_number": 9, "status": "merging",
+                    "pr_url": "https://github.com/o/r/pull/9", "created_at": None, "merging_sha": "a" * 40}}, fh)
+            app = kanban.App(kanban.Config(repo=tmp, port=0, env={"KANBAN_HOME": home, "KANBAN_GH_REPO": "o/r"}))
+            view = {"state": "MERGED", "baseRefName": "main", "headRefOid": head}
+            with mock.patch.object(app, "gh_pr_view", return_value=view):
+                app.recover()
+            self.assertEqual(app.store.cards[CLAIM_C]["column"], "shipped" if completes else "accepted", head)
+            self.assertNotIn("merging_sha", app.store.state["integration"])
 
 
 class UnitHelpersTest(unittest.TestCase):

@@ -162,7 +162,7 @@ Every `/api/*` call needs the session secret in the `X-Kanban-Token` header. It 
 
   Because the board's git gets no tokens, its pushes (the integration branch) authenticate the same way agents do: through a git credential helper, `gh auth setup-git`, or `SSH_AUTH_SOCK`.
 
-  If `gh pr merge` reports an error but GitHub reports the PR `MERGED`, the merge is still treated as successful.
+  After every `gh pr merge`, and also when `gh pr merge` fails, the board reads the PR back (`state,baseRefName,headRefOid,mergeCommit`). A merge counts as the board's only if GitHub reports it `MERGED`, into the expected base, with the pinned head. `--match-head-commit` pins the head but not the base, so a retarget between verification and merge, or someone else merging a different head after the board's pinned merge failed, ends in 409 `merged_unverified`: nothing moves to accepted or shipped, the card gets a `merged_unverified` history event and a blocker, and the integration record keeps a `merged_unverified` note. A restart after an interrupted ship completes it only under the same check against the head that merge was pinned to.
 - The board does not rebase item PRs when the integration branch moves. Conflicts show up in the Integration panel as `mergeable`/`checks` status, and you resolve them with Request changes.
 - Only one integration branch is active at a time, and one server should run per `KANBAN_HOME`.
 

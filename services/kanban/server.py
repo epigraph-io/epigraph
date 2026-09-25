@@ -942,20 +942,28 @@ class App:
             integ = self.store.state.get("integration") or {}
             recover_ship = None
             if integ.get("status") == "merging":
+                recover_ship = dict(integ)  # keeps merging_sha, the head the interrupted merge was pinned to
                 integ["status"] = "pr_open" if integ.get("pr_number") else "open"
+                integ.pop("merging_sha", None)
                 log("integration %s was mid-merge when the server stopped; reset to %s"
                     % (integ.get("branch"), integ["status"]))
-                recover_ship = dict(integ)
             self.store.save()
         if recover_ship and valid_pr_number(recover_ship.get("pr_number")):
-            # If the merge actually went through on GitHub, finish the ship bookkeeping.
+            # If the merge actually went through on GitHub AS PINNED, finish the ship bookkeeping.
+            number, sha = int(recover_ship["pr_number"]), recover_ship.get("merging_sha")
             try:
-                state = str(self.gh_pr_view(int(recover_ship["pr_number"])).get("state") or "").upper()
+                data = self.gh_pr_view(number, self.MERGE_CONFIRM_FIELDS)
             except (CmdError, ValueError):
-                state = ""
-            if state == "MERGED":
-                self._complete_ship(recover_ship, int(recover_ship["pr_number"]), resolve=False,
+                data = {}
+            state = str(data.get("state") or "").upper()
+            base = recover_ship.get("base") or self.cfg.base_branch
+            if state == "MERGED" and sha and data.get("headRefOid") == sha and data.get("baseRefName") == base:
+                self._complete_ship(dict(recover_ship, merged_sha=sha), number, resolve=False,
                                     note="(completed on restart; retire the backlog claims manually)")
+            elif state == "MERGED":
+                log("integration PR #%d is MERGED, but not confirmed as the board's pinned merge (pinned %s, head %s, "
+                    "base %s); the cards were not moved -- inspect it" % (number, sha, data.get("headRefOid"),
+                                                                         data.get("baseRefName")))
 
     # ---- git / gh --------------------------------------------------------
 
@@ -1225,25 +1233,57 @@ class App:
         """An item PR must come from the card's branch into the current integration branch."""
         return self.verify_pr(number, integration, str(card.get("branch") or ""), "the integration branch")
 
-    def gh_merge(self, number: int, match_head: str) -> None:
-        """Merge a PR pinned to `match_head`. No `--delete-branch`: that also deletes (and may switch the operator's
-        checkout away from) a same-named LOCAL branch; the caller deletes the remote branch itself.
+    MERGE_CONFIRM_FIELDS = "baseRefName,headRefOid,mergeCommit,state"
+
+    def gh_merge(self, number: int, match_head: str, base: str) -> Optional[str]:
+        """Merge a PR pinned to `match_head`, then read it back: it counts as merged by the board only if GitHub
+        reports it MERGED, into `base`, with `match_head` as its head. `--match-head-commit` pins the head but not
+        the base (a retarget between verify and merge goes through), and a failed merge that someone else then
+        completed also reads MERGED. Returns the merge commit oid when GitHub reports one.
+
+        Raises CmdError if the merge failed and the PR is not merged; ApiError(409, merged_unverified) if it is
+        merged but not as pinned. No `--delete-branch`: that also deletes (and may switch the operator's checkout
+        away from) a same-named LOCAL branch; the caller deletes the remote branch itself.
         There is no unpinned merge: a missing or malformed sha is refused, never silently dropped."""
         n = valid_pr_number(number)
         if not n:
             raise CmdError(["gh", "pr", "merge"], None, "", "invalid PR number %r" % (number,))
         if not isinstance(match_head, str) or not HEAD_SHA_RE.fullmatch(match_head):
             raise CmdError(["gh", "pr", "merge"], None, "", "refusing to merge PR #%d without a head sha pin" % n)
-        args = ["pr", "merge", str(n), "--merge", "--match-head-commit", match_head]
+        failed: Optional[CmdError] = None
         try:
-            self.gh(args, timeout=300)
+            self.gh(["pr", "merge", str(n), "--merge", "--match-head-commit", match_head], timeout=300)
         except CmdError as e:
-            try:
-                state = str(self.gh_pr_view(number).get("state") or "").upper()
-            except (CmdError, ValueError):
-                state = ""
-            if state != "MERGED":
-                raise e
+            failed = e
+        try:
+            data = self.gh_pr_view(n, self.MERGE_CONFIRM_FIELDS)
+        except (CmdError, ValueError) as e:
+            if failed is not None:
+                raise failed
+            raise ApiError(409, "PR #%d: gh reported the merge done, but the board could not read the PR back to "
+                           "confirm what was merged (%s); inspect it on GitHub" % (n, e),
+                           {"code": "merged_unverified", "pr_number": n, "problem": "no read-back: %s" % e})
+        state = str(data.get("state") or "").upper()
+        if failed is not None and state != "MERGED":
+            raise failed
+        problems = []
+        if state != "MERGED":
+            problems.append("state is %s, not MERGED" % (state or "unknown"))
+        if data.get("baseRefName") != base:
+            problems.append("it was merged into %r, not %r" % (data.get("baseRefName"), base))
+        if data.get("headRefOid") != match_head:
+            problems.append("its head is %s, not the pinned %s" % (data.get("headRefOid"), match_head))
+        if problems:
+            problem = "; ".join(problems) + (" (the board's own pinned merge had failed: %s)" % failed if failed else "")
+            log("MERGED UNVERIFIED: PR #%d %s" % (n, problem))
+            raise ApiError(409, "PR #%d is merged on GitHub, but not as the board pinned it: %s. Nothing was moved; "
+                           "inspect the PR" % (n, problem), {"code": "merged_unverified", "pr_number": n,
+                                                             "problem": problem})
+        if failed is not None:
+            log("gh pr merge #%d reported an error, but GitHub shows it merged exactly as pinned: %s" % (n, failed))
+        commit = data.get("mergeCommit")
+        oid = str(commit.get("oid") or "") if isinstance(commit, dict) else ""
+        return oid if HEAD_SHA_RE.fullmatch(oid) else None
 
     # ---- backlog ---------------------------------------------------------
 
@@ -1782,7 +1822,7 @@ class App:
                            " (forced past blockers)" if open_blockers else ""))
             self.store.save()
         try:
-            self.gh_merge(number, head_sha)
+            merge_commit = self.gh_merge(number, head_sha, current)
         except CmdError as e:
             with self.store.lock:
                 card = self.store.card(card_id)
@@ -1790,12 +1830,25 @@ class App:
                 add_history(card, "merge_failed", str(e))
                 self.store.save()
             raise ApiError(502, "merge failed: %s" % e)
+        except ApiError as e:
+            # merged on GitHub, but not as pinned: never recorded as accepted; the operator has to look
+            with self.store.lock:
+                card = self.store.card(card_id)
+                card["status"] = "awaiting_review"
+                add_history(card, "merged_unverified", e.message)
+                add_blocker(card, "PR #%d was merged on GitHub, but not as the board pinned it (%s). Inspect it "
+                            "before doing anything else with this card." % (number, e.extra.get("problem")),
+                            "blocker", "board")
+                self.store.save()
+            raise
         with self.store.lock:
             card = self.store.card(card_id)
             card["column"] = "accepted"
             card["status"] = "merged"
             card["pr_number"] = number
-            add_history(card, "accepted", "PR #%d merged into %s" % (number, card.get("integration_branch")))
+            add_history(card, "accepted", "PR #%d merged into %s at head %s%s"
+                        % (number, card.get("integration_branch"), head_sha,
+                           ", merge commit %s" % merge_commit if merge_commit else ""))
             branch = card.get("branch")
             self.store.save()
             result = dict(card)
@@ -2043,17 +2096,27 @@ class App:
                                 verified["sha"])
             log("integration merge: PR #%d %s -> %s at %s, checks=%s" % (number, branch, base, verified["sha"],
                                                                         verified["checks"]))
-            self.gh_merge(number, verified["sha"])
+            with self.store.lock:
+                # lets recover() confirm the pinned head if the server stops mid-merge
+                self.store.state["integration"]["merging_sha"] = verified["sha"]
+                self.store.save()
+            merge_commit = self.gh_merge(number, verified["sha"], base)
         except (ApiError, CmdError) as e:
             with self.store.lock:
-                self.store.state["integration"]["status"] = "pr_open"
+                live = self.store.state["integration"]
+                live["status"] = "pr_open"
+                live.pop("merging_sha", None)
+                if isinstance(e, ApiError) and e.extra.get("code") == "merged_unverified":
+                    live["merged_unverified"] = {"at": now_iso(), "pr_number": number,
+                                                 "problem": e.extra.get("problem")}
                 self.store.save()
             if isinstance(e, ApiError):
                 raise
             raise ApiError(502, "integration merge failed: %s" % e)
         self.delete_remote_branch(branch)
         integ = dict(integ, checks_at_merge=verified["checks"],
-                     checks_overridden=verified["checks"] != "pass", merged_sha=verified["sha"])
+                     checks_overridden=verified["checks"] != "pass", merged_sha=verified["sha"],
+                     merge_commit=merge_commit)
         shipped = self._complete_ship(integ, number, resolve)
         if verified["checks"] != "pass":
             with self.store.lock:
