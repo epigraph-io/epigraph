@@ -270,6 +270,66 @@ def git_toplevel(path: str, git_bin: str = "git") -> str:
 
 
 # --------------------------------------------------------------------------
+# agent environment and tool restrictions
+# --------------------------------------------------------------------------
+
+# Agents get an ALLOW-LISTED environment, never the board's own. The board runs with whatever it was
+# started with (API tokens, gh tokens, database URLs); none of that is inherited by a dispatched agent.
+AGENT_ENV_BASE = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR",
+                  "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "CARGO_HOME", "RUSTUP_HOME",
+                  "CARGO_TARGET_DIR", "CLAUDE_CONFIG_DIR")
+# Never passed through, even if named in KANBAN_AGENT_ENV_ALLOW.
+AGENT_ENV_NEVER = frozenset(("EPIGRAPH_TOKEN", "EPIGRAPH_JWT_SECRET", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
+                             "GITHUB_ENTERPRISE_TOKEN", "DATABASE_URL", "MIGRATION_DATABASE_URL"))
+
+# Development agents: file tools pre-approved; Bash is left to --permission-mode. The deny list covers the
+# merge/admin surface. These are prefix patterns matched by Claude Code -- a guard rail, not a sandbox.
+DEV_ALLOWED_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep", "TodoWrite")
+DEV_DISALLOWED_TOOLS = (
+    "Bash(gh pr merge:*)", "Bash(gh pr close:*)", "Bash(gh pr reopen:*)", "Bash(gh pr review:*)",
+    "Bash(gh api:*)", "Bash(gh repo:*)", "Bash(gh release:*)", "Bash(gh secret:*)", "Bash(gh auth:*)",
+    "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --delete:*)", "Bash(git push --mirror:*)",
+    "Bash(curl:*)", "Bash(wget:*)",
+    "mcp__epigraph__resolve_backlog_item", "mcp__epigraph__update_labels", "mcp__epigraph__patch_claim",
+)
+# Built-in tools a helper agent (backlog fetch, retirement) must never have.
+HELPER_DISALLOWED_TOOLS = ("Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task")
+
+
+def split_list(value: Optional[str], default: Tuple[str, ...] = ()) -> Tuple[str, ...]:
+    if value is None or not value.strip():
+        return tuple(default)
+    return tuple(x.strip() for x in value.split(",") if x.strip())
+
+
+def agent_env(cfg: "Config", source: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """The environment for a spawned claude agent: AGENT_ENV_BASE + LC_* + KANBAN_AGENT_ENV_ALLOW, minus
+    AGENT_ENV_NEVER and every KANBAN_* name. Drawn from the board's live environment at spawn time."""
+    src = os.environ if source is None else source
+    names = set(AGENT_ENV_BASE) | set(cfg.agent_env_allow) | {n for n in src if n.startswith("LC_")}
+    env = {n: src[n] for n in sorted(names)
+           if n in src and n not in AGENT_ENV_NEVER and not n.startswith("KANBAN_")}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def dev_tool_args(cfg: "Config") -> List[str]:
+    args: List[str] = []
+    if cfg.agent_allowed_tools:
+        args += ["--allowedTools", ",".join(cfg.agent_allowed_tools)]
+    if cfg.agent_disallowed_tools:
+        args += ["--disallowedTools", ",".join(cfg.agent_disallowed_tools)]
+    return args
+
+
+def helper_tool_args(tool: str) -> List[str]:
+    """A helper agent gets no built-in tools at all, exactly one MCP tool pre-approved, and dontAsk so
+    anything else is denied rather than prompted for."""
+    return ["--tools", "", "--allowedTools", tool, "--disallowedTools", ",".join(HELPER_DISALLOWED_TOOLS),
+            "--permission-mode", "dontAsk"]
+
+
+# --------------------------------------------------------------------------
 # configuration
 # --------------------------------------------------------------------------
 
@@ -296,6 +356,13 @@ class Config:
         self.integration_prefix = env.get("KANBAN_INTEGRATION_PREFIX") or "integration/kanban-"
         self.base_branch = env.get("KANBAN_BASE_BRANCH") or "main"
         self.remote = env.get("KANBAN_REMOTE") or "origin"
+        # Environment variables (beyond AGENT_ENV_BASE) that agents may inherit. Never the board's secrets.
+        self.agent_env_allow = split_list(env.get("KANBAN_AGENT_ENV_ALLOW"))
+        # Tool lists for development agents: explicit, and overridable as comma-separated lists.
+        self.agent_allowed_tools = split_list(env.get("KANBAN_AGENT_ALLOWED_TOOLS"), DEV_ALLOWED_TOOLS)
+        self.agent_disallowed_tools = split_list(env.get("KANBAN_AGENT_DISALLOWED_TOOLS"), DEV_DISALLOWED_TOOLS)
+        self.resolve_tool = env.get("KANBAN_RESOLVE_TOOL") or "mcp__epigraph__resolve_backlog_item"
+        self.backlog_tool = env.get("KANBAN_BACKLOG_TOOL") or "mcp__epigraph__query_claims_by_label"
         self.repo = os.path.abspath(repo) if repo else git_toplevel(os.getcwd(), self.git_bin)
         self.worktrees_dir = os.path.join(self.home, "worktrees")
         self.logs_dir = os.path.join(self.home, "logs")
@@ -316,6 +383,11 @@ class Config:
             "integration_prefix": self.integration_prefix,
             "base_branch": self.base_branch,
             "remote": self.remote,
+            "agent_env_allow": list(self.agent_env_allow),
+            "agent_allowed_tools": list(self.agent_allowed_tools),
+            "agent_disallowed_tools": list(self.agent_disallowed_tools),
+            "resolve_tool": self.resolve_tool,
+            "backlog_tool": self.backlog_tool,
             "repo": self.repo,
             "home": self.home,
             "port": self.port,
@@ -536,8 +608,11 @@ CLAUDE_BACKLOG_PROMPT = (
 
 
 def fetch_backlog_claude(cfg: Config) -> List[Dict[str, Any]]:
-    argv = [cfg.claude_bin, "-p", CLAUDE_BACKLOG_PROMPT, "--output-format", "json"]
-    proc = run_cmd(argv, cwd=cfg.repo, timeout=600)
+    # Read-only helper: one MCP tool, no built-ins, allow-listed env, and a cwd outside the operator's checkout.
+    argv = [cfg.claude_bin, "-p", CLAUDE_BACKLOG_PROMPT, "--output-format", "json"] + helper_tool_args(cfg.backlog_tool)
+    cwd = os.path.join(cfg.home, "helper-cwd")
+    os.makedirs(cwd, exist_ok=True)
+    proc = run_cmd(argv, cwd=cwd, timeout=600, env=agent_env(cfg))
     text = proc.stdout.strip()
     result_text = text
     try:
@@ -1189,7 +1264,7 @@ class App:
                 integration = card.get("integration_branch") or ""
                 prompt = self.feedback_prompt(card, pending.get("text") or "")
                 argv = [cfg.claude_bin, "-p", prompt, "--resume", session_id, "--output-format", "stream-json",
-                        "--verbose", "--permission-mode", cfg.permission_mode]
+                        "--verbose", "--permission-mode", cfg.permission_mode] + dev_tool_args(cfg)
             else:
                 integration = self.ensure_integration()
                 with self.store.lock:
@@ -1201,7 +1276,7 @@ class App:
                 session_id = str(uuid.uuid4())
                 prompt = self.develop_prompt(card, branch, integration, wt, pending.get("text") or "")
                 argv = [cfg.claude_bin, "-p", prompt, "--output-format", "stream-json", "--verbose",
-                        "--permission-mode", cfg.permission_mode, "--session-id", session_id]
+                        "--permission-mode", cfg.permission_mode, "--session-id", session_id] + dev_tool_args(cfg)
             if cfg.model:
                 argv += ["--model", cfg.model]
             self.prepare_kanban_dir(wt)
@@ -1215,7 +1290,7 @@ class App:
                 logfh = open(log_path, "ab")
                 try:
                     proc = subprocess.Popen(argv, cwd=wt, stdin=subprocess.DEVNULL, stdout=logfh,
-                                            stderr=subprocess.STDOUT, start_new_session=True)
+                                            stderr=subprocess.STDOUT, start_new_session=True, env=agent_env(cfg))
                 finally:
                     logfh.close()
                 self.procs[card_id] = proc
@@ -1809,7 +1884,7 @@ class App:
         resolved: List[str] = []
         detail = ""
         try:
-            out = run_cmd(argv, cwd=self.cfg.repo, timeout=900).stdout
+            out = run_cmd(argv, cwd=self.cfg.repo, timeout=900, env=agent_env(self.cfg)).stdout
             text = out
             try:
                 outer = json.loads(out)

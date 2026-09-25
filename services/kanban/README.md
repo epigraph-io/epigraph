@@ -36,6 +36,26 @@ Prerequisites: `git`, an authenticated `gh`, and `claude` on PATH, plus a checko
 | `KANBAN_BASE_BRANCH` | `main` | The production branch |
 | `KANBAN_REMOTE` | `origin` | The git remote |
 | `KANBAN_HTTP_LOG` | – | Set to any value to log each HTTP request to stderr |
+| `KANBAN_AGENT_ENV_ALLOW` | – | Comma-separated extra environment variable names that agents may inherit (see below) |
+| `KANBAN_AGENT_ALLOWED_TOOLS` | `Read,Edit,Write,Glob,Grep,TodoWrite` | `--allowedTools` for development agents. `Bash` is deliberately left to `--permission-mode` |
+| `KANBAN_AGENT_DISALLOWED_TOOLS` | merge/admin `gh` and `git push` patterns, `curl`, `wget`, backlog-mutating MCP tools | `--disallowedTools` for development agents |
+| `KANBAN_BACKLOG_TOOL` / `KANBAN_RESOLVE_TOOL` | `mcp__epigraph__query_claims_by_label` / `mcp__epigraph__resolve_backlog_item` | The one MCP tool each helper agent may call |
+
+### What agents inherit
+
+Agents never get the board's environment. Every `claude` the board starts (development, resume, backlog fetch, retirement) gets an allow-listed environment. The list is `PATH HOME USER LOGNAME SHELL LANG LANGUAGE TERM TZ TMPDIR XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME CARGO_HOME RUSTUP_HOME CARGO_TARGET_DIR CLAUDE_CONFIG_DIR`, plus `LC_*`, plus whatever `KANBAN_AGENT_ENV_ALLOW` names. `GIT_TERMINAL_PROMPT=0` is always set. A few names are never passed, even if allow-listed: `EPIGRAPH_TOKEN`, `EPIGRAPH_JWT_SECRET`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `DATABASE_URL`, `MIGRATION_DATABASE_URL` and every `KANBAN_*`.
+
+Some consequences follow from this:
+
+- Agents push and open PRs with `gh` and `git` credentials from their **config files** (`gh auth login`, a git credential helper, `~/.ssh`), not from environment tokens. If your `gh` authenticates only through `GH_TOKEN`, agents cannot open PRs.
+- If `claude` authenticates through an environment variable rather than its credentials file, add that name to `KANBAN_AGENT_ENV_ALLOW`.
+- `SSH_AUTH_SOCK` is not passed by default. Add it if pushes go over ssh with an agent.
+
+Tool restrictions:
+
+- **Development agents** get `--allowedTools` and `--disallowedTools` from the table above.
+- **Helper agents** (backlog fetch and retirement) get `--tools ""` (no built-in tools at all), `--allowedTools <one MCP tool>` and `--permission-mode dontAsk`, so any other call is denied rather than prompted for. Their `--permission-mode` does not come from `KANBAN_PERMISSION_MODE`.
+- The backlog fetch runs in `$KANBAN_HOME/helper-cwd`, not in your checkout.
 
 `GET /api/state` returns the effective configuration under `.config`. Secrets appear only as booleans.
 

@@ -28,7 +28,7 @@ CLAUDE_STUB = r'''#!/usr/bin/env python3
 import json, os, subprocess, sys, time
 argv = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as fh:
-    fh.write(json.dumps({"bin": "claude", "argv": argv, "cwd": os.getcwd()}) + "\n")
+    fh.write(json.dumps({"bin": "claude", "argv": argv, "cwd": os.getcwd(), "env": sorted(os.environ)}) + "\n")
 prompt = argv[argv.index("-p") + 1] if "-p" in argv else ""
 if "--session-id" in argv or "--resume" in argv:
     def emit(obj):
@@ -122,6 +122,12 @@ else:
 '''
 
 
+# Secrets the board may be started with. None of them may reach a spawned agent.
+SECRET_CANARIES = {"EPIGRAPH_TOKEN": "canary-epigraph-token", "GH_TOKEN": "canary-gh-token",
+                   "GITHUB_TOKEN": "canary-github-token", "DATABASE_URL": "postgres://canary@localhost/canary",
+                   "EPIGRAPH_JWT_SECRET": "canary-jwt", "SOME_VENDOR_API_KEY": "canary-vendor"}
+
+
 def git(args, cwd):
     return subprocess.run(["git"] + args, cwd=cwd, check=True, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True).stdout
@@ -171,7 +177,10 @@ class _ServerFixture(unittest.TestCase):
             "KANBAN_GH_BIN": cls.gh_bin,
             "KANBAN_BACKLOG_SOURCE": "file",
             "KANBAN_MAX_AGENTS": "2",
+            # what the stubs need; GH_TOKEN is listed on purpose -- it must still never reach an agent
+            "KANBAN_AGENT_ENV_ALLOW": "STUB_LOG,STUB_PRS,STUB_HOLD,GIT_CONFIG_GLOBAL,GIT_CONFIG_NOSYSTEM,GH_TOKEN",
         })
+        os.environ.update(SECRET_CANARIES)
         cls.cfg = kanban.Config(repo=clone, port=0)
         cls.app = kanban.App(cls.cfg)
         cls.server = kanban.make_server(cls.app, 0)
@@ -697,6 +706,48 @@ class ChecksGateTest(_ServerFixture):
         self.assertEqual(self.app.store.state["integration_history"][-1]["checks_at_merge"], "pending")
 
 
+CLAIM_K = "56565656-1111-4222-8333-444444444444"
+
+
+class AgentEnvTest(_ServerFixture):
+    """Every agent the board spawns gets an allow-listed environment and explicit tool restrictions."""
+
+    def assert_clean_env(self, call):
+        env = set(call["env"])
+        leaked = env & set(SECRET_CANARIES)
+        self.assertFalse(leaked, "secrets reached the agent: %s" % sorted(leaked))
+        self.assertFalse([n for n in env if n.startswith("KANBAN_")], sorted(env))
+        self.assertIn("PATH", env)
+        self.assertIn("STUB_LOG", env)  # explicitly allow-listed names do pass
+
+    def test_agents_get_scrubbed_env_and_explicit_tools(self):
+        self.import_claim(CLAIM_K, "BACKLOG: env me")
+        card = self.develop_to_review(CLAIM_K)
+        status, body = self.req("POST", "/api/cards/%s/feedback" % CLAIM_K, body={"text": "again"})
+        self.assertEqual(status, 200, body)
+        self.wait_for(lambda: (lambda c: c if c["column"] == "review" and c["run_n"] == 2 else None)(
+            self.card(CLAIM_K)), what="feedback run")
+        runs = [c for c in self.stub_calls("claude") if "--session-id" in c["argv"] or "--resume" in c["argv"]]
+        self.assertEqual(len(runs), 2)
+        for call in runs:
+            self.assert_clean_env(call)
+            argv = call["argv"]
+            self.assertIn("Bash(gh pr merge:*)", argv[argv.index("--disallowedTools") + 1].split(","))
+            self.assertIn("mcp__epigraph__resolve_backlog_item", argv[argv.index("--disallowedTools") + 1].split(","))
+            self.assertNotIn("Bash", argv[argv.index("--allowedTools") + 1].split(","))
+
+        status, body = self.req("POST", "/api/cards/%s/accept" % CLAIM_K, body={})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.req("POST", "/api/integration/open-pr", body={})[0], 200)
+        status, body = self.req("POST", "/api/integration/merge", body={"resolve_backlog": True})
+        self.assertEqual(status, 200, body)
+        self.wait_for(lambda: any(h["event"] == "resolve_backlog" for h in self.card(CLAIM_K)["history"]),
+                      what="retirement run")
+        retire = [c for c in self.stub_calls("claude") if "resolve_backlog_item(" in c["argv"][c["argv"].index("-p") + 1]]
+        self.assertEqual(len(retire), 1)
+        self.assert_clean_env(retire[0])
+
+
 RECORDING_CLAUDE = r'''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
@@ -792,6 +843,30 @@ class PrUrlSinkTest(_IsolatedRepo):
         retire = calls[0]["argv"][calls[0]["argv"].index("-p") + 1]
         self.assertFalse(free_standing(retire, "IGNORE PREVIOUS"), retire)
         self.assertIn("- id=%s |" % CLAIM_A, retire)
+
+
+class HelperAgentTest(_IsolatedRepo):
+    def test_backlog_fetch_agent_is_read_only_scrubbed_and_outside_the_checkout(self):
+        os.environ.update(SECRET_CANARIES)
+        app = self.make_app()
+        try:
+            kanban.fetch_backlog_claude(app.cfg)  # only the recorded call matters, not what the stub returned
+        except (RuntimeError, kanban.CmdError):
+            pass
+        call = self.recorded()[0]
+        self.assertFalse(set(call["env"]) & set(SECRET_CANARIES), call["env"])
+        argv = call["argv"]
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "mcp__epigraph__query_claims_by_label")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        self.assertIn("Bash", argv[argv.index("--disallowedTools") + 1].split(","))
+        self.assertFalse(os.path.realpath(call["cwd"]).startswith(os.path.realpath(self.repo)), call["cwd"])
+
+    def test_agent_env_never_passes_board_secrets(self):
+        cfg = kanban.Config(repo=self.repo, port=0, env={"KANBAN_AGENT_ENV_ALLOW": "GH_TOKEN,KANBAN_X,FOO"})
+        env = kanban.agent_env(cfg, {"PATH": "/bin", "GH_TOKEN": "s", "KANBAN_X": "s", "FOO": "ok",
+                                     "EPIGRAPH_TOKEN": "s", "LC_ALL": "C", "RANDOM_SECRET": "s"})
+        self.assertEqual(env, {"PATH": "/bin", "FOO": "ok", "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"})
 
 
 class RecoverTest(unittest.TestCase):
