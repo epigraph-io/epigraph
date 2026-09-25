@@ -128,6 +128,18 @@ def pr_number_from_url(url: Optional[str]) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+GH_REPO_RE = re.compile(r"(?:[A-Za-z0-9.-]{1,100}/)?[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
+_GITHUB_REMOTE_RE = re.compile(
+    r"(?:https://(?:[^@/\s]+@)?github\.com/|git@github\.com:|ssh://git@github\.com(?::22)?/)"
+    r"([A-Za-z0-9_.-]{1,100})/([A-Za-z0-9_.-]{1,100}?)(?:\.git)?/?")
+
+
+def github_repo_from_url(url: str) -> Optional[str]:
+    """`owner/repo` for a github.com remote URL (https, scp-style or ssh://), else None."""
+    m = _GITHUB_REMOTE_RE.fullmatch((url or "").strip())
+    return "%s/%s" % (m.group(1), m.group(2)) if m else None
+
+
 def to_int(value: Any) -> Optional[int]:
     try:
         return int(value) if value is not None and str(value).strip() != "" else None
@@ -335,6 +347,17 @@ def tool_env(cfg: "Config", source: Optional[Dict[str, str]] = None) -> Dict[str
     return env
 
 
+# Tokens gh itself may authenticate with. The board holds them for its OWN gh calls only (see gh_env).
+GH_SECRET_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+
+def gh_env(cfg: "Config", source: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """tool_env() plus the gh tokens the board was started with: the one subprocess that needs them."""
+    env = tool_env(cfg, source)
+    env.update(cfg.gh_secrets)
+    return env
+
+
 def dev_tool_args(cfg: "Config") -> List[str]:
     args: List[str] = []
     if cfg.agent_allowed_tools:
@@ -379,6 +402,11 @@ class Config:
         self.integration_prefix = env.get("KANBAN_INTEGRATION_PREFIX") or "integration/kanban-"
         self.base_branch = env.get("KANBAN_BASE_BRANCH") or "main"
         self.remote = env.get("KANBAN_REMOTE") or "origin"
+        # Every gh call gets `-R <this>`; default: derived from the pinned URL of `remote` (github.com only).
+        gh_repo = (env.get("KANBAN_GH_REPO") or "").strip()
+        self.gh_repo = gh_repo if GH_REPO_RE.fullmatch(gh_repo) else ""
+        self.gh_repo_invalid = bool(gh_repo) and not self.gh_repo
+        self.gh_secrets = {n: env[n] for n in GH_SECRET_NAMES if env.get(n)}
         # Environment variables (beyond AGENT_ENV_BASE) that agents may inherit. Never the board's secrets.
         self.agent_env_allow = split_list(env.get("KANBAN_AGENT_ENV_ALLOW"))
         # Tool lists for development agents: explicit, and overridable as comma-separated lists.
@@ -404,6 +432,7 @@ class Config:
             "integration_prefix": self.integration_prefix,
             "base_branch": self.base_branch,
             "remote": self.remote,
+            "gh_repo": self.gh_repo,
             "agent_env_allow": list(self.agent_env_allow),
             "agent_allowed_tools": list(self.agent_allowed_tools),
             "agent_disallowed_tools": list(self.agent_disallowed_tools),
@@ -939,8 +968,38 @@ class App:
                            "refusing to talk to it. Restart the board to accept the change."
                            % ((self.cfg.remote,) + pinned + now))
 
+    def gh_repo(self) -> str:
+        """[HOST/]OWNER/REPO every gh call targets: KANBAN_GH_REPO, else the pinned github.com remote URL."""
+        if self.cfg.gh_repo_invalid:
+            raise CmdError(["gh"], None, "", "KANBAN_GH_REPO is not [HOST/]OWNER/REPO; refusing to guess the repository")
+        if self.cfg.gh_repo:
+            return self.cfg.gh_repo
+        repo = github_repo_from_url(self.pin_remote()[0])
+        if not repo:
+            raise CmdError(["gh"], None, "", "cannot derive the GitHub repository from remote %r (%s); set "
+                           "KANBAN_GH_REPO=owner/repo" % (self.cfg.remote, self.pin_remote()[0]))
+        return repo
+
     def gh(self, args: List[str], timeout: float = 120, check: bool = True) -> subprocess.CompletedProcess:
-        return run_cmd([self.cfg.gh_bin] + args, cwd=self.cfg.repo, timeout=timeout, check=check)
+        """The board's own gh: always `-R <pinned repo>`, from a directory that is not a git checkout, so gh never
+        resolves the repository from (agent-writable) remotes and never touches a local branch."""
+        cwd = os.path.join(self.cfg.home, "gh-cwd")
+        os.makedirs(cwd, exist_ok=True)
+        return run_cmd([self.cfg.gh_bin] + args + ["-R", self.gh_repo()], cwd=cwd, timeout=timeout, check=check,
+                       env=gh_env(self.cfg))
+
+    def delete_remote_branch(self, branch: Optional[str]) -> None:
+        """Delete a merged branch on the remote (what `gh pr merge --delete-branch` did, minus the local side)."""
+        if not branch or not BRANCH_NAME_RE.match(branch):
+            return
+        try:
+            with self.git_lock:
+                out = self.git(["push", self.cfg.remote, "--delete", "refs/heads/" + branch], timeout=120, check=False)
+            if out.returncode != 0:
+                log("could not delete %s on %s (it may already be gone): %s"
+                    % (branch, self.cfg.remote, (out.stderr or "").strip()[-300:]))
+        except CmdError as e:
+            log("could not delete %s on %s: %s" % (branch, self.cfg.remote, e))
 
     def remote_branch_exists(self, name: str) -> bool:
         out = self.git(["ls-remote", "--heads", self.cfg.remote, "refs/heads/" + name], timeout=60).stdout
@@ -1130,14 +1189,15 @@ class App:
         return self.verify_pr(number, integration, str(card.get("branch") or ""), "the integration branch")
 
     def gh_merge(self, number: int, match_head: str) -> None:
-        """Merge a PR pinned to `match_head`; tolerate local-branch cleanup noise if GitHub reports it merged.
+        """Merge a PR pinned to `match_head`. No `--delete-branch`: that also deletes (and may switch the operator's
+        checkout away from) a same-named LOCAL branch; the caller deletes the remote branch itself.
         There is no unpinned merge: a missing or malformed sha is refused, never silently dropped."""
         n = valid_pr_number(number)
         if not n:
             raise CmdError(["gh", "pr", "merge"], None, "", "invalid PR number %r" % (number,))
         if not isinstance(match_head, str) or not HEAD_SHA_RE.fullmatch(match_head):
             raise CmdError(["gh", "pr", "merge"], None, "", "refusing to merge PR #%d without a head sha pin" % n)
-        args = ["pr", "merge", str(n), "--merge", "--delete-branch", "--match-head-commit", match_head]
+        args = ["pr", "merge", str(n), "--merge", "--match-head-commit", match_head]
         try:
             self.gh(args, timeout=300)
         except CmdError as e:
@@ -1691,7 +1751,11 @@ class App:
             self.store.save()
             result = dict(card)
         self._integ_cache = None
-        threading.Thread(target=self.remove_worktree, args=(card_id, branch), daemon=True).start()
+
+        def cleanup() -> None:
+            self.delete_remote_branch(branch)
+            self.remove_worktree(card_id, branch)
+        threading.Thread(target=cleanup, daemon=True).start()
         return result
 
     def action_reject(self, card_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1909,6 +1973,7 @@ class App:
             if isinstance(e, ApiError):
                 raise
             raise ApiError(502, "integration merge failed: %s" % e)
+        self.delete_remote_branch(branch)
         integ = dict(integ, checks_at_merge=verified["checks"],
                      checks_overridden=verified["checks"] != "pass", merged_sha=verified["sha"])
         shipped = self._complete_ship(integ, number, resolve)

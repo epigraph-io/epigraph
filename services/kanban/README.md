@@ -39,7 +39,8 @@ Prerequisites: `git`, an authenticated `gh`, and `claude` on PATH, plus a checko
 | `KANBAN_MODEL` | – | Optional `--model` value |
 | `KANBAN_INTEGRATION_PREFIX` | `integration/kanban-` | Integration branches are named `<prefix>YYYY-MM-DD[-N]` |
 | `KANBAN_BASE_BRANCH` | `main` | The production branch |
-| `KANBAN_REMOTE` | `origin` | The git remote |
+| `KANBAN_REMOTE` | `origin` | The git remote. Its URLs are pinned at startup |
+| `KANBAN_GH_REPO` | derived from the pinned `KANBAN_REMOTE` URL | `[HOST/]OWNER/REPO` passed as `-R` to every board `gh` call. Required when the remote is not a github.com URL |
 | `KANBAN_HTTP_LOG` | – | Set to any value to log each HTTP request to stderr |
 | `KANBAN_AGENT_ENV_ALLOW` | – | Comma-separated extra environment variable names that agents may inherit (see below) |
 | `KANBAN_AGENT_ALLOWED_TOOLS` | `Read,Glob,Grep,TodoWrite` | `--allowedTools` for development agents. `Bash`, `Edit` and `Write` are deliberately left to `--permission-mode`. A bare `Edit`/`Write` here would pre-approve writes to *any* path, outside the worktree included |
@@ -92,7 +93,7 @@ main
 
 1. The first develop run with no open integration branch creates one. The server pushes `origin/main` to a new branch `<prefix><date>` and adds a `-2`, `-3`, … suffix if that name already exists on the remote.
 2. Each card gets branch `kanban/<id8>-<slug>` in the worktree `$KANBAN_HOME/worktrees/<id8>`, based on the integration branch. The agent pushes the branch and runs `gh pr create --base <integration> --head <branch>`.
-3. **Accept** first confirms with one `gh pr view` that the PR is `OPEN`, comes from the card's branch in this repository (not a fork: `isCrossRepository` must be `false`), and targets the current integration branch. It then runs `gh pr merge <n> --merge --delete-branch --match-head-commit <sha>`, pinned to the head it just verified. This merges the item into staging, not into main. The worktree is removed afterwards.
+3. **Accept** first confirms with one `gh pr view` that the PR is `OPEN`, comes from the card's branch in this repository (not a fork: `isCrossRepository` must be `false`), and targets the current integration branch. It then runs `gh pr merge <n> --merge --match-head-commit <sha> -R <owner/repo>`, pinned to the head it just verified. This merges the item into staging, not into main. The board then deletes the item branch on the remote itself (`git push <remote> --delete`) and removes the worktree and the local `kanban/*` branch.
 4. **Open integration PR** opens (or reuses) `integration -> main`. It reuses an existing PR only after `gh pr view` confirms the PR is an open, same-repository PR from the integration branch into the configured base branch. A recorded PR that no longer matches is forgotten. The PR body lists the member PRs and backlog claim ids.
 5. **Merge integration → main** gets the same checks as Accept (base, head, state, not a fork, head sha) and merges with `--match-head-commit`. There is no unpinned merge. A missing or malformed head sha is refused. All accepted cards move to `shipped`, and the next develop run starts a new integration branch. If "resolve backlog items" is checked (the default), a background `claude -p` run calls the EpiGraph MCP `resolve_backlog_item(original_id, resolution_content)` for each shipped card, citing both PRs. That run gets its own throwaway detached worktree at `<remote>/<base>` (`$KANBAN_HOME/worktrees/_retire-*`, removed afterwards), never your checkout. It has no built-in tools (`--tools ""`), only `KANBAN_RESOLVE_TOOL` pre-approved, and `--permission-mode dontAsk`. Every value it is given that came from an agent or from GitHub is JSON-quoted in its prompt. The result is recorded in each card's history (`backlog_resolved: true|false`).
 
@@ -145,7 +146,7 @@ Every `/api/*` call needs the session secret in the `X-Kanban-Token` header. It 
 - **What the board does to your repository.** Your working tree is never edited: no files written, no branch switched by the board's own commands, and no exclude file touched. Agents and the retirement run work in worktrees under `$KANBAN_HOME/worktrees`, and the backlog fetch runs in `$KANBAN_HOME/helper-cwd`. The shared `.git` *is* used, because that is what linked worktrees are:
   - `git worktree add/remove/prune` and `fetch`;
   - `kanban/*` branches are created and deleted with `branch -D` after Accept;
-  - `gh` commands run with the checkout as cwd so that they resolve the GitHub repository.
+  - `gh` never runs in your checkout: every board `gh` call runs from `$KANBAN_HOME/gh-cwd` with `-R <KANBAN_GH_REPO>`, so it does not resolve the repository from (agent-writable) remotes and `gh` never deletes or switches a local branch. Merged branches are deleted on the remote by the board's own `git push --delete`, not by `gh pr merge --delete-branch`.
 
   Agents can write that shared `.git` from inside their worktrees (`git rev-parse --git-common-dir` resolves outside the worktree), including `hooks/` and `config`. The board's own git therefore:
   - runs with `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, so no hook or fsmonitor command planted there runs for it;
@@ -154,7 +155,7 @@ Every `/api/*` call needs the session secret in the `X-Kanban-Token` header. It 
 
   Because the board's git gets no tokens, its pushes (the integration branch) authenticate the same way agents do: through a git credential helper, `gh auth setup-git`, or `SSH_AUTH_SOCK`.
 
-  `gh pr merge --delete-branch` also deletes a matching *local* branch. If you have the integration branch checked out in your own checkout when you ship, gh may switch that checkout to the base branch, so don't. If gh fails to delete the local branch but GitHub reports the PR `MERGED`, the merge is still treated as successful.
+  If `gh pr merge` reports an error but GitHub reports the PR `MERGED`, the merge is still treated as successful.
 - The board does not rebase item PRs when the integration branch moves. Conflicts show up in the Integration panel as `mergeable`/`checks` status, and you resolve them with Request changes.
 - Only one integration branch is active at a time, and one server should run per `KANBAN_HOME`.
 

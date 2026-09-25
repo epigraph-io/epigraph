@@ -77,7 +77,7 @@ GH_STUB = r'''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as fh:
-    fh.write(json.dumps({"bin": "gh", "argv": argv}) + "\n")
+    fh.write(json.dumps({"bin": "gh", "argv": argv, "cwd": os.getcwd()}) + "\n")
 reg_path = os.environ["STUB_PRS"]
 def load():
     return json.load(open(reg_path)) if os.path.exists(reg_path) else {}
@@ -178,6 +178,7 @@ class _ServerFixture(unittest.TestCase):
             "KANBAN_GH_BIN": cls.gh_bin,
             "KANBAN_BACKLOG_SOURCE": "file",
             "KANBAN_MAX_AGENTS": "2",
+            "KANBAN_GH_REPO": "example/epigraph",
             # what the stubs need; GH_TOKEN is listed on purpose -- it must still never reach an agent
             "KANBAN_AGENT_ENV_ALLOW": "STUB_LOG,STUB_PRS,STUB_HOLD,GIT_CONFIG_GLOBAL,GIT_CONFIG_NOSYSTEM,GH_TOKEN",
         })
@@ -417,8 +418,8 @@ class KanbanServerTest(_ServerFixture):
         self.assertEqual(body["column"], "accepted")
         self.assertEqual(body["status"], "merged")
         merges = [c["argv"] for c in self.stub_calls("gh") if c["argv"][:2] == ["pr", "merge"]]
-        self.assertIn(["pr", "merge", "101", "--merge", "--delete-branch",
-                       "--match-head-commit", "0123456789abcdef0123456789abcdef01234567"], merges)
+        self.assertIn(["pr", "merge", "101", "--merge", "--match-head-commit",
+                       "0123456789abcdef0123456789abcdef01234567", "-R", "example/epigraph"], merges)
 
         # integration view + new-branch refusal while accepted cards are unshipped
         status, view = self.req("GET", "/api/integration")
@@ -442,13 +443,16 @@ class KanbanServerTest(_ServerFixture):
         status, body = self.req("POST", "/api/integration/merge", body={"resolve_backlog": True})
         self.assertEqual(status, 200, body)
         self.assertEqual(body["shipped"], [CLAIM_A])
-        self.assertIn(["pr", "merge", "200", "--merge", "--delete-branch",
-                       "--match-head-commit", "0123456789abcdef0123456789abcdef01234567"],
+        self.assertIn(["pr", "merge", "200", "--merge", "--match-head-commit",
+                       "0123456789abcdef0123456789abcdef01234567", "-R", "example/epigraph"],
                       [c["argv"] for c in self.stub_calls("gh") if c["argv"][:2] == ["pr", "merge"]])
         shipped = self.card(CLAIM_A)
         self.assertEqual(shipped["column"], "shipped")
         _, state = self.req("GET", "/api/state")
         self.assertEqual(state["integration"]["branch"], "")
+        # the board deleted the shipped integration branch on the remote itself (gh pr merge runs without
+        # --delete-branch, which would also delete -- and could switch away from -- a local branch)
+        self.assertNotIn("refs/heads/" + card["integration_branch"], git(["ls-remote", "--heads", self.origin], self.tmp))
 
         done = self.wait_for(lambda: (lambda c: c if any(h["event"] == "resolve_backlog" for h in c["history"])
                                       else None)(self.card(CLAIM_A)), what="backlog resolution")
@@ -478,8 +482,9 @@ class KanbanServerTest(_ServerFixture):
         self.assertEqual(status, 200, body)
         card = self.wait_for(lambda: (lambda c: c if c["column"] == "review" else None)(self.card(CLAIM_B)),
                              what="card B to reach review")
-        # the previous integration branch still exists on origin, so a suffixed one is created
-        self.assertTrue(card["integration_branch"].endswith("-2"), card["integration_branch"])
+        # test_03 shipped (and the board deleted) the previous integration branch, so a fresh one was cut
+        self.assertIn("refs/heads/" + card["integration_branch"], git(["ls-remote", "--heads", self.origin], self.tmp))
+        self.assertTrue(card["integration_branch"].startswith("integration/kanban-"), card["integration_branch"])
         session = card["session_id"]
         status, body = self.req("POST", "/api/cards/%s/feedback" % CLAIM_B, body={"text": "rename the flag"})
         self.assertEqual(status, 200, body)
@@ -588,6 +593,7 @@ class KanbanGuardsTest(_ServerFixture):
 CLAIM_F = "ffffffff-1111-4222-8333-444444444444"
 CLAIM_G = "abababab-1111-4222-8333-444444444444"
 CLAIM_H = "cdcdcdcd-1111-4222-8333-444444444444"
+CLAIM_PIN = "78787878-1111-4222-8333-444444444444"
 
 
 class IntegrationMergeGuardsTest(_ServerFixture):
@@ -637,7 +643,7 @@ class IntegrationMergeGuardsTest(_ServerFixture):
         status, body = self.req("POST", "/api/integration/merge", body={"resolve_backlog": False})
         self.assertEqual(status, 200, body)
         self.assertEqual(self.merge_calls(integ_pr),
-                         [["pr", "merge", str(integ_pr), "--merge", "--delete-branch", "--match-head-commit", sha]])
+                         [["pr", "merge", str(integ_pr), "--merge", "--match-head-commit", sha, "-R", "example/epigraph"]])
         self.assertEqual(self.card(CLAIM_F)["column"], "shipped")
 
     def test_item_pr_from_a_fork_branch_is_refused(self):
@@ -666,6 +672,23 @@ class IntegrationMergeGuardsTest(_ServerFixture):
         finally:
             with self.app.store.lock:
                 self.app.store.state["integration"] = saved
+
+    def test_gh_targets_the_pinned_repo_from_a_neutral_cwd(self):
+        self.import_claim(CLAIM_PIN, "BACKLOG: pinned repo")
+        self.develop_to_review(CLAIM_PIN)
+        status, body = self.req("POST", "/api/cards/%s/accept" % CLAIM_PIN, body={})
+        self.assertEqual(status, 200, body)
+        calls = self.stub_calls("gh")
+        self.assertTrue(calls)
+        repo = os.path.realpath(self.repo)
+        for call in calls:
+            argv = call["argv"]
+            self.assertEqual(argv[-2:], ["-R", "example/epigraph"], argv)
+            self.assertNotIn("--delete-branch", argv)
+            cwd = os.path.realpath(call["cwd"])
+            self.assertFalse(cwd == repo or cwd.startswith(repo + os.sep), "gh ran in the operator's checkout")
+        # the operator's local branches are the board's business only through `branch -D` of the card branch
+        self.assertIn("main", git(["branch", "--list", "main"], self.repo))
 
     def test_gh_merge_refuses_without_a_head_pin(self):
         for sha in (None, "", "abc123", "0123456789ABCDEF0123456789ABCDEF01234567"):
@@ -1176,6 +1199,23 @@ class UnitHelpersTest(unittest.TestCase):
                     "https://github.com/a b/c/pull/1", "see https://github.com/a/b/pull/1", None, 5):
             self.assertIsNone(kanban.valid_pr_url(bad), repr(bad))
             self.assertIsNone(kanban.pr_number_from_url(bad if isinstance(bad, str) else None), repr(bad))
+
+    def test_github_repo_from_url_and_gh_env(self):
+        for url in ("https://github.com/epigraph-io/epigraph.git", "https://github.com/epigraph-io/epigraph",
+                    "git@github.com:epigraph-io/epigraph.git", "ssh://git@github.com/epigraph-io/epigraph.git",
+                    "https://x-access-token@github.com/epigraph-io/epigraph/"):
+            self.assertEqual(kanban.github_repo_from_url(url), "epigraph-io/epigraph", url)
+        for url in ("/tmp/origin.git", "https://evil.example/epigraph-io/epigraph", "https://github.com/a/b/c",
+                    "https://github.com/a/b x", ""):
+            self.assertIsNone(kanban.github_repo_from_url(url), url)
+        cfg = kanban.Config(repo=HERE, port=0, env={"GH_TOKEN": "gh-secret", "EPIGRAPH_TOKEN": "e", "PATH": "/bin",
+                                                    "KANBAN_GH_REPO": "o/r"})
+        src = {"PATH": "/bin", "SSH_AUTH_SOCK": "/s", "DATABASE_URL": "d"}
+        self.assertEqual(kanban.tool_env(cfg, src), {"PATH": "/bin", "SSH_AUTH_SOCK": "/s", "GIT_TERMINAL_PROMPT": "0"})
+        self.assertEqual(kanban.gh_env(cfg, src)["GH_TOKEN"], "gh-secret")  # gh, and only gh, gets its token
+        self.assertNotIn("EPIGRAPH_TOKEN", kanban.gh_env(cfg, src))
+        self.assertEqual(cfg.gh_repo, "o/r")
+        self.assertTrue(kanban.Config(repo=HERE, port=0, env={"KANBAN_GH_REPO": "o/r --admin"}).gh_repo_invalid)
 
     def test_redact_token(self):
         line = '"GET /api/state?t=SECRETTOKEN&x=1 HTTP/1.1" 200 -'
