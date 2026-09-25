@@ -45,10 +45,37 @@
 //! that is the abuse, and the fix is `tools::viewer::request_viewer`.
 
 use epigraph_db::visibility::SystemReason;
-use epigraph_db::MaintenanceSession;
+use epigraph_db::{MaintenanceDsnSource, MaintenancePrivilege, MaintenanceSession};
 use rmcp::model::ErrorData as McpError;
 
 use crate::server::EpiGraphMcpFull;
+
+/// Whether `main` may attach a probed maintenance pool, which is what makes the
+/// three maintenance tools callable at all.
+///
+/// Two conditions, both required:
+///
+/// 1. the pool's role satisfies `epigraph_bypass()`. Without it a bypass viewer
+///    reads and writes zero rows with no error;
+/// 2. the DSN was CONFIGURED through `MAINTENANCE_DATABASE_URL`, not reached by
+///    the documented fallback to the application DSN.
+///
+/// The second condition is an authorization decision, not a hygiene one. These
+/// tools enumerate and retire rows across every tenant, so enabling them must be
+/// an operator's explicit act. Before this function, an MCP unit whose
+/// application DSN happened to bypass RLS (a superuser DSN, common on stdio
+/// deployments) enabled them with no configuration change at all, and a
+/// `claims:write` bearer could then list other tenants' private claim ids with
+/// `sweep_semantic_duplicates` (measured by the batch H-a review on config A).
+/// The scope half of that fix is `scope_map`'s `claims:admin`; this is the
+/// configuration half.
+#[must_use]
+pub fn may_attach_maintenance_pool(
+    privilege: MaintenancePrivilege,
+    source: MaintenanceDsnSource,
+) -> bool {
+    privilege.bypass && source == MaintenanceDsnSource::Configured
+}
 
 /// A bypass viewer plus the maintenance connection it is inseparable from, for
 /// one of the three maintenance tools.
@@ -72,7 +99,8 @@ use crate::server::EpiGraphMcpFull;
 /// session is handed out:
 ///
 /// 1. no maintenance pool is attached. `main` attaches one only when
-///    `MAINTENANCE_DATABASE_URL` (or its fallback) resolved AND the boot probe
+///    `MAINTENANCE_DATABASE_URL` is SET (the fallback to the application DSN
+///    never attaches, see [`may_attach_maintenance_pool`]) AND the boot probe
 ///    found it privileged, so "unset" and "misconfigured" both land here;
 /// 2. the leased connection itself fails `MaintenanceSession::assert_privileged`.
 ///    This is the per-call half. It does not trust the boot probe or whoever
@@ -201,6 +229,43 @@ mod tests {
         ScopedPool::connect(&url, SessionGucMode::Session)
             .await
             .expect("ScopedPool::connect over the ephemeral test database")
+    }
+
+    /// The attach decision, over every combination of its two inputs.
+    ///
+    /// The fallback-with-bypass case is the one that matters: an MCP unit whose
+    /// application DSN is a superuser must NOT enable corpus-wide maintenance
+    /// tools just because nobody set `MAINTENANCE_DATABASE_URL`.
+    #[test]
+    fn only_a_configured_bypassing_dsn_enables_the_maintenance_tools() {
+        let p = |bypass, rls_active| MaintenancePrivilege { bypass, rls_active };
+        assert!(may_attach_maintenance_pool(
+            p(true, true),
+            MaintenanceDsnSource::Configured
+        ));
+        assert!(
+            !may_attach_maintenance_pool(
+                p(true, true),
+                MaintenanceDsnSource::FellBackToApplicationDsn
+            ),
+            "an application DSN that happens to bypass RLS enabled the corpus-wide maintenance \
+             tools with no operator configuration"
+        );
+        assert!(!may_attach_maintenance_pool(
+            p(true, false),
+            MaintenanceDsnSource::FellBackToApplicationDsn
+        ));
+        for source in [
+            MaintenanceDsnSource::Configured,
+            MaintenanceDsnSource::FellBackToApplicationDsn,
+        ] {
+            for rls in [true, false] {
+                assert!(
+                    !may_attach_maintenance_pool(p(false, rls), source),
+                    "an unprivileged pool was attached ({source:?}, rls_active={rls})"
+                );
+            }
+        }
     }
 
     /// THE HAZARD THIS PIN EXISTS FOR, stated as a test.

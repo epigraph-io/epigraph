@@ -308,10 +308,12 @@ fn check_listen_auth_mode(
 ///   (`maintenance_database_url`'s refusal): a maintenance connection there
 ///   reads zero rows and writes nowhere;
 /// * the pool cannot be built;
-/// * the boot probe finds the role unprivileged while row security is active.
-///   This includes the documented fallback: an unset variable falls back to the
-///   application DSN, which is attached only if THAT role can bypass RLS, which
-///   it cannot on a least-privilege deployment.
+/// * the boot probe finds the role unprivileged while row security is active;
+/// * `MAINTENANCE_DATABASE_URL` is unset. The documented fallback to the
+///   application DSN is NEVER attached, even when that role can bypass RLS
+///   (`epigraph_mcp::maintenance::may_attach_maintenance_pool`): the three tools
+///   read and retire rows across every tenant, so enabling them is an explicit
+///   operator act, not a side effect of a superuser application DSN.
 ///
 /// Sized at 2 connections (a maintenance tool call holds one for its duration),
 /// with the same 5 s acquire timeout as the app pool. `docs/deploy.md` §1c-bis
@@ -357,7 +359,7 @@ async fn attach_maintenance_pool(
     };
     match epigraph_db::probe_maintenance_privilege(maintenance.inner()).await {
         Ok(privilege) => match epigraph_db::maintenance_verdict(privilege, source) {
-            Ok(_) if privilege.bypass => {
+            Ok(_) if epigraph_mcp::maintenance::may_attach_maintenance_pool(privilege, source) => {
                 tracing::info!(
                     target: "tenancy.maintenance",
                     dsn_source = source.as_str(),
@@ -378,7 +380,21 @@ async fn attach_maintenance_pool(
             // the variable logged this line at ERROR, which is noise that trains
             // operators to ignore the configured case.
             Ok(_) | Err(_) => {
-                if source == epigraph_db::MaintenanceDsnSource::FellBackToApplicationDsn {
+                if source == epigraph_db::MaintenanceDsnSource::FellBackToApplicationDsn
+                    && privilege.bypass
+                {
+                    // The application DSN CAN bypass RLS, and that is exactly why
+                    // it is not attached: enabling three cross-tenant tools must be
+                    // an operator's explicit act (`may_attach_maintenance_pool`).
+                    tracing::warn!(
+                        target: "tenancy.maintenance",
+                        dsn_source = source.as_str(),
+                        "MAINTENANCE_DATABASE_URL is not set; the application DSN bypasses RLS \
+                         but is NOT attached as the maintenance pool, because the three \
+                         cross-tenant maintenance tools are enabled only by an explicitly \
+                         configured MAINTENANCE_DATABASE_URL. They will refuse."
+                    );
+                } else if source == epigraph_db::MaintenanceDsnSource::FellBackToApplicationDsn {
                     tracing::warn!(
                         target: "tenancy.maintenance",
                         dsn_source = source.as_str(),

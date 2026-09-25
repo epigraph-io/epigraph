@@ -16,9 +16,15 @@
 #                 an injected mid-call refusal of the justifies edge
 #   submit_ds     submit_claim's DS wiring commits with the claim
 #   maintenance   recompute_beliefs, sweep_semantic_duplicates and
-#                 backfill_embeddings under three server configurations:
-#                 MAINTENANCE_DATABASE_URL unset, set to the app login, and set
-#                 to E2E_MAINT_DSN (a role that satisfies epigraph_bypass())
+#                 backfill_embeddings under four server configurations:
+#                 MAINTENANCE_DATABASE_URL unset, set to the app login, set
+#                 to E2E_MAINT_DSN (a role that satisfies epigraph_bypass()),
+#                 and unset with the APPLICATION DSN itself bypass-capable
+#                 (the fallback, which must never enable them)
+#   maint_auth    the same tools over AUTHENTICATED HTTP (--jwt-secret, a
+#                 random per-run secret that is never written to disk): a
+#                 claims:write-only bearer with no membership must be refused
+#                 before the tool body runs; a claims:admin bearer is admitted
 #
 # WHY THIS PROBE EXISTS. Every other arm in this directory seeds its claims
 # through submit_claim, and submit_claim writes PUBLIC claims. An edge between
@@ -67,11 +73,15 @@ BIN="${1:?usage: probe-batch-h.sh <binary> <label> <a|b> [arm ...]}"
 LABEL="${2:?label}"
 CFG="${3:?a|b}"
 shift 3
-ARMS="${*:-patch_claim edges resolve submit_ds maintenance}"
+ARMS="${*:-patch_claim edges resolve submit_ds maintenance maint_auth}"
 command -v jq >/dev/null || { echo "probe-batch-h.sh needs jq to read tool responses" >&2; exit 2; }
 E2E="$(cd "$(dirname "$0")" && pwd)"
 SOCK="$E2E/bh.sock.$LABEL"
 H=(-H Content-Type:application/json -H Accept:application/json,text/event-stream)
+# Set by the maint_auth arm only: the bearer every call carries, and the JWT
+# secret the server is started with. Both live in this process's memory only.
+BEARER=""
+JWT_SECRET=""
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 q() { PGPASSWORD="$E2E_SU_PW" psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -X -tA -c "$1"; }
@@ -95,11 +105,20 @@ q "TRUNCATE claims, evidence, edges, reasoning_traces, mass_functions, claim_fra
            recall_events, challenges, events, workflows, papers CASCADE;" >/dev/null 2>&1
 
 PID=""
-# $1 = maintenance mode: none | app | maint
+# $1 = maintenance mode: none | app | maint | fallback_bypass | auth
 start_server() {
   local mode="${1:-none}"
   rm -f "$SOCK"
   case "$mode" in
+    # MAINTENANCE_DATABASE_URL unset and the application DSN is itself able to
+    # bypass RLS: the documented fallback must NOT attach it.
+    fallback_bypass) env -u MAINTENANCE_DATABASE_URL DATABASE_URL="$E2E_MAINT_DSN" RUST_LOG=warn "$BIN" \
+             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http \
+             >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
+    # Authenticated HTTP with a configured, bypass-capable maintenance DSN.
+    auth)  EPIGRAPH_JWT_SECRET="$JWT_SECRET" MAINTENANCE_DATABASE_URL="$E2E_MAINT_DSN" DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
+             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" \
+             >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
     none)  env -u MAINTENANCE_DATABASE_URL DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
              --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http \
              >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
@@ -113,7 +132,7 @@ start_server() {
   PID=$!
   for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 1; done
   [ -S "$SOCK" ] || { echo "FAIL: socket never appeared"; tail -20 "$E2E/bh.$LABEL.log"; exit 1; }
-  curl -s --unix-socket "$SOCK" "${H[@]}" -X POST http://localhost/mcp -D "$E2E/bhh.$LABEL" -o /dev/null \
+  curl -s --unix-socket "$SOCK" "${H[@]}" ${BEARER:+-H "Authorization: Bearer $BEARER"} -X POST http://localhost/mcp -D "$E2E/bhh.$LABEL" -o /dev/null \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"batch-h-probe","version":"1"}}}'
   SID=$(grep -i '^mcp-session-id:' "$E2E/bhh.$LABEL" | tr -d '\r' | cut -d' ' -f2)
   call '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
@@ -122,7 +141,7 @@ stop_server() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/nul
 : > "$E2E/bh.$LABEL.log"
 trap 'stop_server; release_lock' EXIT
 
-call() { curl -s --unix-socket "$SOCK" "${H[@]}" -H "mcp-session-id: $SID" \
+call() { curl -s --unix-socket "$SOCK" "${H[@]}" ${BEARER:+-H "Authorization: Bearer $BEARER"} -H "mcp-session-id: $SID" \
            -X POST http://localhost/mcp -d "$1" | grep '^data: {' | tail -1 | sed 's/^data: //'; }
 tool() {  # $1 = tool name, $2 = JSON arguments
   call "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}"
@@ -314,7 +333,7 @@ if want maintenance; then
   if [ -z "$OPENAI_API_KEY" ]; then
     echo "   NOTE: OPENAI_API_KEY is unset, so the backfill case below measures the absence of a key, not the write path (README trap 4). Its verdict is not reported."
   fi
-  for mode in none app maint; do
+  for mode in none app maint fallback_bypass; do
     stop_server
     start_server "$mode"
     reset_stale
@@ -324,6 +343,7 @@ if want maintenance; then
       none)  echo "--- MAINTENANCE_DATABASE_URL unset (expect: all three refuse loudly, rows unchanged)";;
       app)   echo "--- MAINTENANCE_DATABASE_URL = the app login (expect: all three refuse loudly, rows unchanged; this is the zero-row hybrid)";;
       maint) echo "--- MAINTENANCE_DATABASE_URL = a bypass-capable role (expect: all three work on FOREIGN rows)";;
+      fallback_bypass) echo "--- MAINTENANCE_DATABASE_URL unset, APPLICATION DSN bypass-capable (expect: all three refuse loudly, rows unchanged; the fallback never enables them)";;
     esac
     R=$(tool recompute_beliefs "{\"claim_ids\":[\"$CR\"]}")
     echo "   recompute_beliefs: $(verdict "$R") claims_recomputed=$(field "$R" claims_recomputed) frame_writes=$(field "$R" frame_writes) | $(maint_rows)"
@@ -336,6 +356,64 @@ if want maintenance; then
       echo "   backfill_embeddings: (no OPENAI_API_KEY; not reported)"
     fi
   done
+fi
+
+# ── maintenance tools over authenticated HTTP ──────────────────────────────
+if want maint_auth; then
+  echo
+  echo "=== maintenance tools over AUTHENTICATED HTTP: the scope is the gate ==="
+  JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  mint() {  # $1 agent id, $2 scopes (comma-separated). HS256 with this run's secret.
+    SECRET="$JWT_SECRET" python3 - "$1" "$2" <<'PY'
+import base64, hashlib, hmac, json, os, sys, time, uuid
+agent, scopes = sys.argv[1], sys.argv[2].split(",")
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+now = int(time.time()) - 2
+claims = {"sub": agent, "iss": "epigraph", "aud": "epigraph-api", "exp": now + 3600,
+          "iat": now, "nbf": now, "jti": str(uuid.uuid4()), "scopes": scopes,
+          "client_type": "service", "owner_id": agent, "agent_id": agent}
+head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+body = b64(json.dumps(claims).encode())
+sig = hmac.new(os.environ["SECRET"].encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
+print(f"{head}.{body}.{b64(sig)}")
+PY
+  }
+  # PEER: claims:write, a member of NO group that owns the duplicate pair.
+  PEER=$(q "INSERT INTO agents (public_key, display_name) VALUES (decode(md5(random()::text)||md5(random()::text),'hex'), 'batch-h peer $LABEL') RETURNING id" | head -1)
+  # A direction of its own: the maintenance arm's pair uses a constant vector,
+  # and the sweep's neighbour search is corpus-wide, so an identical direction
+  # here would let that pair crowd this one out of the neighbour list.
+  VEC="('[0.9,'||array_to_string(array_fill(0.01::float8, ARRAY[1535]),',')||']')::vector"
+  HASH="decode(md5('bh-authdup-$LABEL')||md5('bh-authdup-$LABEL'),'hex')"
+  A1=$(q "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels, visibility, owner_group_id, embedding)
+          VALUES (gen_random_uuid(), 'Batch H auth duplicate $LABEL', $HASH, 0.7, '$FA', ARRAY['bh-authdup']::text[], 'group', '$FG', $VEC) RETURNING id" | head -1)
+  A2=$(q "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels, visibility, owner_group_id, embedding)
+          VALUES (gen_random_uuid(), 'Batch H auth duplicate $LABEL', $HASH, 0.6, '$MA', ARRAY['bh-authdup']::text[], 'group', '$OG', $VEC) RETURNING id" | head -1)
+  auth_rows() { echo "retired=$(q "SELECT count(*) FROM claims WHERE id IN ('$A1','$A2') AND is_current = false")"; }
+  for who in peer admin; do
+    stop_server
+    case "$who" in
+      peer)  BEARER="$(mint "$PEER" claims:read,claims:write)";;
+      admin) BEARER="$(mint "$PEER" claims:read,claims:write,claims:admin)";;
+    esac
+    start_server auth
+    q "UPDATE claims SET is_current=true, supersedes=NULL WHERE id IN ('$A1','$A2')" >/dev/null
+    case "$who" in
+      peer)  echo "--- claims:write-only bearer, no membership (expect: every call Forbidden, no ids listed, nothing retired)";;
+      admin) echo "--- claims:admin bearer (expect: admitted; the dry run lists the pair, the live run retires one)";;
+    esac
+    R=$(tool sweep_semantic_duplicates '{"dry_run":true,"labels_scope":["bh-authdup"],"similarity_threshold":0.05}')
+    echo "   sweep dry_run: $(verdict "$R") scanned=$(field "$R" scanned) exact_clusters=$(field "$R" 'clusters | length') | $(auth_rows)"
+    R=$(tool sweep_semantic_duplicates '{"dry_run":false,"labels_scope":["bh-authdup"],"similarity_threshold":0.05}')
+    echo "   sweep live:    $(verdict "$R") pairs_marked=$(field "$R" pairs_marked) exact_clusters=$(field "$R" 'clusters | length') failures=$(field "$R" failures) | $(auth_rows)"
+    R=$(tool recompute_beliefs '{"claim_ids":[]}')
+    echo "   recompute_beliefs: $(verdict "$R")"
+    R=$(tool backfill_embeddings '{"limit":1,"dry_run":true}')
+    echo "   backfill_embeddings dry_run: $(verdict "$R")"
+  done
+  stop_server
+  BEARER=""
+  JWT_SECRET=""
 fi
 
 echo

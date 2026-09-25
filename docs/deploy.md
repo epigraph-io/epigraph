@@ -716,9 +716,15 @@ the three tools refuse each call by name with nothing written. Everything else
 serves normally. The asymmetry is deliberate: here maintenance is three tools
 out of the whole surface, not the process's job. On a least-privilege
 deployment the documented fallback (unset, so `--database-url`, so
-`epigraph_app`) is therefore a refusal, not a zero-row no-op. **To enable the
-three tools, set `MAINTENANCE_DATABASE_URL` in the `epigraph-mcp` units'
-environment to a role that is a member of `epigraph_maintenance`.** Each tool
+`epigraph_app`) is therefore a refusal, not a zero-row no-op. **The fallback is
+never attached at all, even when `--database-url` could bypass RLS** (a
+superuser DSN): the three tools read and retire rows across every tenant, so
+enabling them is an explicit operator act, not a side effect of how the
+application DSN happens to be provisioned. **To enable the three tools, set
+`MAINTENANCE_DATABASE_URL` in the `epigraph-mcp` units' environment to a role
+that is a member of `epigraph_maintenance`.** Over HTTP they also require the
+`claims:admin` scope (`scope_map.rs`); a `claims:write` bearer is refused before
+the tool body runs. Each tool
 call also re-probes the connection it leased (`MaintenanceSession::assert_privileged`),
 so a role whose membership is revoked after boot is refused on its next call,
 not trusted on the strength of the boot probe.
