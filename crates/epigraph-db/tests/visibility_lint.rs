@@ -473,11 +473,40 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "claim.rs",
+        "supersede_conn",
+        "WRITE. The body of `supersede`, moved onto a caller-owned connection so the HTTP route \
+         can run it on a viewer-stamped transaction (batch H-a); the SQL is unchanged. Its one \
+         read (`SELECT agent_id, is_current, labels ... FOR the old claim`) is part of the \
+         mutation it guards, not a disclosure, and carries the same VISIBILITY-EXEMPT note it \
+         always had. Authorisation is claims_tenancy's / edges_tenancy's WITH CHECK against the \
+         connection's stamp; the route reads the target through the caller's viewer first.",
+    ),
+    (
+        "claim_theme.rs",
+        "delete_all_conn",
+        "WRITE. The body of `delete_all` (unassign every claim, delete every theme), on a \
+         caller-owned connection so `run_theme_kmeans` can wipe and rebuild in ONE transaction \
+         (batch H-a). A corpus-wide maintenance statement with no row to filter; the SQL is \
+         unchanged.",
+    ),
+    (
+        "claim.rs",
         "update_labels_conn",
         "WRITE. Label mutation on a claim the caller has already fetched under a viewer predicate \
          on the same connection; under migration 077 the claims_tenancy WITH CHECK (keyed on \
          epigraph_writable_groups()) is what authorises the row, not a read predicate. The \
          write-side gate is 16b's, not this lint's.",
+    ),
+    (
+        "claim.rs",
+        "patch_claim_atomic_conn",
+        "WRITE. Arrived by a SIGNATURE change, not a new function: its parameter was a \
+         `sqlx::Transaction`, which this rule does not read, and it now takes the \
+         `&mut PgConnection` a stamped `ScopedTx` derefs to, so the MCP `patch_claim` tool can \
+         reach it on an author-stamped transaction. Same argument as update_labels_conn: the \
+         FOR UPDATE read is part of the mutation it guards, and claims_tenancy's WITH CHECK \
+         (keyed on epigraph_writable_groups()) authorises the row. Both callers check the \
+         caller's read authority with a viewer-filtered get before they reach it.",
     ),
     (
         "claim.rs",
@@ -1128,6 +1157,23 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          authorised by edges_tenancy's WITH CHECK.",
     ),
     (
+        "edge.rs",
+        "create_symmetric_if_absent_oriented_conn",
+        "WRITE. `create_symmetric_if_absent_oriented` on a caller's connection so `link_epistemic` \
+         writes the edge on the same author-stamped transaction as the belief wiring keyed on its \
+         id. Its dedup probe is the write-path read `create_or_get` documents (it must see an \
+         existing edge whoever asks, or the get half becomes a duplicate create); the INSERT is \
+         authorised by edges_tenancy's WITH CHECK on the stamped connection.",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_returning_conn",
+        "WRITE. `create_symmetric_if_absent_returning` on a caller's connection, for \
+         `link_alternative`'s author-stamped transaction. Same argument as \
+         create_symmetric_if_absent_oriented_conn: a write-path dedup probe plus an INSERT \
+         authorised by edges_tenancy's WITH CHECK.",
+    ),
+    (
         "group_membership.rs",
         "count_own_revoked_rows_conn",
         "READ of `group_memberships`, and deliberately viewer-less: it is an AUTHORITY BOOTSTRAP \
@@ -1202,11 +1248,12 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
 /// Eighty-one repo fns take a `PgConnection` in their parameter list: 27 take a
 /// `Viewer` and the 54 below are enumerated with reasons. Fifty-two functions
 /// have a name ending `_conn`, which is why a bare grep disagrees with the
-/// register in both directions — it catches
-/// `ClaimRepository::patch_claim_atomic_conn` (whose parameter is a
-/// `Transaction`, not a `PgConnection`, so this rule correctly skips it) and it
-/// misses all eleven of the functions the widening added. Quote the rule with
-/// the number; the two are not interchangeable.
+/// register in both directions. At the widening it caught
+/// `ClaimRepository::patch_claim_atomic_conn`, whose parameter was then a
+/// `Transaction`, not a `PgConnection`, so this rule correctly skipped it. That
+/// function now takes a `PgConnection` and is in the register. The grep also
+/// misses all eleven of the functions the widening added. Quote the rule with the
+/// number; the two are not interchangeable.
 ///
 /// # What this rule still cannot see
 ///
@@ -1215,7 +1262,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
 /// defect species this whole batch exists to remove.
 ///
 /// 1. **Spelling.** A `Transaction` parameter, as the `patch_claim_atomic_conn`
-///    case shows. The generic `E: sqlx::PgExecutor<'e>` spelling is covered
+///    case showed until it moved to a connection parameter. The generic `E: sqlx::PgExecutor<'e>` spelling is covered
 ///    separately by [`every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt`];
 ///    between the two, the remaining uncovered executor spelling is the
 ///    transaction.
@@ -1311,6 +1358,46 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── Batch H-a: writes whose executor widened so a route or the theme
+    // clusterer can put them in ONE transaction. Same argument as
+    // `trace.rs::create` below: the control on a write is the table's
+    // `WITH CHECK` against the connection's stamp, not an in-query predicate.
+    // SQL unchanged in every one.
+    (
+        "claim_version.rs",
+        "create",
+        "INSERT INTO `claim_versions` (RLS, FORCEd). Widened so HTTP supersede records the \
+         version inside its viewer-stamped transaction under a SAVEPOINT; on the raw pool the \
+         unstamped INSERT was refused on every configuration and the 201 went out with no row.",
+    ),
+    (
+        "behavioral_execution.rs",
+        "create",
+        "INSERT INTO `behavioral_executions` (no row security). Widened so HTTP report_outcome \
+         writes it on the same transaction as the counters it records, all or nothing.",
+    ),
+    (
+        "claim_theme.rs",
+        "create",
+        "INSERT INTO `claim_themes` (no row security). Widened so a theme row commits only with \
+         its assignment; separately on a pool, a refused assignment left the theme behind.",
+    ),
+    (
+        "claim_theme.rs",
+        "set_centroid",
+        "UPDATE of `claim_themes` (no row security), in the same transaction as the theme row.",
+    ),
+    (
+        "claim_theme.rs",
+        "update_count",
+        "UPDATE of `claim_themes` (no row security), in the same transaction as the theme row.",
+    ),
+    (
+        "claim_theme.rs",
+        "bulk_assign",
+        "UPDATE claims SET theme_id. A WRITE governed by claims_tenancy's WITH CHECK against the \
+         connection's stamp; widened so the assignment and the theme row commit together.",
+    ),
     // ── THE THREE WRITES. Every other entry in this register is a READ with
     // nothing to filter; these are the first writes, and the argument is a
     // different one, so it is stated in full rather than borrowed.
@@ -1654,6 +1741,23 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          transaction just created or fetched; the edge's authority was decided by the \
          statement that produced its id, and `edges_tenancy` on the stamped connection still \
          backstops the read.",
+    ),
+    (
+        "edge.rs",
+        "retract_by_id",
+        "WRITE. `UPDATE edges SET valid_to = now()` on one edge by primary key. Widened from \
+         `&PgPool` so the MCP `delete_edge` tool runs it on an author-stamped transaction. \
+         Authority is edges_tenancy on that connection: its USING decides whether the row is \
+         reachable at all (an unreachable edge is `false`, i.e. not found), and its WITH CHECK \
+         decides whether it may be kept. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "edge.rs",
+        "update_valid_to_and_properties",
+        "WRITE. One `UPDATE edges` by primary key. Widened from `&PgPool` for the same reason as \
+         retract_by_id, for `patch_edge`. edges_tenancy on the stamped connection authorises the \
+         row; an unreachable edge is `DbError::NotFound`. SCOPE: executor only; the SQL is \
+         unchanged.",
     ),
     (
         "frame.rs",

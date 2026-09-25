@@ -243,9 +243,9 @@ async fn memorize_distinct_content_inserts_normally_when_embedder_unavailable() 
 }
 
 /// Pull `claim_id` out of a `submit_claim`/`memorize` `CallToolResult`.
-/// Mirrors `extract_submit_claim_id` in `src/tools/claims.rs` (not reused
-/// directly since that helper is private to the crate's src tree, not
-/// exported to integration tests).
+/// It mirrored `extract_submit_claim_id` in `src/tools/claims.rs`, which was
+/// removed when `resolve_backlog_item` stopped parsing `submit_claim`'s response
+/// and started running the submission's write phase on its own transaction.
 fn first_text_claim_id(result: &rmcp::model::CallToolResult) -> String {
     let text = result
         .content

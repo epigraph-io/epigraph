@@ -56,13 +56,13 @@ SOCK="$E2E/ue.sock.$LABEL"
 H=(-H Content-Type:application/json -H Accept:application/json,text/event-stream)
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
-q() { PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
+q() { PGPASSWORD="$E2E_SU_PW" psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
 
 echo "### binary: $BIN"
 # Serialized for the same reason as every other script here: TRUNCATE + count.
 LOCKFIFO="$E2E/.uelock.$LABEL"
 rm -f "$LOCKFIFO"; mkfifo "$LOCKFIFO"
-PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
+PGPASSWORD="$E2E_SU_PW" psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
   -c "SELECT pg_advisory_lock(918273645);" -f "$LOCKFIFO" >/dev/null 2>&1 &
 LOCKPID=$!
 exec 9>"$LOCKFIFO"

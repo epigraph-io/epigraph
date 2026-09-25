@@ -2,7 +2,11 @@
 //!
 //! Every claim-creating or claim-updating tool calls into this module after
 //! persisting the claim. DS is the primary belief authority — `update_with_evidence`
-//! propagates errors. `submit_claim` treats DS as best-effort (claim is already persisted).
+//! propagates errors, and so do `submit_claim` and `memorize`: their new-claim
+//! wiring runs inside the submission's own author-stamped transaction, before
+//! COMMIT, and a wiring failure rolls the whole submission back
+//! (`claim_helper::wire_ds_for_new_claim_in_tx`). It used to be best-effort and
+//! post-commit, which reported success over a committed claim with no BBA.
 //!
 //! Each BBA is Shafer-discounted by its `source_strength` before combination to
 //! prevent runaway confirmation (C2) and dilution attacks (C3).
@@ -295,6 +299,63 @@ pub struct DsAutoInput<'a> {
     pub evidence_type: Option<&'a str>,
 }
 
+/// The future an [`optional_read_under_savepoint`] read returns: it borrows the
+/// savepoint's connection for `'c`.
+pub type OptionalRead<'c, T, E> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<T>, E>> + Send + 'c>>;
+
+/// Run an OPTIONAL read (one whose failure the caller treats as "no value")
+/// under a SAVEPOINT, so its failure cannot abort the enclosing transaction.
+///
+/// # Why this exists
+///
+/// Several calibration reads in this module were written `.await.ok()`, and
+/// their comments promise that a database error "falls through to None". That
+/// was true while they ran on their own pooled checkout. Since the new-claim
+/// wiring moved INSIDE the submission transaction (15f35c6b), a failed
+/// statement ABORTS that transaction: the `.ok()` hides the error, and the NEXT
+/// statement fails with `current transaction is aborted`, so `submit_claim`,
+/// `memorize` and `resolve_backlog_item` would fail with an error that names the
+/// wrong statement (review finding, atomicity-authz). Under a savepoint the
+/// failed read is rolled back alone and the promise holds again.
+///
+/// Returns `Ok(None)` when the read fails (logged at WARN). Only a failure of
+/// the savepoint itself (`SAVEPOINT` / `RELEASE` / `ROLLBACK TO`) is an `Err`:
+/// that means the connection is unusable and the caller must not go on.
+///
+/// # Errors
+/// A string naming the savepoint statement that failed.
+pub async fn optional_read_under_savepoint<T, E, F>(
+    conn: &mut sqlx::PgConnection,
+    what: &'static str,
+    read: F,
+) -> Result<Option<T>, String>
+where
+    E: std::fmt::Display,
+    F: for<'c> FnOnce(&'c mut sqlx::PgConnection) -> OptionalRead<'c, T, E>,
+{
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("{what}: could not open a savepoint: {e}"))?;
+    let outcome = read(&mut sp).await;
+    match outcome {
+        Ok(value) => {
+            sp.commit()
+                .await
+                .map_err(|e| format!("{what}: could not release the savepoint: {e}"))?;
+            Ok(value)
+        }
+        Err(e) => {
+            tracing::warn!(read = what, error = %e, "optional read failed; treated as absent");
+            sp.rollback()
+                .await
+                .map_err(|e| format!("{what}: could not roll back to the savepoint: {e}"))?;
+            Ok(None)
+        }
+    }
+}
+
 /// Auto-wire DS for a **new** claim.
 ///
 /// Creates a BBA, assigns the claim to the binary frame, computes Bel/Pl/BetP,
@@ -369,15 +430,23 @@ pub async fn auto_wire_ds_for_claim(
         .unwrap_or_else(|_| {
             epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
         });
-    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
-        .await
-        .ok()
-        .flatten();
+    // Both optional: a failure means "no per-frame override", and each runs under
+    // its own savepoint because this function runs inside the submission's
+    // transaction (see `optional_read_under_savepoint`).
+    let per_frame_intra =
+        optional_read_under_savepoint(&mut *conn, "intra_evidence_locality_factor", |c| {
+            Box::pin(FrameRepository::get_intra_evidence_locality_factor(
+                c, frame_id,
+            ))
+        })
+        .await?;
     let per_frame_evidence_weights =
-        FrameRepository::get_per_frame_evidence_type_weights(&mut *conn, frame_id)
-            .await
-            .ok()
-            .flatten();
+        optional_read_under_savepoint(&mut *conn, "evidence_type_weights", |c| {
+            Box::pin(FrameRepository::get_per_frame_evidence_type_weights(
+                c, frame_id,
+            ))
+        })
+        .await?;
 
     let all_rows =
         MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
@@ -515,20 +584,26 @@ pub async fn auto_wire_ds_update(
         .unwrap_or_else(|_| {
             epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
         });
-    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
-        .await
-        .ok()
-        .flatten();
+    let per_frame_intra =
+        optional_read_under_savepoint(&mut *conn, "intra_evidence_locality_factor", |c| {
+            Box::pin(FrameRepository::get_intra_evidence_locality_factor(
+                c, frame_id,
+            ))
+        })
+        .await?;
 
     // Phase 4 (issue #197): per-frame evidence-type weight override map.
     // When set, its keyed entries win over the global calibration table
     // at Tier 1 of `effective_source_strength`. Loaded once above the
-    // combine loop. On any DB error we fall through to `None`.
+    // combine loop. On any DB error we fall through to `None`, under a
+    // savepoint so the error cannot abort a caller's transaction.
     let per_frame_evidence_weights =
-        FrameRepository::get_per_frame_evidence_type_weights(&mut *conn, frame_id)
-            .await
-            .ok()
-            .flatten();
+        optional_read_under_savepoint(&mut *conn, "evidence_type_weights", |c| {
+            Box::pin(FrameRepository::get_per_frame_evidence_type_weights(
+                c, frame_id,
+            ))
+        })
+        .await?;
 
     // Read current pignistic_prob for monotonicity clamp.  Supporting evidence
     // must never lower BetP: high-conflict K between legacy mixed-format BBAs
@@ -545,11 +620,19 @@ pub async fn auto_wire_ds_update(
                  WHERE c.id = $1 /* {VISIBILITY:c} */",
             2,
         );
-        let mut q = sqlx::query_scalar::<_, Option<f64>>(&sql).bind(claim_id);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        q.fetch_optional(&mut *conn).await.ok().flatten().flatten()
+        // Owned, so the boxed read borrows only the savepoint's connection.
+        let group: Option<Vec<Uuid>> = viewer.group_bind().map(<[Uuid]>::to_vec);
+        optional_read_under_savepoint(&mut *conn, "prior pignistic_prob", move |c| {
+            Box::pin(async move {
+                let mut q = sqlx::query_scalar::<_, Option<f64>>(&sql).bind(claim_id);
+                if let Some(g) = group {
+                    q = q.bind(g);
+                }
+                q.fetch_optional(c).await
+            })
+        })
+        .await?
+        .flatten()
     };
 
     let combined = if all_rows.len() <= 1 {

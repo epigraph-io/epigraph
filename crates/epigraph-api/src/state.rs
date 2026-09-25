@@ -1187,6 +1187,52 @@ impl AppState {
         scoped.read_as(viewer).await
     }
 
+    /// Begin ONE transaction stamped with `viewer`'s tenancy context, for a
+    /// handler's writes.
+    ///
+    /// The write-side twin of [`Self::read_as`], and it refuses for the same
+    /// reason: a fallback to `db_pool` would be an UNSTAMPED write, which on a
+    /// schema without the orphan `*_privacy` policies is refused for every
+    /// caller (`claims_tenancy`'s `WITH CHECK` sees an empty writable set) and
+    /// on one with them is admitted for every caller. Neither is an
+    /// authorization decision. Stamped, the database decides by the row's owner
+    /// group and the caller's writable set; a refusal is `42501`
+    /// ([`crate::errors::is_insufficient_privilege`]), and nothing commits.
+    ///
+    /// `handler` names the call site in the log line.
+    ///
+    /// # Errors
+    /// `ApiError::InternalError` when this `AppState` was not built from a
+    /// `ScopedPool`, or when `BEGIN` / the stamp fails.
+    #[cfg(feature = "db")]
+    pub async fn write_as(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        handler: &'static str,
+    ) -> Result<epigraph_db::ScopedTx<'_>, crate::errors::ApiError> {
+        let scoped = self.scoped.as_ref().ok_or_else(|| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                handler,
+                "write refused: this process was not built from a ScopedPool"
+            );
+            crate::errors::ApiError::InternalError {
+                message: "Failed to acquire a scoped transaction".to_string(),
+            }
+        })?;
+        scoped.begin_as(viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                error = %e,
+                handler,
+                "could not begin a viewer-stamped transaction"
+            );
+            crate::errors::ApiError::InternalError {
+                message: "Failed to acquire a scoped transaction".to_string(),
+            }
+        })
+    }
+
     /// Create new application state with database pool and custom signature verification state
     #[cfg(feature = "db")]
     pub fn with_db_and_signature_state(

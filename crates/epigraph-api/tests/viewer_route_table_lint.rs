@@ -272,7 +272,10 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // enforcing it, which is precisely the kind of reasoning this register
     // exists to keep visible rather than to accept silently.
     ("search.rs", 1),
-    ("workflows.rs", 4),
+    // 4 -> 3 (batch H-a): `report_outcome`'s unfiltered `SELECT content FROM
+    // claims` for the goal fallback became a `get_by_id_with_labels` read
+    // through the caller's viewer.
+    ("workflows.rs", 3),
 ];
 
 /// Fail-open scope-check sites: `if let Some(..) = auth_ctx { check_scopes(..) }`
@@ -495,7 +498,11 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("revoke_signature.rs", 1),
     // 4, not 5: the fifth is a `sqlx::query!` macro — see the note above.
     ("submit.rs", 4),
-    ("workflows.rs", 4),
+    // 4 -> 2 (batch H-a): `report_outcome`'s two unstamped, result-discarding
+    // `UPDATE claims` (truth value, counters) became
+    // `ClaimRepository::update_truth_value_conn` / `set_properties_conn` on a
+    // viewer-stamped transaction.
+    ("workflows.rs", 2),
 ];
 
 /// Tenancy-scoped tables whose route-layer writes this lint counts.

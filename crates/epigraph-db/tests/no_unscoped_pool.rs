@@ -563,7 +563,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 296;
+const HIGH_WATER: usize = 274;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -600,12 +600,26 @@ const HIGH_WATER: usize = 296;
 /// `HIGH_WATER` 298 -> 297, the file keeping 24 sites. Batch F's community
 /// membership fix took `routes/community.rs` 3 -> 2 and `HIGH_WATER` 297 ->
 /// 296, the file keeping 2 sites, read off `the_scanner_is_not_vacuous`'s own
-/// failure on the converted tree.
+/// failure on the converted tree. Batch H6 took `routes/versioning.rs` 8 -> 7
+/// and `routes/workflows.rs` 24 -> 23 (the two write-path authorization reads
+/// moved onto `AppState::read_as`), so `HIGH_WATER` 296 -> 294 with both files
+/// keeping sites, read off the same failure (`left: 294, right: 296`). Its
+/// `PATCH /claims/:id/labels` sibling took `routes/claims.rs` 21 -> 20, so
+/// `HIGH_WATER` 294 -> 293, the file keeping 20 sites. The batch H-a review's
+/// success-over-nothing routes moved their writes onto
+/// `AppState::write_as` transactions: `routes/versioning.rs` 7 -> 4
+/// (supersede), `routes/workflows.rs` 23 -> 15 (deprecate_workflow,
+/// report_outcome), `routes/computation.rs` 10 -> 8 (bp/propagate's apply) and
+/// `routes/crud.rs` 36 -> 31 (themes/create-with-centroid), so `HIGH_WATER`
+/// 293 -> 275 with every file keeping sites, read off this test's own failure
+/// on the converted tree. Dropping `PATCH /claims/:id/labels`' author-stamp
+/// arm removed its `Viewer::resolve(&state.db_pool, ..)`: `routes/claims.rs`
+/// 20 -> 19, `HIGH_WATER` 275 -> 274.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 298 sites across 44 files as of this commit. Lower an entry when a shard
+/// 293 sites across 44 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -638,10 +652,15 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // site in that file, and it is the first decline in this series whose
     // blocker is the site and not the handler. The remaining NINETEEN sit in
     // write handlers — `create_claim` (9), `update_claim` (6), `patch_claim`
-    // (2), `update_labels` (2) — which with those two gates is 21, the row
-    // below. (An earlier draft of this comment said "seventeen" and did not
-    // close the arithmetic against the row it annotates.)
-    ("routes/claims.rs", 21),
+    // (2), `update_labels` (2) — which with those two gates is 21. (An earlier
+    // draft of this comment said "seventeen" and did not close the arithmetic
+    // against the row it annotates.) Batch H6 took `update_labels` 2 -> 1: its
+    // owner read moved onto `AppState::read_as` and its write onto
+    // `ScopedPool::begin_as`. The one site it keeps is the admin arm's
+    // `Viewer::resolve(&state.db_pool, author)`, a membership read through the
+    // SECURITY DEFINER `epigraph_live_memberships` — the same call
+    // `ViewerExtractor` makes on the same pool. 20, the row below.
+    ("routes/claims.rs", 19),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
@@ -660,7 +679,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // the shard declined to produce one. Of the ten that remain, seven are
     // `propagate_beliefs`, which writes through two of them, and three are
     // `compose_subgraphs`. Both are named in that file's module doc.
-    ("routes/computation.rs", 10),
+    ("routes/computation.rs", 8),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 10),
@@ -701,7 +720,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `get_split_candidates`, `get_distant_claims`, `get_theme_embeddings`) onto
     // `AppState::read_as`. Every one of the thirty-six that remain sits in a
     // WRITE handler; this is the densest write-blocked file in the series.
-    ("routes/crud.rs", 36),
+    ("routes/crud.rs", 31),
     ("routes/edges.rs", 10),
     ("routes/embeddings.rs", 2),
     // 8 before conversion shard 7, and the largest single-file drop in that
@@ -814,7 +833,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // blocked at SITE level: `let pool = state.db_pool.clone()` is moved into a
     // detached `tokio::spawn`, which a `ScopedRead<'_>` borrowed from
     // `AppState` cannot outlive.
-    ("routes/versioning.rs", 8),
+    //
+    // 8 -> 7 (batch H6): `supersede_claim`'s ownership read
+    // (`SELECT agent_id FROM claims WHERE id = $1`) moved onto
+    // `AppState::read_as` + `ClaimRepository::get_by_id` with the caller's
+    // viewer (F-write-authz-reads-unfiltered). Five `supersede_claim` sites and
+    // two `mark_duplicate` sites remain, all write. Read off this test's
+    // failure output.
+    ("routes/versioning.rs", 4),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is
@@ -852,7 +878,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // whether it may provision needs a PRINCIPAL-stamped read of the agent's own
     // revoked memberships (the first revision minted on an empty live set and
     // revived a revoked admin). Read off this test's failure output.
-    ("routes/workflows.rs", 24),
+    //
+    // 24 -> 23 (batch H6): `deprecate_workflow`'s existence gate moved onto
+    // `AppState::read_as` + `ClaimRepository::get_by_id_with_labels` with the
+    // caller's viewer (F-write-authz-reads-unfiltered). Read off this test's
+    // failure output.
+    ("routes/workflows.rs", 15),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

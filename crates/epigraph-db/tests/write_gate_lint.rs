@@ -159,7 +159,7 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     ),
     ("claim.rs::merge_properties", "caller-supplied id"),
     ("claim.rs::patch_claim_atomic_conn", "caller-supplied id"),
-    ("claim.rs::supersede", "caller-supplied id"),
+    ("claim.rs::supersede_conn", "caller-supplied id"),
     ("claim.rs::update_trace_id_conn", "caller-supplied id"),
     ("claim.rs::update_truth_value_conn", "caller-supplied id"),
     ("edge.rs::retract", "caller-supplied id"),
@@ -215,7 +215,7 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
         "clustering, corpus-wide",
     ),
     ("claim_theme.rs::bulk_assign", "clustering, corpus-wide"),
-    ("claim_theme.rs::delete_all", "clustering, corpus-wide"),
+    ("claim_theme.rs::delete_all_conn", "clustering, corpus-wide"),
     ("claim_theme.rs::unassign_claim", "clustering, corpus-wide"),
     (
         "evidence.rs::store_embedding",

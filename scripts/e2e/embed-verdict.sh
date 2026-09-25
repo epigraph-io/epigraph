@@ -22,6 +22,6 @@ E2E_SU_USER="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*://([^:]+):.*#\1#')"
 E2E_DB="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*/([^/?]+)$#\1#')"
 # -----------------------------------------------------------------------------
 export PGPASSWORD="$E2E_SU_PW"
-psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c \
+psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c \
   "SELECT 'embedded=' || count(*) FILTER (WHERE embedding IS NOT NULL) || '/' || count(*) AS embeddings
      FROM claims"

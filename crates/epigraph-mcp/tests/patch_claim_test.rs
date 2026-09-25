@@ -9,7 +9,7 @@ use common::*;
 async fn patch_claim_applies_trace_props_labels_atomically(pool: PgPool) {
     let id = seed_claim_with_labels(&pool, "x", &["alpha"]).await;
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // reasoning_traces.reasoning_type CHECK constraint: must be one of
     // 'deductive', 'inductive', 'abductive', 'analogical', 'statistical'.

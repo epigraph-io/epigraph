@@ -181,11 +181,44 @@ pub async fn do_link_epistemic(
         ));
     }
 
-    let pool = &server.pool;
+    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT. The existence
+    // reads, the edge, the belief wiring, the `edge.added` event and the belief
+    // readback all run on it, and it commits once.
+    //
+    // It used to be three units: the edge INSERT on the unstamped pool, the
+    // belief wiring on its own stamped transaction, and the event on the pool
+    // again. The edge on the unstamped pool was admitted only when world-owned
+    // (two PUBLIC endpoints, which 070's BEFORE trigger makes world-owned). An
+    // edge touching a group-private claim is owned by that claim's group and was
+    // refused on a cleanly-migrated schema. Production admitted it only through
+    // the orphan `edges_privacy` policy that R3 drops. The existence reads on the
+    // pool could not see a group-private endpoint at all, so that population never
+    // reached the INSERT. Both halves move.
+    //
+    // THE BELIEF WIRING STAYS BEST-EFFORT, and it does so inside a SAVEPOINT, not
+    // by swallowing an error in this transaction. `claim_frames` and
+    // `mass_functions` take their tenancy from the TARGET claim, so an epistemic
+    // edge into a claim this agent's group cannot write is refused at the wiring.
+    // Unsavepointed, that refusal would abort the edge's transaction and turn
+    // COMMIT into a silent ROLLBACK. The edge lands on the production schema
+    // today, so that would be a regression there. The savepoint is committed only
+    // when a BBA was actually materialized (`Wired`) and rolled back on every
+    // other outcome. That keeps the old contract: `belief_wired` and the committed
+    // state cannot disagree.
+    //
+    // THE STAMP IS `server.agent_id()`'s, as for every other MCP write. An
+    // endpoint in another agent's private group is refused loudly by the edge's
+    // WITH CHECK, or for a co-owned edge by RETURNING's intersection read, and
+    // nothing is written. Whether a caller should carry write authority into a
+    // group this process cannot write is the cross-agent ownership question
+    // (#374), not a stamping one.
+    let actor_id = server.agent_id().await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "link_epistemic").await?;
 
     // Verify both claims exist via the repo layer (SQL stays in epigraph-db).
     // Disambiguate which side is missing.
-    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(source_id))
+    if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(source_id))
         .await
         .map_err(internal_error)?
         .is_none()
@@ -194,7 +227,7 @@ pub async fn do_link_epistemic(
             "source_claim_id {source_id} not found"
         )));
     }
-    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(target_id))
+    if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(target_id))
         .await
         .map_err(internal_error)?
         .is_none()
@@ -218,8 +251,8 @@ pub async fn do_link_epistemic(
     // the row does not describe.
     let (edge_id, was_created, wire_source, wire_target) =
         if is_symmetric_relationship(&params.relationship) {
-            let upsert = EdgeRepository::create_symmetric_if_absent_oriented(
-                pool,
+            let upsert = EdgeRepository::create_symmetric_if_absent_oriented_conn(
+                &mut tx,
                 source_id,
                 target_id,
                 &params.relationship,
@@ -234,8 +267,8 @@ pub async fn do_link_epistemic(
                 upsert.target_id,
             )
         } else {
-            let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
-                pool,
+            let (edge_row, was_created) = EdgeRepository::create_if_not_exists_conn(
+                &mut tx,
                 source_id,
                 "claim",
                 target_id,
@@ -286,104 +319,64 @@ pub async fn do_link_epistemic(
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_optional(pool).await.map_err(internal_error)?
+        q.fetch_optional(&mut *tx).await.map_err(internal_error)?
     };
 
     if let Some(agent_id) = source_agent_id {
-        // Best-effort: a recompute error must not lose the durable edge.
+        // Best-effort: a wiring error must not lose the durable edge.
         // `belief_wired` is true ONLY when the engine actually materialized
         // a BBA and recomputed the target (`Wired`). The other outcomes
         // (SourceFactorless / Vacuous / NonEpistemic / already-wired / None-on-error)
         // move no belief, so we honestly report `belief_wired=false`.
         //
-        // ONE AUTHOR-STAMPED TRANSACTION, and this is what made `belief_wired`
-        // honest. `auto_wire_edge_if_epistemic` writes `claim_frames`,
-        // `mass_functions` and an `UPDATE claims` on the TARGET; on the unstamped
-        // pool the first of those is refused on a cleanly-migrated schema —
-        // `claim_frames` carries no orphan `*_privacy` policy, so it is refused in
-        // PRODUCTION too — and the failure is swallowed, so the tool reported
-        // `belief_wired: false` and every `supports`/`refutes` edge moved no belief
-        // mass. The refusal is now the only reason that field can be false.
-        //
-        // THE STAMP IS `server.agent_id()`'s, AND THE RESIDUAL IS THE SAME ONE
-        // `submit_ds_evidence` STATES AT ITS OWN SITE: `claim_frames` and
-        // `mass_functions` are CLAIM-DERIVED, so migration 074/070 fill their
-        // tenancy from the TARGET claim and the `WITH CHECK` asks about the
-        // target's group — not the caller's, and not the source author's (which is
-        // what the BBA is ATTRIBUTED to, a different question). So an epistemic
-        // edge into another group's claim stays refused here. Whether an admin
-        // scope should carry write authority into a group it is not a member of is
-        // a tenancy-model decision; `tools/ds.rs` and `tools/claims.rs`
-        // (`update_with_evidence`) carry the same sentence, and
+        // The wiring writes `claim_frames`, `mass_functions` and an
+        // `UPDATE claims` on the TARGET. Those tables are CLAIM-DERIVED, so
+        // migration 074/070 fill their tenancy from the TARGET claim and the
+        // `WITH CHECK` asks about the target's group, not the caller's and not
+        // the source author's (which is what the BBA is ATTRIBUTED to, a
+        // different question). An epistemic edge into another group's claim
+        // therefore moves no belief. `tools/ds.rs` and `tools/claims.rs`
+        // (`update_with_evidence`) carry the same residual, and
         // `epigraph-db/tests/tool_write_tables_require_a_stamp.rs` pins the pair.
-        let mut ds_tx = match crate::claim_helper::begin_author_stamped_tx(
-            server,
-            server.agent_id().await?,
-            "link_epistemic",
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(internal_error)?;
+        let outcome = auto_wire_edge_if_epistemic(
+            &mut sp,
+            viewer,
+            was_created,
+            edge_id,
+            wire_source,
+            "claim",
+            wire_target,
+            "claim",
+            &params.relationship,
+            agent_id,
         )
-        .await
-        {
-            Ok(tx) => Some(tx),
-            Err(e) => {
-                tracing::warn!(
-                    edge = %edge_id,
-                    "edge auto-wire skipped: {}. The edge is durable but moves no belief mass",
-                    e.message
-                );
-                None
-            }
-        };
-        let outcome = match ds_tx.as_mut() {
-            None => None,
-            Some(tx) => {
-                let o = auto_wire_edge_if_epistemic(
-                    tx,
-                    viewer,
-                    was_created,
-                    edge_id,
-                    wire_source,
-                    "claim",
-                    wire_target,
-                    "claim",
-                    &params.relationship,
-                    agent_id,
-                )
-                .await;
-                o
-            }
-        };
-        // Commit only when a BBA was actually materialized. On every other
-        // outcome — NonEpistemic, SourceFactorless, Vacuous, or a swallowed
-        // failure — the transaction is dropped and rolled back, so a partial
-        // wiring is never left behind and the `Wired` verdict and the committed
-        // state cannot disagree.
-        let wired = matches!(outcome, Some(EdgeFactorOutcome::Wired));
-        if let Some(tx) = ds_tx {
-            if wired {
-                if let Err(e) = tx.commit().await {
-                    tracing::warn!(
-                        edge = %edge_id,
-                        "edge auto-wire computed but could not commit: {e}. Nothing was written"
-                    );
-                    belief_wired = false;
-                } else {
-                    belief_wired = true;
-                }
-            }
+        .await;
+        // Release the savepoint only when a BBA was actually materialized. On
+        // every other outcome it is rolled back, so a partial wiring is never
+        // left behind and the `Wired` verdict and the committed state cannot
+        // disagree.
+        if matches!(outcome, Some(EdgeFactorOutcome::Wired)) {
+            sp.commit().await.map_err(internal_error)?;
+            belief_wired = true;
+        } else {
+            sp.rollback().await.map_err(internal_error)?;
         }
     }
 
     if was_created {
-        // Emit the durable `edge.added` event (best-effort; never fail the call
-        // on a publish error). Actor = the MCP signer agent, mirroring
-        // `emit_tool_invoked`'s actor resolution. Scoped to genuine creation
-        // only — a re-assertion of an existing edge (including a wake-up
-        // wire) must not re-emit `edge.added`.
-        let actor_id = server.agent_id().await.ok();
-        let _ = EventRepository::publish_or_log(
-            pool,
+        // Emit the durable `edge.added` event on the SAME transaction. It is
+        // SAVEPOINT-wrapped inside `publish_or_log_conn`, so a refused event
+        // cannot abort the edge, and it shares the edge's fate: there is no
+        // `edge.added` for an edge that was rolled back. Actor = the MCP
+        // signer agent, mirroring `emit_tool_invoked`'s actor resolution.
+        // Scoped to genuine creation only — a re-assertion of an existing edge
+        // (including a wake-up wire) must not re-emit `edge.added`.
+        let _ = EventRepository::publish_or_log_conn(
+            &mut tx,
             "edge.added",
-            actor_id,
+            Some(actor_id),
             &serde_json::json!({
                 "edge_id": edge_id,
                 "source_type": "claim",
@@ -405,10 +398,18 @@ pub async fn do_link_epistemic(
     // on a reverse symmetric dedup hit is the caller's SOURCE. The response
     // echoes it as `belief_target_claim_id` so the caller never has to guess
     // which claim the interval belongs to.
-    let target_belief =
-        match ClaimRepository::get_belief_columns(pool, viewer, ClaimId::from_uuid(wire_target))
-            .await
-        {
+    //
+    // Inside the transaction, before COMMIT, and under a SAVEPOINT because the
+    // failure is swallowed: this read sees exactly what the wiring above wrote,
+    // and a failed read cannot abort the edge.
+    let target_belief = {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(internal_error)?;
+        let read =
+            ClaimRepository::get_belief_columns(&mut *sp, viewer, ClaimId::from_uuid(wire_target))
+                .await;
+        sp.rollback().await.map_err(internal_error)?;
+        match read {
             Ok(Some(cols)) => match (cols.belief, cols.plausibility, cols.pignistic_prob) {
                 (Some(belief), Some(plausibility), Some(pignistic_prob)) => {
                     Some(LinkEpistemicBelief {
@@ -430,7 +431,10 @@ pub async fn do_link_epistemic(
                 );
                 None
             }
-        };
+        }
+    };
+
+    tx.commit().await.map_err(internal_error)?;
 
     success_json(&LinkEpistemicResponse {
         edge_id: edge_id.to_string(),

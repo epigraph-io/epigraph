@@ -102,55 +102,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          is in WRITE_TOKENS (see the note there).",
     ),
     (
-        "tools/claims.rs",
-        "ClaimRepository::update_labels",
-        1,
-        "`resolve_backlog_item`'s step 3, the `resolved` label PATCH on the ORIGINAL backlog \
-         claim. RE-MEASURED a second time, and the previous correction was itself wrong: it said \
-         this was the `update_labels` TOOL, but the only `ClaimRepository::update_labels(&server.pool` \
-         in this file is inside `resolve_backlog_item`, and the `update_labels` tool SUCCEEDS on a \
-         cleanly-migrated schema as `epigraph_app` (`scripts/e2e/probe-tools.sh` CONFIG A: \
-         `labelled=1`). A tier-A `UPDATE claims` on a claim that is frequently ANOTHER agent's, \
-         so its stamp is an ownership question, not a mechanical conversion. Not in E1/E2.",
-    ),
-    (
-        "tools/claims.rs",
-        "EdgeRepository::create_if_not_exists",
-        1,
-        "`resolve_backlog_item`'s `basis -justifies-> resolution` edge. RE-MEASURED: this entry \
-         previously read \"`update_with_evidence`'s CHALLENGED/SUPPORTED verb-edge\", and there \
-         is no such call site — `update_with_evidence` emits no verb-edge, and neither \
-         `CHALLENGED` nor `SUPPORTED` appears anywhere in this file. An inherited description \
-         that names the wrong tool sends the next reader to convert the wrong line, so it is \
-         corrected here rather than carried. `edges` carries an orphan `edges_privacy` policy, so \
-         it lands in production and is refused on a clean migrate. Not in E1/E2: \
-         `resolve_backlog_item` is its own tool with its own population and its own ownership \
-         question (the basis claims are frequently another agent's).",
-    ),
-    (
-        "tools/claims.rs",
-        "server.pool.begin",
-        1,
-        "`patch_claim`. ATOMIC but unstamped. Invisible to an argument-shaped scan — it takes no \
-         `&server.pool` ARGUMENT — which is how it escaped the inherited inventory. Its fix is a \
-         REPOSITORY SIGNATURE change: `patch_claim_atomic_conn` takes `&mut sqlx::Transaction`, \
-         which `ScopedTx` is not, so the parameter has to become a connection and an \
-         `epigraph-api` caller moves with it.",
-    ),
-    (
-        "tools/dedup_sweep.rs",
-        "server.pool.acquire",
-        1,
-        "`sweep_semantic_duplicates`, one of the three MAINTENANCE tools. Hard-gated off by \
-         `maintenance.rs::maintenance_tools_run_on_the_maintenance_connection() == false`, which \
-         is checked before the pool is even consulted, so this line is unreachable. Converting \
-         the three tools' query plumbing is PR-17. \
-         REGISTERED UNDER `server.pool.acquire` RATHER THAN THE CASCADE CALLEE, and that rename \
-         is the point: the engine signature moved to `&mut PgConnection`, so the call no longer \
-         NAMES a pool and an argument-shaped scan stops seeing it. Keeping the site measured \
-         needed `acquire` in WRITE_TOKENS — see the note there.",
-    ),
-    (
         "tools/ds.rs",
         "FrameRepository::create",
         1,
@@ -167,22 +118,24 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          above; same reason it is admitted.",
     ),
     (
-        "tools/embeddings.rs",
-        "ClaimRepository::store_embedding",
-        1,
-        "`backfill_embeddings`, the second of the three MAINTENANCE tools, and the ONE remaining \
-         unstamped `UPDATE claims SET embedding` in this crate — `McpEmbedder`'s store is now \
-         routed through a declared `StorePath`. Unreachable for the same gate reason as \
-         `dedup_sweep`; it converts with PR-17 onto the maintenance connection, not onto a \
-         stamped one, because a backfill is not authored by anyone.",
-    ),
-    (
         "tools/events.rs",
         "EventRepository::insert",
         1,
         "`publish_event`. `events` is not a claim-derived tier-A table and takes no \
          `owner_group_id`, so there is no `WITH CHECK` for a stamp to satisfy. Registered because \
          the inherited inventory listed it and a reader deserves to know why it is not a defect.",
+    ),
+    (
+        "tools/evolve_step.rs",
+        "ClaimRepository::evolve_step",
+        1,
+        "`evolve_step`. Surfaced when `evolve` joined WRITE_TOKENS (batch H-a review); the site \
+         predates this register. MEASURED refused on a clean migrate (config A, 42501 on \
+         claims) and admitted on production's schema by the orphan `claims_privacy` policy. NOT \
+         converted, deliberately: its population is step claims authored by \
+         `workflow-ingest-system`, so the stamp that admits it is that SYSTEM agent's, and a \
+         system-stamped workflow mutation with no caller authority is H3 (backlog 84b2a98d), \
+         outside batch H-a. An R3 blocker, recorded in scripts/e2e/README.md.",
     ),
     (
         "tools/ingestion.rs",
@@ -208,95 +161,23 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          with neither never reaches it — it gets `begin_author_stamped_tx`'s refusal.",
     ),
     (
-        "tools/cdst_maintenance.rs",
-        "server.pool.acquire",
-        1,
-        "`recompute_beliefs`, one of the three MAINTENANCE tools, reached through `let pool = \
-         &server.pool` — invisible to this scan until it followed bindings. Hard-gated off like \
-         `dedup_sweep.rs` above, and its target is the maintenance connection, not a stamped one: \
-         a bulk recompute is authored by nobody. PR-17.",
-    ),
-    (
-        "tools/edge_mutation.rs",
-        "EdgeRepository::update_valid_to_and_properties",
-        1,
-        "`patch_edge`, through `let pool = &server.pool`. An `UPDATE edges`; for an edge between \
-         two PUBLIC claims the `edges_tenancy` trigger makes it world-owned public, which \
-         `edges_tenancy`'s WITH CHECK admits unstamped — MEASURED, `scripts/e2e/probe-unit-e.sh` \
-         CONFIG A REGISTER arm: `patch_edge isError:false`, `patched=1`. A group-owned edge is \
-         refused loudly (one statement). Not in E1/E2; converts with an owner-of-the-edge stamp.",
-    ),
-    (
-        "tools/edge_mutation.rs",
-        "EdgeRepository::retract_by_id",
-        1,
-        "`delete_edge`'s retraction (`valid_to = now()`), through `let pool = &server.pool`. \
-         Invisible until `retract` joined WRITE_TOKENS. Same world-owned-public argument as \
-         `patch_edge`; MEASURED on CONFIG A: `delete_edge isError:false`, `in_force=0`.",
-    ),
-    (
-        "tools/edge_mutation.rs",
-        "EventRepository::publish_or_log",
-        3,
-        "`patch_edge` / `delete_edge`'s best-effort audit events. `events` has no row-level \
-         security, and each is a single auto-committing statement outside any transaction, so \
-         the swallowed failure is genuinely fire-and-forget here.",
-    ),
-    (
-        "tools/link_alternative.rs",
-        "EdgeRepository::create_symmetric_if_absent_returning",
-        1,
-        "`link_alternative`'s `alternative_of` edge, through `let pool = &server.pool`. Between \
-         two PUBLIC claims the edge is world-owned public and admitted unstamped — MEASURED, \
-         CONFIG A REGISTER arm: `isError:false`, `alternative_of=1`, owner \
-         `00000000-…/public`. Between group-private claims it is refused loudly. Not in E1/E2.",
-    ),
-    (
-        "tools/link_epistemic.rs",
-        "EdgeRepository::create_if_not_exists",
-        1,
-        "`link_epistemic`'s edge INSERT, through `let pool = &server.pool`. Its BELIEF WIRING is \
-         stamped (E2: `belief_wired: true` on CONFIG A); the edge itself is world-owned public \
-         between public claims and admitted unstamped — MEASURED, `probe-unit-e.sh` \
-         `supports_edges=1`. A private endpoint makes it a group-owned edge and a loud refusal \
-         BEFORE any belief is wired.",
-    ),
-    (
-        "tools/link_epistemic.rs",
-        "EdgeRepository::create_symmetric_if_absent_oriented",
-        1,
-        "`link_epistemic`'s symmetric-relationship arm (`contradicts` and kin). Same edge-INSERT \
-         argument as its `create_if_not_exists` entry.",
-    ),
-    (
-        "tools/link_epistemic.rs",
-        "EventRepository::publish_or_log",
-        1,
-        "`link_epistemic`'s best-effort `edge.added` event: `events` has no row-level security, \
-         and it is emitted outside the stamped DS transaction.",
-    ),
-    (
-        "tools/link_hierarchical.rs",
-        "EdgeRepository::create_if_not_exists",
-        1,
-        "`link_hierarchical`'s structural edge, through `let pool = &server.pool`. World-owned \
-         public between public claims, admitted unstamped — MEASURED, CONFIG A REGISTER arm: \
-         `isError:false`, `decomposes_to=1`. Not in E1/E2.",
-    ),
-    (
         "tools/matching.rs",
         "EdgeRepository::create_symmetric_if_absent",
         1,
-        "`decide_match_candidate`'s SAME_AS edge. `edges`, so an orphan `edges_privacy` policy \
-         admits it in production and a clean migrate refuses it. Not in D1-D5; filed here so the \
-         set is complete rather than the set the brief happened to enumerate.",
+        "`decide_match_candidate`'s SAME_AS edge. CORRECTED by the batch H-a review, which \
+         MEASURED it on a clean migrate (config A): promote own<->own, foreign<->foreign and \
+         own<->foreign all created the edge. Between PUBLIC claims, migration 070's BEFORE \
+         trigger makes the edge world-owned and `edges_tenancy`'s static world arm admits it \
+         unstamped. The earlier reason (\"refused on a clean migrate\") was an inference. An \
+         edge touching a group-private claim is NOT covered by that measurement.",
     ),
     (
         "tools/perspectives.rs",
         "EdgeRepository::create",
         1,
-        "`create_perspective`'s provenance edge. Same `edges` position as `matching.rs`: admitted \
-         in production by the orphan `edges_privacy` policy, refused on a clean migrate.",
+        "`create_perspective`'s provenance edge. CORRECTED by the batch H-a review: MEASURED OK \
+         on a clean migrate (config A), the edge world-public, perspective +1. Same static world \
+         arm as `matching.rs` above; the earlier \"refused on a clean migrate\" was inferred.",
     ),
     (
         "tools/perspectives.rs",
@@ -314,14 +195,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/supersede.rs",
-        "ClaimRepository::supersede",
-        1,
-        "`supersede_claim`. Tier-A `claims` UPDATE plus the embedding null in the same repo \
-         transaction. Unconverted because the cascade below shares its pool and splitting them \
-         would half-supersede a tree.",
-    ),
-    (
-        "tools/supersede.rs",
         "server.pool.acquire",
         2,
         "`supersede_claim`'s and `mark_duplicate`'s retraction cascades, one acquire each. STILL \
@@ -334,6 +207,18 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          REGISTERED UNDER `server.pool.acquire` for the same reason as `dedup_sweep.rs` above: \
          the engine now takes `&mut PgConnection`, so the cascade call names no pool and only \
          the acquire is visible to this scan.",
+    ),
+    (
+        "tools/themes.rs",
+        "run_theme_kmeans",
+        1,
+        "`theme_cluster`. Surfaced when `run_theme` joined WRITE_TOKENS (batch H-a review). A \
+         corpus-wide clustering: its `bulk_assign` (`UPDATE claims SET theme_id`) spans every \
+         claim's owner group, so no single author stamp covers it. Since 5cafc60a the whole \
+         run is ONE transaction (wipe, themes, assignment), so on a clean migrate it fails \
+         loudly with nothing written (MEASURED: ERR 42501, the previous themes intact) instead \
+         of leaving an orphan theme. Not moved behind the maintenance gate: production runs it \
+         today with no maintenance DSN, and gating it would refuse it there.",
     ),
     (
         "tools/workflow_ingest.rs",
@@ -351,6 +236,17 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "`report_workflow_outcome`. `behavioral_executions` is not claim-derived and carries no \
          `owner_group_id`, so there is no `WITH CHECK` for a stamp to satisfy.",
+    ),
+    (
+        "tools/workflows.rs",
+        "ClaimRepository::merge_properties",
+        1,
+        "`refresh_workflow_promotion`'s `properties.promotion` overwrite. Surfaced when `merge` \
+         joined WRITE_TOKENS (batch H-a review). An `UPDATE claims`, so a clean migrate refuses \
+         it unstamped; its config-A behaviour is INFERRED, not measured (the probe's variant \
+         reached the lineage-root early return). Same population and the same H3 question as \
+         `evolve_step`: the workflow claims it patches are authored by \
+         `workflow-ingest-system`. An R3 blocker, recorded in scripts/e2e/README.md.",
     ),
     (
         "tools/workflows.rs",
@@ -402,7 +298,8 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
 /// The monotone-decreasing rule is about the SITES, not about what the scanner can
 /// see. When `epigraph-engine`'s belief chain moved from `&PgPool` to
 /// `&mut PgConnection`, three unconverted sites stopped naming a pool
-/// (`supersede.rs` twice, `dedup_sweep.rs` once) and would have LEFT this
+/// (`supersede.rs` twice, `dedup_sweep.rs` once; the last has since moved onto
+/// the maintenance session and left the register) and would have LEFT this
 /// register while still reaching an unstamped connection — the register going
 /// blind on exactly what it exists to track. `acquire` keeps them visible, at the
 /// cost of naming the acquire rather than the write it feeds; each affected entry
@@ -440,6 +337,14 @@ const WRITE_TOKENS: &[&str] = &[
     "publish",
     "record",
     "supersede",
+    // Added by the batch H-a review, which found three unstamped write sites
+    // this register did not list because no token matched their callee:
+    // `ClaimRepository::evolve_step`, `ClaimRepository::merge_properties` and
+    // `run_theme_kmeans`. The register GREW when these landed because the
+    // earlier count was wrong, not because a write was added.
+    "evolve",
+    "merge",
+    "run_theme",
 ];
 
 /// Remove `//` line comments and (nestable) `/* */` block comments.
@@ -774,23 +679,30 @@ fn the_scanner_strips_comments_and_would_otherwise_report_the_docs() {
 fn the_scanner_is_not_vacuous() {
     let measured = scan();
     assert!(
-        measured.len() >= 16,
-        "the residual scan found only {} sites; the tool layer had 27 when this lint was written \
-         and 18 after the ingest-executor and DS-substrate conversions, so a collapse below 16 \
-         means the matcher broke rather than that the surface was converted. LOWERED FROM 20 \
-         DELIBERATELY: the register fell 24 -> 18 in one change (five D2 sites converted, three \
-         cascade sites re-keyed onto `server.pool.acquire`), so a floor of 20 would have failed \
-         on a correct shrink. A floor is a matcher-broke tripwire, not a second ratchet — the \
-         exact-equality assertion above is the ratchet.",
+        measured.len() >= 10,
+        "the residual scan found only {} sites; the tool layer had 27 when this lint was written, \
+         18 after the ingest-executor and DS-substrate conversions, and 14 after batch H \
+         converted the edge tools, patch_claim, resolve_backlog_item and moved the three \
+         maintenance tools onto their session. A collapse below 10 means the matcher broke \
+         rather than that the surface was converted. LOWERED FROM 16 DELIBERATELY, for the same \
+         reason it was lowered from 20: a correct shrink must not fail a tripwire. A floor is a \
+         matcher-broke tripwire, not a second ratchet — the exact-equality assertion above is \
+         the ratchet.",
         measured.len()
     );
+    // The method-call arm's calibration site MOVED. It was `patch_claim`'s
+    // `server.pool.begin()` in `tools/claims.rs`, the site the argument-shaped
+    // inventory could not see. Batch H converted that one onto
+    // `begin_author_stamped_tx`, so the arm is now calibrated on the one
+    // registered method-call site left: `begin_ingest_tx`'s privileged arm.
     assert!(
         measured.contains_key(&(
-            "tools/claims.rs".to_string(),
+            "tools/ingestion.rs".to_string(),
             "server.pool.begin".to_string()
         )),
-        "the `patch_claim` site is the one the argument-shaped inventory could not see; if the \
-         scan stops finding it, the method-call arm of the matcher is broken"
+        "`begin_ingest_tx`'s privileged `server.pool.begin()` is the remaining method-call site \
+         (a method ON the pool, not a pool argument); if the scan stops finding it, the \
+         method-call arm of the matcher is broken"
     );
 }
 

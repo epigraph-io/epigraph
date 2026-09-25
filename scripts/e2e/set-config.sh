@@ -39,7 +39,7 @@ E2E_DB="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*/([^/?]+)$#\1#')"
 set -euo pipefail
 WANT="${1:?usage: set-config.sh a|b}"
 export PGPASSWORD="$E2E_SU_PW"
-q() { psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -v ON_ERROR_STOP=1 -tA -c "$1"; }
+q() { psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -v ON_ERROR_STOP=1 -tA -c "$1"; }
 
 case "${WANT,,}" in
   a)

@@ -126,8 +126,8 @@ pub async fn memorize(
     // ── THE ONE TRANSACTION THIS SUBMISSION RUNS IN ─────────────────────
     // Identical construction, identical reasoning and the same two defects as
     // `tools::claims::submit_claim` — see the long comment at that call site for
-    // why claim + labels + Trace + Evidence + `update_trace_id` must share one
-    // author-stamped transaction, and why the DS auto-wire and the embedding stay
+    // why claim + labels + Trace + Evidence + `update_trace_id` + the DS auto-wire
+    // must share one author-stamped transaction, and why only the embedding stays
     // outside it.
     let mut tx = crate::claim_helper::begin_author_stamped_tx(server, agent_id, "memorize").await?;
 
@@ -209,41 +209,45 @@ pub async fn memorize(
             .map_err(internal_error)?;
     }
 
-    // COMMIT. Everything below this line is post-commit and best-effort.
-    tx.commit().await.map_err(internal_error)?;
-
     // DS auto-wire: FIRST-CREATE ONLY (re-running would combine the same mass
     // twice). The embed below is deliberately NOT gated the same way — see the
     // comment there and `tools::claims::submit_claim`, which carries the long
     // form of both halves.
     //
-    // One transaction, stamped from the AUTHOR's viewer: `claim_frames`,
-    // `mass_functions` and the cached-belief `UPDATE claims` land together or not
-    // at all. `memorize` passes `persist_truth_from_pignistic = false` — unlike
-    // `submit_claim` it does not derive a `truth_value` from the BBA, so there is
-    // no second write to keep consistent with it.
+    // IN THIS TRANSACTION, BEFORE COMMIT, and a failure fails the call: the
+    // claim and its `claim_frames` / `mass_functions` / cached-belief
+    // `UPDATE claims` land together or not at all. It used to run post-commit and
+    // warn-only, which returned success with `belief: null` over a committed claim
+    // with no BBA. `memorize` passes `persist_truth_from_pignistic = false` —
+    // unlike `submit_claim` it does not derive a `truth_value` from the BBA, so
+    // there is no second write to keep consistent with it.
     let ds = if was_created {
-        crate::claim_helper::wire_ds_for_new_claim_author_stamped(
-            server,
-            agent_id,
-            claim_uuid,
-            viewer,
-            ds_auto::DsAutoInput {
-                confidence,
-                weight: 0.6,
-                supports: true,
-                evidence_type: None,
-            },
-            /* persist_truth_from_pignistic */ false,
-            "memorize",
+        Some(
+            crate::claim_helper::wire_ds_for_new_claim_in_tx(
+                &mut tx,
+                viewer,
+                agent_id,
+                claim_uuid,
+                ds_auto::DsAutoInput {
+                    confidence,
+                    weight: 0.6,
+                    supports: true,
+                    evidence_type: None,
+                },
+                /* persist_truth_from_pignistic */ false,
+                "memorize",
+            )
+            .await?,
         )
-        .await
     } else {
         // Option A: a dedup hit. AUTHORED already fired in the helper, and Trace
         // + Evidence + `update_trace_id` ran above IF and only if the canonical
         // claim had no trace. No DS: it would double-count.
         None
     };
+
+    // COMMIT. Everything below this line is post-commit and best-effort.
+    tx.commit().await.map_err(internal_error)?;
 
     // EMBEDDING. `was_created` OR "the canonical row is missing its vector" —
     // the repaired orphan is exactly the row for which those differ, and

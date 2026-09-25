@@ -25,10 +25,14 @@ struct LinkHierarchicalResponse {
     created: bool,
 }
 
-fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+/// Built with a `ScopedPool`: since the edge tools moved onto one
+/// author-stamped transaction (03e2c499), a server without one refuses them by
+/// name rather than writing on the unstamped pool.
+async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::generate();
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 /// Minimal seeded claim — bypasses the full submit_claim pipeline because
@@ -92,7 +96,7 @@ fn parse_response(result: &rmcp::model::CallToolResult) -> LinkHierarchicalRespo
 #[sqlx::test(migrations = "../../migrations")]
 async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let source = seed_claim(&pool, "chapter 1 thesis").await;
     let target = seed_claim(&pool, "book thesis").await;
 
@@ -164,7 +168,7 @@ async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn invalid_relationship_is_rejected(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let source = seed_claim(&pool, "atomA").await;
     let target = seed_claim(&pool, "atomB").await;
 
@@ -204,7 +208,7 @@ async fn invalid_relationship_is_rejected(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_source_claim_returns_404_equivalent(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let target = seed_claim(&pool, "real target").await;
     let bogus = Uuid::new_v4();
 
@@ -230,7 +234,7 @@ async fn missing_source_claim_returns_404_equivalent(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_target_claim_returns_404_equivalent(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let source = seed_claim(&pool, "real source").await;
     let bogus = Uuid::new_v4();
 
@@ -256,7 +260,7 @@ async fn missing_target_claim_returns_404_equivalent(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn self_loop_is_rejected(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let claim = seed_claim(&pool, "loop").await;
 
     let err = do_link_hierarchical(

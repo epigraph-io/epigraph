@@ -36,10 +36,10 @@ pub struct EpiGraphMcpFull {
     /// running `submit_claim` / `memorize` on an unstamped connection, where the
     /// claim commits and its trace is then refused with `42501`.
     ///
-    /// `Some` here does NOT license the three maintenance tools. They are gated
-    /// separately, on whether their own query plumbing has been converted — see
-    /// `crate::maintenance::maintenance_tools_run_on_the_maintenance_connection`
-    /// for why that gate deliberately does not key on this field.
+    /// `Some` here does NOT license the three maintenance tools. They require a
+    /// privileged maintenance pool attached to this `ScopedPool`, and a leased
+    /// connection that passes `MaintenanceSession::assert_privileged` on every
+    /// call. See `crate::maintenance::maintenance_viewer`.
     pub(crate) scoped: Option<epigraph_db::ScopedPool>,
     /// `Some(reason)` when the caller DECLARED that `pool` is a privileged
     /// (BYPASSRLS) maintenance pool — set only through
@@ -646,10 +646,12 @@ impl EpiGraphMcpFull {
     /// fifth:
     ///
     /// **This does NOT enable the three maintenance tools, and a reader
-    /// reasonably expects that it would.** `maintenance_viewer` checks a separate
-    /// gate first, because those tools still run their statements on
-    /// `self.pool`: a bypass viewer spent there returns zero rows with no error.
-    /// `main` calls this for the write path only, and
+    /// reasonably expects that it would.** Those tools run on a connection leased
+    /// from a separate, privileged maintenance pool that must be attached to the
+    /// `ScopedPool` itself (`ScopedPool::with_maintenance_pool`, done by `main`
+    /// only when the maintenance DSN's boot probe passes). Without one,
+    /// `maintenance_viewer` refuses them, because a bypass viewer spent on the
+    /// application pool returns zero rows with no error.
     /// `maintenance.rs::tests::attaching_a_scoped_pool_does_not_enable_the_maintenance_tools`
     /// is the pin.
     ///
@@ -772,7 +774,7 @@ impl EpiGraphMcpFull {
     // ── Claims (11 tools) ──
 
     #[tool(
-        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action."
+        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its evidence, reasoning trace, verb-edges and its Dempster-Shafer belief (BBA, frame assignment, cached belief and derived truth_value) commit together; if the belief cannot be wired the call fails and nothing is written, so a retry is safe. Only the embedding is best-effort after commit (embedded=false)."
     )]
     async fn submit_claim(
         &self,
@@ -852,7 +854,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
+        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. The read, the retirement and the new claim commit together on one transaction stamped from this server's agent: a claim the caller cannot read is reported as not found, and one owned by a group this server's agent cannot write is refused with nothing written. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
     )]
     async fn supersede_claim(
         &self,
@@ -902,7 +904,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Optionally takes basis_claim_ids: the claims that justified the closure, each recorded as a `basis -justifies-> resolution` edge so a later retraction of a basis can be reverse-queried to find the closures resting on it (it does not reopen anything by itself). Returns {resolution_claim_id, original_id, original_labels, basis_claim_ids, basis_edge_ids}."
+        description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Optionally takes basis_claim_ids: the claims that justified the closure, each recorded as a `basis -justifies-> resolution` edge so a later retraction of a basis can be reverse-queried to find the closures resting on it (it does not reopen anything by itself). Returns {resolution_claim_id, original_id, original_labels, basis_claim_ids, basis_edge_ids}. All-or-nothing: the resolution claim, its justifies edges and the original's 'resolved' label commit together on one transaction with this server's agent's write authority, or nothing is written and the call fails (a retry is safe). An original owned by a group this server's agent cannot write (another agent's claim) is refused that way even with claims:admin. Only the resolution claim's embedding runs after commit, best-effort."
     )]
     async fn resolve_backlog_item(
         &self,
@@ -921,7 +923,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. Adding or removing the 'resolved' label requires claims:admin or ownership of the claim when the caller is authenticated (HTTP)."
+        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. When the caller is authenticated (HTTP), the whole patch requires claims:admin or ownership of the claim, as PATCH /api/v1/claims/:id does. All-or-nothing: the whole patch lands or nothing does. A claim you cannot read is reported as not found. A claim owned by a group this server's agent cannot write (another agent's claim) is refused with nothing written, even with claims:admin."
     )]
     async fn patch_claim(
         &self,
@@ -1017,20 +1019,19 @@ impl EpiGraphMcpFull {
                        earliest wins ties). DRY RUN BY DEFAULT. Exact restatements are \
                        collapsed via mark_duplicate when dry_run=false; clusters that merely \
                        resemble each other are returned as merge_candidates for \
-                       consolidate_claims so no wording is discarded. Resumable via offset."
+                       consolidate_claims so no wording is discarded. Resumable via offset. The sweep sees every tenant's claims, so it can pair a duplicate that spans two groups. Requires scope claims:admin over HTTP (it reads and writes across every tenant). Requires this server to have a privileged maintenance connection: start it with MAINTENANCE_DATABASE_URL explicitly set to a role that is a member of epigraph_maintenance; the application DSN is never used for this, even when it could bypass row-level security. Without one the call is refused with nothing written, and the boot log says why; it never reports a successful no-op."
     )]
     async fn sweep_semantic_duplicates(
         &self,
         Parameters(params): Parameters<crate::types::SweepSemanticDuplicatesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = crate::maintenance::maintenance_viewer(
+        self.reject_if_read_only()?;
+        let mut session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::DedupSweep,
         )
         .await?;
-        let viewer = session.viewer();
-        self.reject_if_read_only()?;
-        tools::dedup_sweep::sweep_semantic_duplicates(self, viewer, params).await
+        tools::dedup_sweep::sweep_semantic_duplicates(self, &mut session, params).await
     }
 
     // ── Alternative-set candidate finder (1 tool) ──
@@ -1053,7 +1054,7 @@ impl EpiGraphMcpFull {
     // ── Memory (2 tools) ──
 
     #[tool(
-        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action."
+        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its tags, evidence, trace and Dempster-Shafer belief commit together; if the belief cannot be wired the call fails and nothing is written. Only the embedding is best-effort after commit."
     )]
     async fn memorize(
         &self,
@@ -1171,7 +1172,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer."
+        description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer. All-or-nothing, on one transaction with this server's agent's write authority: an edge touching a group-private claim you cannot read is reported as not found, and one touching a group-private claim owned by a group this server's agent cannot write (another agent's private claim) is refused with nothing written."
     )]
     async fn link_hierarchical(
         &self,
@@ -1185,7 +1186,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Promote two existing claims into a mutually-exclusive alternative_of pair — the symmetric edge suggest_alternative_sets tells you to submit but link_epistemic/link_hierarchical cannot create. Direction-agnostic and idempotent on the unordered {claim_a, claim_b} pair (migration 042's symmetric index): re-runs return the existing edge_id with created=false. Optional target_claim_id (the shared target the two claims are rival supporters of) and rationale are validated and stored on the edge. Deliberately inert at write time — the belief effect of an alternative set flows later through CDST max-plausibility combine over the alternative_set view, not a Dempster re-wire here."
+        description = "Promote two existing claims into a mutually-exclusive alternative_of pair — the symmetric edge suggest_alternative_sets tells you to submit but link_epistemic/link_hierarchical cannot create. Direction-agnostic and idempotent on the unordered {claim_a, claim_b} pair (migration 042's symmetric index): re-runs return the existing edge_id with created=false. Optional target_claim_id (the shared target the two claims are rival supporters of) and rationale are validated and stored on the edge. Deliberately inert at write time — the belief effect of an alternative set flows later through CDST max-plausibility combine over the alternative_set view, not a Dempster re-wire here. All-or-nothing, on one transaction with this server's agent's write authority: an edge touching a group-private claim you cannot read is reported as not found, and one touching a group-private claim owned by a group this server's agent cannot write (another agent's private claim) is refused with nothing written."
     )]
     async fn link_alternative(
         &self,
@@ -1199,7 +1200,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it); cites is also accepted as a structural edge that moves no belief. Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is owned by a group this server's agent cannot write). target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead."
+        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it); cites is also accepted as a structural edge that moves no belief. Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is owned by a group this server's agent cannot write). target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with this server's agent's write authority. An endpoint in a group-private claim owned by a group this server's agent cannot write is refused with nothing written. Belief wiring into a target this server's agent cannot write moves no belief (belief_wired=false) and the edge still lands."
     )]
     async fn link_epistemic(
         &self,
@@ -1213,25 +1214,31 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Update an existing edge in place: retire it by closing its lifecycle window (valid_to) and/or shallow-merge a JSON object into its properties. MCP-native wrapper for PATCH /api/v1/edges/:id — before this tool the only way to act on a mislabeled edge from MCP was raw OAuth + curl. At least one of valid_to / properties is required; properties must be a JSON object (a non-object would silently convert the JSONB column to an array via Postgres `||`). valid_to accepts an RFC3339 timestamp or the literal \"now\" (resolved server-side, since an MCP client has no wall clock). Retiring is the NON-DESTRUCTIVE correction: the row and its audit history survive. Emits edge.updated, plus edge.retired when valid_to is set. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retired edge."
+        description = "Update an existing edge in place: retire it by closing its lifecycle window (valid_to) and/or shallow-merge a JSON object into its properties. MCP-native wrapper for PATCH /api/v1/edges/:id — before this tool the only way to act on a mislabeled edge from MCP was raw OAuth + curl. At least one of valid_to / properties is required; properties must be a JSON object (a non-object would silently convert the JSONB column to an array via Postgres `||`). valid_to accepts an RFC3339 timestamp or the literal \"now\" (resolved server-side, since an MCP client has no wall clock). Retiring is the NON-DESTRUCTIVE correction: the row and its audit history survive. Emits edge.updated, plus edge.retired when valid_to is set. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retired edge. The update and its events commit together, with this server's agent's write authority: an edge the CALLER cannot read, or one owned by a group this server's agent cannot write (one touching another agent's private claim), reports not found and nothing is written."
     )]
     async fn patch_edge(
         &self,
         Parameters(params): Parameters<crate::types::PatchEdgeParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::edge_mutation::patch_edge(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::edge_mutation::patch_edge(self, viewer, params).await
     }
 
     #[tool(
-        description = "Hard-delete an edge by id. MCP-native wrapper for DELETE /api/v1/edges/:id. IRREVERSIBLE and audit-destroying — use patch_edge with valid_to to retire an edge that merely stopped holding; delete is for edges that should never have existed (e.g. a mislabeled contradicts edge). Errors if the edge id does not exist. Emits edge.deleted. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the deleted edge."
+        description = "Take an edge out of force by id: sets its valid_to to now (a RETRACTION; the row, its properties and signature survive and stay queryable). MCP-native wrapper for DELETE /api/v1/edges/:id. Use patch_edge with valid_to to retire an edge at a chosen time; delete_edge is for edges that should never have existed (e.g. a mislabeled contradicts edge). Errors if the edge id does not exist or is already retracted. Emits edge.deleted on the same transaction. An edge the CALLER cannot read, or one owned by a group this server's agent cannot write (one touching another agent's private claim), reports not found and nothing is written. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retracted edge."
     )]
     async fn delete_edge(
         &self,
         Parameters(params): Parameters<crate::types::DeleteEdgeParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::edge_mutation::delete_edge(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::edge_mutation::delete_edge(self, viewer, params).await
     }
 
     // ── Paper Queries (3 tools) ──
@@ -1287,20 +1294,19 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path."
+        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path. Each claim's cache is recomputed in its own transaction; claims_recomputed and frame_writes count only claims whose cached belief columns (belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, belief_frame_id) were actually written and committed, and a per-claim failure is rolled back and listed in errors. Requires scope claims:admin over HTTP (it reads and writes across every tenant). Requires this server to have a privileged maintenance connection: start it with MAINTENANCE_DATABASE_URL explicitly set to a role that is a member of epigraph_maintenance; the application DSN is never used for this, even when it could bypass row-level security. Without one the call is refused with nothing written, and the boot log says why; it never reports a successful no-op."
     )]
     async fn recompute_beliefs(
         &self,
         Parameters(params): Parameters<RecomputeBeliefsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = crate::maintenance::maintenance_viewer(
+        self.reject_if_read_only()?;
+        let mut session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::BeliefRecomputation,
         )
         .await?;
-        let viewer = session.viewer();
-        self.reject_if_read_only()?;
-        tools::cdst_maintenance::recompute_beliefs(self, viewer, params).await
+        tools::cdst_maintenance::recompute_beliefs(self, &mut session, params).await
     }
 
     // ── Workflows (8 tools) ──
@@ -1801,20 +1807,19 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Requires claims:write."
+        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Covers every tenant's claims. A claim sealed or superseded between selection and store is not given a vector and is counted in failed. Requires scope claims:admin over HTTP (it reads and writes across every tenant). Requires this server to have a privileged maintenance connection: start it with MAINTENANCE_DATABASE_URL explicitly set to a role that is a member of epigraph_maintenance; the application DSN is never used for this, even when it could bypass row-level security. Without one the call is refused with nothing written, and the boot log says why; it never reports a successful no-op."
     )]
     async fn backfill_embeddings(
         &self,
         Parameters(params): Parameters<crate::tools::embeddings::BackfillEmbeddingsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = crate::maintenance::maintenance_viewer(
+        self.reject_if_read_only()?;
+        let mut session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::EmbeddingBackfill,
         )
         .await?;
-        let viewer = session.viewer();
-        self.reject_if_read_only()?;
-        crate::tools::embeddings::backfill_embeddings(self, viewer, params).await
+        crate::tools::embeddings::backfill_embeddings(self, &mut session, params).await
     }
 
     // ── Themes (3 tools) ──

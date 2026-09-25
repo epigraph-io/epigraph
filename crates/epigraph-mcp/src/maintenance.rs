@@ -45,116 +45,103 @@
 //! that is the abuse, and the fix is `tools::viewer::request_viewer`.
 
 use epigraph_db::visibility::SystemReason;
-use epigraph_db::MaintenanceSession;
+use epigraph_db::{MaintenanceDsnSource, MaintenancePrivilege, MaintenanceSession};
 use rmcp::model::ErrorData as McpError;
 
 use crate::server::EpiGraphMcpFull;
 
-/// Is the three maintenance tools' QUERY PLUMBING converted to run on the
-/// maintenance connection? **No**, and this gate is what keeps that fact from
-/// turning into a silent no-op.
+/// Whether `main` may attach a probed maintenance pool, which is what makes the
+/// three maintenance tools callable at all.
 ///
-/// # Why this is a named predicate and not `self.scoped.is_some()`
+/// Two conditions, both required:
 ///
-/// Attaching a `ScopedPool` to the MCP server is PROCESS-WIDE. The write path
-/// needs one (`claim_helper::begin_author_stamped_tx`), and the instant
-/// `with_scoped_pool` acquired that caller, `maintenance_viewer` started
-/// succeeding too — for three tools whose statements still run on
-/// `server.pool`, the ordinary application pool. A bypass `Viewer` emits no SQL
-/// predicate, so under FORCE those statements are filtered by the *database* and
-/// return **zero rows with no error**: the privileged-viewer / ordinary-pool
-/// hybrid PR-15 deleted from eleven CLI binaries, and plan §4.3's R2 is explicit
-/// that this is the worse failure — *"fail-closed regressions look like data
-/// loss, not errors."*
+/// 1. the pool's role satisfies `epigraph_bypass()`. Without it a bypass viewer
+///    reads and writes zero rows with no error;
+/// 2. the DSN was CONFIGURED through `MAINTENANCE_DATABASE_URL`, not reached by
+///    the documented fallback to the application DSN.
 ///
-/// `crates/epigraph-db/tests/no_hybrid_bypass_spend.rs` CANNOT SEE those three
-/// sites. Its scanner is function-granular and the mint (`server.rs`) and the
-/// spend (`tools/`) are in different files; its own known-limit (b) says the
-/// `"server.pool"` entry in `FOREIGN_POOLS` "contributes zero detections today".
-/// So a one-line `with_scoped_pool` in `main` would have shipped the hybrid with
-/// every ratchet green.
-///
-/// Keying the refusal on `false` rather than on the absence of a `ScopedPool` is
-/// the whole point: the condition that licenses these tools is *the conversion*,
-/// which is a change to `tools::dedup_sweep`, `tools::embeddings` and
-/// `tools::cdst_maintenance`'s query plumbing (PR-17), not the presence of a
-/// pool. Flip this to `true` in the same commit that lands that conversion, and
-/// not before. `crates/epigraph-mcp/src/maintenance.rs`'s own test module pins
-/// that attaching a `ScopedPool` does not enable them.
-const fn maintenance_tools_run_on_the_maintenance_connection() -> bool {
-    false
+/// The second condition is an authorization decision, not a hygiene one. These
+/// tools enumerate and retire rows across every tenant, so enabling them must be
+/// an operator's explicit act. Before this function, an MCP unit whose
+/// application DSN happened to bypass RLS (a superuser DSN, common on stdio
+/// deployments) enabled them with no configuration change at all, and a
+/// `claims:write` bearer could then list other tenants' private claim ids with
+/// `sweep_semantic_duplicates` (measured by the batch H-a review on config A).
+/// The scope half of that fix is `scope_map`'s `claims:admin`; this is the
+/// configuration half.
+#[must_use]
+pub fn may_attach_maintenance_pool(
+    privilege: MaintenancePrivilege,
+    source: MaintenanceDsnSource,
+) -> bool {
+    privilege.bypass && source == MaintenanceDsnSource::Configured
 }
 
-/// A bypass viewer plus the maintenance connection it is inseparable from.
+/// A bypass viewer plus the maintenance connection it is inseparable from, for
+/// one of the three maintenance tools.
 ///
-/// # Status: still fail-CLOSED, on a DIFFERENT gate than before
+/// # What licenses the bypass, and why it is checked on every call
 ///
-/// Until the MCP write path was converted, this function failed closed because
-/// `EpiGraphMcpFull::with_scoped_pool` had no production caller at all. It now
-/// has one — `main` attaches a `ScopedPool` so `submit_claim` / `memorize` can
-/// stamp a connection with the author's tenancy context — so that accident is no
-/// longer the control. The control is now
-/// [`maintenance_tools_run_on_the_maintenance_connection`], which is `false` and
-/// says why.
+/// The three tools spend a bypass viewer, which emits no SQL predicate, so what
+/// they see and write is decided by the CONNECTION alone. Each one now runs every
+/// statement on the connection this session owns: `tools::cdst_maintenance`,
+/// `tools::dedup_sweep` and `tools::embeddings` take the [`MaintenanceSession`]
+/// itself and name no server pool (`tests/maintenance_tools_spend_only_the_session.rs`
+/// is the ratchet). That conversion is what the old gate,
+/// `maintenance_tools_run_on_the_maintenance_connection() == false`, was waiting
+/// for, and it is why the gate is gone.
 ///
-/// The three maintenance tools therefore still cannot run, and the error names
-/// the conversion rather than the missing constructor. Closing it properly means
-/// routing their queries onto the maintenance connection: a change to
-/// `tools::dedup_sweep`, `tools::embeddings` and `tools::cdst_maintenance`
-/// rather than to the pool wiring. That is PR-17's to do.
+/// What is left to check is that the connection can actually spend the viewer.
+/// `ScopedPool::maintenance_session` draws from the ATTACHED maintenance pool, or,
+/// with none attached, silently from the application pool. There a bypass viewer
+/// is filtered by RLS into zero rows and zero updates with no error, which is the
+/// privileged-viewer / ordinary-pool hybrid. So two refusals come before the
+/// session is handed out:
+///
+/// 1. no maintenance pool is attached. `main` attaches one only when
+///    `MAINTENANCE_DATABASE_URL` is SET (the fallback to the application DSN
+///    never attaches, see [`may_attach_maintenance_pool`]) AND the boot probe
+///    found it privileged, so "unset" and "misconfigured" both land here;
+/// 2. the leased connection itself fails `MaintenanceSession::assert_privileged`.
+///    This is the per-call half. It does not trust the boot probe or whoever
+///    attached the pool, and it asks the connection the statements will run on.
+///
+/// Attaching a `ScopedPool` for the write path therefore still does NOT enable
+/// these tools. `tests::attaching_a_scoped_pool_does_not_enable_the_maintenance_tools`
+/// pins that, and `tests::a_privileged_maintenance_pool_enables_them` pins the
+/// positive arm.
 ///
 /// Returns one [`MaintenanceSession`], which owns the connection and the viewer
-/// together and hands the viewer out only by reference — so a call site can no
-/// longer drop the connection and keep the bypass
-/// (`D-PR17-maintenance-lease-coupling-is-a-convention`). A previous revision
-/// of this parenthesis said that covered only the ACCIDENTAL shape, because
-/// `Viewer` was `Clone`; it is no longer, so the deliberate one is closed too.
-/// The mint is `ScopedPool::maintenance_session`, shared with the CLI and API
-/// wrappers.
+/// together and hands the viewer out only by reference, so a call site cannot
+/// drop the connection and keep the bypass
+/// (`D-PR17-maintenance-lease-coupling-is-a-convention`). The mint is
+/// `ScopedPool::maintenance_session`, shared with the CLI and API wrappers.
 ///
 /// ```ignore
-/// let session = maintenance::maintenance_viewer(self, SystemReason::DedupSweep).await?;
-/// let viewer = session.viewer();
+/// let mut session = maintenance::maintenance_viewer(self, SystemReason::DedupSweep).await?;
+/// tools::dedup_sweep::sweep_semantic_duplicates(self, &mut session, params).await
 /// ```
 ///
 /// # Errors
 ///
-/// Returns an MCP internal error in two cases, in this order:
+/// An MCP internal error, in this order, naming the fix:
 ///
-/// 1. [`maintenance_tools_run_on_the_maintenance_connection`] is `false` — the
-///    three tools would spend a bypass viewer on `server.pool`. Checked FIRST
-///    and independently of the pool, so attaching a `ScopedPool` for the write
-///    path cannot un-gate them as a side effect.
-/// 2. This server was not built from a [`epigraph_db::ScopedPool`] — a process
-///    that never built one cannot mint a `MaintenanceLease`, and therefore
-///    cannot construct a bypass viewer at all.
+/// 1. this server was not built from a [`epigraph_db::ScopedPool`], so no
+///    `MaintenanceLease` can be minted;
+/// 2. no maintenance pool is attached;
+/// 3. the maintenance connection could not be acquired;
+/// 4. the leased connection does not satisfy `epigraph_bypass()` while row
+///    security is active.
 pub(crate) async fn maintenance_viewer(
     server: &EpiGraphMcpFull,
     reason: SystemReason,
 ) -> Result<MaintenanceSession<'_>, McpError> {
-    if !maintenance_tools_run_on_the_maintenance_connection() {
-        // The message names the offending pool as "the server's own application
-        // pool" rather than spelling the field access, and that is not
-        // squeamishness: `no_hybrid_bypass_spend.rs` matches the FIELD-ACCESS
-        // SPELLING over comment-stripped source, and a STRING LITERAL is not
-        // stripped. MEASURED — an earlier revision of this sentence spelled it
-        // out and turned this function, whose whole purpose is to make the hybrid
-        // unreachable, into the lint's only reported offender. That lint's own
-        // doc already refuses to "punish a call site for documenting its own
-        // hazard"; this is the same false positive one layer down. Recorded in
-        // that file's known limits.
-        return Err(McpError::internal_error(
-            "this MCP tool is a corpus-wide maintenance job whose statements still run on the \
-             server's own application pool, not on the maintenance connection. A bypass viewer \
-             spent there emits no predicate but is still filtered by RLS, so it would return \
-             ZERO rows with no error instead of the whole corpus. Refusing rather than \
-             reporting a successful no-op. Closing this means routing tools::dedup_sweep / \
-             tools::embeddings / tools::cdst_maintenance onto the maintenance connection \
-             (PR-17); attaching a ScopedPool is NOT sufficient and deliberately does not \
-             enable it.",
-            None,
-        ));
-    }
+    // The messages name the offending pool as "the server's own application
+    // pool" rather than spelling the field access, and that is not
+    // squeamishness: `no_hybrid_bypass_spend.rs` matches the FIELD-ACCESS
+    // SPELLING over comment-stripped source, and a STRING LITERAL is not
+    // stripped. MEASURED: an earlier revision spelled it out and turned this
+    // function into that lint's only reported offender (its known limit (b2)).
     let scoped = server.scoped.as_ref().ok_or_else(|| {
         McpError::internal_error(
             "this MCP server was not built from a ScopedPool, so no maintenance \
@@ -162,10 +149,36 @@ pub(crate) async fn maintenance_viewer(
             None,
         )
     })?;
-    scoped
+    if !scoped.has_maintenance_pool() {
+        return Err(McpError::internal_error(
+            "this MCP tool is a corpus-wide maintenance job and this server has no privileged \
+             maintenance connection attached. Set MAINTENANCE_DATABASE_URL to a role that is a \
+             member of epigraph_maintenance and restart; the boot log names why none was \
+             attached. Refusing rather than running on the server's own application pool, where \
+             a bypass viewer is filtered by RLS into ZERO rows with no error.",
+            None,
+        ));
+    }
+    let mut session = scoped
         .maintenance_session(reason)
         .await
-        .map_err(|e| McpError::internal_error(format!("maintenance acquire failed: {e}"), None))
+        .map_err(|e| McpError::internal_error(format!("maintenance acquire failed: {e}"), None))?;
+    session.assert_privileged().await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.maintenance",
+            reason = reason.as_str(),
+            error = %e,
+            "maintenance tool refused: the leased maintenance connection cannot bypass RLS"
+        );
+        McpError::internal_error(
+            format!(
+                "this MCP tool's maintenance connection cannot bypass row-level security, so \
+                 its statements would read and write ZERO rows with no error. Refusing. ({e})"
+            ),
+            None,
+        )
+    })?;
+    Ok(session)
 }
 
 #[cfg(test)]
@@ -218,21 +231,54 @@ mod tests {
             .expect("ScopedPool::connect over the ephemeral test database")
     }
 
+    /// The attach decision, over every combination of its two inputs.
+    ///
+    /// The fallback-with-bypass case is the one that matters: an MCP unit whose
+    /// application DSN is a superuser must NOT enable corpus-wide maintenance
+    /// tools just because nobody set `MAINTENANCE_DATABASE_URL`.
+    #[test]
+    fn only_a_configured_bypassing_dsn_enables_the_maintenance_tools() {
+        let p = |bypass, rls_active| MaintenancePrivilege { bypass, rls_active };
+        assert!(may_attach_maintenance_pool(
+            p(true, true),
+            MaintenanceDsnSource::Configured
+        ));
+        assert!(
+            !may_attach_maintenance_pool(
+                p(true, true),
+                MaintenanceDsnSource::FellBackToApplicationDsn
+            ),
+            "an application DSN that happens to bypass RLS enabled the corpus-wide maintenance \
+             tools with no operator configuration"
+        );
+        assert!(!may_attach_maintenance_pool(
+            p(true, false),
+            MaintenanceDsnSource::FellBackToApplicationDsn
+        ));
+        for source in [
+            MaintenanceDsnSource::Configured,
+            MaintenanceDsnSource::FellBackToApplicationDsn,
+        ] {
+            for rls in [true, false] {
+                assert!(
+                    !may_attach_maintenance_pool(p(false, rls), source),
+                    "an unprivileged pool was attached ({source:?}, rls_active={rls})"
+                );
+            }
+        }
+    }
+
     /// THE HAZARD THIS PIN EXISTS FOR, stated as a test.
     ///
-    /// Attaching a `ScopedPool` is process-wide. The write path needs one; the
-    /// three maintenance tools must NOT be enabled by that, because their
-    /// statements still run on `server.pool` and a bypass viewer spent there
-    /// returns zero rows with **no error** — a silent no-op replacing a loud
-    /// failure. `crates/epigraph-db/tests/no_hybrid_bypass_spend.rs` states by
-    /// name that its function-granular scanner cannot see those three sites
-    /// (known limit (b): the `"server.pool"` entry in `FOREIGN_POOLS`
-    /// "contributes zero detections today"), so CI would have stayed green while
-    /// a one-line `with_scoped_pool` in `main` shipped the hybrid.
+    /// Attaching a `ScopedPool` is process-wide, and the write path needs one.
+    /// The three maintenance tools must NOT be enabled by that alone. With no
+    /// maintenance pool attached, `ScopedPool::maintenance_session` falls back
+    /// to the application pool, where a bypass viewer is filtered by RLS into
+    /// zero rows with **no error**: a silent no-op replacing a loud failure.
     ///
     /// The assertion is deliberately about the REASON and not just the failure:
     /// a `None` scoped pool also refuses, and a test that accepted either error
-    /// would pass on a tree where the gate had been deleted.
+    /// would pass on a tree where the attachment check had been deleted.
     #[sqlx::test(migrations = "../../migrations")]
     async fn attaching_a_scoped_pool_does_not_enable_the_maintenance_tools(pool: PgPool) {
         let scoped = scoped_pool_over(&pool).await;
@@ -259,18 +305,49 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| {
                     panic!(
-                        "maintenance_viewer({reason:?}) SUCCEEDED on a server whose three \
-                         maintenance tools still run their statements on `server.pool`. That \
-                         mints a bypass viewer and spends it on an unprivileged connection: \
-                         zero rows, no error. Re-gate it, or convert the three tools' query \
-                         plumbing in the same change."
+                        "maintenance_viewer({reason:?}) SUCCEEDED on a server with no maintenance \
+                         pool attached. `maintenance_session` would then lease from the \
+                         application pool and spend a bypass viewer there: zero rows, no error."
                     )
                 });
             let msg = err.message.to_string();
             assert!(
-                msg.contains("server's own application pool"),
+                msg.contains("no privileged maintenance connection attached"),
                 "maintenance_viewer({reason:?}) was refused for the WRONG reason: {msg}. \
-                 Expected the conversion gate, not the missing-ScopedPool arm."
+                 Expected the missing-maintenance-pool arm, not the missing-ScopedPool one."
+            );
+        }
+    }
+
+    /// The positive arm: with a maintenance pool attached on a connection that
+    /// satisfies `epigraph_bypass()`, the three tools get a session, and it is a
+    /// bypass session on that pool. `#[sqlx::test]` connects as a superuser, for
+    /// whom `epigraph_bypass()` is true, so this is the privileged case. The
+    /// UNprivileged case cannot be built in this harness (every role it has
+    /// bypasses) and is measured by `scripts/e2e/probe-batch-h.sh maintenance`
+    /// with `MAINTENANCE_DATABASE_URL` set to the app login.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_privileged_maintenance_pool_enables_them(pool: PgPool) {
+        let scoped = scoped_pool_over(&pool)
+            .await
+            .with_maintenance_pool(pool.clone());
+        let signer = AgentSigner::from_bytes(&[0x5bu8; 32]).expect("signer");
+        let embedder = McpEmbedder::new(pool.clone(), None);
+        let server =
+            EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped);
+        for reason in [
+            SystemReason::DedupSweep,
+            SystemReason::EmbeddingBackfill,
+            SystemReason::BeliefRecomputation,
+        ] {
+            let session = maintenance_viewer(&server, reason)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("maintenance_viewer({reason:?}) refused a privileged pool: {e:?}")
+                });
+            assert!(
+                session.viewer().is_bypass(),
+                "maintenance_viewer({reason:?}) must hand out the bypass viewer"
             );
         }
     }

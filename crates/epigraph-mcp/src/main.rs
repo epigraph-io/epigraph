@@ -304,6 +304,147 @@ fn check_listen_auth_mode(
     }
 }
 
+/// Attach the privileged pool the three MCP maintenance tools lease from, when
+/// one can be vouched for. Otherwise attach NOTHING: the tools then refuse
+/// loudly, and the rest of the server serves normally.
+///
+/// # Why a misconfiguration does not refuse to boot here, unlike `epigraph-api`
+///
+/// `epigraph-api/src/bin/server.rs` `.expect()`s this path. Its background
+/// writers are the process's job, and booting "healthy" while they write
+/// nowhere is the failure it exists to prevent. Here the maintenance surface
+/// is three tools out of the whole MCP surface, and this binary also runs as a
+/// per-client stdio process that is handed only `--database-url`. A boot
+/// refusal would take every tool down to protect three, and each of those three
+/// already refuses on its own call, naming the fix
+/// (`maintenance::maintenance_viewer`). So every failure below is an ERROR log
+/// and no pool:
+///
+/// * `MAINTENANCE_DATABASE_URL` names a different database than the app DSN
+///   (`maintenance_database_url`'s refusal): a maintenance connection there
+///   reads zero rows and writes nowhere;
+/// * the pool cannot be built;
+/// * the boot probe finds the role unprivileged while row security is active;
+/// * `MAINTENANCE_DATABASE_URL` is unset. The documented fallback to the
+///   application DSN is NEVER attached, even when that role can bypass RLS
+///   (`epigraph_mcp::maintenance::may_attach_maintenance_pool`): the three tools
+///   read and retire rows across every tenant, so enabling them is an explicit
+///   operator act, not a side effect of a superuser application DSN.
+///
+/// Sized at 2 connections (a maintenance tool call holds one for its duration),
+/// with the same 5 s acquire timeout as the app pool. `docs/deploy.md` §1c-bis
+/// counts it per MCP process.
+async fn attach_maintenance_pool(
+    scoped: epigraph_db::ScopedPool,
+    database_url: &str,
+    guc_mode: epigraph_db::SessionGucMode,
+) -> epigraph_db::ScopedPool {
+    let (url, source) = match epigraph_db::maintenance_database_url(database_url) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            tracing::error!(
+                target: "tenancy.maintenance",
+                error = %e,
+                "MAINTENANCE_DATABASE_URL is unusable; the three maintenance tools \
+                 (recompute_beliefs, sweep_semantic_duplicates, backfill_embeddings) will refuse"
+            );
+            return scoped;
+        }
+    };
+    let maintenance = match epigraph_db::ScopedPool::connect_with_options(
+        &url,
+        guc_mode,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 2,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            statement_timeout: None,
+        },
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                target: "tenancy.maintenance",
+                dsn_source = source.as_str(),
+                error = %e,
+                "could not connect the maintenance pool; the three maintenance tools will refuse"
+            );
+            return scoped;
+        }
+    };
+    match epigraph_db::probe_maintenance_privilege(maintenance.inner()).await {
+        Ok(privilege) => match epigraph_db::maintenance_verdict(privilege, source) {
+            Ok(_) if epigraph_mcp::maintenance::may_attach_maintenance_pool(privilege, source) => {
+                tracing::info!(
+                    target: "tenancy.maintenance",
+                    dsn_source = source.as_str(),
+                    "maintenance pool attached (satisfies epigraph_bypass()); the three \
+                     maintenance tools are available"
+                );
+                scoped.with_maintenance_pool(maintenance.inner().clone())
+            }
+            // Unprivileged but no table has row security: a bypass viewer would
+            // still see the corpus. Still not attached. This binary has no
+            // pre-077 deployment to serve, and attaching an unprivileged pool
+            // would make the per-call check the only guard.
+            // WARN when the variable was simply not set (the documented fallback
+            // to the app DSN, which on a least-privilege deployment is never
+            // privileged, and a normal state for a per-client stdio process),
+            // ERROR when an operator CONFIGURED a maintenance DSN that cannot
+            // bypass. Measured on the e2e harness: every server started without
+            // the variable logged this line at ERROR, which is noise that trains
+            // operators to ignore the configured case.
+            Ok(_) | Err(_) => {
+                if source == epigraph_db::MaintenanceDsnSource::FellBackToApplicationDsn
+                    && privilege.bypass
+                {
+                    // The application DSN CAN bypass RLS, and that is exactly why
+                    // it is not attached: enabling three cross-tenant tools must be
+                    // an operator's explicit act (`may_attach_maintenance_pool`).
+                    tracing::warn!(
+                        target: "tenancy.maintenance",
+                        dsn_source = source.as_str(),
+                        "MAINTENANCE_DATABASE_URL is not set; the application DSN bypasses RLS \
+                         but is NOT attached as the maintenance pool, because the three \
+                         cross-tenant maintenance tools are enabled only by an explicitly \
+                         configured MAINTENANCE_DATABASE_URL. They will refuse."
+                    );
+                } else if source == epigraph_db::MaintenanceDsnSource::FellBackToApplicationDsn {
+                    tracing::warn!(
+                        target: "tenancy.maintenance",
+                        dsn_source = source.as_str(),
+                        rls_active = privilege.rls_active,
+                        "MAINTENANCE_DATABASE_URL is not set and the application DSN cannot \
+                         bypass RLS; no maintenance pool attached. The three maintenance tools \
+                         will refuse until MAINTENANCE_DATABASE_URL names a member of \
+                         epigraph_maintenance."
+                    );
+                } else {
+                    tracing::error!(
+                        target: "tenancy.maintenance",
+                        dsn_source = source.as_str(),
+                        rls_active = privilege.rls_active,
+                        "the maintenance DSN's role does not satisfy epigraph_bypass(); not \
+                         attaching it. The three maintenance tools will refuse. Set \
+                         MAINTENANCE_DATABASE_URL to a role that is a member of \
+                         epigraph_maintenance."
+                    );
+                }
+                scoped
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                target: "tenancy.maintenance",
+                error = %e,
+                "could not probe the maintenance pool's privilege; not attaching it"
+            );
+            scoped
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Logging to stderr (stdout reserved for MCP JSON-RPC in stdio mode)
@@ -384,18 +525,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    carry one principal's group set into the next session's statements.
     //
     // `server.pool` is `scoped.inner().clone()` — the SAME pool, not a second
-    // one. Building both would double the connection count and make the
-    // hybrid hazard below genuinely worse rather than merely unaddressed.
+    // one. Building both would double the connection count.
     //
-    // THE THREE MAINTENANCE TOOLS ARE NOT ENABLED BY THIS, AND THAT IS
-    // DELIBERATE. `sweep_semantic_duplicates`, `recompute_beliefs` and
-    // `backfill_embeddings` still run their statements on `server.pool`, so
-    // minting a bypass viewer for them would spend it on an unprivileged
-    // connection: zero rows, no error. They are gated on
-    // `maintenance::maintenance_tools_run_on_the_maintenance_connection()`,
-    // which does NOT key on `scoped.is_some()` for exactly that reason, and
-    // `maintenance.rs`'s test module pins that this attachment does not un-gate
-    // them. Converting their query plumbing is PR-17's.
+    // THE THREE MAINTENANCE TOOLS ARE NOT ENABLED BY THIS. They run every
+    // statement on a connection leased from a SEPARATE, privileged maintenance
+    // pool, attached below by `attach_maintenance_pool` only when
+    // `MAINTENANCE_DATABASE_URL` resolves and its boot probe passes.
+    // `maintenance::maintenance_viewer` refuses them when no such pool is
+    // attached, and re-checks the leased connection's privilege on every call.
     tracing::info!("Connecting to database...");
     let guc_mode = epigraph_db::SessionGucMode::from_env(
         std::env::var("EPIGRAPH_SESSION_GUC_MODE")
@@ -447,6 +584,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let pool = scoped.inner().clone();
     tracing::info!("Database connected");
+    let scoped = attach_maintenance_pool(scoped, &cli.database_url, guc_mode).await;
 
     // Create or restore agent signer. Precedence lives in `select_signer`
     // (unit-tested); here we only handle the side effects (secret-key print for

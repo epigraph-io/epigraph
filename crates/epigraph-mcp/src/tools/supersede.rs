@@ -15,17 +15,39 @@ pub async fn supersede_claim(
     let old = parse_uuid(&params.claim_id)?;
     let old_claim_id = ClaimId::from_uuid(old);
 
+    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT, for the gate read
+    // and the supersession, the same construction as `patch_claim` and
+    // `update_labels`.
+    //
+    // This was `get_by_id(&server.pool, ..)` then `supersede(&server.pool, ..)`:
+    // unstamped, so on a schema without the orphan `*_privacy` policies (config
+    // A) the server agent's OWN public claim was refused with 42501 and its own
+    // group-private claim read as "not found" (MEASURED, batch H-a review). The
+    // stamp admits the population this process writes, claims owned by the
+    // server agent's groups. A claim in a group it cannot write is refused
+    // loudly, and nothing commits. Whether an authenticated caller should
+    // supersede under ITS OWN stamp rather than the server agent's is the
+    // authenticated-MCP stamping question recorded as an R3 blocker in
+    // scripts/e2e/README.md, not this conversion's.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.agent_id().await?,
+        "supersede_claim",
+    )
+    .await?;
+
     // Per-resource ownership check: only the claim's author or a
-    // claims:admin token holder may supersede it.
-    let existing = ClaimRepository::get_by_id(&server.pool, viewer, old_claim_id)
+    // claims:admin token holder may supersede it. The read is the CALLER's,
+    // through its viewer, on the same transaction.
+    let existing = ClaimRepository::get_by_id(&mut *tx, viewer, old_claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {} not found", old)))?;
     crate::tools::claims::require_owner_or_admin(server, auth, existing.agent_id.as_uuid()).await?;
 
     let truth = TruthValue::clamped(params.truth_value);
-    let (new_id, old_id) = ClaimRepository::supersede(
-        &server.pool,
+    let (new_id, old_id) = ClaimRepository::supersede_conn(
+        &mut tx,
         old_claim_id,
         &params.content,
         truth,
@@ -33,6 +55,7 @@ pub async fn supersede_claim(
     )
     .await
     .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
 
     // Retraction cascade (backlog 20e9ed83): the supporters this claim was
     // feeding hold BBAs frozen from ITS interval at wire time, so without an
