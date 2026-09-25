@@ -46,6 +46,7 @@ Prerequisites: `git`, an authenticated `gh`, and `claude` on PATH, plus a checko
 | `KANBAN_AGENT_ENV_ALLOW` | – | Comma-separated extra environment variable names that agents may inherit (see below) |
 | `KANBAN_AGENT_ALLOWED_TOOLS` | `Read(./**),TodoWrite` | `--allowedTools` for development agents. Only reads inside the agent's worktree are pre-approved (`Read(./**)` also governed Grep the same way when measured; Glob was not measured). `Bash`, `Edit`, `Write` and reads elsewhere are deliberately left to `--permission-mode`: a bare `Edit`/`Write` would pre-approve writes to *any* path, and a bare `Read` reads to any path (your gh credentials, `~/.claude.json`, `/proc/<pid>/environ`), both measured under `dontAsk` |
 | `KANBAN_AGENT_DISALLOWED_TOOLS` | merge/admin `gh` and `git push` patterns, `curl`, `wget`, backlog-mutating MCP tools | `--disallowedTools` for development agents |
+| `KANBAN_HELPER_MCP_CONFIG` | – | Path to an MCP config JSON (`{"mcpServers": {...}}`) naming only the EpiGraph server. When set, helper agents run hermetic: `--restricted --strict-mcp-config --mcp-config <path>` |
 | `KANBAN_BACKLOG_TOOL` / `KANBAN_RESOLVE_TOOL` | `mcp__epigraph__query_claims_by_label` / `mcp__epigraph__resolve_backlog_item` | The one MCP tool each helper agent may call |
 
 ### What agents inherit
@@ -62,6 +63,7 @@ Tool restrictions:
 
 - **Development agents** get `--allowedTools` and `--disallowedTools` from the table above.
 - **Helper agents** (backlog fetch and retirement) get `--tools ""` (no built-in tools at all), `--allowedTools <one MCP tool>` and `--permission-mode dontAsk`, so any other call is denied rather than prompted for. Their `--permission-mode` does not come from `KANBAN_PERMISSION_MODE`.
+- **Set `KANBAN_HELPER_MCP_CONFIG` to make helpers hermetic.** Without it, "resolve-only" and "no shell" still depend on your configuration: your user-scope permission allow rules and hooks apply, as do the project settings of the checked-out tree (the retirement worktree is a checkout of `<remote>/<base>`, so a `.claude/settings.json` with hooks merged there would run in that unattended agent), and every MCP server you have configured is loaded. With the variable set, helpers also get `--restricted` (user, project and local settings files ignored) and `--strict-mcp-config --mcp-config <path>` (only the servers in that file). It is opt-in because it needs the file: measured with claude 2.1.280, `--restricted` alone and `--setting-sources ""` both drop a project-scoped EpiGraph server (a `.mcp.json` above the checkout) from the session, and `--restricted` drops plugin-provided servers too, which would silently turn every retirement into "not confirmed resolved". The board logs a line at startup when the variable is unset.
 - The backlog fetch runs in `$KANBAN_HOME/helper-cwd`, not in your checkout.
 
 `GET /api/state` returns the effective configuration under `.config`. Secrets appear only as booleans.

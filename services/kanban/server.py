@@ -370,11 +370,20 @@ def dev_tool_args(cfg: "Config") -> List[str]:
     return args
 
 
-def helper_tool_args(tool: str) -> List[str]:
+def helper_tool_args(tool: str, mcp_config: Optional[str] = None) -> List[str]:
     """A helper agent gets no built-in tools at all, exactly one MCP tool pre-approved, and dontAsk so
-    anything else is denied rather than prompted for."""
-    return ["--tools", "", "--allowedTools", tool, "--disallowedTools", ",".join(HELPER_DISALLOWED_TOOLS),
+    anything else is denied rather than prompted for.
+
+    With `mcp_config` (KANBAN_HELPER_MCP_CONFIG) it is also hermetic: `--restricted` ignores user, project and local
+    settings files (their allow rules and hooks, including a `.claude/settings.json` merged into the base branch the
+    retirement worktree checks out), and `--strict-mcp-config --mcp-config` loads only the servers in that file.
+    Without it those flags are NOT passed: measured (claude 2.1.280), `--restricted` and `--setting-sources ""` both
+    drop a project-scoped EpiGraph MCP server from the session, so retirement would silently stop working."""
+    args = ["--tools", "", "--allowedTools", tool, "--disallowedTools", ",".join(HELPER_DISALLOWED_TOOLS),
             "--permission-mode", "dontAsk"]
+    if mcp_config:
+        args += ["--restricted", "--strict-mcp-config", "--mcp-config", mcp_config]
+    return args
 
 
 # --------------------------------------------------------------------------
@@ -419,6 +428,9 @@ class Config:
         self.required_checks = split_list(env.get("KANBAN_REQUIRED_CHECKS"))
         self.resolve_tool = env.get("KANBAN_RESOLVE_TOOL") or "mcp__epigraph__resolve_backlog_item"
         self.backlog_tool = env.get("KANBAN_BACKLOG_TOOL") or "mcp__epigraph__query_claims_by_label"
+        # An MCP config file (naming only the EpiGraph server) that makes helper agents hermetic; see helper_tool_args
+        mcp = (env.get("KANBAN_HELPER_MCP_CONFIG") or "").strip()
+        self.helper_mcp_config: Optional[str] = os.path.abspath(os.path.expanduser(mcp)) if mcp else None
         self.repo = os.path.abspath(repo) if repo else git_toplevel(os.getcwd(), self.git_bin)
         self.worktrees_dir = os.path.join(self.home, "worktrees")
         self.logs_dir = os.path.join(self.home, "logs")
@@ -444,6 +456,7 @@ class Config:
             "agent_disallowed_tools": list(self.agent_disallowed_tools),
             "resolve_tool": self.resolve_tool,
             "backlog_tool": self.backlog_tool,
+            "helper_mcp_config": self.helper_mcp_config,
             "repo": self.repo,
             "home": self.home,
             "port": self.port,
@@ -677,7 +690,8 @@ CLAUDE_BACKLOG_PROMPT = (
 
 def fetch_backlog_claude(cfg: Config) -> List[Dict[str, Any]]:
     # Read-only helper: one MCP tool, no built-ins, allow-listed env, and a cwd outside the operator's checkout.
-    argv = [cfg.claude_bin, "-p", CLAUDE_BACKLOG_PROMPT, "--output-format", "json"] + helper_tool_args(cfg.backlog_tool)
+    argv = [cfg.claude_bin, "-p", CLAUDE_BACKLOG_PROMPT, "--output-format", "json"] + \
+        helper_tool_args(cfg.backlog_tool, cfg.helper_mcp_config)
     cwd = os.path.join(cfg.home, "helper-cwd")
     os.makedirs(cwd, exist_ok=True)
     proc = run_cmd(argv, cwd=cwd, timeout=600, env=agent_env(cfg))
@@ -2185,7 +2199,7 @@ class App:
         # Runs unattended after every ship, so it gets the narrowest agent the board can start: its own
         # throwaway worktree, no built-in tools, only the resolve tool pre-approved, dontAsk for the rest.
         argv = [self.cfg.claude_bin, "-p", self.resolve_prompt(cards, integ), "--output-format", "json"] + \
-            helper_tool_args(self.cfg.resolve_tool)
+            helper_tool_args(self.cfg.resolve_tool, self.cfg.helper_mcp_config)
         resolved: List[str] = []
         detail = ""
         wt: Optional[str] = None
@@ -2590,6 +2604,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = Config(repo=args.repo, port=args.port, env=dict(os.environ, **held))
     if cfg.jwt_secret_ignored:
         log("EPIGRAPH_JWT_SECRET is set but ignored: set EPIGRAPH_TOKEN to an OAuth-minted token for the http source")
+    if not cfg.helper_mcp_config:
+        log("KANBAN_HELPER_MCP_CONFIG is not set: helper agents (backlog fetch, retirement) run with your user and "
+            "project claude settings and every MCP server you have configured (see README)")
     app = App(cfg)
     server = make_server(app, args.port)
     app.start()

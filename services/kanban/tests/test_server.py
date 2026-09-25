@@ -1129,6 +1129,32 @@ class HelperAgentTest(_IsolatedRepo):
         self.assertEqual(subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
                                         capture_output=True, text=True, check=True).stdout, head_before)
 
+    def test_helpers_are_hermetic_when_given_their_own_mcp_config(self):
+        mcp = os.path.join(self.tmp, "helper-mcp.json")
+        with open(mcp, "w") as fh:
+            json.dump({"mcpServers": {}}, fh)
+        app = self.make_app(KANBAN_HELPER_MCP_CONFIG=mcp)
+        try:
+            kanban.fetch_backlog_claude(app.cfg)
+        except (RuntimeError, kanban.CmdError):
+            pass
+        card = dict(kanban.new_card({"id": CLAIM_A, "content": "x"}), pr_url="https://github.com/a/b/pull/3", title="t")
+        app.store.cards[CLAIM_A] = card
+        app._resolve_backlog([card], {"pr_url": "https://github.com/a/b/pull/4", "base": "main"})
+        calls = self.recorded()
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            argv = call["argv"]
+            # no user/project/local settings (allow rules, hooks, the checked-out tree's .claude/), only these MCP servers
+            self.assertIn("--restricted", argv)
+            self.assertIn("--strict-mcp-config", argv)
+            self.assertEqual(argv[argv.index("--mcp-config") + 1], mcp)
+            self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        # without the file the helpers keep the operator's MCP setup (--restricted alone would drop a project- or
+        # plugin-scoped EpiGraph server), and the board says so
+        self.assertIsNone(self.make_app().cfg.helper_mcp_config)
+        self.assertNotIn("--restricted", kanban.helper_tool_args("mcp__x", None))
+
     def test_agent_env_never_passes_board_secrets(self):
         cfg = kanban.Config(repo=self.repo, port=0, env={"KANBAN_AGENT_ENV_ALLOW": "GH_TOKEN,KANBAN_X,FOO"})
         env = kanban.agent_env(cfg, {"PATH": "/bin", "GH_TOKEN": "s", "KANBAN_X": "s", "FOO": "ok",
