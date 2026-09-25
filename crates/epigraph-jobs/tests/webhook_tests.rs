@@ -409,9 +409,21 @@ fn test_ssrf_allows_external_addresses() {
         "example.com IP should be allowed"
     );
     assert!(
-        !is_internal_ip("203.0.113.1"),
-        "203.0.113.1 should be allowed"
+        !is_internal_ip("203.1.113.1"),
+        "203.1.113.1 should be allowed"
     );
+}
+
+/// `203.0.113.0/24` (TEST-NET-3) used to be asserted ALLOWED in the test above.
+/// It is a documentation range the IANA registry marks not globally reachable,
+/// so no legitimate webhook receiver lives there; the egress table now refuses
+/// it along with the other non-global ranges (backlog b159a7fd). Pinned here so
+/// the change of expectation is explicit rather than a silently edited literal.
+#[test]
+fn test_ssrf_blocks_documentation_ranges() {
+    for host in ["203.0.113.1", "192.0.2.1", "198.51.100.1", "2001:db8::1"] {
+        assert!(is_internal_ip(host), "{host} is a documentation range");
+    }
 }
 
 /// IPv6 literals must be classified, not silently allowed.

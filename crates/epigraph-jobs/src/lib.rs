@@ -61,6 +61,8 @@ mod db_reputation_service;
 pub use db_reputation_service::DbReputationService;
 
 pub mod cluster_graph;
+pub mod egress;
+pub use egress::is_internal_addr;
 pub mod coordination;
 pub mod privatization;
 pub mod theme_cluster_rebuild;
@@ -2262,11 +2264,10 @@ pub fn verify_hmac_signature(secret: &str, payload: &str, signature: &str) -> bo
 /// with or without a port (`[::1]`, `[fe80::1]:8080`), an `ipv4:port` pair, or
 /// a hostname.
 ///
-/// Blocks:
-/// - Loopback (127.0.0.0/8, `::1`)
-/// - Private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7)
-/// - Link-local (169.254.0.0/16, fe80::/10)
-/// - Localhost variants
+/// Blocks every address [`egress::internal_category`] names (loopback,
+/// private, link-local, CGNAT, multicast, broadcast, documentation and the
+/// other non-global special-purpose ranges, and IPv6 forms that embed an
+/// internal IPv4 address), plus the `localhost` names.
 ///
 /// Hostnames that are not IP literals are *allowed*: this function does no DNS
 /// resolution, so a name that resolves to an internal address is not caught
@@ -2321,95 +2322,6 @@ pub fn is_internal_ip(host: &str) -> bool {
         Ok(addr) => is_internal_addr(addr),
         // Not a valid IP address; a hostname. Allowed (see the DNS note above).
         Err(_) => false,
-    }
-}
-
-/// Classify an already-parsed IP address as internal/private (SSRF protection).
-///
-/// This is the address-level half of [`is_internal_ip`]. Prefer it when the
-/// caller already holds a parsed address (e.g. `url::Host::Ipv4` / `Ipv6`), so
-/// no host-string re-parsing — and no parsing ambiguity — is involved.
-///
-/// # Returns
-/// `true` if the address is internal and should be blocked, `false` if it's safe.
-#[must_use]
-pub fn is_internal_addr(addr: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-
-    match addr {
-        IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-
-            // Loopback: 127.0.0.0/8
-            if octets[0] == 127 {
-                return true;
-            }
-
-            // Private: 10.0.0.0/8
-            if octets[0] == 10 {
-                return true;
-            }
-
-            // Private: 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
-            if octets[0] == 172 && (16..=31).contains(&octets[1]) {
-                return true;
-            }
-
-            // Private: 192.168.0.0/16
-            if octets[0] == 192 && octets[1] == 168 {
-                return true;
-            }
-
-            // Link-local: 169.254.0.0/16
-            if octets[0] == 169 && octets[1] == 254 {
-                return true;
-            }
-
-            // 0.0.0.0/8 (current network)
-            if octets[0] == 0 {
-                return true;
-            }
-
-            false
-        }
-        IpAddr::V6(ipv6) => {
-            // Loopback ::1
-            if ipv6.is_loopback() {
-                return true;
-            }
-
-            // Unspecified ::
-            if ipv6.is_unspecified() {
-                return true;
-            }
-
-            // Check for IPv4-mapped addresses
-            if let Some(ipv4) = ipv6.to_ipv4_mapped() {
-                let octets = ipv4.octets();
-                if octets[0] == 127
-                    || octets[0] == 10
-                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-                    || (octets[0] == 192 && octets[1] == 168)
-                    || (octets[0] == 169 && octets[1] == 254)
-                    || octets[0] == 0
-                {
-                    return true;
-                }
-            }
-
-            // Unique local addresses (fc00::/7)
-            let segments = ipv6.segments();
-            if (segments[0] & 0xfe00) == 0xfc00 {
-                return true;
-            }
-
-            // Link-local (fe80::/10)
-            if (segments[0] & 0xffc0) == 0xfe80 {
-                return true;
-            }
-
-            false
-        }
     }
 }
 
