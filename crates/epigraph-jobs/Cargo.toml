@@ -24,6 +24,7 @@ hex = { workspace = true }  # Hex encoding for signatures
 petgraph = { workspace = true }
 rand = { workspace = true }  # used by Louvain to break ties between equal-modularity moves
 sqlx = { workspace = true }  # PostgreSQL persistence for job queue
+url = "2"  # WHATWG URL parsing for the webhook egress guard (already in graph via reqwest)
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

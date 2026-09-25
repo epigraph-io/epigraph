@@ -15,8 +15,153 @@
 //! 6to4 `2002:aabb:ccdd::`) are judged by the IPv4 address they carry, through
 //! the SAME IPv4 table — an inline copy of the IPv4 list in the IPv6 arm is how
 //! the previous table drifted.
+//!
+//! # Parsing
+//!
+//! A URL is judged only after [`url::Url`] has parsed it, so what is classified
+//! is the WHATWG-normalised authority the HTTP client will dial — not a
+//! substring of the raw input. That is what makes `http://example.com@127.0.0.1/`
+//! (userinfo), `http://[::1]:8080/`, `http://127.1/` and `http://2130706433/`
+//! (alternate loopback spellings) all land on the loopback address they name.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// Schemes a webhook may be delivered over.
+pub const ALLOWED_SCHEMES: &[&str] = &["http", "https"];
+
+/// Why a webhook target was refused.
+///
+/// Every message repeats back only what the caller supplied (or an address it
+/// resolved to), so it is safe to return to the registering client.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EgressDenied {
+    /// The string is not an absolute URL.
+    #[error("Webhook URL is not a valid absolute URL: {0}")]
+    Unparseable(String),
+    /// The scheme is not in [`ALLOWED_SCHEMES`].
+    #[error("Webhook URL scheme must be one of [\"http\", \"https\"], got {0:?}")]
+    Scheme(String),
+    /// The URL names no host.
+    #[error("Webhook URL must name a host")]
+    NoHost,
+    /// The host is an IP literal in a refused range.
+    #[error("Webhook URL must not target an internal address ({category}): {addr}")]
+    InternalAddress {
+        /// The literal address.
+        addr: IpAddr,
+        /// The table row it matched.
+        category: &'static str,
+    },
+    /// The host is a name RFC 6761 reserves to loopback.
+    #[error(
+        "Webhook URL must not target an internal address (loopback name reserved by RFC 6761): {0}"
+    )]
+    ReservedName(String),
+}
+
+impl EgressDenied {
+    /// The refused destination, for logs and `JobError::SsrfBlocked`, or `None`
+    /// when the refusal is about the URL's shape rather than where it points.
+    #[must_use]
+    pub fn blocked_destination(&self) -> Option<String> {
+        match self {
+            Self::InternalAddress { addr, .. } => Some(addr.to_string()),
+            Self::ReservedName(name) => Some(name.clone()),
+            Self::Unparseable(_) | Self::Scheme(_) | Self::NoHost => None,
+        }
+    }
+}
+
+/// The host of a URL that passed [`parse_and_classify`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckedHost {
+    /// An IP literal, already judged external.
+    Ip(IpAddr),
+    /// A name. NOT yet judged: a name is only as safe as what it resolves to.
+    Domain(String),
+}
+
+/// A URL that parsed, has an allowed scheme, and whose host is not refused on
+/// its face. For a [`CheckedHost::Domain`] that is a necessary condition, not a
+/// sufficient one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedUrl {
+    url: url::Url,
+    host: CheckedHost,
+    port: u16,
+}
+
+impl CheckedUrl {
+    /// The parsed URL — the one to dial, so the judged value and the dialled
+    /// value are the same object.
+    #[must_use]
+    pub fn url(&self) -> &url::Url {
+        &self.url
+    }
+
+    /// The parsed host.
+    #[must_use]
+    pub fn host(&self) -> &CheckedHost {
+        &self.host
+    }
+
+    /// The explicit port, or the scheme's default.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// Is `name` one of the names RFC 6761 reserves to loopback?
+///
+/// `localhost` and any label under `.localhost`, compared case-insensitively
+/// with a single trailing root dot stripped. These are loopback *by
+/// definition*, so they are refused without consulting a resolver.
+#[must_use]
+pub fn is_reserved_loopback_name(name: &str) -> bool {
+    let n = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    n == "localhost" || n.ends_with(".localhost")
+}
+
+/// Parse `raw` and apply every check that needs no DNS: absolute URL, `http`
+/// or `https`, a host, an IP literal outside the refused ranges, a name
+/// outside the reserved-to-loopback set.
+///
+/// Surrounding whitespace is trimmed first, so a padded target is judged as
+/// the value it will be dialled as.
+///
+/// # Errors
+///
+/// [`EgressDenied`] naming the rule the URL tripped.
+pub fn parse_and_classify(raw: &str) -> Result<CheckedUrl, EgressDenied> {
+    let url = url::Url::parse(raw.trim()).map_err(|e| EgressDenied::Unparseable(e.to_string()))?;
+
+    if !ALLOWED_SCHEMES.contains(&url.scheme()) {
+        return Err(EgressDenied::Scheme(url.scheme().to_string()));
+    }
+
+    let host = match url.host() {
+        None => return Err(EgressDenied::NoHost),
+        Some(url::Host::Ipv4(v4)) => CheckedHost::Ip(IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => CheckedHost::Ip(IpAddr::V6(v6)),
+        Some(url::Host::Domain(name)) => {
+            if is_reserved_loopback_name(name) {
+                return Err(EgressDenied::ReservedName(name.to_string()));
+            }
+            CheckedHost::Domain(name.to_string())
+        }
+    };
+
+    if let CheckedHost::Ip(addr) = host {
+        if let Some(category) = internal_category(addr) {
+            return Err(EgressDenied::InternalAddress { addr, category });
+        }
+    }
+
+    // Both allowed schemes are special, so a known default always exists.
+    let port = url.port_or_known_default().unwrap_or(80);
+    Ok(CheckedUrl { url, host, port })
+}
 
 /// Name the reason `addr` must not be dialled, or `None` if it is a globally
 /// reachable unicast address.
@@ -197,6 +342,63 @@ fn ipv6_category(v6: Ipv6Addr) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backlog e4916d42: every one of these reaches loopback (or metadata), and
+    /// the string-slicing extractor let each through. Parsing first means the
+    /// normalised authority is what gets judged.
+    #[test]
+    fn parse_and_classify_refuses_obfuscated_internal_authorities() {
+        for raw in [
+            "http://example.com@127.0.0.1/hook", // userinfo
+            "http://user:pw@169.254.169.254/latest/meta-data/",
+            "http://[::1]:8080/hook",         // bracketed IPv6 with port
+            "http://127.1/hook",              // short-form IPv4
+            "http://2130706433/hook",         // decimal IPv4
+            "http://0x7f.0.0.1/hook",         // hex octet
+            "http://0177.0.0.1/hook",         // octal octet
+            "http://[::ffff:127.0.0.1]/hook", // IPv4-mapped
+            "http://127.0.0.1.:80/hook",      // trailing root dot
+            "HTTP://LOCALHOST/hook",          // reserved name, case
+            "http://localhost./hook",         // reserved name, root dot
+        ] {
+            let got = parse_and_classify(raw);
+            assert!(
+                matches!(
+                    got,
+                    Err(EgressDenied::InternalAddress { .. } | EgressDenied::ReservedName(_))
+                ),
+                "{raw} must be refused as internal, got {got:?}"
+            );
+        }
+    }
+
+    /// The control, and the shape checks.
+    #[test]
+    fn parse_and_classify_accepts_public_and_rejects_bad_shapes() {
+        let ok = parse_and_classify("  https://hooks.example.com:8443/x  ").expect("public");
+        assert_eq!(ok.host(), &CheckedHost::Domain("hooks.example.com".into()));
+        assert_eq!(ok.port(), 8443);
+        assert_eq!(ok.url().as_str(), "https://hooks.example.com:8443/x");
+        let lit = parse_and_classify("http://93.184.216.34/x").expect("public literal");
+        assert_eq!(
+            lit.host(),
+            &CheckedHost::Ip("93.184.216.34".parse().unwrap())
+        );
+        assert_eq!(lit.port(), 80);
+
+        assert!(matches!(
+            parse_and_classify("ftp://example.com/x"),
+            Err(EgressDenied::Scheme(_))
+        ));
+        assert!(matches!(
+            parse_and_classify("/relative"),
+            Err(EgressDenied::Unparseable(_))
+        ));
+        assert!(matches!(
+            parse_and_classify("not a url"),
+            Err(EgressDenied::Unparseable(_))
+        ));
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap_or_else(|e| panic!("{s}: {e}"))

@@ -2325,23 +2325,26 @@ pub fn is_internal_ip(host: &str) -> bool {
     }
 }
 
-/// Extract host from a URL for SSRF checking.
+/// Extract the host of a URL, as the HTTP client will see it.
+///
+/// Parses with [`url::Url`] (WHATWG), so userinfo is stripped, IPv6 literals
+/// keep their brackets (`[::1]`), and alternate IPv4 spellings are normalised
+/// (`127.1` → `127.0.0.1`). The previous substring slicer returned
+/// `example.com@127.0.0.1` for a userinfo URL and `[` for a bracketed IPv6 one.
+///
+/// Classification belongs to [`egress::parse_and_classify`]; this remains for
+/// callers that only need the host string.
 ///
 /// # Returns
-/// The host portion of the URL, or `None` if parsing fails.
+/// The normalised host, or `None` if the URL does not parse, is not
+/// `http`/`https`, or has no host.
 #[must_use]
 pub fn extract_host_from_url(url: &str) -> Option<String> {
-    // Simple URL parsing - extract host between :// and next / or :
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-
-    let host_end = without_scheme
-        .find('/')
-        .unwrap_or(without_scheme.len())
-        .min(without_scheme.find(':').unwrap_or(without_scheme.len()));
-
-    Some(without_scheme[..host_end].to_string())
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    if !egress::ALLOWED_SCHEMES.contains(&parsed.scheme()) {
+        return None;
+    }
+    parsed.host_str().map(str::to_string)
 }
 
 // ============================================================================
@@ -2522,11 +2525,17 @@ impl JobHandler for ConfigurableWebhookHandler {
             });
         }
 
-        // SSRF protection: Check for internal IP addresses
-        if let Some(host) = extract_host_from_url(&config.url) {
-            if is_internal_ip(&host) {
-                return Err(JobError::SsrfBlocked { address: host });
-            }
+        // SSRF protection: parse the URL and judge the normalised authority
+        // (see `egress`). A URL that does not parse, or is not http(s), is
+        // refused too — the old string slicer skipped the check for it and
+        // handed it to the HTTP client anyway.
+        if let Err(denied) = egress::parse_and_classify(&config.url) {
+            return Err(match denied.blocked_destination() {
+                Some(address) => JobError::SsrfBlocked { address },
+                None => JobError::PermanentFailure {
+                    message: denied.to_string(),
+                },
+            });
         }
 
         // Serialize payload to JSON

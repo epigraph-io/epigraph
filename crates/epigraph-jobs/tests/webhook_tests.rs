@@ -591,6 +591,52 @@ async fn test_ssrf_internal_ip_rejected() {
     );
 }
 
+/// Backlog e4916d42: the handler's SSRF gate string-sliced the URL, so each of
+/// these spellings of loopback reached the HTTP client. Every one must now be
+/// refused as `SsrfBlocked` with ZERO calls to the client — the call count is
+/// the discriminator, because a refused-by-network outcome would also be an
+/// error.
+#[tokio::test]
+async fn test_ssrf_obfuscated_loopback_spellings_are_blocked() {
+    for url in [
+        "http://example.com@127.0.0.1/hook", // userinfo: slicer saw `example.com@127.0.0.1`
+        "http://[::1]:8080/hook",            // slicer truncated to `[`
+        "http://127.1/hook",                 // short-form IPv4
+        "http://2130706433/hook",            // decimal IPv4
+    ] {
+        let http_client = Arc::new(MockHttpClient::new());
+        let webhook_repo = Arc::new(MockWebhookRepository::new());
+        let webhook_id = Uuid::new_v4();
+        webhook_repo.add_webhook(WebhookConfig {
+            id: webhook_id,
+            url: url.to_string(),
+            secret: None,
+            enabled: true,
+            retry_count: 0,
+            timeout_seconds: 5,
+        });
+        let handler = create_test_handler(http_client.clone(), webhook_repo);
+        let job = EpiGraphJob::WebhookNotification {
+            webhook_id,
+            payload: json!({"event": "test"}),
+        }
+        .into_job()
+        .unwrap();
+
+        let result = handler.handle(&job).await;
+
+        assert!(
+            matches!(result, Err(JobError::SsrfBlocked { .. })),
+            "{url} must be SsrfBlocked, got {result:?}"
+        );
+        assert_eq!(
+            http_client.get_call_count(),
+            0,
+            "{url} reached the HTTP client"
+        );
+    }
+}
+
 /// Webhook to localhost should be rejected
 #[tokio::test]
 async fn test_ssrf_localhost_rejected() {
