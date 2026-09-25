@@ -552,6 +552,9 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     "privatization_plan_items",
     "privatization_audit",
     "instance_admins",
+    // The operator-link record, FORCEd by the migration that creates it (107),
+    // on the same self-FORCEing precedent as the four above.
+    "operator_links",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.

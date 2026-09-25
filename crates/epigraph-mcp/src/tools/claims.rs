@@ -1121,6 +1121,59 @@ pub async fn update_with_evidence(
 ///   neither `--jwt-secret` nor (unix-only) `--allow-unauthenticated-http`.
 ///
 /// A server WITH a declared signer keeps the strict behavior unchanged.
+///
+/// ## The operator arm (migration 107)
+///
+/// Added BESIDE every branch above, never in place of one. It asks two
+/// DIFFERENT questions, one per side, and uses a different definer read for
+/// each (`migrations/107_operator_link.sql` section 5):
+///
+/// - `author_op(target)` = `AgentRepository::operator_of_author` — "whose are
+///   this author's claims?", from the `operator_links` record alone, RETIRED
+///   links included, no membership consulted. Used ONLY for the target.
+/// - `actor_op(caller)` = `AgentRepository::operator_actor` — "may this agent
+///   act for an operator?": a not-retired record, a live `writer`/`admin`
+///   membership, the operator's own personal group. Used ONLY for the caller.
+///
+/// With `caller` = the server's own agent on stdio and `auth.agent_id` over
+/// HTTP, the arm allows exactly:
+///
+/// - `caller == author_op(target)` — the operator acting on its linked agents'
+///   claims, retired ones included (over HTTP this is the operator's own
+///   `auth.agent_id`);
+/// - `actor_op(caller) == author_op(target)`, both present — an agent acting
+///   for the operator on another of its agents' claims, e.g. a job whose model
+///   was bumped and so runs under a new identity, over its retired
+///   predecessor's claims. **stdio only.** Operated agents are stdio-only
+///   (token issuance refuses them), but that is enforced at MINT, so a token
+///   minted BEFORE the agent was linked would otherwise carry the actor arm
+///   onto HTTP until it expired (stage-2 review). Over HTTP only the operator
+///   acting directly is admitted.
+///
+/// A retired identity is never an actor, so it owns nothing through this arm
+/// (its key may be exposed). An operator's OWN directly authored claims are
+/// not reachable from its agents here: `author_op(operator)` is `None`.
+///
+/// ### What this arm does NOT reach: claims written through a shared HTTP signer
+///
+/// The rule is keyed on the claim's AUTHOR (`claims.agent_id`). Claims an
+/// operator writes through the shared HTTP MCP servers (`epigraph-mcp-auth` /
+/// `-http`) are authored by that server's ONE signer agent, not by the
+/// operator's own agent id, so they are outside it: no link names the signer
+/// as operated (an HTTP listener refuses to start, and refuses every call, while
+/// its signer has any link — `operator::refuse_operated_http_signer`,
+/// `operator::refuse_linked_http_signer`). Do NOT close that gap by walking the
+/// signer's `OPERATED_BY` auth-lineage edges: `record_auth_lineage` writes one
+/// for every OAuth caller and REST `create_edge` accepts `OPERATED_BY` from any
+/// `edges:write` caller, so those edges are forgeable and would make every
+/// caller an owner of every HTTP-authored claim. Extending ownership to
+/// HTTP-authored claims needs its own design.
+///
+/// It is keyed on AUTHORS, never on the claim's owner group. "The owner group is
+/// writable by the caller" would be the wrong generalisation: most pre-tenancy
+/// claims are world-owned, and an agent's writable set would make it an owner
+/// of everything. `None == None` never matches — an unlinked caller and an
+/// unlinked target share no operator.
 pub(crate) async fn require_owner_or_admin(
     server: &EpiGraphMcpFull,
     auth: Option<&epigraph_auth::AuthContext>,
@@ -1133,6 +1186,17 @@ pub(crate) async fn require_owner_or_admin(
         let principal = auth.owner_id.unwrap_or(auth.client_id);
         if principal == target_agent_id {
             return Ok(());
+        }
+        // Between the principal check and the denial, deliberately: every
+        // ALLOW above is unchanged. One visible difference on the DENY path: a
+        // failed operator lookup (e.g. a database without migration 107) now
+        // returns an internal error instead of the ownership denial text — the
+        // gate does not decide on an answer it did not get.
+        if let Some(caller) = auth.agent_id {
+            // `allow_actor = false`: operated agents are stdio-only.
+            if operator_arm_allows(server, caller, target_agent_id, false).await? {
+                return Ok(());
+            }
         }
         return Err(McpError {
             code: rmcp::model::ErrorCode::INVALID_PARAMS,
@@ -1167,6 +1231,17 @@ pub(crate) async fn require_owner_or_admin(
         return Ok(());
     }
 
+    // The operator arm runs AFTER the undeclared-signer arm, so that arm is
+    // byte-for-byte the pre-107 behaviour — including when the operator lookup
+    // fails (e.g. a database without migration 107), where it still warns and
+    // allows instead of returning an internal error. The order changes no
+    // decision: an undeclared (random, per-process) signer can be neither
+    // operated (`operator::check_operator_transport` refuses it) nor anyone's
+    // operator.
+    if operator_arm_allows(server, caller_agent, target_agent_id, true).await? {
+        return Ok(());
+    }
+
     Err(McpError {
         code: rmcp::model::ErrorCode::INVALID_PARAMS,
         message: format!(
@@ -1180,6 +1255,56 @@ pub(crate) async fn require_owner_or_admin(
         .into(),
         data: None,
     })
+}
+
+/// The operator arm of [`require_owner_or_admin`]; see its doc for the rule.
+///
+/// The TARGET side reads `AgentRepository::operator_of_author` and the CALLER
+/// side `AgentRepository::operator_actor` (migration 107's two definer reads).
+/// Swapping either is a defect: an author read on the caller side would let a
+/// retired identity — whose key may be exposed — act for its operator, and an
+/// actor read on the target side would take the operator's ownership of a
+/// retired or revoked agent's claims away. A lookup failure is an error, not a
+/// `false`: the gate must not quietly decide ownership without the answer it
+/// asked for.
+///
+/// `allow_actor` is `false` on the HTTP transport: there only `caller ==
+/// author_op(target)` (the operator itself) is admitted, never the actor arm.
+async fn operator_arm_allows(
+    server: &EpiGraphMcpFull,
+    caller: uuid::Uuid,
+    target: uuid::Uuid,
+    allow_actor: bool,
+) -> Result<bool, McpError> {
+    let Some(target_op) =
+        epigraph_db::AgentRepository::operator_of_author_pool(&server.pool, target)
+            .await
+            .map_err(internal_error)?
+            .map(|a| a.operator_id)
+    else {
+        // An author with no link record has no operator for anyone to share.
+        return Ok(false);
+    };
+    let reason = if caller == target_op {
+        "caller is the operator of the claim's author"
+    } else if allow_actor
+        && epigraph_db::AgentRepository::operator_actor_pool(&server.pool, caller)
+            .await
+            .map_err(internal_error)?
+            .is_some_and(|l| l.operator_id == target_op)
+    {
+        "caller acts for the operator of the claim's author"
+    } else {
+        return Ok(false);
+    };
+    tracing::info!(
+        caller = %caller,
+        target_agent = %target,
+        operator = %target_op,
+        reason,
+        "claim ownership granted through an operator link"
+    );
+    Ok(true)
 }
 
 /// One-call backlog-item retirement.

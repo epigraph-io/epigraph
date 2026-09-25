@@ -21,6 +21,7 @@ pub mod community;
 pub mod context;
 pub mod corpus_stats;
 pub mod counterfactual;
+pub mod decomposition_priority;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
@@ -70,7 +71,8 @@ pub mod workflow_execution;
 // Re-export all repositories for convenience
 pub use activity::ActivityRepository;
 pub use agent::{
-    AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, CapabilityFilter,
+    AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
+    CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome,
 };
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
