@@ -14,7 +14,12 @@ python3 services/kanban/server.py                 # port 8097, repo = git toplev
 python3 services/kanban/server.py --port 8097 --repo ~/Projects/epigraph --no-refresh
 ```
 
-At startup the server prints `http://127.0.0.1:8097/?t=<token>`. Open that exact URL. The UI saves the token for the tab and then removes it from the address bar. The token is kept in `$KANBAN_HOME/token` (mode 0600) and stays the same across restarts.
+At startup the server prints a **single-use pairing link**, `http://127.0.0.1:8097/#pair=<code>`. Open it in the browser you will use. The page trades the code for a per-session secret, keeps that secret in the tab's `sessionStorage`, and clears the link from the address bar.
+
+- The secret is generated in memory when the code is redeemed. It is never written to disk by the board, never put in an environment variable, and never returned by `/api/state`.
+- The code sits in the URL *fragment*, so it never reaches a request line or a log. Once redeemed it is dead, so a copy left in a journal or scrollback authorises nothing.
+- There is one paired session per server process. To pair again (a new browser, or a closed tab), restart `server.py`.
+- Older builds kept a long-lived token in `$KANBAN_HOME/token`. That file is deleted at startup.
 
 Prerequisites: `git`, an authenticated `gh`, and `claude` on PATH, plus a checkout of the repo whose `origin` is on GitHub.
 
@@ -97,7 +102,7 @@ The board refuses to ship while cards that target the current integration branch
 
 ## HTTP API
 
-Every `/api/*` call needs the token: the `X-Kanban-Token` header, or `?t=` for GET only. Other rules:
+Every `/api/*` call needs the session secret in the `X-Kanban-Token` header. It is never accepted from the URL. The one exception is `POST /api/session/pair` `{"code": "<pairing code>"}`. That call returns `{"token": ...}` once per server process and then answers 409. Other rules:
 
 - Requests are refused unless `Host` is `127.0.0.1:<port>` or `localhost:<port>`. This blocks DNS rebinding.
 - A POST whose `Origin` header points to another origin is refused.
@@ -120,8 +125,15 @@ Every `/api/*` call needs the token: the `X-Kanban-Token` header, or `?t=` for G
 
 ## Safety notes
 
-- Each agent runs in its own worktree with `--permission-mode $KANBAN_PERMISSION_MODE` (default `auto`). An agent still has your shell, `gh`, and network credentials. Choose a mode you are comfortable with, and keep `KANBAN_MAX_AGENTS` low.
-- Only a human can merge to `main`: the "Merge integration → main" button in the UI. Agents are told never to merge. The board itself merges only when you click Accept or Ship.
+- **The board merges only when a person clicks.** Merges happen on Accept (into staging) or Ship (into the base branch). No scheduler, timer or recovery path merges anything. Both merges verify the PR, pin its head sha, and require CI to pass unless you explicitly override.
+- **The board cannot stop its own agents from merging. This is a known limitation, not a guarantee.** Dispatched agents run as **your user id**, without a container or a separate uid, and with a shell, under `--permission-mode $KANBAN_PERMISSION_MODE` (default `auto`). "Only a human merges to `main`" is therefore a convention the agents are told to follow and the board's own code keeps. It is not a boundary an agent cannot cross. A same-uid agent that decides to misbehave can still:
+  - run `gh pr merge` (or call the GitHub API) itself, using your `gh` credentials from their config file on disk. The `--disallowedTools` patterns catch the obvious spellings of that command, but they are prefix matches, not a sandbox;
+  - read your browser profile, where `sessionStorage` may be persisted, or read the board's memory where the kernel allows same-uid ptrace;
+  - read the pairing link from wherever the board's stdout goes (a terminal, tmux or the journal) while the link is still unredeemed. Agents only run during that window if they survived a server restart; the board logs a warning when that happens. Pair promptly after a restart;
+  - stop or restart the board process itself.
+
+  What the hardening does buy: the session secret is not on disk, not in any environment, and not in `/api/state`; agents inherit no tokens from the environment; helper agents have no shell at all; and agent-authored text cannot reach a prompt unquoted. Together these close the *accidental* paths and the cheap ones. **For real isolation, run the agents as a separate OS user or in a container that holds no GitHub credential with merge rights**, or at least give their `gh` a token that cannot merge to the base branch. Keep `KANBAN_MAX_AGENTS` low, and pick a permission mode you are comfortable with.
+- Prompts are passed to `claude` in argv, so any local user can read claim text and prompts with `ps`. The board's own agent-identity check reads argv too.
 - Commands are run as argv lists with explicit timeouts. Nothing goes through a shell. Card ids are checked to be UUIDs before they are used in paths, and branch slugs are limited to `[a-z0-9-]`.
 - Claim text is untrusted. The prompt fences it as data, and the UI inserts it with `textContent` only.
 - State is saved atomically (a tmp file, then rename) under one lock. Git operations on the main checkout are serialized.
@@ -139,4 +151,12 @@ Every `/api/*` call needs the token: the `X-Kanban-Token` header, or `?t=` for G
 cd services/kanban && python3 -m unittest discover -s tests -v
 ```
 
-The tests create a temporary bare `origin` repo and a clone, plus stub `claude`/`gh` scripts. They then drive the full flow: import → develop → review (live blocker plus report blockers) → resolve blocker → accept → open integration PR → merge → shipped → backlog resolution. They also cover feedback/resume, reject, auth/Host/Origin rejection, 404, and 409.
+The tests create a temporary bare `origin` repo and a clone, plus stub `claude`/`gh` scripts. They then drive the full flow: import → develop → review (live blocker plus report blockers) → resolve blocker → accept → open integration PR → merge → shipped → backlog resolution. They also cover feedback/resume, reject, auth/Host/Origin rejection, 404, and 409. Security guards are tested separately:
+
+- merge verification and head pinning (`IntegrationMergeGuardsTest`)
+- the CI gate and its override (`ChecksGateTest`)
+- agent environment scrubbing and tool flags (`AgentEnvTest`, `HelperAgentTest`)
+- `pr_url` validation and prompt escaping (`PrUrlSinkTest`)
+- the session secret (`SessionSecretTest`)
+
+Nothing in the suite talks to GitHub, the EpiGraph API or a real `claude`. `gh` and `claude` are stubs, and `urlopen` is patched.

@@ -189,6 +189,14 @@ class _ServerFixture(unittest.TestCase):
         cls.app.start()
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
+        # pair once, as the operator's browser would
+        conn = http.client.HTTPConnection("127.0.0.1", cls.port, timeout=10)
+        conn.request("POST", "/api/session/pair", body=json.dumps({"code": cls.app.pair_code}),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        paired = json.loads(resp.read().decode())
+        conn.close()
+        assert resp.status == 200 and paired["token"] == cls.app.token, paired
 
     @classmethod
     def tearDownClass(cls):
@@ -289,10 +297,11 @@ class KanbanServerTest(_ServerFixture):
     def test_01_auth_and_host(self):
         status, body = self.req("GET", "/api/state", token=False)
         self.assertIn(status, (401, 403))
-        status, _ = self.req("GET", "/api/state?t=wrong", token=False)
+        status, _ = self.req("GET", "/api/state", token=False, headers={"X-Kanban-Token": "wrong"})
         self.assertEqual(status, 403)
+        # the session secret is never accepted from the URL
         status, _ = self.req("GET", "/api/state?t=" + self.app.token, token=False)
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 401)
         status, _ = self.req("POST", "/api/backlog/refresh", body={}, token=False)
         self.assertIn(status, (401, 403))
         status, _ = self.req("POST", "/api/backlog/refresh", body={},
@@ -894,6 +903,77 @@ class HelperAgentTest(_IsolatedRepo):
         env = kanban.agent_env(cfg, {"PATH": "/bin", "GH_TOKEN": "s", "KANBAN_X": "s", "FOO": "ok",
                                      "EPIGRAPH_TOKEN": "s", "LC_ALL": "C", "RANDOM_SECRET": "s"})
         self.assertEqual(env, {"PATH": "/bin", "FOO": "ok", "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"})
+
+
+class SessionSecretTest(unittest.TestCase):
+    """The secret that authorises the mutating endpoints never exists where a same-uid agent could simply
+    read it: not in a file under KANBAN_HOME, not in /api/state, not in any agent's environment, not in a URL."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="kanban-pair-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = os.path.join(self.tmp, "home")
+        self.app = kanban.App(kanban.Config(repo=self.tmp, port=0, env={
+            "KANBAN_HOME": self.home, "KANBAN_GH_BIN": os.path.join(self.tmp, "no-gh"), "KANBAN_BACKLOG_SOURCE": "file"}))
+        self.server = kanban.make_server(self.app, 0)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def files_containing(self, needle):
+        hits = []
+        for root, _, files in os.walk(self.home):
+            for name in files:
+                path = os.path.join(root, name)
+                with open(path, "rb") as fh:
+                    if needle.encode() in fh.read():
+                        hits.append(path)
+        return hits
+
+    def call(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        conn.request(method, path, body=json.dumps(body) if body is not None else None, headers=h)
+        resp = conn.getresponse()
+        raw = resp.read().decode()
+        conn.close()
+        return resp.status, (json.loads(raw) if raw else None)
+
+    def test_session_secret_is_never_on_disk_and_pairing_is_single_use(self):
+        # whatever secret the board holds at startup must not be readable from KANBAN_HOME
+        startup = getattr(self.app, "token", None)
+        if startup:
+            self.assertEqual(self.files_containing(startup), [], "the auth secret is on disk under KANBAN_HOME")
+        self.assertFalse(os.path.exists(os.path.join(self.home, "token")))
+
+        self.assertEqual(self.call("GET", "/api/state")[0], 401)
+        self.assertEqual(self.call("POST", "/api/session/pair", {"code": "wrong"})[0], 403)
+        self.assertEqual(self.call("POST", "/api/session/pair", {"code": self.app.pair_code},
+                                   {"Origin": "http://evil.example"})[0], 403)
+        code = self.app.pair_code
+        status, body = self.call("POST", "/api/session/pair", {"code": code})
+        self.assertEqual(status, 200, body)
+        secret = body["token"]
+        self.assertGreaterEqual(len(secret), 32)
+        # single use: the printed link is dead once redeemed
+        self.assertEqual(self.call("POST", "/api/session/pair", {"code": code})[0], 409)
+        self.assertIsNone(self.app.pair_code)
+
+        status, state = self.call("GET", "/api/state", headers={"X-Kanban-Token": secret})
+        self.assertEqual(status, 200)
+        self.assertNotIn(secret, json.dumps(state))
+        self.assertEqual(self.call("GET", "/api/state?t=" + secret)[0], 401)
+        self.app.store.save()
+        self.assertEqual(self.files_containing(secret), [], "the session secret was written under KANBAN_HOME")
+        self.assertNotIn(secret, json.dumps(kanban.agent_env(self.app.cfg)))
+
+    def test_legacy_token_file_is_removed(self):
+        with open(os.path.join(self.home, "token"), "w") as fh:
+            fh.write("x" * 43)
+        kanban.App(self.app.cfg)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "token")))
 
 
 class RecoverTest(unittest.TestCase):

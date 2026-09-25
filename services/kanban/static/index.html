@@ -652,14 +652,39 @@ function store(key, val) { try { if (val === undefined) return JSON.parse(localS
 /* ================= token & mode ================= */
 var params = new URLSearchParams(location.search);
 var DEMO = params.get('demo') === '1';
+// The session secret is issued by the server once, in exchange for the single-use pairing code in the
+// startup link (#pair=...), and lives only in this tab's sessionStorage. The server never writes it to disk.
 var TOKEN = null;
-try { TOKEN = sessionStorage.getItem('kanban.token'); } catch (e) { /* storage blocked */ }
-if (params.get('t')) {
-  TOKEN = params.get('t');
-  try { sessionStorage.setItem('kanban.token', TOKEN); } catch (e) { /* ignore */ }
-  params.delete('t');
-  var qs = params.toString();
-  try { history.replaceState(null, '', location.pathname + (qs ? '?' + qs : '') + location.hash); } catch (e) { /* file:// */ }
+try { TOKEN = sessionStorage.getItem('kanban.session'); } catch (e) { /* storage blocked */ }
+try { sessionStorage.removeItem('kanban.token'); } catch (e) { /* legacy long-lived token */ }
+var PAIR = null;
+(function () {
+  var hp = new URLSearchParams(String(location.hash || '').replace(/^#/, ''));
+  var legacy = params.get('t') != null;
+  if (hp.get('pair')) PAIR = hp.get('pair');
+  if (legacy) params.delete('t');  // old ?t= links: the server no longer accepts a secret in the URL
+  if (PAIR || legacy) {
+    var qs = params.toString();
+    try { history.replaceState(null, '', location.pathname + (qs ? '?' + qs : '')); } catch (e) { /* file:// */ }
+  }
+})();
+function pairCode(v) {
+  v = String(v || '').trim();
+  var m = /[#&?]pair=([^&\s]+)/.exec(v);
+  return m ? decodeURIComponent(m[1]) : v;
+}
+function pairWith(code) {
+  return fetch('/api/session/pair', { method: 'POST', cache: 'no-store', credentials: 'same-origin',
+    headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ code: code }) })
+    .then(function (res) {
+      return res.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = { error: text.slice(0, 300) }; }
+        if (!res.ok || !data || !data.token) throw apiError(res.status, (data && data.error) || ('HTTP ' + res.status), data);
+        TOKEN = data.token;
+        try { sessionStorage.setItem('kanban.session', TOKEN); } catch (e) { /* this tab keeps it in memory */ }
+      });
+    });
 }
 
 /* ================= API wrapper ================= */
@@ -820,15 +845,15 @@ function setBanner(mode, msg) {
     append(b, [h('strong', { text: 'Demo mode' }), h('span', { text: 'In-memory fake API with sample cards. Nothing is dispatched, pushed or merged.' })]);
   } else if (mode === 'auth') {
     b.className = 'banner err';
-    var inp = h('input', { type: 'text', placeholder: 'Paste token', 'aria-label': 'Kanban token', class: 'mono' });
+    var inp = h('input', { type: 'text', placeholder: 'Paste pairing link', 'aria-label': 'Pairing link or code', class: 'mono' });
     append(b, [
-      h('strong', { text: 'Not authorised.' }),
-      h('span', { text: 'Open the URL printed by server.py (http://127.0.0.1:PORT/?t=TOKEN), or paste the token:' }),
+      h('strong', { text: 'Not paired.' }),
+      h('span', { text: (msg ? msg + ' — ' : '') + 'Open the single-use pairing link printed by server.py (http://127.0.0.1:PORT/#pair=…), or paste it here. If it was already used, restart server.py to get a new one.' }),
       inp,
-      h('button', { type: 'button', class: 'btn sm', text: 'Use token', onclick: function () {
-        var v = inp.value.trim(); if (!v) return;
-        TOKEN = v; try { sessionStorage.setItem('kanban.token', v); } catch (e) { /* ignore */ }
-        bannerMode = null; refreshSoon();
+      h('button', { type: 'button', class: 'btn sm', text: 'Pair', onclick: function () {
+        var v = pairCode(inp.value); if (!v) return;
+        pairWith(v).then(function () { bannerMode = null; refreshSoon(); },
+          function (e) { toast('Pairing failed: ' + e.message, 'error'); });
       } })
     ]);
   } else {
@@ -2192,7 +2217,11 @@ function createDemo() {
 if (DEMO) demo = createDemo();
 wire();
 setBanner(null);
-poll();
+if (PAIR && !DEMO) {
+  pairWith(PAIR).then(function () { poll(); }, function (e) { setBanner('auth', 'Pairing failed: ' + e.message); poll(); });
+} else {
+  poll();
+}
 // elapsed timers tick between polls (cheap: only cards whose signature changed are rebuilt)
 setInterval(function () { if (S && !ui.dragging) renderBoard(); }, 15000);
 })();

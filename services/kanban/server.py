@@ -776,7 +776,13 @@ class App:
         except OSError:
             pass
         self.store = Store(cfg.home, cfg.base_branch)
-        self.token = self._load_token()
+        # The secret that authorises every /api call is PER SESSION: generated in memory when the operator's
+        # browser redeems the single-use pairing code, returned only to that browser, never written to disk,
+        # never put in an environment or in /api/state. See README "Safety notes" for what this does NOT stop.
+        self.token: Optional[str] = None
+        self.pair_code: Optional[str] = secrets.token_urlsafe(24)
+        self._pair_lock = threading.Lock()
+        self._retire_legacy_token_file()
         self.git_lock = threading.Lock()  # serializes git ops on the main repo
         self.procs: Dict[str, subprocess.Popen] = {}
         self._wake = threading.Event()
@@ -787,20 +793,25 @@ class App:
 
     # ---- lifecycle -------------------------------------------------------
 
-    def _load_token(self) -> str:
-        path = os.path.join(self.cfg.home, "token")
+    def _retire_legacy_token_file(self) -> None:
+        """Older builds kept a long-lived token in $KANBAN_HOME/token, readable by every agent (same uid)."""
         try:
-            with open(path, "r") as fh:
-                tok = fh.read().strip()
-            if len(tok) >= 32:
-                return tok
+            os.remove(os.path.join(self.cfg.home, "token"))
+            log("removed the legacy $KANBAN_HOME/token file; the board now pairs one browser session per start")
         except OSError:
             pass
-        tok = secrets.token_urlsafe(32)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(tok)
-        return tok
+
+    def pair(self, code: Any) -> str:
+        """Redeem the single-use pairing code for this process's session secret."""
+        with self._pair_lock:
+            if self.pair_code is None:
+                raise ApiError(409, "this server is already paired with a browser session; restart it to pair again")
+            if not isinstance(code, str) or not hmac.compare_digest(code.encode(), self.pair_code.encode()):
+                raise ApiError(403, "bad pairing code")
+            self.pair_code = None
+            self.token = secrets.token_urlsafe(32)
+            log("paired with a browser session; the pairing link is now spent")
+            return self.token
 
     def start(self) -> None:
         self.recover()
@@ -812,6 +823,7 @@ class App:
 
     def recover(self) -> None:
         """Reconcile cards left mid-flight by a previous server process."""
+        reattached = 0
         with self.store.lock:
             for card in self.store.cards.values():
                 st = card.get("status")
@@ -819,6 +831,7 @@ class App:
                     pid = card.get("pid")
                     if pid and card.get("log_path") and is_our_agent(pid, card.get("session_id"),
                                                                      card.get("pid_started")):
+                        reattached += 1
                         add_history(card, "reattached", "agent pid %s still alive after server restart" % pid)
                         run_n = card.get("run_n", 0)
                         threading.Thread(target=self._monitor, daemon=True,
@@ -836,6 +849,9 @@ class App:
                     add_history(card, "recovered", "server restarted during merge; verify the PR state on GitHub")
                 elif st == "queued":
                     add_history(card, "requeued", "server restarted; still queued")
+            if reattached and self.pair_code:
+                log("WARNING: %d agent(s) from the previous server are still running while the pairing link is "
+                    "unredeemed; open it promptly (see README, Safety notes)" % reattached)
             integ = self.store.state.get("integration") or {}
             recover_ship = None
             if integ.get("status") == "merging":
@@ -1996,6 +2012,10 @@ def make_handler(app: App):
             return fn
         return deco
 
+    @route("POST", r"/api/session/pair")
+    def _pair(h, q, body):
+        return {"ok": True, "token": app.pair(body.get("code") if isinstance(body, dict) else None)}
+
     @route("GET", r"/api/state")
     def _state(h, q, body):
         return app.state_view()
@@ -2127,13 +2147,17 @@ def make_handler(app: App):
                     origin = self.headers.get("Origin")
                     if origin and origin.lower() not in ["http://" + h for h in self._allowed_hosts()]:
                         raise ApiError(403, "cross-origin request refused")
-                supplied = self.headers.get("X-Kanban-Token") or ""
-                if not supplied and method == "GET":
-                    supplied = (query.get("t") or [""])[0]
-                if not supplied:
-                    raise ApiError(401, "missing token")
-                if not hmac.compare_digest(supplied.encode(), app.token.encode()):
-                    raise ApiError(403, "bad token")
+                pairing = method == "POST" and path == "/api/session/pair"
+                if not pairing:
+                    # header only: the session secret is never accepted from a URL (logs, history, Referer)
+                    supplied = self.headers.get("X-Kanban-Token") or ""
+                    session = app.token
+                    if not supplied:
+                        raise ApiError(401, "missing token")
+                    if not session:
+                        raise ApiError(401, "not paired: open the pairing link printed by server.py")
+                    if not hmac.compare_digest(supplied.encode(), session.encode()):
+                        raise ApiError(403, "bad token")
                 body: Any = {}
                 if method == "POST":
                     if self.headers.get("Transfer-Encoding"):
@@ -2144,7 +2168,7 @@ def make_handler(app: App):
                         self.close_connection = True
                         raise ApiError(400, "invalid Content-Length")
                     length = int(raw_len)
-                    if length > 10 * 1024 * 1024:
+                    if length > (4096 if pairing else 10 * 1024 * 1024):
                         self.close_connection = True
                         raise ApiError(413, "body too large")
                     raw = self.rfile.read(length) if length else b""
@@ -2218,7 +2242,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     app.start()
     if not args.no_refresh and cfg.backlog_source != "file":
         app.refresh_backlog_async()
-    print("EpiGraph kanban: http://127.0.0.1:%d/?t=%s" % (cfg.port, app.token), flush=True)
+    # A single-use pairing link, in the URL FRAGMENT so it never reaches a request line or server log. Once the
+    # browser redeems it the printed value is dead, so a copy in a journal or scrollback authorises nothing.
+    print("EpiGraph kanban: open http://127.0.0.1:%d/#pair=%s (single-use; restart the server to pair again)"
+          % (cfg.port, app.pair_code), flush=True)
     print("repo=%s home=%s backlog_source=%s max_agents=%d permission_mode=%s"
           % (cfg.repo, cfg.home, cfg.backlog_source, cfg.max_agents, cfg.permission_mode), flush=True)
     try:
