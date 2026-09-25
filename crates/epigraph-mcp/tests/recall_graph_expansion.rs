@@ -37,9 +37,6 @@ use epigraph_mcp::types::LinkEpistemicParams;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[path = "viewer_fixture.rs"]
-mod viewer_fixture;
-
 mod fixture {
     use super::*;
 
@@ -200,7 +197,7 @@ async fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
     use epigraph_crypto::AgentSigner;
     use epigraph_mcp::embed::McpEmbedder;
     use epigraph_mcp::EpiGraphMcpFull;
-    let scoped = viewer_fixture::scoped_pool(&pool).await;
+    let scoped = viewerfx::scoped_pool(&pool).await;
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
     // mock — tests use pre-computed pgvec
     let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());

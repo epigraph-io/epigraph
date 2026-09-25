@@ -555,6 +555,11 @@ pub async fn sheaf_reconcile(
     })))
 }
 
+/// One BP result to write: `(claim, betp, Some((belief, plausibility)))` for the
+/// CDST branch, `(claim, betp, None)` for the scalar branch.
+#[cfg(feature = "db")]
+type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
+
 /// Write a BP run's results to `claims`, ALL OR NOTHING, on one transaction
 /// stamped with the caller's viewer.
 ///
@@ -576,7 +581,7 @@ pub async fn sheaf_reconcile(
 async fn apply_bp_updates(
     state: &AppState,
     viewer: &epigraph_db::visibility::Viewer,
-    updates: &[(Uuid, f64, Option<(f64, f64)>)],
+    updates: &[BpUpdate],
 ) -> Result<(), ApiError> {
     let mut tx = state.write_as(viewer, "propagate_beliefs").await?;
     for (claim_id, betp, interval) in updates {
@@ -812,7 +817,7 @@ pub async fn propagate_beliefs(
         // with nothing written, not a count beside a 200.
         let apply_failures = 0_usize;
         if apply {
-            let updates: Vec<(Uuid, f64, Option<(f64, f64)>)> = result
+            let updates: Vec<BpUpdate> = result
                 .updated_betps
                 .iter()
                 .map(|(claim_id, betp)| {
@@ -849,7 +854,7 @@ pub async fn propagate_beliefs(
     let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
 
     if apply && !result.updated_beliefs.is_empty() {
-        let updates: Vec<(Uuid, f64, Option<(f64, f64)>)> = result
+        let updates: Vec<BpUpdate> = result
             .updated_beliefs
             .iter()
             .map(|(claim_id, new_betp)| (*claim_id, *new_betp, None))
