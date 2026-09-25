@@ -577,14 +577,47 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// `updated_beliefs` and wrote nothing (MEASURED, batch H-a review: 0 rows on A,
 /// 13-17 on B). Now a refusal (`42501`, 403) or a zero-row UPDATE (409) fails
 /// the request, and the transaction is never committed.
+///
+/// # A BP variable that is not a claim the caller can see is SKIPPED, and counted
+///
+/// `factors.variable_ids` has no foreign key to `claims`, so a factor can name
+/// an id that is no longer (or never was) a claim. MEASURED on a long-lived
+/// test database: 149 of 151 factors named at least one such id, and failing
+/// the whole apply over it turned a working `apply_updates` on production's
+/// schema into a 409. So the visible claim ids are read FIRST, on the same
+/// stamped transaction; an id outside that set is skipped and reported in
+/// `skipped_not_visible` rather than written or failed on. That also covers a
+/// real claim the caller cannot READ, which is the correct answer for it: its
+/// belief is not the caller's to write, and the response says it was not
+/// written. A claim the caller can see but not WRITE is still refused (403),
+/// and the whole apply is rolled back.
+///
+/// Returns `(written, skipped_not_visible)`.
 #[cfg(feature = "db")]
 async fn apply_bp_updates(
     state: &AppState,
     viewer: &epigraph_db::visibility::Viewer,
     updates: &[BpUpdate],
-) -> Result<(), ApiError> {
+) -> Result<(usize, usize), ApiError> {
     let mut tx = state.write_as(viewer, "propagate_beliefs").await?;
+    let ids: Vec<Uuid> = updates.iter().map(|(id, _, _)| *id).collect();
+    let visible: std::collections::HashSet<Uuid> =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM claims WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to read the BP variables' claims: {e}"),
+            })?
+            .into_iter()
+            .collect();
+    let mut written = 0_usize;
+    let mut skipped = 0_usize;
     for (claim_id, betp, interval) in updates {
+        if !visible.contains(claim_id) {
+            skipped += 1;
+            continue;
+        }
         let result = match interval {
             Some((bel, pl)) => {
                 sqlx::query(
@@ -630,19 +663,23 @@ async fn apply_bp_updates(
                 ),
             });
         }
+        written += 1;
     }
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the belief updates: {e}"),
-    })
+    })?;
+    Ok((written, skipped))
 }
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
 ///
 /// With `apply_updates: true` the results are written all-or-nothing on a
 /// transaction stamped with the caller's viewer (`apply_bp_updates`): a claim
-/// the caller cannot write fails the request (403, or 409 for a row the update
-/// could not reach) and nothing is written. `applied: true` in a 200 means
-/// every listed belief was written.
+/// the caller can see but not write fails the request (403) and nothing is
+/// written. A BP variable that is not a claim the caller can see (a stale
+/// factor id, or another group's private claim) is skipped. `applied_count` is
+/// the number of claims written and `skipped_not_visible` the number skipped;
+/// `updated_beliefs` lists what BP computed, which is not the same list.
 #[cfg(feature = "db")]
 pub async fn propagate_beliefs(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -816,6 +853,7 @@ pub async fn propagate_beliefs(
         // its existing readers and is now always 0: a failed apply is an error
         // with nothing written, not a count beside a 200.
         let apply_failures = 0_usize;
+        let (mut written, mut skipped) = (0_usize, 0_usize);
         if apply {
             let updates: Vec<BpUpdate> = result
                 .updated_betps
@@ -830,7 +868,7 @@ pub async fn propagate_beliefs(
                     (*claim_id, *betp, Some((bel, pl)))
                 })
                 .collect();
-            apply_bp_updates(&state, &viewer, &updates).await?;
+            (written, skipped) = apply_bp_updates(&state, &viewer, &updates).await?;
         }
 
         return Ok(Json(serde_json::json!({
@@ -843,6 +881,8 @@ pub async fn propagate_beliefs(
             "factors_count": engine_factors.len(),
             "variables_count": all_var_ids.len(),
             "applied": apply,
+            "applied_count": written,
+            "skipped_not_visible": skipped,
             "apply_failures": apply_failures,
             "updated_beliefs": result.updated_betps.iter()
                 .map(|(id, betp)| serde_json::json!({"claim_id": id, "betp": betp}))
@@ -853,13 +893,14 @@ pub async fn propagate_beliefs(
     // -- Scalar BP fallback ---------------------------------------------------
     let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
 
+    let (mut written, mut skipped) = (0_usize, 0_usize);
     if apply && !result.updated_beliefs.is_empty() {
         let updates: Vec<BpUpdate> = result
             .updated_beliefs
             .iter()
             .map(|(claim_id, new_betp)| (*claim_id, *new_betp, None))
             .collect();
-        apply_bp_updates(&state, &viewer, &updates).await?;
+        (written, skipped) = apply_bp_updates(&state, &viewer, &updates).await?;
     }
 
     let updated: Vec<serde_json::Value> = result
@@ -877,6 +918,8 @@ pub async fn propagate_beliefs(
         "factors_count": engine_factors.len(),
         "variables_count": all_var_ids.len(),
         "applied": apply,
+        "applied_count": written,
+        "skipped_not_visible": skipped,
         "updated_beliefs": updated,
     })))
 }

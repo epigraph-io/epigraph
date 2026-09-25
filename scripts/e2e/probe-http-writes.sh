@@ -212,9 +212,14 @@ if want propagate; then
   bp() {  # $1 case, $2 token, $3 claim to watch
     local before; before="$(q "SELECT round(pignistic_prob::numeric,4) FROM claims WHERE id='$3'")"
     req POST "/api/v1/bp/propagate" "$2" '{"apply_updates":true,"mode":"scalar"}'
-    line "$1" "applied=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('applied'))" "$BODY" 2>/dev/null) listed=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('updated_beliefs') or []))" "$BODY" 2>/dev/null) betp=$before->$(q "SELECT round(pignistic_prob::numeric,4) FROM claims WHERE id='$3'")"
+    line "$1" "applied=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('applied'), 'written', d.get('applied_count'), 'skipped', d.get('skipped_not_visible'))" "$BODY" 2>/dev/null) listed=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('updated_beliefs') or []))" "$BODY" 2>/dev/null) betp=$before->$(q "SELECT round(pignistic_prob::numeric,4) FROM claims WHERE id='$3'")"
   }
   bp owner/own-factor "$T_OWNER" "$P2"
+  # A factor naming an id that is not a claim (`factors.variable_ids` has no
+  # foreign key): the apply must skip it and still write the real claims.
+  q "UPDATE claims SET pignistic_prob = 0.9 WHERE id = '$P1'; UPDATE claims SET pignistic_prob = 0.2 WHERE id = '$P2'" >/dev/null
+  q "INSERT INTO factors (factor_type, variable_ids, potential) VALUES ('evidential_support', ARRAY['$P2', gen_random_uuid()]::uuid[], '{\"strength\":0.9}')" >/dev/null
+  bp owner/own+stale-factor "$T_OWNER" "$P2"
   # A second factor into a STRANGER's claim: the owner cannot write it.
   S1="$(claim "$STRANGER" public "$STRANGER_G" bp-stranger)"
   q "UPDATE claims SET pignistic_prob = 0.9 WHERE id = '$P1'; UPDATE claims SET pignistic_prob = 0.2 WHERE id IN ('$P2', '$S1')" >/dev/null
