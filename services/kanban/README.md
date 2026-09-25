@@ -141,7 +141,12 @@ Every `/api/*` call needs the session secret in the `X-Kanban-Token` header. It 
 ## Limitations
 
 - **MCP in headless mode:** the `claude` backlog source and backlog resolution both depend on the EpiGraph MCP server being available to headless `claude -p`. MCP servers configured as claude.ai connectors may not load in headless or `--print` sessions. If resolution fails, the card history says so. Retire the items by hand with `resolve_backlog_item`. For fetching, `KANBAN_BACKLOG_SOURCE=http` with an OAuth-minted `EPIGRAPH_TOKEN` is the most reliable option.
-- Accept uses `gh pr merge --delete-branch` from the main checkout. If gh fails to delete the local branch but GitHub reports the PR `MERGED`, the merge is still treated as successful.
+- **What the board does to your repository.** Your working tree is never edited: no files written, no branch switched by the board's own commands, and no exclude file touched. Agents and the retirement run work in worktrees under `$KANBAN_HOME/worktrees`, and the backlog fetch runs in `$KANBAN_HOME/helper-cwd`. The shared `.git` *is* used, because that is what linked worktrees are:
+  - `git worktree add/remove/prune` and `fetch`;
+  - `kanban/*` branches are created and deleted with `branch -D` after Accept;
+  - `gh` commands run with the checkout as cwd so that they resolve the GitHub repository.
+
+  `gh pr merge --delete-branch` also deletes a matching *local* branch. If you have the integration branch checked out in your own checkout when you ship, gh may switch that checkout to the base branch, so don't. If gh fails to delete the local branch but GitHub reports the PR `MERGED`, the merge is still treated as successful.
 - The board does not rebase item PRs when the integration branch moves. Conflicts show up in the Integration panel as `mergeable`/`checks` status, and you resolve them with Request changes.
 - Only one integration branch is active at a time, and one server should run per `KANBAN_HOME`.
 
