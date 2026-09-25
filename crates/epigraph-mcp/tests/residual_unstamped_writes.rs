@@ -112,6 +112,18 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          the inherited inventory listed it and a reader deserves to know why it is not a defect.",
     ),
     (
+        "tools/evolve_step.rs",
+        "ClaimRepository::evolve_step",
+        1,
+        "`evolve_step`. Surfaced when `evolve` joined WRITE_TOKENS (batch H-a review); the site \
+         predates this register. MEASURED refused on a clean migrate (config A, 42501 on \
+         claims) and admitted on production's schema by the orphan `claims_privacy` policy. NOT \
+         converted, deliberately: its population is step claims authored by \
+         `workflow-ingest-system`, so the stamp that admits it is that SYSTEM agent's, and a \
+         system-stamped workflow mutation with no caller authority is H3 (backlog 84b2a98d), \
+         outside batch H-a. An R3 blocker, recorded in scripts/e2e/README.md.",
+    ),
+    (
         "tools/ingestion.rs",
         "PaperRepository::get_or_create",
         3,
@@ -138,16 +150,20 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "tools/matching.rs",
         "EdgeRepository::create_symmetric_if_absent",
         1,
-        "`decide_match_candidate`'s SAME_AS edge. `edges`, so an orphan `edges_privacy` policy \
-         admits it in production and a clean migrate refuses it. Not in D1-D5; filed here so the \
-         set is complete rather than the set the brief happened to enumerate.",
+        "`decide_match_candidate`'s SAME_AS edge. CORRECTED by the batch H-a review, which \
+         MEASURED it on a clean migrate (config A): promote own<->own, foreign<->foreign and \
+         own<->foreign all created the edge. Between PUBLIC claims, migration 070's BEFORE \
+         trigger makes the edge world-owned and `edges_tenancy`'s static world arm admits it \
+         unstamped. The earlier reason (\"refused on a clean migrate\") was an inference. An \
+         edge touching a group-private claim is NOT covered by that measurement.",
     ),
     (
         "tools/perspectives.rs",
         "EdgeRepository::create",
         1,
-        "`create_perspective`'s provenance edge. Same `edges` position as `matching.rs`: admitted \
-         in production by the orphan `edges_privacy` policy, refused on a clean migrate.",
+        "`create_perspective`'s provenance edge. CORRECTED by the batch H-a review: MEASURED OK \
+         on a clean migrate (config A), the edge world-public, perspective +1. Same static world \
+         arm as `matching.rs` above; the earlier \"refused on a clean migrate\" was inferred.",
     ),
     (
         "tools/perspectives.rs",
@@ -179,6 +195,18 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          the acquire is visible to this scan.",
     ),
     (
+        "tools/themes.rs",
+        "run_theme_kmeans",
+        1,
+        "`theme_cluster`. Surfaced when `run_theme` joined WRITE_TOKENS (batch H-a review). A \
+         corpus-wide clustering: its `bulk_assign` (`UPDATE claims SET theme_id`) spans every \
+         claim's owner group, so no single author stamp covers it. Since 5cafc60a the whole \
+         run is ONE transaction (wipe, themes, assignment), so on a clean migrate it fails \
+         loudly with nothing written (MEASURED: ERR 42501, the previous themes intact) instead \
+         of leaving an orphan theme. Not moved behind the maintenance gate: production runs it \
+         today with no maintenance DSN, and gating it would refuse it there.",
+    ),
+    (
         "tools/workflow_ingest.rs",
         "WorkflowRepository::set_goal_embedding",
         2,
@@ -194,6 +222,17 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "`report_workflow_outcome`. `behavioral_executions` is not claim-derived and carries no \
          `owner_group_id`, so there is no `WITH CHECK` for a stamp to satisfy.",
+    ),
+    (
+        "tools/workflows.rs",
+        "ClaimRepository::merge_properties",
+        1,
+        "`refresh_workflow_promotion`'s `properties.promotion` overwrite. Surfaced when `merge` \
+         joined WRITE_TOKENS (batch H-a review). An `UPDATE claims`, so a clean migrate refuses \
+         it unstamped; its config-A behaviour is INFERRED, not measured (the probe's variant \
+         reached the lineage-root early return). Same population and the same H3 question as \
+         `evolve_step`: the workflow claims it patches are authored by \
+         `workflow-ingest-system`. An R3 blocker, recorded in scripts/e2e/README.md.",
     ),
     (
         "tools/workflows.rs",
@@ -284,6 +323,14 @@ const WRITE_TOKENS: &[&str] = &[
     "publish",
     "record",
     "supersede",
+    // Added by the batch H-a review, which found three unstamped write sites
+    // this register did not list because no token matched their callee:
+    // `ClaimRepository::evolve_step`, `ClaimRepository::merge_properties` and
+    // `run_theme_kmeans`. The register GREW when these landed because the
+    // earlier count was wrong, not because a write was added.
+    "evolve",
+    "merge",
+    "run_theme",
 ];
 
 /// Remove `//` line comments and (nestable) `/* */` block comments.
