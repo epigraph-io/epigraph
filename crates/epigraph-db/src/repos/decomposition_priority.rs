@@ -261,8 +261,9 @@ impl DecompositionPriorityRepository {
     }
 
     /// In-force contradicts/refutes edges (claim → claim) whose target is a
-    /// current parent with at least one current `decomposes_to` atom, oldest
-    /// edge first (`created_at ASC, id ASC`).
+    /// current parent with at least one current atom reached through an
+    /// IN-FORCE `decomposes_to` edge, oldest edge first
+    /// (`created_at ASC, id ASC`).
     ///
     /// `include_marked = false` skips edges already carrying a
     /// `retargeted_to` property — the retarget pass's first idempotency guard.
@@ -297,6 +298,7 @@ impl DecompositionPriorityRepository {
                   WHERE d.source_id = p.id
                     AND d.relationship = 'decomposes_to'
                     AND d.target_type = 'claim'
+                    AND (d.valid_to IS NULL OR d.valid_to > now())
                     AND COALESCE(a.is_current, true) = true
                     /* {EDGE_VISIBILITY:d} */
                     /* {VISIBILITY:a} */
@@ -323,6 +325,13 @@ impl DecompositionPriorityRepository {
     /// order: `parent_id, atom created_at ASC, atom id ASC`. The retarget
     /// prompt's atom indices are positions in this order.
     ///
+    /// Only atoms reached through an IN-FORCE `decomposes_to` edge count: an
+    /// edge retired with `valid_to` (PATCH /api/v1/edges/:id can set it)
+    /// removes that atom from the decomposition, so it is neither shown to the
+    /// LLM nor accepted as a retarget destination. The undecomposed
+    /// population's `NOT EXISTS` probes deliberately keep counting retired
+    /// edges, as `list_undecomposed` does.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
     pub async fn list_current_atoms<'e, E: sqlx::PgExecutor<'e>>(
@@ -343,6 +352,7 @@ impl DecompositionPriorityRepository {
             WHERE d.source_id = ANY($1::uuid[])
               AND d.relationship = 'decomposes_to'
               AND d.target_type = 'claim'
+              AND (d.valid_to IS NULL OR d.valid_to > now())
               AND COALESCE(a.is_current, true) = true
               /* {EDGE_VISIBILITY:d} */
               /* {VISIBILITY:a} */

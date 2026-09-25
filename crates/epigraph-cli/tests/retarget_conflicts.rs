@@ -777,3 +777,56 @@ async fn an_endpoint_retired_after_the_dry_run_is_not_applied(pool: PgPool) {
     );
     std::fs::remove_file(&manifest).ok();
 }
+
+/// An atom whose `decomposes_to` edge was RETIRED (`valid_to` in the past)
+/// is no longer part of the decomposition: it is not shown to the LLM, and a
+/// manifest naming it is refused. A parent whose ONLY decomposition edge is
+/// retired is not a retarget candidate at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_atom_behind_a_retired_decomposes_to_edge_is_not_a_destination(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let w = seed_world(&pool).await;
+    let stale = seed_claim(
+        &pool,
+        w.agent,
+        "A stale atom no longer in the decomposition.",
+        15,
+    )
+    .await;
+    let d = seed_edge(&pool, w.parent, stale, "decomposes_to").await;
+    // A second parent decomposed ONLY through a retired edge.
+    let lone_parent = seed_claim(&pool, w.agent, "Lone compound. With a retired split.", 40).await;
+    let lone_atom = seed_claim(&pool, w.agent, "Lone compound atom.", 35).await;
+    let d2 = seed_edge(&pool, lone_parent, lone_atom, "decomposes_to").await;
+    seed_edge(&pool, w.source, lone_parent, REL).await;
+    sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = ANY($1)")
+        .bind(vec![d, d2])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let items = epigraph_cli::retarget::load_retarget_items(&pool, &viewer, false, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the lone parent is not a candidate: {items:?}"
+    );
+    let offered: Vec<Uuid> = items[0].atoms.iter().map(|a| a.0).collect();
+    assert_eq!(offered, w.atoms.to_vec(), "the stale atom is not offered");
+
+    let (api, hits) = serve_api(&pool, w.agent).await;
+    let e = entry_for(&w, w.parent_edge, REL, w.parent, vec![stale]);
+    let applied = apply_retarget(&pool, &viewer, &api, &[e]).await.unwrap();
+    assert!(
+        applied[0]
+            .errors
+            .iter()
+            .any(|e| e.contains("no longer current atoms")),
+        "{:?}",
+        applied[0]
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert!(edges_between(&pool, w.source, stale, REL).await.is_empty());
+}
