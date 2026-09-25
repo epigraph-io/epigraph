@@ -1725,10 +1725,14 @@ pub struct StructureSourceParams {
 /// working when the HTTP API binary is unavailable.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkHierarchicalParams {
-    #[schemars(description = "UUID of the source claim")]
+    #[schemars(
+        description = "UUID of the source claim. Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused. Either refusal writes nothing."
+    )]
     pub source_claim_id: String,
 
-    #[schemars(description = "UUID of the target claim")]
+    #[schemars(
+        description = "UUID of the target claim. Same authority rule as source_claim_id: own-group private claims work, another group's private claim is not found or refused, and nothing is written."
+    )]
     pub target_claim_id: String,
 
     #[schemars(
@@ -1767,7 +1771,9 @@ pub struct LinkHierarchicalResponse {
 /// wall clock and would otherwise have to guess it.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchEdgeParams {
-    #[schemars(description = "UUID of the edge to patch")]
+    #[schemars(
+        description = "UUID of the edge to patch. Must be an edge this server's agent can write; an edge touching another group's private claim reports not found and nothing is written."
+    )]
     pub edge_id: String,
 
     #[schemars(
@@ -1834,14 +1840,18 @@ pub struct DeleteEdgeResponse {
 /// `edge_id` with `created=false`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkAlternativeParams {
-    #[schemars(description = "UUID of the first competing claim")]
+    #[schemars(
+        description = "UUID of the first competing claim. Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused, with nothing written."
+    )]
     pub claim_a: String,
 
-    #[schemars(description = "UUID of the second competing claim")]
+    #[schemars(
+        description = "UUID of the second competing claim. Same authority rule as claim_a."
+    )]
     pub claim_b: String,
 
     #[schemars(
-        description = "Optional UUID of the shared target the two claims are rival supporters of. Validated and stored on the edge for provenance."
+        description = "Optional UUID of the shared target the two claims are rival supporters of. Validated and stored on the edge for provenance. A claim you cannot read reports not found and nothing is written."
     )]
     #[serde(default)]
     pub target_claim_id: Option<String>,
@@ -1876,10 +1886,14 @@ pub struct LinkAlternativeResponse {
 /// target's combined belief. Idempotent on `(source, target, relationship)`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkEpistemicParams {
-    #[schemars(description = "UUID of the source claim (the evidence / asserting side)")]
+    #[schemars(
+        description = "UUID of the source claim (the evidence / asserting side). Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused, with nothing written."
+    )]
     pub source_claim_id: String,
 
-    #[schemars(description = "UUID of the target claim (the side whose belief is recomputed)")]
+    #[schemars(
+        description = "UUID of the target claim (the side whose belief is recomputed). Same authority rule as source_claim_id for the edge itself. A PUBLIC target owned by a group this server's agent cannot write still gets the edge, but its belief is not moved: the response reports belief_wired=false."
+    )]
     pub target_claim_id: String,
 
     #[schemars(
