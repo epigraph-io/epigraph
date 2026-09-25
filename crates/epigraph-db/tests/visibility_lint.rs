@@ -1053,6 +1053,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          row this statement just inserted.",
     ),
     (
+        "claim.rs",
+        "create_strict_signed",
+        "WRITE into `claims`: `create_strict`'s INSERT plus the `signature` / `signer_id` columns \
+         (batch H-b, D1-sig). Same explicit `TenancyDecl`, same 077 `WITH CHECK`, and `RETURNING` \
+         projects back only the row this statement just inserted; `create_strict` delegates to it.",
+    ),
+    (
+        "claim.rs",
+        "admin_patch_claim_conn",
+        "WRITE through migration 111's SECURITY DEFINER `epigraph_admin_patch_claim` (batch H-b, \
+         D2). The function takes the admin from the session's `epigraph.principal_id`, re-checks \
+         the token's `oauth_clients` grant and writes one `claims` row plus its `security_events` \
+         audit row; there is no read to filter, and the target is one caller-named claim the \
+         caller has already read through its own viewer.",
+    ),
+    (
         "instance_admin.rs",
         "privatization_authority",
         "READ of `group_memberships` and `groups`, returning four scalars and no ids. It MUST run \
@@ -1825,6 +1841,26 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "ensure_evidence_perspective",
         "WRITE: idempotent INSERT INTO `perspectives` for an evidence BBA's perspective; same \
          argument as `ensure_edge_perspective`.",
+    ),
+    (
+        "workflow.rs",
+        "head_by_canonical",
+        "READ of `workflows` by `canonical_name` (latest generation). `workflows` has no row \
+         security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
+         viewer to filter; batch H-b's H3 check resolves the workflow a step op names with it.",
+    ),
+    (
+        "workflow.rs",
+        "record_submitter",
+        "WRITE of one `workflows` row's `metadata.epigraph_submitted_by`, once (batch H-b, H3). \
+         `workflows` has no row security and no policy, so there is no stamp to satisfy; the \
+         ingest entry point calls it on the plan walk's own transaction.",
+    ),
+    (
+        "workflow.rs",
+        "submitter_of",
+        "READ of one `workflows` row's recorded submitter (batch H-b, H3). No row security and no \
+         policy on `workflows`; it is an authority check's input, not a disclosure.",
     ),
     (
         "workflow.rs",

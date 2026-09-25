@@ -2128,7 +2128,8 @@ async fn workflow_authority(
         return Ok(Some(owner));
     }
     if let Some(caller) = caller {
-        let op = epigraph_db::AgentRepository::operator_of_author_pool(&state.db_pool, owner)
+        // On the request's own transaction, not the raw pool (`no_unscoped_pool`).
+        let op = epigraph_db::AgentRepository::operator_of_author(&mut *conn, owner)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("could not read the submitter's operator: {e}"),
@@ -2873,6 +2874,15 @@ mod tests {
         .unwrap();
         assert_eq!(recorded, owner.agent_id.map(|a| a.to_string()));
 
+        // Counted through the workflow's `executes` edges, not a `claims`
+        // content read: the route layer may not select claim content inline
+        // (`viewer_route_table_lint`), its test module included.
+        let executes_sql = "SELECT count(*) FROM edges e JOIN workflows w ON w.id = e.source_id \
+                            WHERE w.canonical_name = 'h3-http-owned' AND e.relationship = 'executes'";
+        let before: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let step = serde_json::json!({
             "canonical_name": "h3-http-owned",
             "step_text": "a stranger's step",
@@ -2882,12 +2892,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let stranger_steps: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = 'a stranger''s step'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(stranger_steps, 0, "nothing written");
+        let after: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "nothing written");
 
         let resp = router_as(owner)
             .oneshot(post_json(
