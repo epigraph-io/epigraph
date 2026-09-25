@@ -1271,11 +1271,29 @@ function acceptCard(id) {
       openBlockers(c).length ? h('p', { text: openBlockers(c).length + ' open warning(s) remain on this card.' }) : null]
   }).then(function (ok) {
     if (!ok) return;
-    api('POST', cpath(id, '/accept'), {}).then(function () { toast('Merged ' + short(id) + ' into ' + integ, 'ok'); refreshSoon(); })
-      .catch(function (e) {
-        if (e.status === 409 && /block/i.test(e.message)) forceAccept(c, hardBlockers(c), e.message);
-        else { toast(e.message, 'error'); refreshSoon(); }
-      });
+    postAccept(c, {}, 'Merged ' + short(id) + ' into ' + integ);
+  });
+}
+function isChecksRefusal(e) { return e && e.status === 409 && e.data && e.data.code === 'checks_not_passing'; }
+// POST accept; a CI-checks refusal opens its own override dialog (never the blocker one).
+function postAccept(c, body, okMsg) {
+  return api('POST', cpath(c.id, '/accept'), body).then(function () { toast(okMsg, 'ok'); refreshSoon(); })
+    .catch(function (e) {
+      if (isChecksRefusal(e)) overrideChecksAccept(c, body, e);
+      else if (e.status === 409 && /block/i.test(e.message) && !body.force) forceAccept(c, hardBlockers(c), e.message);
+      else { toast(e.message, 'error'); refreshSoon(); }
+    });
+}
+function overrideChecksAccept(c, body, e) {
+  var state = String((e.data && e.data.checks) || 'unknown');
+  dialog({ title: 'CI checks are not passing', danger: true, confirm: 'Merge despite checks',
+    body: [
+      h('p', null, 'CI checks on ', h('strong', { text: 'PR #' + (c.pr_number || '?') }), ' are ', checksEl(state), '.'),
+      h('p', { text: e.message }),
+      h('p', { text: 'Merging anyway is an explicit override for this one request. It is logged by the server and recorded in the card history.' })
+    ]
+  }).then(function (ok) {
+    if (ok) postAccept(c, Object.assign({}, body, { override_checks: true }), 'Merged ' + short(c.id) + ' (CI override: checks ' + state + ')');
   });
 }
 function forceAccept(c, hb, msg) {
@@ -1284,9 +1302,9 @@ function forceAccept(c, hb, msg) {
       msg ? h('p', { text: msg }) : null,
       h('p', { text: hb.length + ' unresolved blocker' + (hb.length === 1 ? '' : 's') + ' on ' + short(c.id) + ':' }),
       h('ul', null, hb.map(function (b) { return h('li', { text: b.text }); })),
-      h('p', { text: 'The PR will be merged into the integration branch anyway. Resolving the blockers first is usually better.' })
+      h('p', { text: 'The PR will be merged into the integration branch anyway. Resolving the blockers first is usually better. Forcing past blockers does not override failing CI checks.' })
     ]
-  }).then(function (ok) { if (ok) run(api('POST', cpath(c.id, '/accept'), { force: true }), 'Force-accepted ' + short(c.id)); });
+  }).then(function (ok) { if (ok) postAccept(c, { force: true }, 'Force-accepted ' + short(c.id)); });
 }
 function rejectCard(id) {
   var c = cardById(id);
@@ -1745,8 +1763,18 @@ function mergeIntegration(branch, base, prNum, accepted) {
     return;
   }
   var force = h('input', { type: 'checkbox' });
-  dialog({ title: 'Merge integration → ' + base + '?', confirm: 'Merge to ' + base,
+  // CI state as last read from GitHub. The server re-reads it in the same `gh pr view` that pins the head sha,
+  // and refuses anything but "pass" unless this override box is ticked.
+  var d = integ.data || {};
+  var checks = String(d.checks || 'unknown').toLowerCase();
+  var overrideCb = h('input', { type: 'checkbox' });
+  dialog({ title: 'Merge integration → ' + base + '?', confirm: 'Merge to ' + base, danger: checks !== 'pass',
     body: [
+      h('div', { class: 'side-box' },
+        h('p', null, 'CI checks on ', h('strong', { text: 'PR #' + prNum }), ': ', checksEl(checks),
+          integ.loading ? ' (refreshing…)' : ''),
+        checks !== 'pass' ? h('p', { text: 'The server refuses to ship unless checks pass. Tick the box to override for this one request; the override is logged and recorded in each shipped card’s history.' }) : null,
+        checks !== 'pass' ? h('label', { class: 'check' }, overrideCb, 'Merge even though checks are ' + checks + ' (override)') : null),
       inflight.length ? h('div', { class: 'side-box' },
         h('p', { text: inflight.length + ' card(s) in development/review still target this branch. Merging deletes the branch, which closes their PRs; they would need to be re-developed:' }),
         h('ul', null, inflight.slice(0, 10).map(function (c) { return h('li', null, h('span', { class: 'mono', text: short(c.id) + ' ' }), titleOf(c)); })),
@@ -1761,8 +1789,16 @@ function mergeIntegration(branch, base, prNum, accepted) {
     if (inflight.length && !force.checked) { toast('Not merged: tick "force" or accept/reject the in-flight cards first.', 'warn'); return; }
     var payload = { resolve_backlog: cb.checked };
     if (inflight.length) payload.force = true;
-    run(api('POST', '/api/integration/merge', payload), 'Merged ' + branch + ' into ' + base + (cb.checked ? '; resolving backlog items' : ''))
-      .then(function (r) { if (r) { integ.data = null; integ.sig = ''; loadInteg(); } });
+    if (overrideCb.checked) payload.override_checks = true;
+    api('POST', '/api/integration/merge', payload).then(function (r) {
+      toast('Merged ' + branch + ' into ' + base + (cb.checked ? '; resolving backlog items' : '') +
+        (r && r.checks && r.checks !== 'pass' ? ' (CI override: checks ' + r.checks + ')' : ''), 'ok');
+      integ.data = null; integ.sig = ''; loadInteg(); refreshSoon();
+    }).catch(function (e) {
+      // e.g. checks changed since the panel last loaded: reload so the dialog shows the fresh state next time
+      toast(e.message, isChecksRefusal(e) ? 'warn' : 'error');
+      integ.data = null; integ.sig = ''; loadInteg(); refreshSoon();
+    });
   });
 }
 function newIntegration() {

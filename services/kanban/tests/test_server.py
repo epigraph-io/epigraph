@@ -639,6 +639,64 @@ class IntegrationMergeGuardsTest(_ServerFixture):
         self.assertFalse(self.merge_calls(999))
 
 
+CLAIM_I = "12121212-1111-4222-8333-444444444444"
+CLAIM_J = "34343434-1111-4222-8333-444444444444"
+
+
+class ChecksGateTest(_ServerFixture):
+    """Both merge paths refuse unless CI checks pass; the only way past is a per-request override_checks."""
+
+    def test_accept_refuses_unless_checks_pass(self):
+        self.import_claim(CLAIM_I, "BACKLOG: gate me")
+        card = self.develop_to_review(CLAIM_I)
+        item = card["pr_number"]
+        for checks in ("FAILURE", "PENDING", "NONE"):
+            self.set_pr_number(item, checks=checks)
+            for body in ({}, {"force": True}, {"override_checks": "true"}, {"override_checks": 1}):
+                status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_I, body=body)
+                self.assertEqual(status, 409, (checks, body, resp))
+                self.assertEqual(resp.get("code"), "checks_not_passing", resp)
+                self.assertNotIn("block", resp["error"].lower())  # the UI routes /block/ to the blocker dialog
+                self.assertFalse(self.merge_calls(item), (checks, body))
+                self.assertEqual(self.card(CLAIM_I)["status"], "awaiting_review")
+        self.set_pr_number(item, checks="FAILURE")
+        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_I, body={"override_checks": True})
+        self.assertEqual(status, 200, resp)
+        self.assertEqual(len(self.merge_calls(item)), 1)
+        self.assertIn("--match-head-commit", self.merge_calls(item)[0])
+        events = [h for h in self.card(CLAIM_I)["history"] if h["event"] == "checks_overridden"]
+        self.assertEqual(len(events), 1)
+        self.assertIn("fail", events[0]["detail"])
+
+    def test_ship_refuses_unless_checks_pass(self):
+        self.import_claim(CLAIM_J, "BACKLOG: ship gate")
+        card = self.develop_to_review(CLAIM_J)
+        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_J, body={})
+        self.assertEqual(status, 200, resp)
+        status, resp = self.req("POST", "/api/integration/open-pr", body={})
+        self.assertEqual(status, 200, resp)
+        integ_pr = resp["pr_number"]
+        for checks in ("FAILURE", "PENDING", "NONE"):
+            self.set_pr_number(integ_pr, checks=checks)
+            for body in ({"resolve_backlog": False}, {"resolve_backlog": False, "force": True}):
+                status, resp = self.req("POST", "/api/integration/merge", body=body)
+                self.assertEqual(status, 409, (checks, body, resp))
+                self.assertEqual(resp.get("code"), "checks_not_passing", resp)
+                self.assertFalse(self.merge_calls(integ_pr), (checks, body))
+                _, state = self.req("GET", "/api/state")
+                self.assertEqual(state["integration"]["status"], "pr_open")
+                self.assertEqual(self.card(CLAIM_J)["column"], "accepted")
+        self.set_pr_number(integ_pr, checks="PENDING")
+        status, resp = self.req("POST", "/api/integration/merge",
+                                body={"resolve_backlog": False, "override_checks": True})
+        self.assertEqual(status, 200, resp)
+        self.assertEqual(resp["checks"], "pending")
+        self.assertEqual(len(self.merge_calls(integ_pr)), 1)
+        self.assertTrue(any(h["event"] == "checks_overridden" for h in self.card(CLAIM_J)["history"]))
+        _, state = self.req("GET", "/api/state")
+        self.assertEqual(self.app.store.state["integration_history"][-1]["checks_at_merge"], "pending")
+
+
 RECORDING_CLAUDE = r'''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]

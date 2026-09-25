@@ -461,10 +461,29 @@ def normalize_claim(raw: Any) -> Optional[Dict[str, Any]]:
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, extra: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.extra = extra or {}
+
+
+def override_checks_requested(body: Any) -> bool:
+    """The per-request CI override: only a literal JSON `true` counts (never persisted, never implied by force)."""
+    return isinstance(body, dict) and body.get("override_checks") is True
+
+
+def require_checks_pass(number: int, checks: str, override: bool, where: str) -> None:
+    """Refuse a merge unless the PR's checks pass. The message avoids the word the UI keys its blocker dialog on."""
+    if checks == "pass":
+        return
+    if override:
+        log("CI OVERRIDE: merging PR #%d into %s with checks=%s (override_checks=true on this request)"
+            % (number, where, checks))
+        return
+    raise ApiError(409, "CI checks on PR #%d are %s, not pass; refusing to merge into %s. Wait for them, or send "
+                   "override_checks=true to merge anyway (logged)." % (number, checks, where),
+                   {"code": "checks_not_passing", "checks": checks, "pr_number": number})
 
 
 # --------------------------------------------------------------------------
@@ -1452,6 +1471,7 @@ class App:
 
     def action_accept(self, card_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         force = bool(body.get("force"))
+        override = override_checks_requested(body)
         with self.store.lock:
             card = self.store.card(card_id)
             if card.get("column") != "review" or card.get("status") in ("merging", "running", "queued"):
@@ -1475,7 +1495,9 @@ class App:
             self.store.save()
             card_snapshot = dict(card)
         try:
-            head_sha = self.verify_item_pr(number, card_snapshot, current)["sha"]
+            verified = self.verify_item_pr(number, card_snapshot, current)
+            require_checks_pass(number, verified["checks"], override, current)
+            head_sha = verified["sha"]
         except ApiError as e:
             with self.store.lock:
                 card = self.store.card(card_id)
@@ -1485,6 +1507,9 @@ class App:
             raise
         with self.store.lock:
             card = self.store.card(card_id)
+            if verified["checks"] != "pass":
+                add_history(card, "checks_overridden", "PR #%d merged with CI checks %s (override_checks on the "
+                            "accept request)" % (number, verified["checks"]))
             add_history(card, "accepting", "merging PR #%d into %s%s" % (number, card.get("integration_branch"),
                                                                        " (forced past blockers)" if open_blockers else ""))
             self.store.save()
@@ -1711,7 +1736,10 @@ class App:
                 raise ApiError(409, "invalid integration PR number %r" % (integ.get("pr_number"),))
             # the same treatment action_accept gives an item PR: base/head/state verified, merge head-pinned
             verified = self.verify_pr(number, base, branch, "the base branch")
-            log("integration merge: PR #%d %s -> %s at %s" % (number, branch, base, verified["sha"]))
+            # `force` (ship past in-flight cards) never implies a CI override; that flag is separate
+            require_checks_pass(number, verified["checks"], override_checks_requested(body), base)
+            log("integration merge: PR #%d %s -> %s at %s, checks=%s" % (number, branch, base, verified["sha"],
+                                                                        verified["checks"]))
             self.gh_merge(number, verified["sha"])
         except (ApiError, CmdError) as e:
             with self.store.lock:
@@ -1720,9 +1748,19 @@ class App:
             if isinstance(e, ApiError):
                 raise
             raise ApiError(502, "integration merge failed: %s" % e)
+        integ = dict(integ, checks_at_merge=verified["checks"],
+                     checks_overridden=verified["checks"] != "pass", merged_sha=verified["sha"])
         shipped = self._complete_ship(integ, number, resolve)
+        if verified["checks"] != "pass":
+            with self.store.lock:
+                for c in shipped:
+                    card = self.store.cards.get(c["id"])
+                    if card:
+                        add_history(card, "checks_overridden", "integration PR #%d shipped with CI checks %s "
+                                    "(override_checks on the ship request)" % (number, verified["checks"]))
+                self.store.save()
         return {"ok": True, "shipped": [c["id"] for c in shipped], "integration_pr": integ.get("pr_url"),
-                "resolving": bool(resolve and shipped)}
+                "resolving": bool(resolve and shipped), "checks": verified["checks"]}
 
     def _complete_ship(self, integ: Dict[str, Any], number: int, resolve: bool, note: str = "") -> List[Dict[str, Any]]:
         """Bookkeeping after the integration PR merged: accepted cards -> shipped, integration reset."""
@@ -2049,7 +2087,7 @@ def make_handler(app: App):
                     raise ApiError(405, "method not allowed")
                 raise ApiError(404, "not found")
             except ApiError as e:
-                self._json(e.status, {"error": e.message})
+                self._json(e.status, dict(e.extra, error=e.message))
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:  # noqa: BLE001
