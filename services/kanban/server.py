@@ -15,9 +15,7 @@ Python 3.9 standard library only. Binds 127.0.0.1 only.
 """
 
 import argparse
-import base64
 import datetime
-import hashlib
 import hmac
 import json
 import os
@@ -42,7 +40,6 @@ DEVELOP_TEMPLATE = os.path.join(HERE, "prompts", "develop.md")
 
 COLUMNS = ["backlog", "develop", "review", "accepted", "shipped"]
 STATUSES = ["idle", "queued", "running", "awaiting_review", "merging", "merged", "failed", "stopped"]
-DEFAULT_CLIENT_ID = "5997f752-5d79-48bc-b876-cb77498066a6"
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 # A GitHub pull-request URL and nothing else. Used with fullmatch: `search` accepted any string that
@@ -340,8 +337,9 @@ class Config:
         self.home = os.path.abspath(os.path.expanduser(env.get("KANBAN_HOME") or "~/.epigraph-kanban"))
         self.api_base = (env.get("EPIGRAPH_API_BASE") or "http://127.0.0.1:8080").rstrip("/")
         self.token = env.get("EPIGRAPH_TOKEN") or ""
-        self.jwt_secret = env.get("EPIGRAPH_JWT_SECRET") or ""
-        self.client_id = env.get("EPIGRAPH_CLIENT_ID") or DEFAULT_CLIENT_ID
+        # EPIGRAPH_JWT_SECRET is no longer read: a locally minted HS256 service JWT carries no agent_id, and the
+        # API rejects such tokens (401) on the by-labels route. Use a token from the OAuth mint instead.
+        self.jwt_secret_ignored = bool(env.get("EPIGRAPH_JWT_SECRET"))
         src = (env.get("KANBAN_BACKLOG_SOURCE") or "auto").lower()
         self.backlog_source = src if src in ("auto", "http", "claude", "file") else "auto"
         self.claude_bin = env.get("KANBAN_CLAUDE_BIN") or "claude"
@@ -371,8 +369,6 @@ class Config:
         return {
             "api_base": self.api_base,
             "epigraph_token_set": bool(self.token),
-            "epigraph_jwt_secret_set": bool(self.jwt_secret),
-            "client_id": self.client_id,
             "backlog_source": self.backlog_source,
             "claude_bin": self.claude_bin,
             "gh_bin": self.gh_bin,
@@ -562,27 +558,16 @@ def require_checks_pass(number: int, checks: str, override: bool, where: str) ->
 # backlog fetchers
 # --------------------------------------------------------------------------
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def mint_jwt(secret: str, client_id: str, ttl: int = 3600) -> str:
-    now = int(time.time())
-    header = {"alg": "HS256", "typ": "JWT"}
-    claims = {"sub": client_id, "iss": "epigraph", "aud": "epigraph-api", "iat": now, "nbf": now - 5,
-              "exp": now + ttl, "jti": str(uuid.uuid4()), "scopes": ["claims:read"], "client_type": "service"}
-    signing_input = _b64url(json.dumps(header, separators=(",", ":")).encode()) + "." + \
-        _b64url(json.dumps(claims, separators=(",", ":")).encode())
-    sig = hmac.new(secret.encode(), signing_input.encode("ascii"), hashlib.sha256).digest()
-    return signing_input + "." + _b64url(sig)
+class NoApiToken(RuntimeError):
+    pass
 
 
 def fetch_backlog_http(cfg: Config) -> List[Dict[str, Any]]:
-    headers = {"Accept": "application/json"}
-    if cfg.token:
-        headers["Authorization"] = "Bearer " + cfg.token
-    elif cfg.jwt_secret:
-        headers["Authorization"] = "Bearer " + mint_jwt(cfg.jwt_secret, cfg.client_id)
+    # The by-labels route requires a token bound to a principal (agent_id); only the OAuth mint issues one.
+    if not cfg.token:
+        raise NoApiToken("EPIGRAPH_TOKEN is not set (the http backlog source needs a bearer token from the "
+                         "EpiGraph OAuth mint)")
+    headers = {"Accept": "application/json", "Authorization": "Bearer " + cfg.token}
     out: List[Dict[str, Any]] = []
     offset, limit = 0, 100
     for _ in range(200):
@@ -1137,7 +1122,10 @@ class App:
             if mode == "file":
                 raise RuntimeError("KANBAN_BACKLOG_SOURCE=file: use POST /api/backlog/import")
             claims: Optional[List[Any]] = None
-            if mode in ("auto", "http"):
+            if mode == "auto" and not self.cfg.token:
+                # nothing to authenticate with: go straight to claude instead of a request that can only 401
+                error = "no EPIGRAPH_TOKEN; used claude"
+            elif mode in ("auto", "http"):
                 try:
                     claims = fetch_backlog_http(self.cfg)
                     source = "http"
@@ -2223,6 +2211,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-refresh", action="store_true", help="do not fetch the backlog on startup")
     args = parser.parse_args(argv)
     cfg = Config(repo=args.repo, port=args.port)
+    if cfg.jwt_secret_ignored:
+        log("EPIGRAPH_JWT_SECRET is set but ignored: set EPIGRAPH_TOKEN to an OAuth-minted token for the http source")
     app = App(cfg)
     server = make_server(app, args.port)
     app.start()

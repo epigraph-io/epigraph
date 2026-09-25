@@ -24,10 +24,10 @@ Prerequisites: `git`, an authenticated `gh`, and `claude` on PATH, plus a checko
 |---|---|---|
 | `KANBAN_HOME` | `~/.epigraph-kanban` | Holds `state.json`, `token`, `worktrees/<id8>`, `logs/<id8>-<run>.jsonl` |
 | `EPIGRAPH_API_BASE` | `http://127.0.0.1:8080` | EpiGraph HTTP API used for the backlog fetch |
-| `EPIGRAPH_TOKEN` | – | Bearer token for the API |
-| `EPIGRAPH_JWT_SECRET` | – | Used when no token is set: the server mints an HS256 service JWT (`scopes=["claims:read"]`) |
-| `EPIGRAPH_CLIENT_ID` | `5997f752-…` | `sub` of the minted JWT |
-| `KANBAN_BACKLOG_SOURCE` | `auto` | `http`, `claude` (asks headless Claude to call the MCP `query_claims_by_label`), `file` (you POST `/api/backlog/import`), or `auto` (tries http first and falls back to claude if http errors or returns 0 items) |
+| `EPIGRAPH_TOKEN` | – | Bearer token for the API. It must come from the EpiGraph OAuth mint, so that it carries an `agent_id` |
+| `KANBAN_BACKLOG_SOURCE` | `auto` | `http` (needs `EPIGRAPH_TOKEN`), `claude` (asks headless Claude to call the MCP `query_claims_by_label`), `file` (you POST `/api/backlog/import`), or `auto`. `auto` uses http when `EPIGRAPH_TOKEN` is set and falls back to claude if http errors or returns 0 items. With no token, `auto` goes straight to claude |
+
+`EPIGRAPH_JWT_SECRET` and `EPIGRAPH_CLIENT_ID` are no longer read. A locally minted HS256 service JWT carries no `agent_id`, and the API rejects such tokens (401) on the by-labels route. The old path therefore always failed and silently fell back to a 600-second `claude` subprocess.
 | `KANBAN_CLAUDE_BIN` / `KANBAN_GH_BIN` / `KANBAN_GIT_BIN` | `claude` / `gh` / `git` | Executables |
 | `KANBAN_MAX_AGENTS` | `3` | Number of agents that run at once. Extra cards wait as `queued` (FIFO) |
 | `KANBAN_PERMISSION_MODE` | `auto` | `--permission-mode` passed to every agent |
@@ -128,7 +128,7 @@ Every `/api/*` call needs the token: the `X-Kanban-Token` header, or `?t=` for G
 
 ## Limitations
 
-- **MCP in headless mode:** the `claude` backlog source and backlog resolution both depend on the EpiGraph MCP server being available to headless `claude -p`. MCP servers configured as claude.ai connectors may not load in headless or `--print` sessions. If resolution fails, the card history says so. Retire the items by hand with `resolve_backlog_item`. For fetching, `KANBAN_BACKLOG_SOURCE=http` with `EPIGRAPH_TOKEN`/`EPIGRAPH_JWT_SECRET` is the most reliable option.
+- **MCP in headless mode:** the `claude` backlog source and backlog resolution both depend on the EpiGraph MCP server being available to headless `claude -p`. MCP servers configured as claude.ai connectors may not load in headless or `--print` sessions. If resolution fails, the card history says so. Retire the items by hand with `resolve_backlog_item`. For fetching, `KANBAN_BACKLOG_SOURCE=http` with an OAuth-minted `EPIGRAPH_TOKEN` is the most reliable option.
 - Accept uses `gh pr merge --delete-branch` from the main checkout. If gh fails to delete the local branch but GitHub reports the PR `MERGED`, the merge is still treated as successful.
 - The board does not rebase item PRs when the integration branch moves. Conflicts show up in the Integration panel as `mergeable`/`checks` status, and you resolve them with Request changes.
 - Only one integration branch is active at a time, and one server should run per `KANBAN_HOME`.

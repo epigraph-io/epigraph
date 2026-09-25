@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -939,14 +940,35 @@ class UnitHelpersTest(unittest.TestCase):
         self.assertEqual(kanban.extract_json_array("here:\n```json\n[{\"a\": [1]}]\n```"), [{"a": [1]}])
         self.assertIsNone(kanban.extract_json_array("no arrays"))
 
-    def test_jwt_shape(self):
-        tok = kanban.mint_jwt("s3cret", "cid")
-        header, payload, sig = tok.split(".")
-        pad = lambda s: s + "=" * (-len(s) % 4)  # noqa: E731
-        claims = json.loads(kanban.base64.urlsafe_b64decode(pad(payload)))
-        self.assertEqual(claims["aud"], "epigraph-api")
-        self.assertEqual(claims["scopes"], ["claims:read"])
-        self.assertEqual(claims["client_type"], "service")
+    def refresh_with(self, env):
+        """Run one backlog refresh with urlopen and the claude fetch both recorded (neither reaches anything)."""
+        tmp = tempfile.mkdtemp(prefix="kanban-src-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        app = kanban.App(kanban.Config(repo=tmp, port=0, env=dict(env, KANBAN_HOME=os.path.join(tmp, "home"))))
+        opened, fetched = [], []
+
+        def fake_urlopen(req, timeout=None):
+            opened.append(req)
+            raise urllib.error.HTTPError(req.full_url, 401, "token carries no agent_id", {}, None)
+
+        with mock.patch.object(kanban.urllib.request, "urlopen", fake_urlopen), \
+                mock.patch.object(kanban, "fetch_backlog_claude", lambda cfg: fetched.append(cfg) or []):
+            app._refresh_backlog()
+        return app, opened, fetched
+
+    def test_jwt_secret_alone_never_sends_a_request_that_can_only_401(self):
+        app, opened, fetched = self.refresh_with({"KANBAN_BACKLOG_SOURCE": "auto", "EPIGRAPH_JWT_SECRET": "s3cret"})
+        self.assertEqual(opened, [], "a locally minted JWT (no agent_id) was sent to the API")
+        self.assertEqual(len(fetched), 1)
+        self.assertFalse(hasattr(kanban, "mint_jwt"))
+        app, opened, fetched = self.refresh_with({"KANBAN_BACKLOG_SOURCE": "http", "EPIGRAPH_JWT_SECRET": "s3cret"})
+        self.assertEqual(opened, [])
+        self.assertEqual(fetched, [])
+        self.assertIn("EPIGRAPH_TOKEN", app.backlog_refresh["error"])
+        # an OAuth-minted token is still used
+        app, opened, fetched = self.refresh_with({"KANBAN_BACKLOG_SOURCE": "auto", "EPIGRAPH_TOKEN": "tok"})
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0].get_header("Authorization"), "Bearer tok")
 
     def test_template_single_pass(self):
         out = kanban.render_template("{a} {b}", {"a": "{b}", "b": "x"})
