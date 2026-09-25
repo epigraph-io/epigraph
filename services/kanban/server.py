@@ -864,20 +864,15 @@ class App:
         return wt, branch
 
     def prepare_kanban_dir(self, wt: str) -> str:
+        """Create the worktree's `.kanban/` scratch dir, git-ignored by a `.gitignore` of `*` INSIDE it.
+
+        A self-ignoring directory touches nothing outside the worktree. (`git rev-parse --git-path
+        info/exclude` from a linked worktree resolves to the MAIN repository's shared exclude file,
+        so appending there edited the operator's own checkout.)"""
         kdir = os.path.join(wt, ".kanban")
         os.makedirs(kdir, exist_ok=True)
-        rel = self.git(["rev-parse", "--git-path", "info/exclude"], cwd=wt).stdout.strip()
-        exclude = rel if os.path.isabs(rel) else os.path.join(wt, rel)
-        os.makedirs(os.path.dirname(exclude), exist_ok=True)
-        existing = ""
-        if os.path.exists(exclude):
-            with open(exclude, "r", encoding="utf-8", errors="replace") as fh:
-                existing = fh.read()
-        if ".kanban/" not in existing.split("\n"):
-            with open(exclude, "a", encoding="utf-8") as fh:
-                if existing and not existing.endswith("\n"):
-                    fh.write("\n")
-                fh.write(".kanban/\n")
+        with open(os.path.join(kdir, ".gitignore"), "w", encoding="utf-8") as fh:
+            fh.write("*\n")
         for name in ("report.json", "blockers.jsonl"):
             try:
                 os.remove(os.path.join(kdir, name))

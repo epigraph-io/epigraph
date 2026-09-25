@@ -94,7 +94,7 @@ Every `/api/*` call needs the token: the `X-Kanban-Token` header, or `?t=` for G
 - **always** write `.kanban/report.json`:
   `{status: done|blocked|failed, summary, pr_url, pr_number, blockers: [{text, severity}], verification}`.
 
-`.kanban/` is added to the worktree's git exclude file, so it is never committed.
+`.kanban/` ignores itself: the board writes `.kanban/.gitignore` containing `*`, so the directory is never committed and nothing outside the worktree is edited. The repository's shared `info/exclude` is not touched (from a linked worktree, that file belongs to the main checkout).
 
 ## Safety notes
 

@@ -617,6 +617,42 @@ class UnitHelpersTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_prepare_kanban_dir_leaves_main_checkout_untouched(self):
+        tmp = tempfile.mkdtemp(prefix="kanban-excl-")
+        try:
+            env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+            run = lambda args, cwd: subprocess.run(["git"] + args, cwd=cwd, check=True, env=env,  # noqa: E731
+                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+            main = os.path.join(tmp, "main")
+            run(["init", "-q", "-b", "main", main], tmp)
+            with open(os.path.join(main, "f"), "w") as fh:
+                fh.write("x\n")
+            run(["add", "f"], main)
+            run(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"], main)
+            wt = os.path.join(tmp, "wt")
+            run(["worktree", "add", "-q", "-b", "kanban/x", wt], main)
+            common = run(["rev-parse", "--path-format=absolute", "--git-common-dir"], wt).strip()
+            exclude = os.path.join(common, "info", "exclude")
+            def read_exclude():
+                if not os.path.exists(exclude):
+                    return None
+                with open(exclude, "rb") as fh:
+                    return fh.read()
+            before = read_exclude()
+
+            app = kanban.App.__new__(kanban.App)
+            app.cfg = kanban.Config(repo=main, port=0, env={"KANBAN_HOME": tmp})
+            kdir = app.prepare_kanban_dir(wt)
+            with open(os.path.join(kdir, "report.json"), "w") as fh:
+                fh.write("{}")
+
+            after = read_exclude()
+            self.assertEqual(before, after, "the main repository's shared info/exclude was modified")
+            self.assertEqual(run(["status", "--porcelain"], wt), "")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_labels_cannot_inject_prompt_sections(self):
         app = kanban.App.__new__(kanban.App)
         app.cfg = kanban.Config(repo=HERE, port=0, env={"KANBAN_HOME": tempfile.gettempdir()})
