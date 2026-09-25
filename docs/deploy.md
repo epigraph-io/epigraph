@@ -23,6 +23,52 @@ The first deploy after 2026-05-05 also requires a one-shot reconcile of
 Subsequent deploys: run `cargo run -p epigraph-api --bin epigraph-migrate`
 (or let `ExecStartPre=` do it), then restart `epigraph-api.service`.
 
+On success `epigraph-migrate` prints one stdout line that still starts with
+the `migrations: ok` marker and now names both heads, e.g.
+`migrations: ok db_head=101 binary_head=101 applied=42` (issue #492). It exits
+nonzero, and never prints the marker, when:
+
+* the database is **ahead** of the binary — `_sqlx_migrations` holds a
+  successful version this build does not embed. That is a version above the
+  binary's highest embedded migration, *or* one that fills a gap below it (a
+  newer build's migration in reserved headroom such as `093`–`099`, or the
+  `102`–`103` a `feat/operator-scoped-ownership` build would apply), which the
+  head alone cannot show. The one exemption is `epigraph-internal`'s `035`
+  (`KNOWN_FOREIGN_VERSIONS` in `crates/epigraph-api/src/migrate.rs`). The
+  binary is stale; deploy one built from the revision that applied those
+  versions — the refusal lists them. Nothing is applied. For a *deliberate*
+  rollback to an older build, re-run with `--allow-db-ahead` or
+  `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` (the env var also covers
+  `EPIGRAPH_MIGRATE_ON_BOOT=1` on the server); it then applies the pending
+  migrations it embeds, leaves the unknown ones in place, prints a `WARNING`
+  naming them, and appends `db_ahead_of_binary=allowed` to the marker line.
+* after running, any migration embedded in the binary is not recorded as
+  successfully applied.
+
+The `035` exemption rests on `migrations/README.md`'s 2026-09-02 measurement
+of prod, not on a fresh read. If a deployed database carries any other
+non-embedded version, the first strict run refuses — fail-closed, nothing
+applied — until the version is identified.
+
+Both checks and the run itself happen on one connection holding sqlx's
+migration advisory lock, so a second `epigraph-migrate` (or a boot-time
+migrate) cannot slip a newer migration in between the check and the run.
+Two migrators started together against a *fresh* database can still fail one
+of them with a `40P01` deadlock between that lock and a `CREATE INDEX
+CONCURRENTLY` migration; that predates #492 (raw `sqlx::migrate!` does the
+same), the losing run exits nonzero without the marker, and re-running it is
+safe.
+
+**What this cannot catch.** A database that stops at an older head *because
+the binary itself is stale* (built before the newer migrations existed) still
+reports `ok` — the binary cannot know migrations it was never built with, so
+nothing inside it can tell "at my head" from "at the head the deployed code
+requires". #492's own measurement (a head-59 build on an empty database)
+still exits 0. The marker shows `binary_head`, so compare it with the newest
+file in `migrations/` for the revision you meant to deploy; making that
+comparison automatic needs the expected head supplied from outside the
+binary.
+
 ### Cross-worktree binary caching (foot-gun)
 
 `/home/jeremy/.cargo-target` is the shared cargo target across every worktree
