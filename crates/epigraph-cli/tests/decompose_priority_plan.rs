@@ -138,6 +138,50 @@ async fn conflict_priority_orders_by_edge_count_then_newest_edge(pool: PgPool) {
     assert_eq!(sel.chosen[1].conflict_edges, 1);
 }
 
+/// A conflict edge from a RETIRED source is not a live dispute: it neither
+/// makes its target a conflict candidate nor raises its rank, the same rule
+/// `ClaimRepository::dispute_batch` (recall's dispute signal) applies.
+#[sqlx::test(migrations = "../../migrations")]
+async fn conflict_priority_ignores_edges_from_retired_sources(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let live = seed_claim(&pool, agent, "A live disputing source claim.", 500, &[]).await;
+    let retired = seed_claim(&pool, agent, "A superseded disputing claim.", 500, &[]).await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(retired)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let first = seed_claim(&pool, agent, &compound("first"), 400, &[]).await;
+    let second = seed_claim(&pool, agent, &compound("second"), 400, &[]).await;
+    let only_retired = seed_claim(&pool, agent, &compound("only-retired"), 400, &[]).await;
+    // `first` has one live conflict, newer than `second`'s one live conflict.
+    seed_edge(&pool, live, first, "refutes", 10).await;
+    seed_edge(&pool, live, second, "refutes", 50).await;
+    // Counting the retired source would lift `second` to two edges, above
+    // `first`, and make `only_retired` a candidate.
+    seed_edge(&pool, retired, second, "contradicts", 5).await;
+    seed_edge(&pool, retired, only_retired, "contradicts", 5).await;
+
+    let sel = select_candidates(
+        &pool,
+        &viewer,
+        Priority::Conflict,
+        None,
+        EligibilityFilters::default(),
+        100,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&sel), vec![first, second]);
+    assert_eq!(
+        sel.chosen[1].conflict_edges, 1,
+        "the retired edge is not counted"
+    );
+}
+
 /// `recent` is `created_at DESC`, `oldest` is `created_at ASC`, both with an
 /// id tiebreaker, and both select the same population.
 #[sqlx::test(migrations = "../../migrations")]

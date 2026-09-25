@@ -62,8 +62,8 @@ pub struct DecomposeCandidate {
     pub content_hash: Vec<u8>,
     pub labels: Vec<String>,
     pub created_at: DateTime<Utc>,
-    /// In-force contradicts/refutes edges from a claim that target this claim.
-    /// Zero outside the conflict ordering.
+    /// In-force contradicts/refutes edges from a current claim that target
+    /// this claim. Zero outside the conflict ordering.
     pub conflict_edges: i64,
     /// `created_at` of the newest such edge.
     pub newest_conflict_at: Option<DateTime<Utc>>,
@@ -159,8 +159,13 @@ impl DecompositionPriorityRepository {
     }
 
     /// Undecomposed claims that are the TARGET of at least one in-force
-    /// contradicts/refutes edge from a claim, most-contested first:
-    /// `conflict_edges DESC, newest_conflict_at DESC, id ASC`.
+    /// contradicts/refutes edge from a current, visible claim, most-contested
+    /// first: `conflict_edges DESC, newest_conflict_at DESC, id ASC`.
+    ///
+    /// A conflict from a retired (superseded, duplicate) source is not a live
+    /// dispute and is not counted, matching `ClaimRepository::dispute_batch`
+    /// (`JOIN claims src ON src.id = e.source_id AND src.is_current`), the
+    /// dispute signal recall shows.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
@@ -175,10 +180,13 @@ impl DecompositionPriorityRepository {
                 WITH conflict AS (
                     SELECT e.target_id, COUNT(*)::bigint AS n, MAX(e.created_at) AS newest
                     FROM edges e
+                    JOIN claims s ON s.id = e.source_id
                     WHERE lower(e.relationship) IN ('contradicts', 'refutes')
                       AND e.source_type = 'claim' AND e.target_type = 'claim'
                       AND (e.valid_to IS NULL OR e.valid_to > now())
+                      AND COALESCE(s.is_current, true) = true
                       /* {EDGE_VISIBILITY:e} */
+                      /* {VISIBILITY:s} */
                     GROUP BY e.target_id
                 )
                 SELECT c.id, c.agent_id, c.content, c.content_hash, c.labels, c.created_at,
