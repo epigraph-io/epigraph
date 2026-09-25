@@ -894,7 +894,8 @@ class App:
             self.pair_code = None
             self.token = secrets.token_urlsafe(32)
             log("paired with a browser session; the pairing link is now spent")
-            return self.token
+        self._wake.set()  # queued cards were held until now (see _schedule_once)
+        return self.token
 
     def start(self) -> None:
         try:
@@ -936,9 +937,12 @@ class App:
                     add_history(card, "recovered", "server restarted during merge; verify the PR state on GitHub")
                 elif st == "queued":
                     add_history(card, "requeued", "server restarted; still queued")
+            queued = sum(1 for c in self.store.cards.values() if c.get("status") == "queued")
             if reattached and self.pair_code:
                 log("WARNING: %d agent(s) from the previous server are still running while the pairing link is "
                     "unredeemed; open it promptly (see README, Safety notes)" % reattached)
+            if queued and self.pair_code:
+                log("%d queued card(s) will start only after the pairing link is opened" % queued)
             integ = self.store.state.get("integration") or {}
             recover_ship = None
             if integ.get("status") == "merging":
@@ -1440,6 +1444,10 @@ class App:
                 log("scheduler error: %s" % traceback.format_exc())
 
     def _schedule_once(self) -> None:
+        # No agent starts before the operator has paired: while the printed pairing link is unredeemed, an agent
+        # that can read the board's stdout (terminal, tmux, journal) could redeem it first and hold the only session.
+        if self.token is None:
+            return
         to_start = []
         with self.store.lock:
             cards = list(self.store.cards.values())

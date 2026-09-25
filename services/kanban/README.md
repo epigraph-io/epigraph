@@ -81,7 +81,7 @@ backlog --develop--> develop --agent exits--> review --accept--> accepted --ship
 - When the agent exits, the card moves to **review** no matter how the run went, so you always see the result. If the agent wrote no report and no PR exists, the card's status becomes `failed` and it gets an automatic blocker.
 - **Develop** works from `backlog`, from `review` (re-run with a fresh session), or on a `failed`/`stopped` card in `develop`. **Request changes** resumes the same Claude session (`--resume <session_id>`) in the same worktree, and the agent pushes to the same PR. **Stop** kills the agent's process group. **Reject** moves the card back to `backlog` and leaves its PR open. Pass `cleanup: true` to also remove the worktree.
 - If a card is in the `backlog` column and disappears from the backlog source, it is marked `stale`. Cards are never deleted automatically.
-- After a server restart, a card that was `running` is reattached if its pid is still alive. Otherwise it is marked `failed`. `queued` cards stay queued.
+- After a server restart, a card that was `running` is reattached if its pid is still alive. Otherwise it is marked `failed`. `queued` cards stay queued, and no agent starts until the new pairing link has been redeemed.
 
 ## The PR tree
 
@@ -137,7 +137,7 @@ Every `/api/*` call needs the session secret in the `X-Kanban-Token` header. It 
 - **The board cannot stop its own agents from merging. This is a known limitation, not a guarantee.** Dispatched agents run as **your user id**, without a container or a separate uid, and with a shell, under `--permission-mode $KANBAN_PERMISSION_MODE` (default `auto`). "Only a human merges to `main`" is therefore a convention the agents are told to follow and the board's own code keeps. It is not a boundary an agent cannot cross. A same-uid agent that decides to misbehave can still:
   - run `gh pr merge` (or call the GitHub API) itself, using your `gh` credentials from their config file on disk. The `--disallowedTools` patterns catch the obvious spellings of that command, but they are prefix matches, not a sandbox;
   - read your browser profile, where `sessionStorage` may be persisted, or read the board's memory where the kernel allows same-uid ptrace;
-  - read the pairing link from wherever the board's stdout goes (a terminal, tmux or the journal) while the link is still unredeemed. Agents only run during that window if they survived a server restart; the board logs a warning when that happens. Pair promptly after a restart;
+  - read the pairing link from wherever the board's stdout goes (a terminal, tmux or the journal) while the link is still unredeemed. The scheduler starts no agent until you have paired, so cards left `queued` by the previous server wait for you. The one exception is an agent that was still *running* when the server restarted: it is reattached, not restarted, and the board logs a warning while the link is unredeemed. Pair promptly after a restart;
   - write the shared `.git/hooks` and `.git/config` of your checkout, your `~/.gitconfig`, `~/.config/gh`, and any executable on your `PATH` that your uid owns. The board's own git ignores hooks and fsmonitor, gets no tokens and refuses a re-pointed remote (see "What the board does to your repository"), but *your* git in your checkout honours whatever an agent planted there. Check `.git/hooks` and `git config --local --list` after a session you did not watch;
   - stop or restart the board process itself.
 

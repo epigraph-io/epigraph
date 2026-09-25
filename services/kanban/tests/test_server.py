@@ -1208,6 +1208,33 @@ class BoardGitHardeningTest(_IsolatedRepo):
                                         capture_output=True, text=True).stdout, "")
 
 
+class PairBeforeAgentsTest(_IsolatedRepo):
+    """While the pairing link is unredeemed, whoever reads the board's stdout first holds the only session. No agent
+    may be running then: a card left queued by the previous server waits for the operator to pair."""
+
+    def test_a_queued_card_does_not_start_an_agent_before_pairing(self):
+        app1 = self.make_app()
+        with app1.store.lock:
+            card = kanban.new_card({"id": CLAIM_A, "content": "BACKLOG: queued across a restart"})
+            app1.store.cards[CLAIM_A] = card
+            app1.enqueue(card, "develop")
+            app1.store.save()
+        # the server restarts with the card still queued
+        app2 = self.make_app()
+        self.addCleanup(app2.shutdown)
+        app2.start()
+        self.assertEqual(app2.store.cards[CLAIM_A]["status"], "queued")
+        time.sleep(2.5)  # several scheduler ticks
+        self.assertEqual(self.recorded(), [], "an agent started while the pairing link was still unredeemed")
+        self.assertEqual(app2.store.cards[CLAIM_A]["status"], "queued")
+        app2.pair(app2.pair_code)
+        deadline = time.time() + 30
+        while time.time() < deadline and not self.recorded():
+            time.sleep(0.2)
+        self.assertTrue(self.recorded(), "the queued card never started after pairing")
+        self.assertIn("--session-id", self.recorded()[0]["argv"])
+
+
 class SessionSecretTest(unittest.TestCase):
     """The secret that authorises the mutating endpoints never exists where a same-uid agent could simply
     read it: not in a file under KANBAN_HOME, not in /api/state, not in any agent's environment, not in a URL."""
@@ -1305,6 +1332,7 @@ class RecoverTest(unittest.TestCase):
             app.store.cards[CLAIM_C]["status"] = "queued"
             app.store.cards[CLAIM_C]["pending"] = {"kind": "develop", "text": ""}
             app._start_run = lambda *a: None
+            app.token = "paired"  # the scheduler starts nothing before pairing
             app._schedule_once()
             self.assertFalse(kanban.unresolved_blockers(app.store.cards[CLAIM_C], "blocker"))
         finally:
