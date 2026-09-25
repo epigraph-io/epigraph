@@ -96,7 +96,7 @@ async fn submit_claim_emits_claim_created_event() {
 
     let before = chrono::Utc::now();
 
-    let submit_result = tools::claims::submit_claim(&server, &viewer, params)
+    let submit_result = tools::claims::submit_claim(&server, &viewer, params, None)
         .await
         .expect("submit_claim succeeds");
 
@@ -185,7 +185,7 @@ async fn resubmit_does_not_emit_duplicate_claim_created() {
     };
 
     // First submit — should create the claim and emit one event.
-    tools::claims::submit_claim(&server, &viewer, make_params("evidence-resubmit-1"))
+    tools::claims::submit_claim(&server, &viewer, make_params("evidence-resubmit-1"), None)
         .await
         .expect("first submit_claim");
 
@@ -214,7 +214,7 @@ async fn resubmit_does_not_emit_duplicate_claim_created() {
     // row's own content_hash dedup doesn't collide; each submission emits
     // its own Evidence + Trace per the architecture doc, but the claim
     // itself is the dedup target this test cares about.)
-    tools::claims::submit_claim(&server, &viewer, make_params("evidence-resubmit-2"))
+    tools::claims::submit_claim(&server, &viewer, make_params("evidence-resubmit-2"), None)
         .await
         .expect("second submit_claim");
 

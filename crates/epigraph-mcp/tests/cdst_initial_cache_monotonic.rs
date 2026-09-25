@@ -81,6 +81,7 @@ async fn adding_supporting_evidence_does_not_drop_cached_betp(pool: sqlx::PgPool
             strength: 0.8,
             labels: vec![],
         },
+        None,
     )
     .await;
     assert!(res.is_ok(), "update_with_evidence failed: {res:?}");

@@ -121,6 +121,66 @@ impl EpiGraphMcpFull {
     pub async fn server_agent_id(&self) -> Result<uuid::Uuid, McpError> {
         self.agent_id().await
     }
+
+    /// The agent a write on this request authors and stamps as (batch H-b, D1).
+    ///
+    /// * `Some(auth)` (the HTTP listener): the caller, `auth.agent_id`. A token
+    ///   with no agent principal is refused, as `request_viewer` refuses it.
+    /// * `None` (stdio, and the operator CLIs that drive the tool functions
+    ///   directly): this server's own agent, exactly as before batch H-b.
+    ///
+    /// `viewer` is the request's own viewer, and over HTTP it MUST name the same
+    /// principal: `request_viewer` resolved it from the same `auth`, so a
+    /// mismatch means a caller wired a viewer from one principal to a write as
+    /// another. That is refused rather than resolved in either direction, so a
+    /// tool's read and write authority cannot silently name two agents. See
+    /// [`crate::write_identity`] for the decision and the ratchet.
+    ///
+    /// # Errors
+    ///
+    /// An MCP invalid-request error for a token with no agent principal, an
+    /// internal error when `viewer`'s principal is not the token's, and
+    /// whatever [`Self::agent_id`] returns on stdio.
+    pub async fn write_identity(
+        &self,
+        auth: Option<&epigraph_auth::AuthContext>,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Result<crate::write_identity::WriteIdentity, McpError> {
+        let Some(auth) = auth else {
+            return Ok(crate::write_identity::WriteIdentity::from_resolved(
+                self.agent_id().await?,
+            ));
+        };
+        let principal = auth
+            .agent_id
+            .ok_or_else(crate::write_identity::no_agent_principal_refusal)?;
+        if viewer.principal() != Some(principal) {
+            return Err(crate::write_identity::diverging_principals(
+                principal,
+                viewer.principal(),
+            ));
+        }
+        Ok(crate::write_identity::WriteIdentity::from_resolved(
+            principal,
+        ))
+    }
+
+    /// The agent whose key SIGNS this server's digests: the server's own agent,
+    /// whatever the author.
+    ///
+    /// Named apart from [`Self::write_identity`] because the two are different
+    /// facts once an authenticated caller authors a row. `claims.signer_id` and
+    /// `evidence.signer_id` record this agent, and `verify_claim` checks the
+    /// stored signature against its `public_key`, so a row authored by the caller
+    /// and signed by the server verifies instead of reporting a mismatch against
+    /// the author's (often `derived`, keyless) agent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever [`Self::agent_id`] returns.
+    pub async fn signer_agent_id(&self) -> Result<uuid::Uuid, McpError> {
+        self.agent_id().await
+    }
 }
 
 /// Builds the per-session servers of ONE HTTP listener, all sharing ONE
@@ -774,7 +834,7 @@ impl EpiGraphMcpFull {
     // ── Claims (11 tools) ──
 
     #[tool(
-        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its evidence, reasoning trace, verb-edges and its Dempster-Shafer belief (BBA, frame assignment, cached belief and derived truth_value) commit together; if the belief cannot be wired the call fails and nothing is written, so a retry is safe. Only the embedding is best-effort after commit (embedded=false)."
+        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by the calling agent (the authenticated caller over HTTP, this server's own agent on stdio) and owned by that agent's personal group, or by its operator's personal group when the agent is operator-linked: if an operator has revoked that personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its evidence, reasoning trace, verb-edges and its Dempster-Shafer belief (BBA, frame assignment, cached belief and derived truth_value) commit together; if the belief cannot be wired the call fails and nothing is written, so a retry is safe. Only the embedding is best-effort after commit (embedded=false)."
     )]
     async fn submit_claim(
         &self,
@@ -784,7 +844,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::claims::submit_claim(self, viewer, params).await
+        tools::claims::submit_claim(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -850,11 +910,11 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::claims::update_with_evidence(self, viewer, params).await
+        tools::claims::update_with_evidence(self, viewer, params, auth).await
     }
 
     #[tool(
-        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. The read, the retirement and the new claim commit together on one transaction stamped from this server's agent: a claim the caller cannot read is reported as not found, and one owned by a group this server's agent cannot write is refused with nothing written. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
+        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. The read, the retirement and the new claim commit together on one transaction stamped from the calling agent (the authenticated caller over HTTP, this server's own agent on stdio): a claim the caller cannot read is reported as not found, and one owned by a group the calling agent cannot write is refused with nothing written. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
     )]
     async fn supersede_claim(
         &self,
@@ -904,7 +964,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Optionally takes basis_claim_ids: the claims that justified the closure, each recorded as a `basis -justifies-> resolution` edge so a later retraction of a basis can be reverse-queried to find the closures resting on it (it does not reopen anything by itself). Returns {resolution_claim_id, original_id, original_labels, basis_claim_ids, basis_edge_ids}. All-or-nothing: the resolution claim, its justifies edges and the original's 'resolved' label commit together on one transaction with this server's agent's write authority, or nothing is written and the call fails (a retry is safe). An original owned by a group this server's agent cannot write (another agent's claim) is refused that way even with claims:admin. Only the resolution claim's embedding runs after commit, best-effort."
+        description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Optionally takes basis_claim_ids: the claims that justified the closure, each recorded as a `basis -justifies-> resolution` edge so a later retraction of a basis can be reverse-queried to find the closures resting on it (it does not reopen anything by itself). Returns {resolution_claim_id, original_id, original_labels, basis_claim_ids, basis_edge_ids}. All-or-nothing: the resolution claim, its justifies edges and the original's 'resolved' label commit together on one transaction with the calling agent (the authenticated caller over HTTP, this server's own agent on stdio)'s write authority, or nothing is written and the call fails (a retry is safe). An original owned by a group the calling agent cannot write (another agent's claim) is refused that way even with claims:admin. Only the resolution claim's embedding runs after commit, best-effort."
     )]
     async fn resolve_backlog_item(
         &self,
@@ -923,7 +983,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. When the caller is authenticated (HTTP), the whole patch requires claims:admin or ownership of the claim, as PATCH /api/v1/claims/:id does. All-or-nothing: the whole patch lands or nothing does. A claim you cannot read is reported as not found. A claim owned by a group this server's agent cannot write (another agent's claim) is refused with nothing written, even with claims:admin."
+        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. When the caller is authenticated (HTTP), the whole patch requires claims:admin or ownership of the claim, as PATCH /api/v1/claims/:id does. All-or-nothing: the whole patch lands or nothing does. A claim you cannot read is reported as not found. A claim owned by a group the calling agent (the authenticated caller over HTTP, this server's own agent on stdio) cannot write (another agent's claim) is refused with nothing written, even with claims:admin."
     )]
     async fn patch_claim(
         &self,
@@ -994,8 +1054,10 @@ impl EpiGraphMcpFull {
                        supersedes edges plus properties.merge. The caller supplies \
                        merged_content; the server never calls an LLM. ALL-OR-NOTHING: on any \
                        error no merged claim is written and no source is retired, so retrying \
-                       a failed call is safe. A source owned by a group this server's agent \
-                       cannot write, or sources spanning two owner groups, is refused \
+                       a failed call is safe. The merged claim is authored by the calling agent \
+                       (the authenticated caller over HTTP, this server's own agent on stdio). \
+                       A source owned by a group the calling agent cannot write, or sources \
+                       spanning two owner groups, is refused \
                        permanently (sometimes as INTERNAL_ERROR); do not retry it. After a \
                        success the sources are no longer current, so repeating the call fails \
                        with 'source ... is not current', which means the first call landed. If \
@@ -1010,7 +1072,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::consolidate::consolidate_claims(self, viewer, params).await
+        tools::consolidate::consolidate_claims(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1054,7 +1116,7 @@ impl EpiGraphMcpFull {
     // ── Memory (2 tools) ──
 
     #[tool(
-        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its tags, evidence, trace and Dempster-Shafer belief commit together; if the belief cannot be wired the call fails and nothing is written. Only the embedding is best-effort after commit."
+        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by the calling agent (the authenticated caller over HTTP, this server's own agent on stdio) and owned by that agent's personal group, or by its operator's personal group when the agent is operator-linked: if an operator has revoked that personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its tags, evidence, trace and Dempster-Shafer belief commit together; if the belief cannot be wired the call fails and nothing is written. Only the embedding is best-effort after commit."
     )]
     async fn memorize(
         &self,
@@ -1064,7 +1126,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::memory::memorize(self, viewer, params).await
+        tools::memory::memorize(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1104,7 +1166,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        crate::tools::evolve_step::evolve_step(self, viewer, params).await
+        crate::tools::evolve_step::evolve_step(self, viewer, params, auth).await
     }
 
     // ── Ingestion ──
@@ -1120,7 +1182,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::ingestion::ingest_document(self, viewer, params).await
+        tools::ingestion::ingest_document(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1137,18 +1199,23 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent PER DOCUMENT: structural nodes are keyed on (document title, structural path, text), so re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths. A DIFFERENT paper that happens to share a section heading or a boilerplate paragraph does NOT dedup against it — each document owns its own spine. SYNCHRONOUS and all-or-nothing: on any error (including a refusal because this server's agent cannot write its personal group) no claims or edges are written, and retrying is safe. It writes the paper's processed_by edge, so check_already_ingested reports true from here on, before any atoms exist. A node another author already wrote is reused, never rewritten; converged_claims_unlabelled counts reused nodes you could not give this document's doi: label."
+        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent PER DOCUMENT: structural nodes are keyed on (document title, structural path, text), so re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths. A DIFFERENT paper that happens to share a section heading or a boilerplate paragraph does NOT dedup against it — each document owns its own spine. SYNCHRONOUS and all-or-nothing: on any error (including a refusal because the calling agent (the authenticated caller over HTTP, this server's own agent on stdio) cannot write its personal group) no claims or edges are written, and retrying is safe. It writes the paper's processed_by edge, so check_already_ingested reports true from here on, before any atoms exist. A node another author already wrote is reused, never rewritten; converged_claims_unlabelled counts reused nodes you could not give this document's doi: label."
     )]
     async fn ingest_document_spine(
         &self,
         Parameters(params): Parameters<IngestDocumentSpineParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::ingestion::ingest_document_spine(self, params).await
+        // A viewer since batch H-b: the spine is AUTHORED as the request's
+        // principal (`EpiGraphMcpFull::write_identity`), which is the viewer's.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::ingestion::ingest_document_spine(self, viewer, params, auth).await
     }
 
     #[tool(
-        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms (the mass functions are wired after the claims commit, best-effort). ASYNCHRONOUS: the call first checks write authority synchronously — if this server's agent cannot write its personal group (membership revoked or read-only) it returns an error and writes nothing — then creates the paper row and returns {status: 'queued', paper_id, document_key}, and everything else is written by a background task. That task is all-or-nothing: if it fails (verbatim-guard mismatch, malformed axis, a rejected row) the error reaches only the server log, no claims or edges are written, and retrying is safe. To confirm it landed, compare query_paper(document_key)'s claim_count before and after: the paper row exists as soon as the call returns, so finding the paper proves nothing, and check_already_ingested is already true after ingest_document_spine or any earlier ingest of the same document. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting a full paper after its abstract was ingested is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design: an atom another author already stored is reused, never rewritten, and if its owner group is one you cannot write it does not get this document's doi: label. For AUTHORED records (an ELN entry, run summary, or other content with no external source to quote) omit the top-level source_text: the verbatim guard is then skipped and this is a supported SINGLE-CALL path — structure_source / ingest_document_spine are NOT required and exist only to re-verify EXTRACTED text byte-for-byte. For the two-phase flow that saves LLM atomization cost on extracted papers, use ingest_document_spine first. By default every atom's CDST mass function is placed on the binary {TRUE, FALSE} frame. To place atoms on a genuinely multi-valued field axis instead — an ordinal scale like {ineffective, mild, moderate, strong} or a categorical partition like {vata, pitta, kapha} — declare `axis: {frame, hypotheses, label}` on a paragraph (or on a section, inherited by its paragraphs), with optional per-atom `axis_labels` positionally overriding `label`. A binary opposition (safe/harmful) does NOT need an axis: model it as a proposition on {TRUE, FALSE} where harm is mass on FALSE. Frames dedupe by name, so one frame name must always mean one ordered hypothesis list; a malformed or inconsistent axis fails the ingest (in the background task, so only the server log shows it) rather than silently falling back to binary."
+        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms (the mass functions are wired after the claims commit, best-effort). ASYNCHRONOUS: the call first checks write authority synchronously — if the calling agent (the authenticated caller over HTTP, this server's own agent on stdio) cannot write its personal group (membership revoked or read-only) it returns an error and writes nothing — then creates the paper row and returns {status: 'queued', paper_id, document_key}, and everything else is written by a background task. That task is all-or-nothing: if it fails (verbatim-guard mismatch, malformed axis, a rejected row) the error reaches only the server log, no claims or edges are written, and retrying is safe. To confirm it landed, compare query_paper(document_key)'s claim_count before and after: the paper row exists as soon as the call returns, so finding the paper proves nothing, and check_already_ingested is already true after ingest_document_spine or any earlier ingest of the same document. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting a full paper after its abstract was ingested is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design: an atom another author already stored is reused, never rewritten, and if its owner group is one you cannot write it does not get this document's doi: label. For AUTHORED records (an ELN entry, run summary, or other content with no external source to quote) omit the top-level source_text: the verbatim guard is then skipped and this is a supported SINGLE-CALL path — structure_source / ingest_document_spine are NOT required and exist only to re-verify EXTRACTED text byte-for-byte. For the two-phase flow that saves LLM atomization cost on extracted papers, use ingest_document_spine first. By default every atom's CDST mass function is placed on the binary {TRUE, FALSE} frame. To place atoms on a genuinely multi-valued field axis instead — an ordinal scale like {ineffective, mild, moderate, strong} or a categorical partition like {vata, pitta, kapha} — declare `axis: {frame, hypotheses, label}` on a paragraph (or on a section, inherited by its paragraphs), with optional per-atom `axis_labels` positionally overriding `label`. A binary opposition (safe/harmful) does NOT need an axis: model it as a proposition on {TRUE, FALSE} where harm is mass on FALSE. Frames dedupe by name, so one frame name must always mean one ordered hypothesis list; a malformed or inconsistent axis fails the ingest (in the background task, so only the server log shows it) rather than silently falling back to binary."
     )]
     async fn ingest_document_inline(
         &self,
@@ -1158,7 +1225,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::ingestion::ingest_document_inline(self, viewer, params).await
+        tools::ingestion::ingest_document_inline(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1172,7 +1239,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer. All-or-nothing, on one transaction with this server's agent's write authority: an edge touching a group-private claim you cannot read is reported as not found, and one touching a group-private claim owned by a group this server's agent cannot write (another agent's private claim) is refused with nothing written."
+        description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer. All-or-nothing, on one transaction with the calling agent (the authenticated caller over HTTP, this server's own agent on stdio)'s write authority: an edge touching a group-private claim you cannot read is reported as not found, and one touching a group-private claim owned by a group the calling agent cannot write (another agent's private claim) is refused with nothing written."
     )]
     async fn link_hierarchical(
         &self,
@@ -1182,11 +1249,11 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::link_hierarchical::link_hierarchical(self, viewer, params).await
+        tools::link_hierarchical::link_hierarchical(self, viewer, params, auth).await
     }
 
     #[tool(
-        description = "Promote two existing claims into a mutually-exclusive alternative_of pair — the symmetric edge suggest_alternative_sets tells you to submit but link_epistemic/link_hierarchical cannot create. Direction-agnostic and idempotent on the unordered {claim_a, claim_b} pair (migration 042's symmetric index): re-runs return the existing edge_id with created=false. Optional target_claim_id (the shared target the two claims are rival supporters of) and rationale are validated and stored on the edge. Deliberately inert at write time — the belief effect of an alternative set flows later through CDST max-plausibility combine over the alternative_set view, not a Dempster re-wire here. All-or-nothing, on one transaction with this server's agent's write authority: an edge touching a group-private claim you cannot read is reported as not found, and one touching a group-private claim owned by a group this server's agent cannot write (another agent's private claim) is refused with nothing written."
+        description = "Promote two existing claims into a mutually-exclusive alternative_of pair — the symmetric edge suggest_alternative_sets tells you to submit but link_epistemic/link_hierarchical cannot create. Direction-agnostic and idempotent on the unordered {claim_a, claim_b} pair (migration 042's symmetric index): re-runs return the existing edge_id with created=false. Optional target_claim_id (the shared target the two claims are rival supporters of) and rationale are validated and stored on the edge. Deliberately inert at write time — the belief effect of an alternative set flows later through CDST max-plausibility combine over the alternative_set view, not a Dempster re-wire here. All-or-nothing, on one transaction with the calling agent (the authenticated caller over HTTP, this server's own agent on stdio)'s write authority: an edge touching a group-private claim you cannot read is reported as not found, and one touching a group-private claim owned by a group the calling agent cannot write (another agent's private claim) is refused with nothing written."
     )]
     async fn link_alternative(
         &self,
@@ -1196,11 +1263,11 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::link_alternative::link_alternative(self, viewer, params).await
+        tools::link_alternative::link_alternative(self, viewer, params, auth).await
     }
 
     #[tool(
-        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it); cites is also accepted as a structural edge that moves no belief. Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is owned by a group this server's agent cannot write). target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with this server's agent's write authority. An endpoint in a group-private claim owned by a group this server's agent cannot write is refused with nothing written. Belief wiring into a target this server's agent cannot write moves no belief (belief_wired=false) and the edge still lands."
+        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it); cites is also accepted as a structural edge that moves no belief. Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is owned by a group the calling agent (the authenticated caller over HTTP, this server's own agent on stdio) cannot write). target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with the calling agent's write authority. An endpoint in a group-private claim owned by a group the calling agent cannot write is refused with nothing written. Belief wiring into a target the calling agent cannot write moves no belief (belief_wired=false) and the edge still lands."
     )]
     async fn link_epistemic(
         &self,
@@ -1210,11 +1277,11 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::link_epistemic::link_epistemic(self, viewer, params).await
+        tools::link_epistemic::link_epistemic(self, viewer, params, auth).await
     }
 
     #[tool(
-        description = "Update an existing edge in place: retire it by closing its lifecycle window (valid_to) and/or shallow-merge a JSON object into its properties. MCP-native wrapper for PATCH /api/v1/edges/:id — before this tool the only way to act on a mislabeled edge from MCP was raw OAuth + curl. At least one of valid_to / properties is required; properties must be a JSON object (a non-object would silently convert the JSONB column to an array via Postgres `||`). valid_to accepts an RFC3339 timestamp or the literal \"now\" (resolved server-side, since an MCP client has no wall clock). Retiring is the NON-DESTRUCTIVE correction: the row and its audit history survive. Emits edge.updated, plus edge.retired when valid_to is set. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retired edge. The update and its events commit together, with this server's agent's write authority: an edge the CALLER cannot read, or one owned by a group this server's agent cannot write (one touching another agent's private claim), reports not found and nothing is written."
+        description = "Update an existing edge in place: retire it by closing its lifecycle window (valid_to) and/or shallow-merge a JSON object into its properties. MCP-native wrapper for PATCH /api/v1/edges/:id — before this tool the only way to act on a mislabeled edge from MCP was raw OAuth + curl. At least one of valid_to / properties is required; properties must be a JSON object (a non-object would silently convert the JSONB column to an array via Postgres `||`). valid_to accepts an RFC3339 timestamp or the literal \"now\" (resolved server-side, since an MCP client has no wall clock). Retiring is the NON-DESTRUCTIVE correction: the row and its audit history survive. Emits edge.updated, plus edge.retired when valid_to is set. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retired edge. The update and its events commit together, with the calling agent (the authenticated caller over HTTP, this server's own agent on stdio)'s write authority: an edge the CALLER cannot read, or one owned by a group the calling agent cannot write (one touching another agent's private claim), reports not found and nothing is written."
     )]
     async fn patch_edge(
         &self,
@@ -1224,11 +1291,11 @@ impl EpiGraphMcpFull {
         self.reject_if_read_only()?;
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        tools::edge_mutation::patch_edge(self, viewer, params).await
+        tools::edge_mutation::patch_edge(self, viewer, params, auth).await
     }
 
     #[tool(
-        description = "Take an edge out of force by id: sets its valid_to to now (a RETRACTION; the row, its properties and signature survive and stay queryable). MCP-native wrapper for DELETE /api/v1/edges/:id. Use patch_edge with valid_to to retire an edge at a chosen time; delete_edge is for edges that should never have existed (e.g. a mislabeled contradicts edge). Errors if the edge id does not exist or is already retracted. Emits edge.deleted on the same transaction. An edge the CALLER cannot read, or one owned by a group this server's agent cannot write (one touching another agent's private claim), reports not found and nothing is written. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retracted edge."
+        description = "Take an edge out of force by id: sets its valid_to to now (a RETRACTION; the row, its properties and signature survive and stay queryable). MCP-native wrapper for DELETE /api/v1/edges/:id. Use patch_edge with valid_to to retire an edge at a chosen time; delete_edge is for edges that should never have existed (e.g. a mislabeled contradicts edge). Errors if the edge id does not exist or is already retracted. Emits edge.deleted on the same transaction. An edge the CALLER cannot read, or one owned by a group the calling agent (the authenticated caller over HTTP, this server's own agent on stdio) cannot write (one touching another agent's private claim), reports not found and nothing is written. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retracted edge."
     )]
     async fn delete_edge(
         &self,
@@ -1238,7 +1305,7 @@ impl EpiGraphMcpFull {
         self.reject_if_read_only()?;
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        tools::edge_mutation::delete_edge(self, viewer, params).await
+        tools::edge_mutation::delete_edge(self, viewer, params, auth).await
     }
 
     // ── Paper Queries (3 tools) ──
@@ -1376,7 +1443,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record what actually happened when you used a workflow. For a workflows-table id (what `store_workflow` / `ingest_workflow` return) it delegates to `report_hierarchical_outcome` and has that tool's response and semantics: counters plus per-step rows, no evidence, no belief change, NOT idempotent, and execution_log[].step_index mapped to the steps in original plan order. Legacy flat workflow claim IDs are still supported: there the run is recorded as evidence plus a Dempster-Shafer truth update, all-or-nothing (an error writes nothing, so an identical retry is safe), and it is refused for a workflow claim owned by a group this server's agent cannot write."
+        description = "Record what actually happened when you used a workflow. For a workflows-table id (what `store_workflow` / `ingest_workflow` return) it delegates to `report_hierarchical_outcome` and has that tool's response and semantics: counters plus per-step rows, no evidence, no belief change, NOT idempotent, and execution_log[].step_index mapped to the steps in original plan order. Legacy flat workflow claim IDs are still supported: there the run is recorded as evidence plus a Dempster-Shafer truth update, all-or-nothing (an error writes nothing, so an identical retry is safe), and it is refused for a workflow claim owned by a group the calling agent (the authenticated caller over HTTP, this server's own agent on stdio) cannot write."
     )]
     async fn report_workflow_outcome(
         &self,
@@ -1386,7 +1453,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflows::report_workflow_outcome(self, viewer, params).await
+        tools::workflows::report_workflow_outcome(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1400,7 +1467,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflows::deprecate_workflow(self, viewer, params).await
+        tools::workflows::deprecate_workflow(self, viewer, params, auth).await
     }
 
     // ── Hierarchical Workflows (4 tools) ──
@@ -1515,14 +1582,18 @@ impl EpiGraphMcpFull {
     // ── Challenges (2 tools) ──
 
     #[tool(
-        description = "Submit a typed challenge against a claim. Types: insufficient_evidence, outdated_evidence, flawed_methodology, contradicting_evidence, factual_error. Returns {challenge_id, claim_id, challenge_type, state: 'pending'}. Refused with an error, writing nothing, when the claim is owned by a group this server's agent cannot write."
+        description = "Submit a typed challenge against a claim. Types: insufficient_evidence, outdated_evidence, flawed_methodology, contradicting_evidence, factual_error. Returns {challenge_id, claim_id, challenge_type, state: 'pending'}. The challenge is filed as the calling principal (the authenticated caller over HTTP, this server's agent on stdio). Refused with an error, writing nothing, when the claim is owned by a group the caller cannot write."
     )]
     async fn challenge_claim(
         &self,
         Parameters(params): Parameters<ChallengeclaimParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::challenges::challenge_claim(self, params).await
+        // A viewer since batch H-b, for its principal: the challenger.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::challenges::challenge_claim(self, viewer, params, auth).await
     }
 
     #[tool(description = "List all challenges filed against a specific claim.")]
@@ -1565,7 +1636,7 @@ impl EpiGraphMcpFull {
     // ── Batch / Staging / Stats (3 tools) ──
 
     #[tool(
-        description = "Submit multiple claims in a single batch (max 100). Each entry needs content, evidence_data, evidence_type, and optional confidence. Entries are submitted one at a time, exactly as submit_claim, and reported individually (submitted, errors, error_details); a refused entry writes nothing. If an operator has revoked this server's agent's personal-group membership, every entry is refused that way. The membership is never restored; restoring it is an operator action."
+        description = "Submit multiple claims in a single batch (max 100). Each entry needs content, evidence_data, evidence_type, and optional confidence. Entries are submitted one at a time, exactly as submit_claim, and reported individually (submitted, errors, error_details); a refused entry writes nothing. If an operator has revoked the calling agent (the authenticated caller over HTTP, this server's own agent on stdio)'s personal-group membership, every entry is refused that way. The membership is never restored; restoring it is an operator action."
     )]
     async fn batch_submit_claims(
         &self,
@@ -1575,7 +1646,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::batch::batch_submit_claims(self, viewer, params).await
+        tools::batch::batch_submit_claims(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1609,9 +1680,13 @@ impl EpiGraphMcpFull {
     async fn create_perspective(
         &self,
         Parameters(params): Parameters<CreatePerspectiveParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::perspectives::create_perspective(self, params).await
+        // A viewer since batch H-b, for its principal: the default owner.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::perspectives::create_perspective(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1670,7 +1745,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group this server's agent cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief."
+        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group the calling agent (the authenticated caller over HTTP, this server's own agent on stdio) cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief."
     )]
     async fn submit_ds_evidence(
         &self,
@@ -1680,7 +1755,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::ds::submit_ds_evidence(self, viewer, params).await
+        tools::ds::submit_ds_evidence(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1940,7 +2015,7 @@ impl EpiGraphMcpFull {
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        tools::matching::decide_match_candidate(self, viewer, params).await
+        tools::matching::decide_match_candidate(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1949,8 +2024,13 @@ impl EpiGraphMcpFull {
     async fn retire_match_candidate(
         &self,
         Parameters(params): Parameters<RetireMatchCandidateParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::matching::retire_match_candidate(self, params).await
+        // A viewer since batch H-b, for its principal: the retiring agent
+        // recorded on the candidate.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::matching::retire_match_candidate(self, viewer, params, auth).await
     }
 
     // ── Meta (1 tool) ──

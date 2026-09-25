@@ -23,6 +23,7 @@ async fn submit_claim_attaches_labels_when_provided(pool: PgPool) {
             labels: vec!["backlog".into(), "test-tag".into()],
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .unwrap();

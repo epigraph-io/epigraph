@@ -28,9 +28,13 @@ pub async fn memorize(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: MemorizeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    let agent_id = server.agent_id().await?;
+    // Author = the request's principal (batch H-b, D1); signer = this server.
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
     let agent_id_typed = AgentId::from_uuid(agent_id);
+    let signer_typed = AgentId::from_uuid(server.signer_agent_id().await?);
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
     let mut tags = params.tags.unwrap_or_default();
@@ -129,7 +133,7 @@ pub async fn memorize(
     // why claim + labels + Trace + Evidence + `update_trace_id` + the DS auto-wire
     // must share one author-stamped transaction, and why only the embedding stays
     // outside it.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, agent_id, "memorize").await?;
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, author, "memorize").await?;
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
@@ -175,8 +179,10 @@ pub async fn memorize(
             format!("Memory [{}] stored via MCP memorize tool", tags.join(", "))
         };
         let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
+        // `Evidence::agent_id` is `evidence.signer_id`: the SIGNER of the
+        // signature below, which is this server, not the author.
         let mut evidence = Evidence::new(
-            agent_id_typed,
+            signer_typed,
             pub_key,
             evidence_hash,
             EvidenceType::Testimony {

@@ -116,6 +116,19 @@ fn http_auth(agent_id: Option<Uuid>) -> AuthContext {
     }
 }
 
+/// The viewer `request_viewer` resolves for `auth`: the token's agent over
+/// HTTP, the public corpus otherwise (a stdio call ignores it for authorship,
+/// which is the server's own agent). Since batch H-b a write refuses a viewer
+/// whose principal is not the token's.
+async fn viewer_for(pool: &PgPool, auth: Option<&AuthContext>) -> epigraph_db::visibility::Viewer {
+    match auth.and_then(|a| a.agent_id) {
+        Some(agent) => epigraph_db::visibility::Viewer::resolve(pool, agent)
+            .await
+            .expect("the token agent's viewer"),
+        None => fixture::public_viewer(pool).await,
+    }
+}
+
 async fn supersede(
     server: &EpiGraphMcpFull,
     pool: &PgPool,
@@ -124,7 +137,7 @@ async fn supersede(
 ) -> Result<(), String> {
     supersede_claim(
         server,
-        &fixture::public_viewer(pool).await,
+        &viewer_for(pool, auth).await,
         SupersedeClaimParams {
             claim_id: target.to_string(),
             content: format!("replacement for {target}"),
@@ -212,7 +225,7 @@ async fn the_operators_http_principal_may_retire_and_patch_its_agents_claims(poo
     let c2 = own_claim(&pool, operated).await;
     patch_claim(
         &server,
-        &fixture::public_viewer(&pool).await,
+        &viewer_for(&pool, Some(&auth)).await,
         PatchClaimParams {
             claim_id: c2.to_string(),
             trace_id: None,
@@ -339,6 +352,7 @@ async fn submit_claim_from_an_operated_agent_is_owned_by_the_operator(pool: PgPo
             labels: Vec::new(),
             novelty_threshold: Some(0.0),
         },
+        None,
     )
     .await
     .expect("submit_claim");

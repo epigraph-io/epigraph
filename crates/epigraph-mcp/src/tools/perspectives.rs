@@ -17,7 +17,9 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// Create a new perspective (frame of discernment viewpoint).
 pub async fn create_perspective(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: CreatePerspectiveParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     if params.name.is_empty() || params.name.len() > 200 {
         return Err(invalid_params("name must be between 1 and 200 characters"));
@@ -31,7 +33,8 @@ pub async fn create_perspective(
     let owner_agent_id = if let Some(ref id) = params.owner_agent_id {
         Some(parse_uuid(id)?)
     } else {
-        Some(server.agent_id().await?)
+        // The caller (batch H-b, D1), not the shared server signer.
+        Some(server.write_identity(auth, viewer).await?.agent_id())
     };
 
     let frame_ids: Vec<uuid::Uuid> = params

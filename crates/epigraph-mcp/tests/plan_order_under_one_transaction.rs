@@ -144,6 +144,7 @@ async fn report_outcome_attributes_each_step_index_to_its_planned_step(pool: PgP
             quality: None,
             goal_text: None,
         },
+        None,
     )
     .await
     .expect("report_workflow_outcome");

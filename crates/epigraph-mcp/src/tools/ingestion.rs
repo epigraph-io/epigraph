@@ -154,6 +154,7 @@ pub async fn ingest_document(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: IngestDocumentParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let canonical = std::fs::canonicalize(&params.file_path)
         .map_err(|e| invalid_params(format!("invalid file path: {e}")))?;
@@ -200,7 +201,7 @@ pub async fn ingest_document(
         )
     })?;
 
-    preflight_write_authority(server, "ingest_document").await?;
+    preflight_write_authority(server, &viewer, "ingest_document", auth).await?;
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
     // parent's `agent_db_id` cache, `ScopedPool` and `privileged_pool` — the
@@ -215,8 +216,12 @@ pub async fn ingest_document(
     // live again -> `INSERT INTO claims`.
     let bg = server.clone();
     let doi_log = doi.clone();
+    // Owned, for the same `'static` reason as the viewer: the detached walk
+    // authors as the request's principal (batch H-b, D1), so it needs the
+    // request's token, not a borrow of it.
+    let auth = auth.cloned();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
+        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref()).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
                 doi = doi_log,
@@ -254,10 +259,13 @@ pub async fn ingest_document(
 /// server log and as the ABSENCE of the paper's `processed_by` edge.
 async fn preflight_write_authority(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     tool_name: &'static str,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<(), McpError> {
-    let agent_id = server.agent_id().await?;
-    let mut tx = begin_ingest_tx(server, agent_id, tool_name).await?;
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
+    let mut tx = begin_ingest_tx(server, author, tool_name).await?;
     // The OWNER group, not merely "some writable group": the same read-only
     // check the walk itself makes (`IngestTx::owner_decl`), so an author whose
     // personal membership is revoked or read-only is refused HERE, to the
@@ -277,6 +285,7 @@ pub async fn ingest_document_inline(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: IngestDocumentInlineParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
@@ -291,15 +300,19 @@ pub async fn ingest_document_inline(
         )
     })?;
 
-    preflight_write_authority(server, "ingest_document_inline").await?;
+    preflight_write_authority(server, &viewer, "ingest_document_inline", auth).await?;
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
     // `ingest_document` above for why a fresh `new_shared` revived revoked
     // memberships.
     let bg = server.clone();
     let doi_log = doi.clone();
+    // Owned, for the same `'static` reason as the viewer: the detached walk
+    // authors as the request's principal (batch H-b, D1), so it needs the
+    // request's token, not a borrow of it.
+    let auth = auth.cloned();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
+        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref()).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
                 doi = doi_log,
@@ -440,9 +453,11 @@ pub async fn check_already_ingested(
 /// or a boilerplate paragraph gets its own nodes.
 pub async fn ingest_document_spine(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: IngestDocumentSpineParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_ingest_document_spine(server, &params.extraction).await
+    do_ingest_document_spine(server, viewer, &params.extraction, auth).await
 }
 
 /// Core ingestion logic factored out so integration tests can drive a parsed
@@ -629,7 +644,7 @@ impl IngestTx<'_> {
 
 async fn begin_ingest_tx<'p>(
     server: &'p EpiGraphMcpFull,
-    agent_id: Uuid,
+    author: crate::write_identity::WriteIdentity,
     tool_name: &'static str,
 ) -> Result<IngestTx<'p>, McpError> {
     if server.scoped.is_none() {
@@ -646,7 +661,7 @@ async fn begin_ingest_tx<'p>(
         }
     }
     Ok(IngestTx::Stamped(
-        crate::claim_helper::begin_author_stamped_tx(server, agent_id, tool_name).await?,
+        crate::claim_helper::begin_author_stamped_tx(server, author, tool_name).await?,
     ))
 }
 
@@ -675,6 +690,7 @@ pub async fn do_ingest_document(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &DocumentExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     // D9 writer-side verbatim re-verification: when the extraction carries
     // `source_text`, every span-backed paragraph's stored `text` must equal the
@@ -691,8 +707,12 @@ pub async fn do_ingest_document(
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
-    let agent_id = server.agent_id().await?;
+    // Author = the request's principal (batch H-b, D1); signer = this server's
+    // key, recorded on evidence as its `signer_id` (see `Evidence::agent_id`).
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
     let agent_id_typed = AgentId::from_uuid(agent_id);
+    let signer_typed = AgentId::from_uuid(server.signer_agent_id().await?);
     let pub_key = server.signer.public_key();
 
     let paper_title = extraction.source.title.clone();
@@ -729,7 +749,7 @@ pub async fn do_ingest_document(
 
     // ── 2. ONE transaction for the whole walk, stamped from the INGESTING agent ──
     //
-    // Every claim below is authored by `server.agent_id()` and owned by that
+    // Every claim below is authored by the write identity and owned by that
     // agent's personal group (`decl`), so that agent's viewer is the one
     // migration 077's `WITH CHECK` asks about — the sibling-tool identity, which
     // here IS the row's author (contrast the workflow executor, which authors as
@@ -748,7 +768,7 @@ pub async fn do_ingest_document(
     // `papers` stays on the pool: it has no row-level security, and
     // `ensure_paper_node` already created the row synchronously before this
     // task was spawned, so the call above is an idempotent read of it.
-    let mut tx = begin_ingest_tx(server, agent_id, "ingest_document").await?;
+    let mut tx = begin_ingest_tx(server, author, "ingest_document").await?;
 
     // ── 3. Ensure author agents + agent --authored--> paper ──
     // Each author gets a deterministic ed25519 keypair via
@@ -957,7 +977,7 @@ pub async fn do_ingest_document(
             format!("Source: {paper_title} (DOI: {doi}). Passage: '{evidence_text}'");
         let evidence_hash = ContentHasher::hash(formatted_evidence.as_bytes());
         let mut evidence = Evidence::new(
-            agent_id_typed,
+            signer_typed,
             pub_key,
             evidence_hash,
             EvidenceType::Literature {
@@ -1133,58 +1153,57 @@ pub async fn do_ingest_document(
     //
     // On the unstamped pool this half was refused at `claim_frames` on BOTH
     // schema configurations, so `claims_ds_wired` was never non-zero there.
-    let (claims_ds_wired, ds_frame_id) =
-        match begin_ingest_tx(server, agent_id, "ingest_document_ds").await {
-            Ok(mut ds_tx) => {
-                for e in &wired_edges {
-                    ds_auto::auto_wire_edge_if_epistemic(
-                        &mut ds_tx,
-                        viewer,
-                        e.was_created,
-                        e.edge_id,
-                        e.source_id,
-                        &e.source_type,
-                        e.target_id,
-                        &e.target_type,
-                        &e.relationship,
-                        agent_id,
-                    )
-                    .await;
-                }
-                let wired = if ds_entries.is_empty() {
-                    (None, None)
-                } else {
-                    match ds_auto::auto_wire_ds_batch(&mut ds_tx, viewer, &ds_entries, agent_id)
-                        .await
-                    {
-                        Ok((fid, count)) => (Some(count), Some(fid.to_string())),
-                        Err(e) => {
-                            tracing::warn!("ds auto-wire batch failed: {e}");
-                            (None, None)
-                        }
-                    }
-                };
-                match ds_tx.commit().await {
-                    Ok(()) => wired,
+    let (claims_ds_wired, ds_frame_id) = match begin_ingest_tx(server, author, "ingest_document_ds")
+        .await
+    {
+        Ok(mut ds_tx) => {
+            for e in &wired_edges {
+                ds_auto::auto_wire_edge_if_epistemic(
+                    &mut ds_tx,
+                    viewer,
+                    e.was_created,
+                    e.edge_id,
+                    e.source_id,
+                    &e.source_type,
+                    e.target_id,
+                    &e.target_type,
+                    &e.relationship,
+                    agent_id,
+                )
+                .await;
+            }
+            let wired = if ds_entries.is_empty() {
+                (None, None)
+            } else {
+                match ds_auto::auto_wire_ds_batch(&mut ds_tx, viewer, &ds_entries, agent_id).await {
+                    Ok((fid, count)) => (Some(count), Some(fid.to_string())),
                     Err(e) => {
-                        tracing::warn!(
-                            paper_id = %paper_id,
-                            "ingest_document ds wiring could not commit: {e}. The document is \
-                             stored; its atoms carry no BBA until a recompute reaches them"
-                        );
+                        tracing::warn!("ds auto-wire batch failed: {e}");
                         (None, None)
                     }
                 }
+            };
+            match ds_tx.commit().await {
+                Ok(()) => wired,
+                Err(e) => {
+                    tracing::warn!(
+                        paper_id = %paper_id,
+                        "ingest_document ds wiring could not commit: {e}. The document is \
+                         stored; its atoms carry no BBA until a recompute reaches them"
+                    );
+                    (None, None)
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    paper_id = %paper_id,
-                    "ingest_document ds wiring skipped: {}. The document is stored and intact",
-                    e.message
-                );
-                (None, None)
-            }
-        };
+        }
+        Err(e) => {
+            tracing::warn!(
+                paper_id = %paper_id,
+                "ingest_document ds wiring skipped: {}. The document is stored and intact",
+                e.message
+            );
+            (None, None)
+        }
+    };
 
     // ── 8. Detach embeddings so the MCP response returns immediately after commit ──
     // All DB writes are done. Embed in the background so the caller is not blocked
@@ -1529,7 +1548,9 @@ const fn level_label(level: u8) -> &'static str {
 #[allow(clippy::too_many_lines)]
 pub async fn do_ingest_document_spine(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     extraction: &DocumentExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
         .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
@@ -1542,8 +1563,12 @@ pub async fn do_ingest_document_spine(
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
-    let agent_id = server.agent_id().await?;
+    // Author = the request's principal (batch H-b, D1); signer = this server's
+    // key, recorded on evidence as its `signer_id` (see `Evidence::agent_id`).
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
     let agent_id_typed = AgentId::from_uuid(agent_id);
+    let signer_typed = AgentId::from_uuid(server.signer_agent_id().await?);
     let pub_key = server.signer.public_key();
 
     let paper_title = extraction.source.title.clone();
@@ -1596,7 +1621,7 @@ pub async fn do_ingest_document_spine(
     // edges had committed, and the owner-group read was blind and minted on
     // every call. This path is synchronous, so the refusal now reaches the
     // caller, and it leaves nothing behind.
-    let mut tx = begin_ingest_tx(server, agent_id, "ingest_document_spine").await?;
+    let mut tx = begin_ingest_tx(server, author, "ingest_document_spine").await?;
 
     // ── 2. Ensure author agents + authored edges ──
     let mut author_responses = Vec::new();
@@ -1785,7 +1810,7 @@ pub async fn do_ingest_document_spine(
             format!("Source: {paper_title} (DOI: {doi}). Passage: '{evidence_text}'");
         let evidence_hash = ContentHasher::hash(formatted_evidence.as_bytes());
         let mut evidence = Evidence::new(
-            agent_id_typed,
+            signer_typed,
             pub_key,
             evidence_hash,
             EvidenceType::Literature {

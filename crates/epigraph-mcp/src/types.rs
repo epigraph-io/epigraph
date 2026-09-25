@@ -1726,7 +1726,7 @@ pub struct StructureSourceParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkHierarchicalParams {
     #[schemars(
-        description = "UUID of the source claim. Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused. Either refusal writes nothing."
+        description = "UUID of the source claim. Written with YOUR agent's authority (the authenticated caller over HTTP, this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused. Either refusal writes nothing."
     )]
     pub source_claim_id: String,
 
@@ -1772,7 +1772,7 @@ pub struct LinkHierarchicalResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchEdgeParams {
     #[schemars(
-        description = "UUID of the edge to patch. Must be an edge YOU can read and this server's agent can write; otherwise (for example an edge touching another group's private claim) it reports not found and nothing is written."
+        description = "UUID of the edge to patch. Must be an edge YOU can read and your agent can write; otherwise (for example an edge touching another group's private claim) it reports not found and nothing is written."
     )]
     pub edge_id: String,
 
@@ -1812,7 +1812,7 @@ pub struct PatchEdgeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteEdgeParams {
     #[schemars(
-        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge YOU can read and this server's agent can write; otherwise it reports not found and nothing is written."
+        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge YOU can read and your agent can write; otherwise it reports not found and nothing is written."
     )]
     pub edge_id: String,
 }
@@ -1841,7 +1841,7 @@ pub struct DeleteEdgeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkAlternativeParams {
     #[schemars(
-        description = "UUID of the first competing claim. Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused, with nothing written."
+        description = "UUID of the first competing claim. Written with YOUR agent's authority (the authenticated caller over HTTP, this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
     )]
     pub claim_a: String,
 
@@ -1887,12 +1887,12 @@ pub struct LinkAlternativeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkEpistemicParams {
     #[schemars(
-        description = "UUID of the source claim (the evidence / asserting side). Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused, with nothing written."
+        description = "UUID of the source claim (the evidence / asserting side). Written with YOUR agent's authority (the authenticated caller over HTTP, this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
     )]
     pub source_claim_id: String,
 
     #[schemars(
-        description = "UUID of the target claim (the side whose belief is recomputed). Same authority rule as source_claim_id for the edge itself. A PUBLIC target owned by a group this server's agent cannot write still gets the edge, but its belief is not moved: the response reports belief_wired=false."
+        description = "UUID of the target claim (the side whose belief is recomputed). Same authority rule as source_claim_id for the edge itself. A PUBLIC target owned by a group your agent cannot write still gets the edge, but its belief is not moved: the response reports belief_wired=false."
     )]
     pub target_claim_id: String,
 
@@ -1929,7 +1929,7 @@ pub struct LinkEpistemicBelief {
 /// BBA yet and its source has since gained belief. It is `false` when no belief
 /// moved: the edge was already wired, the source has no belief interval, the
 /// transfer was vacuous, the relationship is structural, or the wire was
-/// refused or failed (e.g. a target owned by a group this server's agent cannot
+/// refused or failed (e.g. a target owned by a group the calling agent cannot
 /// write) — the edge row stays either way. `target_belief` is a best-effort read of the
 /// target's cached DS columns after the recompute (`None` if the target carries
 /// no belief yet or the read failed).
@@ -2324,7 +2324,7 @@ pub struct UpdateLabelsParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchClaimParams {
     #[schemars(
-        description = "UUID of the claim to patch. Must be a claim you can read (otherwise: not found) and one owned by a group this server's agent can write (otherwise: refused, nothing written). When you are authenticated (HTTP) you must also own it or hold claims:admin."
+        description = "UUID of the claim to patch. Must be a claim you can read (otherwise: not found) and one owned by a group your agent can write (otherwise: refused, nothing written). When you are authenticated (HTTP) you must also own it or hold claims:admin."
     )]
     pub claim_id: String,
     #[schemars(description = "New trace_id (must reference an existing reasoning_traces row)")]
@@ -2588,7 +2588,7 @@ pub struct CreatePerspectiveParams {
     pub description: Option<String>,
 
     #[schemars(
-        description = "UUID of the agent who owns this perspective (defaults to current agent)"
+        description = "UUID of the agent who owns this perspective (defaults to the calling agent: the authenticated caller over HTTP, this server's own agent on stdio)"
     )]
     pub owner_agent_id: Option<String>,
 

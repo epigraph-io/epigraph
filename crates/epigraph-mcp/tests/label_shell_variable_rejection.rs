@@ -58,6 +58,7 @@ async fn submit_claim_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool)
             labels: vec!["fine-label".into(), BAD_LABEL.into()],
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .expect_err("an unexpanded shell variable must be refused, not stored");
@@ -110,6 +111,7 @@ async fn submit_claim_still_accepts_the_live_label_vocabulary(pool: PgPool) {
             ],
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .expect("real labels must keep flowing through");
@@ -144,6 +146,7 @@ async fn memorize_rejects_unexpanded_tag_and_writes_no_claim(pool: PgPool) {
             tags: Some(vec!["claude-memory".into(), BAD_LABEL.into()]),
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .expect_err("memorize must not report success while dropping every tag");
@@ -197,6 +200,7 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                 },
             ],
         },
+        None,
     )
     .await
     .expect("batch call itself succeeds; per-entry failures are reported in the payload");
@@ -293,6 +297,7 @@ async fn update_with_evidence_rejects_unexpanded_label_before_writing_evidence(p
             strength: 0.7,
             labels: vec![BAD_LABEL.into()],
         },
+        None,
     )
     .await
     .expect_err("an unexpanded shell variable must be refused");
@@ -360,9 +365,10 @@ async fn ingest_document_rejects_an_unexpanded_doi_before_writing_anything(pool:
     let extraction: epigraph_ingest::schema::DocumentExtraction =
         serde_json::from_str(fixture).expect("fixture parses");
 
-    let err = epigraph_mcp::tools::ingestion::do_ingest_document(&server, &viewer, &extraction)
-        .await
-        .expect_err("an unexpandable DOI must be refused");
+    let err =
+        epigraph_mcp::tools::ingestion::do_ingest_document(&server, &viewer, &extraction, None)
+            .await
+            .expect_err("an unexpandable DOI must be refused");
 
     // Nothing may have landed: no paper row, no claims.
     let papers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers")

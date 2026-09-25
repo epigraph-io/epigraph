@@ -105,7 +105,7 @@ async fn evolve_step_supersedes_flips_head(pool: PgPool) {
         rationale: Some("clarified wording".to_string()),
         level: Some(2),
     };
-    let _result = evolve_step(&server, &viewer, params)
+    let _result = evolve_step(&server, &viewer, params, None)
         .await
         .expect("evolve_step");
 
@@ -177,7 +177,7 @@ async fn evolve_step_addresses_by_canonical_name_and_index(pool: PgPool) {
         rationale: None,
         level: Some(2),
     };
-    evolve_step(&server, &viewer, params)
+    evolve_step(&server, &viewer, params, None)
         .await
         .expect("name-mode evolve_step must resolve and succeed");
 
@@ -219,6 +219,7 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
             rationale: None,
             level: Some(2),
         },
+        None,
     )
     .await
     .expect("revises A");
@@ -237,6 +238,7 @@ async fn evolve_step_revises_produces_parallel_heads(pool: PgPool) {
             rationale: None,
             level: Some(2),
         },
+        None,
     )
     .await
     .expect("revises B");
@@ -272,6 +274,7 @@ async fn evolve_step_rejects_bad_edge_type(pool: PgPool) {
             rationale: None,
             level: Some(2),
         },
+        None,
     )
     .await;
     assert!(result.is_err(), "BOGUS edge_type must error");
@@ -299,6 +302,7 @@ async fn evolve_step_rejects_level_0_or_1(pool: PgPool) {
                 rationale: None,
                 level: Some(bad_level),
             },
+            None,
         )
         .await;
         assert!(result.is_err(), "level={bad_level} must error");
@@ -386,6 +390,7 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
             rationale: None,
             level: Some(2),
         },
+        None,
     )
     .await
     .expect("evolve s0");
@@ -412,6 +417,7 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
             rationale: None,
             level: Some(2),
         },
+        None,
     )
     .await
     .expect("revises s1 A");
@@ -428,6 +434,7 @@ async fn find_workflow_hierarchical_resolve_walks_lineage(pool: PgPool) {
             rationale: None,
             level: Some(2),
         },
+        None,
     )
     .await
     .expect("revises s1 B");

@@ -21,7 +21,7 @@ mod fixture;
 
 mod common;
 
-use common::{admin_auth, build_scoped_test_server, seed_claim, seed_claim_with_belief};
+use common::{build_scoped_test_server, seed_claim, seed_claim_with_belief};
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
 use epigraph_mcp::tools::supersede::{mark_duplicate, supersede_claim};
 use epigraph_mcp::types::{LinkEpistemicParams, MarkDuplicateParams, SupersedeClaimParams};
@@ -55,6 +55,7 @@ async fn wire_supports(
             relationship: "supports".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("link_epistemic supports");
@@ -82,16 +83,17 @@ async fn supersede_reports_the_downstream_target_it_repaired(pool: PgPool) {
 
     // The enumeration the proposal sketched, run here to prove it is a trap:
     // after the commit, nothing outgoing is still sourced at the retracted id.
+    let (auth, admin_viewer) = common::server_admin(&server).await;
     let result = supersede_claim(
         &server,
-        &viewer,
+        &admin_viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
             truth_value: 0.5,
             reason: "observability fixture".to_string(),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("supersede_claim succeeds");
@@ -175,16 +177,17 @@ async fn sole_supporter_retraction_is_reported_as_unbacked_not_as_nothing_to_do(
     let b = seed_claim(&pool, "sole-supported claim B", 0.5).await;
     wire_supports(&server, &viewer, a, b).await;
 
+    let (auth, admin_viewer) = common::server_admin(&server).await;
     let result = supersede_claim(
         &server,
-        &viewer,
+        &admin_viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
             truth_value: 0.5,
             reason: "unbacked reporting fixture".to_string(),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("supersede_claim succeeds");
@@ -240,16 +243,17 @@ async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
     .await
     .expect("corrupt surviving BBA");
 
+    let (auth, admin_viewer) = common::server_admin(&server).await;
     let result = supersede_claim(
         &server,
-        &viewer,
+        &admin_viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
             truth_value: 0.5,
             reason: "error reporting fixture".to_string(),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("a cascade failure must NOT fail the already-committed supersede");
@@ -283,15 +287,16 @@ async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
     let u = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
     wire_supports(&server, &viewer, u, dup).await;
 
+    let (auth, admin_viewer) = common::server_admin(&server).await;
     let result = mark_duplicate(
         &server,
-        &viewer,
+        &admin_viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
             reason: None,
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("mark_duplicate succeeds");

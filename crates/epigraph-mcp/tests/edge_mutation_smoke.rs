@@ -113,6 +113,7 @@ async fn patch_shallow_merges_properties_and_retires(pool: PgPool) {
             valid_to: None,
             properties: Some(serde_json::json!({"overwrite": "new", "added": 1})),
         },
+        None,
     )
     .await
     .expect("properties-only patch succeeds");
@@ -163,6 +164,7 @@ async fn patch_shallow_merges_properties_and_retires(pool: PgPool) {
             valid_to: Some("now".to_string()),
             properties: None,
         },
+        None,
     )
     .await
     .expect("retirement patch succeeds");
@@ -232,6 +234,7 @@ async fn patch_rejects_non_object_properties_without_corrupting_the_column(pool:
                 valid_to: None,
                 properties: Some(bad.clone()),
             },
+            None,
         )
         .await
         .unwrap_err_or_panic(&format!("non-object properties {bad} must be rejected"));
@@ -258,6 +261,7 @@ async fn patch_rejects_empty_body_and_unknown_edge(pool: PgPool) {
             valid_to: None,
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("empty patch body must be rejected");
@@ -274,6 +278,7 @@ async fn patch_rejects_empty_body_and_unknown_edge(pool: PgPool) {
             valid_to: Some("now".to_string()),
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("patching a nonexistent edge must fail");
@@ -302,6 +307,7 @@ async fn delete_removes_only_the_targeted_edge(pool: PgPool) {
         DeleteEdgeParams {
             edge_id: doomed.to_string(),
         },
+        None,
     )
     .await
     .expect("delete succeeds");
@@ -342,6 +348,7 @@ async fn delete_removes_only_the_targeted_edge(pool: PgPool) {
         DeleteEdgeParams {
             edge_id: doomed.to_string(),
         },
+        None,
     )
     .await
     .expect_err("deleting a nonexistent edge must fail");
@@ -392,6 +399,7 @@ async fn an_edge_the_caller_cannot_read_is_not_patched_or_retracted(pool: PgPool
             valid_to: Some("now".to_string()),
             properties: Some(serde_json::json!({"gate": 1})),
         },
+        None,
     )
     .await
     .expect_err("patch_edge on an edge the caller cannot read must be refused");
@@ -412,6 +420,7 @@ async fn an_edge_the_caller_cannot_read_is_not_patched_or_retracted(pool: PgPool
         DeleteEdgeParams {
             edge_id: edge.to_string(),
         },
+        None,
     )
     .await
     .expect_err("delete_edge on an edge the caller cannot read must be refused");
@@ -431,6 +440,7 @@ async fn an_edge_the_caller_cannot_read_is_not_patched_or_retracted(pool: PgPool
         DeleteEdgeParams {
             edge_id: edge.to_string(),
         },
+        None,
     )
     .await
     .expect("a caller that can read the edge retracts it");

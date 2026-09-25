@@ -29,8 +29,10 @@ pub async fn consolidate_claims(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: ConsolidateClaimsParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    let acting_agent_id = server.agent_id().await?;
+    let acting = server.write_identity(auth, viewer).await?;
+    let acting_agent_id = acting.agent_id();
 
     let source_ids = params
         .source_claim_ids
@@ -81,8 +83,7 @@ pub async fn consolidate_claims(
     // PUBLIC foreign source is visible but its retirement UPDATE fails `WITH
     // CHECK`, which aborts the whole transaction — the merged row included.
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, acting_agent_id, "consolidate_claims")
-            .await?;
+        crate::claim_helper::begin_author_stamped_tx(server, acting, "consolidate_claims").await?;
     let result = ClaimRepository::consolidate_conn(
         &mut tx,
         &source_ids,

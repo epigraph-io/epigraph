@@ -100,14 +100,22 @@ async fn author_write_authority<'p>(
 /// Begin the ONE transaction an MCP submission runs in, stamped from the
 /// **author's** viewer.
 ///
-/// # Why the author's viewer and not the caller's
+/// # Whose viewer: the author's, which since batch H-b IS the caller's
 ///
-/// `submit_claim` and `memorize` author as `server.agent_id()` — the MCP
-/// process's own agent — not as the HTTP principal on the bearer token. The rows
-/// they write therefore inherit `owner_group_id` from the AUTHOR's personal
-/// group, and migration 077's `WITH CHECK` on every claim-derived table asks
-/// `owner_group_id = ANY(epigraph_writable_groups())`. Stamping the caller's
-/// writable set would answer a question nothing asked and refuse the write.
+/// The author is a [`crate::write_identity::WriteIdentity`], which only
+/// `EpiGraphMcpFull::write_identity` constructs: the principal of the request's
+/// own viewer, i.e. `auth.agent_id` over HTTP and the server's own agent on
+/// stdio. Taking the newtype rather than a bare `Uuid` is the ratchet: no tool
+/// can stamp from an agent it picked itself, and the compiler enumerates every
+/// site. Before batch H-b every tool passed `server.agent_id()` here whatever
+/// the transport, so an authenticated caller's writes were authored and stamped
+/// as the shared server signer (#505 F5).
+///
+/// The rows a submission writes inherit `owner_group_id` from the AUTHOR
+/// (`default_decl_for_author`: the author's personal group, or its operator's
+/// for an operated agent), and migration 077's `WITH CHECK` on every
+/// claim-derived table asks `owner_group_id = ANY(epigraph_writable_groups())`,
+/// so the stamp must be the author's writable set.
 /// `epigraph-db/tests/rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`
 /// is the pin: its arm 3 stamps the author's group and succeeds, its arm 4
 /// stamps a *different* real group and is still refused.
@@ -181,9 +189,10 @@ async fn author_write_authority<'p>(
 ///   that viewer has no writable group, or if `BEGIN` / the GUC stamp fails.
 pub async fn begin_author_stamped_tx<'p>(
     server: &'p EpiGraphMcpFull,
-    author_agent_id: uuid::Uuid,
+    author: crate::write_identity::WriteIdentity,
     tool_name: &'static str,
 ) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
+    let author_agent_id = author.agent_id();
     let (scoped, author_viewer) = author_write_authority(
         server.scoped.as_ref(),
         &server.pool,

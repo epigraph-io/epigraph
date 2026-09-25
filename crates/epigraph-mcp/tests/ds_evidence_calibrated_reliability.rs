@@ -123,9 +123,10 @@ async fn evidence_type_testimonial_diverges_from_no_evidence_type(pool: PgPool) 
         .expect("binary frame");
 
     let claim_a = insert_claim(&pool, agent, &format!("calib-a-{}", Uuid::new_v4())).await;
-    let out_a = tools::ds::submit_ds_evidence(&server, &viewer, base_params(claim_a, frame_id))
-        .await
-        .expect("submit_ds_evidence (no evidence_type)");
+    let out_a =
+        tools::ds::submit_ds_evidence(&server, &viewer, base_params(claim_a, frame_id), None)
+            .await
+            .expect("submit_ds_evidence (no evidence_type)");
     let pignistic_a = result_json(out_a)["pignistic_prob"]
         .as_f64()
         .expect("pignistic_prob is a number");
@@ -133,7 +134,7 @@ async fn evidence_type_testimonial_diverges_from_no_evidence_type(pool: PgPool) 
     let claim_b = insert_claim(&pool, agent, &format!("calib-b-{}", Uuid::new_v4())).await;
     let mut params_b = base_params(claim_b, frame_id);
     params_b.evidence_type = Some("testimonial".to_string());
-    let out_b = tools::ds::submit_ds_evidence(&server, &viewer, params_b)
+    let out_b = tools::ds::submit_ds_evidence(&server, &viewer, params_b, None)
         .await
         .expect("submit_ds_evidence (evidence_type=testimonial)");
     let pignistic_b = result_json(out_b)["pignistic_prob"]
@@ -173,7 +174,7 @@ async fn omitting_evidence_type_is_byte_identical_to_legacy_behavior(pool: PgPoo
 
     let mut params = base_params(claim, frame_id);
     params.reliability = Some(0.8);
-    let out = tools::ds::submit_ds_evidence(&server, &viewer, params)
+    let out = tools::ds::submit_ds_evidence(&server, &viewer, params, None)
         .await
         .expect("submit_ds_evidence");
     let json = result_json(out);

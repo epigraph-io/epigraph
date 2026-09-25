@@ -57,6 +57,7 @@ async fn update_with_evidence_adds_labels_without_dropping_existing(pool: PgPool
             strength: 0.7,
             labels: vec!["norcal-rfp-2026-07-05".into()],
         },
+        None,
     )
     .await;
     assert!(result.is_ok(), "update_with_evidence failed: {result:?}");

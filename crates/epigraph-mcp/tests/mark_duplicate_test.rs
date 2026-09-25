@@ -7,15 +7,14 @@ use common::*;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_marks_dup_only(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let canonical = seed_claim(&pool, "canonical", 0.5).await;
     let dup = seed_claim(&pool, "duplicate", 0.5).await;
     let server = build_test_server(pool.clone());
-    let auth = admin_auth();
+    let (auth, admin_viewer) = common::server_admin(&server).await;
 
     epigraph_mcp::tools::supersede::mark_duplicate(
         &server,
-        &viewer,
+        &admin_viewer,
         epigraph_mcp::types::MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),

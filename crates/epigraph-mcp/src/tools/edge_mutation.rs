@@ -36,7 +36,7 @@
 //!
 //! # Tenancy
 //!
-//! Both mutations run on ONE transaction stamped from the MCP server's own
+//! Both mutations run on ONE transaction stamped from the write identity (the caller over HTTP, the server's own
 //! agent (`claim_helper::begin_author_stamped_tx`), with their events on the
 //! same transaction. WRITE authority is the server agent's, as for every other
 //! MCP write. READ authority is the CALLER's: before either write, the edge is
@@ -122,8 +122,9 @@ pub async fn patch_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_patch_edge(server, viewer, params).await
+    do_patch_edge(server, viewer, params, auth).await
 }
 
 /// The caller-read gate both tools apply, on the write transaction.
@@ -149,6 +150,7 @@ pub async fn do_patch_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
 
@@ -168,7 +170,7 @@ pub async fn do_patch_edge(
 
     let valid_to = resolve_valid_to(params.valid_to.as_deref())?;
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT: the UPDATE and
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1): the UPDATE and
     // both events.
     //
     // The UPDATE used to run on the unstamped pool. `edges_tenancy` then let it
@@ -186,9 +188,9 @@ pub async fn do_patch_edge(
     // UPDATE. They now ride the UPDATE's transaction, each SAVEPOINT-wrapped
     // inside `publish_or_log_conn`: a refused event cannot abort the patch, and
     // no `edge.updated` is emitted for a patch that was rolled back.
-    let actor_id = server.agent_id().await?;
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "patch_edge").await?;
+    let actor = server.write_identity(auth, viewer).await?;
+    let actor_id = actor.agent_id();
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, actor, "patch_edge").await?;
     require_visible_edge(&mut tx, viewer, edge_id).await?;
     let updated = EdgeRepository::update_valid_to_and_properties(
         &mut *tx,
@@ -249,8 +251,9 @@ pub async fn delete_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_delete_edge(server, viewer, params).await
+    do_delete_edge(server, viewer, params, auth).await
 }
 
 /// Core logic factored out for direct test invocation (see `do_patch_edge`).
@@ -258,18 +261,19 @@ pub async fn do_delete_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT: the retraction
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1): the retraction
     // and its event. Same reasoning as `do_patch_edge`. On the unstamped pool
     // only a public, world-owned edge was retractable on a cleanly-migrated
     // schema. Stamped, the server agent's own group's edges are too, and an edge
     // in another agent's private group still reports "not found" with nothing
     // written (#374 owns whether it should).
-    let actor_id = server.agent_id().await?;
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "delete_edge").await?;
+    let actor = server.write_identity(auth, viewer).await?;
+    let actor_id = actor.agent_id();
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, actor, "delete_edge").await?;
     require_visible_edge(&mut tx, viewer, edge_id).await?;
 
     // `EdgeRepository::delete` reports absence as `Ok(false)`, not

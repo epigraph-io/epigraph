@@ -185,6 +185,7 @@ async fn a_first_step_ds_failure_is_an_error_and_commits_nothing(pool: PgPool) {
             "Corroboration submitted while DS wiring is refused.",
             &["run-tag-0923"],
         ),
+        None,
     )
     .await
     .expect_err(
@@ -236,6 +237,7 @@ async fn a_successful_ds_wire_reports_belief_wired_true_with_its_measures(pool: 
                 "Corroboration submitted with DS wiring available.",
                 &["run-tag-0923"],
             ),
+            None,
         )
         .await
         .expect("update_with_evidence on a wired path"),
@@ -323,6 +325,7 @@ async fn a_late_step_ds_failure_rolls_back_the_bba_it_had_already_written(pool: 
             "Corroboration whose cached-belief write is refused.",
             &["run-tag-late"],
         ),
+        None,
     )
     .await
     .expect_err("a late-step DS failure is a returned error too");
@@ -361,6 +364,7 @@ async fn after_a_ds_failure_an_identical_resubmit_lands_exactly_once(pool: PgPoo
         &server,
         &viewer,
         params(claim_id, wording, &[]),
+        None,
     )
     .await
     .expect_err("the first call's DS wire is refused");
@@ -381,6 +385,7 @@ async fn after_a_ds_failure_an_identical_resubmit_lands_exactly_once(pool: PgPoo
             &server,
             &viewer,
             params(claim_id, wording, &[]),
+            None,
         )
         .await
         .expect(

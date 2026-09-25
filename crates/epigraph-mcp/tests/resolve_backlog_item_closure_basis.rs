@@ -285,6 +285,7 @@ async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &P
             labels: vec![],
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .expect("bootstrap submit_claim");

@@ -15,7 +15,7 @@ pub async fn supersede_claim(
     let old = parse_uuid(&params.claim_id)?;
     let old_claim_id = ClaimId::from_uuid(old);
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT, for the gate read
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1), for the gate read
     // and the supersession, the same construction as `patch_claim` and
     // `update_labels`.
     //
@@ -29,12 +29,9 @@ pub async fn supersede_claim(
     // supersede under ITS OWN stamp rather than the server agent's is the
     // authenticated-MCP stamping question recorded as an R3 blocker in
     // scripts/e2e/README.md, not this conversion's.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(
-        server,
-        server.agent_id().await?,
-        "supersede_claim",
-    )
-    .await?;
+    let caller = server.write_identity(auth, viewer).await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, caller, "supersede_claim").await?;
 
     // Per-resource ownership check: only the claim's author or a
     // claims:admin token holder may supersede it. The read is the CALLER's,
@@ -43,7 +40,8 @@ pub async fn supersede_claim(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {} not found", old)))?;
-    crate::tools::claims::require_owner_or_admin(server, auth, existing.agent_id.as_uuid()).await?;
+    crate::tools::claims::require_owner_or_admin(server, auth, caller, existing.agent_id.as_uuid())
+        .await?;
 
     let truth = TruthValue::clamped(params.truth_value);
     let (new_id, old_id) = ClaimRepository::supersede_conn(
@@ -110,6 +108,7 @@ pub async fn mark_duplicate(
     let dup = parse_uuid(&params.claim_id)?;
     let canon = parse_uuid(&params.canonical_id)?;
     let dup_claim_id = ClaimId::from_uuid(dup);
+    let caller = server.write_identity(auth, viewer).await?;
 
     // Per-resource ownership check: only the duplicate claim's author or a
     // claims:admin token holder may mark it as a duplicate.
@@ -117,8 +116,13 @@ pub async fn mark_duplicate(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {} not found", dup)))?;
-    crate::tools::claims::require_owner_or_admin(server, auth, dup_claim.agent_id.as_uuid())
-        .await?;
+    crate::tools::claims::require_owner_or_admin(
+        server,
+        auth,
+        caller,
+        dup_claim.agent_id.as_uuid(),
+    )
+    .await?;
 
     // Dedup repairs the derived-record layer inside its own transaction
     // (orphaned + stranded edge-factor BBAs) and hands back what still has to
