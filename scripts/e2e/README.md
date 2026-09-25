@@ -82,8 +82,9 @@ precisely why production admits writes a clean schema refuses.
 | `probe-embed.sh <binary> <label> <a\|b>` | The `McpEmbedder::embed_and_store` callers that embed **executor-authored** claims (`store_workflow`, `add_step`) — the arms that distinguish *stamped* from *stamped from the right author*. |
 | `probe-workflow.sh <binary> <label> <a\|b\|b2a>` | `deprecate_workflow` and `report_workflow_outcome` on their own populations, hierarchical **and** legacy-flat, in both ownership shapes. |
 | `probe-unit-e.sh <binary> <label> <a\|b>` | The R3 gate's remaining tools: `ingest_workflow` (with level-3 atoms), `improve_workflow_hierarchy`, `delete_step`, `link_epistemic`'s belief wiring, `consolidate_claims` (own and foreign sources), `ingest_document_inline` (fresh, re-ingest, converged-foreign-atom) and `ingest_document_spine`, plus the authority arms: the synchronous ingest PREFLIGHT, and a REVOKED / READER ingest-system membership that must not be revived or promoted. Also the REGISTER arm the residual-register reasons cite, and the REVIEW arms: plan order under one transaction (`report_workflow_outcome` attribution), a SECOND `store_workflow` without truncating, transactional event timestamps, a hidden axis frame inside the DS transaction, and a server agent revoked in its PERSONAL group but live in a team group (warm session, fresh MCP session, and a restarted process — each asserted PASS/FAIL: refused, still revoked, +0 claims). Batch F adds the RECALL arm (#493): a recall by a revoked principal must leave it revoked, and a live member's recall must still answer. |
-| `probe-batch-h.sh <binary> <label> <a\|b> [arm ...]` | The arms that need **group-private** rows, which no other script seeds: `patch_claim`, the five edge tools, `resolve_backlog_item` (public and private basis, plus an injected mid-call refusal), `submit_claim`'s DS wiring (plus an injected BBA refusal), and the three maintenance tools under three server configurations (`MAINTENANCE_DATABASE_URL` unset, set to the app login, set to `E2E_MAINT_DSN`). Every case runs on an OWN-group row, which a correctly stamped write must land, and a FOREIGN-group row, which must fail loudly and write nothing on config A. Needs `jq`. |
-| `probe-http-labels.sh <server binary> <label> <a\|b>` | The one **HTTP** arm: `PATCH /api/v1/claims/:id/labels` on the real `epigraph-api` `server` binary, connected as `E2E_APP_DSN`, with HS256 tokens minted per run under a random secret. Callers OWNER / ADMIN (`claims:admin`) / PEER against own-public, own-private, another agent's public, foreign-private and world-owned rows. Prints the status and whether the label is on the row, read back through the SU DSN. Needs `python3`. |
+| `probe-batch-h.sh <binary> <label> <a\|b> [arm ...]` | The arms that need **group-private** rows, which no other script seeds: `patch_claim`, the five edge tools, `resolve_backlog_item` (public and private basis, plus an injected mid-call refusal), `submit_claim`'s DS wiring (plus an injected BBA refusal), `supersede_claim`, `theme_cluster` (all-or-nothing, with a pre-existing theme), and the three maintenance tools under four server configurations (`MAINTENANCE_DATABASE_URL` unset, set to the app login, set to `E2E_MAINT_DSN`, and unset with a bypass-capable APPLICATION DSN), plus `maint_auth`: the same tools over authenticated HTTP (`--jwt-secret`, secret random per run) with a `claims:write` and a `claims:admin` bearer. Every case runs on an OWN-group row, which a correctly stamped write must land, and a FOREIGN-group row, which must fail loudly and write nothing on config A. Needs `jq`. |
+| `probe-http-labels.sh <server binary> <label> <a\|b>` | **HTTP**: `PATCH /api/v1/claims/:id/labels` on the real `epigraph-api` `server` binary, connected as `E2E_APP_DSN`, with HS256 tokens minted per run under a random secret. Callers OWNER / ADMIN (`claims:admin`) / PEER / RADMIN (`claims:admin`, a READER of the team group) against own-public, own-private, another agent's public, foreign-private, world-owned and team rows. Prints the status and whether the label is on the row, read back through the SU DSN. Needs `python3`. |
+| `probe-http-writes.sh <server binary> <label> <a\|b> [arm ...]` | **HTTP**: the claim writers batch H-a stamped — `supersede`, `DELETE /workflows/:id` and `/workflows/:id/outcome` on legacy flat workflow claims, `bp/propagate` with `apply_updates`, `themes/create-with-centroid` — for an owner, an admin and a peer, printing the status AND the rows read back (is_current, truth, counters, executions, BetP, themes). Needs `python3`. |
 | `embed-verdict.sh` | How many committed claims carry a vector. |
 | `drive.sh <binary> <label> <a\|b>` | `set-config` + `run-e2e` + the embedding verdict, in one call. |
 | `set-config.sh a\|b` | Switches the schema configuration. Reads `helper.sql` and `fn2.sql`. |
@@ -179,92 +180,163 @@ site that hit them; they are collected here because they generalise.
    baseline with a separate `CARGO_TARGET_DIR`, and check
    `strings <binary> | grep crates/epigraph-engine` names the tree you meant.
 
-## Measured: batch H (the R3 prerequisites), base a3fbc4ce vs branch tip
+## Measured: batch H-a (the R3 prerequisites) at the revised tip
 
-Every script in this directory was run on both configurations, with the base
-binary (built from `a3fbc4ce` in the same worktree) and the tip binary.
+Every script in this directory was run on both configurations with the revised
+tip's binaries, built in one worktree, and with the pushed tip before the
+revision (`80398b7a`). Test cluster only, as a role with `rolbypassrls = false`.
 **drive, probe-tools, probe-embed, probe-workflow (a, b, b2a) and probe-unit-e
 produced the same verdicts and row counts for both binaries.** Their only
-differences are log lines and run-to-run noise (agent counts, a similarity of
-0.99999 vs 1.0), so nothing previously working regressed. The per-tool table
-below is `probe-batch-h.sh`, whose group-private rows are what discriminate.
-"own" = the server agent's personal group, "foreign" = a team group it is not
-in. Row counts are the database's, not the response's.
+differences are log lines and run-to-run noise (agent and frame counts, a
+similarity of 0.9999995 vs 1.0, and which revoked-membership warning a run
+logged, which depends on agent rows that `TRUNCATE` does not clear).
 
-"Tip" in the table below was first `0dc69ab3`. After the `PATCH /labels`
-conversion and the `types.rs` field-doc commit, drive, probe-tools and
-probe-batch-h were re-run on A and B with the new tip's MCP binary, and every
-verdict and row count in the table held. The only MCP change after `0dc69ab3`
-is schemars description text, so probe-embed, probe-workflow and probe-unit-e
-were not re-run; their last run is at `0dc69ab3`.
+The tables below are the discriminating scripts. "own" = the server agent's (or
+the HTTP owner's) personal group; "foreign" = a group it is not in. Row counts
+are the database's, not the response's. **Bold** = a success-over-nothing or
+partial-state shape the R3 gate forbids, or an authority leak.
 
-| tool / case | A base | A tip | B base | B tip |
-|---|---|---|---|---|
-| patch_claim own public | ERR 42501, 0 rows | OK | OK | OK |
-| patch_claim own private | ERR not found | OK | OK | OK |
-| patch_claim foreign private | ERR not found | ERR not found, 0 rows | **OK (orphan policy; caller cannot read it)** | ERR not found, 0 rows |
-| patch_claim foreign public | ERR 42501 | ERR 42501, 0 rows | OK | OK |
-| link_hierarchical own→own private | ERR not found | OK, edge owned by own group | OK | OK |
-| link_hierarchical touching foreign private | ERR not found | ERR not found, 0 edges | ERR | ERR |
-| link_alternative own↔own private | ERR not found | OK | OK | OK |
-| link_epistemic own→own private (supports) | ERR not found | OK, belief_wired, BBA 1→2, edge.added | OK | OK |
-| link_epistemic own→foreign public (contradicts) | ERR not found | OK edge, belief_wired=false, 0 target BBAs | same | same |
-| patch_edge + delete_edge, own-group edge | ERR not found | OK, patched, retracted, 2 events | OK | OK |
-| patch_edge + delete_edge, foreign-group edge | ERR not found | ERR not found, untouched | OK (orphan policy) | OK (orphan policy) |
-| resolve_backlog_item, public basis | **ERR after writing: resolution=1, item still open** | OK 1/1/1 | OK | OK |
-| resolve_backlog_item, own-private basis | ERR not visible | OK 1/1/1 | OK | OK |
-| resolve_backlog_item, justifies edge refused (injected) | **ERR, resolution=1 left behind** | ERR, 0/0/0 | **ERR, resolution=1 left behind** | ERR, 0/0/0 |
-| submit_claim / memorize fresh | OK, BBA=1 | OK, BBA=1 | OK | OK |
-| submit_claim / memorize, BBA refused (injected) | **OK over claims=1 with no BBA** | ERR, claims=0 | **OK over claims=1 with no BBA** | ERR, claims=0 |
-| recompute_beliefs / sweep_semantic_duplicates / backfill_embeddings, maintenance DSN unset or = app login | ERR (hard gate) | ERR, rows unchanged | ERR | ERR, rows unchanged |
-| the same three, maintenance DSN bypass-capable | ERR (hard gate) | OK on FOREIGN rows: cache written, cross-group dup retired, vector stored | ERR | OK, same |
+### MCP (`probe-batch-h.sh`, all arms)
 
-Bold cells are the success-over-nothing / partial-state shapes the R3 gate
-forbids. A guard-less mutation build (maintenance pool attached unconditionally,
-per-call probe skipped) turns the "unset / app login" row into **OK over zero
-rows** (claims_recomputed=0, scanned=0, embedded=0), which is the hazard the
-maintenance gate exists for. The HTTP half of batch H (supersede and
-deprecate_workflow gate reads) is pinned by
-`crates/epigraph-api/tests/write_gate_reads_are_viewer_filtered.rs`, not here.
+| tool / case | A before (`a3fbc4ce`, or the hunk reverted) | A tip | B tip |
+|---|---|---|---|
+| patch_claim own public / own private | ERR 42501 / ERR not found | OK / OK | OK / OK |
+| patch_claim foreign private / foreign public | ERR / ERR | ERR not found / ERR 42501, 0 rows | ERR not found / OK (orphan policy) |
+| link_hierarchical, link_alternative own private | ERR not found | OK, edge owned by own group | OK |
+| link_* touching foreign private | ERR not found | ERR not found, 0 edges | ERR not found |
+| link_epistemic own→own private | ERR not found | OK, belief wired, BBA 1→2 | OK |
+| patch_edge + delete_edge, own-group edge | ERR not found | OK, patched, retracted, 2 events | OK |
+| patch_edge + delete_edge, edge the caller cannot read | ERR not found | ERR not found, untouched | ERR not found, untouched (**was OK on B before the read gate**) |
+| resolve_backlog_item public / own-private basis | **ERR after writing a resolution** / ERR | OK 1/1/1 / OK 1/1/1 | OK / OK |
+| resolve_backlog_item foreign-private basis / injected edge refusal | ERR / **resolution left behind** | ERR, 0/0/0 / ERR, 0/0/0 | same |
+| submit_claim / memorize, injected BBA refusal | **OK over a claim with no BBA** | ERR, 0 rows | ERR, 0 rows |
+| supersede_claim own public / own private | ERR 42501 / ERR not found | OK, retired, 1 replacement / OK | OK / OK |
+| supersede_claim foreign private / foreign public | ERR / ERR | ERR not found / ERR 42501, untouched | ERR not found / OK (orphan policy) |
+| theme_cluster (wipe_first) over the server agent's public claims | **ERR 42501 with an orphan theme, previous themes wiped** | ERR 42501, previous themes intact | OK, 2 themes |
+| maintenance x3, `MAINTENANCE_DATABASE_URL` unset or = app login | ERR (hard gate) | ERR, rows unchanged | ERR, rows unchanged |
+| maintenance x3, configured bypass-capable DSN | ERR (hard gate) | OK on FOREIGN rows (cache written, dup retired, vectors stored) | OK |
+| maintenance x3, unset but the APP DSN bypass-capable | ERR (hard gate) | ERR, rows unchanged (**was OK at `80398b7a`**) | ERR |
+| maintenance x3 over HTTP, claims:write bearer | n/a | Forbidden, nothing listed or retired (**was OK at `80398b7a`: foreign ids listed, one retired**) | Forbidden |
+| maintenance x3 over HTTP, claims:admin bearer | n/a | OK, pair listed, one retired | OK |
 
-### Measured: `PATCH /api/v1/claims/:id/labels` (`probe-http-labels.sh`)
+### HTTP (`probe-http-writes.sh`, `probe-http-labels.sh`, real `server` binary)
 
-Base = the branch with only the handler hunk reverted, built in the same target
-dir. `label` = whether the label is on the row afterwards.
+| route / case | A at `80398b7a` | A tip | B tip |
+|---|---|---|---|
+| supersede owner own public / own private | 500 / 404 | 201, retired, version row / 201 | 201 / 201 |
+| supersede admin other agent's public | 500 | 403, nothing written | 201 |
+| DELETE /workflows/:id owner own flat public / private | **200, `is_current` still true** | 200, `is_current=f` | 200, f |
+| DELETE /workflows/:id peer other's flat | **200, nothing written** | 403, untouched | 200 (no ownership check, see below) |
+| POST /workflows/:id/outcome owner own flat public | **200, truth unchanged, execution +1** | 200, truth, counters and execution together | same |
+| POST /workflows/:id/outcome owner own flat private | 404 | 200 | 200 |
+| POST /bp/propagate apply, own factor | **200 `applied:true`, 0 rows** | 200, BetP 0.20→0.39 | same |
+| POST /bp/propagate apply, factor into a stranger's claim | **200 `applied:true`, 0 rows** | 403, nothing written | 200 |
+| POST /themes/create-with-centroid own / other's claims | **500 with `claim_themes +1`** / same | 201, themed / 403, +0 | 201 / 201 |
+| PATCH /labels owner own public / own private | 200 / 200 | 200 / 200 | 200 / 200 |
+| PATCH /labels admin other agent's public | 200 (**author's stamp lent**) | 403 | 200 |
+| PATCH /labels READER-member admin, team private / public | **200 / 200 (author's stamp lent)** | 403 / 403 | 200 / 200 |
+| PATCH /labels admin foreign unreadable / world-owned / peer | 404 / 403 / 403 | 404 / 403 / 403 | 404 / 200 / 403 |
 
-| caller / row | A base | A tip | B base | B tip |
-|---|---|---|---|---|
-| owner / own public | **500 42501**, label=f | 200, label=t | 200, t | 200, t |
-| owner / own private | **404** (own row invisible to the unstamped UPDATE) | 200, t | 200, t | 200, t |
-| admin / another agent's public | **500 42501**, f | 200, t (author-stamped) | 200, t | 200, t |
-| admin / foreign group-private (unreadable) | 404, f | 404, f | **200, t (acts on a claim it cannot read)** | 404, f |
-| admin / world-owned public | 500 42501, f | 403, f | 200, t | 200, t |
-| peer / another agent's public | 403, f | 403, f | 403, f | 403, f |
+On config A every row above now either succeeds or fails loudly with nothing
+written. Config B is unchanged except where a row is marked as a tightening
+(an edge the caller cannot read, the maintenance fallback, a claims:write
+bearer on the maintenance tools) or an improvement (supersede now records its
+version row, which the unstamped INSERT never did on either config).
 
-A mutation build with the admin author-stamp arm disabled turns "admin /
-another agent's public" on A into 403, label=f: the arm is what keeps a
-`claims:admin` relabel working once the orphan policies are gone.
+## R3 checklist: what still blocks dropping the orphan policies
 
-**This route is the only HTTP write this branch converts.** On the same
-server, config A, an owner acting on its OWN public claim got a `500` with 0
-rows written from three routes. `PATCH /api/v1/claims/:id` and
-`POST /api/v1/claims/:id/supersede` returned "new row violates row-level
-security policy for table claims"; `POST /api/v1/claims` returned the opaque
-"A database error occurred". Each still writes on the unstamped `db_pool` (see
-`crates/epigraph-db/tests/no_unscoped_pool.rs`'s register). They fail loudly and
-atomically, so they satisfy the letter of the R3 gate. But they stop working
-when the orphan policies are dropped, and the register's other raw-pool write
-sites should be expected to behave the same way. That second point is inferred
-from the register and `claims_tenancy`'s WITH CHECK, not measured. This was measured once with a scratch variant of
-`probe-http-labels.sh` that is not committed. On config B, supersede and
-`POST /claims` succeed. The B arm of `PATCH /claims/:id` measures nothing here:
-the probe's tokens name no `oauth_clients` row, so that route's provenance
-insert fails its foreign key on either config.
+This branch closes the write paths above. It does **not** make the whole write
+surface ready for R3. Each item below was measured by the batch H-a review (the
+`probe_*.py` scratch probes) unless it says otherwise, and each needs its own
+decision or conversion before the operator drops `claims_privacy`,
+`evidence_privacy` and `edges_privacy`.
+
+1. **Authenticated MCP stamps from the SERVER agent, not the caller.** Over HTTP
+   MCP (`--jwt-secret`), `patch_claim` and `update_labels` on the caller's OWN
+   claims are refused on A and admitted on B, and `submit_claim` by a caller
+   writes a claim owned by the server agent. Every committed MCP probe runs
+   unauthenticated (caller == server agent) and cannot see this. It needs a
+   decision: the caller's viewer when auth is present, the server agent on
+   stdio. That is the H-b cross-agent authority cluster's, so this branch does
+   not make it. `probe-batch-h.sh maint_auth` is the committed authenticated
+   arm to extend.
+2. **HTTP writes still on the unstamped pool** (A refuses the owner, B admits):
+   - `POST /api/v1/claims` and `POST /claims`: opaque 500;
+   - `PUT` and `PATCH /api/v1/claims/:id`: 500 42501 on own public, 404 on own
+     private;
+   - `POST /claims/:id/dedup` (claims:admin): 409 "already superseded or
+     invalid input", a misleading status for an RLS refusal;
+   - `PUT /claims/:id/embedding`;
+   - `POST /api/v1/evidence`, `PUT /evidence/:id`, `PUT /evidence/:id/embedding`;
+   - `POST /api/v1/edges` from an own-private source: 404;
+   - `POST /workflows/steps/:id/evolve`;
+   - `POST /skills/share` on an own flat workflow.
+   `crates/epigraph-db/tests/no_unscoped_pool.rs` is the register (274 sites) and
+   `crates/epigraph-api/tests/discarded_route_writes.rs` pins the 46 `let _ =`
+   writes. The remedy is the one this branch used: `AppState::write_as` plus
+   `errors::write_refused` for `42501`.
+3. **Workflow ingest drops embeddings on A.** `POST /workflows`,
+   `/workflows/ingest` and `/workflows/steps` commit their claims, but on A every
+   embedding store fails with a WARN ("Failed to store embedding for ingested
+   workflow claim"). Measured 8/8 workflow claims with a NULL embedding on A, 3/9
+   on B. This breaks the CLAUDE.md embedding invariant (every current,
+   non-telemetry claim has a vector), so it is an R3 blocker in its own right,
+   not a cosmetic warning.
+4. **MCP tools still on the unstamped pool** (`residual_unstamped_writes.rs` is
+   the register):
+   - `evolve_step`: 42501 on A. Its population is step claims authored by
+     `workflow-ingest-system`, and stamping from that system agent is H3
+     (84b2a98d).
+   - `refresh_workflow_promotion`'s `merge_properties`: same population, same H3
+     question. Its A behaviour is inferred, not measured.
+   - `mark_duplicate`: own private "not found", foreign public 42501. Its write
+     IS the retraction cascade, which is the recorded cross-group authority
+     question.
+   - `consolidate_claims` with a foreign public source: 42501. Authority-correct.
+   - `report_workflow_outcome` / `deprecate_workflow` on FOREIGN-owned legacy flat
+     claims: 42501. Authority-correct.
+   - `theme_cluster`: atomic now, but a corpus-wide job with no author stamp that
+     covers it, so it fails loudly on A. It needs a maintenance path that config B
+     does not lose.
+5. **Pre-existing failures on BOTH configurations** (base == tip on B, so not
+   regressions, but several leave partial state on B, which is production):
+   - `POST /api/v1/hypothesis`: B 500 "hypothesis_assessment frame not found",
+     claim +1 left behind (A atomic). Depends on whether production has that
+     frame.
+   - `POST /api/v1/conventions`: A 500 leaving an agent, a group and a membership;
+     B 500 leaving claims +1 and evidence +1.
+   - `POST /frames/:id/evidence`: B 500 with an edge +1 left behind.
+   - Refused on both configs: `POST /claims/:id/challenge` (own and foreign:
+     challenge cannot serve its core use case on either config),
+     `/reasoning-traces`, `PUT /perspectives/:id/source-reliability`,
+     `/communities`, `/entity-mentions/batch`, `/triples/batch`,
+     `/frames/:id/assign-claim`, `/conflicts/:a/:b/resolve` and `/groups`.
+   - `POST /submit/packet` with a real Ed25519 signature: A fails on `claims`, B
+     on `reasoning_traces`. This is the host-telemetry path.
+   - MCP `challenge_claim`, `update_with_evidence` and `submit_ds_evidence` on a
+     foreign public claim, and `mark_duplicate` when the duplicate has a
+     belief-wired supporter.
+   - Dead routes: `/coalitions` and `/propaganda-techniques` name relations that
+     do not exist.
+6. **Known shapes that meet the R3 gate's "succeeds while writing nothing"
+   definition**, the same on both configs; each must be accepted or fixed:
+   - `POST /api/v1/claims/batch`: 200 `created: 2` with ids and 0 rows, because
+     `AppState::claim_store` is an in-memory map (the handler doc says so);
+   - MCP `deprecate_workflow` on a hierarchical id: `deprecated_ids=[id]`, but the
+     id is not a claim (README trap 2);
+   - HTTP `/workflows/:id/outcome`, `/behavioral-executions`, `/skills/share` and
+     `DELETE /workflows/:id` return 404 for hierarchical `workflows`-table ids.
+7. **No ownership check on the HTTP flat-workflow writers.**
+   `DELETE /workflows/:id` and `POST /workflows/:id/outcome` let any
+   `claims:write` caller act on another agent's workflow. On B the orphan
+   policies admit it; on A the stamped write now refuses it (403). The authority
+   decision is #374 / H3.
 
 ## What this harness does not cover
 
 It exercises tools, not the repository layer, and apart from
-`probe-http-labels.sh` it says nothing about the HTTP surface. The in-repo complement is
+`probe-http-labels.sh` and `probe-http-writes.sh` it says nothing about the HTTP
+surface. The in-repo complement is
 `crates/epigraph-mcp/tests/residual_unstamped_writes.rs`, a source ratchet over
 `crates/epigraph-mcp/src` that pins which write sites still take the unstamped
 pool. That ratchet catches *a converted site reverted to `server.pool`* — verified

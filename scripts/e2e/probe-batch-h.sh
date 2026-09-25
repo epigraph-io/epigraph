@@ -422,10 +422,11 @@ PY
   }
   # PEER: claims:write, a member of NO group that owns the duplicate pair.
   PEER=$(q "INSERT INTO agents (public_key, display_name) VALUES (decode(md5(random()::text)||md5(random()::text),'hex'), 'batch-h peer $LABEL') RETURNING id" | head -1)
-  # A direction of its own: the maintenance arm's pair uses a constant vector,
-  # and the sweep's neighbour search is corpus-wide, so an identical direction
-  # here would let that pair crowd this one out of the neighbour list.
-  VEC="('[0.9,'||array_to_string(array_fill(0.01::float8, ARRAY[1535]),',')||']')::vector"
+  # A direction of its own: the sweep's neighbour search is corpus-wide, so a
+  # direction another arm also uses (the maintenance pair's constant vector,
+  # the theme arm's first and second axes) lets those rows crowd this pair out
+  # of the neighbour list. MEASURED: pairs_marked=0 when this shared an axis.
+  VEC="('[0.01,0.01,0.9,'||array_to_string(array_fill(0.01::float8, ARRAY[1533]),',')||']')::vector"
   HASH="decode(md5('bh-authdup-$LABEL')||md5('bh-authdup-$LABEL'),'hex')"
   A1=$(q "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels, visibility, owner_group_id, embedding)
           VALUES (gen_random_uuid(), 'Batch H auth duplicate $LABEL', $HASH, 0.7, '$FA', ARRAY['bh-authdup']::text[], 'group', '$FG', $VEC) RETURNING id" | head -1)
