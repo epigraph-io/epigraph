@@ -279,9 +279,11 @@ AGENT_ENV_BASE = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE"
 AGENT_ENV_NEVER = frozenset(("EPIGRAPH_TOKEN", "EPIGRAPH_JWT_SECRET", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
                              "GITHUB_ENTERPRISE_TOKEN", "DATABASE_URL", "MIGRATION_DATABASE_URL"))
 
-# Development agents: file tools pre-approved; Bash is left to --permission-mode. The deny list covers the
-# merge/admin surface. These are prefix patterns matched by Claude Code -- a guard rail, not a sandbox.
-DEV_ALLOWED_TOOLS = ("Read", "Edit", "Write", "Glob", "Grep", "TodoWrite")
+# Development agents: only read-only tools are pre-approved. Bash, Edit and Write are left to --permission-mode:
+# a bare `Edit`/`Write` in --allowedTools pre-approves writes to ANY path (measured: a pre-approved Write created a
+# file outside the cwd under dontAsk), i.e. the board's state.json, the operator's checkout or ~/.claude.
+# The deny list covers the merge/admin surface. Prefix patterns matched by Claude Code -- a guard rail, not a sandbox.
+DEV_ALLOWED_TOOLS = ("Read", "Glob", "Grep", "TodoWrite")
 DEV_DISALLOWED_TOOLS = (
     "Bash(gh pr merge:*)", "Bash(gh pr close:*)", "Bash(gh pr reopen:*)", "Bash(gh pr review:*)",
     "Bash(gh api:*)", "Bash(gh repo:*)", "Bash(gh release:*)", "Bash(gh secret:*)", "Bash(gh auth:*)",

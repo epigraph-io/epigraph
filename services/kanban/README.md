@@ -42,7 +42,7 @@ Prerequisites: `git`, an authenticated `gh`, and `claude` on PATH, plus a checko
 | `KANBAN_REMOTE` | `origin` | The git remote |
 | `KANBAN_HTTP_LOG` | – | Set to any value to log each HTTP request to stderr |
 | `KANBAN_AGENT_ENV_ALLOW` | – | Comma-separated extra environment variable names that agents may inherit (see below) |
-| `KANBAN_AGENT_ALLOWED_TOOLS` | `Read,Edit,Write,Glob,Grep,TodoWrite` | `--allowedTools` for development agents. `Bash` is deliberately left to `--permission-mode` |
+| `KANBAN_AGENT_ALLOWED_TOOLS` | `Read,Glob,Grep,TodoWrite` | `--allowedTools` for development agents. `Bash`, `Edit` and `Write` are deliberately left to `--permission-mode`. A bare `Edit`/`Write` here would pre-approve writes to *any* path, outside the worktree included |
 | `KANBAN_AGENT_DISALLOWED_TOOLS` | merge/admin `gh` and `git push` patterns, `curl`, `wget`, backlog-mutating MCP tools | `--disallowedTools` for development agents |
 | `KANBAN_BACKLOG_TOOL` / `KANBAN_RESOLVE_TOOL` | `mcp__epigraph__query_claims_by_label` / `mcp__epigraph__resolve_backlog_item` | The one MCP tool each helper agent may call |
 

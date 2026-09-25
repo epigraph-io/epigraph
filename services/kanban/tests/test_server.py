@@ -744,7 +744,10 @@ class AgentEnvTest(_ServerFixture):
             argv = call["argv"]
             self.assertIn("Bash(gh pr merge:*)", argv[argv.index("--disallowedTools") + 1].split(","))
             self.assertIn("mcp__epigraph__resolve_backlog_item", argv[argv.index("--disallowedTools") + 1].split(","))
-            self.assertNotIn("Bash", argv[argv.index("--allowedTools") + 1].split(","))
+            allowed = argv[argv.index("--allowedTools") + 1].split(",")
+            # pre-approving any of these would bypass the permission mode (a bare Write/Edit covers every path)
+            for tool in ("Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"):
+                self.assertNotIn(tool, allowed)
 
         status, body = self.req("POST", "/api/cards/%s/accept" % CLAIM_K, body={})
         self.assertEqual(status, 200, body)
