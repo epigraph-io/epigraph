@@ -60,8 +60,9 @@
 
 use clap::Parser;
 use epigraph_cli::decompose::{
-    persist_planned, plan_decomposition_batches, read_plan_jsonl, run_decomposition_batches,
-    select_candidates, verify_plan, write_plan_jsonl, BatchClaim, EligibilityFilters, Priority,
+    persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
+    run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, BatchClaim,
+    EligibilityFilters, PlanGaps, Priority,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -800,15 +801,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
+            // Refuse an existing plan path BEFORE any LLM call, not after
+            // (write_plan_jsonl refuses it too, but only once the calls are
+            // spent).
+            if let Mode::Plan(path) = &mode {
+                if path.exists() {
+                    return Err(format!(
+                        "plan file {} already exists; pass a new --plan path",
+                        path.display()
+                    )
+                    .into());
+                }
+            }
             // Prepaid Claude path. create_llm_client("epigraph") returns the
             // first active provider (Anthropic-from-env, OAuth-preferred);
             // "mock" for smoke; "fixture" for a deterministic, credential-free
             // write-path exercise.
             let llm = resolve_llm_client(&cli.provider, std::env::var(FIXTURE_PATH_ENV).ok())?;
             if let Mode::Plan(path) = &mode {
-                let plans = plan_decomposition_batches(&claims, llm.as_ref(), cli.batch_size).await;
+                let (plans, gaps) =
+                    plan_decomposition_batches_with_gaps(&claims, llm.as_ref(), cli.batch_size)
+                        .await;
                 write_plan_jsonl(path, &plans)?;
                 print_plan(&plans);
+                let singletons: Vec<uuid::Uuid> = plans
+                    .iter()
+                    .filter(|p| p.atoms.len() <= 1)
+                    .map(|p| p.claim_id)
+                    .collect();
+                report_unplanned(&gaps, &singletons);
                 eprintln!(
                     "plan: {} of {} claims answered; written to {} — nothing persisted. \
                      Apply with --apply-plan {}",
@@ -830,6 +851,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 move |t, g, a| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a),
             )
             .await?;
+            report_unplanned(&totals.gaps, &totals.singletons);
             eprintln!(
                 "decompose complete: {} atoms, {} decomposes_to edges",
                 totals.atoms, totals.edges
@@ -837,6 +859,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Name every chosen claim that was sent to the LLM and produced nothing to
+/// write, one line each, so no claim — above all one named in `--ids-file` —
+/// disappears between selection and the totals.
+fn report_unplanned(gaps: &PlanGaps, singletons: &[uuid::Uuid]) {
+    for (id, why) in &gaps.llm_error {
+        eprintln!("LLM-ERROR {id}: the batch's LLM call failed ({why}); not decomposed");
+    }
+    for id in &gaps.no_answer {
+        eprintln!("NO-ANSWER {id}: the model returned no usable answer; not decomposed");
+    }
+    for id in singletons {
+        eprintln!("SINGLETON {id}: the model returned one atom (already atomic); not decomposed");
+    }
 }
 
 /// Summarize what selection chose and passed over. Every explicit

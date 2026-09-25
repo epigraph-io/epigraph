@@ -389,9 +389,9 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
 
 #[cfg(feature = "db")]
 pub use db_writes::{
-    persist_decomposition, persist_planned, plan_decomposition_batches, run_decomposition_batches,
-    select_candidates, verify_plan, BatchClaim, BatchTotals, PersistOutcome, PlanDrift, Priority,
-    Selection,
+    persist_decomposition, persist_planned, plan_decomposition_batches,
+    plan_decomposition_batches_with_gaps, run_decomposition_batches, select_candidates,
+    verify_plan, BatchClaim, BatchTotals, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
 };
 
 #[cfg(feature = "db")]
@@ -532,6 +532,12 @@ mod db_writes {
         /// Parents whose line failed to persist, with the reason. Each is
         /// still undecomposed (no edge is written until every atom is).
         pub failed: Vec<(Uuid, String)>,
+        /// Parents the model answered with one atom (already atomic), so
+        /// nothing was written for them.
+        pub singletons: Vec<Uuid>,
+        /// Claims sent to the LLM that got no plan line (normal runs only;
+        /// `--apply-plan` makes no LLM call and leaves this empty).
+        pub gaps: PlanGaps,
     }
 
     /// Chunk `claims` into batches, decompose each batch through `llm`, and
@@ -564,11 +570,13 @@ mod db_writes {
     {
         let mut totals = BatchTotals::default();
         for chunk in claims.chunks(batch_size.max(1)) {
-            let planned = plan_chunk(chunk, llm).await;
+            let (planned, gaps) = plan_chunk(chunk, llm).await;
+            totals.gaps.extend(gaps);
             let chunk_totals =
                 persist_planned(pool, viewer, &planned, embedder.clone(), &submit_via).await?;
             totals.atoms += chunk_totals.atoms;
             totals.edges += chunk_totals.edges;
+            totals.singletons.extend(chunk_totals.singletons);
             // A normal run still ABORTS on a persist failure (after finishing
             // the chunk): the next chunk would spend another LLM call on an
             // API that is probably down. `--apply-plan` makes no LLM call and
@@ -593,17 +601,37 @@ mod db_writes {
         Ok(totals)
     }
 
+    /// Chosen claims the planner could not turn into a plan line, and why.
+    /// Without this a claim named in `--ids-file` that the model skipped, or
+    /// whose batch call failed, would simply be missing from the output.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub struct PlanGaps {
+        /// The LLM call for the claim's batch failed, with the error.
+        pub llm_error: Vec<(Uuid, String)>,
+        /// The response had no usable answer for the claim.
+        pub no_answer: Vec<Uuid>,
+    }
+
+    impl PlanGaps {
+        fn extend(&mut self, other: PlanGaps) {
+            self.llm_error.extend(other.llm_error);
+            self.no_answer.extend(other.no_answer);
+        }
+    }
+
     /// One LLM call for one chunk: prompt -> model -> parse -> the parent each
     /// answer belongs to. Writes nothing.
     ///
     /// A failed call is logged and yields an empty plan for the chunk (the run
-    /// continues), matching the historical batch loop. The parent lookup is
+    /// continues), matching the historical batch loop; every claim of the
+    /// chunk is reported in [`PlanGaps::llm_error`]. A claim the response does
+    /// not answer is reported in [`PlanGaps::no_answer`]. The parent lookup is
     /// `chunk.get(local_idx)`: an index the model invented is dropped, never
     /// wired to a neighbour.
     async fn plan_chunk(
         chunk: &[BatchClaim],
         llm: &dyn epigraph_interfaces::LlmProvider,
-    ) -> Vec<super::PlannedDecomposition> {
+    ) -> (Vec<super::PlannedDecomposition>, PlanGaps) {
         let indexed: Vec<(usize, &str)> = chunk
             .iter()
             .enumerate()
@@ -615,10 +643,15 @@ mod db_writes {
             Ok(v) => v.to_string(),
             Err(e) => {
                 eprintln!("  LLM call failed for batch: {e}; skipping");
-                return vec![];
+                let why = e.to_string();
+                let gaps = PlanGaps {
+                    llm_error: chunk.iter().map(|c| (c.claim_id, why.clone())).collect(),
+                    no_answer: vec![],
+                };
+                return (vec![], gaps);
             }
         };
-        super::parse_batch_response(&raw)
+        let planned: Vec<super::PlannedDecomposition> = super::parse_batch_response(&raw)
             .into_iter()
             .filter_map(|(local_idx, decomp)| {
                 let parent = chunk.get(local_idx)?;
@@ -632,24 +665,50 @@ mod db_writes {
                     model: llm.model_name().to_string(),
                 })
             })
-            .collect()
+            .collect();
+        let answered: std::collections::HashSet<Uuid> =
+            planned.iter().map(|p| p.claim_id).collect();
+        let gaps = PlanGaps {
+            llm_error: vec![],
+            no_answer: chunk
+                .iter()
+                .map(|c| c.claim_id)
+                .filter(|id| !answered.contains(id))
+                .collect(),
+        };
+        (planned, gaps)
     }
 
     /// `--plan`: every LLM call a decomposition run would make, and nothing
     /// else. No claim, edge or embedding is written; the caller serializes the
-    /// result with [`super::write_plan_jsonl`].
+    /// result with [`super::write_plan_jsonl`]. See
+    /// [`plan_decomposition_batches_with_gaps`] for what was NOT planned.
     pub async fn plan_decomposition_batches(
         claims: &[BatchClaim],
         llm: &dyn epigraph_interfaces::LlmProvider,
         batch_size: usize,
     ) -> Vec<super::PlannedDecomposition> {
-        let mut out = Vec::new();
-        for chunk in claims.chunks(batch_size.max(1)) {
-            out.extend(plan_chunk(chunk, llm).await);
-        }
-        out
+        plan_decomposition_batches_with_gaps(claims, llm, batch_size)
+            .await
+            .0
     }
 
+    /// [`plan_decomposition_batches`], also returning every claim that got
+    /// no plan line and why, so the caller can name each one.
+    pub async fn plan_decomposition_batches_with_gaps(
+        claims: &[BatchClaim],
+        llm: &dyn epigraph_interfaces::LlmProvider,
+        batch_size: usize,
+    ) -> (Vec<super::PlannedDecomposition>, PlanGaps) {
+        let mut out = Vec::new();
+        let mut gaps = PlanGaps::default();
+        for chunk in claims.chunks(batch_size.max(1)) {
+            let (planned, g) = plan_chunk(chunk, llm).await;
+            out.extend(planned);
+            gaps.extend(g);
+        }
+        (out, gaps)
+    }
     /// Persist already-planned decompositions. Makes NO LLM call — this is
     /// the whole of `--apply-plan`, and the persist half of a normal run.
     ///
@@ -693,6 +752,9 @@ mod db_writes {
                 Ok(outcome) => {
                     totals.atoms += outcome.atom_claim_ids.len();
                     totals.edges += outcome.edges_created;
+                    if outcome.skipped_singletons > 0 {
+                        totals.singletons.push(plan.claim_id);
+                    }
                 }
                 Err(e) => totals.failed.push((plan.claim_id, e.to_string())),
             }
@@ -1143,6 +1205,69 @@ mod tests {
         let err = read_plan_jsonl(&path).unwrap_err().to_string();
         assert!(err.contains("kind"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- plan gaps: every chosen claim is accounted for ---
+
+    #[cfg(feature = "db")]
+    struct DownLlm;
+
+    #[cfg(feature = "db")]
+    #[async_trait::async_trait]
+    impl epigraph_interfaces::LlmProvider for DownLlm {
+        fn name(&self) -> &str {
+            "down"
+        }
+        fn model_name(&self) -> &str {
+            "down"
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        async fn complete_json(
+            &self,
+            _prompt: &str,
+        ) -> Result<serde_json::Value, epigraph_interfaces::LlmError> {
+            Err(epigraph_interfaces::LlmError::RequestFailed {
+                message: "503 upstream".into(),
+            })
+        }
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn planning_names_every_claim_it_could_not_plan() {
+        let claim = |t: &str| BatchClaim {
+            claim_id: uuid::Uuid::new_v4(),
+            agent_id: uuid::Uuid::new_v4(),
+            content: t.to_string(),
+        };
+        let claims = vec![
+            claim("Answered compound. With a second part."),
+            claim("Answered as a single atom."),
+            claim("Ignored by the model. Entirely."),
+        ];
+        let llm = crate::enrichment::llm_client::FixtureLlmClient::from_json(&serde_json::json!({
+            claims[0].content.clone(): {"atoms": ["a", "b"], "generality": [0, 0]},
+            claims[1].content.clone(): {"atoms": ["x"], "generality": [0]},
+        }))
+        .unwrap();
+        let (plans, gaps) = plan_decomposition_batches_with_gaps(&claims, &llm, 10).await;
+        assert_eq!(
+            plans.iter().map(|p| p.claim_id).collect::<Vec<_>>(),
+            vec![claims[0].claim_id, claims[1].claim_id]
+        );
+        assert_eq!(gaps.no_answer, vec![claims[2].claim_id]);
+        assert!(gaps.llm_error.is_empty());
+
+        // A failed call names every claim of every failed batch.
+        let (plans, gaps) = plan_decomposition_batches_with_gaps(&claims, &DownLlm, 2).await;
+        assert!(plans.is_empty());
+        assert_eq!(
+            gaps.llm_error.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            claims.iter().map(|c| c.claim_id).collect::<Vec<_>>()
+        );
+        assert!(gaps.llm_error[0].1.contains("503 upstream"));
     }
 
     #[test]
