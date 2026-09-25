@@ -646,14 +646,44 @@ impl ClaimRepository {
     /// authenticated principal at token mint (PR-02), so on a live path this is
     /// a lookup, not a write (migration 105's live path writes nothing).
     ///
+    /// # An OPERATED author writes into its operator's group (migration 107)
+    ///
+    /// When `agent_id` has an ACTING operator link
+    /// ([`AgentRepository::operator_actor`](crate::repos::AgentRepository::operator_actor)),
+    /// the declaration is `('public', <the OPERATOR's personal group>)`. The
+    /// agent holds `writer` there, so the author-stamped transaction it writes
+    /// in (`epigraph_mcp::claim_helper::begin_author_stamped_tx`) can write the
+    /// claim and every claim-derived row, and the operator — and every other
+    /// agent it operates — owns what it wrote. Model upgrades mint new agent
+    /// identities (`keypair_from_llm_agent`), so this is what keeps a job's work
+    /// in one place across them.
+    ///
+    /// The operator lookup runs FIRST and goes through a `SECURITY DEFINER`
+    /// read, so it answers correctly on an unstamped `epigraph_app` session,
+    /// where `groups_tenancy` hides every row and a read-first lookup here
+    /// would be blind. An unlinked, revoked or RETIRED author falls through to
+    /// [`Self::personal_group_of`] exactly as before.
+    ///
+    /// It is the ACTOR read, never the author read
+    /// ([`AgentRepository::operator_of_author`](crate::repos::AgentRepository::operator_of_author)):
+    /// a retired identity has no membership in its operator's group, so if it
+    /// ever ran again and this chose that group, RLS would refuse every claim
+    /// it wrote (`operator_link.rs::a_retired_agent_gains_no_write_authority`).
+    ///
     /// # Errors
     /// Returns `DbError::MembershipRevoked` if the author holds only revoked rows
-    /// in its personal group, `DbError::ForeignKeyViolation` if `agent_id` names
-    /// no agent, and `DbError::QueryFailed` for other database failures.
+    /// in its personal group (and has no acting operator link),
+    /// `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
+    /// `DbError::QueryFailed` for other database failures — including a
+    /// database that has not applied migration 107, which fails CLOSED here
+    /// rather than authoring as if the author had no operator.
     pub async fn default_decl_for_author(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
     ) -> Result<TenancyDecl, DbError> {
+        if let Some(link) = crate::repos::AgentRepository::operator_actor(conn, agent_id).await? {
+            return Ok(TenancyDecl::public(link.operator_group_id));
+        }
         Ok(TenancyDecl::public(
             Self::personal_group_of(conn, agent_id).await?,
         ))
@@ -8533,20 +8563,26 @@ impl ClaimRepository {
             });
         }
 
-        // ── The actor's own group, for the all-public case ──
+        // ── The actor's authoring default, for the all-public case ──
         //
         // AFTER the idempotent-return branch above, deliberately: that branch
         // ends in `tx.rollback()`, and resolving the group before it would make
         // a no-op retry perform a `groups` upsert and a `group_memberships`
         // upsert only to discard them.
         //
-        // `personal_group_of` resolves through the definer function, which
-        // (migration 105) returns a live group without writing and refuses a
-        // revoked membership rather than reviving it as a side effect of a
-        // merge. See its doc.
+        // `default_decl_for_author`, not `personal_group_of`: an actor with an
+        // ACTING operator link (migration 107) authors into its OPERATOR's
+        // personal group, exactly as every other authoring path does, so a
+        // merge by a model-bumped job does not split its work across groups
+        // again (review finding: the merged claim landed in the agent's own
+        // group while every source sat in the operator's). An unlinked,
+        // revoked or retired actor falls through to `personal_group_of`, which
+        // resolves through the definer function: it (migration 105) returns a
+        // live group without writing and refuses a revoked membership rather
+        // than reviving it as a side effect of a merge. See its doc.
         let decl = match merged_owner {
             Some(g) => TenancyDecl::group(g),
-            None => TenancyDecl::public(Self::personal_group_of(&mut tx, acting_agent_id).await?),
+            None => Self::default_decl_for_author(&mut tx, acting_agent_id).await?,
         };
 
         let merged_id = sqlx::query_scalar!(

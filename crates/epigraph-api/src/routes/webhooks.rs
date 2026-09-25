@@ -941,7 +941,10 @@ async fn retain_visible_subscriptions(
     for sub in attributed {
         let agent_id = sub.agent_id.expect("partitioned on is_some");
         if let std::collections::hash_map::Entry::Vacant(slot) = exists.entry(agent_id) {
-            slot.insert(agent_principal_exists(pool, agent_id).await);
+            slot.insert(
+                agent_principal_exists(pool, agent_id).await
+                    && agent_is_not_operated(pool, agent_id).await,
+            );
         }
         if exists.get(&agent_id).copied().unwrap_or(false) {
             resolvable.push(sub);
@@ -1062,6 +1065,46 @@ async fn agent_principal_exists(pool: &sqlx::PgPool, agent_id: Uuid) -> bool {
                 reason = "principal_probe_failed",
                 "webhook suppressed: could not determine whether the subscription's \
                  principal still exists"
+            );
+            false
+        }
+    }
+}
+
+/// Is `agent_id` free of any operator link (migration 107)?
+///
+/// An OPERATED agent is stdio-only: token issuance and both viewer extractors
+/// refuse it, because its `writer` membership puts its operator's personal
+/// group in any `Viewer` resolved for it. Delivery resolves a `Viewer` for the
+/// subscription's principal directly ([`agent_may_receive`]), so without this
+/// check a subscription registered before the link (or with a token minted
+/// before it) kept delivering events about the operator group's claims over
+/// HTTP for as long as it existed. Keyed on the link RECORD (any state,
+/// retired included), as the token refusal is. Fails closed: an unanswered
+/// question suppresses.
+#[cfg(feature = "db")]
+async fn agent_is_not_operated(pool: &sqlx::PgPool, agent_id: Uuid) -> bool {
+    match epigraph_db::AgentRepository::operator_of_author_pool(pool, agent_id).await {
+        Ok(None) => true,
+        Ok(Some(link)) => {
+            tracing::warn!(
+                target: "webhook.delivery.suppressed",
+                agent_id = %agent_id,
+                operator_id = %link.operator_id,
+                reason = "operated_principal",
+                "webhook suppressed: the subscription's principal is an operated agent, and \
+                 operated agents are stdio-only"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "webhook.delivery.suppressed",
+                agent_id = %agent_id,
+                error = %e,
+                reason = "operator_probe_failed",
+                "webhook suppressed: could not determine whether the subscription's \
+                 principal is an operated agent"
             );
             false
         }

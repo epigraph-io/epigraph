@@ -7,6 +7,7 @@ pub mod errors;
 pub mod federation;
 pub mod host_guard;
 pub mod maintenance;
+pub mod operator;
 pub mod scope_map;
 pub mod server;
 pub mod tools;

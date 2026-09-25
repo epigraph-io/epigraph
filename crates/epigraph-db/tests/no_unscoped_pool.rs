@@ -343,7 +343,7 @@
 //!   `routes/independence.rs::analyze_independence`,
 //!   `routes/provenance.rs::{find_or_create_author_agent, find_or_create_org_agent}`,
 //!   `routes/webhooks.rs::{retain_visible_subscriptions, agent_principal_exists,
-//!   agent_may_receive, deliver_event}`,
+//!   agent_is_not_operated, agent_may_receive, deliver_event}`,
 //!   `routes/workflows.rs::{get_or_create_system_agent,
 //!   auto_wire_inserted_edges}`, `tenancy_gauge.rs::sample`. The webhook
 //!   fan-out is the one that matters most and the one this register cannot
@@ -460,12 +460,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "middleware/bearer.rs",
-        1,
-        "STRUCTURALLY non-exemptable, not merely unconverted. The single site is Viewer::resolve, \
+        2,
+        "STRUCTURALLY non-exemptable, not merely unconverted. The first site is Viewer::resolve, \
          which BUILDS the viewer every scoped acquire needs; ScopedPool::acquire_as takes the very \
          Viewer this call constructs, so stamping the connection first is circular. Recorded as \
          D-PR17-live-memberships-is-parameterised-not-principal-bound. A shard that 'converts' \
-         this deadlocks the bootstrap rather than fixing a leak.",
+         this deadlocks the bootstrap rather than fixing a leak. The second, beside it and run \
+         concurrently with it, is AgentRepository::operator_of_author_pool: migration 107's \
+         `epigraph_operator_of_author` SECURITY DEFINER read of the link RECORD, which must \
+         answer BEFORE there is a viewer (it decides whether the principal gets one: a linked \
+         agent is stdio-only), reads no tenancy-partitioned row, and returns only the named \
+         principal's own link.",
     ),
     (
         "middleware/rate_limit.rs",
@@ -514,9 +519,14 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        13,
+        14,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
-         that MINTS the principal every later request is scoped to; a Viewer cannot precede it.",
+         that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
+         The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
+         whether the agent has ANY operator link record, through the \
+         `epigraph_operator_of_author` SECURITY DEFINER read, which answers without a stamp and \
+         returns only the named agent's operator — the same pre-authentication reason, re-read \
+         for it.",
     ),
     (
         "state.rs",

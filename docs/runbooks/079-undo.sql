@@ -100,7 +100,11 @@ DECLARE t text;
           -- 080-083 — and it is why this script does not need to know whether
           -- they ran.
           'privatization_plans','privatization_plan_items',
-          'privatization_audit','instance_admins'];
+          'privatization_audit','instance_admins',
+          -- ---- the operator-link record (107) ----------------------------
+          -- FORCEd by 107 at creation, on the same precedent and for the same
+          -- boot-assertion reason as the four above.
+          'operator_links'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c
