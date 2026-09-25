@@ -1285,27 +1285,41 @@ function feedbackCard(id) {
   }).then(function (ok) { if (ok) sendFeedback(id, ta.value.trim()); });
 }
 function sendFeedback(id, text) { return run(api('POST', cpath(id, '/feedback'), { text: text }), 'Feedback sent; agent resumed'); }
+// The merge is pinned to the head commit shown here: the server refuses (head_moved) if the PR moved since.
+function headEl(sha) { return h('span', { class: 'mono', title: String(sha || ''), text: String(sha || '?').slice(0, 12) }); }
+function headLine(pr) {
+  return h('p', null, 'Head commit ', headEl(pr.head_sha), ' · CI checks ', checksEl(pr.checks),
+    '. Only this commit is merged; if the PR moves before you confirm, the server refuses and you review again.');
+}
 function acceptCard(id) {
   var c = cardById(id); if (!c) return;
+  // read the PR's current head and checks first: the dialog shows them and Accept sends that head back
+  api('GET', cpath(id, '/pr')).then(function (pr) { acceptDialog(c, pr); })
+    .catch(function (e) { toast(e.message, 'error'); refreshSoon(); });
+}
+function acceptDialog(c, pr) {
   var hb = hardBlockers(c);
-  if (hb.length) { forceAccept(c, hb); return; }
+  if (hb.length) { forceAccept(c, hb, null, pr); return; }
   var integ = c.integration_branch || S.integration.branch || 'the integration branch';
   dialog({ title: 'Accept and merge?', confirm: 'Merge into staging',
-    body: [h('p', null, 'Merges ', c.pr_number ? h('strong', { text: 'PR #' + c.pr_number }) : 'the item PR', ' into ', h('span', { class: 'mono', text: integ }),
+    body: [h('p', null, 'Merges ', h('strong', { text: 'PR #' + pr.pr_number }), ' into ', h('span', { class: 'mono', text: integ }),
       ' with a merge commit, deletes the item branch and removes the worktree.'),
+      headLine(pr),
       openBlockers(c).length ? h('p', { text: openBlockers(c).length + ' open warning(s) remain on this card.' }) : null]
   }).then(function (ok) {
     if (!ok) return;
-    postAccept(c, {}, 'Merged ' + short(id) + ' into ' + integ);
+    postAccept(c, { expected_head: pr.head_sha }, 'Merged ' + short(c.id) + ' into ' + integ);
   });
 }
 function isChecksRefusal(e) { return e && e.status === 409 && e.data && e.data.code === 'checks_not_passing'; }
-// POST accept; a CI-checks refusal opens its own override dialog (never the blocker one).
+function isHeadRefusal(e) { return e && e.status === 409 && e.data && (e.data.code === 'head_moved' || e.data.code === 'head_required'); }
+// POST accept; refusals are routed by their code first (never by message text), then the blocker dialog.
 function postAccept(c, body, okMsg) {
   return api('POST', cpath(c.id, '/accept'), body).then(function () { toast(okMsg, 'ok'); refreshSoon(); })
     .catch(function (e) {
-      if (isChecksRefusal(e)) overrideChecksAccept(c, body, e);
-      else if (e.status === 409 && /block/i.test(e.message) && !body.force) forceAccept(c, hardBlockers(c), e.message);
+      if (isHeadRefusal(e)) { toast(e.message, 'warn'); refreshSoon(); }
+      else if (isChecksRefusal(e)) overrideChecksAccept(c, body, e);
+      else if (e.status === 409 && /block/i.test(e.message) && !body.force) forceAccept(c, hardBlockers(c), e.message, { head_sha: body.expected_head, checks: "unknown", pr_number: c.pr_number });
       else { toast(e.message, 'error'); refreshSoon(); }
     });
 }
@@ -1313,23 +1327,25 @@ function overrideChecksAccept(c, body, e) {
   var state = String((e.data && e.data.checks) || 'unknown');
   dialog({ title: 'CI checks are not passing', danger: true, confirm: 'Merge despite checks',
     body: [
-      h('p', null, 'CI checks on ', h('strong', { text: 'PR #' + (c.pr_number || '?') }), ' are ', checksEl(state), '.'),
+      h('p', null, 'CI checks on ', h('strong', { text: 'PR #' + (c.pr_number || '?') }), ' at ', headEl(body.expected_head), ' are ', checksEl(state), '.'),
       h('p', { text: e.message }),
-      h('p', { text: 'Merging anyway is an explicit override for this one request. It is logged by the server and recorded in the card history.' })
+      h('p', { text: 'Merging anyway is an explicit override for this one request, for checks that are ' + state + ' on this head only. It is logged by the server and recorded in the card history.' })
     ]
   }).then(function (ok) {
-    if (ok) postAccept(c, Object.assign({}, body, { override_checks: true }), 'Merged ' + short(c.id) + ' (CI override: checks ' + state + ')');
+    // the override names the state it overrides; the head stays the one the operator reviewed (body.expected_head)
+    if (ok) postAccept(c, Object.assign({}, body, { override_checks: true, override_checks_state: state }), 'Merged ' + short(c.id) + ' (CI override: checks ' + state + ')');
   });
 }
-function forceAccept(c, hb, msg) {
+function forceAccept(c, hb, msg, pr) {
   dialog({ title: 'Force accept with open blockers?', danger: true, confirm: 'Force accept and merge',
     body: [
       msg ? h('p', { text: msg }) : null,
       h('p', { text: hb.length + ' unresolved blocker' + (hb.length === 1 ? '' : 's') + ' on ' + short(c.id) + ':' }),
       h('ul', null, hb.map(function (b) { return h('li', { text: b.text }); })),
+      pr && pr.head_sha ? headLine(pr) : null,
       h('p', { text: 'The PR will be merged into the integration branch anyway. Resolving the blockers first is usually better. Forcing past blockers does not override failing CI checks.' })
     ]
-  }).then(function (ok) { if (ok) postAccept(c, { force: true }, 'Force-accepted ' + short(c.id)); });
+  }).then(function (ok) { if (ok) postAccept(c, { force: true, expected_head: pr && pr.head_sha }, 'Force-accepted ' + short(c.id)); });
 }
 function rejectCard(id) {
   var c = cardById(id);
@@ -1792,12 +1808,19 @@ function mergeIntegration(branch, base, prNum, accepted) {
   // and refuses anything but "pass" unless this override box is ticked.
   var d = integ.data || {};
   var checks = String(d.checks || 'unknown').toLowerCase();
+  var head = d.head_sha;
+  if (!head) {
+    toast('The integration PR head is not known yet; wait for the Integration panel to load, then ship.', 'warn');
+    integ.data = null; integ.sig = ''; loadInteg();
+    return;
+  }
   var overrideCb = h('input', { type: 'checkbox' });
   dialog({ title: 'Merge integration → ' + base + '?', confirm: 'Merge to ' + base, danger: checks !== 'pass',
     body: [
       h('div', { class: 'side-box' },
-        h('p', null, 'CI checks on ', h('strong', { text: 'PR #' + prNum }), ': ', checksEl(checks),
+        h('p', null, 'CI checks on ', h('strong', { text: 'PR #' + prNum }), ' at ', headEl(head), ': ', checksEl(checks),
           integ.loading ? ' (refreshing…)' : ''),
+        h('p', { text: 'Only this head commit is shipped; if the PR moved since the panel loaded, the server refuses and the panel reloads.' }),
         checks !== 'pass' ? h('p', { text: 'The server refuses to ship unless checks pass. Tick the box to override for this one request; the override is logged and recorded in each shipped card’s history.' }) : null,
         checks !== 'pass' ? h('label', { class: 'check' }, overrideCb, 'Merge even though checks are ' + checks + ' (override)') : null),
       inflight.length ? h('div', { class: 'side-box' },
@@ -1812,16 +1835,16 @@ function mergeIntegration(branch, base, prNum, accepted) {
   }).then(function (ok) {
     if (!ok) return;
     if (inflight.length && !force.checked) { toast('Not merged: tick "force" or accept/reject the in-flight cards first.', 'warn'); return; }
-    var payload = { resolve_backlog: cb.checked };
+    var payload = { resolve_backlog: cb.checked, expected_head: head };
     if (inflight.length) payload.force = true;
-    if (overrideCb.checked) payload.override_checks = true;
+    if (overrideCb.checked) { payload.override_checks = true; payload.override_checks_state = checks; }
     api('POST', '/api/integration/merge', payload).then(function (r) {
       toast('Merged ' + branch + ' into ' + base + (cb.checked ? '; resolving backlog items' : '') +
         (r && r.checks && r.checks !== 'pass' ? ' (CI override: checks ' + r.checks + ')' : ''), 'ok');
       integ.data = null; integ.sig = ''; loadInteg(); refreshSoon();
     }).catch(function (e) {
       // e.g. checks changed since the panel last loaded: reload so the dialog shows the fresh state next time
-      toast(e.message, isChecksRefusal(e) ? 'warn' : 'error');
+      toast(e.message, isChecksRefusal(e) || isHeadRefusal(e) ? 'warn' : 'error');
       integ.data = null; integ.sig = ''; loadInteg(); refreshSoon();
     });
   });
@@ -2119,8 +2142,13 @@ function createDemo() {
       hist(cb, 'blocker_resolved', b.text.slice(0, 80) + (b.note ? ' — ' + b.note : ''));
       return { ok: true };
     }
-    if ((m = p.match(/^\/api\/cards\/([^/]+)\/(develop|stop|feedback|accept|reject|blockers|log)$/))) {
+    if ((m = p.match(/^\/api\/cards\/([^/]+)\/(develop|stop|feedback|accept|reject|blockers|log|pr)$/))) {
       var c = get(m[1]), act = m[2];
+      if (act === 'pr' && method === 'GET') {
+        if (!c.pr_number) throw err(409, 'card has no PR');
+        return { pr_number: c.pr_number, head_sha: 'd3adbeefd3adbeefd3adbeefd3adbeefd3adbeef', checks: 'pass', url: c.pr_url,
+          base: c.integration_branch, head: c.branch };
+      }
       if (act === 'log' && method === 'GET') {
         var tail = Number(u.searchParams.get('tail')) || 300;
         return { lines: (logs[c.id] || []).slice(-tail) };
@@ -2184,7 +2212,8 @@ function createDemo() {
             checks: c.column === 'accepted' ? 'pass' : (c.status === 'failed' ? 'fail' : (c.column === 'develop' ? 'pending' : 'pass')) };
         });
       return { branch: ig.branch, base: ig.base, pr_url: ig.pr_url, pr_number: ig.pr_number,
-        pr_state: ig.pr_number ? 'OPEN' : null, mergeable: ig.pr_number ? 'MERGEABLE' : null, checks: ig.pr_number ? 'pass' : 'none', members: members };
+        pr_state: ig.pr_number ? 'OPEN' : null, mergeable: ig.pr_number ? 'MERGEABLE' : null, checks: ig.pr_number ? 'pass' : 'none',
+        head_sha: ig.pr_number ? 'feedfacefeedfacefeedfacefeedfacefeedface' : null, members: members };
     }
     if (method === 'POST' && p === '/api/integration/open-pr') {
       if (!st.integration.branch) throw err(409, 'no integration branch');

@@ -597,22 +597,41 @@ CHECK_GREEN_CONCLUSIONS = frozenset(("SUCCESS", "NEUTRAL", "SKIPPED"))
 CHECK_RED_CONCLUSIONS = frozenset(("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"))
 
 
-def override_checks_requested(body: Any) -> bool:
-    """The per-request CI override: only a literal JSON `true` counts (never persisted, never implied by force)."""
-    return isinstance(body, dict) and body.get("override_checks") is True
+def require_expected_head(number: int, verified: Dict[str, Any], body: Any) -> str:
+    """The merge is pinned to the head the OPERATOR saw, not whatever GitHub reports when the request arrives:
+    the request must name it as `expected_head`, and it must still be the PR's head. Returns that sha."""
+    expected = body.get("expected_head") if isinstance(body, dict) else None
+    extra = {"pr_number": number, "head_sha": verified["sha"], "checks": verified["checks"]}
+    if not isinstance(expected, str) or not HEAD_SHA_RE.fullmatch(expected):
+        raise ApiError(409, "PR #%d: send expected_head, the head commit you reviewed (it is now %s); refusing an "
+                       "unreviewed merge" % (number, verified["sha"]), dict(extra, code="head_required"))
+    if expected != verified["sha"]:
+        raise ApiError(409, "PR #%d moved: you reviewed %s but its head is now %s. Review the new head and try "
+                       "again" % (number, expected, verified["sha"]), dict(extra, code="head_moved",
+                                                                          expected_head=expected))
+    return expected
 
 
-def require_checks_pass(number: int, checks: str, override: bool, where: str) -> None:
+def override_checks_requested(body: Any, checks: str) -> bool:
+    """The per-request CI override: a literal JSON `true` in override_checks AND override_checks_state naming the
+    check state being overridden, so an override granted for "pending" never covers "fail". Never persisted,
+    never implied by force; the head it applies to is bound separately by require_expected_head."""
+    return (isinstance(body, dict) and body.get("override_checks") is True
+            and body.get("override_checks_state") == checks)
+
+
+def require_checks_pass(number: int, checks: str, override: bool, where: str, head_sha: str = "") -> None:
     """Refuse a merge unless the PR's checks pass. The message avoids the word the UI keys its blocker dialog on."""
     if checks == "pass":
         return
     if override:
-        log("CI OVERRIDE: merging PR #%d into %s with checks=%s (override_checks=true on this request)"
-            % (number, where, checks))
+        log("CI OVERRIDE: merging PR #%d at %s into %s with checks=%s (override_checks on this request)"
+            % (number, head_sha or "?", where, checks))
         return
     raise ApiError(409, "CI checks on PR #%d are %s, not pass; refusing to merge into %s. Wait for them, or send "
-                   "override_checks=true to merge anyway (logged)." % (number, checks, where),
-                   {"code": "checks_not_passing", "checks": checks, "pr_number": number})
+                   "override_checks=true with override_checks_state=%s to merge anyway (logged)."
+                   % (number, checks, where, json.dumps(checks)),
+                   {"code": "checks_not_passing", "checks": checks, "pr_number": number, "head_sha": head_sha})
 
 
 # --------------------------------------------------------------------------
@@ -1706,9 +1725,19 @@ class App:
             self.store.save()
             return card
 
+    def card_pr(self, card_id: str) -> Dict[str, Any]:
+        """What the Accept dialog shows (and sends back as expected_head): the card PR's head and check state."""
+        with self.store.lock:
+            card = dict(self.store.card(card_id))
+        number = valid_pr_number(card.get("pr_number")) or valid_pr_number(pr_number_from_url(card.get("pr_url")))
+        if not number:
+            raise ApiError(409, "card has no PR")
+        verified = self.verify_item_pr(number, card, str(card.get("integration_branch") or ""))
+        return {"pr_number": number, "head_sha": verified["sha"], "checks": verified["checks"],
+                "url": verified["url"], "base": card.get("integration_branch"), "head": card.get("branch")}
+
     def action_accept(self, card_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         force = bool(body.get("force"))
-        override = override_checks_requested(body)
         with self.store.lock:
             card = self.store.card(card_id)
             if card.get("column") != "review" or card.get("status") in ("merging", "running", "queued"):
@@ -1733,8 +1762,9 @@ class App:
             card_snapshot = dict(card)
         try:
             verified = self.verify_item_pr(number, card_snapshot, current)
-            require_checks_pass(number, verified["checks"], override, current)
-            head_sha = verified["sha"]
+            head_sha = require_expected_head(number, verified, body)
+            require_checks_pass(number, verified["checks"], override_checks_requested(body, verified["checks"]),
+                                current, head_sha)
         except ApiError as e:
             with self.store.lock:
                 card = self.store.card(card_id)
@@ -1745,10 +1775,11 @@ class App:
         with self.store.lock:
             card = self.store.card(card_id)
             if verified["checks"] != "pass":
-                add_history(card, "checks_overridden", "PR #%d merged with CI checks %s (override_checks on the "
-                            "accept request)" % (number, verified["checks"]))
-            add_history(card, "accepting", "merging PR #%d into %s%s" % (number, card.get("integration_branch"),
-                                                                       " (forced past blockers)" if open_blockers else ""))
+                add_history(card, "checks_overridden", "PR #%d merged at %s with CI checks %s (override_checks on "
+                            "the accept request)" % (number, head_sha, verified["checks"]))
+            add_history(card, "accepting", "merging PR #%d at %s into %s%s"
+                        % (number, head_sha, card.get("integration_branch"),
+                           " (forced past blockers)" if open_blockers else ""))
             self.store.save()
         try:
             self.gh_merge(number, head_sha)
@@ -1894,12 +1925,16 @@ class App:
             view: Dict[str, Any] = {"branch": branch, "base": integ.get("base") or self.cfg.base_branch,
                                     "pr_url": integ.get("pr_url"), "pr_number": integ.get("pr_number"),
                                     "status": integ.get("status"), "created_at": integ.get("created_at"),
-                                    "pr_state": None, "mergeable": None, "checks": "none", "members": []}
+                                    "pr_state": None, "mergeable": None, "checks": "none", "head_sha": None,
+                                    "members": []}
             errors = []
             if integ.get("pr_number"):
                 try:
-                    data = self.gh_pr_view(int(integ["pr_number"]))
+                    # the head and the checks come from ONE view, so the Ship dialog shows a matching pair
+                    data = self.gh_pr_view(int(integ["pr_number"]), "state,mergeable,statusCheckRollup,url,headRefOid")
                     view["pr_state"] = data.get("state")
+                    sha = str(data.get("headRefOid") or "")
+                    view["head_sha"] = sha if HEAD_SHA_RE.fullmatch(sha) else None
                     view["mergeable"] = data.get("mergeable")
                     view["checks"] = self._checks(data.get("statusCheckRollup"), self.cfg.required_checks)
                     view["pr_url"] = valid_pr_url(data.get("url")) or view["pr_url"]
@@ -2002,8 +2037,10 @@ class App:
                 raise ApiError(409, "invalid integration PR number %r" % (integ.get("pr_number"),))
             # the same treatment action_accept gives an item PR: base/head/state verified, merge head-pinned
             verified = self.verify_pr(number, base, branch, "the base branch")
+            require_expected_head(number, verified, body)
             # `force` (ship past in-flight cards) never implies a CI override; that flag is separate
-            require_checks_pass(number, verified["checks"], override_checks_requested(body), base)
+            require_checks_pass(number, verified["checks"], override_checks_requested(body, verified["checks"]), base,
+                                verified["sha"])
             log("integration merge: PR #%d %s -> %s at %s, checks=%s" % (number, branch, base, verified["sha"],
                                                                         verified["checks"]))
             self.gh_merge(number, verified["sha"])
@@ -2220,6 +2257,10 @@ def make_handler(app: App):
         except ValueError:
             tail = 300
         return {"lines": read_log_tail(path, tail)}
+
+    @route("GET", r"/api/cards/" + CARD + r"/pr")
+    def _card_pr(h, q, body, id):
+        return app.card_pr(id)
 
     @route("POST", r"/api/cards/" + CARD + r"/develop")
     def _develop(h, q, body, id):

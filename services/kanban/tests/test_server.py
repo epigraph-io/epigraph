@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import server as kanban  # noqa: E402
 
 CLAIM_A = "11111111-2222-4333-8444-555555555555"
+DEFAULT_SHA = "0123456789abcdef0123456789abcdef01234567"  # the gh stub's head sha unless a test sets one
 CLAIM_B = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 CLAUDE_STUB = r'''#!/usr/bin/env python3
@@ -295,6 +296,23 @@ class _ServerFixture(unittest.TestCase):
     def merge_calls(self, number):
         return [c["argv"] for c in self.stub_calls("gh") if c["argv"][:3] == ["pr", "merge", str(number)]]
 
+    def accept(self, cid, **extra):
+        """Accept as the UI does: read the PR head first (GET /pr), then send it back as expected_head."""
+        status, pr = self.req("GET", "/api/cards/%s/pr" % cid)
+        body = dict(extra)
+        if status == 200:
+            body.setdefault("expected_head", pr["head_sha"])
+        return self.req("POST", "/api/cards/%s/accept" % cid, body=body)
+
+    def ship(self, **extra):
+        """Ship as the UI does: send back the head sha the Integration panel showed."""
+        self.app._integ_cache = None
+        _, view = self.req("GET", "/api/integration")
+        body = dict(extra)
+        if isinstance(view, dict) and view.get("head_sha"):
+            body.setdefault("expected_head", view["head_sha"])
+        return self.req("POST", "/api/integration/merge", body=body)
+
 
 class KanbanServerTest(_ServerFixture):
     # ---- tests -----------------------------------------------------------
@@ -417,7 +435,7 @@ class KanbanServerTest(_ServerFixture):
         self.assertTrue(resolved["resolved"])
         self.assertEqual(resolved["note"], "decided: add column")
 
-        status, body = self.req("POST", "/api/cards/%s/accept" % CLAIM_A, body={})
+        status, body = self.accept(CLAIM_A)
         self.assertEqual(status, 200, body)
         self.assertEqual(body["column"], "accepted")
         self.assertEqual(body["status"], "merged")
@@ -444,7 +462,7 @@ class KanbanServerTest(_ServerFixture):
         self.assertEqual(create[create.index("--head") + 1], card["integration_branch"])
         self.assertIn(CLAIM_A, create[create.index("--body") + 1])
 
-        status, body = self.req("POST", "/api/integration/merge", body={"resolve_backlog": True})
+        status, body = self.ship(resolve_backlog=True)
         self.assertEqual(status, 200, body)
         self.assertEqual(body["shipped"], [CLAIM_A])
         self.assertIn(["pr", "merge", "200", "--merge", "--match-head-commit",
@@ -607,7 +625,7 @@ class IntegrationMergeGuardsTest(_ServerFixture):
     def accept_one(self, cid, title):
         self.import_claim(cid, "BACKLOG: " + title)
         card = self.develop_to_review(cid)
-        status, body = self.req("POST", "/api/cards/%s/accept" % cid, body={})
+        status, body = self.accept(cid)
         self.assertEqual(status, 200, body)
         return card["integration_branch"]
 
@@ -667,7 +685,7 @@ class IntegrationMergeGuardsTest(_ServerFixture):
 
         sha = "fedcba9876543210fedcba9876543210fedcba98"
         self.set_pr_number(integ_pr, base="main", head=branch, cross=False, state="OPEN", sha=sha)
-        status, body = self.req("POST", "/api/integration/merge", body={"resolve_backlog": False})
+        status, body = self.ship(resolve_backlog=False)
         self.assertEqual(status, 200, body)
         self.assertEqual(self.merge_calls(integ_pr),
                          [["pr", "merge", str(integ_pr), "--merge", "--match-head-commit", sha, "-R", "example/epigraph"]])
@@ -703,7 +721,7 @@ class IntegrationMergeGuardsTest(_ServerFixture):
     def test_gh_targets_the_pinned_repo_from_a_neutral_cwd(self):
         self.import_claim(CLAIM_PIN, "BACKLOG: pinned repo")
         self.develop_to_review(CLAIM_PIN)
-        status, body = self.req("POST", "/api/cards/%s/accept" % CLAIM_PIN, body={})
+        status, body = self.accept(CLAIM_PIN)
         self.assertEqual(status, 200, body)
         calls = self.stub_calls("gh")
         self.assertTrue(calls)
@@ -726,26 +744,35 @@ class IntegrationMergeGuardsTest(_ServerFixture):
 
 CLAIM_I = "12121212-1111-4222-8333-444444444444"
 CLAIM_J = "34343434-1111-4222-8333-444444444444"
+CLAIM_L = "bcbcbcbc-1111-4222-8333-444444444444"
 
 
 class ChecksGateTest(_ServerFixture):
-    """Both merge paths refuse unless CI checks pass; the only way past is a per-request override_checks."""
+    """Both merge paths refuse unless CI checks pass; the only way past is a per-request override_checks that names
+    the check state it overrides, on the head the operator reviewed."""
 
     def test_accept_refuses_unless_checks_pass(self):
         self.import_claim(CLAIM_I, "BACKLOG: gate me")
         card = self.develop_to_review(CLAIM_I)
         item = card["pr_number"]
-        for checks in ("FAILURE", "PENDING", "NONE"):
+        seen = {"expected_head": DEFAULT_SHA}
+        for checks, state in (("FAILURE", "fail"), ("PENDING", "pending"), ("NONE", "none")):
             self.set_pr_number(item, checks=checks)
-            for body in ({}, {"force": True}, {"override_checks": "true"}, {"override_checks": 1}):
+            for extra in ({}, {"force": True}, {"override_checks": "true"}, {"override_checks": 1},
+                          # a bare `true` no longer suffices, nor an override for a different state
+                          {"override_checks": True},
+                          {"override_checks": True, "override_checks_state": "pass"}):
+                body = dict(seen, **extra)
                 status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_I, body=body)
                 self.assertEqual(status, 409, (checks, body, resp))
                 self.assertEqual(resp.get("code"), "checks_not_passing", resp)
+                self.assertEqual((resp.get("checks"), resp.get("head_sha")), (state, DEFAULT_SHA), resp)
                 self.assertNotIn("block", resp["error"].lower())  # the UI routes /block/ to the blocker dialog
                 self.assertFalse(self.merge_calls(item), (checks, body))
                 self.assertEqual(self.card(CLAIM_I)["status"], "awaiting_review")
         self.set_pr_number(item, checks="FAILURE")
-        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_I, body={"override_checks": True})
+        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_I,
+                                body=dict(seen, override_checks=True, override_checks_state="fail"))
         self.assertEqual(status, 200, resp)
         self.assertEqual(len(self.merge_calls(item)), 1)
         self.assertIn("--match-head-commit", self.merge_calls(item)[0])
@@ -753,32 +780,82 @@ class ChecksGateTest(_ServerFixture):
         self.assertEqual(len(events), 1)
         self.assertIn("fail", events[0]["detail"])
 
-    def test_ship_refuses_unless_checks_pass(self):
+    def test_accept_is_bound_to_the_reviewed_head_and_the_observed_check_state(self):
+        sha_a, sha_b = DEFAULT_SHA, "b" * 40
+        self.import_claim(CLAIM_L, "BACKLOG: head bound")
+        item = self.develop_to_review(CLAIM_L)["pr_number"]
+        status, pr = self.req("GET", "/api/cards/%s/pr" % CLAIM_L)
+        self.assertEqual(status, 200, pr)
+        self.assertEqual((pr["pr_number"], pr["head_sha"], pr["checks"]), (item, sha_a, "pass"))
+        # no expected head at all: refused, and the refusal says which head the server sees
+        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_L, body={})
+        self.assertEqual((status, resp.get("code"), resp.get("head_sha")), (409, "head_required", sha_a), resp)
+        # probe test_d: refused as pending at A; the head then moves to B, which FAILS; the override re-POST for
+        # "pending on A" must not merge "fail on B"
+        self.set_pr_number(item, checks="PENDING")
+        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_L, body={"expected_head": sha_a})
+        self.assertEqual((status, resp.get("code"), resp.get("checks"), resp.get("head_sha")),
+                         (409, "checks_not_passing", "pending", sha_a), resp)
+        self.set_pr_number(item, sha=sha_b, checks="FAILURE")
+        override = {"expected_head": sha_a, "override_checks": True, "override_checks_state": "pending"}
+        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_L, body=override)
+        self.assertEqual((status, resp.get("code"), resp.get("head_sha")), (409, "head_moved", sha_b), resp)
+        # ...nor does the same override cover "fail" on the reviewed head
+        self.set_pr_number(item, sha=sha_a, checks="FAILURE")
+        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_L, body=override)
+        self.assertEqual((status, resp.get("code"), resp.get("checks")), (409, "checks_not_passing", "fail"), resp)
+        # probe test_e: A -> B, now green; accepting what was reviewed (A) must not merge B
+        self.set_pr_number(item, sha=sha_b, checks="SUCCESS")
+        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_L, body={"expected_head": sha_a})
+        self.assertEqual((status, resp.get("code")), (409, "head_moved"), resp)
+        self.assertFalse(self.merge_calls(item))
+        self.assertEqual(self.card(CLAIM_L)["status"], "awaiting_review")
+        # reviewing B and accepting B merges exactly B
+        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_L, body={"expected_head": sha_b})
+        self.assertEqual(status, 200, resp)
+        merge = self.merge_calls(item)
+        self.assertEqual(len(merge), 1)
+        self.assertEqual(merge[0][merge[0].index("--match-head-commit") + 1], sha_b)
+
+    def test_ship_refuses_unless_checks_pass_and_is_bound_to_the_seen_head(self):
         self.import_claim(CLAIM_J, "BACKLOG: ship gate")
-        card = self.develop_to_review(CLAIM_J)
-        status, resp = self.req("POST", "/api/cards/%s/accept" % CLAIM_J, body={})
+        self.develop_to_review(CLAIM_J)
+        status, resp = self.accept(CLAIM_J)
         self.assertEqual(status, 200, resp)
         status, resp = self.req("POST", "/api/integration/open-pr", body={})
         self.assertEqual(status, 200, resp)
         integ_pr = resp["pr_number"]
-        for checks in ("FAILURE", "PENDING", "NONE"):
+        seen = {"resolve_backlog": False, "expected_head": DEFAULT_SHA}
+        for checks, state in (("FAILURE", "fail"), ("PENDING", "pending"), ("NONE", "none")):
             self.set_pr_number(integ_pr, checks=checks)
-            for body in ({"resolve_backlog": False}, {"resolve_backlog": False, "force": True}):
+            for extra in ({}, {"force": True}, {"override_checks": True},
+                          {"override_checks": True, "override_checks_state": "pass"}):
+                body = dict(seen, **extra)
                 status, resp = self.req("POST", "/api/integration/merge", body=body)
                 self.assertEqual(status, 409, (checks, body, resp))
-                self.assertEqual(resp.get("code"), "checks_not_passing", resp)
+                self.assertEqual((resp.get("code"), resp.get("checks")), ("checks_not_passing", state), resp)
                 self.assertFalse(self.merge_calls(integ_pr), (checks, body))
-                _, state = self.req("GET", "/api/state")
-                self.assertEqual(state["integration"]["status"], "pr_open")
+                _, st = self.req("GET", "/api/state")
+                self.assertEqual(st["integration"]["status"], "pr_open")
                 self.assertEqual(self.card(CLAIM_J)["column"], "accepted")
-        self.set_pr_number(integ_pr, checks="PENDING")
+        # the Integration panel reports the head the Ship dialog must send back
+        self.app._integ_cache = None
+        self.assertEqual(self.req("GET", "/api/integration")[1].get("head_sha"), DEFAULT_SHA)
+        status, resp = self.req("POST", "/api/integration/merge", body={"resolve_backlog": False})
+        self.assertEqual((status, resp.get("code")), (409, "head_required"), resp)
+        # an override granted for "pending on A" does not ship B
+        self.set_pr_number(integ_pr, checks="FAILURE", sha="c" * 40)
         status, resp = self.req("POST", "/api/integration/merge",
-                                body={"resolve_backlog": False, "override_checks": True})
+                                body=dict(seen, override_checks=True, override_checks_state="pending"))
+        self.assertEqual((status, resp.get("code"), resp.get("head_sha")), (409, "head_moved", "c" * 40), resp)
+        self.assertFalse(self.merge_calls(integ_pr))
+        self.set_pr_number(integ_pr, checks="PENDING", sha=DEFAULT_SHA)
+        status, resp = self.req("POST", "/api/integration/merge",
+                                body=dict(seen, override_checks=True, override_checks_state="pending"))
         self.assertEqual(status, 200, resp)
         self.assertEqual(resp["checks"], "pending")
         self.assertEqual(len(self.merge_calls(integ_pr)), 1)
         self.assertTrue(any(h["event"] == "checks_overridden" for h in self.card(CLAIM_J)["history"]))
-        _, state = self.req("GET", "/api/state")
         self.assertEqual(self.app.store.state["integration_history"][-1]["checks_at_merge"], "pending")
 
 
@@ -815,10 +892,10 @@ class AgentEnvTest(_ServerFixture):
             for tool in ("Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"):
                 self.assertNotIn(tool, allowed)
 
-        status, body = self.req("POST", "/api/cards/%s/accept" % CLAIM_K, body={})
+        status, body = self.accept(CLAIM_K)
         self.assertEqual(status, 200, body)
         self.assertEqual(self.req("POST", "/api/integration/open-pr", body={})[0], 200)
-        status, body = self.req("POST", "/api/integration/merge", body={"resolve_backlog": True})
+        status, body = self.ship(resolve_backlog=True)
         self.assertEqual(status, 200, body)
         self.wait_for(lambda: any(h["event"] == "resolve_backlog" for h in self.card(CLAIM_K)["history"]),
                       what="retirement run")
