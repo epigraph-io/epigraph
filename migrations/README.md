@@ -410,9 +410,46 @@ Current reservation:
   claiming: no remote branch carries a `109`. **Applied to a throwaway database
   only, NOT to any deployed database.**
 
-- **110+**: public next
+- **110**: public `evidence_visibility_pins` — the kernel guard that keeps an
+  operator-HIDDEN evidence row hidden (operator directive 2026-09-23,
+  Amendment 2, B-H2; the operator approved this file). One definer-only side
+  table, `evidence_visibility_pins(evidence_id PK -> evidence ON DELETE
+  CASCADE, pinned_at, pinned_by, reason)`: ENABLE + FORCE row security, a
+  SELECT policy admitting `epigraph_bypass()` or `epigraph_definer_bypass()`,
+  INSERT and DELETE policies admitting `epigraph_bypass()` only, no UPDATE
+  policy, `REVOKE ALL` from `epigraph_app` then `GRANT SELECT` back (a
+  filtered read, as 107 does for `operator_links`), and `SELECT, INSERT,
+  DELETE` to `epigraph_maintenance`. A side table rather than a column because
+  `epigraph_app` holds a table-level UPDATE on `evidence` that a column REVOKE
+  does not subtract from. Pin-aware bodies for `epigraph_propagate_tenancy`
+  (072's arm d) and `epigraph_inherit_tenancy_stmt` (070's arm c), still
+  SECURITY DEFINER and owned by `epigraph_maintenance`: a pinned row is never
+  widened (it stays `group`) and its owner never changes on a claim
+  owner/visibility change, because an owner that followed the claim changed
+  who could READ the hidden row (stage-3 review measured the claim's new
+  owner, and a retired author's personal group, reading it). Unpinned rows get 072/070's statements exactly (one extra
+  `NOT EXISTS (pin)` conjunct on the `evidence` iteration only), and the
+  `derived text[]` literal is byte-for-byte 072's, because
+  `epigraph_cli::operator::tables::parse_derived_array` reads it. Registered
+  with the FORCE ratchets (`FORCE_PROTECTED_SET`,
+  `rls_enforcement.rs::PROTECTED` with an UPDATE row in
+  `DELIBERATELY_UNCOVERED`, `locked_decisions.rs::OPERATOR_TABLES`,
+  `docs/runbooks/079-undo.sql`). Behaviour in
+  `epigraph-db/tests/evidence_visibility_pins.rs`; the write path is
+  `epigraph-operator hide-evidence --apply`, reversed by `reown-reverse`. It is
+  not a read control: production's orphan `evidence_privacy` policy still
+  admits a hidden row to every app session until it is dropped, and the tool
+  refuses without `--accept-unenforced-hide`. Like 100, 101 and 107–109 it
+  sits inside internal's `060–112`. **No undo runbook ships**: undo is
+  `reown-reverse` on every hide manifest, then the two function bodies back to
+  072's and 070's, then `DROP TABLE public.evidence_visibility_pins` (in that
+  order: the bodies name the table). Checked before claiming: no `origin/*`
+  ref and no open PR carries a `110`. **Applied to a throwaway database only,
+  NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `110` or
+- **111+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `111` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

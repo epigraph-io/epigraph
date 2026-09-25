@@ -190,6 +190,15 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          re-pointing an agent to a different operator is a deliberate \
          superuser act, never an application path.",
     ),
+    (
+        "evidence_visibility_pins",
+        "UPDATE",
+        "A pin (110) is written and removed, never edited: `hide-evidence \
+         --apply` INSERTs it and `reown-reverse` DELETEs it, both on a \
+         maintenance session (the bypass-only INSERT and DELETE policies). \
+         Under FORCE the absent UPDATE policy default-denies every non-superuser \
+         role, and 110 grants UPDATE to nobody.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -249,6 +258,7 @@ const PROTECTED: &[&str] = &[
     "privatization_audit",
     "instance_admins",
     "operator_links",
+    "evidence_visibility_pins",
 ];
 
 // ===========================================================================
