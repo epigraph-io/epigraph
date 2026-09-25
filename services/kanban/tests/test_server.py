@@ -1208,6 +1208,62 @@ class BoardGitHardeningTest(_IsolatedRepo):
                                         capture_output=True, text=True).stdout, "")
 
 
+class ProcEnvironTest(_IsolatedRepo):
+    """A same-uid agent can read /proc/<board-pid>/environ, i.e. the environment the board was EXEC'd with (later
+    os.environ edits do not change it). The board must re-exec itself without its secrets and keep them in memory."""
+
+    @unittest.skipUnless(os.path.exists("/proc/self/environ"), "needs Linux /proc")
+    def test_board_process_environ_holds_no_secrets_after_startup(self):
+        import queue
+        canaries = {"EPIGRAPH_TOKEN": "CANARY_EPIGRAPH_TOKEN_123", "GH_TOKEN": "CANARY_GH_TOKEN_456",
+                    "DATABASE_URL": "postgres://CANARY_DB_789@localhost/x"}
+        env = dict(os.environ, KANBAN_HOME=os.path.join(self.tmp, "home"), KANBAN_BACKLOG_SOURCE="file",
+                   KANBAN_CLAUDE_BIN=self.claude, KANBAN_GH_BIN=os.path.join(self.tmp, "no-such-gh"),
+                   EPIGRAPH_API_BASE="http://127.0.0.1:9", **canaries)
+        errlog = open(os.path.join(self.tmp, "server.err"), "w")
+        self.addCleanup(errlog.close)
+        proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(HERE), "server.py"), "--port", "0",
+                                 "--repo", self.repo, "--no-refresh"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=errlog, env=env, text=True)
+
+        def stop():
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self.addCleanup(stop)
+        lines = queue.Queue()
+        threading.Thread(target=lambda: [lines.put(l) for l in proc.stdout], daemon=True).start()
+        link = None
+        deadline = time.time() + 30
+        while time.time() < deadline and link is None:
+            try:
+                line = lines.get(timeout=1)
+            except queue.Empty:
+                continue
+            if "#pair=" in line:
+                link = line.split("open ", 1)[1].split()[0]
+        self.assertIsNotNone(link, "the server never printed its pairing link")
+        port = int(link.split("127.0.0.1:", 1)[1].split("/", 1)[0])
+        code = link.split("#pair=", 1)[1]
+
+        with open("/proc/%d/environ" % proc.pid, "rb") as fh:
+            environ = fh.read()
+        leaked = [name for name, value in canaries.items() if value.encode() in environ]
+        self.assertEqual(leaked, [], "the board's /proc/<pid>/environ exposes %s" % leaked)
+
+        # ...and the board still holds the token in memory: the handoff worked, the secret did not just vanish
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", "/api/session/pair", body=json.dumps({"code": code}),
+                     headers={"Content-Type": "application/json"})
+        token = json.loads(conn.getresponse().read().decode())["token"]
+        conn.request("GET", "/api/state", headers={"X-Kanban-Token": token})
+        state = json.loads(conn.getresponse().read().decode())
+        conn.close()
+        self.assertTrue(state["config"]["epigraph_token_set"], state["config"])
+
+
 class PairBeforeAgentsTest(_IsolatedRepo):
     """While the pairing link is unredeemed, whoever reads the board's stdout first holds the only session. No agent
     may be running then: a card left queued by the previous server waits for the operator to pair."""

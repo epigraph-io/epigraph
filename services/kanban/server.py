@@ -2512,13 +2512,79 @@ def make_server(app: App, port: int) -> ThreadingHTTPServer:
     return server
 
 
+SECRETS_FD_ENV = "KANBAN_SECRETS_FD"
+
+
+def reexec_without_secrets(argv: List[str]) -> None:
+    """Re-exec this server with every AGENT_ENV_NEVER name removed from its environment, handing their values to
+    the new image over an inherited pipe.
+
+    /proc/<pid>/environ shows the environment a process was EXEC'd with; editing os.environ afterwards does not
+    change it, and any same-uid process (every agent) can read it. After this, the board's own environ holds no
+    token; the values live only in memory (Config) and in the gh subprocesses that need them. Returns without
+    doing anything when there is nothing to hide."""
+    held = {n: v for n, v in os.environ.items() if n in AGENT_ENV_NEVER}
+    if not held or SECRETS_FD_ENV in os.environ:
+        return
+    payload = json.dumps(held).encode("utf-8")
+    if len(payload) > 60000:  # stays below the pipe's capacity, so the write below cannot block
+        raise SystemExit("kanban: the secret environment variables are too large to hand over (%d bytes)" % len(payload))
+    r, w = os.pipe()
+    try:
+        os.write(w, payload)
+    finally:
+        os.close(w)
+    os.set_inheritable(r, True)
+    env = {k: v for k, v in os.environ.items() if k not in AGENT_ENV_NEVER}
+    env[SECRETS_FD_ENV] = str(r)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(sys.executable, [sys.executable, os.path.abspath(__file__)] + list(argv), env)
+
+
+def receive_secrets() -> Dict[str, str]:
+    """In the re-exec'd image: read (and close) the secrets pipe. Only AGENT_ENV_NEVER names are accepted."""
+    fd_text = os.environ.pop(SECRETS_FD_ENV, None)
+    if fd_text is None:
+        return {}
+    try:
+        fd = int(fd_text)
+    except ValueError:
+        return {}
+    chunks = []
+    try:
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError:
+        return {}
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if k in AGENT_ENV_NEVER}
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    held = receive_secrets()  # first: nothing may be spawned while the pipe fd is still open
+    if argv is None:
+        reexec_without_secrets(sys.argv[1:])  # returns only when there was nothing to hide
     parser = argparse.ArgumentParser(description="EpiGraph backlog kanban board (local)")
     parser.add_argument("--port", type=int, default=8097)
     parser.add_argument("--repo", default=None, help="git repo to develop in (default: git toplevel of cwd)")
     parser.add_argument("--no-refresh", action="store_true", help="do not fetch the backlog on startup")
     args = parser.parse_args(argv)
-    cfg = Config(repo=args.repo, port=args.port)
+    # the secrets are no longer in os.environ: build the config from the environment plus what was handed over
+    cfg = Config(repo=args.repo, port=args.port, env=dict(os.environ, **held))
     if cfg.jwt_secret_ignored:
         log("EPIGRAPH_JWT_SECRET is set but ignored: set EPIGRAPH_TOKEN to an OAuth-minted token for the http source")
     app = App(cfg)
