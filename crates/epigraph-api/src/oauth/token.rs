@@ -159,31 +159,103 @@ fn refresh_allowed(
 /// `oauth_clients`, the `agents` upsert, the write-once link and the
 /// personal-group bootstrap either all land or none do.
 ///
-/// The WARM path does no database work at all. `client_agent_id` is
+/// The WARM path does no transaction. `client_agent_id` is
 /// `oauth_clients.agent_id` from the row the caller already loaded to
 /// authenticate this request, which is exactly the value the transaction would
 /// re-read; taking it as an argument avoids `BEGIN; SELECT … FOR UPDATE;
 /// COMMIT;` — three round-trips plus a row-level lock that serialises
 /// concurrent mints for one client — on every refresh, forever, for a value the
-/// caller is holding.
+/// caller is holding. It does ONE read: the operated-agent refusal below.
+///
+/// # Operated agents are stdio-only (migration 107)
+///
+/// Both paths end in [`refuse_operated_agent`]: an agent with ANY operator
+/// link record (`epigraph_operator_of_author`: acting, retired, or with its
+/// membership revoked) gets no token, in every grant arm, because this
+/// function is the one choke point all four mint sites share. An operated
+/// agent's writer membership puts its operator's personal group in the
+/// `Viewer` of any token minted for it, so an OAuth token would carry the
+/// operator's write authority onto the HTTP surface. A link-time "has no OAuth
+/// client" check would not be enough — a client can be approved after the
+/// link — so the refusal is at issuance, re-read on every mint.
+///
+/// The refusal keys on the link RECORD, not on the acting read
+/// (`epigraph_operator_actor`), because what reaches the HTTP surface is the
+/// agent's MEMBERSHIP, and the acting read can answer "not acting" while that
+/// membership is live: a retired link over a writer row that predates it, or
+/// (migration 107 section 5) an acting link whose operator's own row was
+/// revoked. Keying on the acting read handed both a token that carried the
+/// operator group's write authority. A linked agent is stdio-only whatever the
+/// state of its link.
 ///
 /// This is on the write path of every token mint, so a failure here is an
 /// authentication failure — it is deliberately NOT best-effort.
 ///
 /// # Errors
-/// Returns `ApiError::InternalError` if the transaction cannot be opened,
-/// committed, or if the principal cannot be materialised.
+/// Returns `ApiError::Forbidden` for an operated agent, and when the
+/// principal's personal-group membership is revoked (migration 105: the
+/// provisioning step refuses to restore it). Returns `ApiError::InternalError`
+/// if the transaction cannot be opened or committed, if the principal cannot be
+/// materialised, or if the operated-agent check fails.
 #[cfg(feature = "db")]
 pub(crate) async fn principal_agent_id(
     state: &AppState,
     client_row_id: uuid::Uuid,
     client_agent_id: Option<uuid::Uuid>,
 ) -> Result<uuid::Uuid, ApiError> {
+    let agent_id = match client_agent_id {
+        Some(agent_id) => agent_id,
+        None => materialise_principal_agent(state, client_row_id).await?,
+    };
+    refuse_operated_agent(state, agent_id).await?;
+    Ok(agent_id)
+}
+
+/// Refuse to mint a token for an agent with any operator link record. See
+/// [`principal_agent_id`]. A RETIRED link refuses too: `epigraph_link_retired_agent`
+/// creates no membership, but a writer row that predates the retire, or one a
+/// concurrent roster write added, would otherwise ride the token onto HTTP.
+///
+/// # Errors
+/// `ApiError::Forbidden` naming the operator; `ApiError::InternalError` if the
+/// check itself fails (fail closed — no token on an unanswered question).
+#[cfg(feature = "db")]
+async fn refuse_operated_agent(state: &AppState, agent_id: uuid::Uuid) -> Result<(), ApiError> {
     use epigraph_db::repos::agent::AgentRepository;
 
-    if let Some(agent_id) = client_agent_id {
-        return Ok(agent_id);
+    match AgentRepository::operator_of_author_pool(&state.db_pool, agent_id).await {
+        Ok(None) => Ok(()),
+        Ok(Some(link)) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                operator_id = %link.operator_id,
+                retired = link.retired,
+                "token refused: the agent is operated (migration 107) and operated agents are \
+                 stdio-only"
+            );
+            Err(ApiError::Forbidden {
+                reason: format!(
+                    "agent {agent_id} is operated by {} and operated agents are stdio-only: a \
+                     token for it would carry the operator's write authority onto the HTTP \
+                     surface",
+                    link.operator_id
+                ),
+            })
+        }
+        Err(e) => Err(ApiError::InternalError {
+            message: format!("Failed to check whether agent {agent_id} is operated: {e}"),
+        }),
     }
+}
+
+/// The COLD path of [`principal_agent_id`]: materialise the client's agent and
+/// link it, in one transaction.
+#[cfg(feature = "db")]
+async fn materialise_principal_agent(
+    state: &AppState,
+    client_row_id: uuid::Uuid,
+) -> Result<uuid::Uuid, ApiError> {
+    use epigraph_db::repos::agent::AgentRepository;
 
     let mut tx = state
         .db_pool
@@ -196,10 +268,18 @@ pub(crate) async fn principal_agent_id(
     // `client_type` is read from the locked row inside `ensure_for_client`
     // rather than passed in: a caller cannot then pass one inconsistent with
     // what is stored (`providers::provision` used to hardcode "human").
+    // A revoked personal membership is a REFUSAL (migration 105), not a server
+    // fault: `ensure_for_client`'s last step is `ensure_personal_group`, which
+    // no longer restores a revoked row. The transaction is aborted by the RAISE,
+    // so the client stays UNLINKED and every later mint refuses the same way
+    // until an operator restores the membership — loud, and reversible.
     let agent_id = AgentRepository::ensure_for_client(&mut tx, client_row_id)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to resolve principal agent: {e}"),
+        .map_err(|e| match e {
+            e if e.is_personal_group_refusal() => ApiError::from(e),
+            other => ApiError::InternalError {
+                message: format!("Failed to resolve principal agent: {other}"),
+            },
         })?;
 
     tx.commit().await.map_err(|e| ApiError::InternalError {
@@ -546,6 +626,16 @@ async fn handle_client_credentials(
     ))
 }
 
+/// Revoke a refresh token (rotation, or a deliberate burn on a denied refresh).
+#[cfg(feature = "db")]
+async fn burn_refresh_token(state: &AppState, id: uuid::Uuid) -> Result<(), ApiError> {
+    epigraph_db::repos::refresh_token::RefreshTokenRepository::revoke(&state.db_pool, id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })
+}
+
 #[cfg(feature = "db")]
 async fn handle_refresh_token(
     state: &AppState,
@@ -572,13 +662,17 @@ async fn handle_refresh_token(
             reason: "Invalid or expired refresh token".to_string(),
         })?;
 
-    // Revoke old token (rotation)
-    RefreshTokenRepository::revoke(&state.db_pool, stored.id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?;
-
+    // WHEN THE OLD TOKEN IS BURNED (rotation). A DENIAL burns it on purpose --
+    // a suspended client, an identity no longer allowlisted, an operated agent
+    // keeps no reusable token -- but a FAILURE to answer must not: before
+    // migration 107 nothing between the revoke and the mint could fail on a
+    // warm client, and `principal_agent_id` now reads the operator link on
+    // every refresh. An `InternalError` there (e.g. a missing EXECUTE grant on
+    // `epigraph_operator_of_author`, which 107 section 6 names an outage) used to
+    // outlive the outage: the token was already revoked, so every refreshing
+    // client lost its chain. So the client is loaded and every check runs
+    // FIRST, and the token is revoked only once the refresh is either denied or
+    // about to mint.
     let client = OAuthClientRepository::get_by_id(&state.db_pool, stored.client_id)
         .await
         .map_err(|e| ApiError::InternalError {
@@ -589,6 +683,7 @@ async fn handle_refresh_token(
         })?;
 
     if client.status != "active" {
+        burn_refresh_token(state, stored.id).await?;
         return Err(ApiError::Forbidden {
             reason: "Client has been suspended or revoked".to_string(),
         });
@@ -598,10 +693,9 @@ async fn handle_refresh_token(
     // clients BEFORE minting. The provision gate only fires on a full ID-token /
     // authorization grant; refresh rotation re-issues a fresh 30d refresh on every
     // call, so without this an identity removed from the allowlist keeps renewing
-    // access indefinitely. The old token was already revoked above (rotation), so a
-    // denied refresh correctly burns it — a deauthorized identity keeps no reusable
-    // token. SKIP (issue normally) for non-external clients and unconfigured
-    // allowlists; see [`refresh_allowed`].
+    // access indefinitely. A denied refresh burns the old token here, so a
+    // deauthorized identity keeps no reusable token. SKIP (issue normally) for
+    // non-external clients and unconfigured allowlists; see [`refresh_allowed`].
     if !refresh_allowed(
         &state.providers,
         &client.client_id,
@@ -622,6 +716,7 @@ async fn handle_refresh_token(
                 "reason": "email_not_in_allowlist",
             }),
         );
+        burn_refresh_token(state, stored.id).await?;
         return Err(ApiError::Forbidden {
             reason: "email no longer authorized for this provider".into(),
         });
@@ -640,7 +735,21 @@ async fn handle_refresh_token(
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
     // their next token, and so all four mint sites share one code path.
-    let agent_id = principal_agent_id(state, client.id, client.agent_id).await?;
+    //
+    // A `Forbidden` (an operated agent) is a DENIAL and burns the token; any
+    // other error is a failure to answer and leaves it intact (see above).
+    let agent_id = match principal_agent_id(state, client.id, client.agent_id).await {
+        Ok(agent_id) => agent_id,
+        Err(denied @ ApiError::Forbidden { .. }) => {
+            burn_refresh_token(state, stored.id).await?;
+            return Err(denied);
+        }
+        Err(unanswered) => return Err(unanswered),
+    };
+
+    // Rotation: the refresh is going ahead, so the old token is spent.
+    burn_refresh_token(state, stored.id).await?;
+
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(

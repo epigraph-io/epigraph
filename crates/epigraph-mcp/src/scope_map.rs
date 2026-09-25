@@ -40,8 +40,13 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("get_provenance", "claims:read"),
     ("get_provenance_chain", "claims:read"),
     ("get_recall_events", "claims:read"),
+    // The theme READ path. `claims:read`, deliberately NOT the `claims:write`
+    // its sibling `theme_cluster` carries: these two issue only SELECTs, and
+    // gating them at write level would preserve exactly the gap they close —
+    // a read-only principal unable to see what topics the corpus holds.
+    ("get_theme", "claims:read"),
+    ("list_themes", "claims:read"),
     ("consolidate_claims", "claims:write"),
-    ("sweep_semantic_duplicates", "claims:write"),
     ("get_workflow_executions", "claims:read"),
     ("list_challenges", "claims:read"),
     ("list_events", "claims:read"),
@@ -67,7 +72,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("traverse", "claims:read"),
     // ─── claims:write ──────────────────────────────────────────────────
     ("add_step", "claims:write"),
-    ("backfill_embeddings", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),
     ("create_frame", "claims:write"),
@@ -93,7 +97,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("patch_edge", "claims:write"),
     ("refresh_workflow_promotion", "claims:write"),
     ("publish_event", "claims:write"),
-    ("recompute_beliefs", "claims:write"),
     ("reconcile_sheaf", "claims:write"),
     ("report_hierarchical_outcome", "claims:write"),
     ("report_workflow_outcome", "claims:write"),
@@ -132,6 +135,17 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("delete_edge", "claims:admin"),
     ("mark_duplicate", "claims:admin"),
     ("supersede_claim", "claims:admin"),
+    // The three corpus-wide maintenance jobs. They run on a bypass viewer over
+    // the maintenance connection, so they read and write EVERY tenant's rows
+    // regardless of the caller: `sweep_semantic_duplicates` returns other
+    // tenants' private claim ids and, with dry_run=false, retires them. At
+    // `claims:write` any ordinary bearer could do that (measured by the batch
+    // H-a review on config A: a claims:write-only principal with no membership
+    // listed two foreign group-private ids and retired one). Cross-tenant power
+    // is admin power, the same tier as `mark_duplicate`, which the sweep calls.
+    ("backfill_embeddings", "claims:admin"),
+    ("recompute_beliefs", "claims:admin"),
+    ("sweep_semantic_duplicates", "claims:admin"),
 ];
 
 #[cfg(test)]
@@ -189,6 +203,24 @@ mod tests {
         );
     }
 
+    /// The theme READ tools must sit at `claims:read`, not inherit
+    /// `theme_cluster`'s `claims:write`.
+    ///
+    /// Backlog `ac4d02b9`: the whole point of adding them is that a
+    /// read-scoped principal (pre-access sensitivity screening, partition
+    /// design) could not learn what topics the corpus covers without invoking
+    /// the destructive clusterer. Mapping them to `claims:write` would compile,
+    /// pass `every_registered_tool_has_a_scope`, and silently preserve that
+    /// gap — so it is asserted explicitly rather than left to the coverage
+    /// test.
+    #[test]
+    fn theme_read_tools_are_read_scoped() {
+        assert_eq!(required_scope("list_themes"), Some("claims:read"));
+        assert_eq!(required_scope("get_theme"), Some("claims:read"));
+        // And the writer is still a writer.
+        assert_eq!(required_scope("theme_cluster"), Some("claims:write"));
+    }
+
     /// Sanity-check the known mutation tools cited in issue #122 are gated on
     /// `claims:admin`.
     ///
@@ -208,5 +240,27 @@ mod tests {
         );
         assert_eq!(required_scope("mark_duplicate"), Some("claims:admin"));
         assert_eq!(required_scope("supersede_claim"), Some("claims:admin"));
+    }
+
+    /// The three maintenance tools act across every tenant on a bypass viewer,
+    /// so a `claims:write` bearer must not reach them.
+    ///
+    /// Asserted by name rather than left to the coverage test, which passes for
+    /// any mapping at all: the batch H-a review measured the `claims:write`
+    /// mapping letting a non-admin HTTP principal list and retire other
+    /// tenants' private claims once the tools were enabled.
+    #[test]
+    fn cross_tenant_maintenance_tools_are_admin_gated() {
+        for tool in [
+            "sweep_semantic_duplicates",
+            "recompute_beliefs",
+            "backfill_embeddings",
+        ] {
+            assert_eq!(
+                required_scope(tool),
+                Some("claims:admin"),
+                "{tool} runs on a bypass viewer over every tenant; claims:write must not reach it"
+            );
+        }
     }
 }

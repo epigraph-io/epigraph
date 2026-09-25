@@ -16,8 +16,10 @@
 //! * a delete removes exactly the targeted row and leaves its siblings alone.
 
 mod common;
+#[path = "viewer_fixture.rs"]
+mod fixture;
 
-use common::{build_test_server, seed_claim};
+use common::seed_claim;
 use epigraph_mcp::tools::edge_mutation::{do_delete_edge, do_patch_edge};
 use epigraph_mcp::types::{DeleteEdgeParams, PatchEdgeParams};
 use sqlx::PgPool;
@@ -90,7 +92,7 @@ async fn edge_event_count(pool: &PgPool, event_type: &str, edge_id: Uuid) -> i64
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn patch_shallow_merges_properties_and_retires(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let server = common::build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let source = seed_claim(&pool, "source claim", 0.5).await;
     let target = seed_claim(&pool, "target claim", 0.5).await;
     let edge_id = seed_edge(
@@ -105,6 +107,7 @@ async fn patch_shallow_merges_properties_and_retires(pool: PgPool) {
     // ── properties-only patch: merges, and must NOT close the window ──
     let merged = do_patch_edge(
         &server,
+        &fixture::public_viewer(&pool).await,
         PatchEdgeParams {
             edge_id: edge_id.to_string(),
             valid_to: None,
@@ -154,6 +157,7 @@ async fn patch_shallow_merges_properties_and_retires(pool: PgPool) {
     // ── retire with the "now" literal ──
     let retired = do_patch_edge(
         &server,
+        &fixture::public_viewer(&pool).await,
         PatchEdgeParams {
             edge_id: edge_id.to_string(),
             valid_to: Some("now".to_string()),
@@ -200,7 +204,7 @@ async fn patch_shallow_merges_properties_and_retires(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn patch_rejects_non_object_properties_without_corrupting_the_column(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let server = common::build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let source = seed_claim(&pool, "source claim", 0.5).await;
     let target = seed_claim(&pool, "target claim", 0.5).await;
     let edge_id = seed_edge(
@@ -222,6 +226,7 @@ async fn patch_rejects_non_object_properties_without_corrupting_the_column(pool:
     ] {
         let err = do_patch_edge(
             &server,
+            &fixture::public_viewer(&pool).await,
             PatchEdgeParams {
                 edge_id: edge_id.to_string(),
                 valid_to: None,
@@ -243,10 +248,11 @@ async fn patch_rejects_non_object_properties_without_corrupting_the_column(pool:
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn patch_rejects_empty_body_and_unknown_edge(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let server = common::build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let empty = do_patch_edge(
         &server,
+        &fixture::public_viewer(&pool).await,
         PatchEdgeParams {
             edge_id: Uuid::new_v4().to_string(),
             valid_to: None,
@@ -262,6 +268,7 @@ async fn patch_rejects_empty_body_and_unknown_edge(pool: PgPool) {
     let missing_id = Uuid::new_v4();
     let missing = do_patch_edge(
         &server,
+        &fixture::public_viewer(&pool).await,
         PatchEdgeParams {
             edge_id: missing_id.to_string(),
             valid_to: Some("now".to_string()),
@@ -282,7 +289,7 @@ async fn patch_rejects_empty_body_and_unknown_edge(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn delete_removes_only_the_targeted_edge(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let server = common::build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let source = seed_claim(&pool, "source claim", 0.5).await;
     let target = seed_claim(&pool, "target claim", 0.5).await;
     let doomed = seed_edge(&pool, source, target, "contradicts", serde_json::json!({})).await;
@@ -291,6 +298,7 @@ async fn delete_removes_only_the_targeted_edge(pool: PgPool) {
 
     let result = do_delete_edge(
         &server,
+        &fixture::public_viewer(&pool).await,
         DeleteEdgeParams {
             edge_id: doomed.to_string(),
         },
@@ -330,6 +338,7 @@ async fn delete_removes_only_the_targeted_edge(pool: PgPool) {
     // otherwise a retry cannot distinguish "already done" from "wrong id".
     let repeat = do_delete_edge(
         &server,
+        &fixture::public_viewer(&pool).await,
         DeleteEdgeParams {
             edge_id: doomed.to_string(),
         },
@@ -352,4 +361,81 @@ impl<T, E> UnwrapErrOrPanic<T, E> for Result<T, E> {
             Err(e) => e,
         }
     }
+}
+
+// ── caller read gate ────────────────────────────────────────────────────────
+
+/// A caller that cannot READ an edge must not be able to retire or relabel it,
+/// even though the write runs under the server agent's stamp.
+///
+/// Before the gate neither tool took a viewer, so the only thing between a
+/// `claims:write` caller and an edge touching another group's private claim was
+/// whether the SERVER agent could write it (batch H-a review). This harness
+/// connects as a superuser, so the stamp admits every write: the refusal below
+/// can only come from the caller-read gate, which is what makes the test
+/// discriminating. The calibration arm (a viewer that CAN read the edge)
+/// shows the same call succeeds, so the refusal is not a fixture accident.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edge_the_caller_cannot_read_is_not_patched_or_retracted(pool: PgPool) {
+    let server = common::build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "edge-gate-owner").await;
+    let a = fixture::seed_group_claim(&pool, owner, group, "private endpoint a").await;
+    let b = fixture::seed_group_claim(&pool, owner, group, "private endpoint b").await;
+    let edge = fixture::seed_edge_owned_by(&pool, a, b, "group", group).await;
+
+    let outsider = fixture::public_viewer(&pool).await;
+    let err = do_patch_edge(
+        &server,
+        &outsider,
+        PatchEdgeParams {
+            edge_id: edge.to_string(),
+            valid_to: Some("now".to_string()),
+            properties: Some(serde_json::json!({"gate": 1})),
+        },
+    )
+    .await
+    .expect_err("patch_edge on an edge the caller cannot read must be refused");
+    assert!(err.message.contains("not found"), "got: {}", err.message);
+    let (props, valid_to) = read_edge(&pool, edge).await.expect("edge row");
+    assert!(
+        valid_to.is_none(),
+        "the edge was retired by a caller that cannot read it"
+    );
+    assert!(
+        props.get("gate").is_none(),
+        "the edge was relabelled by a caller that cannot read it"
+    );
+
+    let err = do_delete_edge(
+        &server,
+        &outsider,
+        DeleteEdgeParams {
+            edge_id: edge.to_string(),
+        },
+    )
+    .await
+    .expect_err("delete_edge on an edge the caller cannot read must be refused");
+    assert!(err.message.contains("not found"), "got: {}", err.message);
+    assert!(
+        read_edge(&pool, edge).await.expect("edge row").1.is_none(),
+        "the edge was retracted by a caller that cannot read it"
+    );
+
+    // Calibration: the group's own member CAN read it, and the same call lands.
+    let member = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("resolve the owner's viewer");
+    do_delete_edge(
+        &server,
+        &member,
+        DeleteEdgeParams {
+            edge_id: edge.to_string(),
+        },
+    )
+    .await
+    .expect("a caller that can read the edge retracts it");
+    assert!(
+        read_edge(&pool, edge).await.expect("edge row").1.is_some(),
+        "calibration: the member's retraction must land"
+    );
 }

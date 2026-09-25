@@ -47,16 +47,23 @@ const FIXTURE: &str = r#"{
   ]
 }"#;
 
-fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+/// Built FROM A `ScopedPool`: the document ingest walk now runs in one
+/// transaction stamped from the ingesting agent and refuses (nothing written) on
+/// a server that cannot stamp one. `#[sqlx::test]` connects as a BYPASSRLS
+/// superuser, so the stamp is inert here — what this buys is that the fixture
+/// drives the PRODUCTION code path (`begin_author_stamped_tx`) rather than the
+/// refusal.
+async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::generate();
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
     let result = do_ingest_document(&server, &viewer, &extraction)
@@ -164,7 +171,7 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn ingested_claims_carry_doi_label_for_recompute(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
     do_ingest_document(&server, &viewer, &extraction)
@@ -185,7 +192,11 @@ async fn ingested_claims_carry_doi_label_for_recompute(pool: PgPool) {
 
     let result = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![doi_label.to_string()]),
@@ -211,7 +222,7 @@ async fn ingested_claims_carry_doi_label_for_recompute(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn re_ingest_same_paper_dedup_detected(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
     let _first = do_ingest_document(&server, &viewer, &extraction)
@@ -238,7 +249,7 @@ async fn re_ingest_same_paper_dedup_detected(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
 
     let make_chapter = |idx: u64| -> DocumentExtraction {
         let json = format!(
@@ -350,7 +361,7 @@ const FIXTURE_OVERLAP: &str = r#"{
 #[sqlx::test(migrations = "../../migrations")]
 async fn cross_paper_atom_and_author_converge(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let first: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
     let second: DocumentExtraction = serde_json::from_str(FIXTURE_OVERLAP).expect("fixture parses");
 
@@ -421,7 +432,7 @@ async fn cross_paper_atom_and_author_converge(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn ingest_document_persists_planned_properties(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
     do_ingest_document(&server, &viewer, &extraction)
@@ -453,7 +464,7 @@ async fn ingest_document_persists_planned_properties(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn ingest_document_handles_compound_equals_atom(pool: sqlx::PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
 
     // Reproduces the wrhq 2026-04-30 collision: paragraph compound text
     // is identical to its sole atom — same content_hash → same persisted
@@ -507,7 +518,7 @@ async fn ingest_document_handles_compound_equals_atom(pool: sqlx::PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn ingest_tags_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
 
     // Two atoms under a paragraph tagged (mixed-case) "Empirical" → their BBAs
     // must carry the normalized canonical tag; nothing should carry the raw
@@ -682,7 +693,7 @@ fn inline_params_expose_hierarchical_json_schema() {
 #[sqlx::test(migrations = "../../migrations")]
 async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
     let params = IngestDocumentInlineParams { extraction };
 
@@ -728,7 +739,7 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn writer_rejects_span_text_drift(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool);
+    let server = make_server(pool).await;
     let extraction: DocumentExtraction = serde_json::from_value(serde_json::json!({
         "source": {
             "title": "Drift Doc",

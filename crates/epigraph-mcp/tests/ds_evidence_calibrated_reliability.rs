@@ -44,10 +44,18 @@ use rmcp::model::RawContent;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+/// Scoped, because `submit_ds_evidence` now runs its `claim_frames` assignment
+/// and its `mass_functions` BBA in ONE transaction stamped from the author's
+/// viewer, and `ScopedPool::begin_as` is the only thing that can open one. Both
+/// tables carry migration 077's strict `WITH CHECK` with no orphan `*_privacy`
+/// policy to fall back on, so a server with no `ScopedPool` REFUSES the tool by
+/// name rather than writing on the unstamped pool — which is what this fixture
+/// used to do, and what made the tool return `42501` in production.
+async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&[0x5du8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let scoped = fixture::scoped_pool(&pool).await;
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 fn result_json(out: rmcp::model::CallToolResult) -> serde_json::Value {
@@ -108,9 +116,9 @@ fn base_params(claim_id: Uuid, frame_id: Uuid) -> SubmitDsEvidenceParams {
 #[sqlx::test(migrations = "../../migrations")]
 async fn evidence_type_testimonial_diverges_from_no_evidence_type(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let agent = insert_agent(&pool, "ds-calibrated-testimonial").await;
-    let frame_id = ensure_binary_frame(&pool, &viewer)
+    let frame_id = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &viewer)
         .await
         .expect("binary frame");
 
@@ -156,9 +164,9 @@ async fn evidence_type_testimonial_diverges_from_no_evidence_type(pool: PgPool) 
 #[sqlx::test(migrations = "../../migrations")]
 async fn omitting_evidence_type_is_byte_identical_to_legacy_behavior(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let agent = insert_agent(&pool, "ds-calibrated-backcompat").await;
-    let frame_id = ensure_binary_frame(&pool, &viewer)
+    let frame_id = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &viewer)
         .await
         .expect("binary frame");
     let claim = insert_claim(&pool, agent, &format!("calib-compat-{}", Uuid::new_v4())).await;

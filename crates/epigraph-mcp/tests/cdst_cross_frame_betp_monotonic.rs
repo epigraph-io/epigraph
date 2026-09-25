@@ -143,7 +143,11 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
     );
 
     // 4. Add a SUPPORTING evidence via the canonical update path (writes to binary_truth).
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let res = epigraph_mcp::tools::claims::update_with_evidence(
         &server,
         &viewer,

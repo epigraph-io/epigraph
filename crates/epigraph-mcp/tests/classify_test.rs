@@ -50,7 +50,15 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 async fn wire(pool: &PgPool, claim: Uuid, agent: Uuid, confidence: f64, supports: bool) {
     let viewer = fixture::public_viewer(pool).await;
     tools::ds_auto::auto_wire_ds_update(
-        pool, &viewer, claim, agent, confidence, 1.0, supports, None, None,
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        claim,
+        agent,
+        confidence,
+        1.0,
+        supports,
+        None,
+        None,
     )
     .await
     .expect("auto_wire_ds_update");
@@ -65,7 +73,11 @@ async fn recompute_and_label(
     let viewer = fixture::public_viewer(pool).await;
     tools::cdst_maintenance::recompute_beliefs(
         server,
-        &viewer,
+        &mut fixture::scoped_pool(pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,

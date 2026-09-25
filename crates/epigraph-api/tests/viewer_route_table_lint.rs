@@ -177,7 +177,25 @@ use std::path::{Path, PathBuf};
 /// The count is asserted exactly, so this ratchet stays monotone: adding a new
 /// inline `tier_a` read fails the build, and removing one fails it too until
 /// the number here is lowered. Do not raise it.
-const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3)];
+/// **`submit.rs` 0 -> 1, and it is a `#[cfg(test)]` read-back like the other
+/// three, not a new handler read.**
+///
+/// `submit_packet_rejects_unexpanded_label_and_writes_no_claim` (backlog
+/// `f6310444`) asserts that a packet carrying an unexpanded shell variable in
+/// `packet.claim.labels` is refused AND leaves no row. The count half is what
+/// makes guard PLACEMENT load-bearing rather than mere existence: a guard that
+/// runs after the write still returns 400 and still orphans a claim. Its
+/// statement is `SELECT COUNT(*) FROM claims WHERE content = $1` inside
+/// `#[cfg(all(test, feature = "db"))] mod db_tests` — a scalar count that
+/// PROJECTS NO CONTENT, matched here only because
+/// `measure_inline_claim_content_reads` keys on the `claims` table plus a
+/// content column and, by design, does not exclude `#[cfg(test)]`.
+///
+/// It is registered rather than rewritten because the alternative was to change
+/// the assertion so it dodges the scanner, which is the same laundering this
+/// register exists to prevent. The handler-read register below is UNCHANGED —
+/// that is the number "do not raise it" is about, and the one a leak would move.
+const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3), ("submit.rs", 1)];
 
 /// The register entries with **no filter and, since PR-14, no post-pass
 /// anywhere in the tree**.
@@ -254,7 +272,10 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // enforcing it, which is precisely the kind of reasoning this register
     // exists to keep visible rather than to accept silently.
     ("search.rs", 1),
-    ("workflows.rs", 4),
+    // 4 -> 3 (batch H-a): `report_outcome`'s unfiltered `SELECT content FROM
+    // claims` for the goal fallback became a `get_by_id_with_labels` read
+    // through the caller's viewer.
+    ("workflows.rs", 3),
 ];
 
 /// Fail-open scope-check sites: `if let Some(..) = auth_ctx { check_scopes(..) }`
@@ -477,7 +498,11 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("revoke_signature.rs", 1),
     // 4, not 5: the fifth is a `sqlx::query!` macro — see the note above.
     ("submit.rs", 4),
-    ("workflows.rs", 4),
+    // 4 -> 2 (batch H-a): `report_outcome`'s two unstamped, result-discarding
+    // `UPDATE claims` (truth value, counters) became
+    // `ClaimRepository::update_truth_value_conn` / `set_properties_conn` on a
+    // viewer-stamped transaction.
+    ("workflows.rs", 2),
 ];
 
 /// Tenancy-scoped tables whose route-layer writes this lint counts.

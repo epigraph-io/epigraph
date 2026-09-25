@@ -497,3 +497,107 @@ async fn absent_extensions_yield_empty_registry() {
     assert!(registry.is_empty());
     assert!(registry.list_federated_tools().is_empty());
 }
+
+// ── Unknown/unavailable tool attribution (backlog ee50d10d) ────────────────
+//
+// `attach_blob` is a FEDERATED episcience tool — `grep -rn attach_blob
+// crates/` finds nothing in this workspace. While episcience was unmounted,
+// every call for it fell through `call_tool`'s federation branch into
+// `enforce_tool_scope`'s deny-by-default arm and came back as
+// "Forbidden: tool 'attach_blob' is not authorized (no scope mapping)" —
+// an AUTHORIZATION verdict on a call whose credentials were never examined.
+// It was filed as an authorization regression for exactly that reason.
+
+/// An unhealthy extension whose configured `prefix=` matches the requested
+/// name is named as the likely owner.
+///
+/// End-to-end against a real registry (unreachable address => mounted
+/// unhealthy), not against the pure rule alone: the unit tests in
+/// `federation::candidate_tests` pin the narrowing logic, and this pins that
+/// `unhealthy_extension_candidates` actually reaches an unhealthy mount.
+#[tokio::test]
+async fn an_unhealthy_extension_owning_the_prefix_is_named_as_the_candidate() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let dead_addr = format!("127.0.0.1:{port}");
+
+    let registry = FederationRegistry::build(
+        vec![cfg("episcience", &dead_addr, Some("es_"))],
+        "discovery-tok",
+    )
+    .await
+    .expect("an unreachable extension must not fail the build");
+    let shared = SharedFederation::new(registry);
+
+    assert_eq!(
+        shared.unhealthy_extension_candidates("es_attach_blob"),
+        vec!["episcience".to_string()],
+        "a down extension that owns the prefix is the diagnosis for an \
+         unroutable name"
+    );
+}
+
+/// A healthy registry names nobody: there is no unreachable extension to blame,
+/// and inventing one would be as misleading as the authz message this replaces.
+#[tokio::test]
+async fn a_healthy_registry_names_no_unhealthy_candidate() {
+    let (addr, _slot) = spawn_stub("ping").await;
+    let registry = FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+        .await
+        .expect("build");
+    let shared = SharedFederation::new(registry);
+
+    assert!(
+        shared
+            .unhealthy_extension_candidates("attach_blob")
+            .is_empty(),
+        "nothing is down, so nothing may be blamed"
+    );
+}
+
+/// The message is a ROUTING verdict, and must not read as an authorization one.
+#[test]
+fn unknown_tool_error_reports_routing_not_authorization() {
+    let err = epigraph_mcp::EpiGraphMcpFull::unknown_tool_error("attach_blob", &[]);
+    let msg = err.message.to_string();
+
+    assert!(
+        msg.contains("attach_blob"),
+        "must name the tool that did not route: {msg}"
+    );
+    assert!(
+        !msg.contains("no scope mapping"),
+        "the old authz-shaped wording is the bug (backlog ee50d10d): {msg}"
+    );
+    assert!(
+        !msg.contains("Forbidden") && !msg.contains("not authorized"),
+        "a name that routes nowhere is not an authorization verdict; the \
+         caller's scopes were never consulted: {msg}"
+    );
+    assert!(
+        msg.contains("ROUTING failure"),
+        "must say what kind of failure this is, or the reader re-derives the \
+         wrong one: {msg}"
+    );
+}
+
+/// With a down extension, the message says which one — the whole point of the
+/// candidate lookup. Without that clause the caller still has a dead end.
+#[test]
+fn unknown_tool_error_names_the_unreachable_extension() {
+    let err = epigraph_mcp::EpiGraphMcpFull::unknown_tool_error(
+        "attach_blob",
+        &["episcience".to_string()],
+    );
+    let msg = err.message.to_string();
+
+    assert!(
+        msg.contains("episcience"),
+        "must name the configured-but-unreachable extension: {msg}"
+    );
+    assert!(
+        msg.contains("unreachable"),
+        "must say WHY it is being named, not just drop a bare name: {msg}"
+    );
+}

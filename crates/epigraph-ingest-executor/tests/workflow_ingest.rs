@@ -88,9 +88,13 @@ async fn execute_is_idempotent(pool: PgPool) {
     let extraction = build_minimal_workflow_extraction("executor-idempotent-test");
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
 
-    let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("first call");
+    let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("first call");
     assert!(
         !r1.already_ingested,
         "first ingest should not short-circuit"
@@ -101,9 +105,13 @@ async fn execute_is_idempotent(pool: PgPool) {
         "first ingest should write executes edges"
     );
 
-    let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("second call");
+    let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("second call");
     assert!(
         r2.already_ingested,
         "second ingest should hit the idempotency gate"
@@ -145,9 +153,13 @@ async fn execute_smoke(pool: PgPool) {
     let extraction = build_minimal_workflow_extraction("executor-smoke-test");
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
 
-    let r = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("ingest must succeed");
+    let r = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("ingest must succeed");
 
     assert!(!r.already_ingested);
     assert!(
@@ -180,7 +192,7 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
     let parent_extraction = build_minimal_workflow_extraction("parent_workflow_v1");
     let parent_plan = epigraph_ingest::workflow::builder::build_ingest_plan(&parent_extraction);
     let parent = epigraph_ingest_executor::execute_workflow_ingest_plan(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &parent_plan,
         &parent_extraction,
     )
@@ -191,7 +203,7 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
     let variant_extraction = build_workflow_with_parent("variant_v1", "parent_workflow_v1");
     let variant_plan = epigraph_ingest::workflow::builder::build_ingest_plan(&variant_extraction);
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &variant_plan,
         &variant_extraction,
     )
@@ -219,7 +231,7 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
 
     // Step 4: re-ingest must be idempotent — still exactly one edge.
     let _result2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &variant_plan,
         &variant_extraction,
     )
@@ -241,4 +253,68 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
         row_count2, 1,
         "re-ingest must not duplicate the variant_of edge"
     );
+}
+
+/// A machine-derived `properties.kind` carrying unexpanded shell syntax must
+/// cost its own label and nothing else — the workflow ingest must still
+/// complete.
+///
+/// Since backlog f6310444, `ClaimRepository::create_with_id_if_absent` refuses
+/// any label containing `$`. The executor walks a whole plan on a pool with no
+/// enclosing transaction, so passing `kind` through verbatim made an extraction
+/// emitting `kind = "cost_$_per_unit"` abort the ENTIRE ingest at that claim
+/// (`DbError::InvalidData`), leaving the claims written before it behind as a
+/// partial ingest. `labels_for_planned_kind` drops the unusable label instead.
+///
+/// The plan is built by the real builder and then mutated, because the builder
+/// hardcodes its own `kind` values — the corruption this guards against enters
+/// from LLM plan output, which reaches the executor as exactly this shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_kind_with_shell_syntax_costs_its_label_not_the_whole_ingest(pool: PgPool) {
+    let extraction = build_minimal_workflow_extraction("executor-dollar-kind-test");
+    let mut plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let planned_count = plan.claims.len();
+
+    // Corrupt exactly one planned claim's kind, the way an extraction would.
+    let victim_id = {
+        let victim = plan
+            .claims
+            .iter_mut()
+            .find(|c| c.level == 2)
+            .expect("the minimal extraction has a level-2 step claim");
+        victim.properties["kind"] = serde_json::json!("cost_$_per_unit");
+        victim.id
+    };
+
+    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("one unusable kind label must not abort the whole workflow ingest");
+
+    assert_eq!(
+        result.claims_ingested, planned_count,
+        "every planned claim must still be written"
+    );
+
+    let (labels,): (Vec<String>,) = sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
+        .bind(victim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the claim whose kind was corrupted must exist");
+    assert_eq!(
+        labels,
+        vec!["claim".to_string()],
+        "the unusable kind must be dropped and `claim` kept; got {labels:?}"
+    );
+
+    // And nothing anywhere in the graph acquired a `$` label from this ingest.
+    let corrupt: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM claims, unnest(labels) l WHERE l LIKE '%$%'")
+            .fetch_one(&pool)
+            .await
+            .expect("count corrupt labels");
+    assert_eq!(corrupt, 0, "no label may carry unexpanded shell syntax");
 }

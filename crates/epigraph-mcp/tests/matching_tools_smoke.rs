@@ -277,7 +277,12 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
     .unwrap();
     assert_eq!(edge_count.0, 1, "promote must write exactly one edge");
 
-    // Second decide is idempotent at the edge layer.
+    // A second promote is now REFUSED rather than silently replayed —
+    // transport parity with the HTTP route's `reject_if_decided` (backlog
+    // b3f95bea). The invariant this half of the test protects is unchanged
+    // (one decided pair, one edge); only the mechanism moved, from
+    // "`create_symmetric_if_absent` deduped the second write" to "the
+    // already-decided gate refused it before any write".
     tools::matching::decide_match_candidate(
         &server,
         &viewer,
@@ -287,7 +292,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
         },
     )
     .await
-    .expect("decide again");
+    .expect_err("a second promote must be refused as already decided");
     let edge_count2: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
          WHERE relationship = 'CORROBORATES'
@@ -301,7 +306,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
     .unwrap();
     assert_eq!(
         edge_count2.0, 1,
-        "duplicate promote must NOT duplicate edges"
+        "a refused duplicate promote must leave exactly one edge"
     );
 }
 
@@ -655,5 +660,327 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
         edge_relationships(&pool, a, b).await,
         vec!["CORROBORATES".to_string()],
         "a refused retire must leave the edge in place"
+    );
+}
+
+/// Transport-parity gate (backlog b3f95bea): `reject` on an ALREADY-PROMOTED
+/// row must be refused, not applied.
+///
+/// Without the gate `reject` just called `set_status(..., "rejected", ...)`.
+/// That leaves the promotion's `CORROBORATES` edge live while the row that
+/// owns it reads `rejected` — an edge whose only link back to a candidate is
+/// the informal, unenforced `properties->>'candidate_id'`, and whose derived
+/// `factors` row keeps corroborating in the belief graph. Nothing downstream
+/// can then distinguish it from an edge nobody ever decided.
+///
+/// The HTTP route has refused this since a3927179 (`reject_if_decided`, 409
+/// Conflict, pinned by
+/// `cross_source_route_tests::promote_and_reject_still_refuse_an_already_decided_candidate`);
+/// this pins the MCP transport to the same contract. Asserted on the DURABLE
+/// state (row status + in-force edge), not just the error string, so the test
+/// fails if the gate is bypassed by any future refactor of either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+
+    tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect("promote");
+    assert_eq!(
+        edge_relationships(&pool, a, b).await,
+        vec!["CORROBORATES".to_string()],
+        "precondition: the promotion wrote the matcher edge"
+    );
+
+    let err = tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "reject".into(),
+        },
+    )
+    .await
+    .expect_err("reject on a promoted row must be refused");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("already decided") && msg.contains("retire_match_candidate"),
+        "the refusal must name the state AND point at the real undo: {msg}"
+    );
+
+    // The refusal must be total: status untouched, edge still in force.
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status, "promoted",
+        "a refused reject must NOT flip the row out of `promoted` — that is \
+         exactly the state that orphans the edge"
+    );
+    assert_eq!(
+        edge_relationships(&pool, a, b).await,
+        vec!["CORROBORATES".to_string()],
+        "the matcher edge must still be in force"
+    );
+}
+
+/// The other half of the same gate: `promote` on a RETIRED (`stale`) row must
+/// be refused.
+///
+/// `retire_match_candidate` retracts the matcher edge (`valid_to` closed) and
+/// deletes the `factors` the `edges_auto_factor` trigger derived from it. An
+/// ungated re-`promote` calls `create_symmetric_if_absent`, whose existence
+/// check does NOT filter on `valid_to` — so the retracted row does not dedup
+/// and a SECOND, live edge is inserted, re-asserting in the belief graph the
+/// exact link an admin-scoped retirement just retracted. Asserting on the
+/// in-force edge count is what makes this load-bearing: an error-string-only
+/// test would pass against a gate that ran after the write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+
+    tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect("promote");
+    tools::matching::retire_match_candidate(
+        &server,
+        RetireMatchCandidateParams {
+            candidate_id: cand.to_string(),
+        },
+    )
+    .await
+    .expect("retire");
+    assert!(
+        edge_relationships(&pool, a, b).await.is_empty(),
+        "precondition: retirement took the edge out of force"
+    );
+
+    tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect_err("promote on a retired row must be refused");
+
+    assert!(
+        edge_relationships(&pool, a, b).await.is_empty(),
+        "a refused promote must NOT resurrect the retracted matcher edge"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "stale", "the retirement must stand");
+}
+
+/// `retire` is not a `decide_match_candidate` verdict — it is a separate tool
+/// carrying `claims:admin` instead of `claims:write`. The rejection message
+/// used to list `'retire'` among the valid verdicts while refusing it, which
+/// sent callers in a circle. It must now name the tool that actually does it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_unknown_verdict_points_at_the_retire_tool(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+
+    let err = tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "retire".into(),
+        },
+    )
+    .await
+    .expect_err("`retire` is not a decide verdict");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("retire_match_candidate"),
+        "must name the tool that performs a retirement: {msg}"
+    );
+    assert!(
+        !msg.contains("'retire'"),
+        "must no longer advertise 'retire' as a valid verdict: {msg}"
+    );
+}
+
+// ── Sweep coverage (backlog 4194b4a7 ask 3 / 9a513d47) ──────────────────────
+//
+// `find_cross_source_matches` returned `{claim_id, candidates, corroborates}`
+// and nothing else, so `candidates: []` was ambiguous between "the matcher
+// scanned this claim and found nothing" and "the matcher has never looked at
+// it". Only the second is actionable. The per-claim marker already existed
+// (`claims.last_match_scan_at`, migration 037, stamped by the
+// `cross_source_sweep` CLI); the read never surfaced it.
+
+/// Never-scanned claim: `never_swept: true`, `last_swept_at: null`.
+///
+/// This is the state the backlog was filed from — empty candidates on a
+/// freshly-ingested claim — and the whole point is that the response now says
+/// which of the two states it is in.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_cross_source_matches_reports_never_swept_for_an_unscanned_claim(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+
+    let out = tools::matching::find_cross_source_matches(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        FindCrossSourceMatchesParams {
+            claim_id: a.to_string(),
+        },
+    )
+    .await
+    .expect("find");
+    let json: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json");
+
+    assert_eq!(
+        json["candidates"],
+        serde_json::json!([]),
+        "precondition: no candidates, which is exactly the ambiguous case"
+    );
+    assert_eq!(
+        json["never_swept"],
+        serde_json::json!(true),
+        "a claim with last_match_scan_at IS NULL has never been swept; without \
+         this field the empty candidate list above is uninterpretable: {json}"
+    );
+    assert_eq!(
+        json["last_swept_at"],
+        serde_json::Value::Null,
+        "never swept means no timestamp: {json}"
+    );
+}
+
+/// Scanned claim with no matches: `never_swept: false` plus the stamp. Same
+/// empty `candidates` as the test above — the two responses must differ.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_cross_source_matches_reports_last_swept_at_for_a_scanned_claim(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+
+    // What `cross_source_sweep.rs` does to every seed it scans.
+    sqlx::query(
+        "UPDATE claims SET last_match_scan_at = TIMESTAMPTZ '2026-09-01 12:00:00+00' \
+         WHERE id = $1",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await
+    .expect("stamp");
+
+    let out = tools::matching::find_cross_source_matches(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        FindCrossSourceMatchesParams {
+            claim_id: a.to_string(),
+        },
+    )
+    .await
+    .expect("find");
+    let json: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json");
+
+    assert_eq!(
+        json["candidates"],
+        serde_json::json!([]),
+        "precondition: the matcher ran and found nothing"
+    );
+    assert_eq!(
+        json["never_swept"],
+        serde_json::json!(false),
+        "this claim WAS swept — reporting it as unswept would send an agent to \
+         re-run a sweep that already covered it: {json}"
+    );
+    assert!(
+        json["last_swept_at"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("2026-09-01")),
+        "must report the stamp the sweep wrote, got {json}"
+    );
+}
+
+/// A claim the viewer cannot read yields NEITHER coverage field.
+///
+/// The fail-open this pins: treating "no visible row" as "never swept". That
+/// arm is reachable for every private claim id a stranger can guess, and it
+/// would (a) assert something false — a group claim may well have been swept,
+/// the sweep runs corpus-wide on a maintenance pool — and (b) be an existence
+/// signal about a row the caller has no right to. The pre-existing contract for
+/// an unreadable claim is empty arrays and no error; the coverage fields must
+/// not break it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_cross_source_matches_omits_sweep_coverage_for_an_invisible_claim(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "xsm-coverage").await;
+    let private = fixture::seed_group_claim(&pool, owner, group, "private xsm claim").await;
+
+    // Swept, so a leaking implementation has a real timestamp to hand back.
+    sqlx::query("UPDATE claims SET last_match_scan_at = now() WHERE id = $1")
+        .bind(private)
+        .execute(&pool)
+        .await
+        .expect("stamp");
+
+    let out = tools::matching::find_cross_source_matches(
+        &server,
+        // Public-only viewer: not a member of `group`.
+        &fixture::public_viewer(&pool).await,
+        FindCrossSourceMatchesParams {
+            claim_id: private.to_string(),
+        },
+    )
+    .await
+    .expect("an unreadable claim is empty, not an error");
+    let json: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json");
+
+    assert!(
+        json.get("never_swept").is_none(),
+        "must not answer a sweep-coverage question about a claim this viewer \
+         cannot read: {json}"
+    );
+    assert!(
+        json.get("last_swept_at").is_none(),
+        "must not leak the sweep stamp of an invisible claim: {json}"
+    );
+    assert_eq!(
+        json["candidates"],
+        serde_json::json!([]),
+        "the pre-existing non-leaking shape is preserved: {json}"
     );
 }

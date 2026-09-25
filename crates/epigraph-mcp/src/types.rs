@@ -155,6 +155,19 @@ pub struct QueryClaimsParams {
 
     #[schemars(description = "Maximum number of results (default 20)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Retirement-state filter. DEFAULTS TO true: superseded/refuted claims are \
+                       excluded unless you pass false explicitly, which returns ONLY superseded \
+                       rows. Omitting this is not 'no filter' — it is 'current claims only', so a \
+                       queue built on this tool does not keep re-surfacing claims that have \
+                       already been resolved. THERE IS NO VALUE THAT RETURNS BOTH POPULATIONS: \
+                       true and false are the only two states and each excludes the other \
+                       (this tool did return both when the parameter was omitted; it no longer \
+                       does). To see both, call twice — once with true, once with false — and \
+                       merge the results."
+    )]
+    pub is_current: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -297,6 +310,26 @@ pub struct UpdateWithEvidenceParams {
 pub struct GetProvenanceParams {
     #[schemars(description = "The UUID of the claim to get provenance for")]
     pub claim_id: String,
+
+    #[schemars(
+        description = "Maximum ancestor depth to walk. Default 5, clamped to 1..=20. \
+                       The bundle reports `truncated: true` when the walk stopped early."
+    )]
+    pub max_depth: Option<i32>,
+
+    #[schemars(
+        description = "Maximum number of claim nodes kept in the bundle. Default 50, \
+                       clamped to 1..=500. The target claim plus its nearest ancestors \
+                       are kept; `truncated: true` when the cap bit."
+    )]
+    pub max_nodes: Option<usize>,
+
+    #[schemars(
+        description = "Per-claim content character budget. Default 500, clamped to \
+                       50..=20000. Entities whose content was cut carry \
+                       `content_truncated: true` and the original `content_chars`."
+    )]
+    pub max_content_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -465,7 +498,7 @@ pub struct RecallParams {
 
     #[schemars(
         description = "Optional lens frame UUID (from list_frames). Must be paired with perspective_id. \
-                       When both are set, each returned claim carries an additive lensed_belief computed under that (frame, perspective) lens. Ranking and min_truth stay on the global truth_value."
+                       When both are set, each returned claim carries an additive lensed_belief computed under that (frame, perspective) lens. Ranking stays on the global truth_value; min_truth gates on the UNFRAMED DS pignistic probability (falling back to truth_value for a claim with no DS cache), so it is not the lensed value and not the authored scalar."
     )]
     #[serde(default)]
     pub frame_id: Option<String>,
@@ -508,6 +541,81 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+
+    #[schemars(
+        description = "Optional theme UUID (from list_themes / get_theme). When set, the CANDIDATE \
+                       POOL of every claims retrieval surface — the hybrid dense leg, the hybrid \
+                       lexical leg, and the embedder-down lexical fallback — is narrowed in SQL to \
+                       that theme's members BEFORE each leg's LIMIT, so no off-theme claim can \
+                       reach the caller and no off-theme claim consumes pool budget. Distinct from \
+                       recall_with_context's diverse=true, which picks themes internally by \
+                       centroid similarity and lets you pin none of them. Mutually exclusive with \
+                       theme_label. A malformed UUID or an unknown theme is REJECTED, never \
+                       silently ignored — a dropped scope filter would widen recall to the whole \
+                       corpus while you believe it is scoped."
+    )]
+    #[serde(default)]
+    pub theme_id: Option<String>,
+
+    #[schemars(
+        description = "Optional exact theme label, resolved to a theme UUID. Mutually exclusive \
+                       with theme_id. Rejected when it matches zero themes, and rejected (listing \
+                       the candidates) when it matches more than one — claim_themes has no \
+                       UNIQUE(label) constraint, so 'the first match' could be any of several \
+                       distinct themes."
+    )]
+    #[serde(default)]
+    pub theme_label: Option<String>,
+
+    #[schemars(
+        description = "Skip the first N ranked claims (default 0). Combine with limit to walk a \
+                       theme to exhaustion; the response carries next_offset and more_available. \
+                       Applied in SQL on the fused ranking, whose ORDER BY carries a claim_id \
+                       tiebreaker so a page boundary cannot show one claim twice and another \
+                       never. CAVEAT: min_truth and exclude_contested are applied in Rust AFTER \
+                       the SQL page, so a page can come back SHORTER than limit while more pages \
+                       remain — use more_available, not an empty page, as the stop condition. \
+                       Rejected together with include_workflows=true: workflows are a separate \
+                       id-space with no ranking continuity across claim pages, so paging them \
+                       alongside claims would re-serve the same workflows on every page."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
+
+    #[schemars(
+        description = "When true, REPLACE the flat `results` array with an `epistemic_partition` \
+                       object grouping the same hits into `confirmed` (truth_value >= 0.75 and \
+                       not contested), `open_question` (is_contested — any live \
+                       contradicts/refutes), and `uncertain` (everything else). Contest is \
+                       checked FIRST, so a high-truth claim carrying a live refutation is \
+                       reported as an open question rather than as confirmed. Ranking is \
+                       UNCHANGED: each bucket keeps the RRF order the flat list would have had, \
+                       and the union of the three buckets is exactly the flat list — this \
+                       regroups the page, it does not filter or re-rank it. `results` is OMITTED \
+                       when this is true, so a caller opts into the new shape explicitly. \
+                       Default false: output is byte-identical to recall without this parameter."
+    )]
+    #[serde(default)]
+    pub epistemic_partition: bool,
+
+    #[schemars(
+        description = "Optional intra-result diversity constraint, as a COSINE DISTANCE in \
+                       (0.0, 2.0] over claims.embedding. When set, a greedy MMR pass walks the \
+                       ranked page top-down and DROPS any hit sitting closer than this to a hit \
+                       already kept above it, so a query cannot come back as ten paraphrases of \
+                       one fact. 0.15 is a reasonable starting value; larger = more aggressive \
+                       de-duplication. SHRINKS the page rather than back-filling — the SQL page \
+                       is already truncated to limit, so there is nothing below to promote, and \
+                       this matches how min_truth and exclude_contested already behave. Use \
+                       paging.more_available, not a short page, as the stop condition. Hits \
+                       whose distance cannot be MEASURED are always KEPT, never dropped: that \
+                       covers workflow hits (include_workflows=true — they are not claims rows) \
+                       and any claim with no embedding, as on the embedder-down lexical \
+                       fallback, where this parameter therefore does nothing. A value outside \
+                       the range is REJECTED, not clamped. Default: no diversity filtering."
+    )]
+    #[serde(default)]
+    pub diversity_radius: Option<f64>,
 }
 
 // ── Ingestion ──
@@ -518,6 +626,16 @@ pub struct RecallParams {
 pub struct QueryPaperParams {
     #[schemars(description = "DOI of the paper (e.g. '10.48550/arXiv.2508.16798')")]
     pub doi: String,
+
+    #[schemars(
+        description = "Maximum asserted claims to return in this page. Default 25, \
+                       clamped to 1..=200. `claim_count` remains the full total, so \
+                       `claim_count > offset + returned` means there are more pages."
+    )]
+    pub limit: Option<i64>,
+
+    #[schemars(description = "Asserted claims to skip (paging). Default 0.")]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -654,7 +772,9 @@ pub struct EvaluateWorkflowPromotionParams {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
-    #[schemars(description = "Zero-based index of the step in the workflow")]
+    #[schemars(
+        description = "Zero-based index of the step in the workflow's original plan order; steps added later with add_step come after all planned steps."
+    )]
     pub step_index: usize,
 
     #[schemars(description = "What the workflow plan said to do for this step")]
@@ -672,7 +792,9 @@ pub struct StepExecution {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReportWorkflowOutcomeParams {
-    #[schemars(description = "UUID of the workflow claim to report on")]
+    #[schemars(
+        description = "UUID of the workflow: a workflows-table id (from store_workflow / ingest_workflow / find_workflow), or a legacy flat workflow claim id."
+    )]
     pub workflow_id: String,
 
     #[schemars(description = "true if the workflow succeeded, false if it failed")]
@@ -682,7 +804,7 @@ pub struct ReportWorkflowOutcomeParams {
     pub execution_log: Vec<StepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed')"
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Recorded in the evidence row for a legacy flat workflow claim; not stored for a workflows-table id."
     )]
     pub outcome_details: String,
 
@@ -692,14 +814,16 @@ pub struct ReportWorkflowOutcomeParams {
     pub quality: Option<f64>,
 
     #[schemars(
-        description = "Your specific goal for this run. Falls back to the workflow's goal if omitted. More specific goal text improves future affinity matching."
+        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching, but only for a legacy flat workflow claim: a workflows-table id stores no goal embedding."
     )]
     pub goal_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeprecateWorkflowParams {
-    #[schemars(description = "UUID of the workflow to deprecate")]
+    #[schemars(
+        description = "UUID of the workflow to deprecate. A hierarchical workflows-table id deprecates only that workflows row, not its thesis or step claims (see the tool description)."
+    )]
     pub workflow_id: String,
 
     #[schemars(
@@ -767,7 +891,7 @@ pub struct FindWorkflowHierarchicalParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HierarchicalStepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2)."
+        description = "Zero-based index of the step in the workflow's original plan order (matches `executes`-edge ordering at level=2); steps added later with add_step come after all planned steps. An out-of-range index is stored with a null step_claim_id."
     )]
     pub step_index: usize,
 
@@ -795,12 +919,12 @@ pub struct ReportHierarchicalOutcomeParams {
     pub success: bool,
 
     #[schemars(
-        description = "Per-step execution log. Each step_index is resolved to the step's claim node via `executes` edges so per-step evidence accrues."
+        description = "Per-step execution log. Each step_index is resolved to the step's claim node via `executes` edges and recorded as one behavioral_executions row (no evidence row, no belief change)."
     )]
     pub step_executions: Vec<HierarchicalStepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed')."
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Currently accepted but not stored."
     )]
     pub outcome_details: String,
 
@@ -816,7 +940,7 @@ pub struct ReportHierarchicalOutcomeParams {
     pub run_label: Option<String>,
 
     #[schemars(
-        description = "Your specific goal for this run. More specific goal text improves future affinity matching."
+        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). This path stores no goal embedding, so it does not feed affinity matching."
     )]
     pub goal_text: Option<String>,
 }
@@ -922,16 +1046,26 @@ pub struct SubmitDsEvidenceParams {
     pub reliability: Option<f64>,
 
     #[schemars(
-        description = "Combination method: Dempster (default), Conjunctive, YagerOpen, YagerClosed, DuboisPrade, Inagaki"
+        description = "Combination method label: Dempster (default), Conjunctive, YagerOpen, \
+                       YagerClosed, DuboisPrade, Inagaki. Validated, stored on the BBA and echoed \
+                       as method_used, but it does NOT change the returned belief: the claim's \
+                       belief is always recomputed by the shared adaptive combine."
     )]
     pub combination_method: Option<String>,
 
     #[schemars(
-        description = "Inagaki gamma parameter (only used with Inagaki method, default 0.5)"
+        description = "Inagaki gamma parameter. Currently has no effect: it is neither stored nor \
+                       used by the belief recompute."
     )]
     pub gamma: Option<f64>,
 
-    #[schemars(description = "Perspective UUID for scoped combination (optional)")]
+    #[schemars(
+        description = "Optional perspective UUID stored on the BBA. It is part of the BBA's \
+                       replacement key: a resubmission by this agent for the same claim, frame and \
+                       perspective_id replaces the earlier BBA, while a different perspective_id adds \
+                       a separate one. It does not scope the combination: the returned belief \
+                       combines every BBA on the claim and frame regardless of perspective."
+    )]
     pub perspective_id: Option<String>,
 
     #[schemars(
@@ -1059,11 +1193,92 @@ pub struct SubmitClaimResponse {
     pub frame_id: Option<String>,
 }
 
+/// Outcome of the content-integrity half of MCP `verify_claim`.
+///
+/// Three states, not two, because `claims.content_hash` is NOT `blake3(content)`
+/// for every row. The canonical Tier-1 document pipeline deliberately binds
+/// `compound_content_hash(blake3(text), artifact_seed)` on every level-0/1/2
+/// (thesis / section / paragraph) node —
+/// `epigraph_ingest::common::plan::PlannedClaim::content_hash` states the
+/// contract, and migration 013's `UNIQUE (content_hash, agent_id)` is why it
+/// exists. Collapsing that class into a boolean forces a wrong answer whichever
+/// way the boolean falls: `true` is the always-passing theatre backlog
+/// `49c17386` was filed about, `false` is a confident tampering accusation
+/// against every untampered structural row in the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HashCheck {
+    /// BLAKE3 over the body reproduces the stored digest. The body is intact
+    /// *with respect to the digest* — who vouched for the digest is
+    /// [`VerifyResponse::signature_valid`]'s question, not this one.
+    Match,
+    /// BLAKE3 over the body does NOT reproduce the stored digest, and this row's
+    /// digest is supposed to be `blake3(content)`. **This is the tampering
+    /// signal** — the body was mutated without rewriting the hash.
+    Mismatch,
+    /// The stored digest is not a function of the body alone, so comparing them
+    /// decides nothing. Reported for document-scoped compound rows, detected via
+    /// `epigraph_ingest::document::stored_content_hash_is_seed_scoped`.
+    ///
+    /// **Undecided, not clean.** Content-hash verification cannot rule tampering
+    /// in *or* out here: the artifact seed that went into the stored digest is
+    /// not carried on the claim, so the digest cannot be recomputed, and a
+    /// guessed seed would manufacture false confidence. Treat this as "no
+    /// integrity evidence available", and use the signature half plus the
+    /// document's own provenance instead.
+    NotApplicable,
+}
+
+/// Result of MCP `verify_claim`.
+///
+/// # A claim is attested only when `signed && signature_valid && hash_check == match`
+///
+/// The two checks are INDEPENDENT and neither implies the other. The signature
+/// attests the digest; the digest attests the body. An attacker who mutates
+/// `claims.content` while leaving `content_hash` and `signature` untouched
+/// yields `{signed: true, signature_valid: true, hash_check: "mismatch"}` — the
+/// signature is genuinely valid over a digest the body no longer matches, so a
+/// caller reading `signature_valid` alone is still fooled. Conversely a
+/// consistent body/digest pair says nothing about who wrote it.
+///
+/// `hash_check: "not_applicable"` is a third outcome and is NOT a failure
+/// report: it means this row's digest is not derivable from its body by
+/// construction (see [`HashCheck::NotApplicable`]), so the body-attests step is
+/// simply unavailable. `{signed: true, signature_valid: true, hash_check:
+/// "not_applicable"}` says a known key vouched for the stored digest and says
+/// nothing at all about whether the body still matches it. Do not read that
+/// combination as attestation of the content.
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub claim_id: String,
+    /// Whether the stored Ed25519 signature verifies against the signer's
+    /// `agents.public_key` over the **stored** `content_hash`.
+    ///
+    /// `false` covers two very different states — read it together with
+    /// [`Self::signed`]: `signed = false` means the claim carries no signature
+    /// at all (nothing to verify), `signed = true` with
+    /// `signature_valid = false` means a signature is present and REJECTED.
     pub signature_valid: bool,
-    pub hash_matches: bool,
+    /// Whether the claim was signed at all (`claims.signature IS NOT NULL`).
+    ///
+    /// Added with backlog `49c17386`: `signature_valid` alone conflated
+    /// "unsigned" with "bad signature", and while `claim_from_row` hardcoded
+    /// `signature = None` every claim looked like the latter.
+    pub signed: bool,
+    /// The authoritative integrity verdict. See [`HashCheck`] — in particular,
+    /// only [`HashCheck::Mismatch`] is evidence of tampering.
+    pub hash_check: HashCheck,
+    /// [`Self::hash_check`] as a boolean for callers that only branch two ways:
+    /// `Some(true)` for `match`, `Some(false)` for `mismatch`, and `None` (JSON
+    /// `null`) for `not_applicable`.
+    ///
+    /// Never `false` for the not-applicable class. That is the whole point: a
+    /// `false` here is a positive claim that the body and its digest disagree,
+    /// and emitting it for a row whose digest was never `blake3(content)` would
+    /// libel every thesis/section/paragraph written by `ingest_document`. A
+    /// consumer that treats `null` as untrustworthy fails safe; one that treats
+    /// it as a mismatch is reading a verdict that was not given.
+    pub hash_matches: Option<bool>,
     pub truth_value: f64,
 }
 
@@ -1073,6 +1288,44 @@ pub struct UpdateResponse {
     pub truth_before: f64,
     pub truth_after: f64,
     pub evidence_id: String,
+    /// Whether the Dempster-Shafer wiring for this submission landed. Always
+    /// `true` in a response.
+    ///
+    /// Introduced by #497, when the DS wiring ran on a sibling pool connection
+    /// after the evidence row had already self-committed, so a wire failure was
+    /// reported as a SUCCESS with `belief_wired: false` rather than as an error
+    /// for work the database had kept. D2 (Unit E) put evidence -> BBA ->
+    /// `truth_value` -> labels in ONE author-stamped transaction, so a wire
+    /// failure now rolls every one of those writes back and the tool returns an
+    /// ERROR naming the failing step (`assign_claim: …`, `store BBA: …`,
+    /// `update_claim_belief: …`). There is no longer a partially-successful
+    /// outcome for this flag to disclose, and nothing is left behind: an
+    /// identical re-submit of the same `evidence_data` is admitted once the
+    /// cause is fixed (pinned in
+    /// `tests/update_with_evidence_ds_wiring_failure_is_atomic.rs`).
+    ///
+    /// The field is RETAINED, constant `true`, because clients of #497 may
+    /// already read it; `true` means what it always meant — a fresh BBA was
+    /// materialized and `truth_after` / `belief` / `plausibility` /
+    /// `pignistic_prob` describe the new epistemic state. Compare
+    /// [`LinkEpistemicResponse::belief_wired`], which is still a live
+    /// best-effort disclosure.
+    pub belief_wired: bool,
+    /// Whether THIS submission's BBA is persisted in `mass_functions`. Always
+    /// `true` in a response.
+    ///
+    /// #497 defined it as always `true` when `belief_wired` is `true`, and used
+    /// `false` to separate a first-step from a late-step wire drop on the old
+    /// best-effort path. Under D2 both drops are a rolled-back ERROR — a BBA
+    /// written before a late-step failure is rolled back with everything else —
+    /// so no response can carry `false`. Retained for client compatibility.
+    pub bba_stored: bool,
+    /// Always absent from a response since D2. #497 reported the DS wiring's
+    /// step-prefixed error here on its best-effort path; that text is now the
+    /// tool's -32603 error MESSAGE instead, because the failure rolls the whole
+    /// submission back. Kept (skipped when `None`) for client compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_wire_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1105,7 +1358,22 @@ pub struct MemorizeResponse {
 pub struct RecallResult {
     pub claim_id: String,
     pub content: String,
+    /// The claim's independently authored `claims.truth_value`, reported
+    /// unchanged. NOT what `min_truth` gates on — see `belief_score`.
     pub truth_value: f64,
+    /// The scalar `min_truth` was actually compared against (backlog
+    /// `14b98adc`): the Dempster–Shafer pignistic probability when the claim
+    /// carries a DS cache, and `truth_value` when it does not.
+    ///
+    /// `belief_score == truth_value` means the claim has no DS state and the
+    /// gate fell back; a divergence means epistemic edges have moved the claim
+    /// away from its authored value, which no DS write path copies back into
+    /// `truth_value`.
+    ///
+    /// Workflow-origin hits (`result_type == "workflow"`) are not claims and
+    /// carry no DS cache, so their `belief_score` always equals their
+    /// `truth_value`.
+    pub belief_score: f64,
     /// Dense cosine similarity in `[0,1]`; `0.0` for a lexical-only hit.
     pub similarity: f64,
     /// Reciprocal Rank Fusion score (primary ordering).
@@ -1175,6 +1443,185 @@ pub(crate) fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// Score at or above which a NON-contested result is reported as `confirmed`
+/// by [`EpistemicPartition`] (backlog e7736ff6).
+///
+/// One constant, shared by `recall` and `recall_with_context`, so "confirmed"
+/// cannot come to mean two different things on the two recall surfaces.
+pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
+
+/// A post-RRF recall page grouped by the epistemic status of each hit, rather
+/// than returned as one flat ranked list (backlog e7736ff6).
+///
+/// The three buckets are exhaustive and mutually exclusive, and the rule is
+/// deliberately contest-first:
+///
+/// * `open_question` — `is_contested` (any live `contradicts`/`refutes`).
+///   Checked FIRST, so a high-scoring claim that is actively disputed is
+///   reported as unsettled rather than as `confirmed`. Score and dispute are
+///   independent signals; a corpus can hold a 0.9 claim and a live refutation
+///   of it at the same time, and that pair is precisely what the caller must
+///   not be told is settled.
+/// * `confirmed` — not contested AND score `>= `[`CONFIRMED_SCORE`].
+/// * `uncertain` — everything else.
+///
+/// Within each bucket the caller's ranking order is PRESERVED (items are
+/// pushed in the order they were given), so bucketing re-groups the page
+/// without re-ranking it.
+///
+/// # The partition never changes which hits are returned
+///
+/// It is a regrouping of a list already fully filtered by `min_truth`,
+/// `exclude_contested` and every other post-filter. That is why `recall`'s
+/// audit row does not record the flag: the returned SET is identical with and
+/// without it, and only the JSON shape differs.
+#[derive(Debug, Clone, Serialize)]
+pub struct EpistemicPartition<T> {
+    /// Uncontested and scoring at or above [`CONFIRMED_SCORE`].
+    pub confirmed: Vec<T>,
+    /// Neither confirmed nor contested — believed, but not settled.
+    pub uncertain: Vec<T>,
+    /// Actively contested: `dispute_count >= 1`.
+    pub open_question: Vec<T>,
+}
+
+impl<T> EpistemicPartition<T> {
+    /// Bucket `items` by `(score, is_contested)`, as read out of each item by
+    /// `signals`.
+    ///
+    /// `signals` is a closure rather than a trait bound because the two recall
+    /// surfaces carry the same two numbers under different field names
+    /// (`RecallResult::truth_value` / `RecallHit::truth_value`) on types that
+    /// live in different modules — and because the score this partitions on
+    /// must stay the SAME score `min_truth` gates on, which is a decision the
+    /// call site owns, not this type.
+    pub fn from_ranked<I>(items: I, signals: impl Fn(&T) -> (f64, bool)) -> Self
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut out = Self {
+            confirmed: Vec::new(),
+            uncertain: Vec::new(),
+            open_question: Vec::new(),
+        };
+        for item in items {
+            let (score, is_contested) = signals(&item);
+            if is_contested {
+                out.open_question.push(item);
+            } else if score >= CONFIRMED_SCORE {
+                out.confirmed.push(item);
+            } else {
+                out.uncertain.push(item);
+            }
+        }
+        out
+    }
+}
+
+/// Widest cosine distance `diversity_radius` will accept.
+///
+/// pgvector's `<=>` is cosine distance on `[0, 2]`, so 2.0 is "drop everything
+/// not diametrically opposed to an already-selected hit" — already absurd, and
+/// the ceiling past which the value cannot mean anything at all.
+pub(crate) const MAX_DIVERSITY_RADIUS: f64 = 2.0;
+
+/// Validate a caller-supplied `diversity_radius`.
+///
+/// REJECTS rather than clamps. A silently clamped radius produces a page that
+/// looks filtered and is not, and this parameter's whole job is to change which
+/// hits come back — the one class of mistake a caller most needs told. `0.0` is
+/// rejected too: nothing is ever strictly nearer than zero, so it is a no-op
+/// spelled like a setting, and `None` is the way to say "off".
+///
+/// # Errors
+/// Returns the caller-facing message when the value is not finite, or is
+/// outside `(0.0, 2.0]`.
+pub(crate) fn validate_diversity_radius(radius: f64) -> Result<f64, String> {
+    if !radius.is_finite() || radius <= 0.0 || radius > MAX_DIVERSITY_RADIUS {
+        return Err(format!(
+            "diversity_radius must be a finite value in (0.0, {MAX_DIVERSITY_RADIUS}] — \
+             cosine distance is bounded on [0, 2], and 0.0 would drop nothing. \
+             Got {radius}. Omit the parameter to disable diversity filtering."
+        ));
+    }
+    Ok(radius)
+}
+
+/// Greedy maximal-marginal-relevance pass over a ranked page (backlog
+/// a9397e8a): walk the page in rank order and drop any hit that sits within
+/// `diversity_radius` cosine distance of a hit ALREADY selected above it.
+///
+/// `too_similar` is the set of unordered id pairs the DB measured as closer
+/// than the radius — i.e. `ClaimRepository::pairwise_cosine_distance_at_dim`'s
+/// output, which already applies the `< max_distance` cut in SQL.
+///
+/// Returns the ids to KEEP, in the input order.
+///
+/// # A pair that is not in `too_similar` is KEPT
+///
+/// This is the load-bearing default, and it is the opposite of the one that
+/// looks natural. A pair is missing from the measured set for two very
+/// different reasons — it is genuinely far apart, OR it could not be measured
+/// at all (an unembedded hit from the embedder-down lexical leg, a workflow hit
+/// whose id is not in `claims`, a row the viewer cannot see). Defaulting an
+/// unmeasurable pair to "distance 0" would make every such hit a duplicate of
+/// everything and silently empty the page down to one row. Keeping is the
+/// honest reading: not known to be near.
+///
+/// # Shrink-only, never back-fill
+///
+/// The candidate list this runs on has already been truncated to `limit` by
+/// SQL, so dropping a redundant hit returns a SHORTER page rather than pulling
+/// a more diverse hit up from below. That matches `min_truth` and
+/// `exclude_contested`, which are documented on both recall surfaces as
+/// returning a short page rather than back-filling with worse-ranked material,
+/// and it leaves `paging.more_available` — derived from the SQL page size, not
+/// from `results.len()` — correct without modification.
+pub(crate) fn greedy_diversity_keep(
+    ranked_ids: &[uuid::Uuid],
+    too_similar: &std::collections::HashSet<(uuid::Uuid, uuid::Uuid)>,
+) -> Vec<uuid::Uuid> {
+    let mut kept: Vec<uuid::Uuid> = Vec::with_capacity(ranked_ids.len());
+    for &candidate in ranked_ids {
+        let redundant = kept
+            .iter()
+            .any(|&selected| too_similar.contains(&unordered_pair(selected, candidate)));
+        if !redundant {
+            kept.push(candidate);
+        }
+    }
+    kept
+}
+
+/// Normalise an unordered id pair so lookups cannot miss by argument order.
+pub(crate) fn unordered_pair(a: uuid::Uuid, b: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Split a ranked page into the two mutually-exclusive response shapes the
+/// `epistemic_partition` flag selects between.
+///
+/// Returns `(flat, partitioned)` where exactly one side is `Some`. Both
+/// envelope fields carry `skip_serializing_if = "Option::is_none"`, so with
+/// the flag off the response is byte-identical to what it was before this
+/// parameter existed — `Some(vec![])` still serializes as `"results": []`,
+/// which an empty-page caller relies on.
+pub(crate) fn split_epistemic<T>(
+    items: Vec<T>,
+    partition: bool,
+    signals: impl Fn(&T) -> (f64, bool),
+) -> (Option<Vec<T>>, Option<EpistemicPartition<T>>) {
+    if partition {
+        (None, Some(EpistemicPartition::from_ranked(items, signals)))
+    } else {
+        (Some(items), None)
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AuthorResponse {
     pub agent_id: String,
@@ -1233,6 +1680,10 @@ pub struct IngestDocumentSpineResponse {
     /// as new in this ingest. Atomize exactly these paragraphs, then call
     /// `ingest_document_inline` with atoms filled for those paths only.
     pub new_paragraph_paths: Vec<String>,
+    /// Spine nodes this ingest resolved to that belong to a group the ingesting
+    /// agent cannot write, so the document's `doi:` label was not added to them.
+    /// See `IngestDocumentResponse::converged_claims_unlabelled`.
+    pub converged_claims_unlabelled: usize,
     /// `true` when every paragraph in the extraction already existed; nothing new was written.
     pub already_ingested: bool,
 }
@@ -1274,10 +1725,14 @@ pub struct StructureSourceParams {
 /// working when the HTTP API binary is unavailable.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkHierarchicalParams {
-    #[schemars(description = "UUID of the source claim")]
+    #[schemars(
+        description = "UUID of the source claim. Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused. Either refusal writes nothing."
+    )]
     pub source_claim_id: String,
 
-    #[schemars(description = "UUID of the target claim")]
+    #[schemars(
+        description = "UUID of the target claim. Same authority rule as source_claim_id: own-group private claims work, another group's private claim is not found or refused, and nothing is written."
+    )]
     pub target_claim_id: String,
 
     #[schemars(
@@ -1316,7 +1771,9 @@ pub struct LinkHierarchicalResponse {
 /// wall clock and would otherwise have to guess it.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchEdgeParams {
-    #[schemars(description = "UUID of the edge to patch")]
+    #[schemars(
+        description = "UUID of the edge to patch. Must be an edge YOU can read and this server's agent can write; otherwise (for example an edge touching another group's private claim) it reports not found and nothing is written."
+    )]
     pub edge_id: String,
 
     #[schemars(
@@ -1350,10 +1807,13 @@ pub struct PatchEdgeResponse {
 }
 
 /// Parameters for the `delete_edge` MCP tool — mirrors
-/// `DELETE /api/v1/edges/:id`, which hard-deletes the row.
+/// `DELETE /api/v1/edges/:id`. Both RETRACT the row (`valid_to = now()` via
+/// `EdgeRepository::retract_by_id`). Neither hard-deletes it.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteEdgeParams {
-    #[schemars(description = "UUID of the edge to hard-delete")]
+    #[schemars(
+        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge YOU can read and this server's agent can write; otherwise it reports not found and nothing is written."
+    )]
     pub edge_id: String,
 }
 
@@ -1380,14 +1840,18 @@ pub struct DeleteEdgeResponse {
 /// `edge_id` with `created=false`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkAlternativeParams {
-    #[schemars(description = "UUID of the first competing claim")]
+    #[schemars(
+        description = "UUID of the first competing claim. Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused, with nothing written."
+    )]
     pub claim_a: String,
 
-    #[schemars(description = "UUID of the second competing claim")]
+    #[schemars(
+        description = "UUID of the second competing claim. Same authority rule as claim_a."
+    )]
     pub claim_b: String,
 
     #[schemars(
-        description = "Optional UUID of the shared target the two claims are rival supporters of. Validated and stored on the edge for provenance."
+        description = "Optional UUID of the shared target the two claims are rival supporters of. Validated and stored on the edge for provenance. A claim you cannot read reports not found and nothing is written."
     )]
     #[serde(default)]
     pub target_claim_id: Option<String>,
@@ -1422,14 +1886,18 @@ pub struct LinkAlternativeResponse {
 /// target's combined belief. Idempotent on `(source, target, relationship)`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkEpistemicParams {
-    #[schemars(description = "UUID of the source claim (the evidence / asserting side)")]
+    #[schemars(
+        description = "UUID of the source claim (the evidence / asserting side). Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused, with nothing written."
+    )]
     pub source_claim_id: String,
 
-    #[schemars(description = "UUID of the target claim (the side whose belief is recomputed)")]
+    #[schemars(
+        description = "UUID of the target claim (the side whose belief is recomputed). Same authority rule as source_claim_id for the edge itself. A PUBLIC target owned by a group this server's agent cannot write still gets the edge, but its belief is not moved: the response reports belief_wired=false."
+    )]
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes. (supersedes is intentionally NOT accepted — use supersede_claim.)"
+        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or cites, a structural edge that moves no belief. (supersedes is intentionally NOT accepted — use supersede_claim.)"
     )]
     pub relationship: String,
 
@@ -1452,13 +1920,17 @@ pub struct LinkEpistemicBelief {
 
 /// Response for the `link_epistemic` MCP tool.
 ///
-/// `was_created=true` means a new edge row was inserted and belief wiring was
-/// attempted; `false` means an edge with the same `(source, target,
-/// relationship)` already existed (idempotent re-hit — no re-wire). `belief_wired`
-/// is `true` only when the engine actually materialized a BBA and recomputed
-/// the target (engine outcome `Wired`); it is `false` for idempotent re-hits and
-/// for the no-op wiring outcomes (source has no belief interval, vacuous
-/// transfer, or a recompute error). `target_belief` is a best-effort read of the
+/// `was_created=true` means a new edge row was inserted; `false` means an edge
+/// with the same `(source, target, relationship)` — or, for a symmetric
+/// relationship, the same unordered pair — already existed (idempotent re-hit).
+/// Belief wiring is attempted on EVERY call, re-hits included. `belief_wired` is
+/// `true` only when THIS call materialized the edge's BBA and recomputed the
+/// target (engine outcome `Wired`), which a re-hit can do when the edge had no
+/// BBA yet and its source has since gained belief. It is `false` when no belief
+/// moved: the edge was already wired, the source has no belief interval, the
+/// transfer was vacuous, the relationship is structural, or the wire was
+/// refused or failed (e.g. a target owned by a group this server's agent cannot
+/// write) — the edge row stays either way. `target_belief` is a best-effort read of the
 /// target's cached DS columns after the recompute (`None` if the target carries
 /// no belief yet or the read failed).
 #[derive(Debug, Serialize)]
@@ -1467,6 +1939,18 @@ pub struct LinkEpistemicResponse {
     pub was_created: bool,
     pub relationship: String,
     pub belief_wired: bool,
+    /// The claim `target_belief` describes, and the one the belief wire
+    /// recomputed.
+    ///
+    /// Normally equals the request's `target_claim_id`. It is the request's
+    /// `source_claim_id` in exactly one case: a SYMMETRIC relationship
+    /// (`contradicts` / `corroborates`) that deduped against an edge already
+    /// stored in the opposite direction. Those two orderings are one fact, so
+    /// only one row exists, and both the wire and this readback follow the
+    /// row's recorded orientation rather than the caller's argument order.
+    /// Always echoed so a caller never has to infer which claim the interval
+    /// belongs to.
+    pub belief_target_claim_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_belief: Option<LinkEpistemicBelief>,
 }
@@ -1489,6 +1973,25 @@ pub struct IngestDocumentResponse {
     pub claims_ds_wired: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ds_frame_id: Option<String>,
+    /// Claims this ingest RESOLVED TO (content-addressed convergence onto a row
+    /// that already existed) but could not tag with the document's `doi:` label,
+    /// because they belong to a group the ingesting agent cannot write. The paper
+    /// still `asserts` each of them; only the label is missing. Disclosed rather
+    /// than swallowed, so a caller counting a paper's claim set by label can
+    /// see the gap.
+    ///
+    /// **Who actually sees it.** This response reaches a caller only from the
+    /// operator `ingest-document` CLI, which calls `do_ingest_document`
+    /// synchronously (`ingest_document_spine` returns its own response type
+    /// with the same field). The two DETACHED MCP tools, `ingest_document` and
+    /// `ingest_document_inline`, answer `queued` and run `do_ingest_document`
+    /// in a spawned task whose response is dropped — for them the count reaches
+    /// only the server log (one WARN per unlabelled claim, target
+    /// `tenancy.scoped_write`). A caller
+    /// of those tools that needs the gap must compare the paper's `asserts`
+    /// edges against its `doi:` label set itself. Stated because an earlier
+    /// summary described this field as the disclosure for every ingest path.
+    pub converged_claims_unlabelled: usize,
     pub already_ingested: bool,
 }
 
@@ -1521,7 +2024,17 @@ pub struct PaperResponse {
     pub doi: String,
     pub title: String,
     pub authors: Vec<AuthorResponse>,
+    /// Total asserted claims for the paper, independent of paging. Compare
+    /// against `offset + returned` to decide whether another page exists.
     pub claim_count: i64,
+    /// `claims.len()` — the size of THIS page, not the total.
+    pub returned: usize,
+    /// Echo of the applied `offset` (after clamping).
+    pub offset: i64,
+    /// Echo of the applied `limit` (after clamping).
+    pub limit: i64,
+    /// `true` when `offset + returned < claim_count`, i.e. another page exists.
+    pub has_more: bool,
     pub claims: Vec<ClaimResponse>,
 }
 
@@ -1602,7 +2115,17 @@ pub struct TraverseNode {
     pub id: String,
     pub node_type: String,
     pub label: Option<String>,
+    /// The node's independently authored `claims.truth_value`, reported
+    /// unchanged. `None` for a non-claim node. NOT what `min_truth` gates on.
     pub truth_value: Option<f64>,
+    /// The scalar `min_truth` was compared against (backlog `14b98adc`): the
+    /// Dempster–Shafer pignistic probability when the node carries a DS cache,
+    /// else `truth_value`. `None` for a non-claim node.
+    ///
+    /// On the default `min_truth = 0.0` path the DS lookup is skipped — no
+    /// value of it could change which nodes are kept — so this equals
+    /// `truth_value` there.
+    pub belief_score: Option<f64>,
     pub depth: i32,
 }
 
@@ -1752,6 +2275,38 @@ pub struct ResolveBacklogItemParams {
         description = "Methodology for the resolution claim (default: 'expert_elicitation'). Use 'inductive_generalization' if the resolution generalizes from an observed pattern."
     )]
     pub methodology: Option<String>,
+
+    /// The CLOSURE BASIS: the claims whose content justified closing the item.
+    ///
+    /// Without it a closure records no basis at all, so nothing can even
+    /// identify a reopen candidate when later evidence contradicts whatever the
+    /// resolution rested on. Each id becomes a
+    /// `basis -justifies-> resolution` edge.
+    ///
+    /// WHAT THIS DOES AND DOES NOT BUY, measured rather than assumed — the
+    /// backlog item that requested this asserted the stronger claim, and it is
+    /// false on two independent counts today:
+    ///   * `sheaf::restriction_kind_with_profile` does not name `"justifies"`,
+    ///     so it takes the `_ => RestrictionKind::Neutral` arm;
+    ///     `auto_wire_edge_if_epistemic` short-circuits on Neutral, so the edge
+    ///     carries no BBA. `invalidate_and_rewire`'s own doc says "Only edges
+    ///     that actually carried a BBA become targets", so `retraction_cascade`
+    ///     skips it.
+    ///   * `semantic_graph_neighbors` hard-codes its relationship set and does
+    ///     not include `justifies`, so no existing traversal consumes it.
+    ///
+    /// What it DOES buy: the basis is recorded durably and is reverse-queryable
+    /// — given a retracted basis, a query on `edges.source_id` finds every
+    /// closure that rested on it. Making the cascade act on that automatically
+    /// is a separate change (it requires giving `justifies` a non-Neutral
+    /// restriction kind, which is a belief-semantics decision).
+    ///
+    /// Optional and defaulted so every existing caller stays wire-compatible.
+    #[schemars(
+        description = "UUIDs of the claims that justified this resolution (the closure basis). Each becomes a `basis -justifies-> resolution` edge, recording WHY the item was closed so that a later retraction of a basis can be reverse-queried to find the closures resting on it. It does NOT by itself reopen anything: `justifies` carries no belief mass today, so retraction_cascade and recompute_beliefs do not act on it. Must be visible to the caller."
+    )]
+    #[serde(default)]
+    pub basis_claim_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1768,7 +2323,9 @@ pub struct UpdateLabelsParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchClaimParams {
-    #[schemars(description = "UUID of the claim to patch")]
+    #[schemars(
+        description = "UUID of the claim to patch. Must be a claim you can read (otherwise: not found) and one owned by a group this server's agent can write (otherwise: refused, nothing written). When you are authenticated (HTTP) you must also own it or hold claims:admin."
+    )]
     pub claim_id: String,
     #[schemars(description = "New trace_id (must reference an existing reasoning_traces row)")]
     pub trace_id: Option<String>,

@@ -107,6 +107,30 @@ pub struct ResolvedStep {
     pub pending_resolution: bool,
 }
 
+/// A [`HierarchicalWorkflowRow`] carrying the cosine similarity that retrieved
+/// it, so a caller can rank hierarchical hits against hits from another store
+/// on one comparable scale.
+///
+/// Exists because the two existing embedding searches over
+/// `workflows.goal_embedding` each drop half of what a cross-store ranker
+/// needs: `find_hierarchical_by_embedding` returns the full row but discards
+/// the distance column, and `search_by_goal_embedding` returns a similarity but
+/// only `(id, goal, truth_value)`. Merging flat workflow CLAIMS with
+/// hierarchical workflow ROWS in `find_workflow` needs both at once.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ScoredHierarchicalWorkflowRow {
+    pub id: Uuid,
+    pub canonical_name: String,
+    pub generation: i32,
+    pub goal: String,
+    pub parent_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub truth_value: f64,
+    /// `1 - cosine_distance` against the query embedding.
+    pub similarity: f64,
+}
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -118,8 +142,15 @@ impl WorkflowRepository {
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails for reasons other
     /// than a duplicate-key conflict on the UNIQUE constraint.
-    pub async fn insert_root(
-        pool: &PgPool,
+    /// `workflows` is MEASURED `relrowsecurity = false` with no policy at
+    /// migration head 101, so this write needs no stamp to be admitted. It takes
+    /// an executor anyway so the workflow-ingest plan walk can run it on the SAME
+    /// connection as the tier-A `claims` and `edges` writes it is atomic with —
+    /// an `insert_root` on a sibling pool checkout would leave a `workflows` row
+    /// behind when the claim walk rolled back, which is the zombie-row shape the
+    /// executor's own pre-flight content guard exists to avoid.
+    pub async fn insert_root<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         canonical_name: &str,
         generation: i32,
@@ -138,14 +169,14 @@ impl WorkflowRepository {
         .bind(goal)
         .bind(parent_id)
         .bind(metadata)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.
-    pub async fn find_root_by_canonical(
-        pool: &PgPool,
+    pub async fn find_root_by_canonical<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         canonical_name: &str,
         generation: i32,
     ) -> Result<Option<Uuid>, sqlx::Error> {
@@ -154,7 +185,7 @@ impl WorkflowRepository {
         )
         .bind(canonical_name)
         .bind(generation)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row.map(|(id,)| id))
     }
@@ -493,15 +524,26 @@ impl WorkflowRepository {
         workflow_id: Uuid,
     ) -> Result<Vec<ResolvedStep>, DbError> {
         // Pull all level=2 step claims under this workflow with their
-        // step_lineage_id, ordered by edge created_at + claim id (matches
-        // do_report_hierarchical_outcome_via_pool).
+        // step_lineage_id, in PLAN ORDER.
+        //
+        // The order key is the `plan_index` ordinal that
+        // `epigraph_ingest_executor::execute_workflow_ingest_plan` records on the
+        // `executes` edge, NOT `e.created_at`. Those edges are now written inside
+        // ONE transaction, and `NOW()` is transaction-start time in PostgreSQL, so
+        // they all share a `created_at` and the old `created_at, c.id` key returned
+        // an arbitrary order. See that loop's comment for the measurement.
+        // `created_at` remains the fallback so edges written before the ordinal
+        // existed are ordered exactly as they were.
         let sql = viewer.splice(
             "SELECT c.id, c.step_lineage_id \
              FROM edges e \
              JOIN claims c ON c.id = e.target_id \
              WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
                /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
-             ORDER BY e.created_at ASC, c.id ASC",
+             ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
             2,
         );
         let mut sq = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(&sql).bind(workflow_id);
@@ -622,7 +664,13 @@ impl WorkflowRepository {
         }
 
         // ── Round-trip 1: fetch all step seeds (level=2) for all workflow IDs. ──
-        // Order matches the single-workflow function: (e.created_at ASC, c.id ASC).
+        // Order matches the single-workflow function: the `plan_index` ordinal
+        // first, `(e.created_at ASC, c.id ASC)` only as the fallback for edges
+        // that predate it. This batched twin was left on the bare `created_at`
+        // key when `resolve_steps_to_heads` was moved to `plan_index`, so once a
+        // plan's edges were written in one transaction (one shared `NOW()`), the
+        // `step_index` it assigns below followed `c.id` — a content-derived UUID
+        // — while its single-workflow sibling followed the plan.
         #[derive(sqlx::FromRow)]
         struct StepSeedRow {
             workflow_id: Uuid,
@@ -641,7 +689,11 @@ impl WorkflowRepository {
                AND e.relationship = 'executes' \
                AND (c.properties->>'level')::int = 2 \
                /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
-             ORDER BY e.source_id, e.created_at ASC, c.id ASC",
+             ORDER BY e.source_id, \
+                      CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
             2,
         );
         let mut sq = sqlx::query_as::<_, StepSeedRow>(&seed_sql).bind(workflow_ids);
@@ -660,7 +712,7 @@ impl WorkflowRepository {
         }
 
         // Build per-workflow step lists and collect the set of lineage_ids to query.
-        // Preserve ordering: seeds are already in (workflow_id, e.created_at, c.id) order.
+        // Preserve ordering: seeds are already in (workflow_id, plan order) order.
         // We need per-workflow sequential step_index, so we track a counter per workflow.
         let mut step_index_counter: HashMap<Uuid, usize> = HashMap::new();
 
@@ -963,6 +1015,121 @@ impl WorkflowRepository {
         .await
     }
 
+    /// Cosine-similarity search over `workflows.goal_embedding` that keeps BOTH
+    /// the full row and its similarity score — see
+    /// [`ScoredHierarchicalWorkflowRow`] for why neither existing sibling does.
+    ///
+    /// Takes a pre-formatted pgvector literal (like
+    /// `ClaimRepository::search_by_embedding_scoped`) so a caller can reuse ONE
+    /// query embedding across the claims and workflows stores. `min_truth`
+    /// filters out deprecated rows (`deprecate_workflow` writes 0.05). No
+    /// similarity floor: the caller ranks and truncates, so imposing one here
+    /// would silently drop rows it may still want to consider.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    ///
+    /// Takes NO `&Viewer`, and no lint sees it either — it takes a `&PgPool`,
+    /// which is neither of the two spellings `visibility_lint.rs` scans. The
+    /// reason is recorded here so the next reader does not have to re-derive
+    /// it: the statement's `FROM` is `workflows` alone and it joins no other
+    /// relation, and `workflows` carries neither a `visibility` nor an
+    /// `owner_group_id` column, so there is no predicate to write. This is the
+    /// scored sibling of `find_hierarchical_by_embedding`, whose identical
+    /// posture is registered in `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    /// Contrast `step_texts_for_hierarchical` below, which joins `claims` and
+    /// therefore DOES take a viewer.
+    pub async fn search_hierarchical_by_embedding_scored(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        min_truth: f64,
+        limit: i64,
+    ) -> Result<Vec<ScoredHierarchicalWorkflowRow>, sqlx::Error> {
+        sqlx::query_as::<_, ScoredHierarchicalWorkflowRow>(
+            "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, \
+                    truth_value, \
+                    (1 - (goal_embedding <=> $1::vector))::float8 AS similarity \
+             FROM workflows \
+             WHERE goal_embedding IS NOT NULL \
+               AND truth_value >= $2 \
+             ORDER BY goal_embedding <=> $1::vector \
+             LIMIT $3",
+        )
+        .bind(query_embedding_pgvector)
+        .bind(min_truth)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    }
+
+    /// Step texts for hierarchical workflows, in plan order, keyed by workflow.
+    ///
+    /// A `workflows` row carries no inline steps — its steps are level-2 claims
+    /// reached through `executes` edges. A caller that renders a hierarchical
+    /// workflow into a steps-bearing shape MUST resolve them: handing back an
+    /// empty `steps` array is the failure mode that caused the 2026-08-18
+    /// incident, where an agent told to "follow the best-matching workflow
+    /// steps" received `[]`, fell back to a bare `theme_cluster` with
+    /// `wipe_first=true`, and destroyed 76 themes.
+    ///
+    /// Ordering is the `executes` edge's `plan_index` ordinal, falling back to
+    /// `(edge created_at ASC, claim id ASC)` for edges that predate it — the
+    /// same plan order [`Self::resolve_steps_to_heads`],
+    /// [`Self::resolve_steps_to_heads_batched`] and both
+    /// `report_hierarchical_outcome` handlers (MCP and HTTP) use, so step N
+    /// means the same step in all of them.
+    ///
+    /// Returns the FROZEN step claims attached to the workflow, not lineage
+    /// heads. `find_workflow` advertises the workflow as stored; callers that
+    /// need head resolution have `find_workflow_hierarchical(resolve_to_latest)`.
+    /// Workflows with no steps are simply absent from the map.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn step_texts_for_hierarchical(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        workflow_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<String>>, sqlx::Error> {
+        if workflow_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // This projects `c.content` — claim TEXT, not a scalar — so it is a
+        // first-class claim read and carries the viewer predicate on `c`.
+        // `$1` is the id array, so the viewer bind is `$2`.
+        //
+        // No `/* {EDGE_VISIBILITY:e} */`: the `edges` leg here has never
+        // carried a predicate, and PR-13 deliberately converted only the reads
+        // that already had one. Adding an edge filter needs its own
+        // JOIN-vs-WHERE reasoning and belongs to the tracked open finding
+        // `F-edges-unfiltered`, not to this merge.
+        let sql = viewer.splice(
+            "SELECT e.source_id, c.content \
+             FROM edges e \
+             JOIN claims c ON c.id = e.target_id \
+             WHERE e.source_id = ANY($1) \
+               AND e.relationship = 'executes' \
+               AND (c.properties->>'level')::int = 2 /* {VISIBILITY:c} */ \
+             ORDER BY e.source_id, \
+                      CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
+            2,
+        );
+        let mut q = sqlx::query_as(&sql).bind(workflow_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid, String)> = q.fetch_all(pool).await?;
+
+        let mut out: HashMap<Uuid, Vec<String>> = HashMap::new();
+        for (workflow_id, content) in rows {
+            out.entry(workflow_id).or_default().push(content);
+        }
+        Ok(out)
+    }
+
     /// Write the embedding vector for a hierarchical workflow's goal text.
     /// Idempotent: caller is expected to skip rows where `goal_embedding`
     /// is already set unless explicitly re-embedding.
@@ -1000,15 +1167,25 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
-    pub async fn set_truth_value(
-        pool: &PgPool,
+    /// # The executor is generic for COHESION, not because `workflows` is protected
+    ///
+    /// MEASURED on a database migrated 001->101: `workflows` has
+    /// `relrowsecurity = false`, no policy, and no entry in migration 062's
+    /// tier-A array — so unlike the `claims` UPDATE this call cascades from, it
+    /// is NOT refused on an unstamped session. It is generic so that the two
+    /// halves of one deprecation can share a transaction: a `claims` row flipped
+    /// to `is_current = false` while its hierarchical `workflows` row keeps its
+    /// truth value is exactly the split `deprecate_workflow`'s cascade exists to
+    /// prevent, and `find_workflow_hierarchical` reads the half that was missed.
+    pub async fn set_truth_value<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         workflow_id: Uuid,
         truth_value: f64,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query("UPDATE workflows SET truth_value = $1 WHERE id = $2")
             .bind(truth_value)
             .bind(workflow_id)
-            .execute(pool)
+            .execute(executor)
             .await?;
         Ok(result.rows_affected())
     }

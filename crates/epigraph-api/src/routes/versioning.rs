@@ -22,10 +22,10 @@
 //! and a `ScopedRead<'_>` borrowed from `AppState` cannot outlive the request.
 //! Their owner is `ScopedPool::begin_as` plus `Viewer::splice_write`.
 //!
-//! `supersede_claim` additionally carries an open entry whose owner is the
-//! write-gate programme, not a read shard: `F-write-authz-reads-unfiltered`.
-//! This shard does not touch it and it stays open. Nothing further about it is
-//! recorded here — see `docs/tenancy/progress.json`.
+//! `supersede_claim`'s ownership read (`F-write-authz-reads-unfiltered`) is
+//! now viewer-filtered on a stamped connection (batch H6): a caller cannot
+//! supersede a claim it cannot read. The write itself is still on the raw
+//! pool, and it is still one of the 8 sites above.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -261,26 +261,67 @@ pub async fn supersede_claim(
             reason: "Truth value must be between 0.0 and 1.0".to_string(),
         })?;
 
-    // 6. Fetch agent_id for event emission before supersession
-    let agent_uuid: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-        .bind(claim_id)
-        .fetch_optional(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("DB error: {e}"),
-        })?
-        .ok_or_else(|| ApiError::NotFound {
-            entity: "Claim".to_string(),
-            id: claim_id.to_string(),
+    // 6. The claim's owner, which the ownership gate below decides on, read
+    //    through the CALLER's viewer on a viewer-stamped connection.
+    //
+    //    This was `SELECT agent_id FROM claims WHERE id = $1` on the raw pool,
+    //    unfiltered while the handler held a Viewer (F-write-authz-reads-unfiltered,
+    //    backlog 30c29c52). A `claims:admin` principal could therefore supersede
+    //    a claim it cannot READ, because the gate asked only whose it was. A claim
+    //    the caller cannot see is now 404, exactly like one that does not exist.
+    //
+    //    READ authority, `{VISIBILITY:c}` through `get_by_id`, and deliberately
+    //    not the write gate `{WRITABLE:c}`: the read decides 404 (can the caller
+    //    see it at all), and the DATABASE decides write authority, because the
+    //    write below runs on a transaction stamped with the caller's viewer and
+    //    `claims_tenancy`'s `WITH CHECK` refuses a row whose owner group the
+    //    caller cannot write (answered 403, nothing written). A Rust-side
+    //    `{WRITABLE:c}` pre-check would only duplicate that decision, and on a
+    //    schema that still carries the orphan `*_privacy` policies it would
+    //    refuse a `claims:admin` supersede those policies admit today.
+    let agent_uuid: Uuid = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "supersede_claim",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
         })?;
+        ClaimRepository::get_by_id(&mut *read, &viewer, ClaimId::from_uuid(claim_id))
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB error: {e}"),
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                entity: "Claim".to_string(),
+                id: claim_id.to_string(),
+            })?
+            .agent_id
+            .as_uuid()
+    };
 
     // 6b. Ownership / admin gate
     crate::middleware::scopes::require_owner_or_admin(&auth, agent_uuid)?;
 
-    // 7. Perform supersession in the database (atomic transaction)
+    // 7. Perform supersession on ONE transaction stamped with the CALLER's
+    //    viewer.
+    //
+    //    This was `ClaimRepository::supersede(&state.db_pool, ..)`: atomic, but
+    //    unstamped, so on a schema without the orphan `*_privacy` policies
+    //    (config A, what production becomes at R3) `claims_tenancy` refused it
+    //    for EVERY caller. MEASURED (batch H-a review): owner / own-public 500
+    //    "new row violates row-level security policy", owner / own-group 404,
+    //    because the unstamped session could not even see the owner's own row.
+    //    Stamped, the owner's supersede commits, and a caller whose writable set
+    //    lacks the claim's owner group gets 403 with nothing written.
     let old_claim_id = ClaimId::from_uuid(claim_id);
-    let (new_uuid, _old_uuid) = ClaimRepository::supersede(
-        &state.db_pool,
+    let mut tx = state.write_as(&viewer, "supersede_claim").await?;
+    let (new_uuid, _old_uuid) = ClaimRepository::supersede_conn(
+        &mut tx,
         old_claim_id,
         &request.content,
         truth_value,
@@ -288,6 +329,16 @@ pub async fn supersede_claim(
     )
     .await
     .map_err(|e| {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "supersede_claim",
+                claim = %claim_id,
+                error = %e,
+                "the database refused the supersession"
+            );
+            return crate::errors::write_refused("claim");
+        }
         // Map DB errors to appropriate API errors
         let msg = e.to_string();
         if msg.contains("not found") {
@@ -307,34 +358,60 @@ pub async fn supersede_claim(
     let now = Utc::now();
     let new_claim_id = ClaimId::from_uuid(new_uuid);
 
-    // 8. Record version history for the new claim (non-blocking, supplementary)
+    // 8. Record version history for the new claim, on the same transaction and
+    //    under a SAVEPOINT. Supplementary: a failure is logged and rolled back
+    //    to the savepoint, and the supersession still commits. The savepoint is
+    //    what makes "supplementary" true inside a transaction; unsavepointed, a
+    //    refused INSERT would abort the transaction and PostgreSQL would answer
+    //    the COMMIT with a silent ROLLBACK. It used to run on the raw pool after
+    //    the commit, where `claim_versions`' row security refused it on config A
+    //    and the 201 went out with no version row.
     #[cfg(feature = "db")]
     {
         use epigraph_db::repos::claim_version::ClaimVersionRow;
         use epigraph_db::ClaimVersionRepository;
+        use sqlx::Acquire as _;
 
-        // Get the next version number for the old claim chain, then +1 for new claim
-        let version_number: i32 =
-            ClaimVersionRepository::latest_version_number(&state.db_pool, &viewer, claim_id)
-                .await
-                .unwrap_or(0)
-                + 1;
-
-        let version_row = ClaimVersionRow {
-            id: uuid::Uuid::new_v4(),
-            claim_id: new_uuid,
-            version_number,
-            content: request.content.clone(),
-            truth_value: request.truth_value,
-            created_by: Some(agent_uuid),
-            created_at: now,
+        // BOTH statements under the savepoint, the read included: a failed
+        // statement aborts the enclosing transaction whether it read or wrote.
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let recorded = match ClaimVersionRepository::latest_version_number(
+            &mut *sp, &viewer, claim_id,
+        )
+        .await
+        {
+            Ok(latest) => {
+                let version_row = ClaimVersionRow {
+                    id: uuid::Uuid::new_v4(),
+                    claim_id: new_uuid,
+                    version_number: latest + 1,
+                    content: request.content.clone(),
+                    truth_value: request.truth_value,
+                    created_by: Some(agent_uuid),
+                    created_at: now,
+                };
+                ClaimVersionRepository::create(&mut *sp, &version_row).await
+            }
+            Err(e) => Err(e),
         };
-
-        if let Err(e) = ClaimVersionRepository::create(&state.db_pool, &version_row).await {
-            tracing::warn!("Failed to record claim version: {e}");
-            // Don't fail the supersede — version history is supplementary
+        match recorded {
+            Ok(_) => sp.commit().await.map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to release the savepoint: {e}"),
+            })?,
+            Err(e) => {
+                tracing::warn!("Failed to record claim version: {e}");
+                sp.rollback().await.map_err(|e| ApiError::DatabaseError {
+                    message: format!("Failed to roll back the savepoint: {e}"),
+                })?;
+            }
         }
     }
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the supersession: {e}"),
+    })?;
 
     // 9. Publish ClaimSubmitted event for the new claim (fire-and-forget)
     let _ = state
@@ -353,12 +430,26 @@ pub async fn supersede_claim(
     // inside the transaction. Best-effort: the transaction has already
     // committed, so a cascade failure must not turn a successful write into a
     // reported error (the retry would hit "already been superseded").
-    let belief_cascade = epigraph_engine::retraction_cascade::cascade_after_supersede(
-        &state.db_pool,
-        &viewer,
-        new_uuid,
-    )
-    .await;
+    //
+    // STILL UNSTAMPED, and named. The cascade walks DOWNSTREAM claims whose owner
+    // groups are arbitrary, so no single viewer's writable set covers its target
+    // population; which authority a retraction cascade carries across group
+    // boundaries is a tenancy-model decision rather than a mechanical conversion.
+    // `no_unscoped_pool.rs` keeps `routes/versioning.rs` at 8 sites for this and
+    // the sibling `mark_duplicate` cascade. The acquire is mechanical: one
+    // connection instead of a checkout per statement.
+    let belief_cascade = match state.db_pool.acquire().await {
+        Ok(mut conn) => {
+            epigraph_engine::retraction_cascade::cascade_after_supersede(
+                &mut conn, &viewer, new_uuid,
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::warn!("belief cascade skipped: could not acquire: {e}");
+            Default::default()
+        }
+    };
 
     // 10. Trigger belief propagation for downstream factors (fire-and-forget).
     //
@@ -489,8 +580,16 @@ pub async fn mark_duplicate(
     // Dedup repairs the orphaned/stranded edge-factor BBAs inside its own
     // transaction and then rebuilds the affected beliefs (backlog 20e9ed83).
     // Only the dedup's own failure is an error; the cascade's is reported.
+    // Unstamped for the reason recorded on `cascade_after_supersede` above.
+    let mut cascade_conn = state
+        .db_pool
+        .acquire()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("belief cascade: could not acquire: {e}"),
+        })?;
     let belief_cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-        &state.db_pool,
+        &mut cascade_conn,
         &viewer,
         dup_id,
         req.canonical_id,

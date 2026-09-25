@@ -17,13 +17,20 @@ use uuid::Uuid;
 
 const DIM: usize = 1536;
 
-fn build_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
+/// A server carrying a `ScopedPool`, which `link_epistemic`'s belief wiring now
+/// REQUIRES: it writes `claim_frames` / `mass_functions` / `UPDATE claims` on the
+/// target, and a server with no `ScopedPool` refuses that rather than falling
+/// back to the unstamped pool. Without the stamp this fixture's
+/// `belief_wired == true` precondition fails — which is the conversion working,
+/// not an inconvenience to route around.
+async fn build_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
     use epigraph_crypto::AgentSigner;
     use epigraph_mcp::embed::McpEmbedder;
     use epigraph_mcp::EpiGraphMcpFull;
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 /// Unit vector pointing at `axis`, tilted by `tilt` toward axis+1 so distances
@@ -91,7 +98,6 @@ fn json_of(out: rmcp::model::CallToolResult) -> serde_json::Value {
 /// claims on a default-arg call would be the worst possible failure here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn dry_run_reports_without_mutating(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     // Identical content REQUIRES distinct agents: uq_claims_content_hash_agent
     // makes an exact within-agent duplicate impossible, which is precisely why
     // the real duplicate corpus is cross-agent.
@@ -100,11 +106,19 @@ async fn dry_run_reports_without_mutating(pool: PgPool) {
     let a = seed(&pool, a1, "identical text", 0.9, &pgvec(0, 0.0), &[]).await;
     let b = seed(&pool, a2, "identical text", 0.5, &pgvec(0, 0.001), &[]).await;
 
-    let server = build_server(pool.clone());
+    let server = build_server(pool.clone()).await;
     let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(true))
-            .await
-            .expect("sweep"),
+        sweep_semantic_duplicates(
+            &server,
+            &mut fixture::scoped_pool(&pool)
+                .await
+                .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+                .await
+                .expect("a maintenance session over the test database"),
+            params(true),
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(j["dry_run"], serde_json::json!(true));
@@ -128,17 +142,24 @@ async fn dry_run_reports_without_mutating(pool: PgPool) {
 /// claim and forwarding the other at it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn execute_collapses_exact_restatements_keeping_highest_truth(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let a1 = seed_agent(&pool).await;
     let a2 = seed_agent(&pool).await;
     let strong = seed(&pool, a1, "same words", 0.9, &pgvec(0, 0.0), &[]).await;
     let weak = seed(&pool, a2, "same words", 0.4, &pgvec(0, 0.001), &[]).await;
 
-    let server = build_server(pool.clone());
+    let server = build_server(pool.clone()).await;
     let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(false))
-            .await
-            .expect("sweep"),
+        sweep_semantic_duplicates(
+            &server,
+            &mut fixture::scoped_pool(&pool)
+                .await
+                .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+                .await
+                .expect("a maintenance session over the test database"),
+            params(false),
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(j["pairs_marked"], serde_json::json!(1));
@@ -171,7 +192,6 @@ async fn execute_collapses_exact_restatements_keeping_highest_truth(pool: PgPool
 /// merge_candidates for consolidate_claims instead.
 #[sqlx::test(migrations = "../../migrations")]
 async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let a = seed(
         &pool,
@@ -192,11 +212,19 @@ async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
     )
     .await;
 
-    let server = build_server(pool.clone());
+    let server = build_server(pool.clone()).await;
     let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(false))
-            .await
-            .expect("sweep"),
+        sweep_semantic_duplicates(
+            &server,
+            &mut fixture::scoped_pool(&pool)
+                .await
+                .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+                .await
+                .expect("a maintenance session over the test database"),
+            params(false),
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(
@@ -224,7 +252,6 @@ async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
 /// directly compared. A pairwise-only implementation would emit two clusters.
 #[sqlx::test(migrations = "../../migrations")]
 async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let (a1, a2, a3) = (
         seed_agent(&pool).await,
         seed_agent(&pool).await,
@@ -234,11 +261,19 @@ async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
     seed(&pool, a2, "chain text", 0.8, &pgvec(0, 0.010), &[]).await;
     seed(&pool, a3, "chain text", 0.7, &pgvec(0, 0.020), &[]).await;
 
-    let server = build_server(pool.clone());
+    let server = build_server(pool.clone()).await;
     let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(true))
-            .await
-            .expect("sweep"),
+        sweep_semantic_duplicates(
+            &server,
+            &mut fixture::scoped_pool(&pool)
+                .await
+                .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+                .await
+                .expect("a maintenance session over the test database"),
+            params(true),
+        )
+        .await
+        .expect("sweep"),
     );
 
     let clusters = j["clusters"].as_array().unwrap();
@@ -254,7 +289,6 @@ async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
 /// the sweep, and neither do already-superseded claims.
 #[sqlx::test(migrations = "../../migrations")]
 async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let a1 = seed_agent(&pool).await;
     let a2 = seed_agent(&pool).await;
     seed(
@@ -289,11 +323,19 @@ async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
         .unwrap();
     }
 
-    let server = build_server(pool.clone());
+    let server = build_server(pool.clone()).await;
     let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(true))
-            .await
-            .expect("sweep"),
+        sweep_semantic_duplicates(
+            &server,
+            &mut fixture::scoped_pool(&pool)
+                .await
+                .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+                .await
+                .expect("a maintenance session over the test database"),
+            params(true),
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(
@@ -307,7 +349,6 @@ async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
 /// Paging is resumable: next_offset advances by what was scanned.
 #[sqlx::test(migrations = "../../migrations")]
 async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     for i in 0..3 {
         seed(
@@ -321,13 +362,21 @@ async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
         .await;
     }
 
-    let server = build_server(pool.clone());
+    let server = build_server(pool.clone()).await;
     let mut p = params(true);
     p.limit = Some(2);
     let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, p)
-            .await
-            .expect("sweep"),
+        sweep_semantic_duplicates(
+            &server,
+            &mut fixture::scoped_pool(&pool)
+                .await
+                .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+                .await
+                .expect("a maintenance session over the test database"),
+            p,
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(j["scanned"], serde_json::json!(2));
@@ -373,7 +422,7 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
         .await
         .expect("plant supporter interval");
 
-    let server = build_server(pool.clone());
+    let server = build_server(pool.clone()).await;
     let link = epigraph_mcp::tools::link_epistemic::do_link_epistemic(
         &server,
         &viewer,
@@ -400,9 +449,17 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
     assert!(weak_betp_before.is_some(), "fixture: duplicate has a BetP");
 
     let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(false))
-            .await
-            .expect("sweep"),
+        sweep_semantic_duplicates(
+            &server,
+            &mut fixture::scoped_pool(&pool)
+                .await
+                .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+                .await
+                .expect("a maintenance session over the test database"),
+            params(false),
+        )
+        .await
+        .expect("sweep"),
     );
     assert_eq!(j["pairs_marked"], serde_json::json!(1));
     assert!(
@@ -436,11 +493,17 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
     assert_eq!(stranded, 0, "the migrated BBA moved onto the survivor");
 
     // The survivor inherited the supporter, and its cache says so.
-    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
-        .await
-        .expect("binary frame");
+    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("binary frame");
     let coherent = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
-        &pool, &viewer, strong, frame_id,
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        strong,
+        frame_id,
     )
     .await
     .expect("preview")

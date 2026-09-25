@@ -126,6 +126,11 @@ path = "tests/recompute_betp_cohort.rs"
 required-features = ["db"]
 
 [[test]]
+name = "operator_reown"
+path = "tests/operator_reown.rs"
+required-features = ["db"]
+
+[[test]]
 name = "recompute_betp_run"
 path = "tests/recompute_betp_run.rs"
 required-features = ["db"]
@@ -193,6 +198,15 @@ required-features = ["db"]
 # dependencies are per-crate, not per-target, so the compiled artifact carries
 # them. "Never linked into the server" is a property of where the key material
 # goes, not something this manifest can enforce.
+# `epigraph-operator`: the one-time operator ownership backfill (retired links,
+# claim re-own, and its manifest-driven reversal). Same convention as its
+# siblings: a snake_case path with a kebab-case `name`. `required-features =
+# ["db"]` because every subcommand opens a maintenance pool.
+[[bin]]
+name = "epigraph-operator"
+path = "src/bin/operator.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "epigraph-group"
 path = "src/bin/group.rs"
@@ -241,6 +255,10 @@ epigraph-api = { workspace = true }
 axum = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# decompose_claims's mint_service_token unit tests (src/bin/decompose_claims.rs):
+# same pin epigraph-api/Cargo.toml already uses for its OAuth provider tests,
+# so this adds no new dependency version to the lockfile.
+wiremock = "0.6"
 
 [lints]
 workspace = true

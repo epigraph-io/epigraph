@@ -15,17 +15,39 @@ pub async fn supersede_claim(
     let old = parse_uuid(&params.claim_id)?;
     let old_claim_id = ClaimId::from_uuid(old);
 
+    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT, for the gate read
+    // and the supersession, the same construction as `patch_claim` and
+    // `update_labels`.
+    //
+    // This was `get_by_id(&server.pool, ..)` then `supersede(&server.pool, ..)`:
+    // unstamped, so on a schema without the orphan `*_privacy` policies (config
+    // A) the server agent's OWN public claim was refused with 42501 and its own
+    // group-private claim read as "not found" (MEASURED, batch H-a review). The
+    // stamp admits the population this process writes, claims owned by the
+    // server agent's groups. A claim in a group it cannot write is refused
+    // loudly, and nothing commits. Whether an authenticated caller should
+    // supersede under ITS OWN stamp rather than the server agent's is the
+    // authenticated-MCP stamping question recorded as an R3 blocker in
+    // scripts/e2e/README.md, not this conversion's.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.agent_id().await?,
+        "supersede_claim",
+    )
+    .await?;
+
     // Per-resource ownership check: only the claim's author or a
-    // claims:admin token holder may supersede it.
-    let existing = ClaimRepository::get_by_id(&server.pool, viewer, old_claim_id)
+    // claims:admin token holder may supersede it. The read is the CALLER's,
+    // through its viewer, on the same transaction.
+    let existing = ClaimRepository::get_by_id(&mut *tx, viewer, old_claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {} not found", old)))?;
     crate::tools::claims::require_owner_or_admin(server, auth, existing.agent_id.as_uuid()).await?;
 
     let truth = TruthValue::clamped(params.truth_value);
-    let (new_id, old_id) = ClaimRepository::supersede(
-        &server.pool,
+    let (new_id, old_id) = ClaimRepository::supersede_conn(
+        &mut tx,
         old_claim_id,
         &params.content,
         truth,
@@ -33,6 +55,7 @@ pub async fn supersede_claim(
     )
     .await
     .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
 
     // Retraction cascade (backlog 20e9ed83): the supporters this claim was
     // feeding hold BBAs frozen from ITS interval at wire time, so without an
@@ -45,9 +68,27 @@ pub async fn supersede_claim(
     //
     // Reported rather than silent so a caller reading a downstream claim
     // straight after this call can see exactly what was repaired.
-    let cascade =
-        epigraph_engine::retraction_cascade::cascade_after_supersede(&server.pool, viewer, new_id)
-            .await;
+    //
+    // STILL UNSTAMPED, and named rather than quietly converted. The cascade walks
+    // DOWNSTREAM claims, whose owner groups are arbitrary — it re-derives belief on
+    // whatever supported the retracted claim — so there is no single viewer whose
+    // writable set covers its target population, and stamping it from
+    // `server.agent_id()` would convert "refused for some rows" into "refused for
+    // some rows while looking converted". Which authority a retraction cascade
+    // carries across group boundaries is a tenancy-model decision, not a
+    // mechanical conversion; `crates/epigraph-mcp/tests/residual_unstamped_writes.rs`
+    // keeps both cascade sites in the residual register. The acquire below is a
+    // mechanical consequence of the engine signature change: it moves the whole
+    // cascade onto ONE connection instead of a checkout per statement, which is a
+    // coherence improvement and NOT a tenancy stamp.
+    let mut cascade_conn = server.pool.acquire().await.map_err(internal_error)?;
+    let cascade = epigraph_engine::retraction_cascade::cascade_after_supersede(
+        &mut cascade_conn,
+        viewer,
+        new_id,
+    )
+    .await;
+    drop(cascade_conn);
 
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
@@ -83,8 +124,10 @@ pub async fn mark_duplicate(
     // (orphaned + stranded edge-factor BBAs) and hands back what still has to
     // be re-derived through the DS pipeline. Same best-effort contract as
     // supersede: the dedup's own failure is an error, the cascade's is not.
+    // Unstamped for the reason recorded on `cascade_after_supersede` above.
+    let mut cascade_conn = server.pool.acquire().await.map_err(internal_error)?;
     let cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-        &server.pool,
+        &mut cascade_conn,
         viewer,
         dup_claim_id.into(),
         canon,

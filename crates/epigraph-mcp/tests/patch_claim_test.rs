@@ -1,3 +1,6 @@
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 mod common;
 use common::*;
@@ -5,7 +8,8 @@ use common::*;
 #[sqlx::test(migrations = "../../migrations")]
 async fn patch_claim_applies_trace_props_labels_atomically(pool: PgPool) {
     let id = seed_claim_with_labels(&pool, "x", &["alpha"]).await;
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // reasoning_traces.reasoning_type CHECK constraint: must be one of
     // 'deductive', 'inductive', 'abductive', 'analogical', 'statistical'.
@@ -22,6 +26,7 @@ async fn patch_claim_applies_trace_props_labels_atomically(pool: PgPool) {
 
     epigraph_mcp::tools::claims::patch_claim(
         &server,
+        &viewer,
         epigraph_mcp::types::PatchClaimParams {
             claim_id: id.to_string(),
             trace_id: Some(trace.to_string()),
@@ -29,6 +34,7 @@ async fn patch_claim_applies_trace_props_labels_atomically(pool: PgPool) {
             add_labels: vec!["beta".into()],
             remove_labels: vec!["alpha".into()],
         },
+        None,
     )
     .await
     .unwrap();

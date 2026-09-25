@@ -20,6 +20,7 @@ pub mod community;
 pub mod context;
 pub mod corpus_stats;
 pub mod counterfactual;
+pub mod decomposition_priority;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
@@ -68,7 +69,8 @@ pub mod workflow_execution;
 // Re-export all repositories for convenience
 pub use activity::ActivityRepository;
 pub use agent::{
-    AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, CapabilityFilter,
+    AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
+    CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome,
 };
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
@@ -76,15 +78,16 @@ pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
     BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
-    ClaimNeighbor, ClaimPairDistance, ClaimRepository, ConsolidateMode, ConsolidateResult,
-    DedupRepair, EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor,
-    HybridHit, LabelQuery, LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff,
-    PatchClaimInput, SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES,
-    CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
+    ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository, ClaimSortField,
+    ClaimSortOrder, ConsolidateMode, ConsolidateResult, DedupRepair, EvolveStepResult,
+    FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit, LabelQuery,
+    LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
+    SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
+    EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
-    DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow,
+    DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow, ThemeMemberRow, ThemeSummaryRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use community::{CommunityRepository, MembershipOutcome};
@@ -97,7 +100,8 @@ pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventRepository, EventRow};
 pub use evidence::{
-    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceRepository, EvidenceSearchResult,
+    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceListFilter, EvidenceListRow,
+    EvidenceRepository, EvidenceSearchResult,
 };
 pub use experiment::{
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
@@ -139,8 +143,8 @@ pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
-    HierarchicalWorkflowRow, ResolvedStep, WorkflowGoalEmbeddingHit, WorkflowListRow,
-    WorkflowRecallResult, WorkflowRepository,
+    HierarchicalWorkflowRow, ResolvedStep, ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit,
+    WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
 };
 
 // Privacy / encryption repositories

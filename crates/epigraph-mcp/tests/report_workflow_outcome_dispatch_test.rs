@@ -26,7 +26,11 @@ use uuid::Uuid;
 #[sqlx::test(migrations = "../../migrations")]
 async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Use a unique goal so canonical_name is unique across reruns / DB sharing.
     let goal = format!("dispatch regression test {}", Uuid::new_v4());
@@ -125,7 +129,11 @@ async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(po
 #[sqlx::test(migrations = "../../migrations")]
 async fn report_outcome_still_handles_legacy_flat_workflow_claim_id(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Seed a flat workflow-labeled claim — id lives in `claims`, NOT in
     // `workflows`. This is the legacy shape for the ~144 pre-migration rows.
@@ -190,7 +198,11 @@ async fn report_outcome_still_handles_legacy_flat_workflow_claim_id(pool: PgPool
 #[sqlx::test(migrations = "../../migrations")]
 async fn report_outcome_404s_for_truly_unknown_id(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let bogus = Uuid::new_v4();
 
     let err = epigraph_mcp::tools::workflows::report_workflow_outcome(

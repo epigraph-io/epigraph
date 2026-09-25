@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (303 today; the assertions below measure the tree and
+//! deletes in week two. (298 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 303 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 298 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -120,10 +120,10 @@
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. None
-//!      discharged the gate — 303 is not 0 — and no shard in the series may be
+//!      discharged the gate — 298 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
 //!      decision: 113 of the 416 sites the series began with are converted, and
-//!      303 are not.
+//!      298 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -343,7 +343,7 @@
 //!   `routes/independence.rs::analyze_independence`,
 //!   `routes/provenance.rs::{find_or_create_author_agent, find_or_create_org_agent}`,
 //!   `routes/webhooks.rs::{retain_visible_subscriptions, agent_principal_exists,
-//!   agent_may_receive, deliver_event}`,
+//!   agent_is_not_operated, agent_may_receive, deliver_event}`,
 //!   `routes/workflows.rs::{get_or_create_system_agent,
 //!   auto_wire_inserted_edges}`, `tenancy_gauge.rs::sample`. The webhook
 //!   fan-out is the one that matters most and the one this register cannot
@@ -460,12 +460,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "middleware/bearer.rs",
-        1,
-        "STRUCTURALLY non-exemptable, not merely unconverted. The single site is Viewer::resolve, \
+        2,
+        "STRUCTURALLY non-exemptable, not merely unconverted. The first site is Viewer::resolve, \
          which BUILDS the viewer every scoped acquire needs; ScopedPool::acquire_as takes the very \
          Viewer this call constructs, so stamping the connection first is circular. Recorded as \
          D-PR17-live-memberships-is-parameterised-not-principal-bound. A shard that 'converts' \
-         this deadlocks the bootstrap rather than fixing a leak.",
+         this deadlocks the bootstrap rather than fixing a leak. The second, beside it and run \
+         concurrently with it, is AgentRepository::operator_of_author_pool: migration 107's \
+         `epigraph_operator_of_author` SECURITY DEFINER read of the link RECORD, which must \
+         answer BEFORE there is a viewer (it decides whether the principal gets one: a linked \
+         agent is stdio-only), reads no tenancy-partitioned row, and returns only the named \
+         principal's own link.",
     ),
     (
         "middleware/rate_limit.rs",
@@ -514,9 +519,14 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        13,
+        14,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
-         that MINTS the principal every later request is scoped to; a Viewer cannot precede it.",
+         that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
+         The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
+         whether the agent has ANY operator link record, through the \
+         `epigraph_operator_of_author` SECURITY DEFINER read, which answers without a stamp and \
+         returns only the named agent's operator — the same pre-authentication reason, re-read \
+         for it.",
     ),
     (
         "state.rs",
@@ -553,7 +563,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 303;
+const HIGH_WATER: usize = 274;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -579,11 +589,37 @@ const HIGH_WATER: usize = 303;
 /// temporarily set to 1 — never by subtracting the count the shard believed it
 /// had converted, which is the method every shard since 5 has used and the one
 /// that catches a miscount.
+///
+/// The workflow-ingest executor conversion did not move it either:
+/// `routes/workflows.rs` falls 30 -> 27 and keeps 27 sites, so no key is
+/// deleted. Its three sites came off `HIGH_WATER` alone, 303 -> 300, read off
+/// `the_scanner_is_not_vacuous`'s own failure on the converted tree. The
+/// DS-substrate conversion in the same branch took it 27 -> 25 and `HIGH_WATER`
+/// 300 -> 298, by the same method and for the same reason: the file keeps 25
+/// sites, so no key is deleted. Unit E's authority fix took it 25 -> 24 and
+/// `HIGH_WATER` 298 -> 297, the file keeping 24 sites. Batch F's community
+/// membership fix took `routes/community.rs` 3 -> 2 and `HIGH_WATER` 297 ->
+/// 296, the file keeping 2 sites, read off `the_scanner_is_not_vacuous`'s own
+/// failure on the converted tree. Batch H6 took `routes/versioning.rs` 8 -> 7
+/// and `routes/workflows.rs` 24 -> 23 (the two write-path authorization reads
+/// moved onto `AppState::read_as`), so `HIGH_WATER` 296 -> 294 with both files
+/// keeping sites, read off the same failure (`left: 294, right: 296`). Its
+/// `PATCH /claims/:id/labels` sibling took `routes/claims.rs` 21 -> 20, so
+/// `HIGH_WATER` 294 -> 293, the file keeping 20 sites. The batch H-a review's
+/// success-over-nothing routes moved their writes onto
+/// `AppState::write_as` transactions: `routes/versioning.rs` 7 -> 4
+/// (supersede), `routes/workflows.rs` 23 -> 15 (deprecate_workflow,
+/// report_outcome), `routes/computation.rs` 10 -> 8 (bp/propagate's apply) and
+/// `routes/crud.rs` 36 -> 31 (themes/create-with-centroid), so `HIGH_WATER`
+/// 293 -> 275 with every file keeping sites, read off this test's own failure
+/// on the converted tree. Dropping `PATCH /claims/:id/labels`' author-stamp
+/// arm removed its `Viewer::resolve(&state.db_pool, ..)`: `routes/claims.rs`
+/// 20 -> 19, `HIGH_WATER` 275 -> 274.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 303 sites across 44 files as of this commit. Lower an entry when a shard
+/// 293 sites across 44 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -616,16 +652,26 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // site in that file, and it is the first decline in this series whose
     // blocker is the site and not the handler. The remaining NINETEEN sit in
     // write handlers — `create_claim` (9), `update_claim` (6), `patch_claim`
-    // (2), `update_labels` (2) — which with those two gates is 21, the row
-    // below. (An earlier draft of this comment said "seventeen" and did not
-    // close the arithmetic against the row it annotates.)
-    ("routes/claims.rs", 21),
+    // (2), `update_labels` (2) — which with those two gates is 21. (An earlier
+    // draft of this comment said "seventeen" and did not close the arithmetic
+    // against the row it annotates.) Batch H6 took `update_labels` 2 -> 1: its
+    // owner read moved onto `AppState::read_as` and its write onto
+    // `ScopedPool::begin_as`. The one site it keeps is the admin arm's
+    // `Viewer::resolve(&state.db_pool, author)`, a membership read through the
+    // SECURITY DEFINER `epigraph_live_memberships` — the same call
+    // `ViewerExtractor` makes on the same pool. 20, the row below.
+    ("routes/claims.rs", 19),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
     // so a `0` row could never be satisfied.
     ("routes/clusters.rs", 1),
-    ("routes/community.rs", 3),
+    // 3 before batch F. `remove_member` no longer touches `state.db_pool` at
+    // all: both membership writes run on a transaction stamped from the
+    // caller's viewer (`routes/community.rs::membership_tx`), because migration
+    // 106's definer takes the actor from the stamped principal. The two that
+    // remain are `create_community` and `add_member`'s existence checks.
+    ("routes/community.rs", 2),
     // 15 before this PR. Shard 4 converted the five sites belonging to its four
     // read-only handlers (`sheaf_consistency`, `sheaf_cohomology`,
     // `sheaf_reconcile`, `belief_at_time`). Unlike `routes/belief.rs` the sites
@@ -633,7 +679,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // the shard declined to produce one. Of the ten that remain, seven are
     // `propagate_beliefs`, which writes through two of them, and three are
     // `compose_subgraphs`. Both are named in that file's module doc.
-    ("routes/computation.rs", 10),
+    ("routes/computation.rs", 8),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 10),
@@ -674,7 +720,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `get_split_candidates`, `get_distant_claims`, `get_theme_embeddings`) onto
     // `AppState::read_as`. Every one of the thirty-six that remain sits in a
     // WRITE handler; this is the densest write-blocked file in the series.
-    ("routes/crud.rs", 36),
+    ("routes/crud.rs", 31),
     ("routes/edges.rs", 10),
     ("routes/embeddings.rs", 2),
     // 8 before conversion shard 7, and the largest single-file drop in that
@@ -787,7 +833,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // blocked at SITE level: `let pool = state.db_pool.clone()` is moved into a
     // detached `tokio::spawn`, which a `ScopedRead<'_>` borrowed from
     // `AppState` cannot outlive.
-    ("routes/versioning.rs", 8),
+    //
+    // 8 -> 7 (batch H6): `supersede_claim`'s ownership read
+    // (`SELECT agent_id FROM claims WHERE id = $1`) moved onto
+    // `AppState::read_as` + `ClaimRepository::get_by_id` with the caller's
+    // viewer (F-write-authz-reads-unfiltered). Five `supersede_claim` sites and
+    // two `mark_duplicate` sites remain, all write. Read off this test's
+    // failure output.
+    ("routes/versioning.rs", 4),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is
@@ -803,7 +856,34 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `add_step`, `delete_step`) and two in `get_workflow`, a routed GET that
     // holds no `Viewer` at all — the same no-Viewer class shard 6 declined in
     // `routes/agents.rs`.
-    ("routes/workflows.rs", 30),
+    //
+    // 30 -> 27: the workflow-ingest executor conversion moved `POST /workflows`,
+    // `POST /workflows/ingest`, `POST /workflows/steps` and
+    // `/workflows/steps/delete` off `state.db_pool` and onto a transaction
+    // stamped from the `workflow-ingest-system` agent's viewer
+    // (`begin_system_ingest_stamped_tx` in that file). FOUR call sites became
+    // THREE removals because the new helper reads `state.db_pool` once itself,
+    // to resolve that agent's write authority — a read the SECURITY DEFINER
+    // `epigraph_live_memberships` makes non-blind on an unstamped session, which
+    // is exactly why it is the bootstrap and cannot be stamped.
+    //
+    // 27 -> 25: the DS-substrate conversion then moved `auto_wire_inserted_edges`
+    // — the post-ingest edge-factor wiring for BOTH ingest handlers — onto its own
+    // system-agent-stamped transaction, so its two `&state.db_pool` sites went
+    // with it. Both counts were read off this test's own failure output rather than
+    // derived by subtraction, which is the method every shard since 5 has used.
+    //
+    // 25 -> 24: the bootstrap read named above no longer takes `state.db_pool`.
+    // `system_agent_write_authority` now takes the `ScopedPool`, because deciding
+    // whether it may provision needs a PRINCIPAL-stamped read of the agent's own
+    // revoked memberships (the first revision minted on an empty live set and
+    // revived a revoked admin). Read off this test's failure output.
+    //
+    // 24 -> 23 (batch H6): `deprecate_workflow`'s existence gate moved onto
+    // `AppState::read_as` + `ClaimRepository::get_by_id_with_labels` with the
+    // caller's viewer (F-write-authz-reads-unfiltered). Read off this test's
+    // failure output.
+    ("routes/workflows.rs", 15),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

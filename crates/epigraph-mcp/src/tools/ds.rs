@@ -168,19 +168,8 @@ pub async fn submit_ds_evidence(
         }
     }
 
-    // Ensure claim-frame assignment exists
-    FrameRepository::assign_claim(
-        &server.pool,
-        claim_id,
-        frame_id,
-        Some(params.hypothesis_index),
-    )
-    .await
-    .map_err(internal_error)?;
-
     let agent_id = server.agent_id().await?;
 
-    // Store the BBA
     let masses_json = serde_json::to_value(
         mass_fn
             .masses()
@@ -190,13 +179,75 @@ pub async fn submit_ds_evidence(
     )
     .map_err(internal_error)?;
 
+    // ── THE TWO TIER-A WRITES AND THE RECOMPUTE, IN ONE STAMPED TRANSACTION ──
+    //
+    // `claim_frames` and `mass_functions` both carry migration 077's strict
+    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))` and neither
+    // has an orphan `*_privacy` policy to fall back on, so on the unstamped pool
+    // this tool was refused with `42501` on its FIRST write — MEASURED on both
+    // schema configurations, `new row violates row-level security policy for
+    // table "claim_frames"`. That is also why `mass_functions` stayed 0 through
+    // every e2e run.
+    //
+    // The two belong together: a `claim_frames` assignment with no BBA is a frame
+    // membership that moves no belief, and a BBA whose claim is not assigned to
+    // the frame is unreachable from `recompute_claim_belief_on_frame`'s own
+    // enumeration. Before this they were two pool checkouts and therefore two
+    // tenancy contexts.
+    //
+    // THE RECOMPUTE BELOW IS IN THE SAME TRANSACTION, and so is the commit. That
+    // makes the whole tool one unit: `claim_frames`, `mass_functions` and the
+    // claim's cached `belief`/`plausibility`/`pignistic_prob` either all land or
+    // none do (see the note at the recompute call for where it used to stop).
+    //
+    // HISTORY, kept short. An earlier revision of this block converted only the
+    // two writes above and left the recompute on `epigraph_engine::edge_factor`'s
+    // pool-bound DS machinery. On a cleanly-migrated schema the tool then
+    // committed `claim_frames` + `mass_functions` and failed afterwards at the
+    // recompute's `UPDATE claims`, leaving the cached belief stale behind an error
+    // response. The only repair for that window was out-of-band
+    // (`epigraph-cli recompute_claim_belief` on `MaintenancePool::connect`),
+    // because the in-band `recompute_beliefs` tool was then hard-disabled (it now
+    // runs on the maintenance connection, batch H1). D2 moved the recompute onto
+    // this connection, so that window no longer exists and there is nothing to
+    // repair.
+    //
+    // Retry-safety is still worth recording, though it no longer carries a
+    // committed-partial argument. `assign_claim` is `ON CONFLICT … DO UPDATE` and
+    // `store_with_perspective` upserts on
+    // `(claim_id, frame_id, source_agent_id, perspective_id)`, so a repeat call
+    // re-states the same BBA rather than combining its mass twice.
+    //
+    // AND IT SUCCEEDS ONLY FOR CLAIMS THIS SERVER'S GROUP OWNS. Stated here because
+    // "the whole tool is one unit that lands" is true only of that case, and the
+    // reported e2e arm was run on the agent's own claim. `claim_frames` and
+    // `mass_functions` are CLAIM-DERIVED: migration 074's
+    // `epigraph_derived_require_tenancy` fills `(visibility, owner_group_id)` from
+    // the parent claim and 070 arm (c) re-stamps it, so the `WITH CHECK` asks about
+    // the CLAIM's group, not the evidence author's. The stamp here carries
+    // `server.agent_id()`'s writable set, so a BBA against ANOTHER group's claim is
+    // still refused on a cleanly-migrated schema. `tools/challenges.rs` states the
+    // same residual for `challenge_claim` in its doc header, and
+    // `epigraph-db/tests/tool_write_tables_require_a_stamp.rs::
+    // a_challenge_against_a_foreign_groups_claim_is_still_refused` pins it on the
+    // non-bypassing role. `tools/claims.rs::update_with_evidence` has the same shape
+    // for the same reason. Whether an admin scope should carry write authority into
+    // a group it is not a member of is a tenancy-model decision, not a bug here.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_ds_evidence")
+            .await?;
+
+    FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
+        .await
+        .map_err(internal_error)?;
+
     // source_strength stays NULL either way: the calibrated path derives
     // reliability dynamically from evidence_type at recompute time
     // (effective_source_strength), and the legacy path already baked the
     // raw `reliability` float into the pre-discounted masses above rather
     // than caching it here — unchanged from pre-change behavior.
     let mf_id = MassFunctionRepository::store_with_perspective(
-        &server.pool,
+        &mut *tx,
         claim_id,
         frame_id,
         Some(agent_id),
@@ -213,8 +264,10 @@ pub async fn submit_ds_evidence(
     .map_err(internal_error)?;
 
     // Count stored BBAs for the response (bba_count is informational only).
+    // Read INSIDE the transaction so it counts the row just stored rather than
+    // whatever a sibling connection can see.
     let bba_count =
-        MassFunctionRepository::get_for_claim_frame(&server.pool, viewer, claim_id, frame_id)
+        MassFunctionRepository::get_for_claim_frame(&mut *tx, viewer, claim_id, frame_id)
             .await
             .map_err(internal_error)?
             .len();
@@ -234,11 +287,18 @@ pub async fn submit_ds_evidence(
     // path always resolves method adaptively (via `combine_multiple`) and
     // targets hypothesis index 0 (the canonical binary_truth convention).
     // This is the accepted consequence of unification, not a follow-up bug.
+    //
+    // IT RUNS INSIDE THE SAME TRANSACTION, and the commit moved below it. Its
+    // `UPDATE claims SET belief/plausibility/pignistic_prob` is where
+    // `submit_ds_evidence` STOPPED on a cleanly-migrated schema: the statement
+    // ran on the unstamped pool, where `claims_tenancy`'s `WITH CHECK` refuses
+    // it. Errors here are propagated (DS is the primary belief authority on this
+    // path), so on the old shape a refusal returned an error with the BBA already
+    // committed and the claim's cached belief still describing the evidence
+    // before it — success-shaped state behind a failure-shaped response. Now the
+    // BBA and the belief it implies are one unit.
     epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-        &server.pool,
-        viewer,
-        claim_id,
-        frame_id,
+        &mut tx, viewer, claim_id, frame_id,
     )
     .await
     .map_err(internal_error)?;
@@ -246,6 +306,21 @@ pub async fn submit_ds_evidence(
     // Read back exactly what the shared recompute path just wrote, so the
     // response can never drift from what a later `recompute_beliefs` call
     // (with no new evidence) would produce.
+    //
+    // ON THE WRITE TRANSACTION, BEFORE THE COMMIT (backlog F3, `15c00c7a`).
+    // This read used to run after `tx.commit()`, on `server.pool`, so every way
+    // it could fail — the claim invisible to the request viewer below, or
+    // invisible to the pool's UNSTAMPED `epigraph_app` connection, which hides
+    // every `group`-visibility row — returned an error for a frame assignment,
+    // BBA and recomputed belief that had already committed. The description's
+    // contract is "a refusal … writes nothing", so the read that can refuse now
+    // runs where a refusal still rolls everything back: `?` below drops `tx`
+    // uncommitted. MEASURED before the move
+    // (`tests/ds_evidence_no_error_after_commit.rs`): the server agent's OWN
+    // group-private claim on an `epigraph_app` pool answered "claim … not
+    // found" with 1 BBA and 1 `claim_frames` row committed, and so did a
+    // request viewer that cannot read the claim. On the transaction the read
+    // sees what the author's stamp sees, which is the row it just updated.
     let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing): (
         f64,
         f64,
@@ -286,13 +361,16 @@ pub async fn submit_ds_evidence(
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_optional(&server.pool)
+        q.fetch_optional(&mut *tx)
             .await
             .map_err(internal_error)?
             .ok_or_else(|| {
                 rmcp::model::ErrorData::invalid_request(format!("claim {claim_id} not found"), None)
             })?
     };
+
+    tx.commit().await.map_err(internal_error)?;
+
     let betp = pignistic_prob.unwrap_or(0.0);
     let ign = plausibility - belief;
 

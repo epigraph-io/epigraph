@@ -61,59 +61,76 @@ struct RecomputeBeliefsResult {
 ///
 /// Target precedence: `claim_ids` (explicit) > `labels` (current claims with
 /// all labels) > bulk enumeration of every claim that has a BBA. Each target
-/// claim is recomputed on **every frame it carries BBAs on**, in frame-name
-/// order, so the frame-agnostic cached scalars converge deterministically.
+/// claim's cache is written from ONE owner frame (`binary_truth` when present),
+/// see `recompute_claim_cached_belief`.
+///
+/// # Every statement runs on the maintenance session's connection
+///
+/// Enumeration, per-claim frame listing and the recompute itself all run on
+/// `session`'s connection, which `maintenance::maintenance_viewer` has checked
+/// can bypass RLS. The server's application pool is never named here
+/// (`tests/maintenance_tools_spend_only_the_session.rs`), so the bypass viewer
+/// cannot be spent on a connection that would filter it into zero rows.
+///
+/// Each claim's recompute is its OWN transaction on that connection. The frame
+/// get-or-create and the cached-belief UPDATE land together or not at all, and a
+/// failure on one claim is rolled back alone and reported in `errors`.
+/// `claims_recomputed` / `frame_writes` count only claims whose transaction
+/// COMMITTED a cache write, so the response cannot claim a write that was
+/// rolled back (#395).
 pub async fn recompute_beliefs(
-    server: &EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    _server: &EpiGraphMcpFull,
+    session: &mut epigraph_db::MaintenanceSession<'_>,
     params: RecomputeBeliefsParams,
 ) -> Result<CallToolResult, McpError> {
-    let pool = &server.pool;
+    use sqlx::Acquire as _;
+    let (conn, viewer) = session.split();
     let limit = params.limit.unwrap_or(500).clamp(1, 2000);
     let offset = params.offset.unwrap_or(0).max(0);
 
     let claim_ids_param = params.claim_ids.unwrap_or_default();
     let labels_param = params.labels.unwrap_or_default();
 
-    let (target, claim_ids, truncated): (&'static str, Vec<Uuid>, bool) =
-        if !claim_ids_param.is_empty() {
-            let mut ids = Vec::with_capacity(claim_ids_param.len());
-            for s in &claim_ids_param {
-                ids.push(
-                    Uuid::parse_str(s.trim())
-                        .map_err(|e| invalid_params(format!("invalid claim_id {s:?}: {e}")))?,
-                );
-            }
-            ("claim_ids", ids, false)
-        } else if !labels_param.is_empty() {
-            // Fetch limit+1 to distinguish "exactly limit, none remain" from
-            // "limit reached, more remain" (same trick as the bulk path).
-            let mut rows = ClaimRepository::list_by_labels(
-                pool,
-                viewer,
-                epigraph_db::LabelQuery {
-                    labels: &labels_param,
-                    current_only: true,
-                    limit: limit + 1,
-                    offset,
-                    ..Default::default()
-                },
-            )
+    let (target, claim_ids, truncated): (&'static str, Vec<Uuid>, bool) = if !claim_ids_param
+        .is_empty()
+    {
+        let mut ids = Vec::with_capacity(claim_ids_param.len());
+        for s in &claim_ids_param {
+            ids.push(
+                Uuid::parse_str(s.trim())
+                    .map_err(|e| invalid_params(format!("invalid claim_id {s:?}: {e}")))?,
+            );
+        }
+        ("claim_ids", ids, false)
+    } else if !labels_param.is_empty() {
+        // Fetch limit+1 to distinguish "exactly limit, none remain" from
+        // "limit reached, more remain" (same trick as the bulk path).
+        let mut rows = ClaimRepository::list_by_labels(
+            &mut *conn,
+            viewer,
+            epigraph_db::LabelQuery {
+                labels: &labels_param,
+                current_only: true,
+                limit: limit + 1,
+                offset,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(internal_error)?;
+        let truncated = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        let ids: Vec<Uuid> = rows.into_iter().map(|(c, _)| c.id.into()).collect();
+        ("labels", ids, truncated)
+    } else {
+        // Fetch limit+1 to detect truncation, then trim back to limit.
+        let mut ids = MassFunctionRepository::list_claim_ids(&mut *conn, viewer, limit + 1, offset)
             .await
             .map_err(internal_error)?;
-            let truncated = rows.len() as i64 > limit;
-            rows.truncate(limit as usize);
-            let ids: Vec<Uuid> = rows.into_iter().map(|(c, _)| c.id.into()).collect();
-            ("labels", ids, truncated)
-        } else {
-            // Fetch limit+1 to detect truncation, then trim back to limit.
-            let mut ids = MassFunctionRepository::list_claim_ids(pool, viewer, limit + 1, offset)
-                .await
-                .map_err(internal_error)?;
-            let truncated = ids.len() as i64 > limit;
-            ids.truncate(limit as usize);
-            ("all_with_bbas", ids, truncated)
-        };
+        let truncated = ids.len() as i64 > limit;
+        ids.truncate(limit as usize);
+        ("all_with_bbas", ids, truncated)
+    };
 
     let claims_considered = claim_ids.len();
     let mut claims_recomputed = 0usize;
@@ -122,7 +139,7 @@ pub async fn recompute_beliefs(
     let mut errors: Vec<RecomputeError> = Vec::new();
 
     for claim_id in claim_ids {
-        let frames = MassFunctionRepository::list_frames_for_claim(pool, viewer, claim_id)
+        let frames = MassFunctionRepository::list_frames_for_claim(&mut *conn, viewer, claim_id)
             .await
             .map_err(internal_error)?;
         if frames.is_empty() {
@@ -139,13 +156,39 @@ pub async fn recompute_beliefs(
             .next()
             .expect("frames is non-empty: checked above");
         let mut wrote_any = false;
-        match epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, viewer, claim_id)
+        // ONE TRANSACTION PER CLAIM, on the maintenance connection. A bulk
+        // recompute is authored by nobody, so it is not stamped from anyone's
+        // viewer; its authority is the connection's bypass, checked by
+        // `maintenance_viewer`. The transaction makes the claim's frame
+        // get-or-create and its cached-belief UPDATE one unit, and a failure is
+        // rolled back alone (it is reported, and the sweep continues).
+        let mut tx = match conn.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                errors.push(RecomputeError {
+                    claim_id: claim_id.to_string(),
+                    frame_id: owner_frame.to_string(),
+                    error: format!("could not begin the per-claim transaction: {e}"),
+                });
+                continue;
+            }
+        };
+        match epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut tx, viewer, claim_id)
             .await
         {
-            Ok(true) => {
-                frame_writes += 1;
-                wrote_any = true;
-            }
+            Ok(true) => match tx.commit().await {
+                Ok(()) => {
+                    frame_writes += 1;
+                    wrote_any = true;
+                }
+                Err(e) => errors.push(RecomputeError {
+                    claim_id: claim_id.to_string(),
+                    frame_id: owner_frame.to_string(),
+                    error: format!("recomputed but could not commit: {e}"),
+                }),
+            },
+            // No BBA on the owner frame: nothing was written. Dropping `tx`
+            // rolls back the (empty) transaction.
             Ok(false) => {}
             Err(e) => errors.push(RecomputeError {
                 claim_id: claim_id.to_string(),

@@ -2,7 +2,7 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, invalid_params, McpError};
+use crate::errors::{db_caller_error, internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
@@ -34,6 +34,20 @@ pub async fn memorize(
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
     let mut tags = params.tags.unwrap_or_default();
+
+    // Validate the caller's tags BEFORE anything is written (backlog
+    // f6310444). `tags` become `claims.labels` via `update_labels` further
+    // down, which refuses unexpanded shell syntax at the repo layer — but that
+    // call sits after `create_claim_idempotent` and its failure used to be
+    // swallowed into a `tracing::warn!`, so `memorize(tags =
+    // ["claude-memory", "group:$EPICLAW_GROUP_ID"])` returned SUCCESS with the
+    // claim stored and ALL tags dropped. That is strictly worse than the
+    // corruption the guard exists to stop: a mislabelled claim is findable by
+    // sweeping for `$`, whereas a silently untagged one is indistinguishable
+    // from a claim never meant to be grouped — the second consequence the
+    // backlog report names. Refusing the call outright makes the failure
+    // visible to the caller that can still fix it.
+    epigraph_db::reject_unexpanded_labels(&tags).map_err(db_caller_error)?;
 
     let raw_truth = (confidence * 0.6).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
@@ -109,22 +123,52 @@ pub async fn memorize(
         }
     }
 
+    // ── THE ONE TRANSACTION THIS SUBMISSION RUNS IN ─────────────────────
+    // Identical construction, identical reasoning and the same two defects as
+    // `tools::claims::submit_claim` — see the long comment at that call site for
+    // why claim + labels + Trace + Evidence + `update_trace_id` + the DS auto-wire
+    // must share one author-stamped transaction, and why only the embedding stays
+    // outside it.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, agent_id, "memorize").await?;
+
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, viewer, &claim, "memorize")
-            .await?;
+        crate::claim_helper::create_claim_idempotent(&mut tx, viewer, &claim, "memorize").await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Persist tags as claim labels so `query_claims_by_label` can surface them.
     // Apply on dedup-hit too — labels accumulate non-destructively via the repo's
     // SELECT DISTINCT, so re-memorizing existing content with new tags is additive.
+    //
+    // The failure is PROPAGATED, not warned-and-dropped. A memory whose tags
+    // silently vanished is unfindable by the `query_claims_by_label` call the
+    // caller stored it for, so reporting success would be a lie; and because
+    // `create_claim_idempotent` dedupes on (content_hash, agent_id) and
+    // `update_labels_conn` unions labels, a caller that retries on this error
+    // lands on the same claim and gets its tags applied rather than a duplicate.
+    // In the transaction now, so a rejected tag set also rolls the claim back
+    // rather than leaving an untagged one behind.
     if !tags.is_empty() {
-        if let Err(e) = ClaimRepository::update_labels(&server.pool, claim_uuid, &tags, &[]).await {
-            tracing::warn!(claim_id = %claim_uuid, "memorize: update_labels failed: {e}");
-        }
+        ClaimRepository::update_labels_conn(&mut tx, claim_uuid, &tags, &[])
+            .await
+            .map_err(db_caller_error)?;
     }
 
-    let (final_truth, ds, embedded) = if was_created {
+    // `was_created` alone used to gate the whole provenance block, which is why
+    // `memory.rs`'s own doc recorded that a dedup hit "skips Evidence + Trace +
+    // update_trace_id + DS + embed". For a claim that is a PRE-EXISTING ORPHAN
+    // — committed by a submission whose trace was refused with 42501 — that made
+    // every retry return `{"embedded": false}` and HTTP success for a row with
+    // no provenance at all, so the retry a caller performs to repair the row
+    // could not repair it. The provenance half is now gated on
+    // `was_created || claim.trace_id.is_none()`, and the embed below on
+    // `was_created || <the canonical row has no vector>` — an orphan lost its
+    // embedding to the same refusal, and repairing provenance while leaving
+    // `embedding IS NULL` leaves the claim unrecallable. Only DS auto-wire stays
+    // gated on `was_created` alone, because re-running it on an existing claim
+    // would combine the same mass twice.
+    let needs_provenance = was_created || claim.trace_id.is_none();
+    if needs_provenance {
         let evidence_text = if tags.is_empty() {
             "Memory stored via MCP memorize tool".to_string()
         } else {
@@ -154,59 +198,106 @@ pub async fn memorize(
             format!("Memory stored via memorize tool. Tags: {}", tags.join(", ")),
         );
 
-        ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
+        ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
             .await
             .map_err(internal_error)?;
-        EvidenceRepository::create(&server.pool, &evidence)
+        EvidenceRepository::create(&mut *tx, &evidence)
             .await
             .map_err(internal_error)?;
-        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
+        ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;
+    }
 
-        let ds = match ds_auto::auto_wire_ds_for_claim(
-            &server.pool,
-            viewer,
-            claim_uuid,
-            agent_id,
-            ds_auto::DsAutoInput {
-                confidence,
-                weight: 0.6,
-                supports: true,
-                evidence_type: None,
-            },
+    // DS auto-wire: FIRST-CREATE ONLY (re-running would combine the same mass
+    // twice). The embed below is deliberately NOT gated the same way — see the
+    // comment there and `tools::claims::submit_claim`, which carries the long
+    // form of both halves.
+    //
+    // IN THIS TRANSACTION, BEFORE COMMIT, and a failure fails the call: the
+    // claim and its `claim_frames` / `mass_functions` / cached-belief
+    // `UPDATE claims` land together or not at all. It used to run post-commit and
+    // warn-only, which returned success with `belief: null` over a committed claim
+    // with no BBA. `memorize` passes `persist_truth_from_pignistic = false` —
+    // unlike `submit_claim` it does not derive a `truth_value` from the BBA, so
+    // there is no second write to keep consistent with it.
+    let ds = if was_created {
+        Some(
+            crate::claim_helper::wire_ds_for_new_claim_in_tx(
+                &mut tx,
+                viewer,
+                agent_id,
+                claim_uuid,
+                ds_auto::DsAutoInput {
+                    confidence,
+                    weight: 0.6,
+                    supports: true,
+                    evidence_type: None,
+                },
+                /* persist_truth_from_pignistic */ false,
+                "memorize",
+            )
+            .await?,
         )
-        .await
+    } else {
+        // Option A: a dedup hit. AUTHORED already fired in the helper, and Trace
+        // + Evidence + `update_trace_id` ran above IF and only if the canonical
+        // claim had no trace. No DS: it would double-count.
+        None
+    };
+
+    // COMMIT. Everything below this line is post-commit and best-effort.
+    tx.commit().await.map_err(internal_error)?;
+
+    // EMBEDDING. `was_created` OR "the canonical row is missing its vector" —
+    // the repaired orphan is exactly the row for which those differ, and
+    // `submit_claim` carries the full argument. Telemetry and sealed rows are
+    // excluded inside `claim_text_if_embedding_missing`; an unreadable answer is
+    // treated as "do not embed" and left to the maintenance backfill.
+    let embed_text: Option<String> = if was_created {
+        Some(params.content.clone())
+    } else {
+        match ClaimRepository::claim_text_if_embedding_missing(&server.pool, viewer, claim_uuid)
+            .await
         {
-            Ok(r) => Some(r),
+            Ok(text) => text,
             Err(e) => {
-                tracing::warn!(claim_id = %claim_uuid, "ds auto-wire memorize failed: {e}");
+                tracing::warn!(
+                    claim_id = %claim_uuid,
+                    "could not read whether the canonical claim still needs an embedding; \
+                     skipping the repair embed: {e}"
+                );
                 None
             }
-        };
+        }
+    };
 
-        // Reuse the novelty gate's already-generated vector when available,
-        // matching submit_claim's pattern — avoids a second OpenAI call.
-        let embedded = if let Some(pgvec) = pending_embedding.take() {
-            match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
-                Ok(stored) => stored,
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
-                    false
-                }
-            }
-        } else {
-            server
-                .embedder
-                .embed_and_store(claim_uuid, &params.content)
-                .await
-        };
+    // On an AUTHOR-STAMPED connection, reusing the novelty gate's vector when
+    // there is one. Identical construction and identical reasoning to
+    // `tools::claims::submit_claim`; `claim_helper::embed_claim_author_stamped`
+    // carries the long form — in short, the `UPDATE claims SET embedding` is
+    // refused on the unstamped pool and the refusal is silent because the embed
+    // is best-effort.
+    let embedded = match embed_text {
+        None => false,
+        Some(text) => {
+            crate::claim_helper::embed_claim_author_stamped(
+                server,
+                agent_id,
+                claim_uuid,
+                &text,
+                pending_embedding.take(),
+                "memorize",
+            )
+            .await
+        }
+    };
 
-        (raw_truth, ds, embedded)
+    // A dedup hit reports the CANONICAL truth, not this call's raw value.
+    let final_truth = if was_created {
+        raw_truth
     } else {
-        // Option A: skip Evidence + Trace + update_trace_id + DS + embed.
-        // AUTHORED already fired in the helper. Report canonical truth.
-        (claim.truth_value.value(), None, false)
+        claim.truth_value.value()
     };
 
     success_json(&MemorizeResponse {
@@ -275,13 +366,67 @@ async fn recall_post_embed(
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
     let agent_filter = parse_agent_filter(params.agent_id.as_deref()).map_err(invalid_params)?;
+    let offset = params.offset.unwrap_or(0).max(0);
     let tags = params.tags;
     let tags_opt: Option<&[String]> = if tags.is_empty() { None } else { Some(&tags) };
 
+    // Theme scope (backlog c95a2509). Resolved up front, and fails closed on
+    // every ambiguity — see `themes::resolve_theme_selector`. Sharing that
+    // resolver with `get_theme` is what makes `theme_label` mean the same thing
+    // on both tools.
+    let theme = crate::tools::themes::resolve_theme_selector(
+        &server.pool,
+        viewer,
+        params.theme_id.as_deref(),
+        params.theme_label.as_deref(),
+    )
+    .await?;
+    let theme_filter = theme.as_ref().map(|t| t.id);
+
+    // The workflows leg is the fourth candidate-producing surface on this tool,
+    // and it is the one a theme filter CANNOT be pushed into: `workflows` rows
+    // carry no `theme_id`, so a theme-scoped recall that still ran that leg
+    // would hand back unthemed workflow hits inside a result the caller asked
+    // to be confined to one theme. Rejecting is chosen over silently skipping
+    // the leg because a caller who passed `include_workflows=true` asked for
+    // something this combination cannot deliver, and a quietly-dropped option
+    // is the failure mode the `since`-window work already had to stamp out on
+    // this surface.
+    if theme_filter.is_some() && params.include_workflows {
+        return Err(invalid_params(
+            "theme_id/theme_label cannot be combined with include_workflows=true: workflows carry \
+             no theme_id, so the workflow hits could not be confined to the theme. Drop one.",
+        ));
+    }
+
+    // Paging and the workflows leg are likewise incompatible. The two hit lists
+    // are disjoint id-spaces RRF-merged in Rust after the SQL page; an offset
+    // applied to the claims leg alone would re-serve the same top workflows on
+    // every page, and there is no ranking continuity to offset them by.
+    if offset > 0 && params.include_workflows {
+        return Err(invalid_params(
+            "offset cannot be combined with include_workflows=true: offset pages the claims \
+             ranking, and the workflows leg has no page-consistent counterpart, so the same \
+             workflows would reappear on every page.",
+        ));
+    }
+
     // Resolve the optional (frame, perspective) lens up front (both-or-neither,
     // parse, existence) so the bulk retrieval / ranking / min_truth path — all
-    // unchanged on the global truth_value — is never entered with a bad lens,
+    // unchanged by the lens (retrieval and ranking stay on similarity/RRF, and
+    // min_truth stays on the UNLENSED belief; backlog 14b98adc moved it from
+    // `truth_value` to the global DS cache, not to a per-perspective value) —
+    // is never entered with a bad lens,
     // and the existence round-trips run ONCE, not per claim.
+    // Same up-front-validation rule as the lens below: a malformed
+    // `diversity_radius` is rejected BEFORE any retrieval runs, so a caller who
+    // mistyped it gets told instead of paying for a page and then losing it.
+    let diversity_radius = params
+        .diversity_radius
+        .map(crate::types::validate_diversity_radius)
+        .transpose()
+        .map_err(invalid_params)?;
+
     let lens = crate::tools::lens::resolve_lens(
         params.frame_id.as_deref(),
         params.perspective_id.as_deref(),
@@ -298,8 +443,12 @@ async fn recall_post_embed(
     //
     // `params.since` is threaded into BOTH branches: the window must not
     // silently widen just because the embedder happened to be down.
+    //
+    // `theme_filter` and `offset` are threaded into BOTH branches for the same
+    // reason: a scope that held on the hybrid path but not on the degrade path
+    // would widen to the whole corpus precisely when the embedder is down.
     let hits: Vec<HybridHit> = match pgvec_opt.as_deref() {
-        Some(pgvec) => ClaimRepository::search_hybrid_scoped_since(
+        Some(pgvec) => ClaimRepository::search_hybrid_scoped_since_in_theme(
             &server.pool,
             viewer,
             pgvec,
@@ -307,25 +456,36 @@ async fn recall_post_embed(
             HYBRID_CANDIDATE_POOL,
             HYBRID_RRF_K,
             limit,
+            offset,
             tags_opt,
             agent_filter,
             params.since,
+            theme_filter,
         )
         .await
         .map_err(internal_error)?,
-        None => ClaimRepository::search_lexical_scoped_since(
+        None => ClaimRepository::search_lexical_scoped_since_in_theme(
             &server.pool,
             viewer,
             &params.query,
             HYBRID_RRF_K,
             limit,
+            offset,
             tags_opt,
             agent_filter,
             params.since,
+            theme_filter,
         )
         .await
         .map_err(internal_error)?,
     };
+
+    // Captured BEFORE the min_truth / exclude_contested post-filters shrink the
+    // page. `hits.len()` is what SQL could supply for this window, so
+    // `== limit` is the exact "another page may exist" signal; the post-filtered
+    // `results.len()` is not (a page filtered down to zero is not the end of the
+    // walk).
+    let sql_page_len = hits.len() as i64;
 
     // Workflows ANN leg (opt-in, backlog 88a09fd2 / Task 6.3). Only runs when
     // BOTH include_workflows=true AND the query embedding succeeded — there is
@@ -383,6 +543,34 @@ async fn recall_post_embed(
     merged.sort_by(|a, b| b.0.total_cmp(&a.0));
     merged.truncate(limit as usize);
 
+    // Backlog 14b98adc: `min_truth` gates on the DS pignistic probability, not
+    // on `claims.truth_value` — which no DS write path refreshes, so a claim
+    // refuted by epistemic edges kept passing a gate set against its pre-edge
+    // authored value. Resolved in ONE round-trip for the page, BEFORE the loop;
+    // a per-hit read would add an N+1 on top of the `get_by_id` below. Only
+    // claim hits are looked up: workflows are a different id-space with no DS
+    // cache. Degrade-not-fail — a failed lookup yields an empty map, and every
+    // hit then falls back to the `truth_value` already in hand.
+    let belief_by_claim = {
+        let ids: Vec<uuid::Uuid> = merged
+            .iter()
+            .filter_map(|(_, h)| match h {
+                MergedHit::Claim(c) => Some(c.claim_id),
+                MergedHit::Workflow(_) => None,
+            })
+            .collect();
+        match ClaimRepository::effective_belief_batch(&server.pool, viewer, &ids).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "DS belief batch failed; min_truth falls back to claims.truth_value for this page"
+                );
+                std::collections::HashMap::new()
+            }
+        }
+    };
+
     let mut results = Vec::new();
     for (merged_rrf_score, merged_hit) in merged {
         match merged_hit {
@@ -395,7 +583,12 @@ async fn recall_post_embed(
                 .await
                 {
                     let tv = claim.truth_value.value();
-                    if tv >= min_truth {
+                    // Absent key == invisible to this viewer / deleted between
+                    // the ANN page and this read. Falling back to the `tv`
+                    // already in hand keeps a claim with no DS state
+                    // byte-identical to pre-fix behaviour.
+                    let score = belief_by_claim.get(&hit.claim_id).copied().unwrap_or(tv);
+                    if score >= min_truth {
                         let mut matched_via = Vec::new();
                         if hit.dense_similarity.is_some() {
                             matched_via.push("dense".to_string());
@@ -416,6 +609,7 @@ async fn recall_post_embed(
                             claim_id: hit.claim_id.to_string(),
                             content: claim.content,
                             truth_value: tv,
+                            belief_score: score,
                             similarity: hit.dense_similarity.unwrap_or(0.0),
                             rrf_score: hit.rrf_score,
                             matched_via,
@@ -444,6 +638,11 @@ async fn recall_post_embed(
                         claim_id: hit.workflow_id.to_string(),
                         content: hit.content,
                         truth_value: hit.truth_value,
+                        // A workflow row is not a claim: it has no DS cache to
+                        // read, so the gate value IS its truth_value. Reported
+                        // rather than omitted so the field means the same thing
+                        // ("what min_truth compared against") on every row.
+                        belief_score: hit.truth_value,
                         similarity: hit.similarity,
                         rrf_score: merged_rrf_score,
                         // Workflows aren't claims, so the batch lens post-pass's
@@ -479,7 +678,8 @@ async fn recall_post_embed(
     // result keyed by claim_id. Per-claim degrade-not-fail is preserved: each
     // claim carries its own `Result`, so one malformed claim warns + serves a
     // null lens without aborting the page (spec §8). min_truth/ranking stayed
-    // on the global `tv` above and are untouched here.
+    // on the UNLENSED `score` above (the global DS cache, backlog 14b98adc) and
+    // are untouched here: a lens annotates, it does not gate.
     if let Some((frame_id, perspective_id)) = lens {
         let claim_ids: Vec<uuid::Uuid> = results
             .iter()
@@ -577,6 +777,76 @@ async fn recall_post_embed(
         }
     }
 
+    // Diversity post-filter (backlog a9397e8a): greedy MMR over the ranked
+    // page, dropping any hit within `diversity_radius` cosine distance of a
+    // hit already kept above it.
+    //
+    // Runs BEFORE the audit block below, which derives `returned_claim_ids`
+    // from `results`. An audit row naming claims the caller never received
+    // would be a false disclosure record, and this is the only post-filter on
+    // this surface that runs late enough to create one.
+    //
+    // Claim ids only. A workflow hit (`result_type = Some("workflow")`) carries
+    // a `workflows.id` in `claim_id` and has no row in `claims`, so it can
+    // neither be measured nor suppress anything — `greedy_diversity_keep`'s
+    // keep-on-unmeasurable rule covers it, and the filter below re-admits it
+    // explicitly rather than relying on a uuid from a foreign id-space failing
+    // to collide.
+    if let Some(radius) = diversity_radius {
+        let claim_ids: Vec<uuid::Uuid> = results
+            .iter()
+            .filter(|r| r.result_type.is_none())
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .collect();
+        // `recall`'s claims legs search `claims.embedding`, the 1536d column,
+        // on both the hybrid and the lexical-fallback path — there is no
+        // runtime dim choice here, unlike `recall_with_context`.
+        match ClaimRepository::pairwise_cosine_distance_at_dim(
+            &server.pool,
+            viewer,
+            &claim_ids,
+            radius,
+            1536,
+        )
+        .await
+        {
+            Ok(pairs) => {
+                // The repo already applied the `< radius` cut in SQL, so every
+                // returned pair IS a too-similar pair.
+                let too_similar: std::collections::HashSet<(uuid::Uuid, uuid::Uuid)> = pairs
+                    .iter()
+                    .map(|p| crate::types::unordered_pair(p.claim_a, p.claim_b))
+                    .collect();
+                let keep: std::collections::HashSet<uuid::Uuid> =
+                    crate::types::greedy_diversity_keep(&claim_ids, &too_similar)
+                        .into_iter()
+                        .collect();
+                results.retain(|r| {
+                    // Workflow hits, and any row whose id will not parse, are
+                    // outside the measured id-space entirely.
+                    if r.result_type.is_some() {
+                        return true;
+                    }
+                    match uuid::Uuid::parse_str(&r.claim_id) {
+                        Ok(id) => keep.contains(&id),
+                        Err(_) => true,
+                    }
+                });
+            }
+            Err(e) => {
+                // Degrade-not-fail, matching the lens and dispute post-passes
+                // above: serve the undiversified page rather than lose results
+                // already retrieved. Deliberately NOT a silent success — a
+                // caller reading the log can tell a page that was not filtered
+                // from one that had nothing to filter.
+                tracing::warn!(
+                    error = %e,
+                    "diversity filter failed; serving the page without it"
+                );
+            }
+        }
+    }
+
     // Id is minted HERE, not read back from the insert: the write is spawned,
     // so the response must be able to cite the event without awaiting it.
     let event_id = uuid::Uuid::new_v4();
@@ -620,41 +890,123 @@ async fn recall_post_embed(
             // and without a window returns different sets, so the window is
             // part of what was asked.
             "since": params.since,
+            // Same argument for the theme scope and the page offset: the same
+            // query pinned to a theme, or taken at offset 20, returns a
+            // different set, so both are part of what was asked and a
+            // retrieval whose scope cannot be reconstructed from its audit row
+            // is an unauditable retrieval. The RESOLVED theme id is logged, not
+            // the raw selector, so a `theme_label` lookup stays reconstructible
+            // after the label is renamed.
+            "theme_id": theme_filter,
+            "offset": offset,
+            // Recorded for the same reason as `since` and `theme_id`: it
+            // changes WHICH claims came back, so a retrieval whose diversity
+            // cut cannot be reconstructed from its audit row is an unauditable
+            // retrieval. `epistemic_partition` is deliberately NOT recorded —
+            // it regroups the response without changing the set.
+            "diversity_radius": params.diversity_radius,
         });
-        let pool = server.pool.clone();
+        let scoped = server.scoped.clone();
         tokio::spawn(async move {
-            // Unresolvable ⇒ DROP, never widen. See `recall_audit_owner_group`.
-            let owner_group_id =
-                match super::recall::recall_audit_owner_group(&pool, principal).await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        tracing::warn!(reason = %e, "recall audit skipped rather than widened");
-                        return;
+            // Unresolvable ⇒ DROP, never widen, and never mint (#493). The row
+            // is written on the principal-stamped transaction that resolved its
+            // owner; see `recall::write_recall_audit`.
+            let written =
+                super::recall::write_recall_audit(scoped.as_ref(), principal, |owner_group_id| {
+                    epigraph_db::NewRecallEvent {
+                        id: event_id,
+                        agent_id: principal,
+                        tool: "recall".to_string(),
+                        query_text,
+                        query_pgvector,
+                        params: params_json,
+                        returned_claim_ids,
+                        owner_group_id: Some(owner_group_id),
                     }
-                };
-            let event = epigraph_db::NewRecallEvent {
-                id: event_id,
-                agent_id: principal,
-                tool: "recall".to_string(),
-                query_text,
-                query_pgvector,
-                params: params_json,
-                returned_claim_ids,
-                owner_group_id: Some(owner_group_id),
-            };
-            if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
-                tracing::warn!(
+                })
+                .await;
+            match written {
+                Ok(_) => {}
+                Err(super::recall::RecallAuditNotWritten::Unresolved(e)) => {
+                    tracing::warn!(reason = %e, "recall audit skipped rather than widened");
+                }
+                Err(super::recall::RecallAuditNotWritten::Write(e)) => tracing::warn!(
                     error = %e,
                     "recall audit log failed; recall itself unaffected"
-                );
+                ),
             }
         });
     }
 
+    // Epistemic partitioning (backlog e7736ff6). Runs LAST, on the page every
+    // other stage has already settled:
+    //
+    //  * AFTER the dispute post-pass — `is_contested` is `false` on every
+    //    result until that pass runs, so bucketing any earlier would leave
+    //    `open_question` permanently empty while every happy-path test still
+    //    passed.
+    //  * AFTER `exclude_contested`'s retain — partitioning rows that are about
+    //    to be dropped would be both wasted and misleading.
+    //  * AFTER the audit block — that block derives `returned_claim_ids` from
+    //    `results`, and this consumes `results` by value.
+    //
+    // The score is the SAME `truth_value` `min_truth` gates on above, read out
+    // of the already-built result rather than recomputed, so the threshold and
+    // the gate cannot come to disagree about what a claim's belief is.
+    let (results, epistemic_partition) =
+        crate::types::split_epistemic(results, params.epistemic_partition, |r| {
+            (r.truth_value, r.is_contested)
+        });
+
     success_json(&RecallEnvelope {
         results,
+        epistemic_partition,
         recall_event_id: Some(event_id.to_string()),
+        // Echoed only when a theme scope or a page offset was actually
+        // requested, so an unscoped recall's response stays byte-identical to
+        // what it produced before this feature existed.
+        theme_scope: theme.as_ref().map(|t| ThemeScopeOut {
+            theme_id: t.id.to_string(),
+            label: t.label.clone(),
+            member_count: t.member_count,
+        }),
+        paging: (offset > 0 || theme_filter.is_some()).then(|| RecallPaging {
+            offset,
+            limit,
+            sql_page_len,
+            next_offset: offset + sql_page_len,
+            more_available: sql_page_len == limit,
+        }),
     })
+}
+
+/// The theme a recall was confined to, echoed back so a theme-scoped retrieval
+/// is self-describing rather than opaque: the caller can see WHICH theme the
+/// label resolved to, and `member_count` bounds how far a walk can go.
+#[derive(serde::Serialize)]
+struct ThemeScopeOut {
+    theme_id: String,
+    label: String,
+    /// Live count of `is_current` claims in the theme — the ceiling on what a
+    /// limit/offset walk can enumerate, before `min_truth` and the lexical /
+    /// dense predicates cut it further.
+    member_count: i64,
+}
+
+/// Paging state for a theme-scoped or offset recall.
+///
+/// `more_available` is derived from `sql_page_len`, the size of the page SQL
+/// produced, NOT from `results.len()`. `min_truth` and `exclude_contested` run
+/// in Rust after the SQL page, so a fully-filtered page has `results == []`
+/// while more pages remain. Treating an empty `results` as the end of the walk
+/// would silently truncate it.
+#[derive(serde::Serialize)]
+struct RecallPaging {
+    offset: i64,
+    limit: i64,
+    sql_page_len: i64,
+    next_offset: i64,
+    more_available: bool,
 }
 
 /// Response envelope carrying the audit-event id alongside the hits, so an
@@ -662,9 +1014,25 @@ async fn recall_post_embed(
 /// PROV-O layer from PR #334).
 #[derive(serde::Serialize)]
 struct RecallEnvelope {
-    results: Vec<RecallResult>,
+    /// The flat RRF-ranked page. `None` — and therefore absent from the JSON —
+    /// exactly when `epistemic_partition=true` replaced it with the bucketed
+    /// shape below. `Some(vec![])` still serializes as `"results": []`, so a
+    /// zero-hit recall is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    results: Option<Vec<RecallResult>>,
+    /// The same page regrouped by epistemic status (backlog e7736ff6).
+    /// Present only when the caller asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epistemic_partition: Option<crate::types::EpistemicPartition<RecallResult>>,
+    /// Same contract as `RecallWithContextResponse::recall_event_id`: the id the
+    /// audit row is written under, minted before an asynchronous best-effort
+    /// write, so it does not prove a row exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     recall_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme_scope: Option<ThemeScopeOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paging: Option<RecallPaging>,
 }
 
 #[doc(hidden)]

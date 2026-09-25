@@ -30,9 +30,24 @@
 //! Events mirror the routes' emissions (`edge.updated` always on patch,
 //! `edge.retired` additionally when the patch closes the lifecycle window,
 //! `edge.deleted` on delete) but travel through
-//! `EventRepository::publish_or_log` — the durable MCP path used by
-//! `link_epistemic` — rather than the API-crate-local `global_event_store`,
-//! which is not reachable from this crate.
+//! `EventRepository::publish_or_log_conn` on the mutation's own transaction —
+//! the durable MCP path `link_epistemic` also uses — rather than the
+//! API-crate-local `global_event_store`, which is not reachable from this crate.
+//!
+//! # Tenancy
+//!
+//! Both mutations run on ONE transaction stamped from the MCP server's own
+//! agent (`claim_helper::begin_author_stamped_tx`), with their events on the
+//! same transaction. WRITE authority is the server agent's, as for every other
+//! MCP write. READ authority is the CALLER's: before either write, the edge is
+//! read through the caller's viewer on that transaction
+//! (`EdgeRepository::visible_to`), and an edge the caller cannot see is
+//! reported as "not found" with nothing written. Before that gate (batch H-a
+//! review) neither tool took a viewer, so any `claims:write` caller could
+//! retire or relabel an edge touching a server-group-private claim it could not
+//! read. Whether the caller should also need OWNERSHIP of the edge (edges carry
+//! no author column; the candidates are its endpoints' authors) is the
+//! cross-agent authority question (H-b, #374), not this gate's.
 //!
 //! # `valid_to: "now"`
 //!
@@ -105,9 +120,26 @@ fn map_edge_err(e: DbError) -> McpError {
 
 pub async fn patch_edge(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
 ) -> Result<CallToolResult, McpError> {
-    do_patch_edge(server, params).await
+    do_patch_edge(server, viewer, params).await
+}
+
+/// The caller-read gate both tools apply, on the write transaction.
+async fn require_visible_edge(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    edge_id: uuid::Uuid,
+) -> Result<(), McpError> {
+    if EdgeRepository::visible_to(&mut *conn, viewer, edge_id)
+        .await
+        .map_err(internal_error)?
+    {
+        Ok(())
+    } else {
+        Err(invalid_params(format!("edge {edge_id} not found")))
+    }
 }
 
 /// Core logic factored out so integration tests can call it directly without
@@ -115,6 +147,7 @@ pub async fn patch_edge(
 /// `do_link_epistemic`).
 pub async fn do_patch_edge(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
@@ -135,18 +168,42 @@ pub async fn do_patch_edge(
 
     let valid_to = resolve_valid_to(params.valid_to.as_deref())?;
 
-    let pool = &server.pool;
-    let updated =
-        EdgeRepository::update_valid_to_and_properties(pool, edge_id, valid_to, params.properties)
-            .await
-            .map_err(map_edge_err)?;
+    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT: the UPDATE and
+    // both events.
+    //
+    // The UPDATE used to run on the unstamped pool. `edges_tenancy` then let it
+    // reach only a PUBLIC edge (USING) and keep it only if world-owned (WITH
+    // CHECK's static arm). A group-owned edge (one touching a group-private claim)
+    // read as "not found" on a cleanly-migrated schema. Production reached it only
+    // through the orphan `edges_privacy` policy that R3 drops. Stamped, the
+    // server agent's own group's edges are reachable too. An edge in another
+    // agent's private group is still invisible to this session and reports "not
+    // found", with nothing written. Whether a caller should carry write authority
+    // into a group this process cannot write is the cross-agent ownership
+    // question (#374), not a stamping one.
+    //
+    // The events used to be separate auto-committing statements after the
+    // UPDATE. They now ride the UPDATE's transaction, each SAVEPOINT-wrapped
+    // inside `publish_or_log_conn`: a refused event cannot abort the patch, and
+    // no `edge.updated` is emitted for a patch that was rolled back.
+    let actor_id = server.agent_id().await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "patch_edge").await?;
+    require_visible_edge(&mut tx, viewer, edge_id).await?;
+    let updated = EdgeRepository::update_valid_to_and_properties(
+        &mut *tx,
+        edge_id,
+        valid_to,
+        params.properties,
+    )
+    .await
+    .map_err(map_edge_err)?;
 
     // Best-effort durable events, mirroring the HTTP route's pair.
-    let actor_id = server.agent_id().await.ok();
-    let _ = EventRepository::publish_or_log(
-        pool,
+    let _ = EventRepository::publish_or_log_conn(
+        &mut tx,
         "edge.updated",
-        actor_id,
+        Some(actor_id),
         &serde_json::json!({
             "edge_id": updated.id,
             "source_type": updated.source_type,
@@ -161,10 +218,10 @@ pub async fn do_patch_edge(
     // `edge.retired` is the more specific signal — fired only when this call
     // closed the lifecycle window.
     if valid_to.is_some() {
-        let _ = EventRepository::publish_or_log(
-            pool,
+        let _ = EventRepository::publish_or_log_conn(
+            &mut tx,
             "edge.retired",
-            actor_id,
+            Some(actor_id),
             &serde_json::json!({
                 "edge_id": updated.id,
                 "valid_to": updated.valid_to,
@@ -172,6 +229,7 @@ pub async fn do_patch_edge(
         )
         .await;
     }
+    tx.commit().await.map_err(internal_error)?;
 
     success_json(&PatchEdgeResponse {
         edge_id: updated.id.to_string(),
@@ -189,36 +247,51 @@ pub async fn do_patch_edge(
 
 pub async fn delete_edge(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
 ) -> Result<CallToolResult, McpError> {
-    do_delete_edge(server, params).await
+    do_delete_edge(server, viewer, params).await
 }
 
 /// Core logic factored out for direct test invocation (see `do_patch_edge`).
 pub async fn do_delete_edge(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
-    let pool = &server.pool;
+
+    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT: the retraction
+    // and its event. Same reasoning as `do_patch_edge`. On the unstamped pool
+    // only a public, world-owned edge was retractable on a cleanly-migrated
+    // schema. Stamped, the server agent's own group's edges are too, and an edge
+    // in another agent's private group still reports "not found" with nothing
+    // written (#374 owns whether it should).
+    let actor_id = server.agent_id().await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "delete_edge").await?;
+    require_visible_edge(&mut tx, viewer, edge_id).await?;
 
     // `EdgeRepository::delete` reports absence as `Ok(false)`, not
-    // `DbError::NotFound`, so the 404-equivalent is raised here.
-    let deleted = EdgeRepository::retract_by_id(pool, edge_id)
+    // `DbError::NotFound`, so the 404-equivalent is raised here. Returning
+    // before COMMIT drops `tx`, which rolls back; nothing was written anyway.
+    let deleted = EdgeRepository::retract_by_id(&mut *tx, edge_id)
         .await
         .map_err(map_edge_err)?;
     if !deleted {
         return Err(invalid_params(format!("edge {edge_id} not found")));
     }
 
-    let actor_id = server.agent_id().await.ok();
-    let _ = EventRepository::publish_or_log(
-        pool,
+    // SAVEPOINT-wrapped inside `publish_or_log_conn`: a refused event cannot
+    // abort the retraction, and it shares the retraction's fate.
+    let _ = EventRepository::publish_or_log_conn(
+        &mut tx,
         "edge.deleted",
-        actor_id,
+        Some(actor_id),
         &serde_json::json!({ "edge_id": edge_id }),
     )
     .await;
+    tx.commit().await.map_err(internal_error)?;
 
     success_json(&DeleteEdgeResponse {
         edge_id: edge_id.to_string(),

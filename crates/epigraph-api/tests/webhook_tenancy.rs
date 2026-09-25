@@ -371,6 +371,81 @@ async fn a_subscription_whose_agent_row_is_gone_is_never_delivered_to() {
     }
 }
 
+/// A subscription whose principal is an OPERATED agent (migration 107) is never
+/// delivered to. The agent's `writer` membership puts its operator's personal
+/// group in the `Viewer` delivery resolves, so without the check a subscription
+/// registered before the link kept receiving events about the operator
+/// group's private claims over HTTP, where operated agents have no authority.
+///
+/// Control, in the same store and the same event: the operator itself (a
+/// member of the group that owns the claim) still receives it, so this is the
+/// operated-principal refusal and not a fan-out that went silent. And the
+/// operated agent's subscription DID receive a public-claim event before the
+/// link, so the refusal is the link and not the fixture.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_whose_principal_is_operated_is_never_delivered_to() {
+    let pool = test_pool().await;
+    let (operator, operator_group) = fixture::seed_agent_with_group(&pool, "wh-operator").await;
+    let (operated, _operated_group) = fixture::seed_agent_with_group(&pool, "wh-operated").await;
+    let public_claim = fixture::seed_public_claim(&pool, operator, "wh operated control").await;
+    let private_claim = fixture::seed_group_claim(
+        &pool,
+        operator,
+        operator_group,
+        "wh operator-group private claim",
+    )
+    .await;
+
+    let operated_sub = unreachable_sub(Some(operated));
+    let operator_sub = unreachable_sub(Some(operator));
+    let store = store_of(&[operated_sub.clone(), operator_sub.clone()]);
+
+    let before: Vec<Uuid> = deliver_event(
+        &reqwest::Client::new(),
+        &pool,
+        &store,
+        &claim_submitted(public_claim, operator),
+        &fast_config(),
+    )
+    .await
+    .iter()
+    .map(|r| r.subscription_id)
+    .collect();
+    assert!(
+        before.contains(&operated_sub.id),
+        "CALIBRATION: before the link the agent's subscription receives a public event: \
+         {before:?}"
+    );
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = epigraph_db::AgentRepository::link_operator(&mut conn, operated, operator)
+        .await
+        .expect("link on the privileged test connection");
+    assert!(out.link_live, "PREMISE: the link is acting: {out:?}");
+    drop(conn);
+
+    let after: Vec<Uuid> = deliver_event(
+        &reqwest::Client::new(),
+        &pool,
+        &store,
+        &claim_submitted(private_claim, operator),
+        &fast_config(),
+    )
+    .await
+    .iter()
+    .map(|r| r.subscription_id)
+    .collect();
+    assert!(
+        !after.contains(&operated_sub.id),
+        "an operated agent's subscription received an event naming its operator group's \
+         private claim: the delivery viewer carried the operator's group onto HTTP: {after:?}"
+    );
+    assert!(
+        after.contains(&operator_sub.id),
+        "control: the operator, a member of the owning group, must still receive it: {after:?}"
+    );
+}
+
 /// The event-type filter still works, and it composes with the tenancy filter
 /// rather than replacing it.
 #[tokio::test(flavor = "multi_thread")]

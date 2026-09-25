@@ -26,6 +26,24 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "refutes",
 ];
 
+/// The subset of [`EPISTEMIC_RELATIONSHIPS`] that WEAKENS its target's belief.
+///
+/// Every other member of that list strengthens the target; these two are the
+/// only ones that subtract. The distinction is not cosmetic — it decides what
+/// may be re-pointed when a claim is replaced. A `refutes`/`contradicts` edge
+/// is an assertion about a *specific pair of contents* ("this text refutes
+/// THAT text"), so re-pointing either endpoint at a different text silently
+/// re-asserts something nobody checked, and the direction of the error is
+/// always suppression: `ClaimRepository::dispute_batch` turns these two
+/// relationships (and only these two) into `is_contested`, which
+/// `recall(exclude_contested: true)` uses to drop results.
+///
+/// Consumed by [`crate::repos::claim::ClaimRepository::supersede`]; kept here
+/// next to `EPISTEMIC_RELATIONSHIPS` so the two sets cannot drift, and bound
+/// into the SQL rather than inlined so adding a third weakening relationship
+/// above automatically covers the supersede path.
+pub const WEAKENING_RELATIONSHIPS: &[&str] = &["contradicts", "refutes"];
+
 /// SQL predicate selecting edges that are currently in force.
 ///
 /// `edges` is bitemporal via `valid_from` / `valid_to` (migration 001), but until
@@ -63,6 +81,21 @@ pub struct EdgeRow {
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Outcome of [`EdgeRepository::create_symmetric_if_absent_oriented`].
+///
+/// `source_id` / `target_id` are the endpoints AS RECORDED on the surviving
+/// row, not necessarily the `(a, b)` the caller passed — on a dedup hit
+/// against the reverse direction they are swapped. See that method's doc
+/// comment for why belief-wiring callers must use these and not their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymmetricEdgeUpsert {
+    pub edge_id: Uuid,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    /// `true` when this call inserted the row, `false` on a dedup hit.
+    pub was_created: bool,
+}
+
 /// Repository for Edge operations
 pub struct EdgeRepository;
 
@@ -70,7 +103,7 @@ impl EdgeRepository {
     /// Create a new edge relationship
     ///
     /// # Arguments
-    /// * `pool` - Database connection pool
+    /// * `executor` - A pool, connection, or transaction handle
     /// * `source_id` - Source entity UUID
     /// * `source_type` - Source entity type (e.g., "claim", "agent")
     /// * `target_id` - Target entity UUID
@@ -78,12 +111,30 @@ impl EdgeRepository {
     /// * `relationship` - Relationship label (e.g., "supports", "refutes")
     /// * `properties` - Optional JSONB properties for the edge
     ///
+    /// # Why the executor is generic
+    ///
+    /// A verb-edge (`AUTHORED`, `DERIVED_FROM`, `HAS_TRACE`) is emitted about a
+    /// row that the same submission just wrote. Once that row's INSERT lives in a
+    /// transaction, an edge emitted on a DIFFERENT connection points at a row no
+    /// other session can see yet — so the edge has to be able to join the
+    /// transaction. `&PgPool` and `&mut PgConnection` both satisfy
+    /// [`sqlx::PgExecutor`], so the existing pool-taking callers compile
+    /// unchanged.
+    ///
+    /// **If you pass a transaction and want the edge to stay BEST-EFFORT, wrap it
+    /// in a SAVEPOINT.** A failed statement aborts the whole PostgreSQL
+    /// transaction, so a `let _ = EdgeRepository::create(&mut *tx, …)` that
+    /// swallows the error does not preserve the old warn-and-continue behaviour —
+    /// it defers the failure to `COMMIT`, where it surfaces as
+    /// `current transaction is aborted` with the real cause gone. See
+    /// `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, properties))]
-    pub async fn create(
-        pool: &PgPool,
+    #[instrument(skip(executor, properties))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         source_id: Uuid,
         source_type: &str,
         target_id: Uuid,
@@ -110,7 +161,7 @@ impl EdgeRepository {
             valid_from,
             valid_to
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row.id)
@@ -132,10 +183,26 @@ impl EdgeRepository {
     /// `ON CONFLICT`. Two round-trips are acceptable for the ingestion
     /// path; the race window is small and edges are idempotent in practice.
     ///
+    /// # Why this takes an `Acquire` rather than a `&PgPool`
+    ///
+    /// `edges` is tier-A under migration 077 and `edges_tenancy`'s `WITH CHECK`
+    /// derives the row's tenancy from its endpoints, so on an unstamped
+    /// connection this INSERT is refused on a cleanly-migrated schema (it lands
+    /// in production only because of the orphan PERMISSIVE `edges_privacy`
+    /// policy, which exists in no migration). A generic `Acquire` lets a
+    /// converted caller pass `&mut *tx` from
+    /// `ScopedPool::begin_as(author_viewer)` while the seventeen `&pool` callers
+    /// compile and behave exactly as before — `&PgPool` implements `Acquire`
+    /// too.
+    ///
+    /// `begin()` below therefore opens a real transaction when handed a pool and
+    /// a **SAVEPOINT** when handed a connection already inside one, which is the
+    /// property that keeps the dedup probe + INSERT atomic in both shapes
+    /// without a second code path.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database operation fails.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, properties))]
     pub async fn create_if_not_exists(
         pool: &PgPool,
         source_id: Uuid,
@@ -147,7 +214,51 @@ impl EdgeRepository {
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(EdgeRow, bool), DbError> {
-        let mut tx = pool.begin().await?;
+        let mut conn = pool.acquire().await?;
+        Self::create_if_not_exists_conn(
+            &mut conn,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// [`Self::create_if_not_exists`] on a connection the caller owns — the form
+    /// a stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one dedup probe
+    /// and one INSERT. `begin()` opens a real transaction when this connection is
+    /// not already in one and a **SAVEPOINT** when it is, which keeps the
+    /// probe+INSERT atomic in both shapes.
+    ///
+    /// A concrete `&mut PgConnection` rather than a generic `Acquire` for the
+    /// reason given on
+    /// [`crate::ClaimRepository::create_with_id_if_absent_conn`]: under
+    /// `#[tool_router]`'s boxed `dyn Future + Send` an `Acquire<'a>` bound fails
+    /// to prove `for<'x> &'x mut PgConnection: Acquire<'x>`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database operation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_not_exists_conn(
+        conn: &mut sqlx::PgConnection,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        use sqlx::Acquire;
+        let mut tx = conn.begin().await?;
 
         let existing = sqlx::query!(
             r#"
@@ -352,6 +463,30 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<(Uuid, bool), DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_symmetric_if_absent_returning_conn(&mut conn, a, b, relationship, properties)
+            .await
+    }
+
+    /// [`Self::create_symmetric_if_absent_returning`] on a connection the caller
+    /// owns: the form an author-stamped transaction can reach. The pool-taking
+    /// function above delegates here, so there is one INSERT and one dedup probe.
+    ///
+    /// On a stamped transaction the dedup-hit probe is filtered by
+    /// `edges_tenancy`'s USING. A conflicting edge this connection cannot see
+    /// therefore still yields `RowNotFound` (a loud error), exactly as the pool
+    /// form's doc describes. It is never a wrong answer.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, properties))]
+    pub async fn create_symmetric_if_absent_returning_conn(
+        conn: &mut sqlx::PgConnection,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<(Uuid, bool), DbError> {
         let inserted: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
@@ -369,7 +504,7 @@ impl EdgeRepository {
         .bind(b)
         .bind(relationship)
         .bind(Json(properties))
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         if let Some(id) = inserted {
@@ -389,10 +524,112 @@ impl EdgeRepository {
         .bind(a)
         .bind(b)
         .bind(relationship)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         Ok((existing, false))
+    }
+
+    /// Symmetric idempotent create that reports the STORED row's orientation.
+    ///
+    /// Same bidirectional-dedup contract as
+    /// [`Self::create_symmetric_if_absent_returning`], but the result also
+    /// carries the `(source_id, target_id)` actually recorded on the surviving
+    /// row rather than the `(a, b)` the caller passed. On a fresh insert those
+    /// are the same; on a dedup hit against the REVERSE direction they are
+    /// swapped.
+    ///
+    /// That distinction is load-bearing for belief-wiring callers. The matcher
+    /// paths that use the plain `create_symmetric_if_absent` never wire belief
+    /// (see `routes/cross_source.rs`'s "never `auto_wire_edge_if_epistemic`"
+    /// note), so orientation is inert for them. `link_epistemic` DOES wire: it
+    /// materializes a BBA keyed on `edge_id` from the source claim's interval
+    /// onto the target. Handing it the caller's orientation on a reverse dedup
+    /// hit would attach a factor that contradicts the row it is keyed to —
+    /// "B contradicts A" on disk, "A's interval restricts B" in the BBA. With
+    /// the stored orientation returned, the wire always matches the row.
+    ///
+    /// Runtime `sqlx::query*` throughout — no `.sqlx/` prepared-cache entry.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, properties))]
+    pub async fn create_symmetric_if_absent_oriented(
+        pool: &PgPool,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<SymmetricEdgeUpsert, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_symmetric_if_absent_oriented_conn(&mut conn, a, b, relationship, properties)
+            .await
+    }
+
+    /// [`Self::create_symmetric_if_absent_oriented`] on a connection the caller
+    /// owns, so `link_epistemic` can write the edge on the same author-stamped
+    /// transaction as the belief wiring keyed on its id. The pool-taking function
+    /// above delegates here, so there is one INSERT and one dedup probe.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, properties))]
+    pub async fn create_symmetric_if_absent_oriented_conn(
+        conn: &mut sqlx::PgConnection,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<SymmetricEdgeUpsert, DbError> {
+        let inserted: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type,
+                                relationship, properties)
+             SELECT $1, 'claim', $2, 'claim', $3, $4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM edges
+                 WHERE ((source_id = $1 AND target_id = $2)
+                     OR (source_id = $2 AND target_id = $1))
+                   AND relationship = $3
+             )
+             RETURNING id, source_id, target_id",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .bind(Json(properties))
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        if let Some((edge_id, source_id, target_id)) = inserted {
+            return Ok(SymmetricEdgeUpsert {
+                edge_id,
+                source_id,
+                target_id,
+                was_created: true,
+            });
+        }
+
+        // Dedup hit — surface the existing row AS STORED, which may be the
+        // reverse of the caller's (a, b).
+        let (edge_id, source_id, target_id): (Uuid, Uuid, Uuid) = sqlx::query_as(
+            "SELECT id, source_id, target_id FROM edges
+             WHERE ((source_id = $1 AND target_id = $2)
+                 OR (source_id = $2 AND target_id = $1))
+               AND relationship = $3
+             LIMIT 1",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        Ok(SymmetricEdgeUpsert {
+            edge_id,
+            source_id,
+            target_id,
+            was_created: false,
+        })
     }
 
     /// Get edges by source entity
@@ -524,6 +761,35 @@ impl EdgeRepository {
         Ok(rows)
     }
 
+    /// Can `viewer` READ the edge `id`? The edge-visibility predicate (the
+    /// owner / co-owner intersection, `Viewer::edge_predicate_fragment`), spliced.
+    ///
+    /// The caller-read gate for MCP `patch_edge` / `delete_edge`. Their writes
+    /// run under the server agent's stamp, so without this a caller that cannot
+    /// read an edge (one touching another group's private claim) could still
+    /// retire or relabel it by naming its id, as long as the server agent could
+    /// write it (batch H-a review, atomicity-authz). Run it on the same
+    /// transaction as the write.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn visible_to<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS (SELECT 1 FROM edges e WHERE e.id = $1 /* {EDGE_VISIBILITY:e} */)",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
     /// Retract edges by closing their validity interval instead of deleting them.
     ///
     /// This is the non-destructive counterpart to `DELETE FROM edges`. The row —
@@ -571,13 +837,16 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn is_in_force(pool: &PgPool, edge_id: Uuid) -> Result<bool, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn is_in_force<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        edge_id: Uuid,
+    ) -> Result<bool, DbError> {
         let found: Option<bool> = sqlx::query_scalar(&format!(
             "SELECT true FROM edges e WHERE e.id = $1 AND {EDGE_IN_FORCE}"
         ))
         .bind(edge_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(found.unwrap_or(false))
     }
@@ -941,9 +1210,19 @@ impl EdgeRepository {
     /// # Errors
     /// - `DbError::NotFound` if the edge doesn't exist
     /// - `DbError::QueryFailed` if the database query fails
-    #[instrument(skip(pool, properties_merge))]
-    pub async fn update_valid_to_and_properties(
-        pool: &PgPool,
+    ///
+    /// # Why this takes an executor rather than a `&PgPool`
+    ///
+    /// `edges` is tier-A under migration 077. An UPDATE on an unstamped session
+    /// can only reach a row whose `edges_tenancy` USING admits it (a public
+    /// edge), and it can only keep that row if the WITH CHECK admits it too. A
+    /// generic executor lets the MCP `patch_edge` tool run this on an
+    /// author-stamped transaction and emit its events on the same one. The
+    /// `&state.db_pool` HTTP caller compiles unchanged. One statement, so no
+    /// atomicity moves with it. The SQL is byte-identical.
+    #[instrument(skip(executor, properties_merge))]
+    pub async fn update_valid_to_and_properties<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
         properties_merge: Option<serde_json::Value>,
@@ -963,7 +1242,7 @@ impl EdgeRepository {
             valid_to,
             properties_merge,
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?
         .ok_or(DbError::NotFound {
             entity: "edge".to_string(),
@@ -990,7 +1269,7 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(executor))]
     /// Take a single edge out of force.
     ///
     /// Named `retract_by_id` rather than `delete` because it no longer deletes:
@@ -1002,7 +1281,14 @@ impl EdgeRepository {
     /// not exist OR was already retracted. Callers that raise a 404 on `false`
     /// therefore also 404 a double-retract, which matches the previous
     /// delete-twice behaviour.
-    pub async fn retract_by_id(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
+    ///
+    /// Generic over the executor for the same reason as
+    /// [`Self::update_valid_to_and_properties`]: the MCP `delete_edge` tool runs
+    /// it on an author-stamped transaction. The SQL is byte-identical.
+    pub async fn retract_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
         let result = sqlx::query!(
             r#"
             UPDATE edges
@@ -1012,7 +1298,7 @@ impl EdgeRepository {
             "#,
             id
         )
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(result.rows_affected() > 0)

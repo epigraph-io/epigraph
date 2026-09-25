@@ -206,7 +206,13 @@ const ALLOWED_WEBHOOK_SCHEMES: &[&str] = &["http", "https"];
 ///   set of targets that are reachable-but-internal; it does not constrain who
 ///   may be POSTed to.
 fn validate_webhook_url(raw: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(raw)
+    // `.trim()` HERE and not only at the call site. `register_webhook` trims
+    // before calling and stores the trimmed string, so on that path this is a
+    // no-op — but `deliver_to_subscription` re-checks `subscription.url` from
+    // the in-memory store, which other code paths can insert into without
+    // passing through the handler. A leading space would make `Url::parse`
+    // fail there and turn a policy verdict into a parse error.
+    let parsed = url::Url::parse(raw.trim())
         .map_err(|e| format!("Webhook URL is not a valid absolute URL: {e}"))?;
 
     if !ALLOWED_WEBHOOK_SCHEMES.contains(&parsed.scheme()) {
@@ -224,6 +230,19 @@ fn validate_webhook_url(raw: &str) -> Result<(), String> {
     // IP LITERALS are judged as addresses. A NAME is judged only against the
     // reserved-to-loopback set, and is otherwise accepted on its face — see
     // "What this policy does NOT cover" above.
+    //
+    // THE VERDICT COMES FROM `epigraph_jobs`, THE CATEGORY FROM THIS MODULE.
+    // `epigraph-jobs`'s `ConfigurableWebhookHandler` is a SECOND webhook
+    // delivery surface with its own SSRF gate (`is_internal_ip`), so two
+    // independent classifiers here would be two definitions of "internal" that
+    // can drift — and the one that drifts open is the one nobody notices.
+    // `is_internal_addr` is a superset of `internal_address_category`'s
+    // judgement in every case (it treats the whole of `0.0.0.0/8` as internal
+    // where `Ipv4Addr::is_unspecified` names only `0.0.0.0`), so delegating is
+    // never a loosening. `internal_address_category` and
+    // `is_reserved_loopback_name` survive to NAME the rule the caller tripped;
+    // they no longer decide it, and a category of `None` under a `true` verdict
+    // simply yields the generic message.
     let addr = match host {
         url::Host::Ipv4(v4) => std::net::IpAddr::V4(v4),
         // An IPv4-mapped literal is the same destination written differently.
@@ -232,17 +251,22 @@ fn validate_webhook_url(raw: &str) -> Result<(), String> {
             None => std::net::IpAddr::V6(v6),
         },
         url::Host::Domain(name) => {
-            if is_reserved_loopback_name(name) {
+            if epigraph_jobs::is_internal_ip(name) {
+                let category = if is_reserved_loopback_name(name) {
+                    "loopback name reserved by RFC 6761"
+                } else {
+                    "internal host"
+                };
                 return Err(format!(
-                    "Webhook URL must not target an internal address (loopback name \
-                     reserved by RFC 6761): {name}"
+                    "Webhook URL must not target an internal address ({category}): {name}"
                 ));
             }
             return Ok(());
         }
     };
 
-    if let Some(category) = internal_address_category(addr) {
+    if epigraph_jobs::is_internal_addr(addr) {
+        let category = internal_address_category(addr).unwrap_or("internal");
         return Err(format!(
             "Webhook URL must not target an internal address ({category}): {addr}"
         ));
@@ -380,9 +404,9 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: empty URL, a URL that fails
-///   [`validate_webhook_url`]'s scheme or internal-address rules, or a secret
-///   shorter than 32 characters
+/// - 400 Bad Request: empty URL; a URL that is unparseable, non-`http(s)`, or
+///   aimed at an internal/loopback/link-local host (see
+///   [`validate_webhook_url`]); or a secret shorter than 32 characters
 /// - 401 Unauthorized: Missing or invalid Bearer token, or a token that names
 ///   no `agents.id`
 /// - 403 Forbidden: Missing `webhooks:write` scope
@@ -405,7 +429,8 @@ pub async fn register_webhook(
         });
     }
 
-    // 1b. Validate the delivery target against the scheme allowlist and the
+    // 1b. Reject SSRF targets (internal hosts, non-http schemes) before the
+    //     subscription is ever stored: validate against the scheme allowlist and the
     //     internal-address denylist. Kept as a separate step from the
     //     non-emptiness check above because that one, and only that one, is
     //     mirrored by migration 085's `CHECK (btrim(url) <> '')`; this policy
@@ -916,7 +941,10 @@ async fn retain_visible_subscriptions(
     for sub in attributed {
         let agent_id = sub.agent_id.expect("partitioned on is_some");
         if let std::collections::hash_map::Entry::Vacant(slot) = exists.entry(agent_id) {
-            slot.insert(agent_principal_exists(pool, agent_id).await);
+            slot.insert(
+                agent_principal_exists(pool, agent_id).await
+                    && agent_is_not_operated(pool, agent_id).await,
+            );
         }
         if exists.get(&agent_id).copied().unwrap_or(false) {
             resolvable.push(sub);
@@ -1037,6 +1065,46 @@ async fn agent_principal_exists(pool: &sqlx::PgPool, agent_id: Uuid) -> bool {
                 reason = "principal_probe_failed",
                 "webhook suppressed: could not determine whether the subscription's \
                  principal still exists"
+            );
+            false
+        }
+    }
+}
+
+/// Is `agent_id` free of any operator link (migration 107)?
+///
+/// An OPERATED agent is stdio-only: token issuance and both viewer extractors
+/// refuse it, because its `writer` membership puts its operator's personal
+/// group in any `Viewer` resolved for it. Delivery resolves a `Viewer` for the
+/// subscription's principal directly ([`agent_may_receive`]), so without this
+/// check a subscription registered before the link (or with a token minted
+/// before it) kept delivering events about the operator group's claims over
+/// HTTP for as long as it existed. Keyed on the link RECORD (any state,
+/// retired included), as the token refusal is. Fails closed: an unanswered
+/// question suppresses.
+#[cfg(feature = "db")]
+async fn agent_is_not_operated(pool: &sqlx::PgPool, agent_id: Uuid) -> bool {
+    match epigraph_db::AgentRepository::operator_of_author_pool(pool, agent_id).await {
+        Ok(None) => true,
+        Ok(Some(link)) => {
+            tracing::warn!(
+                target: "webhook.delivery.suppressed",
+                agent_id = %agent_id,
+                operator_id = %link.operator_id,
+                reason = "operated_principal",
+                "webhook suppressed: the subscription's principal is an operated agent, and \
+                 operated agents are stdio-only"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "webhook.delivery.suppressed",
+                agent_id = %agent_id,
+                error = %e,
+                reason = "operator_probe_failed",
+                "webhook suppressed: could not determine whether the subscription's \
+                 principal is an operated agent"
             );
             false
         }
@@ -1217,6 +1285,11 @@ pub struct WebhookDeliveryResult {
 }
 
 /// Deliver a payload to a single webhook subscription with retry logic
+///
+/// Re-validates the target URL immediately before dialling. The registration
+/// gate is not sufficient on its own: the store is an in-memory map that other
+/// code paths can insert into, and subscriptions registered before the gate
+/// existed would otherwise stay deliverable for the lifetime of the process.
 async fn deliver_to_subscription(
     client: &reqwest::Client,
     subscription: &crate::state::WebhookSubscription,
@@ -1224,6 +1297,24 @@ async fn deliver_to_subscription(
     signature: &str,
     config: &WebhookDeliveryConfig,
 ) -> WebhookDeliveryResult {
+    // SSRF guard: refuse to make the request at all. `attempts: 0` records
+    // that no connection was opened, distinguishing a blocked target from one
+    // that was dialled and refused the connection.
+    if let Err(reason) = validate_webhook_url(&subscription.url) {
+        tracing::warn!(
+            subscription_id = %subscription.id,
+            reason = %reason,
+            "Refusing webhook delivery to disallowed target URL"
+        );
+        return WebhookDeliveryResult {
+            subscription_id: subscription.id,
+            success: false,
+            status_code: None,
+            attempts: 0,
+            error: Some(format!("blocked by SSRF guard: {reason}")),
+        };
+    }
+
     let mut last_error = None;
 
     for attempt in 0..=config.max_retries {
@@ -1248,6 +1339,38 @@ async fn deliver_to_subscription(
                         error: None,
                     };
                 }
+
+                // A 3xx is a redirect the client refused to follow (see
+                // `dispatcher_client_builder`). Surface it as its own terminal
+                // failure rather than a generic `HTTP 307` that retries: the
+                // hop target was never classified by the guard, retrying just
+                // re-asks the same attacker-controlled endpoint, and naming it
+                // is what makes the attempt visible in the logs at all.
+                if response.status().is_redirection() {
+                    let location = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    tracing::warn!(
+                        subscription_id = %subscription.id,
+                        status,
+                        location = %location,
+                        "Refusing to follow webhook redirect; target was never validated"
+                    );
+                    return WebhookDeliveryResult {
+                        subscription_id: subscription.id,
+                        success: false,
+                        status_code: Some(status),
+                        attempts: attempt + 1,
+                        error: Some(format!(
+                            "refused to follow redirect (HTTP {status}) to `{location}`: \
+                             only the registered URL is SSRF-validated"
+                        )),
+                    };
+                }
+
                 last_error = Some(format!("HTTP {status}"));
             }
             Err(e) => {
@@ -1269,6 +1392,33 @@ async fn deliver_to_subscription(
         attempts: config.max_retries + 1,
         error: last_error,
     }
+}
+
+/// Build the HTTP client the dispatcher delivers with.
+///
+/// Single construction site on purpose: the SSRF guard is a property of this
+/// client as much as of `validate_webhook_url`, so a second ad-hoc
+/// `reqwest::Client::new()` on the delivery path would silently reinstate the
+/// default redirect policy. Tests build through this function for the same
+/// reason — a test that configured its own client would prove nothing about
+/// what the server actually dials with.
+///
+/// `Policy::none()` is the load-bearing setting: `validate_webhook_url` only
+/// ever classifies `subscription.url`, so with reqwest's default policy (follow
+/// up to 10 hops) a registered public endpoint can answer `307 Location:
+/// http://169.254.169.254/…` and the signed payload is delivered to a host the
+/// guard had just rejected by name. A webhook receiver has no legitimate reason
+/// to redirect, so refusing outright is preferred over a `Policy::custom` that
+/// re-runs the guard per hop.
+///
+/// **Both `cfg` arms of [`start_webhook_dispatcher`] build through it.** The
+/// `db` arm gained a `pool` parameter in PR-10 and nothing else; a client
+/// constructed inline in only one arm is a redirect policy that holds in one
+/// build configuration and not the other.
+pub fn dispatcher_client_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 /// Start the webhook dispatcher background task
@@ -1300,11 +1450,50 @@ pub fn start_webhook_dispatcher(
     webhook_store: crate::state::WebhookStore,
     config: WebhookDeliveryConfig,
 ) -> epigraph_events::SubscriptionId {
-    let client = reqwest::Client::builder()
-        .timeout(config.timeout)
+    // Deliberately NOT `unwrap_or_default()`: `reqwest::Client::default()`
+    // carries reqwest's default redirect policy, so a build failure would hand
+    // the dispatcher a client that follows hops into the internal network —
+    // the exact bypass `Policy::none()` exists to close, reinstated silently
+    // and only on the unhappy path. Failing loudly at startup is the safe
+    // direction.
+    let client = dispatcher_client_builder(config.timeout)
         .build()
-        .unwrap_or_default();
+        .expect("webhook dispatcher HTTP client must build; a default client would drop the no-redirect SSRF policy");
+    start_webhook_dispatcher_with_client(event_bus, pool, webhook_store, config, client)
+}
 
+/// [`start_webhook_dispatcher`] over a caller-supplied client.
+///
+/// # This seam exists because the delivery-time SSRF guard closed the old one
+///
+/// `deliver_to_subscription` re-validates `subscription.url` immediately before
+/// dialling (backlog `cf05eb0d`), because the store is an in-memory map other
+/// code paths insert into and rows registered before the gate existed would
+/// otherwise stay deliverable for the process lifetime. A consequence, and not
+/// an incidental one: **a loopback sink is unreachable through this dispatcher
+/// by design.** `tests/webhook_dispatcher_wiring.rs` previously pointed a
+/// subscription straight at a `wiremock::MockServer` on `127.0.0.1` — the guard
+/// refuses it, and the test's positive control failed.
+///
+/// A behavioural test of the dispatcher therefore needs a host the guard
+/// ACCEPTS (a name under RFC 2606 `.example`, which is judged on its face
+/// because no DNS resolution happens in the guard) pointed at a local listener
+/// with reqwest's `.resolve()` — which requires the client to be injectable.
+/// That is the whole of what this function adds.
+///
+/// **It weakens nothing.** The client still comes from
+/// [`dispatcher_client_builder`], the SSRF guard still runs per delivery, and
+/// `.resolve()` overrides only DNS — it cannot make the guard accept an address
+/// literal it would otherwise refuse. A test that pointed this at
+/// `http://127.0.0.1/` would still be refused.
+#[cfg(feature = "db")]
+pub fn start_webhook_dispatcher_with_client(
+    event_bus: &crate::state::SharedEventBus,
+    pool: sqlx::PgPool,
+    webhook_store: crate::state::WebhookStore,
+    config: WebhookDeliveryConfig,
+    client: reqwest::Client,
+) -> epigraph_events::SubscriptionId {
     let store = webhook_store;
     let cfg = std::sync::Arc::new(config);
 
@@ -1342,10 +1531,15 @@ pub fn start_webhook_dispatcher(
     webhook_store: crate::state::WebhookStore,
     config: WebhookDeliveryConfig,
 ) -> epigraph_events::SubscriptionId {
-    let client = reqwest::Client::builder()
-        .timeout(config.timeout)
+    // Deliberately NOT `unwrap_or_default()`: `reqwest::Client::default()`
+    // carries reqwest's default redirect policy, so a build failure would hand
+    // the dispatcher a client that follows hops into the internal network —
+    // the exact bypass `Policy::none()` above exists to close, reinstated
+    // silently and only on the unhappy path. Failing loudly at startup is the
+    // safe direction.
+    let client = dispatcher_client_builder(config.timeout)
         .build()
-        .unwrap_or_default();
+        .expect("webhook dispatcher HTTP client must build; a default client would drop the no-redirect SSRF policy");
 
     let store = webhook_store;
     let cfg = std::sync::Arc::new(config);
@@ -1662,6 +1856,367 @@ mod tests {
             results.is_empty(),
             "No subscriptions means no delivery results"
         );
+    }
+
+    // ---- SSRF guard (backlog cf05eb0d) ----
+
+    /// A subscription that never passed through `register_webhook` — inserted
+    /// straight into the store, which is exactly the case the delivery-side
+    /// re-check exists for.
+    fn ssrf_sub(url: String) -> WebhookSubscription {
+        WebhookSubscription {
+            id: Uuid::new_v4(),
+            url,
+            event_types: vec![],
+            created_at: Utc::now(),
+            active: true,
+            secret: "x".repeat(32),
+            agent_id: None,
+        }
+    }
+
+    // THESE THREE DRIVE `deliver_to_subscription`, NOT `deliver_event`, AND
+    // THAT IS NOT A WEAKENING.
+    //
+    // They were written against `deliver_event` before PR-10 gave it a `pool`
+    // and a per-subscriber tenancy filter. That filter drops an `agent_id ==
+    // None` subscription BEFORE any delivery is attempted, so the same tests
+    // re-pointed at `deliver_event` would return an empty result vec and pass
+    // for a reason that has nothing to do with SSRF — the worst kind of green.
+    // Giving them a real principal instead would make each one a database
+    // integration test of the tenancy filter, which `webhook_tenancy.rs`
+    // already is.
+    //
+    // `deliver_to_subscription` is the function that owns the guard and the
+    // only function on the path that opens a socket, so the assertions below —
+    // zero accepted TCP connections, `attempts: 0`, an error naming the guard —
+    // are unchanged in meaning and are now stated against the unit that decides
+    // them. The fan-out's own behaviour is `webhook_tenancy.rs`'s subject.
+
+    /// The dispatcher must not open a TCP connection to an internal target.
+    ///
+    /// This binds a REAL listener on loopback and counts accepted connections,
+    /// rather than asserting `success == false` on an unreachable port — an
+    /// unguarded dispatcher also reports failure there (connection refused),
+    /// so that assertion would pass over the unfixed code and prove nothing.
+    /// Zero accepted connections can only happen if the request was never
+    /// made.
+    #[tokio::test]
+    async fn test_deliver_event_does_not_dial_internal_target() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&connections);
+        let accept_task = tokio::spawn(async move {
+            while let Ok((_stream, _peer)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let subscription = ssrf_sub(format!("http://{addr}/hook"));
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(500),
+            max_retries: 0,
+        };
+
+        let results =
+            [deliver_to_subscription(&client, &subscription, b"{}", "deadbeef", &config).await];
+
+        // Give any in-flight connection a chance to be accepted before we
+        // read the counter, so a pre-fix run is definitely observed.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        accept_task.abort();
+
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "no TCP connection may reach an internal target"
+        );
+        assert_eq!(results.len(), 1, "subscription should still yield a result");
+        assert!(!results[0].success, "delivery must not be reported as sent");
+        assert_eq!(
+            results[0].attempts, 0,
+            "guard must refuse before any HTTP attempt is counted"
+        );
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("SSRF guard"),
+            "failure must be attributed to the guard, not to a network error: {:?}",
+            results[0].error
+        );
+    }
+
+    /// The fully-qualified spelling of loopback must not be dialled either.
+    ///
+    /// `localhost.` resolves to 127.0.0.1 exactly like `localhost`, but it
+    /// survives WHATWG normalisation as a domain, so before the trailing-dot
+    /// strip in `epigraph_jobs::is_internal_ip` the guard allowed it and this
+    /// harness recorded one real TCP connection to loopback — the very outcome
+    /// `test_deliver_event_does_not_dial_internal_target` asserts is
+    /// impossible, defeated by appending one character.
+    #[tokio::test]
+    async fn test_deliver_event_does_not_dial_trailing_dot_localhost() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&connections);
+        let accept_task = tokio::spawn(async move {
+            while let Ok((_stream, _peer)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let subscription = ssrf_sub(format!("http://localhost.:{port}/hook"));
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(500),
+            max_retries: 0,
+        };
+
+        let results =
+            [deliver_to_subscription(&client, &subscription, b"{}", "deadbeef", &config).await];
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        accept_task.abort();
+
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "`localhost.` must not be dialled any more than `localhost`"
+        );
+        assert_eq!(results.len(), 1, "subscription should still yield a result");
+        assert_eq!(
+            results[0].attempts, 0,
+            "guard must refuse before any HTTP attempt is counted"
+        );
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("SSRF guard"),
+            "failure must be attributed to the guard: {:?}",
+            results[0].error
+        );
+    }
+
+    /// A registered target must not be able to *redirect* the dispatcher onto
+    /// an internal host.
+    ///
+    /// `validate_webhook_url` only ever sees `subscription.url`. If the client
+    /// follows redirects, an attacker registers a perfectly legitimate public
+    /// endpoint — one that passes both gates — and answers the delivery with
+    /// `307 Location: http://169.254.169.254/…`; the HMAC-signed payload then
+    /// reaches a host the guard had just rejected by name, reported as a
+    /// success. This test is that attack, with the metadata endpoint stood in
+    /// for by a loopback listener that counts connections.
+    ///
+    /// The entry host is a *domain* the guard allows, resolved to the local
+    /// entry listener with reqwest's DNS override, so the request genuinely
+    /// leaves the dispatcher (asserted) and the hop is refused by the redirect
+    /// policy rather than by the URL guard or by DNS failure.
+    #[tokio::test]
+    async fn test_delivery_does_not_follow_redirect_to_internal_target() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // --- hop listener: the internal target the redirect points at. It
+        // answers 200 OK, so a dispatcher that follows the hop reports
+        // `success: true` and only the connection counter reveals the breach.
+        let hop = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hop listener");
+        let hop_addr = hop.local_addr().expect("hop addr");
+        let hop_connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let hop_counter = std::sync::Arc::clone(&hop_connections);
+        let hop_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = hop.accept().await {
+                hop_counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        // --- entry listener: the attacker's "public" endpoint, which 307s to
+        // the hop.
+        let entry = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind entry listener");
+        let entry_addr = entry.local_addr().expect("entry addr");
+        let entry_connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let entry_counter = std::sync::Arc::clone(&entry_connections);
+        let redirect_to = format!("http://{hop_addr}/latest/meta-data/");
+        let entry_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = entry.accept().await {
+                entry_counter.fetch_add(1, Ordering::SeqCst);
+                // Drain the request before answering; writing a response over
+                // an unread request can surface as a connection reset.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect_to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        // The dispatcher's own client, with DNS for the entry domain pointed
+        // at the local entry listener. `resolve` ignores the port in the
+        // SocketAddr, so the URL carries it.
+        let entry_host = "webhook-entry.example.com";
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(1000),
+            max_retries: 0,
+        };
+        let client = super::dispatcher_client_builder(config.timeout)
+            .resolve(entry_host, entry_addr)
+            .build()
+            .expect("dispatcher client must build");
+
+        let subscription = ssrf_sub(format!("http://{entry_host}:{}/hook", entry_addr.port()));
+
+        let results =
+            [deliver_to_subscription(&client, &subscription, b"{}", "deadbeef", &config).await];
+
+        // Give a followed redirect time to land before reading the counter, so
+        // an unguarded run is definitely observed.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        entry_task.abort();
+        hop_task.abort();
+
+        assert_eq!(
+            hop_connections.load(Ordering::SeqCst),
+            0,
+            "no TCP connection may reach the redirect's internal target"
+        );
+        assert_eq!(
+            entry_connections.load(Ordering::SeqCst),
+            1,
+            "the registered entry host must actually have been dialled — \
+             otherwise this test proves nothing about redirects"
+        );
+        assert_eq!(results.len(), 1, "subscription should yield a result");
+        assert!(
+            !results[0].success,
+            "a 3xx must not be reported as a successful delivery"
+        );
+        assert_eq!(
+            results[0].status_code,
+            Some(307),
+            "the redirect status itself must be recorded"
+        );
+        assert_eq!(
+            results[0].attempts, 1,
+            "the entry attempt counts; the hop must not be retried"
+        );
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("redirect"),
+            "failure must be attributed to the refused redirect: {:?}",
+            results[0].error
+        );
+    }
+
+    #[test]
+    fn test_validate_webhook_url_accepts_public_https() {
+        assert!(validate_webhook_url("https://example.com/webhook").is_ok());
+        assert!(validate_webhook_url("http://93.184.216.34:8080/hook").is_ok());
+        assert!(validate_webhook_url("  https://hooks.example.org/x  ").is_ok());
+        // Positive control for the trailing-dot strip: a fully-qualified
+        // PUBLIC name must stay deliverable, so the strip is a classifier and
+        // not a blanket deny on FQDNs.
+        assert!(validate_webhook_url("https://hooks.example.org./x").is_ok());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_internal_hosts() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:9000/admin",
+            "http://localhost/hook",
+            "http://sub.localhost/hook",
+            // Fully-qualified spellings. WHATWG normalisation strips the
+            // trailing dot only on the numeric path, so these arrive here as
+            // `Host::Domain("localhost.")` and must be classified by name.
+            "http://localhost./hook",
+            "http://sub.localhost./hook",
+            "http://localhost.:9000/admin",
+            "http://10.0.0.5/hook",
+            "http://172.16.0.1/hook",
+            "http://192.168.1.1/hook",
+            "http://0.0.0.0/hook",
+        ] {
+            assert!(
+                validate_webhook_url(url).is_err(),
+                "{url} must be rejected as an internal target"
+            );
+        }
+    }
+
+    /// Obfuscated spellings of loopback must be rejected too.
+    ///
+    /// These are the cases a naive `strip_prefix("http://")` + substring host
+    /// extractor lets through: WHATWG URL parsing canonicalises `127.1` and
+    /// the 32-bit decimal form to `127.0.0.1`, and resolves the authority
+    /// correctly when a userinfo component is present.
+    #[test]
+    fn test_validate_webhook_url_rejects_obfuscated_loopback() {
+        for url in [
+            "http://127.1/hook",
+            "http://2130706433/hook",
+            "http://example.com@127.0.0.1/hook",
+            "http://user:pass@169.254.169.254/hook",
+            "http://[::1]:8080/hook",
+            "http://[::ffff:127.0.0.1]/hook",
+        ] {
+            assert!(
+                validate_webhook_url(url).is_err(),
+                "{url} must be rejected as an internal target"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_non_http_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "gopher://example.com/x",
+            "ftp://example.com/x",
+        ] {
+            assert!(
+                validate_webhook_url(url).is_err(),
+                "{url} must be rejected: only http/https are deliverable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_unparseable() {
+        assert!(validate_webhook_url("").is_err());
+        assert!(validate_webhook_url("not a url").is_err());
+        assert!(validate_webhook_url("/relative/path").is_err());
     }
 
     // ---- Handler integration tests (need AppState without DB) ----
@@ -2413,6 +2968,175 @@ mod tests {
                 response.status(),
                 StatusCode::NOT_FOUND,
                 "Second delete of same webhook should return 404"
+            );
+        }
+    }
+}
+
+// =============================================================================
+// SSRF REGISTRATION GATE — HANDLER-LEVEL TESTS (backlog cf05eb0d)
+// =============================================================================
+//
+// The `handler_tests` module above is `#[cfg(not(feature = "db"))]`, and `db`
+// is a DEFAULT feature — so none of it is compiled by `cargo test -p
+// epigraph-api`. These tests are gated the other way so the registration gate
+// is actually exercised under the default build.
+//
+// They call `register_webhook` directly (the scope extractor is a public
+// newtype over `AuthContext`), with a lazy pg pool that never connects: the
+// handler issues no query.
+
+#[cfg(all(test, feature = "db"))]
+mod ssrf_registration_tests {
+    use super::{register_webhook, WebhookRegistration};
+    use crate::errors::ApiError;
+    use crate::middleware::bearer::{AuthContext, ClientType, RequireScopeWebhooksWrite};
+    use crate::state::{ApiConfig, AppState};
+    use axum::extract::State;
+    use axum::Json;
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    fn webhooks_write_auth() -> AuthContext {
+        AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: None,
+            owner_id: None,
+            client_type: ClientType::Service,
+            scopes: vec!["webhooks:write".to_string()],
+            jti: Uuid::new_v4(),
+        }
+    }
+
+    /// Lazy pg pool that never connects — `register_webhook` issues no query.
+    fn test_state() -> AppState {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nobody")
+            .expect("lazy pool construction must succeed");
+        AppState::with_db(pool, ApiConfig::default())
+    }
+
+    fn registration(url: &str) -> WebhookRegistration {
+        WebhookRegistration {
+            url: url.to_string(),
+            event_types: vec!["ClaimSubmitted".to_string()],
+            secret: "Xk9mP2qL7vN8wBjH5cT0yDrF3gU6eA1s".to_string(),
+        }
+    }
+
+    /// Positive control: a legitimate public target gets PAST the URL gate.
+    ///
+    /// # It used to assert 201 + stored, and cannot any more
+    ///
+    /// PR-10 gave `register_webhook` two steps this fixture cannot satisfy: it
+    /// refuses a token carrying no `agents.id` (step 3) and it INSERTs into
+    /// `webhook_subscriptions` before caching (step 5). The fixture's auth has
+    /// `agent_id: None` and its pool is a lazy handle to `127.0.0.1:1` that
+    /// never connects, so the old assertion now fails on the principal check —
+    /// a failure that says nothing about SSRF.
+    ///
+    /// Satisfying it would mean seeding an agent and a real database, which is
+    /// a different test in a different file, and it already exists:
+    /// `tests/webhook_url_policy_test.rs::a_conventional_https_target_is_still_accepted`
+    /// asserts 201 AND that the row stores the target verbatim, over HTTP,
+    /// against a migrated database. That is a STRONGER control than this one
+    /// ever was.
+    ///
+    /// What is left here is the non-vacuity this module needs and that one
+    /// cannot give it: the three cases below assert `BadRequest`, and without a
+    /// positive arm a gate that refused EVERY url would pass all of them. The
+    /// assertion is therefore `Unauthorized`, NOT `BadRequest` — the URL gate at
+    /// step 1b runs BEFORE the principal check at step 3, so reaching step 3 is
+    /// proof the url was accepted. An `Err(BadRequest)` here would mean the gate
+    /// rejected a public https target; an `Ok` would mean the fixture had
+    /// silently acquired a principal and this arm had stopped discriminating.
+    #[tokio::test]
+    async fn register_webhook_accepts_public_https_target() {
+        let state = test_state();
+        let result = register_webhook(
+            State(state.clone()),
+            RequireScopeWebhooksWrite(webhooks_write_auth()),
+            Json(registration("https://example.com/webhook")),
+        )
+        .await;
+
+        match result {
+            Err(ApiError::Unauthorized { .. }) => {}
+            Err(ApiError::BadRequest { message }) => {
+                panic!("the URL gate must not refuse a public https target: {message}")
+            }
+            Err(other) => {
+                panic!("expected the principal check to be the first refusal, got {other:?}")
+            }
+            Ok(_) => panic!(
+                "the fixture carries no agent_id, so a 201 here means the principal \
+                 check stopped running and this arm no longer discriminates"
+            ),
+        }
+
+        assert!(
+            state.webhook_store.read().await.is_empty(),
+            "nothing is cached before the principal check passes"
+        );
+    }
+
+    /// The cloud instance-metadata endpoint is the canonical SSRF target named
+    /// in backlog cf05eb0d. Registration must 400 and store nothing.
+    #[tokio::test]
+    async fn register_webhook_rejects_cloud_metadata_endpoint() {
+        let state = test_state();
+        let result = register_webhook(
+            State(state.clone()),
+            RequireScopeWebhooksWrite(webhooks_write_auth()),
+            Json(registration("http://169.254.169.254/latest/meta-data/")),
+        )
+        .await;
+
+        match result {
+            Err(ApiError::BadRequest { message }) => {
+                assert!(
+                    message.contains("169.254.169.254"),
+                    "rejection must name the offending host: {message}"
+                );
+            }
+            Err(other) => panic!("expected 400 BadRequest, got {other:?}"),
+            Ok(_) => panic!("link-local metadata endpoint must not be registrable"),
+        }
+
+        assert!(
+            state.webhook_store.read().await.is_empty(),
+            "rejected subscription must not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_webhook_rejects_loopback_and_non_http_targets() {
+        for url in [
+            "http://127.0.0.1:9000/admin",
+            "http://localhost/hook",
+            "http://localhost./hook",
+            "http://sub.localhost./hook",
+            "http://10.0.0.5/hook",
+            "http://127.1/hook",
+            "http://example.com@127.0.0.1/hook",
+            "file:///etc/passwd",
+        ] {
+            let state = test_state();
+            let result = register_webhook(
+                State(state.clone()),
+                RequireScopeWebhooksWrite(webhooks_write_auth()),
+                Json(registration(url)),
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(ApiError::BadRequest { .. })),
+                "{url} must be rejected with 400"
+            );
+            assert!(
+                state.webhook_store.read().await.is_empty(),
+                "{url} must not be stored"
             );
         }
     }

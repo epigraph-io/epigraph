@@ -121,6 +121,25 @@ const MARKER: &str = "MAINTENANCE-DSN-EXEMPT:";
 /// PR-15's acceptance requires a reason per entry, not just names — an
 /// exemption whose justification lives only in a reviewer's memory is
 /// indistinguishable from an oversight six months later.
+///
+/// # `crates/epigraph-mcp/src/main.rs` WAS HERE AND IS NOT ANY MORE
+///
+/// It built its pool with `create_pool` and was exempted on the grounds that
+/// attaching a `ScopedPool` would half-wire its three maintenance tools into a
+/// privileged-viewer/ordinary-pool hybrid. It now builds through
+/// `ScopedPool::connect` — the MCP write path cannot stamp a connection
+/// otherwise, and an unstamped one commits the claim and then loses its trace to
+/// a `42501` — so it constructs no unmaintained pool and
+/// `the_exemption_set_is_exactly_what_was_reviewed`'s "still needs the
+/// exemption" arm would now FAIL on the entry. The hybrid concern was real and
+/// is answered where it lives rather than by keeping a pool exemption for it.
+/// `main.rs` now also builds a SECOND, privileged maintenance pool through
+/// `ScopedPool::connect_with_options` on the DSN `maintenance_database_url`
+/// returned, which is this lint's converted shape, and attaches it only when
+/// its boot probe passes. `epigraph-mcp/src/maintenance.rs::maintenance_viewer`
+/// refuses the three tools when none is attached and re-probes every leased
+/// connection. That module's test pins that attaching a `ScopedPool` alone does
+/// not enable them.
 const EXEMPT: &[(&str, &str)] = &[
     (
         "crates/epigraph-cli/src/bin/compare_routes.rs",
@@ -140,15 +159,6 @@ const EXEMPT: &[(&str, &str)] = &[
          keyed on pool construction, not on the DSN variable, so the PR-16 change is invisible \
          to it by design; the entry is what records that the remaining PgPool::connect is \
          deliberate.",
-    ),
-    (
-        "crates/epigraph-mcp/src/main.rs",
-        "Serves callers, and its three maintenance tools are DEFERRED to PR-17 rather than \
-         half-wired here. EpiGraphMcpFull::with_scoped_pool has no callers, so those tools \
-         currently fail CLOSED with a clear error. Attaching a ScopedPool without also moving \
-         the three tools' queries onto the maintenance connection would trade that hard error \
-         for a silent no-op under FORCE — the exact hybrid this lint exists to catch. See \
-         crates/epigraph-mcp/src/maintenance.rs.",
     ),
     (
         "scripts/subcluster_outliers.py",

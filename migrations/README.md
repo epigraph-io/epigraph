@@ -172,7 +172,7 @@ Current reservation:
   free number for PR-10's webhook-persistence migration and no slack at all. The
   version space is shared with `epigraph-internal` against the same
   `_sqlx_migrations` table, and `run_migrations` sets `set_ignore_missing(true)`
-  (`crates/epigraph-api/src/lib.rs:54`), so a collision is **not** caught by the
+  (`crates/epigraph-api/src/migrate.rs::embedded_migrator`), so a collision is **not** caught by the
   missing-version check — it panics the api binary on restart.
 
   **Why the +1 shift:** the plan assigns no migration to PR-02, yet PR-02's
@@ -216,9 +216,240 @@ Current reservation:
   surfaced only on reading. Renumbered here rather than on main because it has
   never been applied to a deployed database — production is at 59.
 
-- **101+**: public next
+- **101**: public `seed_method_entity_type` (backlog 895a74e5) — seeds the
+  `method` row in the `entity_types` registry, without which every edge whose
+  `source_type`/`target_type` is `'method'` is refused by the FK migration 055
+  installed.
 
-Next public migration **outside both reserved tenancy ranges** must be `100` or
+  **Why 101 and not 094.** It was authored as `094` against a `main` whose
+  README read "095+: public next", so neither the author nor CI could see that
+  `092–099` had been reserved as the SECOND tenancy block on 2026-09-15 — the
+  same blind spot that put `claims_belief_frame_id` at `093`, recorded one entry
+  up. The renumber also dissolves a second collision the original entry had to
+  document and live with: `epigraph-internal` carries a DIFFERENT
+  `094_stop_truth_value_overwrite.sql`, and the two repos share a
+  `_sqlx_migrations` table, so version 94 was a checksum collision waiting for
+  the first database that saw both. At `101` there is nothing to check for
+  before deploying. Renumbered here rather than on `main` for the same reason
+  `100` was: it has never been applied to a deployed database — production is at
+  59.
+
+- **102–104**: UNALLOCATED. Held on this line for the open branch
+  `feat/operator-scoped-ownership` while it carried `102`–`104`; that branch
+  renumbered them to `107`–`109` when `105`/`106` shipped (see "Why 107–109"
+  below). Nothing may be allocated here: a throwaway that ran the branch's
+  old files still carries these versions with different checksums.
+- **105**: public `personal_group_no_revival` (batch F; backlog F2 `af7c58d9`,
+  the root of F1 `da432f25`, #493 and #498's `system_agent_write_authority`
+  finding). `CREATE OR REPLACE` of migration 077's
+  `epigraph_ensure_personal_group(uuid) RETURNS uuid`, same signature: a LIVE
+  personal membership is returned with its role kept and nothing written; only
+  REVOKED rows (any epoch) RAISE SQLSTATE `RVK01`, which
+  `epigraph-db/src/errors.rs` maps to `DbError::MembershipRevoked`; no row of
+  any state provisions exactly as before. Before any of that, the group under
+  the canonical did_key must be the agent's own (`kind = 'personal'` and
+  `created_by_agent_id` = the agent), or it RAISEs SQLSTATE `RVK02`
+  (`DbError::PersonalGroupNotOwned`): a group another agent created under that
+  key is a squat, not a personal group. 077's body ended in `ON CONFLICT …
+  DO UPDATE SET revoked_at = NULL, role = 'admin'`, so every call revived a
+  revocation and promoted a demotion. Re-states 077's owner / `REVOKE … FROM
+  PUBLIC` / `GRANT EXECUTE … TO epigraph_app` block (idempotent). Pinned by
+  `epigraph-db/tests/personal_group_no_revival.rs` as `epigraph_app`. **No undo
+  runbook ships**: reversing it is re-running 077's function body, which
+  restores the defect; it creates and changes no rows. **No deploy
+  precondition.** **Claimed 2026-09-24.** **Applied to a throwaway database
+  only, NOT to any deployed database.**
+- **106**: public `community_membership_integrity` (batch F follow-on; F4a
+  `afb1cfaf`, F4b `7cdea6f1`). Two `SECURITY DEFINER` functions,
+  `epigraph_community_add_member(uuid, uuid, uuid)` and
+  `epigraph_community_remove_member(uuid, uuid, uuid)`, each of which takes the
+  community group's roster lock, then its `groups` row lock (which serialises
+  first joiners over an empty roster), decides under both, and writes — one
+  statement for `CommunityRepository`. Rules: add needs a LIVE member, except a
+  group that has NEVER had a membership row of any state (a group emptied by
+  removals does not re-open); a revoked row is restored at the requested
+  `reader` role, never its old one. Only a LIVE admin may restore a revoked
+  row (`'denied_readmit'` otherwise), so a live reader cannot undo an
+  eviction. Remove needs the perspective's owner
+  (leaving) or a LIVE admin (evicting), and never removes the last live admin
+  (`'last_admin'`, nothing written). The actor is `epigraph_principal_id()`
+  unless `epigraph_bypass()`; a mismatched `p_actor` is DENIED. The
+  `community_members` DELETE runs in the caller's statement, because
+  `epigraph_maintenance` holds no DELETE (070). Owner `epigraph_maintenance`,
+  `REVOKE … FROM PUBLIC`, `GRANT EXECUTE … TO epigraph_app`. Also `REVOKE
+  DELETE ON group_memberships FROM epigraph_app`: the membership table is an
+  append-and-revoke ledger, 105's and 106's rules both rest on rows never
+  disappearing, and the FOR ALL policy let a stamped agent delete its own and
+  its groups' rows (measured: a revoked agent re-provisioned as live admin, a
+  reader deleted its admin's row, an emptied group re-bootstrapped). Pinned by
+  `epigraph-db/tests/community_membership_integrity.rs` as `epigraph_app`.
+  **No undo runbook ships**: reversing it is two `DROP FUNCTION IF EXISTS`
+  (named in the file), `GRANT DELETE ON group_memberships TO epigraph_app`
+  (which restores the hole), and the pre-batch-F `community.rs`; it creates no
+  rows. **No deploy precondition in this repository**; deploy note: a consumer
+  OUTSIDE this repository that deletes `group_memberships` rows as
+  `epigraph_app` will get 42501 after this file (none exists in-tree; not
+  verified for out-of-repo consumers). **Claimed 2026-09-24.** **Applied to a
+  throwaway database only, NOT to any deployed database.**
+- **Why 107–109 and not 102–104.** The operator-ownership branch was authored
+  as `102`–`104` while `main` held those numbers for it. `main` then shipped
+  `105` and `106` (batch F) and production applied them. sqlx applies every
+  pending version in order, so on production a `102`–`104` would have run
+  AFTER `105`/`106`, while a fresh install runs them BEFORE: two orders over
+  the same `group_memberships` and personal-group definers, and no guarantee
+  of one final state. Renumbered to `107`–`109`, which run after `106` on
+  every database. `102`–`104` were only ever applied to throwaway databases,
+  and are left unallocated (a gap sqlx accepts) rather than reused, so no
+  throwaway that ran the old files can meet a different file under the same
+  version. Checked before renaming: no `origin/*` ref and no open PR carries
+  a `107`–`110`.
+
+- **107**: public `operator_link` — operator-scoped ownership. One
+  definer-only table and two `SECURITY DEFINER` functions.
+  `operator_links(agent_id PK, operator_id, operator_group_id, retired)` is the link
+  RECORD: ENABLE + FORCE row security, an INSERT policy admitting only
+  `epigraph_definer_bypass()`, no UPDATE/DELETE policy, and INSERT/UPDATE/DELETE
+  revoked from `epigraph_app`, so an app session cannot forge a link from an
+  edge plus a membership (the review's finding). `epigraph_link_operator(agent,
+  operator)` writes that row plus a `writer` membership for the agent in the
+  operator's personal group and the `agent --OPERATED_BY--> operator` graph
+  edge (EXECUTE: `epigraph_maintenance` only — revoked from `PUBLIC` and from
+  `epigraph_app`). Two reads (EXECUTE: `epigraph_app`), so neither path
+  depends on a stamped session, answer two different questions:
+  `epigraph_operator_of_author(agent)` ("whose are this author's claims?" —
+  the record alone, retired included) for the TARGET side of
+  `require_owner_or_admin`, and `epigraph_operator_actor(agent)` ("may this
+  agent act for an operator?" — not retired, live writer/admin membership,
+  the operator's own personal group) for the CALLER side and for
+  `default_decl_for_author`. `epigraph_link_retired_agent(agent, operator)` (EXECUTE:
+  `epigraph_maintenance` only) writes a RETIRED row plus the edge and NO
+  membership, so a retired identity whose key may be exposed gains zero write
+  authority while the operator owns its claims; `epigraph_link_operator` never
+  promotes a retired row. The link is recorded once: the membership is inserted only
+  by the call that recorded the `operator_links` row (plus a no-history check
+  and `ON CONFLICT DO NOTHING`), so a revoked link is never revived, not even
+  after its revoked row is erased. The OPERATOR's personal group (and its first
+  admin row) is resolved through 105's `epigraph_ensure_personal_group`, the one
+  personal-group definer, so both link functions refuse with its `RVK01` (the
+  operator's own row is only revoked) and `RVK02` (a squatted key) and write
+  nothing; `personal_group_mint_ratchet.rs::GUARDED_DEFINERS` pins that call and
+  that neither body revives. **Deploy precondition:** because that refusal also
+  fires on every stdio self-link, the operator must hold a LIVE row in its own
+  personal group (read-only check: `SELECT count(*) FROM group_memberships m JOIN
+  groups g ON g.id = m.group_id WHERE g.did_key = 'did:epigraph:personal:' ||
+  $operator AND m.agent_id = $operator AND m.revoked_at IS NULL` must be 1, or
+  the operator must have no group yet). Both link
+  functions refuse a SHARED HTTP SIGNER (an agent or operator whose outbound
+  `OPERATED_BY` auth-lineage edges name more than one principal), and a third
+  refusal-only read, `epigraph_operates_agents(agent)` (EXECUTE: `epigraph_app`),
+  lets the HTTP listeners refuse to serve as a signer that is anyone's
+  operator (107 section 9). The table
+  is registered with the FORCE ratchets (`FORCE_PROTECTED_SET`,
+  `rls_enforcement.rs::PROTECTED`, `locked_decisions.rs::OPERATOR_TABLES`,
+  `docs/runbooks/079-undo.sql`). Pinned by
+  `schema_contract.rs::migration_107_operator_definers_are_owned_and_granted` and
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`; behaviour in
+  `epigraph-db/tests/operator_link.rs`. **Deploy order:** a binary carrying
+  `default_decl_for_author`'s operator lookup fails closed on every claim write
+  against a database without 107, so apply 107 first. `epigraph-migrate` runs
+  only as the API's `ExecStartPre`, and the HTTP MCP listeners check the
+  signer's operator records (107's reads) fail-closed on EVERY tool call, read
+  tools included, and at startup: restart the API (or run `epigraph-migrate`)
+  so 107–109 are applied BEFORE restarting `epigraph-mcp`, or every HTTP MCP
+  call is refused until they are. Allocated here, not in
+  `093–099`, because this is not one of the obligation batches that block is
+  reserved for. Like `100` and `101` it sits inside internal's `060–112`; see
+  "Version range coordination" above. **No undo runbook ships**: undo is the
+  `DROP FUNCTION` / `DROP TABLE` statements named in the file, together with a
+  binary that no longer calls them. **Applied to a throwaway database only, NOT
+  to any deployed database.**
+
+- **108**: public `groups_identity_immutable` — one invoker trigger function
+  (`epigraph_groups_identity_immutable`) and a `BEFORE UPDATE` trigger on
+  `groups` that raises `42501` when `created_by_agent_id`, `did_key` or `kind`
+  changes outside `epigraph_bypass()` / `epigraph_definer_bypass()`. Closes a
+  pre-existing 077 hole that 107 made reachable: `groups_tenancy`'s WITH CHECK
+  let any member rewrite a group's creator to itself, and 092's creator arm
+  then made an operated `writer` admin-equivalent in its operator's group.
+  A second invoker trigger, `groups_personal_identity_names_creator`
+  (`BEFORE INSERT`), raises `42501` outside the same bypasses for any row in the
+  personal did namespace or of `kind='personal'` unless it is
+  `kind='personal'` with `did_key = 'did:epigraph:personal:' || created_by_agent_id`:
+  review showed any principal could squat a not-yet-grouped operator's personal
+  did (as `personal` or, through `create_with_admin`, as `team`) and block every
+  link to that operator permanently. This overlaps 105's `RVK02`, and both are
+  kept: 108 refuses a NEW squat at INSERT, and 105 refuses at use a squat that
+  predates 108, which only an upgraded database can hold
+  (`personal_group_no_revival.rs::a_squatted_personal_group_is_refused` pins
+  both layers). Behaviour in
+  `epigraph-db/tests/operator_link.rs::an_operated_writer_cannot_rewrite_its_operator_groups_identity`.
+  Like 100, 101 and 107 it sits inside internal's `060–112`. **No undo runbook ships**:
+  undo is the `DROP TRIGGER` / `DROP FUNCTION` pair named in the file. Checked
+  before claiming: no remote branch carries a `108`. **Applied to a throwaway
+  database only, NOT to any deployed database.**
+
+- **109**: public `group_memberships_guards` — two roster guards the tenancy
+  policy cannot express, as invoker `BEFORE` triggers on `group_memberships`.
+  `group_memberships_no_retired_writer` raises `42501` on an INSERT or UPDATE
+  that leaves a live `writer`/`admin` row for an agent in the group its RETIRED
+  operator link names (107 section 7): review showed the operator could
+  otherwise enrol a retired identity, whose key may be public, as a writer by an
+  ordinary roster write. `group_memberships_identity_immutable` raises `42501`
+  on an UPDATE that changes a row's `group_id` or `agent_id` outside
+  `epigraph_bypass()` / `epigraph_definer_bypass()`: moving a row is a DELETE of
+  its (group, agent) by another statement, which 106's REVOKE DELETE does not
+  cover (section 3; no application path changes either column). Hard deletes
+  are NOT this file's: its first form
+  carried a `group_memberships_no_hard_delete` trigger, and 106's `REVOKE
+  DELETE ON group_memberships FROM epigraph_app` now closes the same hole on
+  every database this file can run on, so the trigger was removed (the file's
+  section 1 records the with/without measurement; the behaviour is identical).
+  Behaviour in `epigraph-db/tests/operator_link.rs`. Like 100, 101, 107 and 108
+  it sits inside internal's `060–112`. **No undo runbook ships**: undo is the
+  `DROP TRIGGER` / `DROP FUNCTION` pair named in the file. Checked before
+  claiming: no remote branch carries a `109`. **Applied to a throwaway database
+  only, NOT to any deployed database.**
+
+- **110**: public `evidence_visibility_pins` — the kernel guard that keeps an
+  operator-HIDDEN evidence row hidden (operator directive 2026-09-23,
+  Amendment 2, B-H2; the operator approved this file). One definer-only side
+  table, `evidence_visibility_pins(evidence_id PK -> evidence ON DELETE
+  CASCADE, pinned_at, pinned_by, reason)`: ENABLE + FORCE row security, a
+  SELECT policy admitting `epigraph_bypass()` or `epigraph_definer_bypass()`,
+  INSERT and DELETE policies admitting `epigraph_bypass()` only, no UPDATE
+  policy, `REVOKE ALL` from `epigraph_app` then `GRANT SELECT` back (a
+  filtered read, as 107 does for `operator_links`), and `SELECT, INSERT,
+  DELETE` to `epigraph_maintenance`. A side table rather than a column because
+  `epigraph_app` holds a table-level UPDATE on `evidence` that a column REVOKE
+  does not subtract from. Pin-aware bodies for `epigraph_propagate_tenancy`
+  (072's arm d) and `epigraph_inherit_tenancy_stmt` (070's arm c), still
+  SECURITY DEFINER and owned by `epigraph_maintenance`: a pinned row is never
+  widened (it stays `group`) and its owner never changes on a claim
+  owner/visibility change, because an owner that followed the claim changed
+  who could READ the hidden row (stage-3 review measured the claim's new
+  owner, and a retired author's personal group, reading it). Unpinned rows get 072/070's statements exactly (one extra
+  `NOT EXISTS (pin)` conjunct on the `evidence` iteration only), and the
+  `derived text[]` literal is byte-for-byte 072's, because
+  `epigraph_cli::operator::tables::parse_derived_array` reads it. Registered
+  with the FORCE ratchets (`FORCE_PROTECTED_SET`,
+  `rls_enforcement.rs::PROTECTED` with an UPDATE row in
+  `DELIBERATELY_UNCOVERED`, `locked_decisions.rs::OPERATOR_TABLES`,
+  `docs/runbooks/079-undo.sql`). Behaviour in
+  `epigraph-db/tests/evidence_visibility_pins.rs`; the write path is
+  `epigraph-operator hide-evidence --apply`, reversed by `reown-reverse`. It is
+  not a read control: production's orphan `evidence_privacy` policy still
+  admits a hidden row to every app session until it is dropped, and the tool
+  refuses without `--accept-unenforced-hide`. Like 100, 101 and 107–109 it
+  sits inside internal's `060–112`. **No undo runbook ships**: undo is
+  `reown-reverse` on every hide manifest, then the two function bodies back to
+  072's and 070's, then `DROP TABLE public.evidence_visibility_pins` (in that
+  order: the bodies name the table). Checked before claiming: no `origin/*`
+  ref and no open PR carries a `110`. **Applied to a throwaway database only,
+  NOT to any deployed database.**
+
+- **111+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `111` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
@@ -380,11 +611,30 @@ carries a migration in this block; if a database is found that ran internal, the
 whole `092`–`099` reservation is void for that database and the rule in the
 paragraph above applies instead.
 
-Note also that `crates/epigraph-api/src/lib.rs` sets
+Note also that `crates/epigraph-api/src/migrate.rs::embedded_migrator` sets
 `migrator.set_ignore_missing(true)`, so a *gap* is tolerated but a *checksum
 mismatch* is not. Prod's missing version 35 is the benign case: there is no
 public `035_*.sql` at all, 035 belongs to internal, and prod's 036/037/038
 descriptions match the public filenames.
+
+Since issue #492 the flag no longer hides a database that carries migrations
+the binary does not embed: `run_migrations` refuses, before applying anything,
+when `_sqlx_migrations` holds a successful version the binary does not embed,
+unless `--allow-db-ahead` / `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` opts in to a
+rollback. That covers versions above the binary's head AND versions that fill a
+gap below it — a newer build's file in this README's reserved headroom
+(`093`–`099`) or held block (`102`–`104`) sits below a head-`106` binary's head
+and is exactly as unknown to it. The only tolerated unknown is internal's
+`035`, listed in `crates/epigraph-api/src/migrate.rs::KNOWN_FOREIGN_VERSIONS`
+on the strength of the 2026-09-02 measurement above; any other version found on
+a deployed database must be identified and either added there with its
+provenance or dealt with by the opt-in. Consequences, all deliberate:
+
+* a database that ever ran internal's `060`–`112` trips the refusal (see the
+  paragraph above);
+* a database migrated by a `feat/operator-scoped-ownership` build (`102`/`103`)
+  is refused by a `main` build that does not embed them, until that branch
+  lands.
 
 ## Migration Order
 

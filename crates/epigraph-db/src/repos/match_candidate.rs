@@ -479,6 +479,58 @@ impl MatchCandidateRepo {
         q.fetch_all(&self.pool).await
     }
 
+    /// Cross-source **sweep coverage** for one claim: the value of
+    /// `claims.last_match_scan_at` (migration `037`), which
+    /// `epigraph-cli/src/bin/cross_source_sweep.rs` stamps over every seed it
+    /// scans.
+    ///
+    /// # Why this lives here
+    ///
+    /// It reads `claims`, not `match_candidates`, but it is the third leg of
+    /// the same per-claim read as [`Self::list_for_claim`] and
+    /// [`Self::corroborates_edges_for_claim`] — the cross-source match view of
+    /// a claim — and [`Self::corroborates_edges_for_claim`] already sets the
+    /// precedent of querying another table from this repo. Putting it on
+    /// `ClaimRepository` instead would mean widening a claim row struct, which
+    /// `claim_from_row`'s ~20 callers make a much larger change than this is.
+    ///
+    /// # Three-state return
+    ///
+    /// `Option<Option<_>>` on purpose; flattening loses the distinction the
+    /// caller exists to make.
+    ///
+    /// - `Ok(None)` — **no row this viewer may read**. Either the claim does
+    ///   not exist or it is not visible. The caller must report NOTHING about
+    ///   sweep coverage in this case: saying "never swept" about a row the
+    ///   viewer has no right to read is both a false statement (it may well
+    ///   have been swept) and an assertion about the existence of that row.
+    /// - `Ok(Some(None))` — visible, and `last_match_scan_at IS NULL`: the
+    ///   matcher has never scanned this claim. An empty candidate list here
+    ///   means "not looked at yet", not "looked at and found nothing".
+    /// - `Ok(Some(Some(ts)))` — visible, last scanned at `ts`.
+    ///
+    /// # Tenancy
+    ///
+    /// Same `{VISIBILITY:…}` predicate every other claim read on this branch
+    /// carries. A timestamp is a small datum, but "was this id scanned" is
+    /// still an existence oracle over `claims`.
+    pub async fn last_match_scan_at(
+        &self,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> sqlx::Result<Option<Option<DateTime<Utc>>>> {
+        let sql = viewer.splice(
+            "SELECT c.last_match_scan_at FROM claims c
+             WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(&self.pool).await
+    }
+
     /// `CORROBORATES` edges incident on `claim_id` — the already-promoted half
     /// of a cross-source match read.
     ///

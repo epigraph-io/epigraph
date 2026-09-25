@@ -54,7 +54,11 @@ async fn supporting_evidence_lowers_belief_emits_warning(pool: sqlx::PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     // High prior belief, NULL pignistic column (seed_claim leaves it NULL).
     let claim_id = seed_claim(&pool, "high-belief claim for warning test", 0.85).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value/labels update on author-stamped transactions, and a server
+    // with no `ScopedPool` refuses the tool by name rather than writing on the
+    // unstamped pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let json = run_update(&server, &viewer, claim_id, 0.6, true).await;
 
@@ -83,7 +87,11 @@ async fn supporting_evidence_lowers_belief_emits_warning(pool: sqlx::PgPool) {
 async fn supporting_evidence_raising_belief_emits_no_warning(pool: sqlx::PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let claim_id = seed_claim(&pool, "lower-belief claim for no-warning test", 0.4).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value/labels update on author-stamped transactions, and a server
+    // with no `ScopedPool` refuses the tool by name rather than writing on the
+    // unstamped pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let json = run_update(&server, &viewer, claim_id, 0.95, true).await;
 

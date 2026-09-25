@@ -70,27 +70,48 @@
 //! pool, that assumption dies and this paragraph is the thing to re-measure.
 //!
 //! **(b) A MINT AND A SPEND IN DIFFERENT FUNCTIONS — OR DIFFERENT FILES — ARE
-//! INVISIBLE TO THIS SCANNER, AND THAT IS WHERE THE LARGEST RESIDUAL LIVES.**
-//! [`scan`] keys on one function-sized region containing BOTH a [`MINTS`]
-//! spelling and a [`FOREIGN_POOLS`] one. A function that mints and hands the
-//! `&Viewer` to a callee that runs the statements elsewhere matches neither
-//! half anywhere. **Measured instance:** `epigraph-mcp/src/server.rs`'s three
-//! maintenance tools mint through `maintenance_viewer(` and pass the viewer
-//! into `crates/epigraph-mcp/src/tools/`, whose statements run on
-//! `server.pool`. No file under `crates/epigraph-mcp/src` that names
-//! `server.pool` also carries a [`MINTS`] spelling, so the `"server.pool"` entry
-//! in [`FOREIGN_POOLS`] contributes **zero** detections today and a reader of
-//! this file alone would wrongly conclude that surface is covered.
+//! INVISIBLE TO THIS SCANNER.** [`scan`] keys on one function-sized region
+//! containing BOTH a [`MINTS`] spelling and a [`FOREIGN_POOLS`] one. A function
+//! that mints and hands the `&Viewer` to a callee that runs the statements
+//! elsewhere matches neither half anywhere. **Measured instance, now closed by
+//! a different control:** `epigraph-mcp/src/server.rs`'s three maintenance tools
+//! mint through `maintenance_viewer(` and hand the result into
+//! `crates/epigraph-mcp/src/tools/`. No file under `crates/epigraph-mcp/src` that
+//! names `server.pool` also carries a [`MINTS`] spelling, so the `"server.pool"`
+//! entry in [`FOREIGN_POOLS`] contributes **zero** detections, and a reader of
+//! this file alone would wrongly conclude that surface is covered by it.
 //!
-//! Those three sites are NOT in [`EXPECTED_HYBRIDS`], deliberately: [`scan`]
-//! cannot find them, so registering them would put them in the `fixed` set and
-//! fail the second assertion of
-//! `no_function_mints_a_bypass_and_names_a_foreign_pool` — a register can only
-//! hold rows this scanner can confirm. The class IS recorded elsewhere:
-//! `no_unmaintained_dsn.rs`'s register carries `epigraph-mcp/src/main.rs` with
-//! the reasoning, `main.rs` documents it, and `EpiGraphMcpFull::with_scoped_pool`
-//! has no production caller, so `maintenance_viewer` fails CLOSED there today.
-//! Owner for closing the gap: `D-PR17-hybrid-shape-lint`.
+//! **What covers those three sites now (batch H1), so this paragraph does not
+//! read as an open hole.** They used to spend the viewer on `server.pool` and
+//! were kept fail-closed by a hard-coded `false` gate in
+//! `epigraph-mcp/src/maintenance.rs`. They now take the whole
+//! `MaintenanceSession` (connection + viewer as one value) and run every
+//! statement on its connection. Two controls outside this scanner pin that.
+//! `crates/epigraph-mcp/tests/maintenance_tools_spend_only_the_session.rs` is a
+//! source ratchet: each tool's body takes the session, calls `session.split()`,
+//! and names no server pool. `maintenance_viewer` refuses to hand a session out
+//! unless a maintenance pool is attached AND the leased connection passes
+//! `MaintenanceSession::assert_privileged`, a runtime probe of that exact
+//! connection. The sites stay out of [`EXPECTED_HYBRIDS`], deliberately:
+//! [`scan`] cannot find them, and a register can only hold rows this scanner can
+//! confirm. Owner for a general cross-file scanner is still
+//! `D-PR17-hybrid-shape-lint`.
+//!
+//! **(b2) A STRING LITERAL naming a foreign pool is indistinguishable from a
+//! use, and the stripper cannot help.** Comments are stripped; string literals
+//! deliberately are not, because [`strip_comments`]-style handling has to track
+//! them in order NOT to mistake a `"postgres://…"` DSN for a line comment (see
+//! `the_stripper_does_not_eat_code`). MEASURED, on this batch:
+//! `epigraph-mcp/src/maintenance.rs::maintenance_viewer` became this lint's only
+//! reported offender because its REFUSAL MESSAGE spelled the field access while
+//! explaining why the refusal exists — a function whose entire purpose is to make
+//! the hybrid unreachable, flagged for describing it. Same class as the
+//! comment-stripping decision above ("a lint that punishes a call site for
+//! documenting its own hazard is worse than no lint"), one layer down. It was
+//! resolved by rewording the message rather than by registering a non-hybrid in
+//! [`EXPECTED_HYBRIDS`] or by teaching the stripper to eat literals, and the site
+//! carries a comment saying so. A future message that names a pool field will
+//! reproduce it; reword, do not register.
 //!
 //! **(c) Passing a `MaintenanceSession` into a callee has the same shape as
 //! (b).** A helper taking `&mut MaintenanceSession`

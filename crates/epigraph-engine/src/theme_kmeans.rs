@@ -213,10 +213,6 @@ pub async fn run_theme_kmeans(
 
     let limit = config.limit.max(1);
 
-    if config.wipe_first {
-        ClaimThemeRepository::delete_all(pool).await?;
-    }
-
     // 1. Pull claims with embeddings. Branch on centroid_dim: 1536 reads
     //    `claims.embedding`; 3072 reads `claims.embedding_3072`.
     let source_col = if config.centroid_dim == 3072 {
@@ -337,7 +333,21 @@ pub async fn run_theme_kmeans(
     let labels: Vec<usize> = model.predict(&dataset).iter().copied().collect();
     let centroids = model.centroids();
 
-    // 5. Persist: theme per cluster, then bulk-assign claim_ids.
+    // 5. Persist, ALL OR NOTHING: the optional wipe, then a theme per cluster
+    //    with its centroid, assignment and count, on ONE transaction.
+    //
+    //    These used to be separate statements on the pool, and the wipe ran
+    //    before the corpus read. So a refused assignment (on a schema without
+    //    the orphan `*_privacy` policies an unstamped `UPDATE claims` is refused
+    //    with `42501`) left `claim_themes` rows behind, and a failed run after a
+    //    committed wipe left no themes at all (MEASURED, batch H-a review:
+    //    `claim_themes +1` on an errored `theme_cluster`, and an orphan theme in
+    //    `list_themes`). The wipe now runs here, after the read and the k-means
+    //    fit, so a failure anywhere leaves the previous themes untouched.
+    let mut tx = pool.begin().await?;
+    if config.wipe_first {
+        ClaimThemeRepository::delete_all_conn(&mut tx).await?;
+    }
     let mut themes_created = 0_usize;
     let mut claims_assigned = 0_usize;
     let min_claims = config.min_claims_per_theme as usize;
@@ -361,7 +371,8 @@ pub async fn run_theme_kmeans(
             chosen_k,
             config.centroid_dim,
         );
-        let theme = ClaimThemeRepository::create(pool, &theme_label, &theme_description).await?;
+        let theme =
+            ClaimThemeRepository::create(&mut *tx, &theme_label, &theme_description).await?;
 
         let centroid_row = centroids.row(cluster_idx);
         let centroid_str = format!(
@@ -380,22 +391,23 @@ pub async fn run_theme_kmeans(
             )
             .bind(theme.id)
             .bind(&centroid_str)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
         } else {
-            ClaimThemeRepository::set_centroid(pool, theme.id, &centroid_str).await?;
+            ClaimThemeRepository::set_centroid(&mut *tx, theme.id, &centroid_str).await?;
         }
 
         let assigned =
-            ClaimThemeRepository::bulk_assign(pool, &cluster_claim_ids, theme.id).await?;
+            ClaimThemeRepository::bulk_assign(&mut *tx, &cluster_claim_ids, theme.id).await?;
         // update_count runs LAST per-cluster so claim_themes.updated_at is
         // bumped strictly after the per-claim updates.  The scheduled
         // `theme_cluster_rebuild` job's skip-check relies on this ordering.
-        ClaimThemeRepository::update_count(pool, theme.id, assigned as i32).await?;
+        ClaimThemeRepository::update_count(&mut *tx, theme.id, assigned as i32).await?;
 
         themes_created += 1;
         claims_assigned += assigned as usize;
     }
+    tx.commit().await?;
 
     Ok(RunThemeKmeansSummary {
         themes_created,

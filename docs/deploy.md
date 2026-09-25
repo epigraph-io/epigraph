@@ -23,6 +23,52 @@ The first deploy after 2026-05-05 also requires a one-shot reconcile of
 Subsequent deploys: run `cargo run -p epigraph-api --bin epigraph-migrate`
 (or let `ExecStartPre=` do it), then restart `epigraph-api.service`.
 
+On success `epigraph-migrate` prints one stdout line that still starts with
+the `migrations: ok` marker and now names both heads, e.g.
+`migrations: ok db_head=101 binary_head=101 applied=42` (issue #492). It exits
+nonzero, and never prints the marker, when:
+
+* the database is **ahead** of the binary — `_sqlx_migrations` holds a
+  successful version this build does not embed. That is a version above the
+  binary's highest embedded migration, *or* one that fills a gap below it (a
+  newer build's migration in reserved headroom such as `093`–`099`, or the
+  `102`–`103` a `feat/operator-scoped-ownership` build would apply), which the
+  head alone cannot show. The one exemption is `epigraph-internal`'s `035`
+  (`KNOWN_FOREIGN_VERSIONS` in `crates/epigraph-api/src/migrate.rs`). The
+  binary is stale; deploy one built from the revision that applied those
+  versions — the refusal lists them. Nothing is applied. For a *deliberate*
+  rollback to an older build, re-run with `--allow-db-ahead` or
+  `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` (the env var also covers
+  `EPIGRAPH_MIGRATE_ON_BOOT=1` on the server); it then applies the pending
+  migrations it embeds, leaves the unknown ones in place, prints a `WARNING`
+  naming them, and appends `db_ahead_of_binary=allowed` to the marker line.
+* after running, any migration embedded in the binary is not recorded as
+  successfully applied.
+
+The `035` exemption rests on `migrations/README.md`'s 2026-09-02 measurement
+of prod, not on a fresh read. If a deployed database carries any other
+non-embedded version, the first strict run refuses — fail-closed, nothing
+applied — until the version is identified.
+
+Both checks and the run itself happen on one connection holding sqlx's
+migration advisory lock, so a second `epigraph-migrate` (or a boot-time
+migrate) cannot slip a newer migration in between the check and the run.
+Two migrators started together against a *fresh* database can still fail one
+of them with a `40P01` deadlock between that lock and a `CREATE INDEX
+CONCURRENTLY` migration; that predates #492 (raw `sqlx::migrate!` does the
+same), the losing run exits nonzero without the marker, and re-running it is
+safe.
+
+**What this cannot catch.** A database that stops at an older head *because
+the binary itself is stale* (built before the newer migrations existed) still
+reports `ok` — the binary cannot know migrations it was never built with, so
+nothing inside it can tell "at my head" from "at the head the deployed code
+requires". #492's own measurement (a head-59 build on an empty database)
+still exits 0. The marker shows `binary_head`, so compare it with the newest
+file in `migrations/` for the revision you meant to deploy; making that
+comparison automatic needs the expected head supplied from outside the
+binary.
+
 ### Cross-worktree binary caching (foot-gun)
 
 `/home/jeremy/.cargo-target` is the shared cargo target across every worktree
@@ -698,6 +744,36 @@ not a side effect: an operator running an approval while a colleague walks a
 plan's item pages and the embedding enumerator is mid-sweep was previously one
 request away from an acquire-timeout. If you are tuning `max_connections` on the
 server, the api process's share is now 22 per replica.
+
+**`epigraph-mcp` reads it too (batch H1), and treats it differently.** Its three
+maintenance tools (`recompute_beliefs`, `sweep_semantic_duplicates`,
+`backfill_embeddings`) run on a connection leased from a separate maintenance
+pool that `epigraph-mcp` builds from this variable, falling back to
+`--database-url` as above. Each `epigraph-mcp` process therefore opens
+app(10) + **maintenance(2)** = **12** connections. That includes every listening
+service AND every per-client stdio process, because each one is its own process
+with its own pools. Count each one when tuning `max_connections`.
+
+Unlike the api, **a bad value does not stop `epigraph-mcp` from booting.** When
+the variable names a different database, cannot connect, or names a role that
+does not satisfy `epigraph_bypass()` while row security is active, the pool is
+NOT attached. The boot log records why on the `tenancy.maintenance` target, and
+the three tools refuse each call by name with nothing written. Everything else
+serves normally. The asymmetry is deliberate: here maintenance is three tools
+out of the whole surface, not the process's job. On a least-privilege
+deployment the documented fallback (unset, so `--database-url`, so
+`epigraph_app`) is therefore a refusal, not a zero-row no-op. **The fallback is
+never attached at all, even when `--database-url` could bypass RLS** (a
+superuser DSN): the three tools read and retire rows across every tenant, so
+enabling them is an explicit operator act, not a side effect of how the
+application DSN happens to be provisioned. **To enable the three tools, set
+`MAINTENANCE_DATABASE_URL` in the `epigraph-mcp` units' environment to a role
+that is a member of `epigraph_maintenance`.** Over HTTP they also require the
+`claims:admin` scope (`scope_map.rs`); a `claims:write` bearer is refused before
+the tool body runs. Each tool
+call also re-probes the connection it leased (`MaintenanceSession::assert_privileged`),
+so a role whose membership is revoked after boot is refused on its next call,
+not trusted on the strength of the boot probe.
 
 **Fleet-wide pool sizing changed.** `MaintenancePool` uses one cap of 11 (10 for
 work, 1 for the connection the bypass lease holds) for every converted CLI

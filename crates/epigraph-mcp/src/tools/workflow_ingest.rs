@@ -43,71 +43,75 @@ pub struct IngestWorkflowResponse {
 
 /// Inner helper: runs the executor and builds the response, but also returns
 /// the executor's `inserted` vec so MCP entry points can embed those claims
-/// inline. `pub(crate)` so sibling MCP tool modules (e.g. `workflows::store_workflow`)
-/// can drive the same embed loop without duplicating the executor wiring.
+/// inline. `pub(crate)` so sibling MCP tool modules (e.g.
+/// `workflows::store_workflow`) can drive the same embed loop without
+/// duplicating the executor wiring.
+///
+/// It does NOT hand back the system agent id, and does not need to: the embed
+/// goes through `McpEmbedder::embed_and_store`, whose `StorePath::AuthorStamped`
+/// arm reads the author off the ROW rather than taking it from a caller —
+/// precisely so `store_workflow` cannot pass `server.agent_id()` here and get a
+/// session stamped with the wrong writable group.
+///
+/// # The plan walk is one stamped transaction
+///
+/// `epigraph_ingest_executor::execute_workflow_ingest_plan` used to run on
+/// `server.pool`, where migration 077's `claims_tenancy` `WITH CHECK` refuses
+/// its first claim INSERT on a cleanly-migrated schema — that refusal is why
+/// `store_workflow` was entirely unavailable there, and it is the release-gate
+/// blocker this conversion clears. The stamp must be the
+/// `workflow-ingest-system` agent's; see
+/// [`crate::claim_helper::begin_system_ingest_stamped_tx`] for the measurement
+/// that rules out `server.agent_id()`.
+///
+/// Wrapping the walk in a transaction also makes the failure ATOMIC. Before, a
+/// refusal partway through left the `workflows` row, the claims inserted so far
+/// and their `executes` edges behind. Now the ingest either lands whole or
+/// leaves nothing — and re-running it converges, because every write in the walk
+/// is keyed on a deterministic id with an `ON CONFLICT` clause.
 pub(crate) async fn execute_workflow_ingest_with_inserted(
-    pool: &sqlx::PgPool,
+    server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &WorkflowExtraction,
 ) -> Result<(IngestWorkflowResponse, Vec<(uuid::Uuid, String)>), McpError> {
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
-    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(pool, &plan, extraction)
+
+    let (_system_agent_id, mut tx) =
+        crate::claim_helper::begin_system_ingest_stamped_tx(server, "workflow_ingest").await?;
+    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, extraction)
         .await
-        .map_err(|e| internal_error(format!("workflow ingest: {e}")))?;
+        .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
 
-    // Auto-wire DS factors for newly-inserted epistemic edges. The executor
-    // returns the edges so the caller can fire this without pulling
-    // `epigraph-engine` into the executor's dep graph (matches the embedding
-    // pattern documented in CLAUDE.md "Embedding policy").
-    if let Some(agent_id) = result.system_agent_id {
-        for e in &result.inserted_edges {
-            ds_auto::auto_wire_edge_if_epistemic(
-                pool,
-                viewer,
-                true, // executor only emits an InsertedPlanEdge when was_created=true
-                e.edge_id,
-                e.source_id,
-                &e.source_type,
-                e.target_id,
-                &e.target_type,
-                &e.relationship,
-                agent_id,
-            )
-            .await;
-        }
-
-        // Per-claim CDST batch wire (operation atoms only) — parity with
-        // `do_ingest_document`, which wires a per-atom BBA carrying the
-        // normalised `evidence_type` so the tag reaches `mass_functions` and
-        // participates in `effective_source_strength` / the per-perspective
-        // frame function. The workflow hierarchy edges (decomposes / *_follows /
-        // executes / asserts) all map to `RestrictionKind::Neutral`, so edge
-        // auto-wire writes no BBA — without this loop the operation atoms would
-        // have no BBA at all. Only newly-inserted level-3 atoms get an entry:
-        // thesis/phase/step claims are structural (matching the document path,
-        // where only level-3 atoms are wired). `weight` mirrors the document
-        // default for an untagged-methodology claim (`Methodology::Extraction`).
-        let inserted_ids: std::collections::HashSet<uuid::Uuid> =
-            result.inserted.iter().map(|(id, _)| *id).collect();
-        let ds_entries: Vec<ds_auto::BatchDsEntry> = plan
-            .claims
-            .iter()
-            .filter(|c| c.level == 3 && inserted_ids.contains(&c.id))
-            .map(|c| ds_auto::BatchDsEntry {
-                claim_id: c.id,
-                confidence: c.confidence.clamp(0.0, 1.0),
-                weight: epigraph_core::Methodology::Extraction.weight_modifier(),
-                evidence_type: c.evidence_type.clone(),
-                // Workflow steps carry no axis declaration; the workflow builder
-                // always plans `axis: None`, so this is the binary frame (#222).
-                axis: c.axis.clone(),
-            })
-            .collect();
-        if !ds_entries.is_empty() {
-            if let Err(e) = ds_auto::auto_wire_ds_batch(pool, viewer, &ds_entries, agent_id).await {
-                tracing::warn!("workflow ds auto-wire batch failed: {e}");
+    // The DS wiring runs in its OWN system-agent-stamped transaction, after the
+    // ingest commit. `claim_frames` / `mass_functions` / the cached-belief
+    // `UPDATE claims` are all owned by the same group as the claims they hang off
+    // — the `workflow-ingest-system` agent's — so this needs the same stamp the
+    // plan walk needed, and on the unstamped pool it was refused on BOTH
+    // configurations (`claim_frames` carries no orphan `*_privacy` policy).
+    //
+    // A SECOND transaction rather than the ingest's own, because this half is
+    // best-effort: a DS failure must not roll back a workflow that landed. Inside
+    // it the per-entry work is SAVEPOINT-wrapped by `auto_wire_ds_batch` and
+    // `auto_wire_edge_if_epistemic`, so one bad entry does not abort the rest.
+    match crate::claim_helper::begin_system_ingest_stamped_tx(server, "workflow_ingest_ds").await {
+        Ok((_agent, mut ds_tx)) => {
+            wire_ds_after_ingest(&mut ds_tx, viewer, &plan, &result).await;
+            if let Err(e) = ds_tx.commit().await {
+                tracing::warn!(
+                    workflow_id = %result.workflow_id,
+                    "workflow ds wiring could not commit: {e}. The ingest is stored; its claims \
+                     carry no BBA until a recompute reaches them"
+                );
             }
         }
+        Err(e) => tracing::warn!(
+            workflow_id = %result.workflow_id,
+            "workflow ds wiring skipped: {}. The ingest is stored and intact",
+            e.message
+        ),
     }
 
     let inserted = result.inserted.clone();
@@ -124,22 +128,158 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     Ok((response, inserted))
 }
 
-/// Pool-only ingest logic. Callable from both the MCP entry point (which
-/// supplies `server.pool`) and from integration tests (which supply a
-/// `sqlx::test`-managed pool directly).
+/// Post-commit DS wiring for a completed workflow ingest: an edge-factor BBA for
+/// every newly-inserted epistemic plan edge, plus a per-claim BBA for every
+/// newly-inserted level-3 operation atom.
+///
+/// # Post-commit and best-effort, deliberately outside the ingest transaction
+///
+/// The ingest is committed by the time this runs, and every failure below is
+/// warned rather than returned. Pulling it inside the stamped transaction would
+/// make a DS failure roll the whole ingest back — turning a WARN into a total
+/// `store_workflow` outage, which is the fail-closed-regression-as-data-loss
+/// shape `claim_helper::emit_verb_edge_best_effort`'s doc says this programme is
+/// trying not to create.
+///
+/// Factored out of [`execute_workflow_ingest_with_inserted`] when that function
+/// took the server instead of a pool: `do_ingest_workflow_via_pool` is the
+/// `#[sqlx::test]` fixture and it must keep firing the same wiring, or a test
+/// asserting on `mass_functions` measures the refactor instead of the tool.
+/// MEASURED — the first revision of this change did lose it, and
+/// `ingest_workflow_tags_atom_bbas_with_normalized_evidence_type` failed with
+/// "expected exactly 2 operation-atom BBAs tagged 'empirical', found 0".
+async fn wire_ds_after_ingest(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    plan: &epigraph_ingest::common::plan::IngestPlan,
+    result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
+) {
+    // Auto-wire DS factors for newly-inserted epistemic edges. The executor
+    // returns the edges so the caller can fire this without pulling
+    // `epigraph-engine` into the executor's dep graph (matches the embedding
+    // pattern documented in CLAUDE.md "Embedding policy").
+    let Some(agent_id) = result.system_agent_id else {
+        return;
+    };
+    for e in &result.inserted_edges {
+        ds_auto::auto_wire_edge_if_epistemic(
+            &mut *conn,
+            viewer,
+            true, // executor only emits an InsertedPlanEdge when was_created=true
+            e.edge_id,
+            e.source_id,
+            &e.source_type,
+            e.target_id,
+            &e.target_type,
+            &e.relationship,
+            agent_id,
+        )
+        .await;
+    }
+
+    // Per-claim CDST batch wire (operation atoms only) — parity with
+    // `do_ingest_document`, which wires a per-atom BBA carrying the
+    // normalised `evidence_type` so the tag reaches `mass_functions` and
+    // participates in `effective_source_strength` / the per-perspective
+    // frame function. The workflow hierarchy edges (decomposes / *_follows /
+    // executes / asserts) all map to `RestrictionKind::Neutral`, so edge
+    // auto-wire writes no BBA — without this loop the operation atoms would
+    // have no BBA at all. Only newly-inserted level-3 atoms get an entry:
+    // thesis/phase/step claims are structural (matching the document path,
+    // where only level-3 atoms are wired). `weight` mirrors the document
+    // default for an untagged-methodology claim (`Methodology::Extraction`).
+    let inserted_ids: std::collections::HashSet<uuid::Uuid> =
+        result.inserted.iter().map(|(id, _)| *id).collect();
+    let ds_entries: Vec<ds_auto::BatchDsEntry> = plan
+        .claims
+        .iter()
+        .filter(|c| c.level == 3 && inserted_ids.contains(&c.id))
+        .map(|c| ds_auto::BatchDsEntry {
+            claim_id: c.id,
+            confidence: c.confidence.clamp(0.0, 1.0),
+            weight: epigraph_core::Methodology::Extraction.weight_modifier(),
+            evidence_type: c.evidence_type.clone(),
+            // Workflow steps carry no axis declaration; the workflow builder
+            // always plans `axis: None`, so this is the binary frame (#222).
+            axis: c.axis.clone(),
+        })
+        .collect();
+    if !ds_entries.is_empty() {
+        if let Err(e) = ds_auto::auto_wire_ds_batch(&mut *conn, viewer, &ds_entries, agent_id).await
+        {
+            tracing::warn!("workflow ds auto-wire batch failed: {e}");
+        }
+    }
+}
+
+/// Pool-only ingest logic, for test fixtures that hold a `sqlx::test`-managed
+/// pool and no server.
+///
+/// **This is the UNSTAMPED path and it is deliberately not the production one.**
+/// `#[sqlx::test]` connects as `epigraph` — superuser, `BYPASSRLS`, owner of
+/// every protected table — so the tenancy stamp is inert there and an extra
+/// connection is all a stamp would buy. Production goes through
+/// [`execute_workflow_ingest_with_inserted`], which takes the server so it can
+/// reach the `ScopedPool`. A caller that reaches for this function with a real
+/// least-privilege pool gets the refusal the conversion exists to remove, which
+/// is the correct outcome: it means the call site needs a server, not a pool.
 ///
 /// Thin wrapper over [`epigraph_ingest_executor::execute_workflow_ingest_plan`];
 /// see that function for the canonical persistence semantics. Does NOT embed
 /// — embedding happens in the MCP entry point [`do_ingest_workflow`], which
 /// has access to `server.embedder`.
+///
+/// **The walk runs in ONE transaction, as production's does.** Unstamped is a
+/// deliberate difference from production; autocommit was not. On a bare pooled
+/// checkout every statement got its own `NOW()`, so the fixture's plan got
+/// strictly increasing `created_at` values that production's never has — and a
+/// reader ordering a workflow's steps by `created_at` passed every test built on
+/// this fixture while it returned steps in UUID order on the server. A fixture
+/// that differs from production on the very property under test cannot see it.
 pub async fn do_ingest_workflow_via_pool(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &WorkflowExtraction,
 ) -> Result<IngestWorkflowResponse, McpError> {
-    let (response, _inserted) =
-        execute_workflow_ingest_with_inserted(pool, viewer, extraction).await?;
-    Ok(response)
+    let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
+    let result = {
+        // Named `unstamped_tx`, not `tx`: `residual_unstamped_writes.rs`'s
+        // executor-call register counts calls spelled `&mut tx` as STAMPED, and
+        // this one is not.
+        let mut unstamped_tx = pool
+            .begin()
+            .await
+            .map_err(|e| internal_error(format!("workflow ingest: could not begin: {e}")))?;
+        let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
+            &mut unstamped_tx,
+            &plan,
+            extraction,
+        )
+        .await
+        .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
+        unstamped_tx
+            .commit()
+            .await
+            .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
+        result
+    };
+    {
+        let mut ds_conn = pool
+            .acquire()
+            .await
+            .map_err(|e| internal_error(format!("workflow ingest: could not acquire: {e}")))?;
+        wire_ds_after_ingest(&mut ds_conn, viewer, &plan, &result).await;
+    }
+    Ok(IngestWorkflowResponse {
+        workflow_id: result.workflow_id.to_string(),
+        canonical_name: result.canonical_name.clone(),
+        generation: result.generation,
+        claims_ingested: result.claims_ingested,
+        claims_skipped_dedup: result.claims_skipped_dedup,
+        executes_edges: result.executes_edges_created,
+        relationships_created: result.relationship_edges_created,
+        already_ingested: result.already_ingested,
+    })
 }
 
 // ── MCP entry point ────────────────────────────────────────────────────────
@@ -151,7 +291,7 @@ pub async fn do_ingest_workflow(
     extraction: &WorkflowExtraction,
 ) -> Result<CallToolResult, McpError> {
     let (response, inserted) =
-        execute_workflow_ingest_with_inserted(&server.pool, viewer, extraction).await?;
+        execute_workflow_ingest_with_inserted(server, viewer, extraction).await?;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue —
@@ -222,20 +362,22 @@ pub struct ImproveWorkflowHierarchyResponse {
 /// Called by `improve_workflow_hierarchy` (this module) — kept private since
 /// no other module needs the inserted vec for this path.
 async fn improve_workflow_hierarchy_with_inserted(
-    pool: &sqlx::PgPool,
+    server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     parent_canonical_name: &str,
     mut extraction: WorkflowExtraction,
 ) -> Result<(ImproveWorkflowHierarchyResponse, Vec<(uuid::Uuid, String)>), McpError> {
-    let parent_max =
-        epigraph_db::WorkflowRepository::max_generation_by_canonical(pool, parent_canonical_name)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| {
-                invalid_params(format!(
-                    "no workflow with canonical_name={parent_canonical_name}"
-                ))
-            })?;
+    let parent_max = epigraph_db::WorkflowRepository::max_generation_by_canonical(
+        &server.pool,
+        parent_canonical_name,
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| {
+        invalid_params(format!(
+            "no workflow with canonical_name={parent_canonical_name}"
+        ))
+    })?;
 
     let new_generation = parent_max + 1;
 
@@ -245,7 +387,7 @@ async fn improve_workflow_hierarchy_with_inserted(
     extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
 
     let (response, inserted) =
-        execute_workflow_ingest_with_inserted(pool, viewer, &extraction).await?;
+        execute_workflow_ingest_with_inserted(server, viewer, &extraction).await?;
 
     let improve_response = ImproveWorkflowHierarchyResponse {
         parent_canonical_name: parent_canonical_name.to_string(),
@@ -268,16 +410,42 @@ async fn improve_workflow_hierarchy_with_inserted(
 /// are intentionally OVERWRITTEN so that the variant's identity is dictated
 /// by the resolver, not the caller. Does NOT embed — embedding happens in
 /// the MCP entry point [`improve_workflow_hierarchy`].
+///
+/// **Unstamped, like [`do_ingest_workflow_via_pool`], and for the same reason:**
+/// it is a fixture entry point for `#[sqlx::test]`, which connects as a
+/// `BYPASSRLS` superuser. The production path is
+/// [`improve_workflow_hierarchy`], which holds a server and can reach the
+/// `ScopedPool`.
 pub async fn improve_workflow_hierarchy_via_pool(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     parent_canonical_name: &str,
-    extraction: WorkflowExtraction,
+    mut extraction: WorkflowExtraction,
 ) -> Result<ImproveWorkflowHierarchyResponse, McpError> {
-    let (response, _inserted) =
-        improve_workflow_hierarchy_with_inserted(pool, viewer, parent_canonical_name, extraction)
-            .await?;
-    Ok(response)
+    let parent_max =
+        epigraph_db::WorkflowRepository::max_generation_by_canonical(pool, parent_canonical_name)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "no workflow with canonical_name={parent_canonical_name}"
+                ))
+            })?;
+    let new_generation = parent_max + 1;
+    extraction.source.canonical_name = parent_canonical_name.to_string();
+    extraction.source.generation = u32::try_from(new_generation)
+        .map_err(|e| internal_error(format!("new_generation does not fit in u32: {e}")))?;
+    extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
+
+    let response = do_ingest_workflow_via_pool(pool, viewer, &extraction).await?;
+    Ok(ImproveWorkflowHierarchyResponse {
+        parent_canonical_name: parent_canonical_name.to_string(),
+        parent_generation: parent_max,
+        new_generation,
+        workflow_id: response.workflow_id,
+        claims_ingested: response.claims_ingested,
+        already_ingested: response.already_ingested,
+    })
 }
 
 /// MCP tool entry point for `improve_workflow_hierarchy`.
@@ -289,7 +457,7 @@ pub async fn improve_workflow_hierarchy(
     // Save goal before params.extraction is consumed by improve_workflow_hierarchy_with_inserted.
     let goal = params.extraction.source.goal.clone();
     let (response, inserted) = improve_workflow_hierarchy_with_inserted(
-        &server.pool,
+        server,
         viewer,
         &params.parent_canonical_name,
         params.extraction,
@@ -477,9 +645,11 @@ mod tests {
         );
 
         // Manually insert the document atom (mirrors what do_ingest_document would do).
-        let sys_agent_id = epigraph_ingest_executor::get_or_create_system_agent(&pool)
-            .await
-            .unwrap();
+        let sys_agent_id = epigraph_ingest_executor::get_or_create_system_agent(
+            &mut pool.acquire().await.expect("acquire"),
+        )
+        .await
+        .unwrap();
         let doc_atom = doc_plan.claims.iter().find(|c| c.level == 3).unwrap();
         assert_eq!(doc_atom.id, expected_atom_id);
         epigraph_db::ClaimRepository::create_with_id_if_absent(

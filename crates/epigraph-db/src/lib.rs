@@ -51,6 +51,7 @@
 //! All migrations are in `/migrations/` and should be run with `sqlx migrate run`.
 
 pub mod errors;
+pub mod label_validation;
 pub mod pool;
 pub mod repos;
 pub mod visibility;
@@ -63,31 +64,34 @@ pub mod visibility;
 // it, and it re-exported `COARSE_EDGE_TYPES` from `repos::structural` purely to
 // keep that module path resolving. The constant is unaffected and is exported
 // below from where PR-08 actually put it.
-pub use errors::DbError;
+pub use errors::{DbError, PERSONAL_GROUP_NOT_OWNED, PERSONAL_MEMBERSHIP_REVOKED};
+pub use label_validation::reject_unexpanded_labels;
 pub use pool::{
     apply_statement_timeout, assert_maintenance_privilege, create_pool, create_pool_from_options,
     create_pool_with_options, maintenance_database_url, maintenance_verdict,
-    probe_maintenance_privilege, resolve_maintenance_url, MaintenanceConn, MaintenanceDsnSource,
-    MaintenancePrivilege, MaintenanceSession, MaintenanceVerdict, ScopedConn, ScopedPool,
-    ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, MAINTENANCE_DATABASE_URL,
+    probe_maintenance_privilege, probe_maintenance_privilege_conn, resolve_maintenance_url,
+    MaintenanceConn, MaintenanceDsnSource, MaintenancePrivilege, MaintenanceSession,
+    MaintenanceVerdict, ScopedConn, ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx,
+    SessionGucMode, MAINTENANCE_DATABASE_URL,
 };
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository,
     AlternativePairRow, AlternativeSetRepository, AnalysisRecord, AnalysisRepository,
-    BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
+    AuthorOperator, BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
-    ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow, ClaimNeighbor,
-    ClaimNeighborBetpRow, ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow,
-    ClaimVersionRepository, ClaimVersionRow, CommunityRepository, ConsolidateMode,
-    ConsolidateResult, ContextRepository, CorpusCounts, CorpusStatsRepository,
-    CounterfactualRepository, CounterfactualRow, DedupRepair, DivergenceRepository,
-    EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EntityRepository, EntityRow,
-    EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow, EventRepository, EventRow,
-    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceEncryptionRepository,
-    EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult, EvolveStepResult,
-    ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
-    FactorRepository, FrameClaimBeliefHit, FrameRepository, GapAnalysisResult, GapChallengeRow,
-    GapRecord, GapRepository, GraphExpansionHit, GraphViewRepository, GroundedNeighbor,
+    ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
+    ClaimListFilter, ClaimNeighbor, ClaimNeighborBetpRow, ClaimRepository, ClaimSortField,
+    ClaimSortOrder, ClaimSummary, ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository,
+    ClaimVersionRow, CommunityRepository, ConsolidateMode, ConsolidateResult, ContextRepository,
+    CorpusCounts, CorpusStatsRepository, CounterfactualRepository, CounterfactualRow, DedupRepair,
+    DivergenceRepository, EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository,
+    EntityRepository, EntityRow, EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow,
+    EventRepository, EventRow, EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow,
+    EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceListFilter, EvidenceListRow,
+    EvidenceRepository, EvidenceSearchResult, EvolveStepResult, ExperimentRepository,
+    ExperimentResultRepository, ExperimentResultRow, ExperimentRow, FactorRepository,
+    FrameClaimBeliefHit, FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord,
+    GapRepository, GraphExpansionHit, GraphViewRepository, GroundedNeighbor,
     GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository, GroupRow,
     HierarchicalWorkflowRow, HybridHit, IndexCounts, InstanceAdminRepository, InstanceAdminRow,
     KeyEpochRow, LabelQuery, LearningEventRepository, LearningEventRow, LevelAndSourceType,
@@ -95,13 +99,14 @@ pub use repos::{
     MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
     MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,
     MethodUsageExample, NearestClaimHit, NewRecallEvent, OAuthClientRepository, OAuthClientRow,
-    PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
-    PatternTemplateRow, PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository,
-    ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
-    ReasoningTraceRepository, RecallEventRepository, RecallEventRow, RefreshTokenRepository,
-    RefreshTokenRow, ResolvedStep, RevokeOutcome, RotateOutcome, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
-    StructuralRepository, SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition,
+    OperatorLink, OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput,
+    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProvenanceChain,
+    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
+    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome,
+    RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow, SecurityEventRepository,
+    SecurityEventRow, SheafRepository, SortDirection, StructuralRepository, SweepCandidate,
+    TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
     TraceProvenanceStep, TripleRepository, TripleRow, WebhookSubscriptionRepository,
     WebhookSubscriptionRow, WorkflowExecutionRepository, WorkflowExecutionRow,
     WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
@@ -117,7 +122,7 @@ pub use repos::activity::ActivityRow;
 pub use repos::community::{CommunityMemberRow, CommunityRow, MembershipOutcome};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
-pub use repos::edge::{AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS};
+pub use repos::edge::{AttributedClaimRow, EdgeRow, SymmetricEdgeUpsert, EPISTEMIC_RELATIONSHIPS};
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::graph_view::{

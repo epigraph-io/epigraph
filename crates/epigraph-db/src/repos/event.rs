@@ -308,6 +308,66 @@ impl EventRepository {
     /// which is the correct behavior here, since we do not want to log
     /// `claim.created` for a claim that never persisted.
     ///
+    /// # Why the INSERT runs inside a SAVEPOINT
+    ///
+    /// The `or_log` half of this method's contract is *"swallow the failure and
+    /// let the caller's write proceed"*, and a bare `execute` on the caller's
+    /// connection cannot honour it. Every caller reached here through
+    /// `let _ = …` — `ClaimRepository::create_strict` and
+    /// `ClaimRepository::supersede` — and while every statement ran on its own
+    /// autocommit pool checkout a failed event INSERT cost exactly that
+    /// statement. On a connection that is inside a transaction it costs the
+    /// whole transaction: PostgreSQL aborts it on the first failed statement, so
+    /// the swallowed error resurfaces at the NEXT statement as `25P02 current
+    /// transaction is aborted, commands ignored until end of transaction block`
+    /// with the real cause only in this log line. That is strictly worse than
+    /// either honest alternative — the caller's write is lost *and* the
+    /// diagnostic is gone — and it became reachable the moment a writer put a
+    /// real transaction around `create_strict` (the MCP submission path).
+    ///
+    /// A savepoint keeps the contract in both shapes: the event row either lands
+    /// or is rolled back alone, and the caller's transaction is still usable
+    /// either way. Same construction and same reasoning as
+    /// `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort`.
+    ///
+    /// `events` is not RLS-enabled by migration 077 and not in 079's FORCE set,
+    /// so today the INSERT is governed by GRANTs alone and the abort is latent
+    /// rather than live. The savepoint is what keeps it latent when `events`
+    /// grows a policy or a constraint.
+    ///
+    /// A failure to take or release the savepoint itself is also logged and
+    /// swallowed: it means the caller's transaction was already unusable, which
+    /// this method has no way to repair and must not mask by panicking.
+    ///
+    /// # An event's `created_at` is NOT its visibility order
+    ///
+    /// Stated because the transactional callers multiplied and the consequence
+    /// is invisible from any one of them. `created_at` is `NOW()`, which inside
+    /// a transaction is the transaction's START time, and `graph_version` is a
+    /// `nextval` taken at INSERT time — but a reader sees the row only at
+    /// COMMIT. So an event can become visible carrying a timestamp (and a
+    /// version) EARLIER than events that were already visible. MEASURED: the
+    /// review saw one transactional `ingest_workflow` write 18 `claim.created`
+    /// events with ONE distinct `created_at`; `scripts/e2e/probe-unit-e.sh`'s
+    /// TRANSACTIONAL EVENTS arm reads groups of up to 8 sharing one timestamp
+    /// on this branch, against 1 on main, whose walk was not transactional.
+    ///
+    /// The consequence for a poller: `GET /api/v1/events` filters on
+    /// `created_at >= since`. A consumer that advances `since` past the start
+    /// of a transaction that is still open when it polls will never see that
+    /// transaction's events. Inferred from the code, not observed. Not new in
+    /// kind — `ClaimRepository::create_strict` and `::supersede` published
+    /// through here inside transactions before the Unit E conversions — but
+    /// those conversions put whole ingest walks (many events, long
+    /// transactions) on this path.
+    ///
+    /// Not fixed here, deliberately: `clock_timestamp()` would narrow the
+    /// window without closing it (it is still pre-commit), and a
+    /// commit-ordered cursor is a change to the events API's contract, not to
+    /// this helper. A consumer that must not miss events should re-read an
+    /// overlap window behind its cursor (the endpoint's `since` is inclusive)
+    /// and dedupe by event id.
+    ///
     /// Uses runtime `sqlx::query` (not the compile-time macro) to avoid
     /// adding offline-data churn for callers in transactional contexts.
     pub async fn publish_or_log_conn(
@@ -316,8 +376,23 @@ impl EventRepository {
         actor_id: Option<Uuid>,
         payload: &serde_json::Value,
     ) -> Option<Uuid> {
+        use sqlx::Acquire;
+
         let id = Uuid::new_v4();
-        match sqlx::query(
+        let mut sp = match conn.begin().await {
+            Ok(sp) => sp,
+            Err(err) => {
+                tracing::warn!(
+                    event_type = event_type,
+                    actor_id = ?actor_id,
+                    error = %err,
+                    "EventRepository::publish_or_log_conn: could not open a savepoint for the \
+                     event INSERT; the caller's transaction is already unusable"
+                );
+                return None;
+            }
+        };
+        let inserted = sqlx::query(
             "INSERT INTO events (id, event_type, actor_id, payload, graph_version, created_at) \
              VALUES ($1, $2, $3, $4, nextval('events_graph_version_seq'), NOW())",
         )
@@ -325,18 +400,39 @@ impl EventRepository {
         .bind(event_type)
         .bind(actor_id)
         .bind(payload)
-        .execute(&mut *conn)
-        .await
-        {
-            Ok(_) => Some(id),
+        .execute(&mut *sp)
+        .await;
+
+        match inserted {
+            Ok(_) => match sp.commit().await {
+                Ok(()) => Some(id),
+                Err(err) => {
+                    tracing::warn!(
+                        event_type = event_type,
+                        actor_id = ?actor_id,
+                        error = %err,
+                        "EventRepository::publish_or_log_conn: the event INSERT succeeded but \
+                         its savepoint could not be released"
+                    );
+                    None
+                }
+            },
             Err(err) => {
                 tracing::warn!(
                     event_type = event_type,
                     actor_id = ?actor_id,
                     error = %err,
-                    "EventRepository::publish_or_log_conn: failed to persist event; \
-                     downstream write may or may not commit (caller's tx)"
+                    "EventRepository::publish_or_log_conn: failed to persist event; rolled back \
+                     to the savepoint so the caller's write is unaffected"
                 );
+                if let Err(rb) = sp.rollback().await {
+                    tracing::warn!(
+                        event_type = event_type,
+                        error = %rb,
+                        "EventRepository::publish_or_log_conn: rollback to savepoint failed; the \
+                         caller's transaction is aborted and its next statement will fail"
+                    );
+                }
                 None
             }
         }

@@ -28,7 +28,11 @@ async fn update_with_evidence_does_not_violate_plausibility_bounds_at_one(pool: 
     )
     .await;
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value/labels update on author-stamped transactions, and a server
+    // with no `ScopedPool` refuses the tool by name rather than writing on the
+    // unstamped pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let result = epigraph_mcp::tools::claims::update_with_evidence(
         &server,
