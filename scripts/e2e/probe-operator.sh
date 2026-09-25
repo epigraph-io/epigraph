@@ -51,12 +51,12 @@ E2E="$(cd "$(dirname "$0")" && pwd)"
 # The prompt hash is a fixed public test value, not a secret.
 PHASH="$(printf 'ab%.0s' $(seq 1 32))"
 
-q() { PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
+q() { PGPASSWORD="$E2E_SU_PW" psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
 
 echo "### binary: $BIN"
 LOCKFIFO="$E2E/.oplock.$LABEL"
 rm -f "$LOCKFIFO"; mkfifo "$LOCKFIFO"
-PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
+PGPASSWORD="$E2E_SU_PW" psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
   -c "SELECT pg_advisory_lock(918273645);" -f "$LOCKFIFO" >/dev/null 2>&1 &
 LOCKPID=$!
 exec 9>"$LOCKFIFO"
