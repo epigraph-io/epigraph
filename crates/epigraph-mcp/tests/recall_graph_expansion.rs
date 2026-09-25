@@ -37,6 +37,9 @@ use epigraph_mcp::types::LinkEpistemicParams;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+#[path = "viewer_fixture.rs"]
+mod viewer_fixture;
+
 mod fixture {
     use super::*;
 
@@ -191,13 +194,17 @@ fn base_params(depth: Option<u32>, limit: u32) -> RecallWithContextParams {
     }
 }
 
-fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
+/// Built with a `ScopedPool`: `link_epistemic` runs on one author-stamped
+/// transaction (03e2c499), and a server without one refuses it by name.
+async fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
     use epigraph_crypto::AgentSigner;
     use epigraph_mcp::embed::McpEmbedder;
     use epigraph_mcp::EpiGraphMcpFull;
+    let scoped = viewer_fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
-    let embedder = McpEmbedder::new(pool.clone(), None); // mock — tests use pre-computed pgvec
-    EpiGraphMcpFull::new(pool, signer, embedder, /*read_only=*/ false)
+    // mock — tests use pre-computed pgvec
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, /*read_only=*/ false).with_scoped_pool(scoped)
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -287,7 +294,7 @@ async fn build_two_hop_fixture(
         .await;
     }
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
 
     do_link_epistemic(
         &server,
@@ -526,7 +533,7 @@ async fn graph_expansion_does_not_promote_a_level_3_atom(pool: PgPool) {
         .await;
     }
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     for target in [para, atom] {
         do_link_epistemic(
             &server,
