@@ -417,6 +417,18 @@ decision or conversion before the operator drops `claims_privacy`,
    `claims:write` caller act on another agent's workflow. On B the orphan
    policies admit it; on A the stamped write now refuses it (403). The authority
    decision is #374 / H3.
+8. **H3, hierarchical workflows: PARTLY closed by batch H-b, forward-only.**
+   `add_step` / `delete_step` (MCP and HTTP) and a variant ingest now check the
+   caller against the workflow's recorded submitter (the submitter, its
+   operator, or `claims:admin`; over HTTP only, stdio unchanged). `workflows`
+   recorded no owner before batch H-b, so every EXISTING workflow has no record
+   and stays open to any caller, with a WARN: which authority legacy workflows
+   carry is an open operator decision. `evolve_step` and
+   `refresh_workflow_promotion` (item 4) are not covered: they remain on the
+   unstamped pool and take no workflow-authority check. Measured by
+   `epigraph-mcp/tests/workflow_caller_authority.rs` and the API
+   `workflow_steps_refuse_a_caller_who_did_not_submit_the_workflow`; no e2e arm
+   drives it yet.
 
 ## What this harness does not cover
 
