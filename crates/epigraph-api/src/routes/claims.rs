@@ -1946,6 +1946,7 @@ pub struct UpdateLabelsResponse {
     tag = "claims"
 )]
 pub async fn update_labels(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
@@ -1965,21 +1966,108 @@ pub async fn update_labels(
         });
     }
 
-    // Fetch agent_id — 404 before 403 (don't leak existence via ownership check)
-    let claim_agent_id: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("DB error fetching claim owner: {e}"),
-        })?
-        .ok_or_else(|| ApiError::NotFound {
-            entity: "Claim".to_string(),
-            id: id.to_string(),
+    // ── The write target, read through the CALLER's viewer ──
+    //
+    // This was `SELECT agent_id FROM claims WHERE id = $1` on the raw pool,
+    // unfiltered, and the handler held no Viewer at all (batch H6, the sibling
+    // of supersede's `F-write-authz-reads-unfiltered`). A `claims:admin`
+    // principal could therefore relabel a claim it cannot read. A claim the
+    // caller cannot see is now 404, exactly like one that does not exist, and
+    // 404 still fires before the 403 below, so ownership leaks nothing either.
+    let (claim_agent_id, owner_group_id) = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "update_labels",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
         })?;
+        ClaimRepository::write_target_of(&mut *read, &viewer, id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB error fetching claim owner: {e}"),
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                entity: "Claim".to_string(),
+                id: id.to_string(),
+            })?
+    };
     crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
 
-    let labels = ClaimRepository::update_labels(&state.db_pool, id, &body.add, &body.remove)
+    // ── Whose write authority the transaction is stamped with ──
+    //
+    // Migration 077's `claims_tenancy` WITH CHECK admits the UPDATE only when
+    // the claim's `owner_group_id` is in `epigraph_writable_groups()`. On the
+    // raw, unstamped pool that set is empty, so without the orphan
+    // `claims_privacy` policy (config A) this route refused EVERY caller with
+    // 42501 — owners included.
+    //
+    // 1. The CALLER's viewer, whenever it can write the owning group. This is
+    //    every owner relabelling its own claim, and an admin who is itself a
+    //    writer of that group.
+    // 2. Only for a `claims:admin` caller that cannot write it: the AUTHOR's
+    //    viewer (`claims.agent_id`), if the author can. The authority for the
+    //    act is `require_owner_or_admin` above, which already admits an admin
+    //    for any claim it can read, and production's schema admits that write
+    //    today through the orphan policy. The stamp carries that decision to
+    //    the database; it does not make one. A non-admin never reaches this
+    //    arm, so it only ever writes under its own stamp.
+    // 3. Otherwise the caller's viewer again, and the database decides: a row
+    //    neither viewer can write is refused with 42501, answered 403 below
+    //    with nothing written. NOT pre-refused here, because on a schema that
+    //    still carries the orphan policies that write is admitted, and a
+    //    Rust-side refusal would be a regression there.
+    //
+    // `Viewer::resolve` reads memberships through the SECURITY DEFINER
+    // `epigraph_live_memberships`, so it is correct on the unstamped pool, and
+    // it mints nothing.
+    let author_viewer;
+    let stamp: &epigraph_db::Viewer = if viewer.writable_groups().contains(&owner_group_id) {
+        &viewer
+    } else if auth.has_scope("claims:admin") {
+        author_viewer = epigraph_db::Viewer::resolve(&state.db_pool, claim_agent_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("could not resolve the claim author's viewer: {e}"),
+            })?;
+        if author_viewer.writable_groups().contains(&owner_group_id) {
+            &author_viewer
+        } else {
+            &viewer
+        }
+    } else {
+        &viewer
+    };
+
+    // Never a fallback to `state.db_pool`: an unstamped write is exactly what
+    // this conversion removes.
+    let scoped = state.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            handler = "update_labels",
+            "label write refused: this process was not built from a ScopedPool"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+    let mut tx = scoped.begin_as(stamp).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "update_labels",
+            "could not begin a viewer-stamped transaction"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+
+    let labels = ClaimRepository::update_labels_conn(&mut tx, id, &body.add, &body.remove)
         .await
         .map_err(|e| match e {
             epigraph_db::DbError::NotFound { .. } => ApiError::NotFound {
@@ -1993,10 +2081,37 @@ pub async fn update_labels(
                 field: "add".to_string(),
                 reason,
             },
+            // 42501: the WITH CHECK refused the stamp chosen above, so no
+            // viewer this request may act under can write the owning group.
+            epigraph_db::DbError::QueryFailed { ref source }
+                if source
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .as_deref()
+                    == Some("42501") =>
+            {
+                tracing::warn!(
+                    target: "tenancy.scoped_write",
+                    handler = "update_labels",
+                    claim = %id,
+                    owner_group = %owner_group_id,
+                    error = %e,
+                    "the database refused the label write"
+                );
+                ApiError::Forbidden {
+                    reason: "no write authority over the group that owns this claim; \
+                             nothing was written"
+                        .to_string(),
+                }
+            }
             other => ApiError::DatabaseError {
                 message: other.to_string(),
             },
         })?;
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit transaction: {e}"),
+    })?;
 
     Ok(Json(UpdateLabelsResponse { id, labels }))
 }

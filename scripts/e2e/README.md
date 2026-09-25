@@ -220,6 +220,24 @@ maintenance gate exists for. The HTTP half of batch H (supersede and
 deprecate_workflow gate reads) is pinned by
 `crates/epigraph-api/tests/write_gate_reads_are_viewer_filtered.rs`, not here.
 
+### Measured: `PATCH /api/v1/claims/:id/labels` (`probe-http-labels.sh`)
+
+Base = the branch with only the handler hunk reverted, built in the same target
+dir. `label` = whether the label is on the row afterwards.
+
+| caller / row | A base | A tip | B base | B tip |
+|---|---|---|---|---|
+| owner / own public | **500 42501**, label=f | 200, label=t | 200, t | 200, t |
+| owner / own private | **404** (own row invisible to the unstamped UPDATE) | 200, t | 200, t | 200, t |
+| admin / another agent's public | **500 42501**, f | 200, t (author-stamped) | 200, t | 200, t |
+| admin / foreign group-private (unreadable) | 404, f | 404, f | **200, t (acts on a claim it cannot read)** | 404, f |
+| admin / world-owned public | 500 42501, f | 403, f | 200, t | 200, t |
+| peer / another agent's public | 403, f | 403, f | 403, f | 403, f |
+
+A mutation build with the admin author-stamp arm disabled turns "admin /
+another agent's public" on A into 403, label=f: the arm is what keeps a
+`claims:admin` relabel working once the orphan policies are gone.
+
 ## What this harness does not cover
 
 It exercises tools, not the repository layer, and apart from

@@ -553,7 +553,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 294;
+const HIGH_WATER: usize = 293;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -593,12 +593,14 @@ const HIGH_WATER: usize = 294;
 /// failure on the converted tree. Batch H6 took `routes/versioning.rs` 8 -> 7
 /// and `routes/workflows.rs` 24 -> 23 (the two write-path authorization reads
 /// moved onto `AppState::read_as`), so `HIGH_WATER` 296 -> 294 with both files
-/// keeping sites, read off the same failure (`left: 294, right: 296`).
+/// keeping sites, read off the same failure (`left: 294, right: 296`). Its
+/// `PATCH /claims/:id/labels` sibling took `routes/claims.rs` 21 -> 20, so
+/// `HIGH_WATER` 294 -> 293, the file keeping 20 sites.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 294 sites across 44 files as of this commit. Lower an entry when a shard
+/// 293 sites across 44 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -631,10 +633,15 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // site in that file, and it is the first decline in this series whose
     // blocker is the site and not the handler. The remaining NINETEEN sit in
     // write handlers — `create_claim` (9), `update_claim` (6), `patch_claim`
-    // (2), `update_labels` (2) — which with those two gates is 21, the row
-    // below. (An earlier draft of this comment said "seventeen" and did not
-    // close the arithmetic against the row it annotates.)
-    ("routes/claims.rs", 21),
+    // (2), `update_labels` (2) — which with those two gates is 21. (An earlier
+    // draft of this comment said "seventeen" and did not close the arithmetic
+    // against the row it annotates.) Batch H6 took `update_labels` 2 -> 1: its
+    // owner read moved onto `AppState::read_as` and its write onto
+    // `ScopedPool::begin_as`. The one site it keeps is the admin arm's
+    // `Viewer::resolve(&state.db_pool, author)`, a membership read through the
+    // SECURITY DEFINER `epigraph_live_memberships` — the same call
+    // `ViewerExtractor` makes on the same pool. 20, the row below.
+    ("routes/claims.rs", 20),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,

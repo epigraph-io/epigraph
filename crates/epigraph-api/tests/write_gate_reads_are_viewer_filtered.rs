@@ -28,6 +28,13 @@
 //! Created), and with `workflows.rs`'s change alone reverted it fails on the
 //! deprecate arm (200 OK).
 //!
+//! `PATCH /claims/:id/labels` is the sibling that held no `Viewer` at all. Its
+//! owner read now runs through the caller's viewer too (batch H6), so it has
+//! its own arm. This file only discriminates the 404 half. Whether the write
+//! lands under a non-bypassing role is measured by
+//! `scripts/e2e/probe-http-labels.sh` on config A: this database connects as a
+//! superuser, and `epigraph_bypass()` keys on `session_user`.
+//!
 //! Each arm is calibrated by the same call on a PUBLIC claim, which must
 //! succeed. Without that, a 404 could come from a broken fixture rather than
 //! from the filter.
@@ -87,6 +94,14 @@ async fn state_of(pool: &PgPool, id: Uuid) -> (bool, f64, bool, i64) {
     .fetch_one(pool)
     .await
     .expect("read claim state")
+}
+
+async fn labels_of(pool: &PgPool, id: Uuid) -> Vec<String> {
+    sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read claim labels")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -169,6 +184,38 @@ async fn a_principal_cannot_act_on_a_claim_it_cannot_read() {
                 "PATCH of a claim the caller cannot read must be 404, got {status}"
             );
             assert_eq!(after, before, "a refused PATCH must write nothing");
+        }
+
+        // ── PATCH /labels ──
+        let c = seed("wgr labels target", &[]).await;
+        let labels_before = labels_of(&pool, c).await;
+        let resp = http
+            .patch(format!("http://{addr}/api/v1/claims/{c}/labels"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"add": ["wgr-label"]}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let labels_after = labels_of(&pool, c).await;
+        if expect_ok {
+            assert_eq!(
+                status, 200,
+                "calibration ({visibility}): PATCH /labels must succeed"
+            );
+            assert!(
+                labels_after.contains(&"wgr-label".to_string()),
+                "calibration: the label must land, got {labels_after:?}"
+            );
+        } else {
+            assert_eq!(
+                status, 404,
+                "relabelling a claim the caller cannot read must be 404, got {status}"
+            );
+            assert_eq!(
+                labels_after, labels_before,
+                "a refused relabel must write nothing"
+            );
         }
 
         // ── deprecate_workflow ──

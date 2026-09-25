@@ -7847,6 +7847,49 @@ impl ClaimRepository {
             }),
         }
     }
+
+    /// The two facts a write gate decides on for one claim, read through
+    /// `viewer`: its author (`claims.agent_id`) and its owning group
+    /// (`claims.owner_group_id`).
+    ///
+    /// `None` when the claim does not exist OR the viewer cannot read it. The
+    /// two are deliberately indistinguishable, so a caller that answers `None`
+    /// with 404 leaks nothing about claims it cannot see.
+    ///
+    /// # Why the owning group is returned, not only the author
+    ///
+    /// Migration 077's `claims_tenancy` `WITH CHECK` admits an UPDATE only when
+    /// `owner_group_id = ANY(epigraph_writable_groups())`, so a write path has
+    /// to stamp its transaction from a viewer whose writable set holds THIS
+    /// group. The author and the owning group are not interchangeable:
+    /// `POST /api/v1/claims` owns a row by the authenticated principal's
+    /// personal group while taking `agent_id` from the request body. A gate
+    /// that chose its stamp from the author alone would refuse every such row.
+    ///
+    /// Read-only, and it mints nothing.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a database failure.
+    pub async fn write_target_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<(Uuid, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.agent_id, c.owner_group_id
+            FROM claims c
+            WHERE c.id = $1
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
 }
 
 #[cfg(test)]
