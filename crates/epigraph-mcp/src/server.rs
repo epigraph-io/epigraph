@@ -942,7 +942,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Atomically add and/or remove labels on an existing claim. Idempotent. Adding or removing the 'resolved' label requires claims:admin or ownership of the claim when the caller is authenticated (HTTP)."
+        description = "Atomically add and/or remove labels on an existing claim. Idempotent. Adding or removing the 'resolved' label requires ownership of the claim on EVERY transport: you authored it, or (stdio) you are an agent linked to the same operator as its author, or (HTTP) you are its author's operator; over HTTP a claims:admin token also passes. Anyone else is refused with nothing written. Every other label is ungated."
     )]
     async fn update_labels(
         &self,

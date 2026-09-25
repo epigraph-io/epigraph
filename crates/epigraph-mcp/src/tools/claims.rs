@@ -1805,8 +1805,8 @@ pub const JUSTIFIES_RELATIONSHIP: &str = "justifies";
 pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 
 /// Apply `resolve_backlog_item`'s ownership gate to a free-form label mutation,
-/// but ONLY when it touches [`RETIREMENT_LABEL`] and ONLY on a transport that
-/// carries an `AuthContext` (issue #374).
+/// but ONLY when it touches [`RETIREMENT_LABEL`] (issue #374). On EVERY
+/// transport since batch H-b.
 ///
 /// ## The asymmetry this closes
 ///
@@ -1827,30 +1827,27 @@ pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 /// Both directions are gated: *removing* `resolved` un-retires a claim, which is
 /// the same authority as retiring it.
 ///
-/// ## Why only the authenticated transport — and what stays open
+/// ## The stdio half (#374), closed in batch H-b
 ///
-/// `auth = None` means stdio, and stdio is NOT a trust boundary here: the
-/// process that spawned the server handed it `--database-url`, so it already
-/// holds unmediated write access to every row this gate protects (the same
-/// argument [`require_owner_or_admin`]'s doc comment makes for its own stdio
-/// arm). Gating it would also break a live, documented workflow rather than an
-/// abuse: `epiclaw-host`'s baked `release/epiclaw/CLAUDE.md` instructs every
-/// scheduled agent to retire cross-agent backlog items with exactly
-/// `update_labels(original_id, add=["resolved"])`, because `resolve_backlog_item`
-/// refuses them.
+/// This gate used to return `Ok` whenever `auth` was `None`, so any stdio
+/// caller could add `resolved` to a claim it did not own. It was left open
+/// because the sanctioned path was unreachable for the fleet: epiclaw's
+/// scheduled agents run with a DECLARED signer (`EPIGRAPH_AGENT_MODEL`,
+/// `main::select_signer` rung 1), and `require_owner_or_admin`'s stdio arm
+/// compared the claim's author against that one agent, so a model bump (a new
+/// identity) could not retire its predecessor's items at all. #503's operator
+/// arms are what make it reachable: agents linked to the same operator are
+/// co-owners, so a new identity may retire the items of every other agent
+/// under its operator. With that in place the stdio half takes the normal
+/// ownership rule — the author, an agent acting for the author's operator, or
+/// (per-process random signer only) the undeclared-signer arm. Everyone else
+/// is refused; an admin retiring across operators uses the audited admin path,
+/// which needs an authenticated `claims:admin` token (batch H-b, D2).
 ///
-/// That refusal is real and was **re-measured, not assumed**: the epiclaw
-/// agent-runner exports `EPIGRAPH_AGENT_MODEL` /
-/// `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` (`agent-runner/src/index.ts`,
-/// `agentIdentityEnv`), so `main::select_signer` takes rung 1 and
-/// `signer_identity_declared` is **true** for the fleet — the
-/// warn-and-allow `!signer_identity_declared` arm does not cover them. Gating
-/// stdio here would therefore leave those agents with no way to retire a
-/// backlog item at all.
-///
-/// So this closes the remotely-reachable half and leaves the local half as it
-/// was. The stdio bypass remains open by design until the sanctioned path is
-/// reachable for the fleet; issue #374 stays open for that half.
+/// The one population this newly refuses is a stdio agent retiring a claim by
+/// an agent it shares no operator with (unlinked fleet agents included): the
+/// `release/epiclaw/CLAUDE.md` procedure that relabels cross-agent items with
+/// `update_labels` now works only between agents linked to one operator.
 #[allow(clippy::too_many_arguments)]
 async fn gate_retirement_label(
     server: &EpiGraphMcpFull,
@@ -1869,9 +1866,6 @@ async fn gate_retirement_label(
     if !touches_retirement {
         return Ok(());
     }
-    let Some(auth) = auth else {
-        return Ok(());
-    };
 
     // Only fetched on the gated path, so the common label mutation keeps its
     // single round-trip. This also means a `resolved` mutation now reports
@@ -1896,7 +1890,7 @@ async fn gate_retirement_label(
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
-    require_owner_or_admin(server, Some(auth), caller, claim.agent_id.as_uuid())
+    require_owner_or_admin(server, auth, caller, claim.agent_id.as_uuid())
         .await
         .map(|_| ())
 }
@@ -2009,8 +2003,10 @@ pub async fn patch_claim(
     // who could merely READ a server-authored claim could rewrite its trace and
     // properties with the server's write authority (batch H-a review,
     // atomicity-authz). Only when `auth` is present: on stdio the caller IS the
-    // process that holds the DSN, and a cross-agent patch there is the
-    // #374 stdio half, left open by design (see `gate_retirement_label`).
+    // process that holds the DSN, and a cross-agent patch of trace/properties
+    // there stays ungated (batch H-b left stdio unchanged except for the
+    // retirement label, which `gate_retirement_label` below now gates on every
+    // transport, #374).
     if auth.is_some() {
         require_owner_or_admin(server, auth, caller, target.agent_id.as_uuid()).await?;
     }

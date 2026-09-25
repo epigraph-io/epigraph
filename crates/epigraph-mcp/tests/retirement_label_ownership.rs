@@ -17,12 +17,13 @@
 //! * every OTHER label is still ungated for a foreign principal — the gate is
 //!   scoped to the one label with retirement semantics, because cross-agent
 //!   taxonomy maintenance is legitimate and high-volume;
-//! * with `auth = None` (stdio) the mutation is still permitted. That carve-out
-//!   is deliberate and load-bearing: epiclaw's agent-runner exports
-//!   `EPIGRAPH_AGENT_MODEL`/`EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH`, so the fleet
-//!   runs with `signer_identity_declared = true` and CANNOT reach
-//!   `resolve_backlog_item` for a cross-agent claim; gating stdio would leave
-//!   those agents no way to retire a backlog item at all.
+//! * with `auth = None` (stdio) the same ownership rule applies since batch
+//!   H-b (#374's stdio half): the author, or an agent linked to the author's
+//!   operator (#503), or a per-process random signer (undecidable, allowed).
+//!   A declared stdio signer that shares no operator with the author is
+//!   refused. The old carve-out existed because a model-bumped fleet agent
+//!   could not reach its predecessor's items; #503's operator arms are what
+//!   reach them now.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -257,24 +258,105 @@ async fn update_labels_leaves_non_retirement_labels_ungated_for_a_foreign_princi
     assert!(!labels.contains(&"backlog".to_string()), "{labels:?}");
 }
 
-/// The stdio carve-out, pinned so it cannot be closed by accident. `auth =
-/// None` is the transport epiclaw's scheduled agents run on, and their
-/// documented retirement procedure is exactly this call. Closing it without
-/// first making `resolve_backlog_item` reachable for them would break the
-/// fleet, not an abuse.
+/// #374's stdio half, closed in batch H-b. A declared stdio signer (the fleet's
+/// shape: `EPIGRAPH_AGENT_MODEL`, `select_signer` rung 1) adding `resolved` to a
+/// claim by an agent it shares no operator with is REFUSED and writes nothing.
+/// This arm was `update_labels_still_permits_resolved_on_the_unauthenticated_stdio_path`,
+/// which pinned the opposite; it FAILS on the tree before the change (the gate
+/// returned `Ok` for `auth = None`).
 #[sqlx::test(migrations = "../../migrations")]
-async fn update_labels_still_permits_resolved_on_the_unauthenticated_stdio_path(pool: PgPool) {
-    let claim = seed_claim_with_labels(&pool, "epiclaw-retired item", &["backlog"]).await;
+async fn update_labels_refuses_resolved_on_a_foreign_claim_over_stdio(pool: PgPool) {
+    let claim = seed_claim_with_labels(&pool, "someone else's stdio item", &["backlog"]).await;
     let viewer = fixture::public_viewer(&pool).await;
-    // Scoped: these tools now write on author-stamped transactions, and a
-    // server with no `ScopedPool` refuses them by name rather than writing on
-    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
-    // UPDATE with 42501.
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
+    let err = stdio_retire(&server, &viewer, claim)
+        .await
+        .expect_err("a declared stdio signer must not retire a foreign agent's claim");
+    assert!(
+        err.message.contains("declared signer identity"),
+        "the refusal must be the ownership rule's: {}",
+        err.message
+    );
+    let labels = labels_of(&pool, claim).await;
+    assert!(!labels.contains(&"resolved".to_string()), "{labels:?}");
+}
+
+/// The stdio arms the normal ownership rule ADMITS: the server's own claim, and
+/// (#503) a claim by another agent linked to the same operator — the model-bump
+/// case the old carve-out existed for. The calibration for the refusal above.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_labels_admits_resolved_for_the_author_and_a_same_operator_sibling_over_stdio(
+    pool: PgPool,
+) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let me = server.server_agent_id().await.expect("server agent");
+
+    let mine = common::seed_claim_with_labels(&pool, "my own stdio item", &["backlog"]).await;
+    sqlx::query("UPDATE claims SET agent_id = $2 WHERE id = $1")
+        .bind(mine)
+        .bind(me)
+        .execute(&pool)
+        .await
+        .expect("author the claim as the server agent");
+    stdio_retire(&server, &viewer, mine)
+        .await
+        .expect("the author retires its own item over stdio");
+    assert!(labels_of(&pool, mine)
+        .await
+        .contains(&"resolved".to_string()));
+
+    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (sibling, _) = fixture::seed_agent_with_group(&pool, "sibling").await;
+    for agent in [me, sibling] {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, agent, operator)
+            .await
+            .expect("link on the privileged harness connection");
+    }
+    let theirs =
+        common::seed_claim_with_labels(&pool, "a sibling's stdio item", &["backlog"]).await;
+    sqlx::query("UPDATE claims SET agent_id = $2 WHERE id = $1")
+        .bind(theirs)
+        .bind(sibling)
+        .execute(&pool)
+        .await
+        .expect("author the claim as the sibling");
+    stdio_retire(&server, &viewer, theirs)
+        .await
+        .expect("an agent under the same operator retires its sibling's item over stdio");
+    assert!(labels_of(&pool, theirs)
+        .await
+        .contains(&"resolved".to_string()));
+}
+
+/// A per-process random signer keeps its pre-existing warn-and-allow arm: its
+/// ownership comparison is undecidable, not failed (`require_owner_or_admin`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undeclared_stdio_signer_may_still_retire(pool: PgPool) {
+    let claim = seed_claim_with_labels(&pool, "undeclared-signer item", &["backlog"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = common::build_scoped_test_server_generated_signer(
+        pool.clone(),
+        fixture::scoped_pool(&pool).await,
+    );
+    stdio_retire(&server, &viewer, claim)
+        .await
+        .expect("an undeclared signer's comparison is undecidable, so it is allowed");
+    assert!(labels_of(&pool, claim)
+        .await
+        .contains(&"resolved".to_string()));
+}
+
+async fn stdio_retire(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim: Uuid,
+) -> Result<rmcp::model::CallToolResult, epigraph_mcp::errors::McpError> {
     epigraph_mcp::tools::claims::update_labels(
-        &server,
-        &viewer,
+        server,
+        viewer,
         UpdateLabelsParams {
             claim_id: claim.to_string(),
             add: vec!["resolved".into()],
@@ -283,10 +365,6 @@ async fn update_labels_still_permits_resolved_on_the_unauthenticated_stdio_path(
         None,
     )
     .await
-    .expect("stdio retirement must keep working until the sanctioned path is reachable");
-
-    let labels = labels_of(&pool, claim).await;
-    assert!(labels.contains(&"resolved".to_string()), "{labels:?}");
 }
 
 /// Batch H-a review (atomicity-authz): on the authenticated transport the WHOLE

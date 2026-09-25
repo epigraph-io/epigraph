@@ -42,16 +42,17 @@ Do NOT:
   that bypasses the canonical resolution-claim trail.
 
 **Enforcement (issue #374).** `resolved` is the one label with retirement
-semantics, so `update_labels` and `patch_claim` now apply
-`resolve_backlog_item`'s `require_owner_or_admin` check when a call adds or
-removes it — but only when the caller is authenticated (HTTP). Every other
-label stays ungated, and the unauthenticated **stdio** path stays ungated too:
-epiclaw's scheduled agents run with a declared signer identity
-(`EPIGRAPH_AGENT_MODEL`), cannot satisfy `resolve_backlog_item` for a
-cross-agent claim, and `release/epiclaw/CLAUDE.md` documents this call as their
-retirement procedure. Closing that half requires making the sanctioned path
-reachable for them first; until then the guidance above is a convention on
-stdio and an enforced rule over HTTP.
+semantics, so `update_labels` and `patch_claim` apply `resolve_backlog_item`'s
+`require_owner_or_admin` check when a call adds or removes it, on EVERY
+transport (the stdio half closed in batch H-b). Ownership is the claim's
+author, or an agent linked to the same operator as the author (stdio;
+migration 107's operator arms, which is what makes a model-bumped fleet agent
+able to retire its predecessor's items), or the author's operator (HTTP).
+Over HTTP a `claims:admin` token also passes; its write into a group the admin
+cannot write goes through the audited admin path (batch H-b, D2). Every other
+label stays ungated. A stdio agent that shares no operator with the claim's
+author is now refused, including through `release/epiclaw/CLAUDE.md`'s
+`update_labels(original_id, add=["resolved"])` procedure.
 
 **Querying open backlog:**
 
