@@ -82,10 +82,10 @@ precisely why production admits writes a clean schema refuses.
 | `probe-embed.sh <binary> <label> <a\|b>` | The `McpEmbedder::embed_and_store` callers that embed **executor-authored** claims (`store_workflow`, `add_step`) — the arms that distinguish *stamped* from *stamped from the right author*. |
 | `probe-workflow.sh <binary> <label> <a\|b\|b2a>` | `deprecate_workflow` and `report_workflow_outcome` on their own populations, hierarchical **and** legacy-flat, in both ownership shapes. |
 | `probe-unit-e.sh <binary> <label> <a\|b>` | The R3 gate's remaining tools: `ingest_workflow` (with level-3 atoms), `improve_workflow_hierarchy`, `delete_step`, `link_epistemic`'s belief wiring, `consolidate_claims` (own and foreign sources), `ingest_document_inline` (fresh, re-ingest, converged-foreign-atom) and `ingest_document_spine`, plus the authority arms: the synchronous ingest PREFLIGHT, and a REVOKED / READER ingest-system membership that must not be revived or promoted. Also the REGISTER arm the residual-register reasons cite, and the REVIEW arms: plan order under one transaction (`report_workflow_outcome` attribution), a SECOND `store_workflow` without truncating, transactional event timestamps, a hidden axis frame inside the DS transaction, and a server agent revoked in its PERSONAL group but live in a team group (warm session, fresh MCP session, and a restarted process — each asserted PASS/FAIL: refused, still revoked, +0 claims). Batch F adds the RECALL arm (#493): a recall by a revoked principal must leave it revoked, and a live member's recall must still answer. |
-| `probe-batch-h.sh <binary> <label> <a\|b> [arm ...]` | The arms that need **group-private** rows, which no other script seeds: `patch_claim`, the five edge tools, `resolve_backlog_item` (public and private basis, plus an injected mid-call refusal), `submit_claim`'s DS wiring (plus an injected BBA refusal), `supersede_claim`, `theme_cluster` (all-or-nothing, with a pre-existing theme), and the three maintenance tools under four server configurations (`MAINTENANCE_DATABASE_URL` unset, set to the app login, set to `E2E_MAINT_DSN`, and unset with a bypass-capable APPLICATION DSN), plus `maint_auth`: the same tools over authenticated HTTP (`--jwt-secret`, secret random per run) with a `claims:write` and a `claims:admin` bearer. Every case runs on an OWN-group row, which a correctly stamped write must land, and a FOREIGN-group row, which must fail loudly and write nothing on config A. Needs `jq`. |
-| `probe-http-labels.sh <server binary> <label> <a\|b>` | **HTTP**: `PATCH /api/v1/claims/:id/labels` on the real `epigraph-api` `server` binary, connected as `E2E_APP_DSN`, with HS256 tokens minted per run under a random secret. Callers OWNER / ADMIN (`claims:admin`) / PEER / RADMIN (`claims:admin`, a READER of the team group) against own-public, own-private, another agent's public, foreign-private, world-owned and team rows. Prints the status and whether the label is on the row, read back through the SU DSN. Needs `python3`. |
+| `probe-batch-h.sh <binary> <label> <a\|b> [arm ...]` | The arms that need **group-private** rows, which no other script seeds: `patch_claim`, the five edge tools, `resolve_backlog_item` (public and private basis, plus an injected mid-call refusal), `submit_claim`'s DS wiring (plus an injected BBA refusal), `supersede_claim`, `theme_cluster` (all-or-nothing, with a pre-existing theme), and the three maintenance tools under four server configurations (`MAINTENANCE_DATABASE_URL` unset, set to the app login, set to `E2E_MAINT_DSN`, and unset with a bypass-capable APPLICATION DSN), plus `maint_auth`: the same tools over authenticated HTTP (`--jwt-secret`, secret random per run) with a `claims:write` and a `claims:admin` bearer; `caller_auth` (batch H-b): a caller that is not the server's signer authors, owns and signs its own claims, writes its own and is refused a foreign one, and a `claims:admin` bearer with a live client grant writes a foreign one through the AUDITED ADMIN PATH (audit row, admin as principal) while one without the grant is refused; and `op_http`: the operator's bearer on its linked agent's claims. Every case runs on an OWN-group row, which a correctly stamped write must land, and a FOREIGN-group row, which must fail loudly and write nothing on config A. Needs `jq`. |
+| `probe-http-labels.sh <server binary> <label> <a\|b>` | **HTTP**: `PATCH /api/v1/claims/:id/labels` on the real `epigraph-api` `server` binary, connected as `E2E_APP_DSN`, with HS256 tokens minted per run under a random secret. Callers OWNER / ADMIN (`claims:admin`) / PEER / RADMIN (`claims:admin`, a READER of the team group) / NOGRANT (`claims:admin` in the token, no client grant) against own-public, own-private, another agent's public, foreign-private, world-owned and team rows. Prints the status, whether the label is on the row and the claim's `claims.admin_write` audit count, read back through the SU DSN. ADMIN and RADMIN carry an `oauth_clients` grant, which the audited admin path re-checks. Needs `python3`. |
 | `probe-http-writes.sh <server binary> <label> <a\|b> [arm ...]` | **HTTP**: the claim writers batch H-a stamped — `supersede`, `DELETE /workflows/:id` and `/workflows/:id/outcome` on legacy flat workflow claims, `bp/propagate` with `apply_updates`, `themes/create-with-centroid` — for an owner, an admin and a peer, printing the status AND the rows read back (is_current, truth, counters, executions, BetP, themes). Needs `python3`. |
-| `probe-operator.sh <binary> <label> <a\|b>` | The stdio operator self-link's two REFUSALS through the real binary (migrations 105 + 107): `--operator-id` on the least-privilege DSN must exit non-zero with the EXECUTE-grant text and write no link or membership (OP-APP); an operator whose own personal-group row is only revoked must refuse with `RVK01` and stay revoked (OP-RVK01); a live operator on the same DSN must link (OP-LIVE, the calibration). The transport refusal, the HTTP listener's linked-signer refusal and the no-revival restart are `operator_startup_gate_test.rs`'s. OP-RVK01 and OP-LIVE run the server on `E2E_SU_DSN`, because the link function is EXECUTE-able by a maintenance or superuser login only. |
+| `probe-operator.sh <binary> <label> <a\|b>` | OP-AUTHOR (batch H-b): an agent linked on the SU DSN and restarted on the APP DSN authors a stdio `submit_claim` owned by its operator's group, DS-wired and embedded. Every model carries a per-run nonce (agents and links survive TRUNCATE). And the stdio operator self-link's two REFUSALS through the real binary (migrations 105 + 107): `--operator-id` on the least-privilege DSN must exit non-zero with the EXECUTE-grant text and write no link or membership (OP-APP); an operator whose own personal-group row is only revoked must refuse with `RVK01` and stay revoked (OP-RVK01); a live operator on the same DSN must link (OP-LIVE, the calibration). The transport refusal, the HTTP listener's linked-signer refusal and the no-revival restart are `operator_startup_gate_test.rs`'s. OP-RVK01 and OP-LIVE run the server on `E2E_SU_DSN`, because the link function is EXECUTE-able by a maintenance or superuser login only. |
 | `embed-verdict.sh` | How many committed claims carry a vector. |
 | `drive.sh <binary> <label> <a\|b>` | `set-config` + `run-e2e` + the embedding verdict, in one call. |
 | `set-config.sh a\|b` | Switches the schema configuration. Reads `helper.sql` and `fn2.sql`. |
@@ -255,6 +255,60 @@ written. Config B is unchanged except where a row is marked as a tightening
 bearer on the maintenance tools) or an improvement (supersede now records its
 version row, which the unstamped INSERT never did on either config).
 
+## Measured: batch H-b (cross-agent authority) at its tip
+
+Binaries: `TIP` is this branch; `BASE` is `origin/main` at `e507a1fc` (#505 on
+#503), built from the same worktree by checking the crates out at that ref.
+Database: `epigraph_*_test` on the test cluster, migrated `001 -> 111`, the
+server on a login in `epigraph_app` (`rolbypassrls = false`), `E2E_MAINT_DSN` a
+login in `epigraph_maintenance`. "Caller" is an agent that is NOT the server's
+signer. Every figure below is the database's, read back through the SU DSN.
+
+### MCP over authenticated HTTP (`probe-batch-h.sh caller_auth op_http`)
+
+| case | A BASE | A TIP | B TIP |
+|---|---|---|---|
+| caller `submit_claim`: author / owner / signer | **SERVER / server's group / none** | CALLER / caller's group / SERVER | same as A |
+| `verify_claim` on it | **signed=false, signature_valid=false** | signed=true, signature_valid=true, hash match | same |
+| caller `patch_claim` / `update_labels +resolved`, its OWN claim | **ERR (gate: principal is not the author), 0 rows** | OK, patched / labelled | OK |
+| caller `patch_claim` / `update_labels +resolved`, a FOREIGN claim | ERR, 0 | ERR (not the author, not its operator, no admin), 0 | ERR, 0 |
+| caller `update_labels` foreign, a non-retirement label | ERR 42501, 0 | ERR 42501, 0 | OK (orphan policy) |
+| admin (live grant on its client record) `update_labels` / `patch_claim`, foreign public | **ERR 42501, 0 rows, no audit** | OK `admin_path=true`, written, 1 audit row each, principal = ADMIN, author recorded as target | same |
+| admin, foreign PRIVATE it cannot read | ERR not found | ERR not found | ERR not found |
+| admin token whose `sub` grants nothing | ERR 42501 | ERR `ADM02`, 0 rows, 0 audit rows | same |
+| operator's `claims:write` bearer on its linked agent's claims: `patch_claim` / `update_labels +resolved` / `resolve_backlog_item` | **ERR 42501 x3, 0 rows** (gate admitted, stamp was the server's) | OK x3, written; the resolution is authored by the OPERATOR | OK x3 |
+
+### stdio operator authoring (`probe-operator.sh`, OP-AUTHOR)
+
+An agent linked on the SU DSN, restarted on the APP DSN without
+`--operator-id`: `submit_claim` is authored by the agent, OWNED by the
+operator's personal group, DS-wired (1 BBA) and embedded, on A and on B. OP-APP,
+OP-RVK01 and OP-LIVE PASS on both, with a per-run nonce in every model so a
+re-run with the same label no longer re-derives an already-linked agent.
+
+### HTTP `PATCH /api/v1/claims/:id/labels` (`probe-http-labels.sh`, real `server`)
+
+| caller / row | A at #505 (README table above) | A TIP | B TIP |
+|---|---|---|---|
+| owner own public / own private | 200 / 200 | 200 / 200, no audit | same |
+| admin other agent's public | 403 | 200 via the audited path, 1 audit row | same |
+| admin foreign unreadable | 404 | 404 | 404 |
+| admin world-owned | 403 | 200 via the audited path, 1 audit row | same |
+| READER-member admin, team private / public | 403 / 403 | 200 / 200 via the audited path: the ADMIN is the recorded principal, not the author | same |
+| peer other's public | 403 | 403, 0 rows | 403 |
+| admin token with no client grant | n/a | 403 ("the audited admin path refused this token"), 0 rows | same |
+
+### What moved on config B, stated
+
+* **Tightening.** On the `--allow-unauthenticated-http` listener the injected
+  context carries `claims:admin` with a NIL `client_id`, so a cross-group write
+  there now takes the admin path and is refused `ADM02`
+  (`patch_claim foreign_pub`: was OK through the orphan policy, now ERR, 0
+  rows). An unauthenticated socket has no admin principal to audit.
+* Every other row of the H-a tables above is unchanged on both configs
+  (the `patch_claim foreign_pub` message on A changed from a bare 42501 to the
+  admin path's refusal; both write nothing).
+
 ## R3 checklist: what still blocks dropping the orphan policies
 
 This branch closes the write paths above. It does **not** make the whole write
@@ -263,15 +317,24 @@ surface ready for R3. Each item below was measured by the batch H-a review (the
 decision or conversion before the operator drops `claims_privacy`,
 `evidence_privacy` and `edges_privacy`.
 
-1. **Authenticated MCP stamps from the SERVER agent, not the caller.** Over HTTP
-   MCP (`--jwt-secret`), `patch_claim` and `update_labels` on the caller's OWN
-   claims are refused on A and admitted on B, and `submit_claim` by a caller
-   writes a claim owned by the server agent. Every committed MCP probe runs
-   unauthenticated (caller == server agent) and cannot see this. It needs a
-   decision: the caller's viewer when auth is present, the server agent on
-   stdio. That is the H-b cross-agent authority cluster's, so this branch does
-   not make it. `probe-batch-h.sh maint_auth` is the committed authenticated
-   arm to extend.
+1. **CLOSED by batch H-b: authenticated MCP stamped from the SERVER agent, not
+   the caller.** Every MCP write now authors and stamps as
+   `EpiGraphMcpFull::write_identity(auth, viewer)` (the caller over HTTP, the
+   server agent on stdio), measured by `probe-batch-h.sh caller_auth` above.
+   Two rows that belong to it, also closed and measured there:
+   - **The HTTP operator arm.** An HTTP MCP server on the app DSN with an
+     unrelated signer, and the OPERATOR's `claims:write` bearer acting on public
+     claims authored by its linked agent: `patch_claim`, `update_labels
+     +resolved` and `resolve_backlog_item` all passed `require_owner_or_admin`
+     through #503's operator arm and then failed 42501 on A with nothing
+     written, because the transaction was stamped from the server agent; on B
+     they succeeded only through the orphan policy. Now OK on both
+     (`probe-batch-h.sh op_http`).
+   - **`claims:admin` into a group the admin cannot write.** Refused on A,
+     admitted on B only by the orphan policy. Now the audited admin path
+     (migration 111) on both surfaces, with the admin recorded as principal and
+     a `security_events` row. Supersede is deliberately NOT on that path: an
+     admin supersede into a group it cannot write stays refused on A.
 2. **HTTP writes still on the unstamped pool** (A refuses the owner, B admits):
    - `POST /api/v1/claims` and `POST /claims`: opaque 500;
    - `PUT` and `PATCH /api/v1/claims/:id`: 500 42501 on own public, 404 on own
@@ -301,15 +364,26 @@ decision or conversion before the operator drops `claims_privacy`,
      (84b2a98d).
    - `refresh_workflow_promotion`'s `merge_properties`: same population, same H3
      question. Its A behaviour is inferred, not measured.
-   - `mark_duplicate`: own private "not found", foreign public 42501. Its write
-     IS the retraction cascade, which is the recorded cross-group authority
-     question.
+   - `mark_duplicate`: CONVERTED in batch H-b (gate read, dedup and cascade on
+     one caller-stamped transaction); both retraction cascades are stamped from
+     the caller with a savepoint per edge and per target, so a downstream claim
+     the caller cannot write fails alone and is reported in
+     `belief_cascade.errors`.
    - `consolidate_claims` with a foreign public source: 42501. Authority-correct.
    - `report_workflow_outcome` / `deprecate_workflow` on FOREIGN-owned legacy flat
      claims: 42501. Authority-correct.
    - `theme_cluster`: atomic now, but a corpus-wide job with no author stamp that
      covers it, so it fails loudly on A. It needs a maintenance path that config B
      does not lose.
+4a. **A real `epigraph_maintenance` login cannot write `factors`.** MEASURED in
+   batch H-b with `E2E_MAINT_DSN` a login role in `epigraph_maintenance` (every
+   earlier run defaulted it to the superuser DSN): `sweep_semantic_duplicates`
+   over authenticated HTTP lists the pair and then fails every merge with
+   `permission denied for table factors`, identically on `BASE` and `TIP`.
+   Migration 070 grants the role `SELECT, INSERT, UPDATE ON ALL TABLES` as of
+   070, and says a later table must re-issue the grant; `factors` did not. A
+   deployment whose `MAINTENANCE_DATABASE_URL` is a non-superuser maintenance
+   login has a dedup sweep that retires nothing.
 5. **Pre-existing failures on BOTH configurations** (base == tip on B, so not
    regressions, but several leave partial state on B, which is production):
    - `POST /api/v1/hypothesis`: B 500 "hypothesis_assessment frame not found",

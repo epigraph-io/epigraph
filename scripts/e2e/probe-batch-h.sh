@@ -30,6 +30,17 @@
 #                 random per-run secret that is never written to disk): a
 #                 claims:write-only bearer with no membership must be refused
 #                 before the tool body runs; a claims:admin bearer is admitted
+#   caller_auth   batch H-b over AUTHENTICATED HTTP, with a caller that is NOT
+#                 the server's signer: submit_claim is authored, owned and
+#                 signed as D1 says (verify_claim valid), the caller's own
+#                 patch_claim / update_labels land, a foreign claim is refused;
+#                 a claims:admin bearer whose client record grants it relabels
+#                 and patches a foreign claim through the AUDITED ADMIN PATH
+#                 (migration 111: admin recorded, security_events row); an
+#                 admin bearer with no such grant is refused, nothing written
+#   op_http       #503's operator arm over AUTHENTICATED HTTP: the operator's
+#                 claims:write bearer patches, relabels and resolves its linked
+#                 agent's claims (owned by the operator's group) on the APP DSN
 #
 # WHY THIS PROBE EXISTS. Every other arm in this directory seeds its claims
 # through submit_claim, and submit_claim writes PUBLIC claims. An edge between
@@ -78,7 +89,7 @@ BIN="${1:?usage: probe-batch-h.sh <binary> <label> <a|b> [arm ...]}"
 LABEL="${2:?label}"
 CFG="${3:?a|b}"
 shift 3
-ARMS="${*:-patch_claim edges resolve submit_ds supersede theme maintenance maint_auth}"
+ARMS="${*:-patch_claim edges resolve submit_ds supersede theme maintenance maint_auth caller_auth op_http}"
 command -v jq >/dev/null || { echo "probe-batch-h.sh needs jq to read tool responses" >&2; exit 2; }
 E2E="$(cd "$(dirname "$0")" && pwd)"
 SOCK="$E2E/bh.sock.$LABEL"
@@ -454,6 +465,131 @@ PY
     R=$(tool backfill_embeddings '{"limit":1,"dry_run":true}')
     echo "   backfill_embeddings dry_run: $(verdict "$R")"
   done
+  stop_server
+  BEARER=""
+  JWT_SECRET=""
+fi
+
+# ── caller_auth: batch H-b D1 + D2 over AUTHENTICATED HTTP ─────────────────
+# The transport batch H-b changes. Every arm above runs unauthenticated, where
+# the caller IS the server agent, so a write stamped from the wrong agent is
+# invisible there. Here the server's signer (MA) is NOT the caller: a
+# claims:write bearer for agent CA (own personal group CG) and a claims:admin
+# bearer for agent AD whose token `sub` is an oauth_clients row granting it
+# claims:admin (migration 111 re-checks exactly that record).
+# `mint_as <sub> <agent> <scopes>`: HS256 with this run's secret.
+mint_as() {
+  SECRET="$JWT_SECRET" python3 - "$1" "$2" "$3" <<'PY'
+import base64, hashlib, hmac, json, os, sys, time, uuid
+sub, agent, scopes = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+now = int(time.time()) - 2
+claims = {"sub": sub, "iss": "epigraph", "aud": "epigraph-api", "exp": now + 3600,
+          "iat": now, "nbf": now, "jti": str(uuid.uuid4()), "scopes": scopes,
+          "client_type": "human", "owner_id": sub, "agent_id": agent}
+head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+body = b64(json.dumps(claims).encode())
+sig = hmac.new(os.environ["SECRET"].encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
+print(f"{head}.{body}.{b64(sig)}")
+PY
+}
+# A fresh agent with its personal group, minted through 105's definer.
+new_agent() {
+  local id
+  id=$(q "INSERT INTO agents (public_key, display_name) VALUES (decode(md5(random()::text)||md5(random()::text),'hex'), 'batch-h-b $1 $LABEL') RETURNING id" | head -1)
+  q "SELECT public.epigraph_ensure_personal_group('$id')" >/dev/null
+  printf '%s' "$id"
+}
+personal_group() { q "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:$1'"; }
+admin_audits() { q "SELECT count(*) FROM security_events WHERE event_type='claims.admin_write' AND agent_id='$1'"; }
+
+if want caller_auth; then
+  echo
+  echo "=== caller_auth: authenticated MCP writes carry the CALLER's authority (D1) and the audited admin path (D2) ==="
+  JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  CA=$(new_agent caller); CG=$(personal_group "$CA")
+  AD=$(new_agent admin);  AG=$(personal_group "$AD")
+  ADC=$(q "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, granted_scopes, status, agent_id)
+          VALUES (gen_random_uuid(), 'bh-admin-'||gen_random_uuid(), 'batch-h-b admin', 'human',
+                  ARRAY['claims:read','claims:write','claims:admin'], ARRAY['claims:read','claims:write','claims:admin'], 'active', '$AD') RETURNING id" | head -1)
+  echo "### caller=$CA ($CG) admin=$AD ($AG, client $ADC) server signer=$MA foreign=$FA ($FG)"
+  C_AUTH_FOR=$(seed "Batch H-b foreign public $LABEL" public "$FG" "$FA" "ARRAY['backlog']::text[]")
+  C_AUTH_FOR2=$(seed "Batch H-b foreign public two $LABEL" public "$FG" "$FA" "ARRAY['backlog']::text[]")
+
+  stop_server
+  BEARER="$(mint_as "$(q "SELECT gen_random_uuid()")" "$CA" claims:read,claims:write)"
+  start_server auth
+  echo "--- claims:write bearer for the caller (expect A and B: authored+owned by the caller; own writes OK; foreign refused)"
+  R=$(tool submit_claim "{\"content\":\"Batch H-b caller claim $LABEL\",\"methodology\":\"extraction\",\"evidence_data\":\"probe\",\"evidence_type\":\"empirical\",\"confidence\":0.7,\"novelty_threshold\":0.0}")
+  CC=$(field "$R" claim_id)
+  echo "   submit_claim: $(verdict "$R") | author=$(q "SELECT CASE agent_id WHEN '$CA' THEN 'CALLER' WHEN '$MA' THEN 'SERVER' ELSE agent_id::text END FROM claims WHERE id='$CC'") owner=$(q "SELECT CASE owner_group_id WHEN '$CG' THEN 'CALLER-GROUP' ELSE owner_group_id::text END FROM claims WHERE id='$CC'") signer=$(q "SELECT CASE signer_id WHEN '$MA' THEN 'SERVER' ELSE COALESCE(signer_id::text,'none') END FROM claims WHERE id='$CC'") bbas=$(q "SELECT count(*) FROM mass_functions WHERE claim_id='$CC'")"
+  R=$(tool verify_claim "{\"claim_id\":\"$CC\"}")
+  echo "   verify_claim: $(verdict "$R") signed=$(field "$R" signed) signature_valid=$(field "$R" signature_valid) hash_check=$(field "$R" hash_check)"
+  R=$(tool patch_claim "{\"claim_id\":\"$CC\",\"properties\":{\"bhb\":1}}")
+  echo "   patch_claim own: $(verdict "$R") | patched=$(q "SELECT count(*) FROM claims WHERE id='$CC' AND properties ? 'bhb'")"
+  R=$(tool update_labels "{\"claim_id\":\"$CC\",\"add\":[\"resolved\"]}")
+  echo "   update_labels own +resolved: $(verdict "$R") admin_path=$(field "$R" admin_path) | labelled=$(q "SELECT count(*) FROM claims WHERE id='$CC' AND 'resolved'=ANY(labels)")"
+  R=$(tool patch_claim "{\"claim_id\":\"$C_AUTH_FOR\",\"properties\":{\"bhb\":1}}")
+  echo "   patch_claim foreign: $(verdict "$R") | patched=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND properties ? 'bhb'")"
+  R=$(tool update_labels "{\"claim_id\":\"$C_AUTH_FOR\",\"add\":[\"resolved\"]}")
+  echo "   update_labels foreign +resolved: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND 'resolved'=ANY(labels)")"
+  R=$(tool update_labels "{\"claim_id\":\"$C_AUTH_FOR\",\"add\":[\"bhb-free\"]}")
+  echo "   update_labels foreign +free label (A: ERR 42501, B: OK orphan policy): $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND 'bhb-free'=ANY(labels)")"
+  echo "   non-admin audit rows: $(admin_audits "$CA")"
+
+  stop_server
+  BEARER="$(mint_as "$ADC" "$AD" claims:read,claims:write,claims:admin)"
+  start_server auth
+  echo "--- claims:admin bearer, a live grant on its client record (expect A and B: foreign relabel OK through the audited path, admin recorded)"
+  BEFORE=$(admin_audits "$AD")
+  R=$(tool update_labels "{\"claim_id\":\"$C_AUTH_FOR\",\"add\":[\"resolved\"]}")
+  echo "   update_labels foreign +resolved: $(verdict "$R") admin_path=$(field "$R" admin_path) | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND 'resolved'=ANY(labels)") audit $BEFORE->$(admin_audits "$AD") principal=$(q "SELECT CASE details->>'admin_agent_id' WHEN '$AD' THEN 'ADMIN' ELSE details->>'admin_agent_id' END FROM security_events WHERE event_type='claims.admin_write' AND agent_id='$AD' ORDER BY created_at DESC LIMIT 1") author_recorded_as=$(q "SELECT CASE details->>'claim_author' WHEN '$FA' THEN 'TARGET-AUTHOR' ELSE details->>'claim_author' END FROM security_events WHERE event_type='claims.admin_write' AND agent_id='$AD' ORDER BY created_at DESC LIMIT 1")"
+  R=$(tool patch_claim "{\"claim_id\":\"$C_AUTH_FOR2\",\"properties\":{\"bhb_admin\":1},\"remove_labels\":[\"backlog\"]}")
+  echo "   patch_claim foreign: $(verdict "$R") admin_path=$(field "$R" admin_path) | patched=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR2' AND properties ? 'bhb_admin' AND NOT ('backlog'=ANY(labels))") audit=$(admin_audits "$AD")"
+  R=$(tool update_labels "{\"claim_id\":\"$C_FOR_PRIV2\",\"add\":[\"resolved\"]}")
+  echo "   update_labels foreign PRIVATE (unreadable): $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_FOR_PRIV2' AND 'resolved'=ANY(labels)")"
+
+  stop_server
+  BEARER="$(mint_as "$(q "SELECT gen_random_uuid()")" "$AD" claims:read,claims:write,claims:admin)"
+  start_server auth
+  echo "--- claims:admin bearer whose sub is NOT a client record granting it (expect: refused, nothing written, no audit row)"
+  BEFORE=$(admin_audits "$AD")
+  q "UPDATE claims SET labels = ARRAY['backlog'] WHERE id='$C_AUTH_FOR'" >/dev/null
+  R=$(tool update_labels "{\"claim_id\":\"$C_AUTH_FOR\",\"add\":[\"resolved\"]}")
+  echo "   update_labels foreign +resolved: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND 'resolved'=ANY(labels)") audit $BEFORE->$(admin_audits "$AD")"
+  stop_server
+  BEARER=""
+  JWT_SECRET=""
+fi
+
+# ── op_http: #503's operator arm over AUTHENTICATED HTTP (merge report) ─────
+# An HTTP MCP server on the APP DSN whose signer (MA) is unrelated to the
+# operator, and a claims:read,claims:write bearer for the OPERATOR acting on
+# public claims authored by its linked agent and owned by the operator's
+# personal group (where #503 puts an operated agent's claims). Before batch H-b
+# every call passed require_owner_or_admin's operator arm and then failed 42501
+# on A with nothing written: the transaction was stamped from MA.
+if want op_http; then
+  echo
+  echo "=== op_http: the operator's bearer on its linked agent's claims (expect A and B: OK, written) ==="
+  JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  OP=$(new_agent operator); OPG=$(personal_group "$OP")
+  LA=$(new_agent linked)
+  q "SELECT public.epigraph_link_operator('$LA', '$OP')" >/dev/null
+  echo "### operator=$OP ($OPG) linked=$LA link=$(q "SELECT count(*) FROM operator_links WHERE agent_id='$LA' AND operator_id='$OP'")"
+  L1=$(seed "Batch H-b operated claim one $LABEL" public "$OPG" "$LA" "ARRAY['backlog']::text[]")
+  L2=$(seed "Batch H-b operated claim two $LABEL" public "$OPG" "$LA" "ARRAY['backlog']::text[]")
+  L3=$(seed "Batch H-b operated claim three $LABEL" public "$OPG" "$LA" "ARRAY['backlog']::text[]")
+  stop_server
+  BEARER="$(mint_as "$(q "SELECT gen_random_uuid()")" "$OP" claims:read,claims:write)"
+  start_server auth
+  R=$(tool patch_claim "{\"claim_id\":\"$L1\",\"properties\":{\"bhb_op\":1}}")
+  echo "   patch_claim: $(verdict "$R") | patched=$(q "SELECT count(*) FROM claims WHERE id='$L1' AND properties ? 'bhb_op'")"
+  R=$(tool update_labels "{\"claim_id\":\"$L2\",\"add\":[\"resolved\"]}")
+  echo "   update_labels +resolved: $(verdict "$R") admin_path=$(field "$R" admin_path) | labelled=$(q "SELECT count(*) FROM claims WHERE id='$L2' AND 'resolved'=ANY(labels)")"
+  R=$(tool resolve_backlog_item "{\"original_id\":\"$L3\",\"resolution_content\":\"retired by the operator over HTTP\"}")
+  RES=$(field "$R" resolution_claim_id)
+  echo "   resolve_backlog_item: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$L3' AND 'resolved'=ANY(labels)") resolution_author=$(q "SELECT CASE agent_id WHEN '$OP' THEN 'OPERATOR' WHEN '$MA' THEN 'SERVER' ELSE agent_id::text END FROM claims WHERE id='${RES:-00000000-0000-0000-0000-000000000000}'")"
   stop_server
   BEARER=""
   JWT_SECRET=""

@@ -3,7 +3,8 @@
 # path must be measured on. Written 2026-09-23; run-e2e.sh has referenced this
 # file since it was authored, but it did not exist on disk.
 #
-#   CONFIG A  the clean public migration series (001 -> 101), nothing else.
+#   CONFIG A  the clean public migration series (001 -> head, 111 at batch H-b),
+#             nothing else.
 #   CONFIG B  A + the three orphan PERMISSIVE *_privacy policies and the two
 #             helper functions they call, replayed verbatim from production
 #             (captured from the live definitions with pg_get_expr).

@@ -29,3 +29,4 @@ bhh.*
 .hl.*
 .oplock.*
 op.*.err
+op.*.out
