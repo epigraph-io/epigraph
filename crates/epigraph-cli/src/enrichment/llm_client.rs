@@ -140,6 +140,14 @@ impl LlmProvider for MockLlmClient {
 /// Deterministic [`LlmProvider`] that answers a `decompose_claims` batch prompt
 /// from a caller-supplied fixture file instead of calling a model.
 ///
+/// It answers a `decompose_claims --retarget` prompt the same way: that prompt
+/// renders each item as one `[<idx>] <source claim>` line (see
+/// `epigraph_cli::retarget::build_retarget_prompt`), so a fixture keyed by the
+/// SOURCE claim's text, whose value is the retarget answer (`{"atoms": [1]}`,
+/// `"whole"`, `"unclear"`, or anything malformed), drives the retarget pass.
+/// [`Self::call_count`] counts every call, which is how a test proves a path
+/// made no model call at all.
+///
 /// Motivation: `MockLlmClient` has an empty response vec, so `complete_json`
 /// returns `[]`, `decompose::parse_batch_response` yields nothing, and
 /// `persist_decomposition` is never reached — the atom/edge write path is
@@ -186,6 +194,10 @@ impl LlmProvider for MockLlmClient {
 pub struct FixtureLlmClient {
     /// Claim text -> the decomposition object for that claim.
     by_claim_text: std::collections::HashMap<String, serde_json::Value>,
+    /// Number of `complete_json` calls answered so far (including ones that
+    /// errored). Lets a test prove a path made NO model call — the property
+    /// `--apply-plan` and a re-run of `--retarget` both promise.
+    calls: std::sync::atomic::AtomicUsize,
 }
 
 impl FixtureLlmClient {
@@ -220,7 +232,13 @@ impl FixtureLlmClient {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect::<std::collections::HashMap<_, _>>(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// How many times `complete_json` has been called on this client.
+    pub fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Extract `(index, claim_text)` pairs from a `build_batch_prompt` body.
@@ -255,6 +273,7 @@ impl LlmProvider for FixtureLlmClient {
     }
 
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let indexed = Self::indexed_claims(prompt);
         // A prompt with no `[idx] statement` lines means `build_batch_prompt`'s
         // format drifted (or a non-decompose prompt was routed here). Fail loudly
