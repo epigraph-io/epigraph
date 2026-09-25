@@ -231,11 +231,22 @@ partial-state shape the R3 gate forbids, or an authority leak.
 | POST /workflows/:id/outcome owner own flat private | 404 | 200 | 200 |
 | POST /bp/propagate apply, own factor | **200 `applied:true`, 0 rows** | 200, BetP 0.20→0.39 | same |
 | POST /bp/propagate apply, factor into a stranger's claim | **200 `applied:true`, 0 rows** | 403, nothing written | 200 |
+| POST /bp/propagate apply, factor naming a non-claim id | **200 `applied:true`, 0 rows** | 200, real claims written, `skipped_not_visible: 1` | same (**was 409 at 2fe34e17**) |
 | POST /themes/create-with-centroid own / other's claims | **500 with `claim_themes +1`** / same | 201, themed / 403, +0 | 201 / 201 |
 | PATCH /labels owner own public / own private | 200 / 200 | 200 / 200 | 200 / 200 |
 | PATCH /labels admin other agent's public | 200 (**author's stamp lent**) | 403 | 200 |
 | PATCH /labels READER-member admin, team private / public | **200 / 200 (author's stamp lent)** | 403 / 403 | 200 / 200 |
 | PATCH /labels admin foreign unreadable / world-owned / peer | 404 / 403 / 403 | 404 / 403 / 403 | 404 / 200 / 403 |
+
+The batch H-a reviewer's own scratch probes (`probe_http.py`, `probe_http2.py`,
+`probe_mcp.py`, `probe_mcp_auth.py`: about 80 HTTP routes, 78 MCP cases and the
+authenticated MCP arm) were re-run at the tip on both configs and diffed against
+their saved `80398b7a` runs. On B the only moved rows are supersede's new
+`claim_versions` row and counts that depend on accumulated test-database state
+(evolve_step's factor delta, `frames/evidence`'s leftover edges, theme counts,
+and one `batch_submit_claims` novelty-gate dedup that did not reproduce on a
+re-run); the stale-factor `bp/propagate` 409 they exposed is fixed. On A the moved
+rows are exactly the conversions in the tables above.
 
 On config A every row above now either succeeds or fails loudly with nothing
 written. Config B is unchanged except where a row is marked as a tightening
