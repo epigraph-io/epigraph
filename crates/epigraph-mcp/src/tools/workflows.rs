@@ -311,6 +311,7 @@ pub async fn store_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: StoreWorkflowParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     use epigraph_ingest::common::schema::ThesisDerivation;
     use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
@@ -369,6 +370,7 @@ pub async fn store_workflow(
             server,
             viewer,
             &extraction,
+            auth,
         )
         .await?;
 

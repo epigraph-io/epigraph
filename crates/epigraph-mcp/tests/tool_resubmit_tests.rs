@@ -339,10 +339,10 @@ async fn store_workflow_resubmit_is_idempotent_at_workflow_row() {
         tags: Some(vec!["s3a-test".to_string()]),
     };
 
-    tools::workflows::store_workflow(&server, &viewer, make_params())
+    tools::workflows::store_workflow(&server, &viewer, make_params(), None)
         .await
         .expect("first store_workflow");
-    tools::workflows::store_workflow(&server, &viewer, make_params())
+    tools::workflows::store_workflow(&server, &viewer, make_params(), None)
         .await
         .expect("second store_workflow");
 

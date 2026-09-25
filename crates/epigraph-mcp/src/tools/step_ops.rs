@@ -66,6 +66,32 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
     }
 }
 
+/// The caller's authority over the head of `canonical_name` (batch H-b, H3;
+/// see `tools::workflow_authority`). An unknown name is left to the executor,
+/// which reports it as not found.
+async fn require_authority_over(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
+    canonical_name: &str,
+    tool_name: &'static str,
+) -> Result<(), McpError> {
+    if let Some(head) =
+        epigraph_db::WorkflowRepository::head_by_canonical(&mut *conn, canonical_name)
+            .await
+            .map_err(|e| {
+                internal_error(format!("{tool_name}: could not resolve the workflow: {e}"))
+            })?
+    {
+        crate::tools::workflow_authority::require_workflow_authority(
+            server, conn, auth, caller, head, tool_name,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Append or middle-insert a step under an existing workflow.
 ///
 /// # One stamped transaction, not five pool checkouts
@@ -86,10 +112,24 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
 /// and the INSERT carries `ON CONFLICT (id) DO NOTHING`.
 pub async fn add_step(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: AddStepParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    let caller = server.write_identity(auth, viewer).await?;
     let (_system_agent_id, mut tx) =
         crate::claim_helper::begin_system_ingest_stamped_tx(server, "add_step").await?;
+    // H3 (batch H-b): the CALLER's authority over the workflow, before the
+    // system-stamped write. The stamp stays the system agent's.
+    require_authority_over(
+        server,
+        &mut tx,
+        auth,
+        caller,
+        &params.canonical_name,
+        "add_step",
+    )
+    .await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
         &params.canonical_name,
@@ -132,11 +172,24 @@ pub async fn add_step(
 /// on a clean migrate.
 pub async fn delete_step(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DeleteStepParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let lineage = parse_uuid(&params.step_lineage_id)?;
+    let caller = server.write_identity(auth, viewer).await?;
     let (_system_agent_id, mut tx) =
         crate::claim_helper::begin_system_ingest_stamped_tx(server, "delete_step").await?;
+    // H3 (batch H-b); see `add_step`.
+    require_authority_over(
+        server,
+        &mut tx,
+        auth,
+        caller,
+        &params.canonical_name,
+        "delete_step",
+    )
+    .await?;
     let r = epigraph_ingest_executor::delete_step(&mut tx, &params.canonical_name, lineage)
         .await
         .map_err(map_step_err)?;

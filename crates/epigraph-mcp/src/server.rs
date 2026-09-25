@@ -1379,7 +1379,7 @@ impl EpiGraphMcpFull {
     // ── Workflows (8 tools) ──
 
     #[tool(
-        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table — NOT a claim id, so `get_claim` on it 404s. Retrieve it with `find_workflow` (which searches both stores) or `find_workflow_hierarchical`. Use `report_workflow_outcome` with the returned id to record execution results. All-or-nothing: on any error nothing is written. KNOWN ISSUE (not your error): the steps are filed under a constant 'Body' phase, so once any stored workflow has that phase this call can fail with 'Duplicate entity already exists' and write nothing. Workaround: `ingest_workflow` with a phase summary unique to this workflow (and different from its thesis) and step texts no other workflow uses."
+        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table — NOT a claim id, so `get_claim` on it 404s. Retrieve it with `find_workflow` (which searches both stores) or `find_workflow_hierarchical`. Use `report_workflow_outcome` with the returned id to record execution results. All-or-nothing: on any error nothing is written. KNOWN ISSUE (not your error): the steps are filed under a constant 'Body' phase, so once any stored workflow has that phase this call can fail with 'Duplicate entity already exists' and write nothing. Workaround: `ingest_workflow` with a phase summary unique to this workflow (and different from its thesis) and step texts no other workflow uses. The workflow records its submitter, the calling agent (the authenticated caller over HTTP, this server's own agent on stdio), and only that submitter, its operator, or claims:admin may later add or delete its steps or add a generation over HTTP; a re-ingest never changes the recorded submitter."
     )]
     async fn store_workflow(
         &self,
@@ -1389,7 +1389,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflows::store_workflow(self, viewer, params).await
+        tools::workflows::store_workflow(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1478,7 +1478,7 @@ impl EpiGraphMcpFull {
     // variants independently of its workflow root.
 
     #[tool(
-        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim (recording plan order), and resolves author identities. All-or-nothing: on any error nothing is written. Idempotent: re-ingesting the same canonical_name+generation is a no-op. KNOWN ISSUE (not your error): a thesis, phase text (summary, or title when the summary is empty) or step text that another stored workflow already uses can fail the call with 'Duplicate entity already exists', writing nothing. Keep those texts unique to this workflow, and do not reuse the thesis text as a phase summary."
+        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim (recording plan order), and resolves author identities. All-or-nothing: on any error nothing is written. Idempotent: re-ingesting the same canonical_name+generation is a no-op. KNOWN ISSUE (not your error): a thesis, phase text (summary, or title when the summary is empty) or step text that another stored workflow already uses can fail the call with 'Duplicate entity already exists', writing nothing. Keep those texts unique to this workflow, and do not reuse the thesis text as a phase summary. The workflow records its submitter, the calling agent (the authenticated caller over HTTP, this server's own agent on stdio), and only that submitter, its operator, or claims:admin may later add or delete its steps or add a generation over HTTP; a re-ingest never changes the recorded submitter."
     )]
     async fn ingest_workflow(
         &self,
@@ -1488,11 +1488,11 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflow_ingest::ingest_workflow(self, viewer, params).await
+        tools::workflow_ingest::ingest_workflow(self, viewer, params, auth).await
     }
 
     #[tool(
-        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation. Same all-or-nothing behaviour and duplicate-text known issue as ingest_workflow; texts unchanged from the parent are reused, not duplicated."
+        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation. Same all-or-nothing behaviour and duplicate-text known issue as ingest_workflow; texts unchanged from the parent are reused, not duplicated. Over HTTP, requires authority over the parent lineage when it records a submitter (the submitter, its operator, or claims:admin; batch H-b), and the new generation inherits that submitter; a lineage with no recorded submitter stays open, as before."
     )]
     async fn improve_workflow_hierarchy(
         &self,
@@ -1502,7 +1502,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflow_ingest::improve_workflow_hierarchy(self, viewer, params).await
+        tools::workflow_ingest::improve_workflow_hierarchy(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1530,25 +1530,34 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i of the `step_follows` chain, and the returned step_index is that chain slot. `position` does NOT change plan order: find_workflow, find_workflow_hierarchical and the step_index of report_workflow_outcome / report_hierarchical_outcome all place an added step AFTER every originally planned step (added steps in the order they were added). Idempotent on `(canonical_name, step_text)` via deterministic claim ID. All-or-nothing; a step text another workflow already uses can fail with 'Duplicate entity already exists' (known issue, see ingest_workflow)."
+        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i of the `step_follows` chain, and the returned step_index is that chain slot. `position` does NOT change plan order: find_workflow, find_workflow_hierarchical and the step_index of report_workflow_outcome / report_hierarchical_outcome all place an added step AFTER every originally planned step (added steps in the order they were added). Idempotent on `(canonical_name, step_text)` via deterministic claim ID. All-or-nothing; a step text another workflow already uses can fail with 'Duplicate entity already exists' (known issue, see ingest_workflow). Authority (batch H-b): a workflow created since then records its submitter (the calling agent: the authenticated caller over HTTP, this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token may change it; anyone else is refused with nothing written (stdio callers are not checked). A workflow with no recorded submitter (created before then) stays open to any caller, as before."
     )]
     async fn add_step(
         &self,
         Parameters(params): Parameters<crate::tools::step_ops::AddStepParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::step_ops::add_step(self, params).await
+        // A viewer since batch H-b (H3): the caller's authority over the
+        // workflow is checked against the workflow's recorded submitter.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::step_ops::add_step(self, viewer, params, auth).await
     }
 
     #[tool(
-        description = "Soft-delete a workflow step by step_lineage_id. Sets the head claim's truth_value to 0.05; default min_truth filters hide it from active queries while preserving history. Does not rewire the step_follows chain."
+        description = "Soft-delete a workflow step by step_lineage_id. Sets the head claim's truth_value to 0.05; default min_truth filters hide it from active queries while preserving history. Does not rewire the step_follows chain. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: the authenticated caller over HTTP, this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token may change it; anyone else is refused with nothing written (stdio callers are not checked). A workflow with no recorded submitter (created before then) stays open to any caller, as before."
     )]
     async fn delete_step(
         &self,
         Parameters(params): Parameters<crate::tools::step_ops::DeleteStepParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::step_ops::delete_step(self, params).await
+        // A viewer since batch H-b (H3); see `add_step`.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::step_ops::delete_step(self, viewer, params, auth).await
     }
 
     // ── Graph (2 tools) ──

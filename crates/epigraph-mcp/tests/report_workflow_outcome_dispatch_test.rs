@@ -45,6 +45,7 @@ async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(po
             confidence: None,
             tags: None,
         },
+        None,
     )
     .await
     .expect("store_workflow must succeed");
