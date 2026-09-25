@@ -21,6 +21,8 @@
 #                 to E2E_MAINT_DSN (a role that satisfies epigraph_bypass()),
 #                 and unset with the APPLICATION DSN itself bypass-capable
 #                 (the fallback, which must never enable them)
+#   supersede     supersede_claim on own-public / own-private / foreign-private /
+#                 foreign-public claims (fresh rows, so no other arm sees them)
 #   theme         theme_cluster (wipe_first=true) over public claims the server
 #                 agent owns, with a pre-existing theme in place: the run must
 #                 commit whole or leave the previous themes exactly as they were
@@ -76,7 +78,7 @@ BIN="${1:?usage: probe-batch-h.sh <binary> <label> <a|b> [arm ...]}"
 LABEL="${2:?label}"
 CFG="${3:?a|b}"
 shift 3
-ARMS="${*:-patch_claim edges resolve submit_ds theme maintenance maint_auth}"
+ARMS="${*:-patch_claim edges resolve submit_ds supersede theme maintenance maint_auth}"
 command -v jq >/dev/null || { echo "probe-batch-h.sh needs jq to read tool responses" >&2; exit 2; }
 E2E="$(cd "$(dirname "$0")" && pwd)"
 SOCK="$E2E/bh.sock.$LABEL"
@@ -309,6 +311,22 @@ if want submit_ds; then
   R=$(tool memorize '{"content":"Batch H memorize DS wiring probe","tags":["bh-memo"]}')
   C=$(field "$R" claim_id)
   echo "   memorize fresh: $(verdict "$R") belief=$(field "$R" belief) | claims=$(q "SELECT count(*) FROM claims WHERE content='Batch H memorize DS wiring probe'") bbas=$(q "SELECT count(*) FROM mass_functions WHERE claim_id='${C:-00000000-0000-0000-0000-000000000000}'")"
+fi
+
+# ── supersede_claim ────────────────────────────────────────────────────────
+if want supersede; then
+  echo
+  echo "=== supersede_claim ==="
+  echo "    expect A: own_pub OK, own_priv OK, foreign_priv ERR (not found), foreign_pub ERR; retired only where OK"
+  S_OWN_PUB=$(seed "Batch H supersede own public $LABEL" public "$OG" "$MA")
+  S_OWN_PRIV=$(seed "Batch H supersede own private $LABEL" group "$OG" "$MA")
+  S_FOR_PRIV=$(seed "Batch H supersede foreign private $LABEL" group "$FG" "$FA")
+  S_FOR_PUB=$(seed "Batch H supersede foreign public $LABEL" public "$FG" "$FA")
+  for pair in "own_pub:$S_OWN_PUB" "own_priv:$S_OWN_PRIV" "foreign_priv:$S_FOR_PRIV" "foreign_pub:$S_FOR_PUB"; do
+    name="${pair%%:*}"; id="${pair#*:}"
+    R=$(tool supersede_claim "{\"claim_id\":\"$id\",\"content\":\"Batch H replacement for $name $LABEL\",\"truth_value\":0.6,\"reason\":\"probe\"}")
+    echo "   $name: $(verdict "$R") | old_is_current=$(q "SELECT is_current FROM claims WHERE id='$id'") replacements=$(q "SELECT count(*) FROM claims WHERE supersedes='$id'")"
+  done
 fi
 
 # ── theme_cluster ──────────────────────────────────────────────────────────

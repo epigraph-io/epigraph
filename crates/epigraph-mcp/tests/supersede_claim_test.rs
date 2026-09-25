@@ -9,7 +9,7 @@ use common::*;
 async fn supersede_claim_marks_old_and_links_new(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let old = seed_claim(&pool, "v1", 0.5).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let auth = admin_auth();
 
     let result = epigraph_mcp::tools::supersede::supersede_claim(
@@ -95,7 +95,7 @@ async fn supersede_claim_nulls_embedding_on_superseded_claim(pool: PgPool) {
     .await
     .unwrap();
 
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let auth = admin_auth();
 
     // Call the MCP supersede handler. If the handler fails to null the

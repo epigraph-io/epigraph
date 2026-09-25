@@ -165,14 +165,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/supersede.rs",
-        "ClaimRepository::supersede",
-        1,
-        "`supersede_claim`. Tier-A `claims` UPDATE plus the embedding null in the same repo \
-         transaction. Unconverted because the cascade below shares its pool and splitting them \
-         would half-supersede a tree.",
-    ),
-    (
-        "tools/supersede.rs",
         "server.pool.acquire",
         2,
         "`supersede_claim`'s and `mark_duplicate`'s retraction cascades, one acquire each. STILL \
