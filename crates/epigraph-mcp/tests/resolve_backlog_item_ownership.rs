@@ -170,6 +170,10 @@ async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) 
     let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
 
     let (admin_auth, admin_viewer) = common::server_admin(&server).await;
+    // A live claims:admin grant on the token's client record: the foreign
+    // claim's group is not the admin's, so the write takes the audited admin
+    // path (batch H-b, D2), which re-checks exactly this record.
+    common::seed_admin_grant(&pool, &admin_auth).await;
 
     let result = resolve_backlog_item(
         &server,

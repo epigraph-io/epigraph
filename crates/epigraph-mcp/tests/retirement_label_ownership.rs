@@ -204,6 +204,10 @@ async fn update_labels_admin_scope_passes_the_retirement_authz_gate(pool: PgPool
     // UPDATE with 42501.
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let (admin_auth, admin_viewer) = common::server_admin(&server).await;
+    // A live claims:admin grant on the token's client record: the foreign
+    // claim's group is not the admin's, so the write takes the audited admin
+    // path (batch H-b, D2), which re-checks exactly this record.
+    common::seed_admin_grant(&pool, &admin_auth).await;
 
     epigraph_mcp::tools::claims::update_labels(
         &server,
@@ -380,6 +384,10 @@ async fn patch_claim_without_labels_on_a_foreign_claim_is_refused_over_http(pool
     let viewer = fixture::public_viewer(&pool).await;
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let (admin_auth, admin_viewer) = common::server_admin(&server).await;
+    // A live claims:admin grant on the token's client record: the foreign
+    // claim's group is not the admin's, so the write takes the audited admin
+    // path (batch H-b, D2), which re-checks exactly this record.
+    common::seed_admin_grant(&pool, &admin_auth).await;
     let (_caller, caller_auth, caller_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
     let patch = |value: &str| PatchClaimParams {
         claim_id: claim.to_string(),

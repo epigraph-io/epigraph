@@ -2021,12 +2021,91 @@ pub async fn update_labels(
     // `update_labels` / `patch_claim` refuse the same act. Whether `claims:admin`
     // should carry write authority into groups the admin cannot write is the
     // cross-agent ownership decision (H-b, #374); lending the author's stamp
-    // decided it silently, so the route now stamps the caller only.
+    // decided it silently, so the route stamps the caller only.
+    //
+    // THE AUDITED ADMIN PATH (batch H-b, D2). A `claims:admin` caller whose own
+    // writable set does not hold the claim's owning group no longer gets a bare
+    // 403: its write goes through migration 111's
+    // `epigraph_admin_patch_claim`, on this SAME caller-stamped transaction (so
+    // `epigraph.principal_id` is the ADMIN), which re-checks the token's client
+    // record for a live `claims:admin` grant, writes the labels and records a
+    // `security_events` row (`claims.admin_write`: admin, token, target,
+    // before/after). Everyone else stays on the caller's own stamp. MCP
+    // `update_labels` routes identically (`epigraph-mcp/src/tools/admin_write.rs`).
     let stamp: &epigraph_db::Viewer = &viewer;
+    let admin_path =
+        auth.has_scope("claims:admin") && !viewer.writable_groups().contains(&owner_group_id);
 
     // Never a fallback to `state.db_pool`: an unstamped write is exactly what
     // this conversion removes.
     let mut tx = state.write_as(stamp, "update_labels").await?;
+
+    if admin_path {
+        let written = ClaimRepository::admin_patch_claim_conn(
+            &mut tx,
+            epigraph_db::AdminToken {
+                client_id: auth.client_id,
+                jti: auth.jti,
+            },
+            id,
+            epigraph_db::AdminClaimAction::UpdateLabels,
+            &body.add,
+            &body.remove,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| match e {
+            epigraph_db::DbError::InvalidData { reason } => ApiError::ValidationError {
+                field: "add".to_string(),
+                reason,
+            },
+            epigraph_db::DbError::QueryFailed { ref source }
+                if source
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .as_deref()
+                    == Some("P0002") =>
+            {
+                ApiError::NotFound {
+                    entity: "Claim".to_string(),
+                    id: id.to_string(),
+                }
+            }
+            epigraph_db::DbError::QueryFailed { ref source }
+                if source
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .as_deref()
+                    == Some("42501") =>
+            {
+                tracing::warn!(
+                    target: "tenancy.scoped_write",
+                    handler = "update_labels",
+                    claim = %id,
+                    owner_group = %owner_group_id,
+                    error = %e,
+                    "the audited admin path refused the token"
+                );
+                ApiError::Forbidden {
+                    reason: "the audited admin path refused this token: it needs a live \
+                             claims:admin grant on the token's own client record; nothing \
+                             was written"
+                        .to_string(),
+                }
+            }
+            other => ApiError::DatabaseError {
+                message: other.to_string(),
+            },
+        })?;
+        tx.commit().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to commit transaction: {e}"),
+        })?;
+        return Ok(Json(UpdateLabelsResponse {
+            id,
+            labels: written.labels,
+        }));
+    }
 
     let labels = ClaimRepository::update_labels_conn(&mut tx, id, &body.add, &body.remove)
         .await

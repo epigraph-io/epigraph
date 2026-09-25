@@ -1759,15 +1759,39 @@ pub async fn resolve_backlog_item(
     // 3. PATCH the original's labels: add "resolved", keep "backlog". In the
     //    same transaction: a refusal here rolls back the resolution claim and
     //    its edges, so an item is never left open beside a resolution of it.
-    let after_labels =
+    //
+    //    A `claims:admin` caller retiring an item in a group it cannot write
+    //    takes the audited admin path for THIS step (batch H-b, D2): the
+    //    resolution claim and its edges are the admin's own, in the admin's own
+    //    group, and only the original's label crosses the group boundary, through
+    //    the definer that records the admin as principal and writes the audit
+    //    row. Same transaction, so the whole retirement is still one fact.
+    let owner_group =
+        crate::tools::admin_write::owner_group_of(&mut tx, viewer, original_id).await?;
+    let after_labels = if crate::tools::admin_write::takes_admin_path(auth, viewer, owner_group) {
+        crate::tools::admin_write::admin_patch(
+            &mut tx,
+            auth,
+            original_id,
+            epigraph_db::AdminClaimAction::ResolveBacklogItem,
+            &["resolved".to_string()],
+            &[],
+            None,
+            None,
+        )
+        .await?
+        .labels
+    } else {
         ClaimRepository::update_labels_conn(&mut tx, original_id, &["resolved".to_string()], &[])
             .await
             .map_err(|e| {
                 internal_error(format!(
-            "resolve_backlog_item: could not label {original_id} resolved: {e}. Nothing was \
-             written: the resolution claim and its basis edges were rolled back with it."
-        ))
-            })?;
+                    "resolve_backlog_item: could not label {original_id} resolved: {e}. Nothing \
+                     was written: the resolution claim and its basis edges were rolled back \
+                     with it."
+                ))
+            })?
+    };
 
     tx.commit().await.map_err(internal_error)?;
 
@@ -1911,15 +1935,12 @@ pub async fn update_labels(
     // it, so nothing is persisted — only the reported code was wrong here.
     //
     // Author-stamped, because this is an `UPDATE claims` and `claims_tenancy`'s
-    // WITH CHECK refuses it on an unstamped session. The stamp is the MCP
-    // server's own agent, which is what makes the SANCTIONED case work: the
-    // stdio ownership gate above degrades to "the claim's author is this server's
-    // agent", so the row is owned by the group this session can write. A
-    // `claims:admin` HTTP caller relabelling ANOTHER agent's claim is still
-    // refused on a cleanly-migrated schema, because the row is owned by that
-    // agent's group and no viewer this process can resolve carries write
-    // authority there — the same residual `challenge_claim` carries, and a
-    // tenancy-model question rather than a stamping one.
+    // WITH CHECK refuses it on an unstamped session. The stamp is the CALLER's
+    // (batch H-b, D1): an author, or an operator over its agents' claims, writes
+    // the group its own stamp can write. A `claims:admin` caller relabelling a
+    // claim in a group it cannot write takes the audited admin path instead
+    // (D2, `tools::admin_write`): same transaction (stamped from the ADMIN, never
+    // the author), a definer that re-checks the grant and writes the audit row.
     let caller = server.write_identity(auth, viewer).await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "update_labels").await?;
@@ -1936,11 +1957,32 @@ pub async fn update_labels(
         &params.remove,
     )
     .await?;
-    let labels = ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
-        .await
-        .map_err(db_caller_error)?;
+    let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;
+    let admin_path = crate::tools::admin_write::takes_admin_path(auth, viewer, owner_group);
+    let labels = if admin_path {
+        crate::tools::admin_write::admin_patch(
+            &mut tx,
+            auth,
+            id,
+            epigraph_db::AdminClaimAction::UpdateLabels,
+            &params.add,
+            &params.remove,
+            None,
+            None,
+        )
+        .await?
+        .labels
+    } else {
+        ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
+            .await
+            .map_err(db_caller_error)?
+    };
     tx.commit().await.map_err(internal_error)?;
-    success_json(&serde_json::json!({ "claim_id": id, "labels": labels }))
+    success_json(&serde_json::json!({
+        "claim_id": id,
+        "labels": labels,
+        "admin_path": admin_path,
+    }))
 }
 
 pub async fn patch_claim(
@@ -1974,14 +2016,10 @@ pub async fn patch_claim(
     // `ScopedTx` is not. It now takes the connection a `ScopedTx` derefs to.
     //
     // THE STAMP IS THE WRITE IDENTITY's, the same as `update_labels`, and for
-    // the same reason. Every claim this MCP process writes is authored by that
-    // agent and owned by its group, so that is the population the stamp admits.
-    // A claim owned by another agent's group is refused loudly (`42501` from the
-    // UPDATE, or not-found from the row lock). Nothing is written, because the
-    // refusal aborts this transaction and it is never committed. Whether a
-    // `claims:admin` caller should carry write authority into a group this
-    // process cannot write is the cross-agent ownership question (#374), not a
-    // stamping one.
+    // the same reason. A claim owned by a group the caller cannot write is
+    // refused loudly (`42501` from the UPDATE, or not-found from the row lock),
+    // with nothing written — unless the caller holds `claims:admin`, in which
+    // case the whole patch takes the audited admin path (batch H-b, D2).
     let caller = server.write_identity(auth, viewer).await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "patch_claim").await?;
@@ -2025,24 +2063,43 @@ pub async fn patch_claim(
         &params.remove_labels,
     )
     .await?;
-    let diff = ClaimRepository::patch_claim_atomic_conn(
-        &mut tx,
-        ClaimId::from_uuid(id),
-        &PatchClaimInput {
-            trace_id: trace,
-            properties: params.properties.clone(),
-            add_labels: params.add_labels.clone(),
-            remove_labels: params.remove_labels.clone(),
-        },
-    )
-    .await
-    .map_err(db_caller_error)?;
+    let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;
+    let admin_path = crate::tools::admin_write::takes_admin_path(auth, viewer, owner_group);
+    let (after_labels, after_props, after_trace) = if admin_path {
+        let w = crate::tools::admin_write::admin_patch(
+            &mut tx,
+            auth,
+            id,
+            epigraph_db::AdminClaimAction::PatchClaim,
+            &params.add_labels,
+            &params.remove_labels,
+            params.properties.as_ref(),
+            trace,
+        )
+        .await?;
+        (w.labels, w.properties, w.trace_id)
+    } else {
+        let diff = ClaimRepository::patch_claim_atomic_conn(
+            &mut tx,
+            ClaimId::from_uuid(id),
+            &PatchClaimInput {
+                trace_id: trace,
+                properties: params.properties.clone(),
+                add_labels: params.add_labels.clone(),
+                remove_labels: params.remove_labels.clone(),
+            },
+        )
+        .await
+        .map_err(db_caller_error)?;
+        (diff.after_labels, diff.after_props, diff.after_trace)
+    };
     tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({
         "claim_id": id,
-        "after_labels": diff.after_labels,
-        "after_properties": diff.after_props,
-        "after_trace": diff.after_trace,
+        "after_labels": after_labels,
+        "after_properties": after_props,
+        "after_trace": after_trace,
+        "admin_path": admin_path,
     }))
 }
 

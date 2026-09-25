@@ -538,6 +538,26 @@ pub async fn server_admin(
     )
 }
 
+/// Record `token`'s client as an ACTIVE `oauth_clients` row granting
+/// `claims:admin`, bound to the token's agent — what `oauth/token.rs` mints an
+/// admin token from. Migration 111's audited admin path re-checks exactly this
+/// record, so a test whose admin writes into a group it cannot write needs it
+/// (batch H-b, D2); a hand-minted token with no such row is refused there.
+pub async fn seed_admin_grant(pool: &PgPool, token: &AuthContext) {
+    sqlx::query(
+        "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id) \
+         VALUES ($1, $2, 'test admin', 'human', ARRAY['claims:admin'], ARRAY['claims:admin'], \
+                 'active', $3)",
+    )
+    .bind(token.client_id)
+    .bind(format!("test-admin-{}", token.client_id))
+    .bind(token.agent_id)
+    .execute(pool)
+    .await
+    .expect("seed the admin token's client record");
+}
+
 /// A real agent with a live personal group, a `claims:write`-style token that
 /// names it the way `oauth/token.rs` does (`sub`/`owner_id` are
 /// `oauth_clients` ids, only `agent_id` is an `agents.id`), and its viewer.

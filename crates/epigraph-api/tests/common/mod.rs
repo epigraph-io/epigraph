@@ -433,6 +433,22 @@ pub async fn test_bearer_token_with_seeded_client(
     let agent_id = epigraph_db::AgentRepository::ensure_for_client(&mut conn, client_id)
         .await
         .expect("ensure agent for seeded client");
+    // GRANT the scopes the token will carry, as `oauth/token.rs` only mints
+    // scopes a client was granted. Batch H-b's audited admin path (migration
+    // 111) re-checks `claims:admin` against this record, so a hand-minted
+    // admin token whose client was never granted it is (correctly) refused.
+    let scope_vec: Vec<String> = scopes.iter().map(|s| (*s).to_string()).collect();
+    sqlx::query(
+        "UPDATE oauth_clients \
+            SET granted_scopes = ARRAY(SELECT DISTINCT unnest(granted_scopes || $2::text[])), \
+                allowed_scopes = ARRAY(SELECT DISTINCT unnest(allowed_scopes || $2::text[])) \
+          WHERE id = $1",
+    )
+    .bind(client_id)
+    .bind(&scope_vec)
+    .execute(&mut *conn)
+    .await
+    .expect("grant the token's scopes to its client");
     drop(conn);
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());

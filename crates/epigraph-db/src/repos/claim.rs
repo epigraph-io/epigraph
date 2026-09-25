@@ -440,6 +440,52 @@ pub struct PatchClaimInput {
     pub remove_labels: Vec<String>,
 }
 
+/// Which audited admin write [`ClaimRepository::admin_patch_claim_conn`] records.
+///
+/// A closed set, because it is written into the `security_events` audit row
+/// and migration 111's function refuses anything else (`ADM03`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminClaimAction {
+    /// MCP `update_labels` / HTTP `PATCH /api/v1/claims/:id/labels`.
+    UpdateLabels,
+    /// MCP `patch_claim`.
+    PatchClaim,
+    /// The original's `resolved` label in MCP `resolve_backlog_item`.
+    ResolveBacklogItem,
+}
+
+impl AdminClaimAction {
+    /// The `action` string migration 111 records and accepts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UpdateLabels => "update_labels",
+            Self::PatchClaim => "patch_claim",
+            Self::ResolveBacklogItem => "resolve_backlog_item",
+        }
+    }
+}
+
+/// What [`ClaimRepository::admin_patch_claim_conn`] wrote: the row's labels,
+/// properties and trace after the write, and before it.
+#[derive(Debug, Clone)]
+pub struct AdminClaimWrite {
+    pub labels: Vec<String>,
+    pub properties: serde_json::Value,
+    pub trace_id: Option<Uuid>,
+    pub before_labels: Vec<String>,
+    pub before_properties: serde_json::Value,
+    pub before_trace_id: Option<Uuid>,
+}
+
+/// The token facts the audited admin path re-checks and records: the token's
+/// `sub` (an `oauth_clients.id`) and its `jti`.
+#[derive(Debug, Clone, Copy)]
+pub struct AdminToken {
+    pub client_id: Uuid,
+    pub jti: Uuid,
+}
+
 /// Diff produced by [`ClaimRepository::patch_claim_atomic_conn`].
 #[derive(Debug)]
 pub struct PatchClaimDiff {
@@ -7976,6 +8022,79 @@ impl ClaimRepository {
                 id: claim_id,
             }),
         }
+    }
+
+    /// The AUDITED admin path for a `claims:admin` write into a claim whose
+    /// owning group the admin cannot write (batch H-b, D2; migration 111).
+    ///
+    /// Calls `public.epigraph_admin_patch_claim`, a SECURITY DEFINER owned by
+    /// `epigraph_maintenance`, which in one step re-checks the token's client
+    /// record (`oauth_clients`: active, `claims:admin` granted, bound to the
+    /// session principal), applies the label add/remove, the shallow properties
+    /// merge and the trace relink with exactly the semantics of
+    /// [`Self::update_labels_conn`] and [`Self::patch_claim_atomic_conn`], and
+    /// writes a `security_events` row (`claims.admin_write`) naming the admin,
+    /// the token, the action, the target and the before/after state. The write
+    /// and its audit row commit with the caller's transaction or not at all.
+    ///
+    /// The ADMIN is read from the session's `epigraph.principal_id`, so `conn`
+    /// must be a transaction stamped from the admin's OWN viewer (never the
+    /// claim author's). A NULL principal is refused.
+    ///
+    /// # Errors
+    /// * `DbError::InvalidData` if an added label carries unexpanded shell
+    ///   syntax (checked before the call, as the ordinary path checks it).
+    /// * `DbError::QueryFailed` with SQLSTATE `42501` when the function refuses
+    ///   the admin (`ADM01` no principal, `ADM02` no live `claims:admin` grant),
+    ///   `P0002` when the claim does not exist (`ADM04`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admin_patch_claim_conn(
+        conn: &mut sqlx::PgConnection,
+        token: AdminToken,
+        claim_id: Uuid,
+        action: AdminClaimAction,
+        add_labels: &[String],
+        remove_labels: &[String],
+        properties: Option<&serde_json::Value>,
+        trace_id: Option<Uuid>,
+    ) -> Result<AdminClaimWrite, DbError> {
+        crate::label_validation::reject_unexpanded_labels(add_labels)?;
+        let out: serde_json::Value = sqlx::query_scalar(
+            "SELECT public.epigraph_admin_patch_claim($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(token.client_id)
+        .bind(token.jti)
+        .bind(claim_id)
+        .bind(action.as_str())
+        .bind(add_labels)
+        .bind(remove_labels)
+        .bind(properties)
+        .bind(trace_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        let labels = |key: &str| -> Vec<String> {
+            out.get(key)
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let trace = |key: &str| -> Option<Uuid> {
+            out.get(key)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
+        Ok(AdminClaimWrite {
+            labels: labels("labels"),
+            properties: out.get("properties").cloned().unwrap_or_default(),
+            trace_id: trace("trace_id"),
+            before_labels: labels("before_labels"),
+            before_properties: out.get("before_properties").cloned().unwrap_or_default(),
+            before_trace_id: trace("before_trace_id"),
+        })
     }
 
     /// The two facts a write gate decides on for one claim, read through
