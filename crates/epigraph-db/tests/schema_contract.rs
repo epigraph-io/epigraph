@@ -1162,3 +1162,105 @@ async fn migration_092_roster_definer_is_revoked_from_public(pool: PgPool) {
          REVOKE above without the matching GRANT is a total outage, not a narrowing."
     );
 }
+
+/// Migration 107's operator-link definer bodies: `SECURITY DEFINER`, owned by
+/// `epigraph_maintenance`, an EXPLICIT ACL with no `PUBLIC` grant, and the
+/// asymmetric role grant that IS the trust basis — `epigraph_app` may ASK who an
+/// agent's operator is (the actor and author reads) and may NOT record a link
+/// (either link function).
+///
+/// Per-function, on the 086/089/092 template, because there is still no generic
+/// sweep: a later `DROP FUNCTION` + `CREATE` silently restores the implicit
+/// `PUBLIC` grant, and the guarded `OWNER TO` can silently no-op. For the link
+/// functions the first would let any request-DSN connection enrol any agent in
+/// any operator's personal group; for the reads a non-member owner reads no
+/// link at all (fails closed, but silently turns operator ownership off). The
+/// behavioural half — the calls actually raising 42501 for `epigraph_app` — is
+/// `operator_link.rs::epigraph_app_cannot_execute_link_operator` and
+/// `epigraph_app_cannot_execute_link_retired_agent`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_107_operator_definers_are_owned_and_granted(pool: PgPool) {
+    for (name, signature, volatility, app_may_execute) in [
+        (
+            "epigraph_operator_actor",
+            "public.epigraph_operator_actor(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_of_author",
+            "public.epigraph_operator_of_author(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operates_agents",
+            "public.epigraph_operates_agents(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_link_operator",
+            "public.epigraph_link_operator(uuid, uuid)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_link_retired_agent",
+            "public.epigraph_link_retired_agent(uuid, uuid)",
+            "v",
+            false,
+        ),
+    ] {
+        let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+               FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+               JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE n.nspname = 'public' AND p.proname = $1",
+        )
+        .bind(name)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl) =
+            meta.unwrap_or_else(|| panic!("public.{name} must exist (migration 107)"));
+        assert!(
+            secdef,
+            "{name} must stay SECURITY DEFINER: it reads/writes edges, groups and \
+             group_memberships, all under FORCEd row security"
+        );
+        assert_eq!(
+            owner, "epigraph_maintenance",
+            "{name} must be owned by epigraph_maintenance, whose membership is what \
+             epigraph_definer_bypass() tests inside the definer frame"
+        );
+        assert_eq!(vol, volatility, "{name} volatility");
+        assert!(
+            acl.is_some(),
+            "{name} must carry an EXPLICIT ACL; a NULL proacl is the default grant, which \
+             includes EXECUTE to PUBLIC"
+        );
+
+        let public_can: bool =
+            sqlx::query_scalar("SELECT has_function_privilege('public', $1, 'EXECUTE')")
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("public privilege");
+        assert!(!public_can, "{name} is EXECUTE-able by PUBLIC");
+
+        let app_can: bool =
+            sqlx::query_scalar("SELECT has_function_privilege('epigraph_app', $1, 'EXECUTE')")
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("app privilege");
+        assert_eq!(
+            app_can, app_may_execute,
+            "{name}: epigraph_app EXECUTE must be {app_may_execute}. The read is granted so the \
+             authoring path works on an unstamped app session; the link is refused so the \
+             request DSN cannot record one"
+        );
+    }
+}

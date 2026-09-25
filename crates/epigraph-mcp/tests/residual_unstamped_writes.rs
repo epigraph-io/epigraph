@@ -88,6 +88,20 @@ use std::path::{Path, PathBuf};
 // ===========================================================================
 const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     (
+        "operator.rs",
+        "server.pool.acquire",
+        1,
+        "`self_link`, the stdio startup's operator link (migration 107). Not a tool: it runs once, \
+         in `main`, before any MCP session exists, so there is no caller viewer to stamp from. \
+         Its only statement is `SELECT epigraph_link_operator(agent, operator)`, a SECURITY \
+         DEFINER owned by `epigraph_maintenance` and EXECUTE-able by that role alone. The rows \
+         it writes (the `operator_links` row, the operator-group membership, the OPERATED_BY \
+         edge) are written by the definer under its own identity, so a viewer stamp on the \
+         calling connection would change nothing it checks. On an `epigraph_app` DSN the call is refused `42501` and `main` exits; \
+         105's `RVK01` / `RVK02` refuse it before anything is written. Matched because `acquire` \
+         is in WRITE_TOKENS (see the note there).",
+    ),
+    (
         "tools/ds.rs",
         "FrameRepository::create",
         1,

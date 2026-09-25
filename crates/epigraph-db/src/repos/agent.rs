@@ -8,6 +8,82 @@ use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
 
+/// One ACTING operator link: the operator's agent id and the id of the
+/// operator's personal group, which owns the operated agent's new claims.
+///
+/// Produced only by [`AgentRepository::operator_actor`] (migration 107's
+/// `epigraph_operator_actor`): a not-retired link record, a live
+/// `writer`/`admin` membership, and the operator's own personal group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorLink {
+    pub operator_id: Uuid,
+    pub operator_group_id: Uuid,
+}
+
+/// The operator an AUTHOR's claims belong to, from the link record alone.
+///
+/// Produced only by [`AgentRepository::operator_of_author`] (migration 107's
+/// `epigraph_operator_of_author`). Includes RETIRED links, and says nothing
+/// about whether the agent may act: that is [`OperatorLink`]'s question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct AuthorOperator {
+    pub operator_id: Uuid,
+    pub operator_group_id: Uuid,
+    /// The link is retired (migration 107 section 7): the agent never acts for
+    /// the operator.
+    pub retired: bool,
+}
+
+/// What one [`AgentRepository::link_operator`] call did, for the startup log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct OperatorLinkOutcome {
+    /// The operator's personal group.
+    pub operator_group_id: Uuid,
+    /// This call created the operator's personal group (and seeded the
+    /// operator's own `admin` row in it).
+    pub group_created: bool,
+    /// This call inserted the agent's `writer` membership.
+    pub membership_created: bool,
+    /// The agent's membership is live after the call. `false` means an operator
+    /// revoked it and the call deliberately did not restore it.
+    pub membership_live: bool,
+    /// This call inserted the `OPERATED_BY` edge.
+    pub edge_created: bool,
+    /// The link is LIVE after the call, as the authoring and ownership paths
+    /// read it (`epigraph_operator_actor` names this operator). This, not
+    /// [`Self::membership_live`], is what decides whether the agent authors into
+    /// the operator's group: a live membership whose role is no longer
+    /// `writer`/`admin` is not a link.
+    pub link_live: bool,
+    /// The agent's link record is RETIRED (migration 107 section 7). A retired
+    /// link is never promoted: the call inserted no membership, and the agent
+    /// authors into its own group.
+    pub link_retired: bool,
+}
+
+/// What one [`AgentRepository::link_retired_agent`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct RetiredLinkOutcome {
+    /// The operator's personal group.
+    pub operator_group_id: Uuid,
+    /// This call created the operator's personal group.
+    pub group_created: bool,
+    /// This call inserted the `operator_links` row.
+    pub link_created: bool,
+    /// The agent's link record is retired after the call. Always `true` on
+    /// success: an existing ACTOR link to this operator is refused, not left
+    /// in place (migration 107 section 7).
+    pub link_retired: bool,
+    /// This call inserted the `OPERATED_BY` edge.
+    pub edge_created: bool,
+    /// The agent holds a live membership (of any role) in the operator's
+    /// group. Never created or changed by this call. A live `writer`/`admin`
+    /// row is refused before the call writes anything, so `true` here means a
+    /// `reader` row; callers still surface it rather than report a clean
+    /// retire.
+    pub membership_live: bool,
+}
+
 /// A database row combining agent identity fields with capability flags.
 ///
 /// Uses primitive types (no `epigraph-api` imports) so callers can convert
@@ -1332,6 +1408,224 @@ impl AgentRepository {
                 .await?;
 
         Ok(group_id)
+    }
+
+    /// "May `agent_id` act for an operator?" — its ACTING operator link, through
+    /// migration 107's `epigraph_operator_actor` definer read, or `None`.
+    ///
+    /// An acting link is an `operator_links` row that is NOT retired AND a live
+    /// `writer`/`admin` membership for the agent in the group that row names,
+    /// that group being the operator's own personal group. The row is writable
+    /// only inside a link function's definer frame (or on a maintenance login),
+    /// which is what makes a link unforgeable from an `epigraph_app` session;
+    /// the `OPERATED_BY` edge is the graph record and grants nothing, so an HTTP
+    /// server's auth-lineage edges (`EpiGraphMcpFull::record_auth_lineage`)
+    /// never read as links. The membership half is what lets the operator end
+    /// the agent's authority with an ordinary revoke.
+    ///
+    /// Used for the CALLER side of `require_owner_or_admin` and by
+    /// [`crate::repos::ClaimRepository::default_decl_for_author`] — never for
+    /// "whose claim is this?", which is [`Self::operator_of_author`].
+    ///
+    /// `operator_links` is keyed on the agent, so there is at most one.
+    ///
+    /// # Why a definer function and not a read of the tables
+    ///
+    /// On an unstamped `epigraph_app` session `groups_tenancy` and
+    /// `group_memberships_tenancy` hide every row, so an inline read here would
+    /// answer "no operator" on exactly the connections that most need the
+    /// answer, and the caller would fall through to minting. The definer read
+    /// does not depend on the session's stamp.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent (a database that has not
+    /// applied migration 107) or the read fails. Deliberately NOT mapped to
+    /// "no operator": a binary that cannot ask must not author as if the answer
+    /// were no.
+    pub async fn operator_actor(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Option<OperatorLink>, DbError> {
+        let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT operator_id, operator_group_id \
+               FROM public.epigraph_operator_actor($1)",
+        )
+        .bind(agent_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row.map(|(operator_id, operator_group_id)| OperatorLink {
+            operator_id,
+            operator_group_id,
+        }))
+    }
+
+    /// [`Self::operator_actor`] for a caller holding a pool.
+    ///
+    /// # Errors
+    /// As [`Self::operator_actor`], plus `DbError::ConnectionFailed` if no
+    /// connection can be acquired.
+    pub async fn operator_actor_pool(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<Option<OperatorLink>, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::operator_actor(&mut conn, agent_id).await
+    }
+
+    /// "Whose are `agent_id`'s claims?" — the operator named by its link
+    /// record, through migration 107's `epigraph_operator_of_author`, or `None`.
+    ///
+    /// From the `operator_links` row ALONE: RETIRED links are included, and no
+    /// membership is consulted, so an operator keeps ownership of what an agent
+    /// wrote after revoking or retiring it. This answers ONLY the target side
+    /// of `require_owner_or_admin` and refusal-only checks (an HTTP listener
+    /// must not serve as a linked signer). It must never decide authoring or
+    /// the caller side: a retired identity's key may be exposed, and it holds
+    /// no membership, so authoring into its operator's group would be refused
+    /// by RLS and acting for the operator would be an escalation.
+    ///
+    /// # Errors
+    /// As [`Self::operator_actor`].
+    pub async fn operator_of_author(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Option<AuthorOperator>, DbError> {
+        Ok(sqlx::query_as::<_, AuthorOperator>(
+            "SELECT operator_id, operator_group_id, retired \
+               FROM public.epigraph_operator_of_author($1)",
+        )
+        .bind(agent_id)
+        .fetch_optional(&mut *conn)
+        .await?)
+    }
+
+    /// [`Self::operator_of_author`] for a caller holding a pool.
+    ///
+    /// # Errors
+    /// As [`Self::operator_of_author`], plus `DbError::ConnectionFailed` if no
+    /// connection can be acquired.
+    pub async fn operator_of_author_pool(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<Option<AuthorOperator>, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::operator_of_author(&mut conn, agent_id).await
+    }
+
+    /// "Does any agent name `agent_id` as its operator?", through migration
+    /// 107's `epigraph_operates_agents` (retired links included).
+    ///
+    /// REFUSAL-ONLY (107 section 9): an HTTP listener must not serve as a
+    /// signer that is anyone's operator, because on an unauthenticated HTTP
+    /// transport every anonymous caller IS the signer, and would then satisfy
+    /// "caller is the operator of the claim's author". Never use it to GRANT.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails (e.g. a database without 107).
+    pub async fn operates_agents(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar::<_, bool>("SELECT public.epigraph_operates_agents($1)")
+                .bind(agent_id)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// [`Self::operates_agents`] for a caller holding a pool.
+    ///
+    /// # Errors
+    /// As [`Self::operates_agents`], plus `DbError::ConnectionFailed` if no
+    /// connection can be acquired.
+    pub async fn operates_agents_pool(pool: &PgPool, agent_id: Uuid) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::operates_agents(&mut conn, agent_id).await
+    }
+
+    /// Record that `agent_id` is operated by `operator_id`, through migration
+    /// 107's `epigraph_link_operator`.
+    ///
+    /// **The caller's connection privilege is the authorization.** The function
+    /// is EXECUTE-able by `epigraph_maintenance` (and superusers) only; on an
+    /// `epigraph_app` connection this returns the database's `42501 permission
+    /// denied` as `DbError::QueryFailed`. It is never skipped or retried on a
+    /// different connection — a declared link the process cannot record must be
+    /// visible, not absent.
+    ///
+    /// Recorded once: an existing membership row of any state for the pair is
+    /// left untouched, so a link an operator revoked stays revoked
+    /// ([`OperatorLinkOutcome::membership_live`] and
+    /// [`OperatorLinkOutcome::link_live`] report `false`). See the migration's
+    /// section 3.
+    ///
+    /// The OPERATOR's personal group is resolved through migration 105's
+    /// `epigraph_ensure_personal_group` (107 section 3), so its two refusals
+    /// surface here as themselves.
+    ///
+    /// # Errors
+    /// [`DbError::MembershipRevoked`] (RVK01) when the operator's own membership
+    /// of its personal group is only revoked; [`DbError::PersonalGroupNotOwned`]
+    /// (RVK02) when the group under the operator's personal did_key is not the
+    /// operator's own. Both write nothing. `DbError::QueryFailed` for a
+    /// permission refusal, a missing agent, a self-link, an operator that is
+    /// itself operated, or an agent already linked to a DIFFERENT live
+    /// operator; the database message names which.
+    pub async fn link_operator(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        operator_id: Uuid,
+    ) -> Result<OperatorLinkOutcome, DbError> {
+        Ok(sqlx::query_as::<_, OperatorLinkOutcome>(
+            "SELECT operator_group_id, group_created, membership_created, membership_live, \
+                    edge_created, link_live, link_retired \
+               FROM public.epigraph_link_operator($1, $2)",
+        )
+        .bind(agent_id)
+        .bind(operator_id)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
+    /// Record that the RETIRED agent `agent_id`'s claims belong to
+    /// `operator_id`, through migration 107's `epigraph_link_retired_agent`.
+    ///
+    /// Writes the `operator_links` row with `retired = true` and the
+    /// `OPERATED_BY` edge, and creates NO membership: a retired identity's key
+    /// may be publicly recomputable or exposed, so linking it must confer zero
+    /// write authority. The operator (and the operator's live actors) then own
+    /// its claims through `require_owner_or_admin`'s author resolution; the
+    /// retired agent itself can never act for the operator.
+    ///
+    /// Same authorization as [`Self::link_operator`]: EXECUTE-able by
+    /// `epigraph_maintenance` (and superusers) only. Idempotent on an existing
+    /// RETIRED row, and never changes an existing row or membership.
+    ///
+    /// # Errors
+    /// [`DbError::MembershipRevoked`] (RVK01) / [`DbError::PersonalGroupNotOwned`]
+    /// (RVK02) from the operator's own personal group, exactly as
+    /// [`Self::link_operator`]; both write nothing. `DbError::QueryFailed` for a
+    /// permission refusal, a missing agent, a self-link, an operator that is
+    /// itself operated, an agent that already operates others or is linked to
+    /// a DIFFERENT operator, an agent with an ACTOR (not retired) link to this
+    /// operator (a retire is not a demotion), or an agent holding a live
+    /// `writer`/`admin` membership in the operator's group (revoke it first);
+    /// the database message names which, and nothing is written.
+    pub async fn link_retired_agent(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        operator_id: Uuid,
+    ) -> Result<RetiredLinkOutcome, DbError> {
+        Ok(sqlx::query_as::<_, RetiredLinkOutcome>(
+            "SELECT operator_group_id, group_created, link_created, link_retired, \
+                    edge_created, membership_live \
+               FROM public.epigraph_link_retired_agent($1, $2)",
+        )
+        .bind(agent_id)
+        .bind(operator_id)
+        .fetch_one(&mut *conn)
+        .await?)
     }
 
     /// Tier-B projection of one agent, filtered by what `viewer` may see.

@@ -174,6 +174,31 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          on the maintenance role, and deliberately stops short of FOR ALL, \
          which would have covered DELETE too.",
     ),
+    (
+        "operator_links",
+        "UPDATE",
+        "The operator-link record (107) is written once, by \
+         `epigraph_link_operator`'s definer frame, and never edited: a link is \
+         ended by revoking the agent's membership, not by changing this row. \
+         Under FORCE the absent policy default-denies every non-superuser role, \
+         which is the control.",
+    ),
+    (
+        "operator_links",
+        "DELETE",
+        "Same as UPDATE. The row is the record that the link was declared; \
+         re-pointing an agent to a different operator is a deliberate \
+         superuser act, never an application path.",
+    ),
+    (
+        "evidence_visibility_pins",
+        "UPDATE",
+        "A pin (110) is written and removed, never edited: `hide-evidence \
+         --apply` INSERTs it and `reown-reverse` DELETEs it, both on a \
+         maintenance session (the bypass-only INSERT and DELETE policies). \
+         Under FORCE the absent UPDATE policy default-denies every non-superuser \
+         role, and 110 grants UPDATE to nobody.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -232,6 +257,8 @@ const PROTECTED: &[&str] = &[
     "privatization_plan_items",
     "privatization_audit",
     "instance_admins",
+    "operator_links",
+    "evidence_visibility_pins",
 ];
 
 // ===========================================================================

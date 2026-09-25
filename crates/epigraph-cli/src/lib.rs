@@ -7,11 +7,14 @@ pub mod enrichment;
 #[cfg(feature = "genai")]
 pub mod matching_client;
 #[cfg(feature = "db")]
+pub mod operator;
+#[cfg(feature = "db")]
 pub mod recompute_betp;
 #[cfg(feature = "db")]
 pub mod reembed;
 #[cfg(feature = "genai")]
 pub mod rerank;
+pub mod retarget;
 
 #[cfg(feature = "db")]
 use sqlx::PgPool;

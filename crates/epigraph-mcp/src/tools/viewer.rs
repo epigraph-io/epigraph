@@ -152,7 +152,41 @@ pub async fn request_viewer(
         // module doc's "why there is no HTTP-with-no-context arm".
         None => server.agent_id().await?,
     };
-    Viewer::resolve(&server.pool, principal)
-        .await
-        .map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None))
+    if auth.is_none() {
+        return Viewer::resolve(&server.pool, principal)
+            .await
+            .map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None));
+    }
+    // HTTP: an OPERATED principal gets no viewer. Operated agents are
+    // stdio-only (migration 107); token issuance refuses them, but a token
+    // minted BEFORE the link would otherwise carry the operator's group in
+    // this viewer until it expired. Keyed on the link RECORD (any state,
+    // retired included), not on the acting read, which can say "not acting"
+    // while the agent's writer row in the operator's group is live. Checked
+    // concurrently with the resolve, so it adds a round trip of work but no
+    // latency.
+    let (viewer, actor) = tokio::join!(
+        Viewer::resolve(&server.pool, principal),
+        epigraph_db::AgentRepository::operator_of_author_pool(&server.pool, principal),
+    );
+    match actor {
+        Ok(None) => {}
+        Ok(Some(link)) => {
+            return Err(McpError::invalid_request(
+                format!(
+                    "agent {principal} is operated by {} and operated agents are stdio-only: \
+                     this token predates the link and carries no HTTP authority",
+                    link.operator_id
+                ),
+                None,
+            ))
+        }
+        Err(e) => {
+            return Err(McpError::internal_error(
+                format!("could not check whether agent {principal} is operated: {e}"),
+                None,
+            ))
+        }
+    }
+    viewer.map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None))
 }

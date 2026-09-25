@@ -27,3 +27,5 @@ bhh.*
 .hw.*
 .hllock.*
 .hl.*
+.oplock.*
+op.*.err

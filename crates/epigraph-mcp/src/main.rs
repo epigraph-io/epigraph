@@ -108,6 +108,22 @@ struct Cli {
     #[arg(long)]
     read_only: bool,
 
+    /// The agent that OPERATES this process's signer agent (migration 107).
+    ///
+    /// When set, startup records `signer --OPERATED_BY--> operator` plus a
+    /// `writer` membership in the operator's personal group, once
+    /// (`epigraph_link_operator`), and the agent then authors into the
+    /// operator's group and shares ownership with the operator and its other
+    /// agents. The value DECLARES; the `--database-url` privilege AUTHORIZES:
+    /// the link function is EXECUTE-able by `epigraph_maintenance` only, and a
+    /// refusal is fatal.
+    ///
+    /// stdio only, with a declared identity (`--agent-model` / `--agent-key`).
+    /// Refused with `--listen`, and an HTTP listener whose signer already has a
+    /// link refuses to start.
+    #[arg(long = "operator-id", env = "EPIGRAPH_OPERATOR_ID")]
+    operator_id: Option<uuid::Uuid>,
+
     /// Absolute URL of the protected-resource metadata document, advertised in 401
     /// WWW-Authenticate challenges so MCP clients can discover the auth server.
     #[arg(long, env = "EPIGRAPH_RESOURCE_METADATA_URL")]
@@ -456,6 +472,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Operator gate (see `epigraph_mcp::operator`). Signer SELECTION is pure, so
+    // it runs here, before the DB connect, and only its side effects (printing a
+    // generated key) stay below; that lets the gate read the rung off
+    // `select_signer`'s own answer instead of re-deriving it.
+    let selected_signer = select_signer(
+        cli.agent_model.as_deref(),
+        cli.agent_system_prompt.as_deref(),
+        cli.agent_system_prompt_hash.as_deref(),
+        cli.agent_key.as_deref(),
+    )?;
+    if let Err(reason) = epigraph_mcp::operator::check_operator_transport(
+        cli.listen.as_deref(),
+        cli.operator_id,
+        selected_signer.identity_declared,
+    ) {
+        eprintln!("ERROR: {reason}");
+        std::process::exit(1);
+    }
+
     // Fail fast on a malformed --resource-metadata-url. The value is interpolated
     // into the 401 WWW-Authenticate challenge (an HTTP header), which rejects
     // control chars / non-ASCII. Validating here surfaces an operator typo at boot
@@ -558,12 +593,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signer,
         llm_identity,
         identity_declared,
-    } = select_signer(
-        cli.agent_model.as_deref(),
-        cli.agent_system_prompt.as_deref(),
-        cli.agent_system_prompt_hash.as_deref(),
-        cli.agent_key.as_deref(),
-    )?;
+    } = selected_signer;
     // Read the rung off `select_signer`'s own return value rather than
     // re-deriving `agent_model.is_none() && agent_key.is_none()` here: the
     // precedence table is documented as living in one place, and a second copy
@@ -696,6 +726,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use rmcp::transport::streamable_http_server::{
             StreamableHttpServerConfig, StreamableHttpService,
         };
+
+        // Constraint: never serve HTTP as an OPERATED signer. `--operator-id`
+        // was already refused above; this catches a link recorded earlier by a
+        // stdio process under the same key. Read-only, and before anything
+        // below resolves (and so creates) the signer's agent row.
+        if let Err(reason) =
+            epigraph_mcp::operator::refuse_operated_http_signer(&pool, &signer.public_key()).await
+        {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
+        }
 
         let signer = Arc::new(signer);
         let embedder = Arc::new(embedder);
@@ -871,6 +912,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             server.with_generated_signer_identity()
         };
+        // Declared operator: record the link before serving, fatally on refusal
+        // (`epigraph_mcp::operator::self_link`). `check_operator_transport`
+        // already guaranteed stdio and a declared identity.
+        if let Some(operator) = cli.operator_id {
+            if let Err(reason) = epigraph_mcp::operator::self_link(&server, operator).await {
+                eprintln!("ERROR: {reason}");
+                std::process::exit(1);
+            }
+        }
         let service = server.serve(rmcp::transport::stdio()).await.map_err(|e| {
             tracing::error!("MCP serve error: {e}");
             e

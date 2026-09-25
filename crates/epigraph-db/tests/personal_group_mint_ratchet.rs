@@ -152,16 +152,18 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-db/src/repos/claim.rs",
         "personal_group_of",
-        3,
-        "`default_decl_for_author`, `personal_group_of_pool` and `consolidate`'s all-public \
-         branch. All resolve through the definer.",
+        2,
+        "`default_decl_for_author` (reached only when the author has no ACTING operator link, \
+         migration 107) and `personal_group_of_pool`. Both resolve through the definer.",
     ),
     (
         "epigraph-db/src/repos/claim.rs",
         "default_decl_for_author",
-        1,
-        "`default_decl_for_author_pool`'s body: acquire a pool connection, then the same \
-         definer answer as every other caller.",
+        2,
+        "`default_decl_for_author_pool`'s body (acquire a pool connection, then the same \
+         definer answer as every other caller) and `consolidate`'s all-public branch, which \
+         since migration 107 asks the ACTOR read first so an operated agent's merge lands in \
+         its operator's group; otherwise the same definer answer.",
     ),
     (
         "epigraph-ingest-executor/src/system_agent.rs",
@@ -340,6 +342,23 @@ const GUARDED_DEFINERS: &[(&str, usize, &[&str])] = &[
     ("epigraph_ensure_personal_group", 0, &["rvk01", "rvk02"]),
     ("epigraph_community_remove_member", 0, &[]),
     ("epigraph_community_add_member", 1, &["denied_readmit"]),
+    // Migration 107's two operator-link definers are SQL call sites of the
+    // mint, which arm 1 (Rust source only) cannot see. Each resolves the
+    // OPERATOR's personal group through 105's definer and nothing else, so the
+    // marker pins that call (a re-inlined copy of the group + admin-row mint
+    // would drop it), and 0 pins that neither body revives. RVK01 / RVK02 from
+    // the call abort the link: `operator_link.rs::a_link_to_an_operator_with_only_a_revoked_own_row_is_refused`
+    // and `a_squatted_personal_group_is_not_the_operators` (ARM B).
+    (
+        "epigraph_link_operator",
+        0,
+        &["public.epigraph_ensure_personal_group(p_operator)"],
+    ),
+    (
+        "epigraph_link_retired_agent",
+        0,
+        &["public.epigraph_ensure_personal_group(p_operator)"],
+    ),
 ];
 
 /// Functions the LIVE database may hold whose source matches

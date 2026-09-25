@@ -2080,6 +2080,8 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "privatization_plan_items",
     "privatization_audit",
     "instance_admins",
+    "operator_links",
+    "evidence_visibility_pins",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2119,6 +2121,15 @@ const PRIVATIZATION_TABLES: &[&str] = &[
     "privatization_audit",
     "instance_admins",
 ];
+
+/// The operator records: the link record migration 107 creates and FORCEs, and
+/// the evidence visibility pins migration 110 does.
+///
+/// A FOURTH TERM, for the reason [`PRIVATIZATION_TABLES`] is a third: each is
+/// FORCEd by the migration that creates it, not by 079, and neither is a 079
+/// control table nor a D4 privatization table. Neither carries `visibility` /
+/// `owner_group_id` columns, so neither joins `tier_a`.
+const OPERATOR_TABLES: &[&str] = &["operator_links", "evidence_visibility_pins"];
 
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
@@ -2168,6 +2179,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .cloned()
         .chain(CONTROL_TABLES.iter().map(|s| (*s).to_string()))
         .chain(PRIVATIZATION_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(OPERATOR_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()
@@ -2176,7 +2188,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     assert_eq!(
         declared, expected,
         "the FORCEd set must be 062's tier_a union the ten control tables union the four \
-         privatization tables. If a table was ADDED to the generators: FORCE it IN ITS OWN \
+         privatization tables union the operator records (107, 110). If a table was ADDED to the generators: FORCE it IN ITS OWN \
          MIGRATION — 079_rls_force.sql is APPLIED and editing it changes its checksum, which \
          makes the next `sqlx migrate run` refuse to start; 078 set the precedent by FORCEing \
          rls_canary at creation and 080/082/083 followed it. Then add the name to \
@@ -2198,7 +2210,8 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     assert_eq!(
         forced, declared,
         "the catalog and the DECLARED FORCEd set disagree. The declared set is 062's tier_a \
-         union the ten control tables union the four privatization tables — NOT migration \
+         union the ten control tables union the four privatization tables union the \
+         operator-link table — NOT migration \
          079's array, which names only the first two terms and is APPLIED and immutable. A \
          relation that appears here and nowhere in the declaration is a table that FORCEs \
          itself at creation without being declared; add it to PRIVATIZATION_TABLES (or to \
