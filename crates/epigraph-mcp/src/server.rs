@@ -914,7 +914,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. The read, the retirement and the new claim commit together on one transaction stamped from the calling agent (the authenticated caller over HTTP, this server's own agent on stdio): a claim the caller cannot read is reported as not found, and one owned by a group the calling agent cannot write is refused with nothing written. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
+        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. The read, the retirement and the new claim commit together on one transaction stamped from the calling agent (the authenticated caller over HTTP, this server's own agent on stdio): a claim the caller cannot read is reported as not found, and one owned by a group the calling agent cannot write is refused with nothing written (a claims:admin token does not lend write authority into such a group). Who may: the claim's author; on stdio also an agent linked to the same operator as the author; over HTTP also the author's operator, or a claims:admin token. Anyone else is refused with nothing written. The downstream belief cascade (belief_cascade) runs with the calling agent's write authority, one downstream claim at a time: a downstream claim it cannot write keeps its stale support and is named in belief_cascade.errors, while the others are repaired. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
     )]
     async fn supersede_claim(
         &self,
@@ -928,7 +928,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical untouched. Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
+        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical untouched. The gate read, the dedup and its belief repair commit together on one transaction stamped from the calling agent (the authenticated caller over HTTP, this server's own agent on stdio): a duplicate you cannot read is reported as not found, and one owned by a group the calling agent cannot write is refused with nothing written. Who may: the claim's author; on stdio also an agent linked to the same operator as the author; over HTTP also the author's operator, or a claims:admin token. Anyone else is refused with nothing written. The downstream belief cascade (belief_cascade) runs with the calling agent's write authority, one downstream claim at a time: a downstream claim it cannot write keeps its stale support and is named in belief_cascade.errors, while the others are repaired. Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
     )]
     async fn mark_duplicate(
         &self,

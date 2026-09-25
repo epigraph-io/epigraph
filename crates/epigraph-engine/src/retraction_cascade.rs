@@ -116,6 +116,8 @@
 
 use std::collections::HashSet;
 
+use sqlx::Acquire;
+
 use uuid::Uuid;
 
 use epigraph_db::{ClaimRepository, DedupRepair, EdgeRepository, MassFunctionRepository};
@@ -253,13 +255,29 @@ pub async fn cascade_after_dedup(
     // decision) belongs to phase 3, once every row-level mutation is done;
     // deciding `canonical` is unbacked here would also NULL the very interval
     // phase 2 is about to read.
-    if let Err(e) =
-        recompute_claim_belief_on_frame(&mut *conn, viewer, canonical_id, frame_id).await
-    {
-        report.note_error(
-            &format!("pre-refresh canonical {canonical_id} before re-deriving its edges"),
-            e,
-        );
+    match conn.begin().await {
+        Ok(mut sp) => {
+            match recompute_claim_belief_on_frame(&mut sp, viewer, canonical_id, frame_id).await {
+                Ok(_) => {
+                    if let Err(e) = sp.commit().await {
+                        report.note_error(
+                            &format!("release savepoint for canonical {canonical_id}"),
+                            e,
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = sp.rollback().await;
+                    report.note_error(
+                        &format!(
+                            "pre-refresh canonical {canonical_id} before re-deriving its edges"
+                        ),
+                        e,
+                    );
+                }
+            }
+        }
+        Err(e) => report.note_error("savepoint for the canonical pre-refresh", e),
     }
 
     // Phase 2 — edges re-sourced from `dup` onto `canonical`. Their BBAs sit on
@@ -359,18 +377,34 @@ async fn invalidate_and_rewire(
     };
 
     for (edge_id, target_id, relationship) in edges {
-        let deleted =
-            match MassFunctionRepository::delete_for_perspective(&mut *conn, *edge_id).await {
-                Ok(n) => n,
-                Err(e) => {
-                    report.note_error(&format!("invalidate BBA for edge {edge_id}"), e);
-                    continue;
-                }
-            };
+        // ONE SAVEPOINT PER EDGE (batch H-b). The cascade now runs on a
+        // transaction stamped from the retracting caller, and inside a
+        // transaction a refused statement (a target in a group the caller cannot
+        // write: `42501`) aborts everything after it. Without the savepoint one
+        // foreign target would silently void every other target's repair at
+        // COMMIT. With it, a refusal rolls back THIS edge alone — its stale BBA
+        // is restored rather than deleted with no re-derivation — and is
+        // reported, and the walk continues.
+        let mut sp = match conn.begin().await {
+            Ok(sp) => sp,
+            Err(e) => {
+                report.note_error(&format!("savepoint for edge {edge_id}"), e);
+                return queued;
+            }
+        };
+        let deleted = match MassFunctionRepository::delete_for_perspective(&mut *sp, *edge_id).await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                report.note_error(&format!("invalidate BBA for edge {edge_id}"), e);
+                let _ = sp.rollback().await;
+                continue;
+            }
+        };
         if deleted == 0 {
+            let _ = sp.rollback().await;
             continue;
         }
-        report.invalidated_bbas += deleted;
 
         // Re-derive from the current source. After a supersede this normally
         // yields `SourceFactorless` because the replacement claim is inserted
@@ -386,7 +420,7 @@ async fn invalidate_and_rewire(
         // evidence destroyed with `CascadeReport::errors` still empty —
         // precisely the state C1(b) promises the caller can rule out.
         if auto_wire_edge_if_epistemic(
-            &mut *conn,
+            &mut sp,
             viewer,
             /* was_created */ false,
             *edge_id,
@@ -400,14 +434,26 @@ async fn invalidate_and_rewire(
         .await
         .is_none()
         {
+            // Rolled back, not committed: `auto_wire_edge_if_epistemic` swallows
+            // its own failure, and inside the savepoint that failure may have
+            // aborted it. Rolling back keeps the stale BBA rather than deleting
+            // a supporter nothing re-derives.
+            let _ = sp.rollback().await;
             report.note_error(
                 &format!("re-derive edge factor for edge {edge_id} on claim {target_id}"),
                 format!(
-                    "auto-wire from {source_id} failed after the stale BBA was invalidated; \
-                     the supporter is gone until the edge is re-asserted"
+                    "auto-wire from {source_id} failed; the stale BBA was NOT invalidated \
+                     (rolled back), so the target keeps the retracted supporter's frozen \
+                     interval until the edge is re-asserted"
                 ),
             );
+            continue;
         }
+        if let Err(e) = sp.commit().await {
+            report.note_error(&format!("release savepoint for edge {edge_id}"), e);
+            continue;
+        }
+        report.invalidated_bbas += deleted;
 
         if visited.insert(*target_id) {
             queued.push(*target_id);
@@ -433,25 +479,48 @@ async fn repair_targets(
 ) {
     for target_id in targets {
         let target_id = *target_id;
-        match recompute_claim_belief_on_frame(&mut *conn, viewer, target_id, frame_id).await {
+        // One savepoint per target, for the reason `invalidate_and_rewire`
+        // gives: a target the stamp cannot write must fail alone.
+        let mut sp = match conn.begin().await {
+            Ok(sp) => sp,
+            Err(e) => {
+                report.targets.push(target_id);
+                report.note_error(&format!("savepoint for claim {target_id}"), e);
+                return;
+            }
+        };
+        let ok = match recompute_claim_belief_on_frame(&mut sp, viewer, target_id, frame_id).await {
             Ok(true) => {
                 report.targets.push(target_id);
                 report.recomputed.push(target_id);
+                true
             }
             Ok(false) => {
-                match mark_unbacked_if_evidence_free(&mut *conn, viewer, target_id, report).await {
+                match mark_unbacked_if_evidence_free(&mut sp, viewer, target_id, report).await {
                     UnbackedOutcome::Cleared => {
                         report.targets.push(target_id);
                         report.unbacked.push(target_id);
+                        true
                     }
-                    UnbackedOutcome::Failed => report.targets.push(target_id),
-                    UnbackedOutcome::NothingToClear => {}
+                    UnbackedOutcome::Failed => {
+                        report.targets.push(target_id);
+                        false
+                    }
+                    UnbackedOutcome::NothingToClear => true,
                 }
             }
             Err(e) => {
                 report.targets.push(target_id);
                 report.note_error(&format!("recompute claim {target_id}"), e);
+                false
             }
+        };
+        if ok {
+            if let Err(e) = sp.commit().await {
+                report.note_error(&format!("release savepoint for claim {target_id}"), e);
+            }
+        } else {
+            let _ = sp.rollback().await;
         }
     }
 }
