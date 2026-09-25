@@ -1144,14 +1144,25 @@ class App:
         return data if isinstance(data, dict) else {}
 
     def gh_pr_for_head(self, branch: str, base: Optional[str] = None) -> Tuple[Optional[str], Optional[int]]:
-        args = ["pr", "list", "--head", branch, "--state", "open", "--json", "url,number", "--limit", "1"]
+        """The open, SAME-REPOSITORY PR from `branch` (into `base`), if any. `gh pr list --head` matches the bare
+        branch name, fork PRs included, so a fork's PR from a same-named branch must never be the one chosen:
+        it would be refused later anyway, and picking it on every retry blocks the real one from being opened."""
+        args = ["pr", "list", "--head", branch, "--state", "open", "--json",
+                "url,number,isCrossRepository,headRepositoryOwner", "--limit", "50"]
         if base:
             args[4:4] = ["--base", base]
         out = self.gh(args, timeout=60).stdout
         data = json.loads(out or "[]")
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            url = valid_pr_url(data[0].get("url"))
-            number = valid_pr_number(data[0].get("number"))
+        owner = self.gh_repo().split("/")[-2].lower()
+        for hit in data if isinstance(data, list) else []:
+            if not isinstance(hit, dict) or hit.get("isCrossRepository") is not False:
+                continue
+            head_owner = hit.get("headRepositoryOwner")
+            login = str(head_owner.get("login") or "") if isinstance(head_owner, dict) else ""
+            if login and login.lower() != owner:
+                continue
+            url = valid_pr_url(hit.get("url"))
+            number = valid_pr_number(hit.get("number"))
             if url and number and pr_number_from_url(url) == number:
                 return url, number
         return None, None

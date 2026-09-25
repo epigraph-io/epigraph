@@ -89,10 +89,14 @@ ROLLUP = {"SUCCESS": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
           "PENDING": [{"status": "IN_PROGRESS", "conclusion": ""}],
           "NONE": []}
 if argv[:2] == ["pr", "list"]:
-    head, base = opt("--head"), opt("--base")
-    hits = [{"url": URL % p["number"], "number": p["number"]} for p in load().values()
+    # like gh: --head matches the bare branch name (fork PRs included), and only the --json fields come back
+    head, base, fields = opt("--head"), opt("--base"), (opt("--json") or "").split(",")
+    full = [{"url": URL % p["number"], "number": p["number"], "isCrossRepository": p.get("cross", False),
+             "headRepositoryOwner": {"login": "someone-else" if p.get("cross") else "example"}}
+            for p in load().values()
             if p["head"] == head and p["state"] == "OPEN" and (base is None or p["base"] == base)]
-    print(json.dumps(hits[:1]))
+    hits = [{k: v for k, v in h.items() if k in fields} for h in full]
+    print(json.dumps(hits[:int(opt("--limit") or 30)]))
 elif argv[:2] == ["pr", "create"]:
     reg = load()
     head = opt("--head")
@@ -594,6 +598,7 @@ CLAIM_F = "ffffffff-1111-4222-8333-444444444444"
 CLAIM_G = "abababab-1111-4222-8333-444444444444"
 CLAIM_H = "cdcdcdcd-1111-4222-8333-444444444444"
 CLAIM_PIN = "78787878-1111-4222-8333-444444444444"
+CLAIM_FORK = "90909090-1111-4222-8333-444444444444"
 
 
 class IntegrationMergeGuardsTest(_ServerFixture):
@@ -616,6 +621,28 @@ class IntegrationMergeGuardsTest(_ServerFixture):
         create = [c["argv"] for c in self.stub_calls("gh") if c["argv"][:2] == ["pr", "create"]][-1]
         self.assertEqual(create[create.index("--base") + 1], "main")
         self.assertEqual(create[create.index("--head") + 1], branch)
+
+    def test_open_pr_is_not_blocked_by_a_fork_pr_from_a_same_named_branch(self):
+        branch = self.accept_one(CLAIM_FORK, "fork squat")
+        # start from "no integration PR yet": close any PR an earlier test in this class opened for this branch
+        with open(self.stub_prs) as fh:
+            for pr in json.load(fh).values():
+                if pr["head"] == branch and pr["state"] == "OPEN":
+                    self.set_pr_number(pr["number"], state="CLOSED")
+        with self.app.store.lock:
+            self.app.store.state["integration"].update({"pr_url": None, "pr_number": None, "status": "open"})
+        # an outside fork opens a PR from a branch with the integration branch's (predictable) name into main
+        self.add_pr("fork", number=666, base="main", head=branch, state="OPEN", cross=True)
+        creates = len([c for c in self.stub_calls("gh") if c["argv"][:2] == ["pr", "create"]])
+        status, body = self.req("POST", "/api/integration/open-pr", body={})
+        self.assertEqual(status, 200, body)
+        self.assertNotEqual(body["pr_number"], 666)
+        self.assertEqual(len([c for c in self.stub_calls("gh") if c["argv"][:2] == ["pr", "create"]]), creates + 1)
+        self.assertFalse(self.merge_calls(666))
+        # the fork PR stays out on every later lookup as well
+        status, body2 = self.req("POST", "/api/integration/open-pr", body={})
+        self.assertEqual((status, body2["pr_number"]), (200, body["pr_number"]))
+        self.set_pr_number(666, state="CLOSED")
 
     def test_integration_merge_verifies_base_head_state_and_pins_head(self):
         branch = self.accept_one(CLAIM_F, "ship me")
