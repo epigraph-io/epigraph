@@ -132,6 +132,16 @@ async fn seed_world_with(pool: &PgPool, rel: &str) -> World {
 /// The two production handlers the retarget client calls, on a real socket,
 /// behind a request counter.
 async fn serve_api(pool: &PgPool, agent: Uuid) -> (EdgeApiClient, Arc<AtomicUsize>) {
+    serve_api_hanging(pool, agent, None).await
+}
+
+/// [`serve_api`], except that request number `hang_on` (1-based) is accepted
+/// and never answered — an API that stops responding mid-run.
+async fn serve_api_hanging(
+    pool: &PgPool,
+    agent: Uuid,
+    hang_on: Option<usize>,
+) -> (EdgeApiClient, Arc<AtomicUsize>) {
     let state = AppState::with_scoped_pool(
         viewer_fixture::scoped_pool(pool).await,
         ApiConfig::default(),
@@ -145,7 +155,10 @@ async fn serve_api(pool: &PgPool, agent: Uuid) -> (EdgeApiClient, Arc<AtomicUsiz
             move |req: Request, next: Next| {
                 let hits = hits_mw.clone();
                 async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
+                    let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if Some(n) == hang_on {
+                        std::future::pending::<()>().await;
+                    }
                     next.run(req).await
                 }
             },
@@ -714,9 +727,15 @@ async fn tampered_manifest_entries_are_refused_and_write_nothing(pool: PgPool) {
     let mut unshown = entry_for(&w, w.parent_edge, REL, w.parent, vec![w.atoms[0]]);
     unshown.chosen_atom_ids = vec![w.atoms[1]];
 
-    let applied = apply_retarget(&pool, &viewer, &api, &[non_conflict, foreign_atom, unshown])
-        .await
-        .unwrap();
+    let applied = apply_retarget(
+        &pool,
+        &viewer,
+        &api,
+        &[non_conflict, foreign_atom, unshown],
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(applied.len(), 3);
     for a in &applied {
@@ -767,7 +786,7 @@ async fn an_endpoint_retired_after_the_dry_run_is_not_applied(pool: PgPool) {
         .await
         .unwrap();
 
-    let applied = apply_retarget(&pool, &viewer, &api, &dry.plan)
+    let applied = apply_retarget(&pool, &viewer, &api, &dry.plan, None)
         .await
         .unwrap();
 
@@ -830,7 +849,9 @@ async fn an_atom_behind_a_retired_decomposes_to_edge_is_not_a_destination(pool: 
 
     let (api, hits) = serve_api(&pool, w.agent).await;
     let e = entry_for(&w, w.parent_edge, REL, w.parent, vec![stale]);
-    let applied = apply_retarget(&pool, &viewer, &api, &[e]).await.unwrap();
+    let applied = apply_retarget(&pool, &viewer, &api, &[e], None)
+        .await
+        .unwrap();
     assert!(
         applied[0]
             .errors
@@ -970,4 +991,96 @@ async fn an_unwired_atom_edge_is_recorded_and_wired_by_a_later_run(pool: PgPool)
     for m in [m1, m2, m3] {
         std::fs::remove_file(&m).ok();
     }
+}
+
+/// A second decomposed parent disputed by the same source, for multi-entry
+/// runs. Returns `(parent, parent_edge, first_atom)`.
+async fn seed_second_parent(pool: &PgPool, w: &World) -> (Uuid, Uuid, Uuid) {
+    let p2 = seed_claim(pool, w.agent, "Second compound claim. It has parts.", 50).await;
+    let p2a = seed_claim(pool, w.agent, "Second compound part one.", 45).await;
+    let p2b = seed_claim(pool, w.agent, "Second compound part two.", 44).await;
+    seed_edge(pool, p2, p2a, "decomposes_to").await;
+    seed_edge(pool, p2, p2b, "decomposes_to").await;
+    let e2 = seed_edge(pool, w.source, p2, REL).await;
+    (p2, e2, p2a)
+}
+
+fn manifest_applied_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["kind"] == "retarget_applied")
+        .collect()
+}
+
+/// The audit record is written per entry, not at the end: when the API stops
+/// answering during the SECOND entry (the run never finishes), the manifest
+/// already holds the first entry's applied line with the edge id it created.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_applied_entry_reaches_the_manifest_before_the_next_one_starts(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let w = seed_world(&pool).await;
+    let (p2, e2, p2a) = seed_second_parent(&pool, &w).await;
+    // Entry 1 = POST (1) + PATCH (2); entry 2's POST is request 3.
+    let (api, _hits) = serve_api_hanging(&pool, w.agent, Some(3)).await;
+    let plan = vec![
+        entry_for(&w, w.parent_edge, REL, w.parent, vec![w.atoms[1]]),
+        entry_for(&w, e2, REL, p2, vec![p2a]),
+    ];
+    let manifest = manifest_path();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        apply_retarget(&pool, &viewer, &api, &plan, Some(&manifest)),
+    )
+    .await;
+
+    assert!(outcome.is_err(), "the run must still be stuck on entry 2");
+    let lines = manifest_applied_lines(&manifest);
+    assert_eq!(lines.len(), 1, "entry 1 is on record: {lines:?}");
+    let created = edges_between(&pool, w.source, w.atoms[1], REL).await;
+    assert_eq!(created.len(), 1);
+    assert_eq!(lines[0]["edge_id"], serde_json::json!(w.parent_edge));
+    assert_eq!(
+        lines[0]["created_edge_ids"],
+        serde_json::json!([created[0].0])
+    );
+    std::fs::remove_file(&manifest).ok();
+}
+
+/// A database error while applying an entry is recorded ON that entry and
+/// the run continues and returns normally, with every entry on record in the
+/// manifest — instead of aborting with `?` and losing the audit trail.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_database_error_is_recorded_per_entry_and_does_not_abort_the_run(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let w = seed_world(&pool).await;
+    let (p2, e2, p2a) = seed_second_parent(&pool, &w).await;
+    let (api, hits) = serve_api(&pool, w.agent).await;
+    let plan = vec![
+        entry_for(&w, w.parent_edge, REL, w.parent, vec![w.atoms[1]]),
+        entry_for(&w, e2, REL, p2, vec![p2a]),
+    ];
+    // A pool over the same database that is already closed: every query
+    // through it fails.
+    let dead = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    dead.close().await;
+    let manifest = manifest_path();
+
+    let applied = apply_retarget(&dead, &viewer, &api, &plan, Some(&manifest))
+        .await
+        .expect("a database error must not abort the run");
+
+    assert_eq!(applied.len(), 2);
+    for a in &applied {
+        assert!(a.errors.iter().any(|e| e.starts_with("database:")), "{a:?}");
+    }
+    assert_eq!(manifest_applied_lines(&manifest).len(), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing was written");
+    std::fs::remove_file(&manifest).ok();
 }

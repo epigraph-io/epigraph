@@ -65,8 +65,8 @@ use epigraph_cli::decompose::{
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
-    append_jsonl, apply_retarget, load_retarget_items, read_retarget_manifest, run_retarget,
-    verdict, EdgeApiClient, RetargetOptions,
+    apply_retarget, load_retarget_items, read_retarget_manifest, run_retarget, verdict,
+    EdgeApiClient, RetargetOptions,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -727,8 +727,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 api_base,
                 token,
             };
-            let applied = apply_retarget(pool, viewer, &api, &plan).await?;
-            append_jsonl(&manifest, &applied)?;
+            // Each applied line is appended to the manifest as its entry
+            // finishes, not at the end.
+            let applied = apply_retarget(pool, viewer, &api, &plan, Some(&manifest)).await?;
             print_applied(&applied);
         }
         Mode::ApplyPlan(path) => {

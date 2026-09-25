@@ -806,10 +806,23 @@ mod db {
         // spelling (the API's dedup matches the relationship byte-exactly, so
         // re-asserting any other spelling would create a second row).
         let mut reassertable: Vec<(Uuid, Uuid)> = Vec::new();
+        // From here on an entry may already have written something, so a
+        // database error is RECORDED on the entry (keeping the ids created so
+        // far in the manifest) rather than propagated with `?`.
         for &atom in &entry.chosen_atom_ids {
             let matches =
-                existing_atom_edges(pool, viewer, entry.source_id, atom, &entry.relationship)
-                    .await?;
+                match existing_atom_edges(pool, viewer, entry.source_id, atom, &entry.relationship)
+                    .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        applied.errors.push(format!(
+                            "database: looking up existing edges to {atom}: {e}; \
+                         this and later atoms not applied"
+                        ));
+                        break;
+                    }
+                };
             if let Some(live) = matches.iter().find(|e| e.in_force) {
                 applied.existing_edge_ids.push(live.id);
                 if live.source_id == entry.source_id && live.relationship == sent_relationship {
@@ -841,8 +854,15 @@ mod db {
         // outside its `was_created` block), so an edge whose source has since
         // acquired belief wires now; an already-wired edge is never re-sent.
         for (id, atom) in reassertable {
-            if MassFunctionRepository::exists_for_perspective(pool, viewer, id).await? {
-                continue;
+            match MassFunctionRepository::exists_for_perspective(pool, viewer, id).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    applied.errors.push(format!(
+                        "database: BBA check for {id}: {e}; not re-asserted"
+                    ));
+                    continue;
+                }
             }
             match api
                 .create_edge(
@@ -868,8 +888,14 @@ mod db {
             .copied()
             .collect();
         for &id in &resolved {
-            if MassFunctionRepository::exists_for_perspective(pool, viewer, id).await? {
-                applied.ds_wired_edge_ids.push(id);
+            // A failed check counts as unwired: that keeps the edge open for
+            // the next run instead of marking it done on no evidence.
+            match MassFunctionRepository::exists_for_perspective(pool, viewer, id).await {
+                Ok(true) => applied.ds_wired_edge_ids.push(id),
+                Ok(false) => {}
+                Err(e) => applied
+                    .errors
+                    .push(format!("database: BBA check for {id}: {e}")),
             }
         }
         let unwired: Vec<Uuid> = resolved
@@ -1078,26 +1104,45 @@ mod db {
             });
         }
         let api = api.ok_or("retarget apply requires an API client")?;
-        let applied = apply_retarget(pool, viewer, api, &plan).await?;
-        super::append_jsonl(manifest, &applied)?;
+        let applied = apply_retarget(pool, viewer, api, &plan, Some(manifest)).await?;
         Ok(RetargetRun { plan, applied })
     }
 
     /// Apply every `atoms` entry in `plan`, in order.
     ///
+    /// Each [`AppliedEntry`] is appended to `manifest` (when given) AS SOON AS
+    /// its entry finishes, so edges already created are on record even if the
+    /// run dies later (killed, an API that stops answering). A database error
+    /// while applying one entry is recorded in that entry's `errors` and the
+    /// run moves on to the next entry; a re-run adopts whatever was written.
+    ///
     /// # Errors
-    /// Database failure.
+    /// Manifest I/O failure only.
     pub async fn apply_retarget(
         pool: &PgPool,
         viewer: &epigraph_db::visibility::Viewer,
         api: &EdgeApiClient,
         plan: &[RetargetPlanEntry],
+        manifest: Option<&std::path::Path>,
     ) -> Result<Vec<AppliedEntry>, Box<dyn std::error::Error>> {
         let mut out = Vec::new();
         for entry in plan {
-            if let Some(a) = apply_entry(pool, viewer, api, entry).await? {
-                out.push(a);
+            let applied = match apply_entry(pool, viewer, api, entry).await {
+                Ok(Some(a)) => a,
+                Ok(None) => continue,
+                Err(e) => AppliedEntry {
+                    kind: AppliedEntry::KIND.to_string(),
+                    edge_id: entry.edge_id,
+                    errors: vec![format!(
+                        "database: {e}; entry not applied (re-run to resume it)"
+                    )],
+                    ..Default::default()
+                },
+            };
+            if let Some(m) = manifest {
+                super::append_jsonl(m, std::slice::from_ref(&applied))?;
             }
+            out.push(applied);
         }
         Ok(out)
     }
