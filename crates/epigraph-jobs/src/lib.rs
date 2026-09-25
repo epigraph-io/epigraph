@@ -2163,12 +2163,31 @@ pub enum HttpError {
 /// Trait for HTTP client implementations.
 ///
 /// This trait enables dependency injection for testing with mock clients.
+///
+/// # The egress contract — an implementation that breaks it reopens SSRF
+///
+/// [`ConfigurableWebhookHandler`] hands the client an
+/// [`egress::VettedTarget`], not a URL string: the URL has been parsed, its
+/// host resolved ONCE, and every resolved address checked against the egress
+/// table. An implementation MUST:
+///
+/// 1. connect only to [`egress::VettedTarget::addrs`] — never resolve
+///    [`egress::VettedTarget::domain`] again (with reqwest:
+///    `resolve_to_addrs(domain, addrs)` plus a `dns_resolver` that refuses
+///    every other name, so a missed override fails closed);
+/// 2. send to [`egress::VettedTarget::url`] unchanged, so the `Host` header and
+///    TLS SNI/certificate name are the registered host's;
+/// 3. not follow redirects (a hop is a new, unvetted destination) and not use
+///    a proxy (the proxy would resolve the name itself).
+///
+/// Resolving the name again is DNS rebinding: a hostile server answers the
+/// guard with a public address and the client with an internal one.
 #[async_trait]
 pub trait HttpClient: Send + Sync {
-    /// Send an HTTP POST request.
+    /// Send an HTTP POST request to a vetted target.
     ///
     /// # Arguments
-    /// * `url` - Target URL
+    /// * `target` - The vetted URL and the only addresses it may be dialled on
     /// * `headers` - HTTP headers as key-value pairs
     /// * `body` - Request body
     ///
@@ -2176,7 +2195,7 @@ pub trait HttpClient: Send + Sync {
     /// The HTTP response on success, or an error on failure.
     async fn post(
         &self,
-        url: &str,
+        target: &egress::VettedTarget,
         headers: std::collections::HashMap<String, String>,
         body: &str,
     ) -> Result<HttpResponse, HttpError>;
@@ -2421,6 +2440,7 @@ pub struct ConfigurableWebhookHandler {
     http_client: std::sync::Arc<dyn HttpClient>,
     webhook_repo: std::sync::Arc<dyn WebhookRepository>,
     default_timeout: Duration,
+    egress: egress::EgressGuard,
 }
 
 impl ConfigurableWebhookHandler {
@@ -2438,7 +2458,16 @@ impl ConfigurableWebhookHandler {
             http_client,
             webhook_repo,
             default_timeout: Duration::from_secs(30),
+            egress: egress::EgressGuard::system(),
         }
+    }
+
+    /// Replace the egress guard (tests: a guard over
+    /// [`egress::StubResolver`], so no real DNS is consulted).
+    #[must_use]
+    pub fn with_egress_guard(mut self, guard: egress::EgressGuard) -> Self {
+        self.egress = guard;
+        self
     }
 
     /// Set default timeout for HTTP requests.
@@ -2525,18 +2554,25 @@ impl JobHandler for ConfigurableWebhookHandler {
             });
         }
 
-        // SSRF protection: parse the URL and judge the normalised authority
-        // (see `egress`). A URL that does not parse, or is not http(s), is
-        // refused too — the old string slicer skipped the check for it and
-        // handed it to the HTTP client anyway.
-        if let Err(denied) = egress::parse_and_classify(&config.url) {
-            return Err(match denied.blocked_destination() {
-                Some(address) => JobError::SsrfBlocked { address },
-                None => JobError::PermanentFailure {
-                    message: denied.to_string(),
-                },
-            });
-        }
+        // SSRF protection: parse the URL, judge the normalised authority,
+        // resolve a name ONCE and refuse it if any answer is internal (see
+        // `egress`). The vetted addresses travel to the client, which must
+        // dial only those — see the `HttpClient` contract.
+        let target = match self.egress.vet(&config.url).await {
+            Ok(target) => target,
+            Err(denied) => {
+                return Err(match denied.blocked_destination() {
+                    Some(address) => JobError::SsrfBlocked { address },
+                    // A resolution failure can clear on its own; retry it.
+                    None if denied.is_transient() => JobError::ProcessingFailed {
+                        message: denied.to_string(),
+                    },
+                    None => JobError::PermanentFailure {
+                        message: denied.to_string(),
+                    },
+                });
+            }
+        };
 
         // Serialize payload to JSON
         let body = serde_json::to_string(&notification_payload).map_err(|e| {
@@ -2558,7 +2594,7 @@ impl JobHandler for ConfigurableWebhookHandler {
         // Send HTTP request with timeout
         let result = tokio::time::timeout(
             timeout_duration,
-            self.http_client.post(&config.url, headers, &body),
+            self.http_client.post(&target, headers, &body),
         )
         .await;
 
@@ -2581,7 +2617,10 @@ impl JobHandler for ConfigurableWebhookHandler {
                         },
                     }),
 
-                    // Redirect: 3xx - treat as success (client should follow redirects)
+                    // Redirect: 3xx - recorded, NOT followed (the `HttpClient`
+                    // contract forbids following: the hop target was never
+                    // vetted). The registered endpoint answered, so the job
+                    // is done.
                     300..=399 => Ok(JobResult {
                         output: serde_json::json!({
                             "webhook_id": webhook_id.to_string(),

@@ -12,6 +12,7 @@
 //! 5. Error responses: Proper categorization of HTTP status codes
 //! 6. Payload validation: Correct serialization format
 
+use epigraph_jobs::egress::{EgressGuard, StubResolver, VettedTarget};
 use epigraph_jobs::{
     async_trait, compute_hmac_signature, extract_host_from_url, is_internal_ip,
     verify_hmac_signature, ConfigurableWebhookHandler, EpiGraphJob, HttpClient, HttpError,
@@ -127,10 +128,11 @@ impl MockHttpClient {
 impl HttpClient for MockHttpClient {
     async fn post(
         &self,
-        url: &str,
+        target: &VettedTarget,
         headers: HashMap<String, String>,
         body: &str,
     ) -> Result<HttpResponse, HttpError> {
+        let url = target.url().as_str();
         let config = self.response_config.read().unwrap().clone();
         let current_call = self.call_count.fetch_add(1, Ordering::SeqCst);
 
@@ -202,11 +204,28 @@ impl WebhookRepository for MockWebhookRepository {
 // Helper to create a standard test handler
 // ============================================================================
 
+/// The public address every fixture name resolves to. No test here uses real
+/// DNS: the handler's egress guard is built over a `StubResolver`.
+const STUB_PUBLIC_ADDR: &str = "93.184.216.34";
+
 fn create_test_handler(
     http_client: Arc<MockHttpClient>,
     webhook_repo: Arc<MockWebhookRepository>,
 ) -> ConfigurableWebhookHandler {
+    create_test_handler_with_resolver(
+        http_client,
+        webhook_repo,
+        StubResolver::new().with_fallback([STUB_PUBLIC_ADDR.parse().unwrap()]),
+    )
+}
+
+fn create_test_handler_with_resolver(
+    http_client: Arc<MockHttpClient>,
+    webhook_repo: Arc<MockWebhookRepository>,
+    resolver: StubResolver,
+) -> ConfigurableWebhookHandler {
     ConfigurableWebhookHandler::new(http_client, webhook_repo)
+        .with_egress_guard(EgressGuard::with_resolver(Arc::new(resolver)))
 }
 
 // ============================================================================
@@ -637,6 +656,122 @@ async fn test_ssrf_obfuscated_loopback_spellings_are_blocked() {
     }
 }
 
+/// Backlog c89b65b0 on the jobs path: a NAME that resolves to loopback or to
+/// the metadata address must be refused like the literal it resolves to, with
+/// zero client calls. Before resolution existed the handler judged only the
+/// literal host, so a public name pointed at 127.0.0.1 was POSTed to.
+#[tokio::test]
+async fn test_ssrf_name_resolving_internal_is_blocked() {
+    for (name, addr) in [
+        ("loopback-alias.example", "127.0.0.1"),
+        ("metadata-alias.example", "169.254.169.254"),
+    ] {
+        let http_client = Arc::new(MockHttpClient::new());
+        let webhook_repo = Arc::new(MockWebhookRepository::new());
+        let webhook_id = Uuid::new_v4();
+        webhook_repo.add_webhook(WebhookConfig {
+            id: webhook_id,
+            url: format!("https://{name}/hook"),
+            secret: None,
+            enabled: true,
+            retry_count: 0,
+            timeout_seconds: 5,
+        });
+        let handler = create_test_handler_with_resolver(
+            http_client.clone(),
+            webhook_repo,
+            StubResolver::new().with(name, [addr.parse().unwrap()]),
+        );
+        let job = EpiGraphJob::WebhookNotification {
+            webhook_id,
+            payload: json!({"event": "test"}),
+        }
+        .into_job()
+        .unwrap();
+
+        let result = handler.handle(&job).await;
+
+        match &result {
+            Err(JobError::SsrfBlocked { address }) => assert!(
+                address.contains(addr),
+                "{name}: the refusal must name the resolved address: {address}"
+            ),
+            other => panic!("{name} must be SsrfBlocked, got {other:?}"),
+        }
+        assert_eq!(http_client.get_call_count(), 0, "{name} reached the client");
+    }
+}
+
+/// The client receives the vetted addresses to pin — the single resolution
+/// the guard judged — not just a URL it would resolve again.
+#[tokio::test]
+async fn test_client_receives_the_vetted_addresses() {
+    let webhook_repo = Arc::new(MockWebhookRepository::new());
+    let webhook_id = Uuid::new_v4();
+    webhook_repo.add_webhook(WebhookConfig {
+        id: webhook_id,
+        url: "https://pinned.example:8443/hook".to_string(),
+        secret: None,
+        enabled: true,
+        retry_count: 0,
+        timeout_seconds: 5,
+    });
+    let resolver = Arc::new(StubResolver::new().with(
+        "pinned.example",
+        [
+            "93.184.216.34".parse().unwrap(),
+            "2606:4700::1".parse().unwrap(),
+        ],
+    ));
+    let seen = Arc::new(RwLock::new(Vec::new()));
+
+    /// (url, domain, vetted addrs) per call.
+    type Seen = (String, Option<String>, Vec<std::net::SocketAddr>);
+    struct Recorder(Arc<RwLock<Vec<Seen>>>);
+    #[async_trait]
+    impl HttpClient for Recorder {
+        async fn post(
+            &self,
+            target: &VettedTarget,
+            _headers: HashMap<String, String>,
+            _body: &str,
+        ) -> Result<HttpResponse, HttpError> {
+            self.0.write().unwrap().push((
+                target.url().to_string(),
+                target.domain().map(str::to_string),
+                target.addrs().to_vec(),
+            ));
+            Ok(HttpResponse {
+                status_code: 200,
+                body: String::new(),
+            })
+        }
+    }
+
+    let handler = ConfigurableWebhookHandler::new(Arc::new(Recorder(seen.clone())), webhook_repo)
+        .with_egress_guard(EgressGuard::with_resolver(resolver.clone()));
+    let job = EpiGraphJob::WebhookNotification {
+        webhook_id,
+        payload: json!({"event": "test"}),
+    }
+    .into_job()
+    .unwrap();
+    handler.handle(&job).await.expect("public target delivers");
+
+    let seen = seen.read().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "https://pinned.example:8443/hook");
+    assert_eq!(seen[0].1.as_deref(), Some("pinned.example"));
+    assert_eq!(
+        seen[0].2,
+        vec![
+            "93.184.216.34:8443".parse().unwrap(),
+            "[2606:4700::1]:8443".parse().unwrap()
+        ]
+    );
+    assert_eq!(resolver.calls("pinned.example"), 1, "resolved exactly once");
+}
+
 /// Webhook to localhost should be rejected
 #[tokio::test]
 async fn test_ssrf_localhost_rejected() {
@@ -1027,7 +1162,8 @@ async fn test_rate_limit_429_with_retry_after() {
 // Test: Redirect Handling (3xx)
 // ============================================================================
 
-/// 3xx redirects should be handled (treated as success since client follows)
+/// 3xx redirects are recorded and NOT followed (the `HttpClient` contract
+/// forbids following an unvetted hop); the job completes.
 #[tokio::test]
 async fn test_redirect_handling() {
     let redirect_codes = [301, 302, 307, 308];
@@ -1063,7 +1199,7 @@ async fn test_redirect_handling() {
 
         let result = handler.handle(&job).await;
 
-        // Redirects are treated as success (client should follow redirects)
+        // Redirects are recorded as a completed delivery, not followed
         assert!(
             result.is_ok(),
             "Redirect {status_code} should be treated as success: {result:?}"

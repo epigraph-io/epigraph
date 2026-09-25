@@ -23,6 +23,29 @@
 //! substring of the raw input. That is what makes `http://example.com@127.0.0.1/`
 //! (userinfo), `http://[::1]:8080/`, `http://127.1/` and `http://2130706433/`
 //! (alternate loopback spellings) all land on the loopback address they name.
+//!
+//! # Resolution, and why the answer must be pinned
+//!
+//! A name is only as safe as what it resolves to: a public name can have a
+//! static record pointing at loopback or at the metadata address, and no
+//! string check on the name can see that. [`EgressGuard::vet`] therefore
+//! resolves the name ONCE and refuses it if ANY answer is internal.
+//!
+//! Vetting alone is not enough. If the HTTP client then resolves the name
+//! again, a hostile DNS server can answer the guard with a public address and
+//! the client, moments later, with an internal one (DNS rebinding). So `vet`
+//! returns a [`VettedTarget`] carrying the vetted socket addresses, and every
+//! caller must connect to those and nothing else — keeping the URL (and so the
+//! `Host` header and TLS SNI) unchanged. Redirects must not be followed: a hop
+//! is a new, unvetted destination.
+//!
+//! # Tests never use real DNS
+//!
+//! The resolver is injectable ([`EgressResolver`]); [`StubResolver`] answers
+//! from a table. A stub cannot weaken the guard — whatever it returns is still
+//! judged by the table. The one way to reach a loopback listener in a test is
+//! [`EgressGuard::exempt_socket_for_tests`], which exists only under the
+//! `test-support` feature (enabled from `[dev-dependencies]` only).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -57,18 +80,52 @@ pub enum EgressDenied {
         "Webhook URL must not target an internal address (loopback name reserved by RFC 6761): {0}"
     )]
     ReservedName(String),
+    /// The host is a name that resolved to at least one refused address.
+    ///
+    /// ANY internal answer refuses the whole name: a resolver may return the
+    /// addresses in any order and the client may try any of them.
+    #[error("Webhook URL host {host} resolves to an internal address ({category}): {addr}")]
+    ResolvesInternal {
+        /// The name as the URL spelled it (normalised).
+        host: String,
+        /// The first refused address in the answer.
+        addr: IpAddr,
+        /// The table row it matched.
+        category: &'static str,
+    },
+    /// The host is a name that could not be resolved (no answer, an empty
+    /// answer, a resolver error, or a timeout). Nothing can be vetted, so
+    /// nothing is dialled.
+    #[error("Webhook URL host {host} could not be resolved: {reason}")]
+    Unresolvable {
+        /// The name as the URL spelled it (normalised).
+        host: String,
+        /// What the resolver said.
+        reason: String,
+    },
 }
 
 impl EgressDenied {
     /// The refused destination, for logs and `JobError::SsrfBlocked`, or `None`
-    /// when the refusal is about the URL's shape rather than where it points.
+    /// when the refusal is not about an internal destination (a bad shape, or
+    /// a name that did not resolve).
     #[must_use]
     pub fn blocked_destination(&self) -> Option<String> {
         match self {
             Self::InternalAddress { addr, .. } => Some(addr.to_string()),
             Self::ReservedName(name) => Some(name.clone()),
-            Self::Unparseable(_) | Self::Scheme(_) | Self::NoHost => None,
+            Self::ResolvesInternal { host, addr, .. } => Some(format!("{host} ({addr})")),
+            Self::Unparseable(_) | Self::Scheme(_) | Self::NoHost | Self::Unresolvable { .. } => {
+                None
+            }
         }
+    }
+
+    /// May the same URL be vetted successfully later? Only a resolution
+    /// failure can change without the URL changing.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Unresolvable { .. })
     }
 }
 
@@ -161,6 +218,314 @@ pub fn parse_and_classify(raw: &str) -> Result<CheckedUrl, EgressDenied> {
     // Both allowed schemes are special, so a known default always exists.
     let port = url.port_or_known_default().unwrap_or(80);
     Ok(CheckedUrl { url, host, port })
+}
+
+// =============================================================================
+// RESOLUTION
+// =============================================================================
+
+/// Name resolution as the guard sees it.
+///
+/// Injectable so tests never touch real DNS ([`StubResolver`]). A resolver
+/// cannot weaken the guard: whatever it returns is judged by the address
+/// table, and the returned addresses are the only ones the caller may dial.
+#[async_trait::async_trait]
+pub trait EgressResolver: Send + Sync {
+    /// Resolve `host` (as the URL spells it, normalised by the `url` crate)
+    /// to the addresses a client would try.
+    ///
+    /// # Errors
+    ///
+    /// Any resolution failure; the guard reports it as
+    /// [`EgressDenied::Unresolvable`].
+    async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<IpAddr>>;
+}
+
+/// The operating system's resolver (`getaddrinfo`, via `tokio::net::lookup_host`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemResolver;
+
+#[async_trait::async_trait]
+impl EgressResolver for SystemResolver {
+    async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<IpAddr>> {
+        Ok(tokio::net::lookup_host((host, port))
+            .await?
+            .map(|sa| sa.ip())
+            .collect())
+    }
+}
+
+/// A fixed-answer resolver for tests. No network access.
+///
+/// Each name maps to a SEQUENCE of answers: the n-th lookup of a name returns
+/// the n-th answer and the last answer repeats, which is how a test models a
+/// DNS-rebinding server (public on the first lookup, internal afterwards).
+/// Names are matched case-insensitively with a trailing root dot ignored. A
+/// name with no entry falls back to [`Self::with_fallback`]'s answer, or fails
+/// like NXDOMAIN.
+#[derive(Debug, Default)]
+pub struct StubResolver {
+    answers: std::collections::HashMap<String, Vec<Vec<IpAddr>>>,
+    fallback: Option<Vec<IpAddr>>,
+    calls: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+}
+
+impl StubResolver {
+    /// An empty stub: every lookup fails.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn key(host: &str) -> String {
+        host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+    }
+
+    /// Answer `host` with `addrs` on every lookup.
+    #[must_use]
+    pub fn with(self, host: &str, addrs: impl IntoIterator<Item = IpAddr>) -> Self {
+        self.with_sequence(host, vec![addrs.into_iter().collect()])
+    }
+
+    /// Answer the n-th lookup of `host` with `answers[n]`; the last repeats.
+    #[must_use]
+    pub fn with_sequence(mut self, host: &str, answers: Vec<Vec<IpAddr>>) -> Self {
+        self.answers.insert(Self::key(host), answers);
+        self
+    }
+
+    /// Answer every name that has no entry with `addrs`.
+    #[must_use]
+    pub fn with_fallback(mut self, addrs: impl IntoIterator<Item = IpAddr>) -> Self {
+        self.fallback = Some(addrs.into_iter().collect());
+        self
+    }
+
+    /// How many times `host` has been looked up.
+    #[must_use]
+    pub fn calls(&self, host: &str) -> usize {
+        self.calls
+            .lock()
+            .map(|c| c.get(&Self::key(host)).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl EgressResolver for StubResolver {
+    async fn resolve(&self, host: &str, _port: u16) -> std::io::Result<Vec<IpAddr>> {
+        let key = Self::key(host);
+        let n = {
+            let mut calls = self
+                .calls
+                .lock()
+                .map_err(|_| std::io::Error::other("stub resolver lock poisoned"))?;
+            let entry = calls.entry(key.clone()).or_insert(0);
+            *entry += 1;
+            *entry - 1
+        };
+        if let Some(seq) = self.answers.get(&key) {
+            if let Some(answer) = seq.get(n).or_else(|| seq.last()) {
+                return Ok(answer.clone());
+            }
+        }
+        self.fallback.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("stub resolver has no answer for {host}"),
+            )
+        })
+    }
+}
+
+// =============================================================================
+// THE GUARD
+// =============================================================================
+
+/// A URL that passed every check, with the ONLY socket addresses it may be
+/// dialled on.
+///
+/// For a name, `addrs` is the single vetted resolution. Dialling anything
+/// else — in particular, letting the HTTP client resolve the name again —
+/// reopens DNS rebinding: a hostile server can answer the guard with a public
+/// address and the client with an internal one. See [`EgressGuard::vet`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VettedTarget {
+    checked: CheckedUrl,
+    addrs: Vec<std::net::SocketAddr>,
+}
+
+impl VettedTarget {
+    /// The URL to send to. Unchanged from what was judged, so the `Host`
+    /// header and TLS SNI/certificate name are the registered host's.
+    #[must_use]
+    pub fn url(&self) -> &url::Url {
+        self.checked.url()
+    }
+
+    /// The name to pin, or `None` for an IP-literal URL (which the client
+    /// dials directly, without resolving).
+    #[must_use]
+    pub fn domain(&self) -> Option<&str> {
+        match self.checked.host() {
+            CheckedHost::Domain(name) => Some(name),
+            CheckedHost::Ip(_) => None,
+        }
+    }
+
+    /// The port every address is dialled on.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.checked.port()
+    }
+
+    /// The vetted socket addresses — the only ones a client may connect to.
+    /// Never empty.
+    #[must_use]
+    pub fn addrs(&self) -> &[std::net::SocketAddr] {
+        &self.addrs
+    }
+}
+
+/// Default bound on a single resolution, so a slow resolver cannot hold a
+/// registration request or a delivery open indefinitely.
+pub const DEFAULT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The egress guard: parse, classify, resolve once, refuse if any answer is
+/// internal, and hand back the vetted addresses to pin.
+#[derive(Clone)]
+pub struct EgressGuard {
+    resolver: std::sync::Arc<dyn EgressResolver>,
+    resolve_timeout: std::time::Duration,
+    #[cfg(feature = "test-support")]
+    exempt: std::sync::Arc<std::collections::HashSet<std::net::SocketAddr>>,
+}
+
+impl std::fmt::Debug for EgressGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("EgressGuard");
+        d.field("resolve_timeout", &self.resolve_timeout);
+        #[cfg(feature = "test-support")]
+        d.field("exempt", &self.exempt);
+        d.finish_non_exhaustive()
+    }
+}
+
+impl Default for EgressGuard {
+    fn default() -> Self {
+        Self::system()
+    }
+}
+
+impl EgressGuard {
+    /// The production guard: the operating system's resolver.
+    #[must_use]
+    pub fn system() -> Self {
+        Self::with_resolver(std::sync::Arc::new(SystemResolver))
+    }
+
+    /// A guard over a caller-supplied resolver (tests: [`StubResolver`]).
+    #[must_use]
+    pub fn with_resolver(resolver: std::sync::Arc<dyn EgressResolver>) -> Self {
+        Self {
+            resolver,
+            resolve_timeout: DEFAULT_RESOLVE_TIMEOUT,
+            #[cfg(feature = "test-support")]
+            exempt: std::sync::Arc::default(),
+        }
+    }
+
+    /// Bound each resolution by `timeout`.
+    #[must_use]
+    pub fn resolve_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.resolve_timeout = timeout;
+        self
+    }
+
+    /// TEST SUPPORT ONLY: treat exactly `addr` (IP *and* port) as external
+    /// when a NAME resolves to it, so a test can deliver to a local listener.
+    ///
+    /// Compiled only with the `test-support` feature, which only
+    /// `[dev-dependencies]` enable, so a release build of any binary does not
+    /// contain it. Keyed on the full socket address so a test guard still
+    /// refuses every other loopback port — a redirect hop, a second listener.
+    /// IP-literal URLs are never exempted.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn exempt_socket_for_tests(mut self, addr: std::net::SocketAddr) -> Self {
+        std::sync::Arc::make_mut(&mut self.exempt).insert(addr);
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    fn is_exempt(&self, addr: std::net::SocketAddr) -> bool {
+        self.exempt.contains(&addr)
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    #[allow(clippy::unused_self)]
+    fn is_exempt(&self, _addr: std::net::SocketAddr) -> bool {
+        false
+    }
+
+    /// Vet `raw` as a webhook destination.
+    ///
+    /// 1. [`parse_and_classify`] — shape, scheme, IP literal, reserved names.
+    /// 2. For a name: resolve it ONCE (bounded by the resolve timeout). An
+    ///    error, a timeout, or an empty answer refuses it
+    ///    ([`EgressDenied::Unresolvable`]).
+    /// 3. Refuse if ANY resolved address is internal
+    ///    ([`EgressDenied::ResolvesInternal`]).
+    /// 4. Return the vetted addresses. The caller must connect to these and
+    ///    only these ([`VettedTarget`]).
+    ///
+    /// # Errors
+    ///
+    /// [`EgressDenied`] naming the rule the URL tripped.
+    pub async fn vet(&self, raw: &str) -> Result<VettedTarget, EgressDenied> {
+        let checked = parse_and_classify(raw)?;
+        let port = checked.port();
+
+        let addrs = match checked.host() {
+            CheckedHost::Ip(ip) => vec![std::net::SocketAddr::new(*ip, port)],
+            CheckedHost::Domain(name) => {
+                let unresolvable = |reason: String| EgressDenied::Unresolvable {
+                    host: name.clone(),
+                    reason,
+                };
+                let ips =
+                    tokio::time::timeout(self.resolve_timeout, self.resolver.resolve(name, port))
+                        .await
+                        .map_err(|_| {
+                            unresolvable(format!("timed out after {:?}", self.resolve_timeout))
+                        })?
+                        .map_err(|e| unresolvable(e.to_string()))?;
+                if ips.is_empty() {
+                    return Err(unresolvable("no addresses".to_string()));
+                }
+
+                let mut addrs: Vec<std::net::SocketAddr> = Vec::with_capacity(ips.len());
+                for ip in ips {
+                    let sa = std::net::SocketAddr::new(ip, port);
+                    if let Some(category) = internal_category(ip) {
+                        if !self.is_exempt(sa) {
+                            return Err(EgressDenied::ResolvesInternal {
+                                host: name.clone(),
+                                addr: ip,
+                                category,
+                            });
+                        }
+                    }
+                    if !addrs.contains(&sa) {
+                        addrs.push(sa);
+                    }
+                }
+                addrs
+            }
+        };
+
+        Ok(VettedTarget { checked, addrs })
+    }
 }
 
 /// Name the reason `addr` must not be dialled, or `None` if it is a globally
@@ -370,6 +735,93 @@ mod tests {
                 "{raw} must be refused as internal, got {got:?}"
             );
         }
+    }
+
+    fn stub_guard(stub: StubResolver) -> (EgressGuard, std::sync::Arc<StubResolver>) {
+        let stub = std::sync::Arc::new(stub);
+        (EgressGuard::with_resolver(stub.clone()), stub)
+    }
+
+    /// Backlog c89b65b0: a public NAME that resolves to loopback or to the
+    /// metadata address passed every gate, because names were never resolved.
+    #[tokio::test]
+    async fn vet_refuses_names_that_resolve_internal() {
+        let (guard, _) = stub_guard(
+            StubResolver::new()
+                .with("loopback-alias.example", [ip("127.0.0.1")])
+                .with("metadata-alias.example", [ip("169.254.169.254")])
+                .with("mapped-alias.example", [ip("::ffff:10.0.0.1")])
+                .with("cgnat-alias.example", [ip("100.64.1.1")])
+                // Round-robin with ONE internal member: the client may pick
+                // either, so the whole name is refused.
+                .with("mixed.example", [ip("93.184.216.34"), ip("10.0.0.5")]),
+        );
+        for name in [
+            "loopback-alias.example",
+            "metadata-alias.example",
+            "mapped-alias.example",
+            "cgnat-alias.example",
+            "mixed.example",
+        ] {
+            let got = guard.vet(&format!("https://{name}/hook")).await;
+            assert!(
+                matches!(got, Err(EgressDenied::ResolvesInternal { .. })),
+                "{name} must be refused, got {got:?}"
+            );
+        }
+    }
+
+    /// The control: a name resolving only to public addresses is accepted,
+    /// and the vetted set is exactly the resolved answer on the URL's port.
+    #[tokio::test]
+    async fn vet_accepts_public_names_and_returns_the_answer_to_pin() {
+        let (guard, stub) = stub_guard(
+            StubResolver::new().with("hooks.example", [ip("93.184.216.34"), ip("2606:4700::1")]),
+        );
+        let t = guard
+            .vet("https://Hooks.Example:8443/x")
+            .await
+            .expect("public name");
+        assert_eq!(t.domain(), Some("hooks.example"));
+        assert_eq!(
+            t.addrs(),
+            &[
+                "93.184.216.34:8443".parse().unwrap(),
+                "[2606:4700::1]:8443".parse().unwrap()
+            ]
+        );
+        assert_eq!(t.url().as_str(), "https://hooks.example:8443/x");
+        assert_eq!(stub.calls("hooks.example"), 1, "resolved exactly once");
+
+        let lit = guard.vet("http://93.184.216.34/x").await.expect("literal");
+        assert_eq!(lit.domain(), None);
+        assert_eq!(lit.addrs(), &["93.184.216.34:80".parse().unwrap()]);
+    }
+
+    /// A name that does not resolve cannot be vetted, so it is refused — and
+    /// the refusal is transient, not an SSRF verdict.
+    #[tokio::test]
+    async fn vet_refuses_unresolvable_names() {
+        let (guard, _) = stub_guard(StubResolver::new().with("empty.example", []));
+        for raw in ["https://nxdomain.example/x", "https://empty.example/x"] {
+            let got = guard.vet(raw).await;
+            match got {
+                Err(ref d @ EgressDenied::Unresolvable { .. }) => {
+                    assert!(d.is_transient());
+                    assert_eq!(d.blocked_destination(), None);
+                }
+                other => panic!("{raw} must be Unresolvable, got {other:?}"),
+            }
+        }
+    }
+
+    /// Literals and reserved names are refused BEFORE the resolver is asked.
+    #[tokio::test]
+    async fn vet_does_not_resolve_what_parse_already_refused() {
+        let (guard, stub) = stub_guard(StubResolver::new().with_fallback([ip("93.184.216.34")]));
+        assert!(guard.vet("http://127.0.0.1/x").await.is_err());
+        assert!(guard.vet("http://localhost/x").await.is_err());
+        assert_eq!(stub.calls("localhost"), 0);
     }
 
     /// The control, and the shape checks.

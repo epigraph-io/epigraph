@@ -34,6 +34,10 @@ proptest = { workspace = true }
 default = []
 # Enable integration tests that require a live PostgreSQL database
 integration = []
+# Exposes `egress::EgressGuard::exempt_socket_for_tests`, which lets a test
+# guard deliver to one exact local listener. Enable ONLY from
+# [dev-dependencies]: a release build must not contain it.
+test-support = []
 
 [lints]
 workspace = true
