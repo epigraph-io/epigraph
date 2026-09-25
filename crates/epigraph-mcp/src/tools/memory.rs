@@ -136,8 +136,14 @@ pub async fn memorize(
     let mut tx = crate::claim_helper::begin_author_stamped_tx(server, author, "memorize").await?;
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
-    let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&mut tx, viewer, &claim, "memorize").await?;
+    let (claim, was_created) = crate::claim_helper::create_claim_idempotent(
+        &mut tx,
+        viewer,
+        &claim,
+        Some(signer_typed.as_uuid()),
+        "memorize",
+    )
+    .await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Persist tags as claim labels so `query_claims_by_label` can surface them.

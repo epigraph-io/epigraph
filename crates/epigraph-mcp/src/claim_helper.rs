@@ -734,6 +734,7 @@ pub async fn create_claim_idempotent(
     conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim: &Claim,
+    signer_agent_id: Option<uuid::Uuid>,
     tool_name: &'static str,
 ) -> Result<(Claim, bool), McpError> {
     // Tenancy declaration (PR-16). Every MCP writer that reaches this helper
@@ -750,9 +751,14 @@ pub async fn create_claim_idempotent(
     let decl = ClaimRepository::default_decl_for_author(&mut *conn, claim.agent_id.into())
         .await
         .map_err(crate::errors::db_caller_error)?;
-    let (claim, was_created) = ClaimRepository::create_or_get(&mut *conn, viewer, claim, decl)
-        .await
-        .map_err(internal_error)?;
+    // The signature is persisted with its SIGNER (batch H-b, D1-sig): the author
+    // is `claim.agent_id`, the signer is `signer_agent_id`, and since D1 they
+    // differ for every authenticated caller. `verify_claim` checks the stored
+    // signature against the signer's key. `None` stores no signature, as before.
+    let (claim, was_created) =
+        ClaimRepository::create_or_get_signed(&mut *conn, viewer, claim, decl, signer_agent_id)
+            .await
+            .map_err(internal_error)?;
 
     emit_verb_edge_best_effort(
         &mut *conn,

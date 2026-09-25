@@ -419,8 +419,14 @@ async fn write_submission(
     // and a provider round trip must not hold a transaction open.
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
-    let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&mut *conn, viewer, claim, tool_name).await?;
+    let (claim, was_created) = crate::claim_helper::create_claim_idempotent(
+        &mut *conn,
+        viewer,
+        claim,
+        Some(signer_agent_id),
+        tool_name,
+    )
+    .await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Already validated above, before the claim write. This call can now only

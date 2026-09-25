@@ -887,7 +887,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with."
+        description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with. The signature is checked against the key of the claim's SIGNER (the agent recorded as claims.signer_id), not its author: a claim written through MCP is authored by the calling agent and signed by the MCP server, so it verifies (signed=true, signature_valid=true) whoever authored it. A claim with no stored signature reports signed=false."
     )]
     async fn verify_claim(
         &self,

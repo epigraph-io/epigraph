@@ -1264,6 +1264,14 @@ pub struct VerifyResponse {
     /// Added with backlog `49c17386`: `signature_valid` alone conflated
     /// "unsigned" with "bad signature", and while `claim_from_row` hardcoded
     /// `signature = None` every claim looked like the latter.
+    ///
+    /// The signature belongs to the claim's SIGNER (`claims.signer_id`), which
+    /// is not necessarily its author (`claims.agent_id`). Since batch H-b an MCP
+    /// `submit_claim` / `memorize` / `batch_submit_claims` / resolution claim is
+    /// authored by the calling agent and signed by the MCP server's key, and the
+    /// server's agent is recorded as the signer, so such a claim reports
+    /// `signed = true, signature_valid = true`. Claims written before that, and
+    /// by paths that store no signature, report `signed = false`.
     pub signed: bool,
     /// The authoritative integrity verdict. See [`HashCheck`] — in particular,
     /// only [`HashCheck::Mismatch`] is evidence of tampering.
