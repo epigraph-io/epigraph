@@ -930,6 +930,18 @@ fn print_retarget_plan(plan: &[epigraph_cli::retarget::RetargetPlanEntry]) {
             e.parent_id
         );
     }
+    let held = plan
+        .iter()
+        .filter(|e| e.verdict == verdict::ATOMS)
+        .filter_map(|e| epigraph_cli::retarget::hold_reason(&e.relationship))
+        .count();
+    if held > 0 {
+        eprintln!(
+            "note: {held} of the atom mappings above are `contradicts` retargets, which --apply \
+             HOLDS (reports, writes nothing) until POST /api/v1/edges accepts lower-case \
+             `contradicts`; see epigraph_cli::retarget::HELD_RELATIONSHIPS"
+        );
+    }
     let count = |v: &str| plan.iter().filter(|e| e.verdict == v).count();
     eprintln!(
         "retarget plan: {} edges — atoms={} whole={} unclear={} malformed={} no_answer={} llm_error={}",
@@ -949,6 +961,7 @@ fn print_applied(applied: &[epigraph_cli::retarget::AppliedEntry]) {
     let mut blocked = 0;
     let mut unwired = 0;
     let mut marked = 0;
+    let held = applied.iter().filter(|a| a.held).count();
     for a in applied {
         created += a.created_edge_ids.len();
         existing += a.existing_edge_ids.len();
@@ -973,7 +986,8 @@ fn print_applied(applied: &[epigraph_cli::retarget::AppliedEntry]) {
     }
     eprintln!(
         "retarget apply: {} entries — created={created} existing={existing} \
-         blocked_by_retired={blocked} parents_marked={marked} created_but_not_ds_wired={unwired}",
+         blocked_by_retired={blocked} held={held} parents_marked={marked} \
+         created_but_not_ds_wired={unwired}",
         applied.len()
     );
     if unwired > 0 {

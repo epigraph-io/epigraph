@@ -16,10 +16,12 @@
 //!    SOURCE claim contradicts. Allowed answers: a non-empty subset of atom
 //!    indices, `"whole"`, or `"unclear"`. Anything else is malformed, and a
 //!    malformed answer takes NO action for that edge ([`parse_retarget_response`]).
-//! 2. For each chosen atom, create the SAME relationship source→atom through
-//!    `POST /api/v1/edges`, so the API's create→wire path runs and DS belief
-//!    is wired on the atom exactly as a fresh link would be. Provenance rides
-//!    on the edge's properties.
+//! 2. For each chosen atom, create the same relationship source→atom, in its
+//!    lower-case spelling ([`api_relationship`]), through `POST /api/v1/edges`,
+//!    so the API's create→wire path runs and DS belief is wired on the atom
+//!    exactly as a fresh link would be. Provenance rides on the edge's
+//!    properties. `contradicts` retargets are HELD until the API accepts that
+//!    spelling ([`HELD_RELATIONSHIPS`]); `refutes` retargets are applied.
 //! 3. KEEP the parent edge and mark it `properties.retargeted_to = [...]`
 //!    through `PATCH /api/v1/edges/:id`. Its belief mass is not touched.
 //!
@@ -71,26 +73,58 @@ Example output: {"0": {"atoms": [1]}, "1": "whole", "2": "unclear", "3": {"atoms
 Items:
 {items}"#;
 
-/// The spelling `POST /api/v1/edges` accepts for a conflict relationship.
-///
-/// The HTTP whitelist (`routes/edges.rs::VALID_RELATIONSHIPS`) is
-/// case-sensitive and holds `refutes` in lower case but `contradicts` ONLY as
-/// `CONTRADICTS`, while MCP `link_epistemic` (the path most production conflict
-/// edges were filed through) stores lower-case `contradicts`. Re-sending the
-/// parent's stored spelling therefore 400s for the commonest case, measured by
-/// this branch's integration test before this function existed.
-///
-/// The belief effect is spelling-independent (`restriction_kind_with_profile`
-/// lower-cases), and the pre-create check matches `lower(relationship)`, so an
-/// existing atom edge of either spelling is still found. A relationship this
+/// The spelling a retargeted atom edge is sent (and therefore stored) with:
+/// the lower-case conflict relationship, the spelling every exact-case reader
+/// matches (`ClaimRepository::dispute_batch`, `repos/sheaf.rs`,
+/// `routes/computation.rs`, `repos/alternative_set.rs`, and
+/// `create_symmetric_if_absent_oriented`'s dedup). A relationship this
 /// function does not know is returned unchanged and left to the API to judge.
-/// `tests/retarget_conflicts.rs` pins both mappings against the live whitelist.
+///
+/// This is NOT always a spelling `POST /api/v1/edges` accepts: see
+/// [`hold_reason`], which stops a retarget before it reaches the API when it
+/// is not.
 pub fn api_relationship(stored: &str) -> String {
-    match stored.to_ascii_lowercase().as_str() {
-        "contradicts" => "CONTRADICTS".to_string(),
-        "refutes" => "refutes".to_string(),
+    let lower = stored.to_ascii_lowercase();
+    match lower.as_str() {
+        "contradicts" | "refutes" => lower,
         _ => stored.to_string(),
     }
+}
+
+/// Conflict relationships whose retarget is HELD: planned (the dry run and
+/// the manifest still show the LLM's mapping) but never applied.
+///
+/// # Why `contradicts` is held
+///
+/// The HTTP whitelist (`routes/edges.rs::VALID_RELATIONSHIPS`) is
+/// case-sensitive and accepts `contradicts` ONLY as `CONTRADICTS`. An atom
+/// edge stored as `CONTRADICTS` is invisible to every reader that matches the
+/// lower-case spelling MCP `link_epistemic` stores — measured in review:
+/// after an apply, `dispute_batch` reported the parent disputed and the atom
+/// not (lower-casing the same row made the atom count 1), and a later
+/// `link_epistemic` of the same dispute onto the atom created a SECOND edge
+/// and a second BBA from the same source (DS double counting), because its
+/// symmetric dedup matches the relationship byte-exactly. Writing that split
+/// 100+ times in production is hard to undo, so it is not written at all.
+///
+/// The hold lifts when the owner of `routes/edges.rs` adds lower-case
+/// `contradicts` to `VALID_RELATIONSHIPS`: then remove it from this list.
+/// `tests/retarget_conflicts.rs` pins the hold to the whitelist, so it fails
+/// the moment the whitelist changes. `refutes` is accepted in lower case and
+/// is not held.
+pub const HELD_RELATIONSHIPS: [&str; 1] = ["contradicts"];
+
+/// Why a retarget of `stored` must not be applied, or `None` if it may be.
+pub fn hold_reason(stored: &str) -> Option<String> {
+    let lower = stored.to_ascii_lowercase();
+    HELD_RELATIONSHIPS.contains(&lower.as_str()).then(|| {
+        format!(
+            "HELD: `{lower}` retargets are not applied — POST /api/v1/edges accepts only \
+             `CONTRADICTS`, which readers matching `{lower}` (dispute_batch, sheaf, \
+             link_epistemic dedup) do not see; waiting on routes/edges.rs \
+             VALID_RELATIONSHIPS to accept `{lower}`"
+        )
+    })
 }
 
 /// One conflict edge to retarget, with the parent's atoms in their stable
@@ -285,6 +319,9 @@ pub struct AppliedEntry {
     pub ds_wired_edge_ids: Vec<Uuid>,
     /// Whether `retargeted_to` on the parent edge now lists every atom edge.
     pub parent_marked: bool,
+    /// The relationship is in [`HELD_RELATIONSHIPS`]: nothing was sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
     /// Why nothing (or not everything) was applied.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
@@ -591,6 +628,11 @@ mod db {
             edge_id: entry.edge_id,
             ..Default::default()
         };
+        if let Some(why) = super::hold_reason(&entry.relationship) {
+            applied.held = true;
+            applied.errors.push(why);
+            return Ok(Some(applied));
+        }
 
         // The parent edge as it is NOW.
         let parent_edge = R::find_edges_by_triple(
@@ -807,6 +849,24 @@ mod tests {
                 .map(|a| (Uuid::new_v4(), a.to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn contradicts_is_held_in_every_spelling_and_refutes_is_not() {
+        for s in ["contradicts", "CONTRADICTS", "Contradicts"] {
+            assert!(hold_reason(s).is_some(), "{s} must be held");
+        }
+        for s in ["refutes", "REFUTES"] {
+            assert!(hold_reason(s).is_none(), "{s} must not be held");
+        }
+    }
+
+    #[test]
+    fn api_relationship_sends_the_lower_case_conflict_spelling() {
+        assert_eq!(api_relationship("REFUTES"), "refutes");
+        assert_eq!(api_relationship("refutes"), "refutes");
+        assert_eq!(api_relationship("CONTRADICTS"), "contradicts");
+        assert_eq!(api_relationship("supports"), "supports");
     }
 
     #[test]

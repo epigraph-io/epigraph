@@ -38,6 +38,12 @@ const ATOM_0: &str = "Gravity bends light.";
 const ATOM_1: &str = "Time dilates near mass.";
 const SOURCE: &str = "Clocks near massive bodies tick at exactly the same rate as distant clocks.";
 
+/// The conflict relationship the world is seeded with. `refutes`, because
+/// `contradicts` retargets are HELD (`retarget::HELD_RELATIONSHIPS`): a
+/// regression test built on a held relationship would pass on the hold alone,
+/// whatever the guard it claims to test does.
+const REL: &str = "refutes";
+
 struct World {
     agent: Uuid,
     parent: Uuid,
@@ -89,9 +95,13 @@ async fn seed_edge(pool: &PgPool, src: Uuid, tgt: Uuid, rel: &str) -> Uuid {
     .unwrap()
 }
 
-/// Compound parent + two atoms + a believed source + `source -contradicts->
+/// Compound parent + two atoms + a believed source + `source -refutes->
 /// parent`.
 async fn seed_world(pool: &PgPool) -> World {
+    seed_world_with(pool, REL).await
+}
+
+async fn seed_world_with(pool: &PgPool, rel: &str) -> World {
     let agent = seed_agent(pool).await;
     let parent = seed_claim(pool, agent, PARENT, 30).await;
     let a0 = seed_claim(pool, agent, ATOM_0, 20).await;
@@ -106,7 +116,7 @@ async fn seed_world(pool: &PgPool) -> World {
         .execute(pool)
         .await
         .unwrap();
-    let parent_edge = seed_edge(pool, source, parent, "contradicts").await;
+    let parent_edge = seed_edge(pool, source, parent, rel).await;
     World {
         agent,
         parent,
@@ -200,9 +210,7 @@ async fn edges_between(
     rel: &str,
 ) -> Vec<(Uuid, serde_json::Value)> {
     sqlx::query_as(
-        // Case-insensitive: the parent edge is stored `contradicts` (MCP
-        // spelling) and the atom edge `CONTRADICTS` (the only spelling the
-        // HTTP route accepts); both are the same relationship.
+        // Case-insensitive, so a wrongly-spelled duplicate is still counted.
         "SELECT id, properties FROM edges WHERE source_id = $1 AND target_id = $2 \
          AND lower(relationship) = lower($3) ORDER BY created_at, id",
     )
@@ -257,12 +265,14 @@ async fn snapshot(pool: &PgPool, w: &World) -> Vec<(String, i64)> {
     out
 }
 
-/// The spellings `api_relationship` sends must be the ones the API accepts.
-/// Pinned against the handler's own whitelist so a change on either side
-/// fails here instead of 400ing every retarget in production.
+/// Every relationship that is NOT held must be sent in a spelling the API
+/// accepts, and a relationship is held EXACTLY while the API refuses its
+/// lower-case spelling. Pinned against the handler's own whitelist, so the day
+/// `routes/edges.rs` accepts lower-case `contradicts` this fails and tells the
+/// reader to release the hold (`retarget::HELD_RELATIONSHIPS`).
 #[test]
-fn api_relationship_spellings_are_accepted_by_the_edges_route() {
-    use epigraph_cli::retarget::api_relationship;
+fn the_hold_tracks_the_edges_route_whitelist() {
+    use epigraph_cli::retarget::{api_relationship, hold_reason};
     for stored in [
         "contradicts",
         "CONTRADICTS",
@@ -271,19 +281,68 @@ fn api_relationship_spellings_are_accepted_by_the_edges_route() {
         "REFUTES",
     ] {
         let sent = api_relationship(stored);
-        assert!(
+        assert_eq!(
+            sent,
+            stored.to_ascii_lowercase(),
+            "atom edges are stored in the lower-case spelling exact-case readers match"
+        );
+        assert_eq!(
+            hold_reason(stored).is_some(),
+            !routes::edges::is_valid_relationship(&sent),
+            "{stored}: held={} but POST /api/v1/edges accepts {sent:?}={}; \
+             release or add the hold in retarget::HELD_RELATIONSHIPS",
+            hold_reason(stored).is_some(),
             routes::edges::is_valid_relationship(&sent),
-            "{stored} -> {sent} is rejected by POST /api/v1/edges"
         );
     }
-    // The measured reason the mapping exists: lower-case `contradicts`, the
-    // spelling MCP `link_epistemic` stores, is NOT accepted verbatim.
-    assert!(!routes::edges::is_valid_relationship("contradicts"));
+}
+
+/// A `contradicts` parent edge is HELD on apply: the LLM plan is still made
+/// (the dry run shows it), but nothing crosses the socket, no row is written,
+/// the parent stays unmarked, and the entry says why.
+#[sqlx::test(migrations = "../../migrations")]
+async fn contradicts_retargets_are_held_and_write_nothing(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let w = seed_world_with(&pool, "contradicts").await;
+    let (api, hits) = serve_api(&pool, w.agent).await;
+    let llm = fixture(serde_json::json!({"atoms": [1]}));
+    let before = snapshot(&pool, &w).await;
+    let manifest = manifest_path();
+
+    let run = run_retarget(&pool, &viewer, &llm, Some(&api), &manifest, opts(true))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a held retarget sends no request"
+    );
+    assert_eq!(
+        snapshot(&pool, &w).await,
+        before,
+        "a held retarget writes nothing"
+    );
+    assert_eq!(
+        run.plan[0].verdict,
+        verdict::ATOMS,
+        "the plan is still made"
+    );
+    let applied = &run.applied[0];
+    assert!(applied.held, "{applied:?}");
+    assert!(!applied.parent_marked);
+    assert!(
+        applied.errors.iter().any(|e| e.starts_with("HELD")),
+        "{:?}",
+        applied.errors
+    );
+    std::fs::remove_file(&manifest).ok();
 }
 
 /// THE CORE CLAIM. `--retarget --apply` with the fixture choosing atom 1
-/// creates exactly `source -contradicts-> atom1` with provenance, wires DS on
-/// the atom, creates nothing toward atom 0, and KEEPS the parent edge, marked.
+/// creates exactly `source -refutes-> atom1` with provenance, wires DS on
+/// the atom, creates nothing toward atom 0, KEEPS the parent edge, marked, and
+/// recall's dispute signal (`dispute_batch`) now sees the atom as disputed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn apply_moves_the_conflict_onto_the_chosen_atom_with_ds_wired(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
@@ -312,7 +371,7 @@ async fn apply_moves_the_conflict_onto_the_chosen_atom_with_ds_wired(pool: PgPoo
     let new_edge = applied.created_edge_ids[0];
 
     // Exactly one source->atom1 edge, with the provenance properties.
-    let to_atom1 = edges_between(&pool, w.source, w.atoms[1], "contradicts").await;
+    let to_atom1 = edges_between(&pool, w.source, w.atoms[1], REL).await;
     assert_eq!(to_atom1.len(), 1);
     assert_eq!(to_atom1[0].0, new_edge);
     let props = &to_atom1[0].1;
@@ -324,7 +383,7 @@ async fn apply_moves_the_conflict_onto_the_chosen_atom_with_ds_wired(pool: PgPoo
     assert_eq!(props["method"], serde_json::json!("llm-retarget"));
     assert_eq!(props["model"], serde_json::json!("fixture"));
     // Nothing toward the atom the source does NOT dispute.
-    assert!(edges_between(&pool, w.source, w.atoms[0], "contradicts")
+    assert!(edges_between(&pool, w.source, w.atoms[0], REL)
         .await
         .is_empty());
 
@@ -343,8 +402,25 @@ async fn apply_moves_the_conflict_onto_the_chosen_atom_with_ds_wired(pool: PgPoo
     );
     assert_eq!(applied.ds_wired_edge_ids, vec![new_edge]);
 
+    // Stored in the exact spelling every exact-case reader matches, so the
+    // atom is disputed where recall looks.
+    let stored: String = sqlx::query_scalar("SELECT relationship FROM edges WHERE id = $1")
+        .bind(new_edge)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, REL);
+    let disputes = epigraph_db::ClaimRepository::dispute_batch(&pool, &viewer, &[w.atoms[1]])
+        .await
+        .unwrap();
+    assert_eq!(
+        disputes.get(&w.atoms[1]).map(|d| d.dispute_count),
+        Some(1),
+        "dispute_batch must report the retargeted atom as disputed"
+    );
+
     // The parent edge is KEPT (in force) and MARKED with the atom edge.
-    let parent_rows = edges_between(&pool, w.source, w.parent, "contradicts").await;
+    let parent_rows = edges_between(&pool, w.source, w.parent, REL).await;
     assert_eq!(parent_rows.len(), 1);
     assert_eq!(parent_rows[0].0, w.parent_edge);
     assert_eq!(
@@ -411,9 +487,7 @@ async fn rerun_after_apply_calls_no_llm_and_creates_nothing(pool: PgPool) {
         "re-run must write nothing"
     );
     assert_eq!(
-        edges_between(&pool, w.source, w.atoms[1], "contradicts")
-            .await
-            .len(),
+        edges_between(&pool, w.source, w.atoms[1], REL).await.len(),
         1
     );
     std::fs::remove_file(&m1).ok();
@@ -461,13 +535,11 @@ async fn unmarked_parent_with_an_existing_atom_edge_creates_no_duplicate(pool: P
         edges_before
     );
     assert_eq!(
-        edges_between(&pool, w.source, w.atoms[1], "contradicts")
-            .await
-            .len(),
+        edges_between(&pool, w.source, w.atoms[1], REL).await.len(),
         1,
         "exactly one source->atom edge after two applies"
     );
-    let marked = &edges_between(&pool, w.source, w.parent, "contradicts").await[0].1;
+    let marked = &edges_between(&pool, w.source, w.parent, REL).await[0].1;
     assert_eq!(marked["retargeted_to"], serde_json::json!([atom_edge]));
     std::fs::remove_file(&m1).ok();
     std::fs::remove_file(&m2).ok();
@@ -503,7 +575,7 @@ async fn dry_run_calls_the_llm_and_writes_nothing(pool: PgPool) {
         "dry run must send no request"
     );
     assert!(run.applied.is_empty());
-    let parent_props = &edges_between(&pool, w.source, w.parent, "contradicts").await[0].1;
+    let parent_props = &edges_between(&pool, w.source, w.parent, REL).await[0].1;
     assert!(parent_props.get("retargeted_to").is_none());
     let raw = std::fs::read_to_string(&manifest).unwrap();
     assert_eq!(raw.lines().count(), 1, "one plan line, no applied line");
@@ -549,7 +621,7 @@ async fn a_retired_atom_edge_blocks_the_retarget_instead_of_being_resurrected(po
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
     let (api, hits) = serve_api(&pool, w.agent).await;
-    let retired = seed_edge(&pool, w.source, w.atoms[1], "contradicts").await;
+    let retired = seed_edge(&pool, w.source, w.atoms[1], REL).await;
     sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
         .bind(retired)
         .execute(&pool)
@@ -571,9 +643,7 @@ async fn a_retired_atom_edge_blocks_the_retarget_instead_of_being_resurrected(po
     );
     assert_eq!(hits.load(Ordering::SeqCst), 0);
     assert_eq!(
-        edges_between(&pool, w.source, w.atoms[1], "contradicts")
-            .await
-            .len(),
+        edges_between(&pool, w.source, w.atoms[1], REL).await.len(),
         1,
         "still only the retired edge"
     );
