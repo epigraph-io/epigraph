@@ -923,7 +923,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. Adding or removing the 'resolved' label requires claims:admin or ownership of the claim when the caller is authenticated (HTTP). All-or-nothing: the whole patch lands or nothing does. A claim you cannot read is reported as not found. A claim owned by a group this server's agent cannot write (another agent's claim) is refused with nothing written, even with claims:admin."
+        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. When the caller is authenticated (HTTP), the whole patch requires claims:admin or ownership of the claim, as PATCH /api/v1/claims/:id does. All-or-nothing: the whole patch lands or nothing does. A claim you cannot read is reported as not found. A claim owned by a group this server's agent cannot write (another agent's claim) is refused with nothing written, even with claims:admin."
     )]
     async fn patch_claim(
         &self,
@@ -1214,25 +1214,31 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Update an existing edge in place: retire it by closing its lifecycle window (valid_to) and/or shallow-merge a JSON object into its properties. MCP-native wrapper for PATCH /api/v1/edges/:id — before this tool the only way to act on a mislabeled edge from MCP was raw OAuth + curl. At least one of valid_to / properties is required; properties must be a JSON object (a non-object would silently convert the JSONB column to an array via Postgres `||`). valid_to accepts an RFC3339 timestamp or the literal \"now\" (resolved server-side, since an MCP client has no wall clock). Retiring is the NON-DESTRUCTIVE correction: the row and its audit history survive. Emits edge.updated, plus edge.retired when valid_to is set. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retired edge. The update and its events commit together, with this server's agent's write authority: an edge owned by a group this server's agent cannot write (one touching another agent's private claim) reports not found and nothing is written."
+        description = "Update an existing edge in place: retire it by closing its lifecycle window (valid_to) and/or shallow-merge a JSON object into its properties. MCP-native wrapper for PATCH /api/v1/edges/:id — before this tool the only way to act on a mislabeled edge from MCP was raw OAuth + curl. At least one of valid_to / properties is required; properties must be a JSON object (a non-object would silently convert the JSONB column to an array via Postgres `||`). valid_to accepts an RFC3339 timestamp or the literal \"now\" (resolved server-side, since an MCP client has no wall clock). Retiring is the NON-DESTRUCTIVE correction: the row and its audit history survive. Emits edge.updated, plus edge.retired when valid_to is set. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retired edge. The update and its events commit together, with this server's agent's write authority: an edge the CALLER cannot read, or one owned by a group this server's agent cannot write (one touching another agent's private claim), reports not found and nothing is written."
     )]
     async fn patch_edge(
         &self,
         Parameters(params): Parameters<crate::types::PatchEdgeParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::edge_mutation::patch_edge(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::edge_mutation::patch_edge(self, viewer, params).await
     }
 
     #[tool(
-        description = "Take an edge out of force by id: sets its valid_to to now (a RETRACTION; the row, its properties and signature survive and stay queryable). MCP-native wrapper for DELETE /api/v1/edges/:id. Use patch_edge with valid_to to retire an edge at a chosen time; delete_edge is for edges that should never have existed (e.g. a mislabeled contradicts edge). Errors if the edge id does not exist or is already retracted. Emits edge.deleted on the same transaction. An edge owned by a group this server's agent cannot write (one touching another agent's private claim) reports not found and nothing is written. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retracted edge."
+        description = "Take an edge out of force by id: sets its valid_to to now (a RETRACTION; the row, its properties and signature survive and stay queryable). MCP-native wrapper for DELETE /api/v1/edges/:id. Use patch_edge with valid_to to retire an edge at a chosen time; delete_edge is for edges that should never have existed (e.g. a mislabeled contradicts edge). Errors if the edge id does not exist or is already retracted. Emits edge.deleted on the same transaction. An edge the CALLER cannot read, or one owned by a group this server's agent cannot write (one touching another agent's private claim), reports not found and nothing is written. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the retracted edge."
     )]
     async fn delete_edge(
         &self,
         Parameters(params): Parameters<crate::types::DeleteEdgeParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::edge_mutation::delete_edge(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::edge_mutation::delete_edge(self, viewer, params).await
     }
 
     // ── Paper Queries (3 tools) ──

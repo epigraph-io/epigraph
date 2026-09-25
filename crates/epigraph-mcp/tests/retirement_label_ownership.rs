@@ -311,3 +311,70 @@ async fn update_labels_still_permits_resolved_on_the_unauthenticated_stdio_path(
     let labels = labels_of(&pool, claim).await;
     assert!(labels.contains(&"resolved".to_string()), "{labels:?}");
 }
+
+/// Batch H-a review (atomicity-authz): on the authenticated transport the WHOLE
+/// patch, not just the retirement label, needs claims:admin or ownership, as
+/// `PATCH /api/v1/claims/:id` does. The write runs under the SERVER agent's
+/// stamp, so without this a caller that could merely read a claim could rewrite
+/// its properties with the server's write authority. A patch that touches no
+/// label at all is the discriminating case: the retirement gate never fires on
+/// it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn patch_claim_without_labels_on_a_foreign_claim_is_refused_over_http(pool: PgPool) {
+    let claim = seed_claim_with_labels(&pool, "patch_claim property subject", &["topic"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let patch = |value: &str| PatchClaimParams {
+        claim_id: claim.to_string(),
+        trace_id: None,
+        properties: Some(serde_json::json!({ "patched_by": value })),
+        add_labels: vec![],
+        remove_labels: vec![],
+    };
+
+    epigraph_mcp::tools::claims::patch_claim(
+        &server,
+        &viewer,
+        patch("a-reader-not-the-owner"),
+        Some(&write_auth(Uuid::new_v4())),
+    )
+    .await
+    .expect_err("an authenticated non-owner without claims:admin must not patch the claim");
+    assert!(
+        properties_of(&pool, claim)
+            .await
+            .get("patched_by")
+            .is_none(),
+        "the refused patch must not have written"
+    );
+
+    // Calibration: claims:admin passes the same gate, so the refusal above is
+    // the ownership check and not a fixture accident.
+    epigraph_mcp::tools::claims::patch_claim(
+        &server,
+        &viewer,
+        patch("admin"),
+        Some(&admin_write_auth()),
+    )
+    .await
+    .expect("claims:admin may patch another agent's claim");
+    assert_eq!(
+        properties_of(&pool, claim).await.get("patched_by"),
+        Some(&serde_json::json!("admin"))
+    );
+
+    // And stdio (no AuthContext) is unchanged: the #374 stdio half stays open.
+    epigraph_mcp::tools::claims::patch_claim(&server, &viewer, patch("stdio"), None)
+        .await
+        .expect("the unauthenticated stdio path is not gated here");
+}
+
+async fn properties_of(pool: &PgPool, claim_id: Uuid) -> serde_json::Value {
+    let (props,): (serde_json::Value,) =
+        sqlx::query_as("SELECT COALESCE(properties, '{}'::jsonb) FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_one(pool)
+            .await
+            .expect("read properties");
+    props
+}

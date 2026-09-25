@@ -1772,7 +1772,7 @@ pub struct LinkHierarchicalResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchEdgeParams {
     #[schemars(
-        description = "UUID of the edge to patch. Must be an edge this server's agent can write; an edge touching another group's private claim reports not found and nothing is written."
+        description = "UUID of the edge to patch. Must be an edge YOU can read and this server's agent can write; otherwise (for example an edge touching another group's private claim) it reports not found and nothing is written."
     )]
     pub edge_id: String,
 
@@ -1812,7 +1812,7 @@ pub struct PatchEdgeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteEdgeParams {
     #[schemars(
-        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge this server's agent can write; otherwise it reports not found and nothing is written."
+        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge YOU can read and this server's agent can write; otherwise it reports not found and nothing is written."
     )]
     pub edge_id: String,
 }
@@ -2324,7 +2324,7 @@ pub struct UpdateLabelsParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchClaimParams {
     #[schemars(
-        description = "UUID of the claim to patch. Must be a claim you can read (otherwise: not found) and one owned by a group this server's agent can write (otherwise: refused, nothing written)."
+        description = "UUID of the claim to patch. Must be a claim you can read (otherwise: not found) and one owned by a group this server's agent can write (otherwise: refused, nothing written). When you are authenticated (HTTP) you must also own it or hold claims:admin."
     )]
     pub claim_id: String,
     #[schemars(description = "New trace_id (must reference an existing reasoning_traces row)")]

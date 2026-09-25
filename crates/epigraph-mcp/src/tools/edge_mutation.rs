@@ -38,10 +38,16 @@
 //!
 //! Both mutations run on ONE transaction stamped from the MCP server's own
 //! agent (`claim_helper::begin_author_stamped_tx`), with their events on the
-//! same transaction. An edge this session cannot see, which includes one owned
-//! by another agent's private group, is reported as "not found" and nothing is
-//! written. Neither tool takes the caller's viewer. The authority is the
-//! server agent's, as for every other MCP write.
+//! same transaction. WRITE authority is the server agent's, as for every other
+//! MCP write. READ authority is the CALLER's: before either write, the edge is
+//! read through the caller's viewer on that transaction
+//! (`EdgeRepository::visible_to`), and an edge the caller cannot see is
+//! reported as "not found" with nothing written. Before that gate (batch H-a
+//! review) neither tool took a viewer, so any `claims:write` caller could
+//! retire or relabel an edge touching a server-group-private claim it could not
+//! read. Whether the caller should also need OWNERSHIP of the edge (edges carry
+//! no author column; the candidates are its endpoints' authors) is the
+//! cross-agent authority question (H-b, #374), not this gate's.
 //!
 //! # `valid_to: "now"`
 //!
@@ -114,9 +120,26 @@ fn map_edge_err(e: DbError) -> McpError {
 
 pub async fn patch_edge(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
 ) -> Result<CallToolResult, McpError> {
-    do_patch_edge(server, params).await
+    do_patch_edge(server, viewer, params).await
+}
+
+/// The caller-read gate both tools apply, on the write transaction.
+async fn require_visible_edge(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    edge_id: uuid::Uuid,
+) -> Result<(), McpError> {
+    if EdgeRepository::visible_to(&mut *conn, viewer, edge_id)
+        .await
+        .map_err(internal_error)?
+    {
+        Ok(())
+    } else {
+        Err(invalid_params(format!("edge {edge_id} not found")))
+    }
 }
 
 /// Core logic factored out so integration tests can call it directly without
@@ -124,6 +147,7 @@ pub async fn patch_edge(
 /// `do_link_epistemic`).
 pub async fn do_patch_edge(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
@@ -165,6 +189,7 @@ pub async fn do_patch_edge(
     let actor_id = server.agent_id().await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, actor_id, "patch_edge").await?;
+    require_visible_edge(&mut tx, viewer, edge_id).await?;
     let updated = EdgeRepository::update_valid_to_and_properties(
         &mut *tx,
         edge_id,
@@ -222,14 +247,16 @@ pub async fn do_patch_edge(
 
 pub async fn delete_edge(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
 ) -> Result<CallToolResult, McpError> {
-    do_delete_edge(server, params).await
+    do_delete_edge(server, viewer, params).await
 }
 
 /// Core logic factored out for direct test invocation (see `do_patch_edge`).
 pub async fn do_delete_edge(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
@@ -243,6 +270,7 @@ pub async fn do_delete_edge(
     let actor_id = server.agent_id().await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, actor_id, "delete_edge").await?;
+    require_visible_edge(&mut tx, viewer, edge_id).await?;
 
     // `EdgeRepository::delete` reports absence as `Ok(false)`, not
     // `DbError::NotFound`, so the 404-equivalent is raised here. Returning

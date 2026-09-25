@@ -761,6 +761,35 @@ impl EdgeRepository {
         Ok(rows)
     }
 
+    /// Can `viewer` READ the edge `id`? The edge-visibility predicate (the
+    /// owner / co-owner intersection, `Viewer::edge_predicate_fragment`), spliced.
+    ///
+    /// The caller-read gate for MCP `patch_edge` / `delete_edge`. Their writes
+    /// run under the server agent's stamp, so without this a caller that cannot
+    /// read an edge (one touching another group's private claim) could still
+    /// retire or relabel it by naming its id, as long as the server agent could
+    /// write it (batch H-a review, atomicity-authz). Run it on the same
+    /// transaction as the write.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn visible_to<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS (SELECT 1 FROM edges e WHERE e.id = $1 /* {EDGE_VISIBILITY:e} */)",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
     /// Retract edges by closing their validity interval instead of deleting them.
     ///
     /// This is the non-destructive counterpart to `DELETE FROM edges`. The row —

@@ -1800,10 +1800,22 @@ pub async fn patch_claim(
     // read, as long as it named the id. That is the MCP twin of the HTTP
     // write-path gap (backlog 30c29c52). An invisible claim is reported as not
     // found, exactly like a missing one.
-    ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(id))
+    let target = ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(id))
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
+
+    // OWNERSHIP OF THE WHOLE PATCH on the authenticated transport, as the HTTP
+    // twin (`PATCH /api/v1/claims/:id`, `require_owner_or_admin`) requires. The
+    // write runs under the SERVER agent's stamp, so without this an HTTP caller
+    // who could merely READ a server-authored claim could rewrite its trace and
+    // properties with the server's write authority (batch H-a review,
+    // atomicity-authz). Only when `auth` is present: on stdio the caller IS the
+    // process that holds the DSN, and a cross-agent patch there is the
+    // #374 stdio half, left open by design (see `gate_retirement_label`).
+    if auth.is_some() {
+        require_owner_or_admin(server, auth, target.agent_id.as_uuid()).await?;
+    }
 
     // Same gate as `update_labels`: `patch_claim` also accepts
     // `add_labels`/`remove_labels`, so leaving it ungated would just move the
