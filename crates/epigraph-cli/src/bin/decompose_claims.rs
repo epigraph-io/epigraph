@@ -143,7 +143,9 @@ struct Cli {
     /// `retarget-manifest-<UTC timestamp>.jsonl`). Refused if it exists.
     #[arg(long)]
     manifest: Option<PathBuf>,
-    /// With --retarget: also re-plan edges already marked `retargeted_to`.
+    /// With --retarget: also revisit edges already marked `retargeted_to`
+    /// (fully wired ones included). An edge that already has atom edges is
+    /// resumed from them and re-checked, not re-asked of the LLM.
     #[arg(long, default_value_t = false)]
     include_marked: bool,
 }
@@ -954,21 +956,23 @@ fn print_retarget_plan(plan: &[epigraph_cli::retarget::RetargetPlanEntry]) {
         count(verdict::LLM_ERROR),
     );
 }
-
 fn print_applied(applied: &[epigraph_cli::retarget::AppliedEntry]) {
     let mut created = 0;
     let mut existing = 0;
     let mut blocked = 0;
     let mut unwired = 0;
+    let mut reasserted = 0;
     let mut marked = 0;
     let held = applied.iter().filter(|a| a.held).count();
     for a in applied {
         created += a.created_edge_ids.len();
         existing += a.existing_edge_ids.len();
         blocked += a.blocked_by_retired_edge.len();
+        reasserted += a.reasserted_edge_ids.len();
         unwired += a
             .created_edge_ids
             .iter()
+            .chain(a.existing_edge_ids.iter())
             .filter(|id| !a.ds_wired_edge_ids.contains(id))
             .count();
         if a.parent_marked {
@@ -986,15 +990,19 @@ fn print_applied(applied: &[epigraph_cli::retarget::AppliedEntry]) {
     }
     eprintln!(
         "retarget apply: {} entries — created={created} existing={existing} \
-         blocked_by_retired={blocked} held={held} parents_marked={marked} \
-         created_but_not_ds_wired={unwired}",
+         reasserted={reasserted} blocked_by_retired={blocked} held={held} \
+         parents_marked={marked} atom_edges_not_ds_wired={unwired}",
         applied.len()
     );
     if unwired > 0 {
         eprintln!(
-            "note: {unwired} created edges carry no DS BBA yet — their source claim has no \
-             belief interval (SourceFactorless); they will wire when the source acquires belief \
-             and the edge is re-asserted"
+            "note: {unwired} atom edges carry no DS BBA yet. Either the source claim has no \
+             belief interval (SourceFactorless), or the API cannot write mass_functions — e.g. it \
+             runs as epigraph_app while the edge DS path (routes/edges.rs \
+             trigger_edge_ds_recomputation) is still unstamped; the API boot log's RLS-posture \
+             line says which role it runs as. Each is recorded in the parent edge's \
+             `retarget_unwired`, so the next --retarget run resumes that edge (no LLM call) and \
+             re-asserts it until it wires."
         );
     }
 }

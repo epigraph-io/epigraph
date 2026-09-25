@@ -105,6 +105,16 @@ pub struct TripleEdge {
     pub properties: serde_json::Value,
 }
 
+/// An atom edge a retarget created from a parent conflict edge
+/// (`properties.retargeted_from_edge = parent_edge_id`).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct RetargetedChild {
+    pub parent_edge_id: Uuid,
+    pub edge_id: Uuid,
+    pub target_id: Uuid,
+    pub in_force: bool,
+}
+
 pub struct DecompositionPriorityRepository;
 
 impl DecompositionPriorityRepository {
@@ -279,7 +289,10 @@ impl DecompositionPriorityRepository {
     /// (`created_at ASC, id ASC`).
     ///
     /// `include_marked = false` skips edges already carrying a
-    /// `retargeted_to` property — the retarget pass's first idempotency guard.
+    /// `retargeted_to` property — the retarget pass's first idempotency guard
+    /// — EXCEPT those whose `retarget_unwired` is a non-empty array: an atom
+    /// edge that exists but carries no DS BBA yet must come back so the pass
+    /// can re-assert it.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
@@ -304,7 +317,11 @@ impl DecompositionPriorityRepository {
               AND (e.valid_to IS NULL OR e.valid_to > now())
               AND COALESCE(s.is_current, true) = true
               AND COALESCE(p.is_current, true) = true
-              AND ($3::bool OR NOT (e.properties ? 'retargeted_to'))
+              AND ($3::bool
+                   OR NOT (e.properties ? 'retargeted_to')
+                   OR (e.properties -> 'retarget_unwired' IS NOT NULL
+                       AND e.properties -> 'retarget_unwired'
+                           NOT IN ('[]'::jsonb, 'null'::jsonb)))
               AND EXISTS (
                   SELECT 1 FROM edges d
                   JOIN claims a ON a.id = d.target_id
@@ -435,6 +452,50 @@ impl DecompositionPriorityRepository {
             .bind(source_id)
             .bind(target_id)
             .bind(relationship);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Edges an earlier retarget created from each parent conflict edge in
+    /// `parent_edges` (`(parent_edge_id, source_id)` pairs): edges from that
+    /// source whose `properties.retargeted_from_edge` names the parent edge,
+    /// live and retired, oldest first.
+    ///
+    /// This is what lets a re-run RESUME a parent edge deterministically
+    /// (reuse the atoms it already chose, no second LLM call that could pick
+    /// different ones). The `source_id` restriction keeps the probe on the
+    /// source index instead of scanning every edge's properties.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn list_retargeted_children<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        parent_edges: &[(Uuid, Uuid)],
+    ) -> Result<Vec<RetargetedChild>, DbError> {
+        if parent_edges.is_empty() {
+            return Ok(vec![]);
+        }
+        let parent_ids: Vec<String> = parent_edges.iter().map(|(e, _)| e.to_string()).collect();
+        let sources: Vec<Uuid> = parent_edges.iter().map(|(_, s)| *s).collect();
+        let sql = viewer.splice(
+            r#"
+            SELECT (e.properties ->> 'retargeted_from_edge')::uuid AS parent_edge_id,
+                   e.id AS edge_id, e.target_id,
+                   (e.valid_to IS NULL OR e.valid_to > now()) AS in_force
+            FROM edges e
+            WHERE e.source_id = ANY($2::uuid[])
+              AND e.properties ->> 'retargeted_from_edge' = ANY($1::text[])
+              /* {EDGE_VISIBILITY:e} */
+            ORDER BY e.created_at ASC, e.id ASC
+            "#,
+            3,
+        );
+        let mut q = sqlx::query_as::<_, RetargetedChild>(&sql)
+            .bind(parent_ids)
+            .bind(sources);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

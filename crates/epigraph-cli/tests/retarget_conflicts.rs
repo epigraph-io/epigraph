@@ -498,14 +498,17 @@ async fn rerun_after_apply_calls_no_llm_and_creates_nothing(pool: PgPool) {
 }
 
 /// Idempotency guard 2: the atom edge exists but the parent is NOT marked
-/// (a run whose PATCH failed). A re-run re-plans, but adopts the existing atom
-/// edge instead of creating a second one, and re-marks the parent with it.
+/// (a run whose PATCH failed). A re-run RESUMES the edge from its existing
+/// atom edge — no LLM call, so a model that would now answer differently
+/// cannot add a second source→atom edge — adopts it, and re-marks the parent.
 #[sqlx::test(migrations = "../../migrations")]
 async fn unmarked_parent_with_an_existing_atom_edge_creates_no_duplicate(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
     let (api, _hits) = serve_api(&pool, w.agent).await;
     let llm = fixture(serde_json::json!({"atoms": [1]}));
+    // What the model would say if it were asked again: a DIFFERENT atom.
+    let fickle = fixture(serde_json::json!({"atoms": [0]}));
 
     let m1 = manifest_path();
     let first = run_retarget(&pool, &viewer, &llm, Some(&api), &m1, opts(true))
@@ -521,7 +524,7 @@ async fn unmarked_parent_with_an_existing_atom_edge_creates_no_duplicate(pool: P
     let edges_before = count(&pool, "SELECT COUNT(*) FROM edges").await;
 
     let m2 = manifest_path();
-    let second = run_retarget(&pool, &viewer, &llm, Some(&api), &m2, opts(true))
+    let second = run_retarget(&pool, &viewer, &fickle, Some(&api), &m2, opts(true))
         .await
         .unwrap();
 
@@ -529,6 +532,15 @@ async fn unmarked_parent_with_an_existing_atom_edge_creates_no_duplicate(pool: P
         second.plan.len(),
         1,
         "an unmarked parent edge is re-planned"
+    );
+    assert_eq!(fickle.call_count(), 0, "a resumed edge is not re-asked");
+    assert_eq!(second.plan[0].chosen_atom_ids, vec![w.atoms[1]]);
+    assert_eq!(second.plan[0].model, epigraph_cli::retarget::RESUMED_MODEL);
+    assert!(
+        edges_between(&pool, w.source, w.atoms[0], REL)
+            .await
+            .is_empty(),
+        "no edge to the atom a second LLM answer would have picked"
     );
     let applied = &second.applied[0];
     assert!(applied.created_edge_ids.is_empty(), "{applied:?}");
@@ -864,4 +876,98 @@ async fn the_pre_create_check_sees_a_reverse_symmetric_edge_only(pool: PgPool) {
         refutes.is_empty(),
         "a reverse refutes edge is a different claim: {refutes:?}"
     );
+}
+
+async fn bbas_for_edge(pool: &PgPool, claim: Uuid, edge: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+    )
+    .bind(claim)
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// An atom edge the API stores but cannot wire (here: the source has no
+/// belief interval, `SourceFactorless`) must not be marked done. The parent
+/// is marked with the edge in `retarget_unwired`; the next run brings it back
+/// with NO LLM call, re-asserts the SAME edge once the source has belief, the
+/// BBA lands on the atom, and the list empties — after which the edge is left
+/// alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unwired_atom_edge_is_recorded_and_wired_by_a_later_run(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let w = seed_world(&pool).await;
+    sqlx::query("UPDATE claims SET belief = NULL, plausibility = NULL WHERE id = $1")
+        .bind(w.source)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (api, hits) = serve_api(&pool, w.agent).await;
+    let llm = fixture(serde_json::json!({"atoms": [1]}));
+
+    // Run 1: the edge is created, not wired, and recorded as unwired.
+    let m1 = manifest_path();
+    let first = run_retarget(&pool, &viewer, &llm, Some(&api), &m1, opts(true))
+        .await
+        .unwrap();
+    let atom_edge = first.applied[0].created_edge_ids[0];
+    assert!(
+        first.applied[0].ds_wired_edge_ids.is_empty(),
+        "{:?}",
+        first.applied[0]
+    );
+    assert_eq!(bbas_for_edge(&pool, w.atoms[1], atom_edge).await, 0);
+    let props = &edges_between(&pool, w.source, w.parent, REL).await[0].1;
+    assert_eq!(props["retargeted_to"], serde_json::json!([atom_edge]));
+    assert_eq!(props["retarget_unwired"], serde_json::json!([atom_edge]));
+
+    // The source acquires belief.
+    sqlx::query("UPDATE claims SET belief = 0.8, plausibility = 0.9 WHERE id = $1")
+        .bind(w.source)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Run 2: resumed (no LLM call), re-asserted, wired.
+    let m2 = manifest_path();
+    let second = run_retarget(&pool, &viewer, &llm, Some(&api), &m2, opts(true))
+        .await
+        .unwrap();
+    assert_eq!(
+        llm.call_count(),
+        1,
+        "the unwired edge is resumed, not re-asked"
+    );
+    assert_eq!(second.plan.len(), 1, "an unwired mark brings the edge back");
+    let applied = &second.applied[0];
+    assert_eq!(applied.existing_edge_ids, vec![atom_edge], "{applied:?}");
+    assert!(applied.created_edge_ids.is_empty());
+    assert_eq!(applied.reasserted_edge_ids, vec![atom_edge]);
+    assert_eq!(applied.ds_wired_edge_ids, vec![atom_edge]);
+    assert_eq!(
+        bbas_for_edge(&pool, w.atoms[1], atom_edge).await,
+        1,
+        "the re-assert wires the BBA on the atom"
+    );
+    assert_eq!(
+        edges_between(&pool, w.source, w.atoms[1], REL).await.len(),
+        1,
+        "the SAME edge was re-asserted, not a second one created"
+    );
+    let props = &edges_between(&pool, w.source, w.parent, REL).await[0].1;
+    assert_eq!(props["retarget_unwired"], serde_json::json!([]));
+
+    // Run 3: fully wired and marked -> nothing to do.
+    let hits_before = hits.load(Ordering::SeqCst);
+    let m3 = manifest_path();
+    let third = run_retarget(&pool, &viewer, &llm, Some(&api), &m3, opts(true))
+        .await
+        .unwrap();
+    assert!(third.plan.is_empty());
+    assert_eq!(hits.load(Ordering::SeqCst), hits_before);
+    for m in [m1, m2, m3] {
+        std::fs::remove_file(&m).ok();
+    }
 }

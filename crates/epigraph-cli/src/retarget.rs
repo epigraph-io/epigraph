@@ -29,17 +29,34 @@
 //! prints the mapping, writes a JSONL manifest, and writes nothing to the
 //! graph.
 //!
-//! # Idempotency — three guards, each for a different failure
+//! # Idempotency — four guards, each for a different failure
 //!
 //! * **Marked parents are not re-planned.** [`load_retarget_items`] skips edges
-//!   that already carry `retargeted_to`, so a re-run after a successful apply
-//!   makes no LLM call and no write.
+//!   that already carry `retargeted_to` with an empty `retarget_unwired`, so a
+//!   re-run after a successful, fully-wired apply makes no LLM call and no
+//!   write.
+//! * **Resume, don't re-ask.** An edge an earlier run already moved (atom
+//!   edges with `retargeted_from_edge = <this edge>` exist) is re-planned from
+//!   those atoms with NO LLM call ([`plan_with_resume`]): a lost PATCH or an
+//!   unwired atom edge is retried with the same atoms, never with a second,
+//!   possibly different, LLM answer.
 //! * **Pre-create check.** Before creating source→atom, [`apply_entry`] looks
-//!   the triple up. A live match is recorded as `existing`, not re-created. This
-//!   is what makes a run whose PATCH failed (created edges, unmarked parent)
-//!   safe to repeat.
+//!   the edge up (both orientations for a symmetric relationship). A live
+//!   match is recorded as `existing`, not re-created, and re-asserted through
+//!   the API if it still has no BBA.
 //! * **`if_not_exists: true`** on the POST, so a concurrent writer racing the
 //!   pre-check still cannot produce a duplicate.
+//!
+//! # When an atom edge carries no BBA
+//!
+//! The API can store an edge and wire nothing: the source claim has no belief
+//! interval yet (`SourceFactorless`), or — conditional on how production is
+//! deployed, not measured here — the API runs as `epigraph_app`, where the
+//! still-unstamped edge DS path cannot write `mass_functions`. The parent is
+//! then marked with the atom edge in `retargeted_to` AND in
+//! `retarget_unwired`, which brings it back on the next run to be resumed and
+//! re-asserted (the dedup-hit path of `POST /api/v1/edges` re-runs the
+//! auto-wire), until it wires.
 //!
 //! A RETIRED source→atom edge blocks the retarget for that atom: someone
 //! retracted exactly this claim, and `if_not_exists` would hand back the
@@ -317,7 +334,14 @@ pub struct AppliedEntry {
     /// `created_edge_ids` but not here was written but NOT wired — typically a
     /// source claim with no belief interval yet (`SourceFactorless`).
     pub ds_wired_edge_ids: Vec<Uuid>,
+    /// Adopted atom edges that had no BBA and were re-asserted through
+    /// `POST /api/v1/edges` (`if_not_exists`), whose dedup-hit path re-runs
+    /// the DS auto-wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasserted_edge_ids: Vec<Uuid>,
     /// Whether `retargeted_to` on the parent edge now lists every atom edge.
+    /// The mark also records `retarget_unwired` (resolved edges with no BBA);
+    /// a non-empty list brings the parent edge back on the next run.
     pub parent_marked: bool,
     /// The relationship is in [`HELD_RELATIONSHIPS`]: nothing was sent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -491,9 +515,15 @@ pub fn read_retarget_manifest(
 
 #[cfg(feature = "db")]
 pub use db::{
-    apply_entry, apply_retarget, existing_atom_edges, load_retarget_items, run_retarget,
-    EdgeApiClient, RetargetOptions, RetargetRun,
+    apply_entry, apply_retarget, existing_atom_edges, load_retarget_items, plan_with_resume,
+    run_retarget, EdgeApiClient, RetargetOptions, RetargetRun,
 };
+
+/// `model` of a plan entry resumed from existing atom edges (no LLM call).
+pub const RESUMED_MODEL: &str = "resumed";
+/// `reason` of a plan entry resumed from existing atom edges.
+pub const RESUMED_REASON: &str =
+    "resumed from atom edges an earlier run created from this parent edge; no LLM call";
 
 /// Conflict relationships that are one fact in either orientation (MCP
 /// `link_epistemic`'s `SYMMETRIC_RELATIONSHIPS` holds `contradicts` and
@@ -770,30 +800,33 @@ mod db {
             return Ok(Some(applied));
         }
 
+        let sent_relationship = super::api_relationship(&entry.relationship);
+        // Live edges this run ADOPTED rather than created, that `POST
+        // if_not_exists` would find again: same orientation, same stored
+        // spelling (the API's dedup matches the relationship byte-exactly, so
+        // re-asserting any other spelling would create a second row).
+        let mut reassertable: Vec<(Uuid, Uuid)> = Vec::new();
         for &atom in &entry.chosen_atom_ids {
             let matches =
                 existing_atom_edges(pool, viewer, entry.source_id, atom, &entry.relationship)
                     .await?;
             if let Some(live) = matches.iter().find(|e| e.in_force) {
                 applied.existing_edge_ids.push(live.id);
+                if live.source_id == entry.source_id && live.relationship == sent_relationship {
+                    reassertable.push((live.id, atom));
+                }
                 continue;
             }
             if !matches.is_empty() {
                 applied.blocked_by_retired_edge.push(atom);
                 continue;
             }
-            let props = serde_json::json!({
-                "retargeted_from_edge": entry.edge_id,
-                "from_parent": entry.parent_id,
-                "method": "llm-retarget",
-                "model": entry.model,
-            });
             match api
                 .create_edge(
                     entry.source_id,
                     atom,
-                    &super::api_relationship(&entry.relationship),
-                    props,
+                    &sent_relationship,
+                    retarget_edge_properties(entry),
                 )
                 .await
             {
@@ -803,19 +836,57 @@ mod db {
             }
         }
 
-        for &id in applied
+        // Re-assert adopted edges that carry no BBA yet. The API's dedup-hit
+        // path re-runs the DS auto-wire (`trigger_edge_ds_recomputation` is
+        // outside its `was_created` block), so an edge whose source has since
+        // acquired belief wires now; an already-wired edge is never re-sent.
+        for (id, atom) in reassertable {
+            if MassFunctionRepository::exists_for_perspective(pool, viewer, id).await? {
+                continue;
+            }
+            match api
+                .create_edge(
+                    entry.source_id,
+                    atom,
+                    &sent_relationship,
+                    retarget_edge_properties(entry),
+                )
+                .await
+            {
+                Ok((got, _)) if got == id => applied.reasserted_edge_ids.push(id),
+                Ok((got, _)) => applied.errors.push(format!(
+                    "re-assert {atom}: API returned edge {got}, expected {id}"
+                )),
+                Err(e) => applied.errors.push(format!("re-assert {atom}: {e}")),
+            }
+        }
+
+        let resolved: Vec<Uuid> = applied
             .created_edge_ids
             .iter()
             .chain(applied.existing_edge_ids.iter())
-        {
+            .copied()
+            .collect();
+        for &id in &resolved {
             if MassFunctionRepository::exists_for_perspective(pool, viewer, id).await? {
                 applied.ds_wired_edge_ids.push(id);
             }
         }
+        let unwired: Vec<Uuid> = resolved
+            .iter()
+            .copied()
+            .filter(|id| !applied.ds_wired_edge_ids.contains(id))
+            .collect();
 
         // Mark the parent. PATCH merges shallowly (`||`), so a second patch
         // would REPLACE the array: always write the union of what is already
         // recorded and what this run resolved.
+        //
+        // `retarget_unwired` lists the resolved atom edges with no BBA. While
+        // it is non-empty the parent edge is NOT treated as done:
+        // `load_retarget_items` returns it again, the next run resumes it from
+        // its existing atom edges (no LLM call) and re-asserts them, and only
+        // an empty list lets the mark stand on its own.
         let mut union: Vec<Uuid> = parent_edge
             .properties
             .get("retargeted_to")
@@ -827,11 +898,7 @@ mod db {
             })
             .unwrap_or_default();
         let before = union.clone();
-        for id in applied
-            .created_edge_ids
-            .iter()
-            .chain(applied.existing_edge_ids.iter())
-        {
+        for id in &resolved {
             if !union.contains(id) {
                 union.push(*id);
             }
@@ -840,25 +907,128 @@ mod db {
             // Nothing resolved (all blocked or failed): leave the parent as is.
             return Ok(Some(applied));
         }
-        if union == before {
+        let unwired_json = serde_json::json!(unwired);
+        if union == before && parent_edge.properties.get("retarget_unwired") == Some(&unwired_json)
+        {
             applied.parent_marked = true;
             return Ok(Some(applied));
         }
-        match api
-            .patch_edge_properties(
-                entry.edge_id,
-                serde_json::json!({
-                    "retargeted_to": union,
-                    "retarget_method": "llm-retarget",
-                    "retarget_model": entry.model,
-                }),
-            )
-            .await
-        {
+        let mut mark = serde_json::json!({
+            "retargeted_to": union,
+            "retarget_unwired": unwired_json,
+            "retarget_method": "llm-retarget",
+        });
+        // A resumed entry carries no model of its own: keep the one that
+        // chose the atoms.
+        if entry.model != super::RESUMED_MODEL {
+            mark["retarget_model"] = serde_json::json!(entry.model);
+        }
+        match api.patch_edge_properties(entry.edge_id, mark).await {
             Ok(()) => applied.parent_marked = true,
             Err(e) => applied.errors.push(format!("mark parent: {e}")),
         }
         Ok(Some(applied))
+    }
+
+    /// Provenance carried by every atom edge a retarget creates.
+    fn retarget_edge_properties(entry: &RetargetPlanEntry) -> serde_json::Value {
+        serde_json::json!({
+            "retargeted_from_edge": entry.edge_id,
+            "from_parent": entry.parent_id,
+            "method": "llm-retarget",
+            "model": entry.model,
+        })
+    }
+
+    /// Plan `items`: an edge that an earlier run already retargeted (atom
+    /// edges carrying `retargeted_from_edge = <this edge>` exist, in force,
+    /// onto current atoms of the parent) is RESUMED from those atoms with no
+    /// LLM call; every other edge is asked of the LLM ([`super::plan_retarget`]).
+    ///
+    /// Resuming instead of re-asking is what makes a partial run (a lost
+    /// PATCH, an unwired atom edge) safe to repeat: a second LLM answer could
+    /// name a different atom and add a second source→atom edge the first mark
+    /// never recorded. Output order is `items` order.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn plan_with_resume(
+        pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+        items: &[RetargetItem],
+        llm: &dyn epigraph_interfaces::LlmProvider,
+        batch_size: usize,
+    ) -> Result<Vec<RetargetPlanEntry>, Box<dyn std::error::Error>> {
+        let mut children: std::collections::HashMap<Uuid, Vec<Uuid>> =
+            std::collections::HashMap::new();
+        let keys: Vec<(Uuid, Uuid)> = items.iter().map(|i| (i.edge_id, i.source_id)).collect();
+        for chunk in keys.chunks(1000) {
+            for c in R::list_retargeted_children(pool, viewer, chunk).await? {
+                if c.in_force {
+                    children
+                        .entry(c.parent_edge_id)
+                        .or_default()
+                        .push(c.target_id);
+                }
+            }
+        }
+        let mut resumed: std::collections::HashMap<Uuid, RetargetPlanEntry> =
+            std::collections::HashMap::new();
+        let mut ask: Vec<RetargetItem> = Vec::new();
+        for item in items {
+            let prior = children.get(&item.edge_id);
+            // Chosen in the parent's atom numbering order.
+            let chosen: Vec<Uuid> = item
+                .atoms
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| prior.is_some_and(|p| p.contains(id)))
+                .collect();
+            if chosen.is_empty() {
+                ask.push(item.clone());
+                continue;
+            }
+            resumed.insert(
+                item.edge_id,
+                RetargetPlanEntry {
+                    kind: RetargetPlanEntry::KIND.to_string(),
+                    edge_id: item.edge_id,
+                    relationship: item.relationship.clone(),
+                    source_id: item.source_id,
+                    parent_id: item.parent_id,
+                    atoms: item
+                        .atoms
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (atom_id, _))| super::AtomRef {
+                            index,
+                            atom_id: *atom_id,
+                        })
+                        .collect(),
+                    verdict: super::verdict::ATOMS.to_string(),
+                    reason: Some(super::RESUMED_REASON.to_string()),
+                    chosen_atom_ids: chosen,
+                    model: super::RESUMED_MODEL.to_string(),
+                },
+            );
+        }
+        let mut asked: std::collections::HashMap<Uuid, RetargetPlanEntry> = if ask.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            super::plan_retarget(&ask, llm, batch_size)
+                .await
+                .into_iter()
+                .map(|e| (e.edge_id, e))
+                .collect()
+        };
+        Ok(items
+            .iter()
+            .filter_map(|i| {
+                resumed
+                    .remove(&i.edge_id)
+                    .or_else(|| asked.remove(&i.edge_id))
+            })
+            .collect())
     }
 
     /// What one `--retarget` invocation does, besides the manifest path.
@@ -899,7 +1069,7 @@ mod db {
         if items.is_empty() {
             return Ok(RetargetRun::default());
         }
-        let plan = super::plan_retarget(&items, llm, opts.batch_size).await;
+        let plan = plan_with_resume(pool, viewer, &items, llm, opts.batch_size).await?;
         super::append_jsonl(manifest, &plan)?;
         if !opts.apply {
             return Ok(RetargetRun {
