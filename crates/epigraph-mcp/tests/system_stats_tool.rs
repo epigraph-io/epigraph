@@ -58,9 +58,16 @@ async fn seed_claim(pool: &PgPool, agent: Uuid, labels: &[&str]) -> Uuid {
 #[sqlx::test(migrations = "../../migrations")]
 async fn default_mode_reports_exactly_the_five_corpus_counts(pool: PgPool) {
     let server = build_test_server(pool.clone());
+    // `system_stats` is viewer-scoped now, so the caller needs a principal. The
+    // deltas below are measured through THIS viewer, which is why the claim is
+    // seeded under the same agent.
+    let caller = seed_agent(&pool).await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, caller)
+        .await
+        .expect("caller viewer");
 
     let before = parse(
-        &system_stats(&server, SystemStatsParams { detailed: None })
+        &system_stats(&server, &viewer, SystemStatsParams { detailed: None })
             .await
             .expect("system_stats"),
     );
@@ -70,12 +77,12 @@ async fn default_mode_reports_exactly_the_five_corpus_counts(pool: PgPool) {
         "the un-detailed key set is part of this tool's contract"
     );
 
-    let agent = seed_agent(&pool).await;
-    seed_claim(&pool, agent, &[]).await;
+    seed_claim(&pool, caller, &[]).await;
 
     let after = parse(
         &system_stats(
             &server,
+            &viewer,
             SystemStatsParams {
                 detailed: Some(false),
             },
@@ -85,16 +92,23 @@ async fn default_mode_reports_exactly_the_five_corpus_counts(pool: PgPool) {
     );
     assert_eq!(keys(&after), keys(&before));
     assert_eq!(count(&after, "claims") - count(&before, "claims"), 1);
-    assert_eq!(count(&after, "agents") - count(&before, "agents"), 1);
+    // The caller's own agent already existed at `before`, so the agent count is
+    // unchanged; `agent_count` is deliberately viewer-independent.
+    assert_eq!(count(&after, "agents") - count(&before, "agents"), 0);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn detailed_mode_adds_the_six_extra_counts(pool: PgPool) {
     let server = build_test_server(pool.clone());
+    let caller = seed_agent(&pool).await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, caller)
+        .await
+        .expect("caller viewer");
 
     let before = parse(
         &system_stats(
             &server,
+            &viewer,
             SystemStatsParams {
                 detailed: Some(true),
             },
@@ -129,6 +143,7 @@ async fn detailed_mode_adds_the_six_extra_counts(pool: PgPool) {
     let after = parse(
         &system_stats(
             &server,
+            &viewer,
             SystemStatsParams {
                 detailed: Some(true),
             },

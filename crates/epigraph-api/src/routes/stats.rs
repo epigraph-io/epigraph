@@ -36,14 +36,29 @@ pub async fn corpus_stats(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
 ) -> Result<Json<StatsResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "corpus_stats",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Tenant-scoped, matching what MCP `system_stats` reports: the unscoped
     // `StatsRepository::corpus_counts` counted the WHOLE corpus regardless of
     // viewer, so this endpoint reported other tenants' totals to any caller. It
-    // compiles either way — nothing here is a deleted symbol — so the drift is
+    // compiled either way — nothing here was a deleted symbol — so the drift was
     // silent. `detailed = true` populates the three Option fields below.
-    let counts = CorpusStatsRepository::tenant_counts(pool, &viewer, true).await?;
-    let agents = CorpusStatsRepository::agent_count(pool, &viewer).await?;
+    //
+    // The VIEWER ALONE IS NOT ENOUGH: the policy's group functions read session
+    // state, so an unstamped connection evaluates them empty and this degrades to
+    // public-only rows. The stamped connection and the viewer are both required.
+    let counts = CorpusStatsRepository::tenant_counts(&mut read, &viewer, true).await?;
+    let agents = CorpusStatsRepository::agent_count(&mut *read, &viewer).await?;
 
     Ok(Json(StatsResponse {
         claims: counts.claims,

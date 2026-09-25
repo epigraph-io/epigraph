@@ -45,18 +45,32 @@ pub async fn claim_placement(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<PlacementResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_placement",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // There is no content here, but a theme or cluster id is a pointer into a
     // view that renders the claim's text, so this still has to be gated on the
-    // VIEWER. Read through `get_by_id`, whose `/* {VISIBILITY:c} */` splice does
-    // the filtering in SQL — hence the plain pool rather than a stamped
-    // connection. A claim the viewer cannot read is reported ABSENT, identically
-    // to one that does not exist (the convention `claim_compound_neighborhood`
+    // VIEWER. A claim the viewer cannot read is reported ABSENT, identically to
+    // one that does not exist (the convention `claim_compound_neighborhood`
     // sets); the pre-tenancy spelling returned the all-null body an unclustered
     // claim gets, which told the caller the claim existed.
+    //
+    // Read on the STAMPED connection, not merely with a viewer argument. The
+    // `/* {VISIBILITY:c} */` splice narrows the query, but row-level security
+    // evaluates its group functions from session state, so an unstamped
+    // connection sees an empty set and the endpoint would quietly answer
+    // public-only. Both halves are required.
     if epigraph_db::ClaimRepository::get_by_id(
-        pool,
+        &mut *read,
         &viewer,
         epigraph_core::ClaimId::from_uuid(claim_id),
     )
@@ -69,7 +83,7 @@ pub async fn claim_placement(
         });
     }
 
-    let placement = ClusterRunRepository::claim_placement(pool, claim_id)
+    let placement = ClusterRunRepository::claim_placement(&mut read, claim_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Claim".to_string(),

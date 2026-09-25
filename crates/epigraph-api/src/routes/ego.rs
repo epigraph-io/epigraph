@@ -181,7 +181,17 @@ pub async fn claim_ego(
     Path(claim_id): Path<Uuid>,
     Query(params): Query<EgoQuery>,
 ) -> Result<Json<EgoResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_ego",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     let max_degree = params
         .max_degree
@@ -189,7 +199,7 @@ pub async fn claim_ego(
         .clamp(MIN_MAX_DEGREE, MAX_MAX_DEGREE) as usize;
     let relationships = parse_relationships(params.relationships.as_deref());
 
-    let center_rows = EgoRepository::hydrate(pool, &viewer, &[claim_id]).await?;
+    let center_rows = EgoRepository::hydrate(&mut read, &viewer, &[claim_id]).await?;
     let center_entity = center_rows
         .into_iter()
         .find(|e| e.entity_type == "claim")
@@ -205,7 +215,7 @@ pub async fn claim_ego(
     // existed.
 
     let fetched =
-        EgoRepository::edges(pool, claim_id, max_degree, relationships.as_deref()).await?;
+        EgoRepository::edges(&mut read, claim_id, max_degree, relationships.as_deref()).await?;
 
     // Neighbour id → the entity type the edge declares for it.
     let mut declared_type: HashMap<Uuid, String> = HashMap::new();
@@ -237,7 +247,7 @@ pub async fn claim_ego(
     declared_type.remove(&claim_id);
 
     let neighbour_ids: Vec<Uuid> = declared_type.keys().copied().collect();
-    let hydrated = EgoRepository::hydrate(pool, &viewer, &neighbour_ids).await?;
+    let hydrated = EgoRepository::hydrate(&mut read, &viewer, &neighbour_ids).await?;
 
     // A neighbour the viewer may not read is now missing from `hydrated`
     // entirely, because the filtering moved into `hydrate`'s SQL. Its id is still

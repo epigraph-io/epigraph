@@ -472,6 +472,26 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "cluster_run.rs",
+        "claim_placement",
+        "READ, no claim content. Projects claims.theme_id plus graph_cluster_runs / \
+         graph_clusters / graph_neighborhoods metadata — ids and timestamps, never \
+         claims.content. Moved onto a connection so GET /claims/:id/placement could come off \
+         the raw pool; its caller gates FIRST on ClaimRepository::get_by_id under the viewer \
+         and 404s when the claim is not readable, so an unreadable claim never reaches this \
+         function. The connection is viewer-stamped, so RLS still applies to the claims read.",
+    ),
+    (
+        "ego.rs",
+        "edges",
+        "READ, edges only. Returns edge rows and a degree count for the ego graph; the node \
+         CONTENT it is paired with comes from EgoRepository::hydrate, which does take a Viewer \
+         and splices /* {VISIBILITY:c} */ over claims. Edge traversals being unfiltered is \
+         main's own documented residual — see GraphViewRepository's module docs and the PR-07 \
+         report — and this matches claim_compound_neighborhood rather than widening it. The \
+         connection is viewer-stamped, so edges RLS applies where the policy defines it.",
+    ),
+    (
         "claim.rs",
         "update_labels_conn",
         "WRITE. Label mutation on a claim the caller has already fetched under a viewer predicate \
@@ -1269,6 +1289,15 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    (
+        "cluster_run.rs",
+        "latest",
+        "READ, no claim data at all. One row from graph_cluster_runs (run_id, completed_at, \
+         degraded) — clustering-run metadata, not anything a tenant owns. Made generic over \
+         PgExecutor rather than connection-taking precisely so its existing pool callers in \
+         routes/graph.rs keep working while claim_placement can pass it the stamped \
+         connection it already holds.",
+    ),
     // ── THE THREE WRITES. Every other entry in this register is a READ with
     // nothing to filter; these are the first writes, and the argument is a
     // different one, so it is stated in full rather than borrowed.

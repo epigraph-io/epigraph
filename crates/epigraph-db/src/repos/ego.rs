@@ -16,7 +16,6 @@
 //! (see `routes/graph.rs` `GRAPH_VIEW_RELATIONSHIPS`), so a case-sensitive
 //! filter would silently hide half the graph.
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -104,7 +103,7 @@ impl EgoRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the count or either edge query fails.
     pub async fn edges(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         center: Uuid,
         max_degree: usize,
         relationships: Option<&[String]>,
@@ -126,7 +125,7 @@ impl EgoRepository {
         )
         .bind(center)
         .bind(&filter)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         // Fetch up to the whole budget on each side, then decide the split in
@@ -148,7 +147,7 @@ impl EgoRepository {
         .bind(center)
         .bind(&filter)
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         // `NOT (source_id = $1 AND source_type = 'claim')` keeps a degenerate
@@ -168,7 +167,7 @@ impl EgoRepository {
         .bind(center)
         .bind(&filter)
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         let (out_take, in_take) = balanced_split(outbound.len(), inbound.len(), max_degree);
@@ -208,7 +207,7 @@ impl EgoRepository {
     /// `agents` are not filtered: an agent row carries no claim content, and the
     /// ids reaching here already survived the edge walk.
     pub async fn hydrate(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         ids: &[Uuid],
     ) -> Result<Vec<EgoEntity>, DbError> {
@@ -231,7 +230,7 @@ impl EgoRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let claims: Vec<ClaimHydrationRow> = q.fetch_all(pool).await?;
+        let claims: Vec<ClaimHydrationRow> = q.fetch_all(&mut *conn).await?;
         for row in claims {
             out.push(EgoEntity {
                 id: row.id,
@@ -250,7 +249,7 @@ impl EgoRepository {
         let agents: Vec<(Uuid, Option<String>)> =
             sqlx::query_as("SELECT id, display_name FROM agents WHERE id = ANY($1)")
                 .bind(ids)
-                .fetch_all(pool)
+                .fetch_all(&mut *conn)
                 .await?;
         for (id, display_name) in agents {
             let label = display_name.unwrap_or_else(|| short_id("Agent", id));
@@ -274,7 +273,7 @@ impl EgoRepository {
              FROM evidence WHERE id = ANY($1)",
         )
         .bind(ids)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for row in evidence {
             let id = row.id;
@@ -309,7 +308,7 @@ impl EgoRepository {
             "SELECT id, reasoning_type, confidence FROM reasoning_traces WHERE id = ANY($1)",
         )
         .bind(ids)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for (id, reasoning_type, confidence) in traces {
             out.push(EgoEntity {
@@ -327,7 +326,7 @@ impl EgoRepository {
         let papers: Vec<(Uuid, Option<String>, String)> =
             sqlx::query_as("SELECT id, title, doi FROM papers WHERE id = ANY($1)")
                 .bind(ids)
-                .fetch_all(pool)
+                .fetch_all(&mut *conn)
                 .await?;
         for (id, title, doi) in papers {
             let label = title.filter(|t| !t.is_empty()).unwrap_or(doi);

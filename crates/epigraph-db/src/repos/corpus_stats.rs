@@ -85,7 +85,7 @@ impl CorpusStatsRepository {
     ///
     /// Returns [`DbError`] if the query fails.
     pub async fn tenant_counts(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         viewer: &Viewer,
         detailed: bool,
     ) -> Result<CorpusCounts, DbError> {
@@ -114,7 +114,7 @@ impl CorpusStatsRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let (claims, evidence, edges, frames) = q.fetch_one(pool).await?;
+        let (claims, evidence, edges, frames) = q.fetch_one(&mut *conn).await?;
 
         let mut out = CorpusCounts {
             claims,
@@ -141,7 +141,7 @@ impl CorpusStatsRepository {
             if let Some(g) = viewer.group_bind() {
                 dq = dq.bind(g);
             }
-            let (workflow_claims, challenges, embedded_claims) = dq.fetch_one(pool).await?;
+            let (workflow_claims, challenges, embedded_claims) = dq.fetch_one(&mut *conn).await?;
             out.workflow_claims = Some(workflow_claims);
             out.challenges = Some(challenges);
             out.embedded_claims = Some(embedded_claims);

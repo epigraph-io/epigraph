@@ -54,8 +54,15 @@ pub async fn get_provenance_chain(
     let claim_id = parse_uuid(&params.claim_id)?;
     let max_depth = params.max_depth.unwrap_or(4);
 
+    // `chain` takes a connection now; MCP is not on a ScopedPool yet, so it
+    // acquires an ordinary one and behaviour is unchanged.
+    let mut conn = server
+        .pool
+        .acquire()
+        .await
+        .map_err(|e| internal_error(epigraph_db::DbError::from(e)))?;
     let chain = ProvenanceChainRepository::chain(
-        &server.pool,
+        &mut conn,
         viewer,
         claim_id,
         max_depth,

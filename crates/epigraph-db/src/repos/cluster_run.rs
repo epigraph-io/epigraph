@@ -23,7 +23,6 @@
 //! separate decision for all five call sites at once.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -60,14 +59,16 @@ impl ClusterRunRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the lookup fails.
-    pub async fn latest(pool: &PgPool) -> Result<Option<ClusterRunRow>, DbError> {
+    pub async fn latest<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+    ) -> Result<Option<ClusterRunRow>, DbError> {
         let row = sqlx::query_as::<_, ClusterRunRow>(
             "SELECT run_id, completed_at, degraded
              FROM graph_cluster_runs
              ORDER BY completed_at DESC
              LIMIT 1",
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row)
     }
@@ -83,7 +84,7 @@ impl ClusterRunRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if any of the lookups fails.
     pub async fn claim_placement(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
     ) -> Result<Option<ClaimPlacement>, DbError> {
         // `theme_id` is a column on the claim, so this doubles as the
@@ -91,13 +92,13 @@ impl ClusterRunRepository {
         let claim: Option<(Option<Uuid>,)> =
             sqlx::query_as("SELECT theme_id FROM claims WHERE id = $1")
                 .bind(claim_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *conn)
                 .await?;
         let Some((theme_id,)) = claim else {
             return Ok(None);
         };
 
-        let Some(run) = Self::latest(pool).await? else {
+        let Some(run) = Self::latest(&mut *conn).await? else {
             return Ok(Some(ClaimPlacement {
                 claim_id,
                 theme_id,
@@ -114,7 +115,7 @@ impl ClusterRunRepository {
         )
         .bind(claim_id)
         .bind(run.run_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         let neighborhood_id: Option<Uuid> = sqlx::query_scalar(
@@ -123,7 +124,7 @@ impl ClusterRunRepository {
         )
         .bind(claim_id)
         .bind(run.run_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         let placed = cluster_id.is_some() || neighborhood_id.is_some();

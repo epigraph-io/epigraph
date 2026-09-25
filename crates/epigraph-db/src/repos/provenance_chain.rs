@@ -23,7 +23,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -96,9 +95,9 @@ impl ProvenanceChainRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the traversal or hydration query
     /// fails.
-    #[instrument(skip(pool, viewer))]
+    #[instrument(skip(conn, viewer))]
     pub async fn chain(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: u8,
@@ -190,7 +189,7 @@ impl ProvenanceChainRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         // Fewest-hops depth per node, the stored edge set, and any cycles.
@@ -242,7 +241,7 @@ impl ProvenanceChainRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         let depth_of: HashMap<Uuid, i32> = kept.iter().copied().collect();

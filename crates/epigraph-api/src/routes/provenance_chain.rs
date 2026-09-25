@@ -109,7 +109,17 @@ pub async fn claim_provenance_chain(
     Path(claim_id): Path<Uuid>,
     Query(params): Query<ProvenanceChainQuery>,
 ) -> Result<Json<ProvenanceChainResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_provenance_chain",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     let max_depth = params
         .max_depth
@@ -118,7 +128,7 @@ pub async fn claim_provenance_chain(
     let relationships = parse_relationships(params.relationships.as_deref());
 
     let chain = epigraph_db::ProvenanceChainRepository::chain(
-        pool,
+        &mut read,
         &viewer,
         claim_id,
         max_depth,
