@@ -924,6 +924,85 @@ class HelperAgentTest(_IsolatedRepo):
         self.assertEqual(env, {"PATH": "/bin", "FOO": "ok", "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"})
 
 
+HOOK_SCRIPT = """#!/bin/sh
+echo "$(basename "$0") cwd=$(pwd) token=${EPIGRAPH_TOKEN:-none} gh=${GH_TOKEN:-none}" >> "%s"
+cat >/dev/null 2>&1 || true
+exit 0
+"""
+
+
+class BoardGitHardeningTest(_IsolatedRepo):
+    """An agent can write the SHARED .git (hooks, config) from its own worktree. Nothing it plants there may run
+    with the board's environment, and the board must not follow a remote that was re-pointed after it started."""
+
+    def plant_hooks(self, worktree):
+        # exactly what an agent can do: resolve the common dir from inside its worktree and write hooks there
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=worktree,
+                                env=self.git_env, check=True, capture_output=True, text=True).stdout.strip()
+        self.assertFalse(os.path.realpath(common).startswith(os.path.realpath(worktree)), common)
+        self.hook_log = os.path.join(self.tmp, "hooks-ran.log")
+        hooks = os.path.join(common, "hooks")
+        os.makedirs(hooks, exist_ok=True)
+        for name in ("post-checkout", "reference-transaction"):
+            path = os.path.join(hooks, name)
+            with open(path, "w") as fh:
+                fh.write(HOOK_SCRIPT % self.hook_log)
+            os.chmod(path, 0o755)
+
+    def hook_runs(self):
+        if not os.path.exists(self.hook_log):
+            return ""
+        with open(self.hook_log) as fh:
+            return fh.read()
+
+    def test_hooks_planted_from_a_worktree_never_run_for_the_boards_git(self):
+        os.environ.update(SECRET_CANARIES)
+        app = self.make_app()
+        integ = app.ensure_integration()
+        wt_a, _ = app.ensure_worktree(CLAIM_A, "first", None, integ)
+        self.plant_hooks(wt_a)
+        # the board's next fetch (ensure_integration) and worktree add (ensure_worktree) must not run them
+        self.assertEqual(app.ensure_integration(), integ)
+        app.ensure_worktree(CLAIM_B, "second", None, integ)
+        self.assertEqual(self.hook_runs(), "", "a hook planted by an agent ran inside the board's git")
+        # control: the planted hooks are live for a plain git, so the assertion above is not vacuous
+        subprocess.run(["git", "worktree", "add", "-q", "--detach", os.path.join(self.tmp, "control"), "HEAD"],
+                       cwd=self.repo, env=self.git_env, check=True, capture_output=True)
+        self.assertIn("post-checkout", self.hook_runs())
+
+    def test_board_git_runs_with_hooks_off_and_a_scrubbed_env(self):
+        os.environ.update(SECRET_CANARIES)
+        app = self.make_app()
+        seen = []
+
+        def fake_run_cmd(argv, cwd=None, timeout=60, check=True, env=None):
+            seen.append((argv, env))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(kanban, "run_cmd", fake_run_cmd):
+            app.git(["worktree", "prune"])
+        argv, env = seen[-1]
+        self.assertIn("core.hooksPath=/dev/null", argv)
+        self.assertIn("core.fsmonitor=false", argv)
+        self.assertIsNotNone(env, "the board's git inherited the board's whole environment")
+        self.assertFalse(set(env) & set(SECRET_CANARIES), sorted(env))
+
+    def test_board_refuses_a_remote_whose_url_changed_after_startup(self):
+        app = self.make_app()
+        app.pin_remote()
+        app.git(["fetch", "origin"])  # unchanged: fine
+        other = os.path.join(self.tmp, "other.git")
+        subprocess.run(["git", "init", "-q", "--bare", other], env=self.git_env, check=True, capture_output=True)
+        subprocess.run(["git", "remote", "set-url", "origin", other], cwd=self.repo, env=self.git_env, check=True,
+                       capture_output=True)
+        for args in (["fetch", "origin"], ["ls-remote", "--heads", "origin"], ["push", "origin", "HEAD:refs/heads/x"]):
+            with self.assertRaises(kanban.CmdError) as cm:
+                app.git(args)
+            self.assertIn("changed since the board started", str(cm.exception))
+        self.assertEqual(subprocess.run(["git", "ls-remote", "--heads", other], env=self.git_env,
+                                        capture_output=True, text=True).stdout, "")
+
+
 class SessionSecretTest(unittest.TestCase):
     """The secret that authorises the mutating endpoints never exists where a same-uid agent could simply
     read it: not in a file under KANBAN_HOME, not in /api/state, not in any agent's environment, not in a URL."""

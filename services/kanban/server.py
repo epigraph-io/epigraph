@@ -312,6 +312,29 @@ def agent_env(cfg: "Config", source: Optional[Dict[str, str]] = None) -> Dict[st
     return env
 
 
+# The board's OWN git and gh get the agent allow-list plus what those tools need to reach the remote -- never the
+# board's tokens. Agents can write the shared .git (hooks, config) and every config file under $HOME, so anything
+# the board's git ends up executing on their behalf must see no more than an agent already has: running code as the
+# same uid is not an escalation, the board's environment is.
+TOOL_ENV_EXTRA = ("SSH_AUTH_SOCK", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
+                  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy",
+                  "all_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO", "DBUS_SESSION_BUS_ADDRESS",
+                  "XDG_RUNTIME_DIR", "GH_HOST", "GH_CONFIG_DIR")
+# `-c` has the highest precedence: no repository hook and no fsmonitor command ever runs for the board's git.
+GIT_SAFE_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+NETWORK_GIT_COMMANDS = ("fetch", "push", "ls-remote")
+
+
+def tool_env(cfg: "Config", source: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Environment for the board's own git/gh subprocesses: agent_env() plus TOOL_ENV_EXTRA, minus AGENT_ENV_NEVER."""
+    src = os.environ if source is None else source
+    env = agent_env(cfg, src)
+    for name in TOOL_ENV_EXTRA:
+        if name in src and name not in AGENT_ENV_NEVER:
+            env[name] = src[name]
+    return env
+
+
 def dev_tool_args(cfg: "Config") -> List[str]:
     args: List[str] = []
     if cfg.agent_allowed_tools:
@@ -792,6 +815,9 @@ class App:
         self.backlog_refresh: Dict[str, Any] = {"running": False, "error": None, "source": None}
         self._integ_cache: Optional[Tuple[float, str, Dict[str, Any]]] = None
         self._integ_lock = threading.Lock()
+        # (fetch URL, push URL) of cfg.remote as the board first saw them; see pin_remote()
+        self._remote_pin: Optional[Tuple[str, str]] = None
+        self._pin_lock = threading.Lock()
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -816,6 +842,10 @@ class App:
             return self.token
 
     def start(self) -> None:
+        try:
+            self.pin_remote()
+        except CmdError as e:
+            log("could not read the URL of remote %r yet (%s); it is pinned on first use" % (self.cfg.remote, e))
         self.recover()
         threading.Thread(target=self._scheduler_loop, name="scheduler", daemon=True).start()
 
@@ -875,7 +905,39 @@ class App:
     # ---- git / gh --------------------------------------------------------
 
     def git(self, args: List[str], cwd: Optional[str] = None, timeout: float = 120, check: bool = True) -> subprocess.CompletedProcess:
-        return run_cmd([self.cfg.git_bin] + args, cwd=cwd or self.cfg.repo, timeout=timeout, check=check)
+        """The board's own git: hooks and fsmonitor off, the scrubbed tool_env(), and network commands only
+        against the remote URL pinned at startup."""
+        if args and args[0] in NETWORK_GIT_COMMANDS:
+            self._check_remote_pin()
+        return run_cmd([self.cfg.git_bin, *GIT_SAFE_CONFIG] + args, cwd=cwd or self.cfg.repo, timeout=timeout,
+                       check=check, env=tool_env(self.cfg))
+
+    def _remote_urls(self) -> Tuple[str, str]:
+        # `get-url` expands insteadOf/pushInsteadOf, so a rewrite rule planted in config shows up here as well
+        fetch = self.git(["remote", "get-url", self.cfg.remote], timeout=15).stdout.strip()
+        push = self.git(["remote", "get-url", "--push", self.cfg.remote], timeout=15).stdout.strip()
+        return fetch, push
+
+    def pin_remote(self) -> Tuple[str, str]:
+        """Record the remote's URLs once. The shared .git/config is agent-writable, so a later change is refused."""
+        with self._pin_lock:
+            if self._remote_pin is None:
+                self._remote_pin = self._remote_urls()
+                log("pinned remote %s: fetch %s, push %s" % ((self.cfg.remote,) + self._remote_pin))
+            return self._remote_pin
+
+    def _check_remote_pin(self) -> None:
+        with self._pin_lock:
+            pinned = self._remote_pin
+        if pinned is None:
+            self.pin_remote()
+            return
+        now = self._remote_urls()
+        if now != pinned:
+            raise CmdError(["git", "remote"], None, "",
+                           "the URL of remote %r changed since the board started (was fetch %s / push %s, now %s / %s); "
+                           "refusing to talk to it. Restart the board to accept the change."
+                           % ((self.cfg.remote,) + pinned + now))
 
     def gh(self, args: List[str], timeout: float = 120, check: bool = True) -> subprocess.CompletedProcess:
         return run_cmd([self.cfg.gh_bin] + args, cwd=self.cfg.repo, timeout=timeout, check=check)

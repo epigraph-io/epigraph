@@ -130,6 +130,7 @@ Every `/api/*` call needs the session secret in the `X-Kanban-Token` header. It 
   - run `gh pr merge` (or call the GitHub API) itself, using your `gh` credentials from their config file on disk. The `--disallowedTools` patterns catch the obvious spellings of that command, but they are prefix matches, not a sandbox;
   - read your browser profile, where `sessionStorage` may be persisted, or read the board's memory where the kernel allows same-uid ptrace;
   - read the pairing link from wherever the board's stdout goes (a terminal, tmux or the journal) while the link is still unredeemed. Agents only run during that window if they survived a server restart; the board logs a warning when that happens. Pair promptly after a restart;
+  - write the shared `.git/hooks` and `.git/config` of your checkout, your `~/.gitconfig`, `~/.config/gh`, and any executable on your `PATH` that your uid owns. The board's own git ignores hooks and fsmonitor, gets no tokens and refuses a re-pointed remote (see "What the board does to your repository"), but *your* git in your checkout honours whatever an agent planted there. Check `.git/hooks` and `git config --local --list` after a session you did not watch;
   - stop or restart the board process itself.
 
   What the hardening does buy: the session secret is not on disk, not in any environment, and not in `/api/state`; agents inherit no tokens from the environment; helper agents have no shell at all; and agent-authored text cannot reach a prompt unquoted. Together these close the *accidental* paths and the cheap ones. **For real isolation, run the agents as a separate OS user or in a container that holds no GitHub credential with merge rights**, or at least give their `gh` a token that cannot merge to the base branch. Keep `KANBAN_MAX_AGENTS` low, and pick a permission mode you are comfortable with.
@@ -145,6 +146,13 @@ Every `/api/*` call needs the session secret in the `X-Kanban-Token` header. It 
   - `git worktree add/remove/prune` and `fetch`;
   - `kanban/*` branches are created and deleted with `branch -D` after Accept;
   - `gh` commands run with the checkout as cwd so that they resolve the GitHub repository.
+
+  Agents can write that shared `.git` from inside their worktrees (`git rev-parse --git-common-dir` resolves outside the worktree), including `hooks/` and `config`. The board's own git therefore:
+  - runs with `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, so no hook or fsmonitor command planted there runs for it;
+  - runs with the scrubbed environment (the agent allow-list plus `SSH_AUTH_SOCK`, `GIT_SSH*`, `GIT_CONFIG_GLOBAL/NOSYSTEM`, proxy and CA variables), never the board's tokens. Anything else a planted config key makes git execute (`credential.helper`, `core.sshCommand`, filter drivers) sees only what an agent already has. Running code as your uid is not an escalation for an agent; the board's environment would be;
+  - pins `git remote get-url` / `get-url --push` of `KANBAN_REMOTE` at startup (with `insteadOf` rules expanded) and refuses every `fetch`, `push` and `ls-remote` once either URL differs. Restart the board to accept a deliberate change.
+
+  Because the board's git gets no tokens, its pushes (the integration branch) authenticate the same way agents do: through a git credential helper, `gh auth setup-git`, or `SSH_AUTH_SOCK`.
 
   `gh pr merge --delete-branch` also deletes a matching *local* branch. If you have the integration branch checked out in your own checkout when you ship, gh may switch that checkout to the base branch, so don't. If gh fails to delete the local branch but GitHub reports the PR `MERGED`, the merge is still treated as successful.
 - The board does not rebase item PRs when the integration branch moves. Conflicts show up in the Integration panel as `mergeable`/`checks` status, and you resolve them with Request changes.
