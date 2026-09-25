@@ -3,6 +3,8 @@ pub mod errors;
 pub mod extractors;
 pub mod metrics;
 pub mod middleware;
+#[cfg(feature = "db")]
+pub mod migrate;
 pub mod oauth;
 pub mod openapi;
 #[cfg(feature = "db")]
@@ -38,9 +40,16 @@ pub fn _test_event_store() -> std::sync::Arc<crate::routes::events::EventStore> 
     crate::routes::events::global_event_store().clone()
 }
 
-/// Apply all pending SQL migrations from the workspace `migrations/` directory.
+/// Apply all pending SQL migrations from the workspace `migrations/` directory,
+/// then verify the database reached this binary's embedded head.
 ///
-/// Migrations are embedded into the binary at compile time by `sqlx::migrate!()`.
+/// Migrations are embedded into the binary at compile time by `sqlx::migrate!()`,
+/// so a binary knows only the migrations that existed when it was built. The
+/// schema-head checks that make that safe — and why `set_ignore_missing(true)`
+/// is kept — live in [`migrate`] (issue #492): a database AHEAD of the binary
+/// is refused before anything is applied unless `opts.allow_db_ahead`, and
+/// after running every embedded migration must be recorded as applied. The
+/// returned [`migrate::MigrationReport`] names both heads.
 ///
 /// `bin/epigraph-migrate.rs` is the supported deploy path and calls this
 /// unconditionally. `bin/server.rs` calls it only when `EPIGRAPH_MIGRATE_ON_BOOT`
@@ -48,19 +57,8 @@ pub fn _test_event_store() -> std::sync::Arc<crate::routes::events::EventStore> 
 /// when their tenancy preconditions do not hold and the server call site
 /// `.expect()`s — an unattended boot-time apply turns a precondition failure
 /// into a crash loop. See `docs/deploy.md`.
-///
-/// `ignore_missing(true)` is required because `epigraph-internal` shares the
-/// same `_sqlx_migrations` table and applies its own migrations (currently
-/// versions 35–37). Without this flag, the public binary would panic on
-/// restart with "migration N was previously applied but is missing in the
-/// resolved migrations". See `migrations/README.md` for the version-range
-/// reservation.
 #[cfg(feature = "db")]
-pub async fn run_migrations(pool: &epigraph_db::PgPool) -> Result<(), sqlx::migrate::MigrateError> {
-    let mut migrator = sqlx::migrate!("../../migrations");
-    migrator.set_ignore_missing(true);
-    migrator.run(pool).await
-}
+pub use migrate::run_migrations;
 
 /// Should `bin/server.rs` apply migrations at boot? Reads the raw
 /// `EPIGRAPH_MIGRATE_ON_BOOT` value; `None` means unset.
@@ -73,6 +71,14 @@ pub async fn run_migrations(pool: &epigraph_db::PgPool) -> Result<(), sqlx::migr
 /// YAML quoting must not silently get the *skip* branch: that yields a server
 /// that boots happily against a stale schema, the worst failure available here.
 pub fn should_migrate_on_boot(raw: Option<&str>) -> bool {
+    env_flag_enabled(raw)
+}
+
+/// The boolean-environment-variable rule shared by `EPIGRAPH_MIGRATE_ON_BOOT`
+/// and `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD`: `1`/`true`/`yes`, trimmed and
+/// case-folded. Anything else — including unset and the empty string — is
+/// false.
+pub fn env_flag_enabled(raw: Option<&str>) -> bool {
     matches!(
         raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("1") | Some("true") | Some("yes")

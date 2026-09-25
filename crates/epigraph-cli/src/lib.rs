@@ -14,6 +14,7 @@ pub mod recompute_betp;
 pub mod reembed;
 #[cfg(feature = "genai")]
 pub mod rerank;
+pub mod retarget;
 
 #[cfg(feature = "db")]
 use sqlx::PgPool;

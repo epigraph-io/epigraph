@@ -59,12 +59,55 @@ async fn main() {
     let pool = epigraph_db::PgPool::connect(&url)
         .await
         .expect("PgPool::connect to DATABASE_URL failed");
-    tracing::info!("Applying migrations");
-    epigraph_api::run_migrations(&pool)
-        .await
-        .expect("sqlx::migrate failed — refusing to leave DB in a half-migrated state");
-    tracing::info!("migrations: ok");
-    println!("migrations: ok"); // keep stdout marker for ops scripts that grep for it
+    // Issue #492: a database AHEAD of this binary's embedded migration set is
+    // refused unless the operator opts in, by flag or by env. Either spelling
+    // suffices; both are named in the refusal text.
+    let opts = epigraph_api::migrate::MigrateOptions {
+        allow_db_ahead: std::env::args()
+            .skip(1)
+            .any(|a| a == epigraph_api::migrate::ALLOW_DB_AHEAD_FLAG)
+            || epigraph_api::migrate::MigrateOptions::from_env().allow_db_ahead,
+    };
+    tracing::info!(
+        binary_head = epigraph_api::migrate::embedded_migration_versions()
+            .last()
+            .copied(),
+        allow_db_ahead = opts.allow_db_ahead,
+        "Applying migrations"
+    );
+    let report = match epigraph_api::run_migrations(&pool, opts).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Nonzero exit and NO `migrations: ok` marker: ops scripts key on
+            // that string, so it must never appear on a refusal.
+            tracing::error!(error = %e, "migrations FAILED");
+            eprintln!("migrations: FAILED: {e}");
+            std::process::exit(1);
+        }
+    };
+    // `run_migrations` returns `db_ahead` only when the opt-in was given (a
+    // strict run is refused instead), but the claim below is about the opt-in,
+    // so it is keyed on the opt-in rather than inferred from the report.
+    if report.db_ahead && opts.allow_db_ahead {
+        eprintln!(
+            "WARNING: the database has applied migration version(s) {:?} that this binary \
+             does not embed (database head {}, binary head {}); proceeding because the \
+             rollback opt-in is set",
+            report.ahead, report.db_head, report.binary_head
+        );
+    }
+    tracing::info!(
+        db_head_before = report.db_head_before,
+        db_head = report.db_head,
+        binary_head = report.binary_head,
+        applied = report.applied_this_run,
+        db_ahead = report.db_ahead,
+        "migrations: ok"
+    );
+    // Stdout marker for ops scripts: the line still STARTS with
+    // `migrations: ok`, so an existing `grep 'migrations: ok'` keeps matching,
+    // and it now carries both heads so the marker says what "ok" means.
+    println!("migrations: ok {report}");
 }
 
 #[cfg(not(feature = "db"))]
