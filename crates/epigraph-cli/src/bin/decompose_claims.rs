@@ -748,9 +748,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a)
             };
             let totals = persist_planned(pool, viewer, &ok, embedder, &submit).await?;
+            for (id, why) in &totals.failed {
+                eprintln!("FAILED {id}: {why}");
+            }
             eprintln!(
-                "apply-plan complete: {} applied, {} refused, {} atoms, {} decomposes_to edges",
-                ok.len(),
+                "apply-plan complete: {} applied, {} failed (still undecomposed; re-run this \
+                 plan to retry them), {} refused, {} atoms, {} decomposes_to edges",
+                ok.len() - totals.failed.len(),
+                totals.failed.len(),
                 drifted.len(),
                 totals.atoms,
                 totals.edges

@@ -435,11 +435,27 @@ mod db_writes {
         if !ClaimRepository::are_all_current(pool, viewer, &[parent_id]).await? {
             return Err(format!("parent claim {parent_id} is not current").into());
         }
+        // Phase 1: submit EVERY atom before wiring ANY edge. The
+        // `decomposes_to` edges are what take the parent out of the
+        // undecomposed population; writing them per atom meant a submit that
+        // failed on atom k (an API restart, a 502) left the parent with k-1
+        // atoms for good — `--apply-plan` then refused it as no longer
+        // undecomposed and no selection ever chose it again. Atoms without
+        // edges change nothing about the parent, and `if_not_exists` on the
+        // atom POST hands back the same ids when the line is re-applied.
         let mut atom_ids = Vec::with_capacity(decomp.atoms.len());
-        let mut edges = 0usize;
+        let mut gens = Vec::with_capacity(decomp.atoms.len());
         for (i, atom) in decomp.atoms.iter().enumerate() {
             let gen = decomp.generality.get(i).copied().unwrap_or(-1);
-            let atom_id = submit_via(atom.clone(), gen).await?;
+            let atom_id = submit_via(atom.clone(), gen).await.map_err(|e| {
+                format!(
+                    "atom {} of {} for parent {parent_id}: {e}; no decomposes_to edge \
+                     was written, so the parent is still undecomposed and the line can be \
+                     re-applied",
+                    i + 1,
+                    decomp.atoms.len()
+                )
+            })?;
             // Best-effort embed-on-write when the caller passes a live embedder
             // and the submit path did not already embed (API path embeds; the
             // direct-insert test fake does not).
@@ -448,8 +464,16 @@ mod db_writes {
                     let _ = e.store(atom_id, &vec).await;
                 }
             }
-            let (_row, was_created) = EdgeRepository::create_if_not_exists(
-                pool,
+            atom_ids.push(atom_id);
+            gens.push(gen);
+        }
+        // Phase 2: every edge in ONE transaction, so the parent goes from
+        // "no decomposition" to "all atoms" with nothing in between.
+        let mut tx = pool.begin().await?;
+        let mut edges = 0usize;
+        for (&atom_id, &gen) in atom_ids.iter().zip(gens.iter()) {
+            let (_row, was_created) = EdgeRepository::create_if_not_exists_conn(
+                &mut tx,
                 parent_id,
                 "claim",
                 atom_id,
@@ -463,8 +487,8 @@ mod db_writes {
             if was_created {
                 edges += 1;
             }
-            atom_ids.push(atom_id);
         }
+        tx.commit().await?;
         Ok(PersistOutcome {
             atom_claim_ids: atom_ids,
             edges_created: edges,
@@ -488,6 +512,9 @@ mod db_writes {
     pub struct BatchTotals {
         pub atoms: usize,
         pub edges: usize,
+        /// Parents whose line failed to persist, with the reason. Each is
+        /// still undecomposed (no edge is written until every atom is).
+        pub failed: Vec<(Uuid, String)>,
     }
 
     /// Chunk `claims` into batches, decompose each batch through `llm`, and
@@ -525,6 +552,26 @@ mod db_writes {
                 persist_planned(pool, viewer, &planned, embedder.clone(), &submit_via).await?;
             totals.atoms += chunk_totals.atoms;
             totals.edges += chunk_totals.edges;
+            // A normal run still ABORTS on a persist failure (after finishing
+            // the chunk): the next chunk would spend another LLM call on an
+            // API that is probably down. `--apply-plan` makes no LLM call and
+            // continues instead (see `persist_planned`).
+            if !chunk_totals.failed.is_empty() {
+                let lines: Vec<String> = chunk_totals
+                    .failed
+                    .iter()
+                    .map(|(id, why)| format!("{id}: {why}"))
+                    .collect();
+                return Err(format!(
+                    "persist failed for {} parent(s), aborting before the next LLM call \
+                     ({} atoms / {} edges written so far): {}",
+                    lines.len(),
+                    totals.atoms,
+                    totals.edges,
+                    lines.join("; ")
+                )
+                .into());
+            }
         }
         Ok(totals)
     }
@@ -589,9 +636,19 @@ mod db_writes {
     /// Persist already-planned decompositions. Makes NO LLM call — this is
     /// the whole of `--apply-plan`, and the persist half of a normal run.
     ///
+    /// A line that fails is recorded in [`BatchTotals::failed`] and the next
+    /// line is still attempted: one bad line (or a transient API error) must
+    /// not strand the rest of a reviewed plan. Because
+    /// [`persist_decomposition`] writes no edge until every atom is
+    /// submitted, a failed line leaves its parent undecomposed and a re-run of
+    /// the same plan applies it.
+    ///
     /// Atoms inherit the parent compound claim's author: `agent_id` is a
     /// REQUIRED field of CreateClaimRequest (POST /api/v1/claims), and omitting
     /// it returned 422, which silently dropped every decomposition atom.
+    ///
+    /// # Errors
+    /// None today; the `Result` is kept for callers.
     pub async fn persist_planned<F, Fut>(
         pool: &PgPool,
         viewer: &epigraph_db::visibility::Viewer,
@@ -606,7 +663,7 @@ mod db_writes {
         let mut totals = BatchTotals::default();
         for plan in planned {
             let parent_agent_id = plan.agent_id;
-            let outcome = persist_decomposition(
+            match persist_decomposition(
                 pool,
                 viewer,
                 plan.claim_id,
@@ -614,9 +671,14 @@ mod db_writes {
                 embedder.clone(),
                 move |atom_text, generality| submit_via(atom_text, generality, parent_agent_id),
             )
-            .await?;
-            totals.atoms += outcome.atom_claim_ids.len();
-            totals.edges += outcome.edges_created;
+            .await
+            {
+                Ok(outcome) => {
+                    totals.atoms += outcome.atom_claim_ids.len();
+                    totals.edges += outcome.edges_created;
+                }
+                Err(e) => totals.failed.push((plan.claim_id, e.to_string())),
+            }
         }
         Ok(totals)
     }

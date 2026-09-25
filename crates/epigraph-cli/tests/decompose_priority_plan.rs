@@ -470,3 +470,118 @@ async fn plan_then_apply_plan_persists_the_reviewed_atoms_with_no_second_llm_cal
     )));
     std::fs::remove_file(&path).ok();
 }
+
+/// The fake atom submit, idempotent the way `POST /api/v1/claims` with
+/// `if_not_exists: true` is: the same text by the same author returns the
+/// same claim id.
+async fn get_or_insert_atom(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
+    let hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
+    let existing: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2")
+            .bind(hash.as_slice())
+            .bind(agent)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+    match existing {
+        Some(id) => id,
+        None => insert_atom(pool, agent, content).await,
+    }
+}
+
+fn three_atom_plan(
+    claim_id: Uuid,
+    agent: Uuid,
+    text: &str,
+) -> epigraph_cli::decompose::PlannedDecomposition {
+    epigraph_cli::decompose::PlannedDecomposition {
+        kind: "decomposition".into(),
+        claim_id,
+        agent_id: agent,
+        content: text.to_string(),
+        atoms: vec![
+            "Partial atom one.".into(),
+            "Partial atom two.".into(),
+            "Partial atom three.".into(),
+        ],
+        generality: vec![0, 0, 0],
+        model: "fixture".into(),
+    }
+}
+
+/// A submit that fails partway through a parent's atoms (an API restart, a
+/// 502 on atom 2 of 3) leaves the parent UNdecomposed — no decomposes_to edge
+/// at all — so the same reviewed line passes `verify_plan` again and a
+/// re-apply completes it with exactly the planned atoms. A second line in the
+/// same plan is still applied: one failure does not strand the rest.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_submit_failure_mid_parent_leaves_it_reapplicable(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let text = compound("partial");
+    let other_text = compound("other");
+    let parent = seed_claim(&pool, agent, &text, 100, &[]).await;
+    let other = seed_claim(&pool, agent, &other_text, 100, &[]).await;
+    let mut other_plan = three_atom_plan(other, agent, &other_text);
+    other_plan.atoms = vec!["Other atom one.".into(), "Other atom two.".into()];
+    other_plan.generality = vec![0, 0];
+    let plan = vec![three_atom_plan(parent, agent, &text), other_plan];
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (pool_c, calls_c) = (pool.clone(), calls.clone());
+    let flaky = move |t: String, _g: i64, a: Uuid| {
+        let pool_c = pool_c.clone();
+        // The 2nd submit of the whole run is atom 2 of the first parent.
+        let n = calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move {
+            if n == 1 {
+                return Err::<Uuid, Box<dyn std::error::Error>>("HTTP 502 (API restarting)".into());
+            }
+            Ok(get_or_insert_atom(&pool_c, a, &t).await)
+        }
+    };
+    let (ok, _) = verify_plan(&pool, &viewer, plan.clone()).await.unwrap();
+    let totals = persist_planned(&pool, &viewer, &ok, None, &flaky)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        totals.failed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![parent],
+        "the failed line is reported: {totals:?}"
+    );
+    assert!(
+        atoms_of(&pool, parent).await.is_empty(),
+        "no decomposes_to edge until every atom is submitted"
+    );
+    assert_eq!(
+        atoms_of(&pool, other).await.len(),
+        2,
+        "the next line still ran"
+    );
+
+    // Re-apply the SAME reviewed plan with a healthy submit.
+    let (ok2, drifted2) = verify_plan(&pool, &viewer, plan).await.unwrap();
+    assert_eq!(
+        ok2.iter().map(|p| p.claim_id).collect::<Vec<_>>(),
+        vec![parent],
+        "the failed parent is still undecomposed; the applied one drifts: {drifted2:?}"
+    );
+    let pool_h = pool.clone();
+    let healthy = move |t: String, _g: i64, a: Uuid| {
+        let pool_h = pool_h.clone();
+        async move { Ok(get_or_insert_atom(&pool_h, a, &t).await) }
+    };
+    let totals2 = persist_planned(&pool, &viewer, &ok2, None, &healthy)
+        .await
+        .unwrap();
+    assert!(totals2.failed.is_empty(), "{totals2:?}");
+    assert_eq!(
+        atoms_of(&pool, parent).await,
+        vec![
+            "Partial atom one.".to_string(),
+            "Partial atom three.".to_string(),
+            "Partial atom two.".to_string()
+        ]
+    );
+}
