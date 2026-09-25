@@ -969,6 +969,13 @@ class AgentEnvTest(_ServerFixture):
             # pre-approving any of these would bypass the permission mode (a bare Write/Edit covers every path)
             for tool in ("Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"):
                 self.assertNotIn(tool, allowed)
+            # a BARE Read/Glob/Grep pre-approves reads of any path (gh credentials, ~/.claude.json, /proc/*/environ);
+            # file reads are pre-approved only inside the worktree
+            for tool in ("Read", "Glob", "Grep"):
+                self.assertNotIn(tool, allowed)
+            self.assertIn("Read(./**)", allowed)
+            self.assertFalse([t for t in allowed if t.startswith(("Read(", "Glob(", "Grep(")) and t != "Read(./**)"],
+                             allowed)
 
         status, body = self.accept(CLAIM_K)
         self.assertEqual(status, 200, body)

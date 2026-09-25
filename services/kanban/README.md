@@ -44,7 +44,7 @@ Prerequisites: `git`, an authenticated `gh`, and `claude` on PATH, plus a checko
 | `KANBAN_REQUIRED_CHECKS` | – | Comma-separated CI check names (check-run `name` or status `context`) that must have reported green before checks count as `pass`. Without it, `pass` means "every check reported so far is green" |
 | `KANBAN_HTTP_LOG` | – | Set to any value to log each HTTP request to stderr |
 | `KANBAN_AGENT_ENV_ALLOW` | – | Comma-separated extra environment variable names that agents may inherit (see below) |
-| `KANBAN_AGENT_ALLOWED_TOOLS` | `Read,Glob,Grep,TodoWrite` | `--allowedTools` for development agents. `Bash`, `Edit` and `Write` are deliberately left to `--permission-mode`. A bare `Edit`/`Write` here would pre-approve writes to *any* path, outside the worktree included |
+| `KANBAN_AGENT_ALLOWED_TOOLS` | `Read(./**),TodoWrite` | `--allowedTools` for development agents. Only reads inside the agent's worktree are pre-approved (`Read(./**)` also governed Grep the same way when measured; Glob was not measured). `Bash`, `Edit`, `Write` and reads elsewhere are deliberately left to `--permission-mode`: a bare `Edit`/`Write` would pre-approve writes to *any* path, and a bare `Read` reads to any path (your gh credentials, `~/.claude.json`, `/proc/<pid>/environ`), both measured under `dontAsk` |
 | `KANBAN_AGENT_DISALLOWED_TOOLS` | merge/admin `gh` and `git push` patterns, `curl`, `wget`, backlog-mutating MCP tools | `--disallowedTools` for development agents |
 | `KANBAN_BACKLOG_TOOL` / `KANBAN_RESOLVE_TOOL` | `mcp__epigraph__query_claims_by_label` / `mcp__epigraph__resolve_backlog_item` | The one MCP tool each helper agent may call |
 
