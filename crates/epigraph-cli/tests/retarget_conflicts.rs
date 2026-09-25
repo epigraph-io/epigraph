@@ -131,8 +131,35 @@ async fn seed_world_with(pool: &PgPool, rel: &str) -> World {
 
 /// The two production handlers the retarget client calls, on a real socket,
 /// behind a request counter.
-async fn serve_api(pool: &PgPool, agent: Uuid) -> (EdgeApiClient, Arc<AtomicUsize>) {
+async fn serve_api(pool: &PgPool, agent: Uuid) -> (EdgeApiClient, Arc<AtomicUsize>, TestServer) {
     serve_api_hanging(pool, agent, None).await
+}
+
+/// The spawned API server and the separate pool it holds. The scoped pool
+/// is its OWN connection pool (not the `#[sqlx::test]` one), so unless it is
+/// closed before the test returns, sqlx's cleanup cannot drop the per-test
+/// database ("is being accessed by other users") and it is left on the shared
+/// 5433 cluster. Every test ends with [`TestServer::stop`].
+struct TestServer {
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+    db: PgPool,
+}
+
+impl TestServer {
+    async fn stop(self) {
+        let _ = self.shutdown.send(());
+        // Graceful shutdown waits for in-flight requests; a test that left
+        // one hanging on purpose gets a bounded wait, then the task is
+        // dropped. Closing the pool is what releases the database either way.
+        if tokio::time::timeout(std::time::Duration::from_secs(5), self.task)
+            .await
+            .is_err()
+        {
+            eprintln!("test server did not shut down gracefully within 5 s");
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), self.db.close()).await;
+    }
 }
 
 /// [`serve_api`], except that request number `hang_on` (1-based) is accepted
@@ -141,11 +168,10 @@ async fn serve_api_hanging(
     pool: &PgPool,
     agent: Uuid,
     hang_on: Option<usize>,
-) -> (EdgeApiClient, Arc<AtomicUsize>) {
-    let state = AppState::with_scoped_pool(
-        viewer_fixture::scoped_pool(pool).await,
-        ApiConfig::default(),
-    );
+) -> (EdgeApiClient, Arc<AtomicUsize>, TestServer) {
+    let scoped = viewer_fixture::scoped_pool(pool).await;
+    let db = scoped.inner().clone();
+    let state = AppState::with_scoped_pool(scoped, ApiConfig::default());
     let hits = Arc::new(AtomicUsize::new(0));
     let hits_mw = hits.clone();
     let app = Router::new()
@@ -187,18 +213,28 @@ async fn serve_api_hanging(
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async move {
+                let _ = stopped.await;
+            })
             .await
             .unwrap();
     });
     (
         EdgeApiClient {
-            http: reqwest::Client::new(),
+            // No idle keep-alive connections, so graceful shutdown has
+            // nothing to wait for once the last request is answered.
+            http: reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .build()
+                .unwrap(),
             api_base: format!("http://{addr}"),
             token: "test-token".to_string(),
         },
         hits,
+        TestServer { shutdown, task, db },
     )
 }
 
@@ -320,7 +356,7 @@ fn the_hold_tracks_the_edges_route_whitelist() {
 async fn contradicts_retargets_are_held_and_write_nothing(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world_with(&pool, "contradicts").await;
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let llm = fixture(serde_json::json!({"atoms": [1]}));
     let before = snapshot(&pool, &w).await;
     let manifest = manifest_path();
@@ -353,6 +389,7 @@ async fn contradicts_retargets_are_held_and_write_nothing(pool: PgPool) {
         applied.errors
     );
     std::fs::remove_file(&manifest).ok();
+    server.stop().await;
 }
 
 /// THE CORE CLAIM. `--retarget --apply` with the fixture choosing atom 1
@@ -363,7 +400,7 @@ async fn contradicts_retargets_are_held_and_write_nothing(pool: PgPool) {
 async fn apply_moves_the_conflict_onto_the_chosen_atom_with_ds_wired(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let llm = fixture(serde_json::json!({"atoms": [1]}));
     let manifest = manifest_path();
 
@@ -459,6 +496,7 @@ async fn apply_moves_the_conflict_onto_the_chosen_atom_with_ds_wired(pool: PgPoo
     assert_eq!(raw.lines().count(), 2, "{raw}");
     assert!(raw.lines().nth(1).unwrap().contains(&new_edge.to_string()));
     std::fs::remove_file(&manifest).ok();
+    server.stop().await;
 }
 
 /// Idempotency guard 1: a re-run after a successful apply finds the parent
@@ -467,7 +505,7 @@ async fn apply_moves_the_conflict_onto_the_chosen_atom_with_ds_wired(pool: PgPoo
 async fn rerun_after_apply_calls_no_llm_and_creates_nothing(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let llm = fixture(serde_json::json!({"atoms": [1]}));
 
     let m1 = manifest_path();
@@ -508,6 +546,7 @@ async fn rerun_after_apply_calls_no_llm_and_creates_nothing(pool: PgPool) {
     );
     std::fs::remove_file(&m1).ok();
     std::fs::remove_file(&m2).ok();
+    server.stop().await;
 }
 
 /// Idempotency guard 2: the atom edge exists but the parent is NOT marked
@@ -518,7 +557,7 @@ async fn rerun_after_apply_calls_no_llm_and_creates_nothing(pool: PgPool) {
 async fn unmarked_parent_with_an_existing_atom_edge_creates_no_duplicate(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
-    let (api, _hits) = serve_api(&pool, w.agent).await;
+    let (api, _hits, server) = serve_api(&pool, w.agent).await;
     let llm = fixture(serde_json::json!({"atoms": [1]}));
     // What the model would say if it were asked again: a DIFFERENT atom.
     let fickle = fixture(serde_json::json!({"atoms": [0]}));
@@ -571,6 +610,7 @@ async fn unmarked_parent_with_an_existing_atom_edge_creates_no_duplicate(pool: P
     assert_eq!(marked["retargeted_to"], serde_json::json!([atom_edge]));
     std::fs::remove_file(&m1).ok();
     std::fs::remove_file(&m2).ok();
+    server.stop().await;
 }
 
 /// The dry run (the binary's DEFAULT) calls the LLM and writes the manifest,
@@ -580,7 +620,7 @@ async fn unmarked_parent_with_an_existing_atom_edge_creates_no_duplicate(pool: P
 async fn dry_run_calls_the_llm_and_writes_nothing(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let llm = fixture(serde_json::json!({"atoms": [0, 1]}));
     let before = snapshot(&pool, &w).await;
     let manifest = manifest_path();
@@ -608,6 +648,7 @@ async fn dry_run_calls_the_llm_and_writes_nothing(pool: PgPool) {
     let raw = std::fs::read_to_string(&manifest).unwrap();
     assert_eq!(raw.lines().count(), 1, "one plan line, no applied line");
     std::fs::remove_file(&manifest).ok();
+    server.stop().await;
 }
 
 /// `whole`, `unclear` and a malformed answer each leave the edge on the
@@ -616,7 +657,7 @@ async fn dry_run_calls_the_llm_and_writes_nothing(pool: PgPool) {
 async fn whole_unclear_and_malformed_leave_the_parent_edge_untouched(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     for (answer, expect) in [
         (serde_json::json!("whole"), verdict::WHOLE),
         (serde_json::json!("unclear"), verdict::UNCLEAR),
@@ -639,6 +680,7 @@ async fn whole_unclear_and_malformed_leave_the_parent_edge_untouched(pool: PgPoo
         std::fs::remove_file(&manifest).ok();
     }
     assert_eq!(hits.load(Ordering::SeqCst), 0);
+    server.stop().await;
 }
 
 /// A RETIRED source->atom edge is a retraction: the pass must not resurrect
@@ -648,7 +690,7 @@ async fn whole_unclear_and_malformed_leave_the_parent_edge_untouched(pool: PgPoo
 async fn a_retired_atom_edge_blocks_the_retarget_instead_of_being_resurrected(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let retired = seed_edge(&pool, w.source, w.atoms[1], REL).await;
     sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
         .bind(retired)
@@ -676,6 +718,7 @@ async fn a_retired_atom_edge_blocks_the_retarget_instead_of_being_resurrected(po
         "still only the retired edge"
     );
     std::fs::remove_file(&manifest).ok();
+    server.stop().await;
 }
 
 /// A manifest entry as an operator could hand-edit it.
@@ -719,7 +762,7 @@ async fn tampered_manifest_entries_are_refused_and_write_nothing(pool: PgPool) {
     let other_parent = seed_claim(&pool, w.agent, "Other compound. With two parts.", 40).await;
     let other_atom = seed_claim(&pool, w.agent, "Other atom text here.", 35).await;
     seed_edge(&pool, other_parent, other_atom, "decomposes_to").await;
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let before = snapshot(&pool, &w).await;
 
     let non_conflict = entry_for(&w, supports, "supports", w.parent, vec![w.atoms[0]]);
@@ -765,6 +808,7 @@ async fn tampered_manifest_entries_are_refused_and_write_nothing(pool: PgPool) {
         supports_props.get("retargeted_to").is_none(),
         "{supports_props}"
     );
+    server.stop().await;
 }
 
 /// A source claim retired between the reviewed dry run and the apply gains
@@ -773,7 +817,7 @@ async fn tampered_manifest_entries_are_refused_and_write_nothing(pool: PgPool) {
 async fn an_endpoint_retired_after_the_dry_run_is_not_applied(pool: PgPool) {
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let llm = fixture(serde_json::json!({"atoms": [1]}));
     let manifest = manifest_path();
     let dry = run_retarget(&pool, &viewer, &llm, None, &manifest, opts(false))
@@ -807,6 +851,7 @@ async fn an_endpoint_retired_after_the_dry_run_is_not_applied(pool: PgPool) {
         "a retired source must not gain a conflict edge"
     );
     std::fs::remove_file(&manifest).ok();
+    server.stop().await;
 }
 
 /// An atom whose `decomposes_to` edge was RETIRED (`valid_to` in the past)
@@ -847,7 +892,7 @@ async fn an_atom_behind_a_retired_decomposes_to_edge_is_not_a_destination(pool: 
     let offered: Vec<Uuid> = items[0].atoms.iter().map(|a| a.0).collect();
     assert_eq!(offered, w.atoms.to_vec(), "the stale atom is not offered");
 
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let e = entry_for(&w, w.parent_edge, REL, w.parent, vec![stale]);
     let applied = apply_retarget(&pool, &viewer, &api, &[e], None)
         .await
@@ -862,6 +907,7 @@ async fn an_atom_behind_a_retired_decomposes_to_edge_is_not_a_destination(pool: 
     );
     assert_eq!(hits.load(Ordering::SeqCst), 0);
     assert!(edges_between(&pool, w.source, stale, REL).await.is_empty());
+    server.stop().await;
 }
 
 /// The pre-create check for a SYMMETRIC relationship sees a reverse edge:
@@ -925,7 +971,7 @@ async fn an_unwired_atom_edge_is_recorded_and_wired_by_a_later_run(pool: PgPool)
         .execute(&pool)
         .await
         .unwrap();
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let llm = fixture(serde_json::json!({"atoms": [1]}));
 
     // Run 1: the edge is created, not wired, and recorded as unwired.
@@ -991,6 +1037,7 @@ async fn an_unwired_atom_edge_is_recorded_and_wired_by_a_later_run(pool: PgPool)
     for m in [m1, m2, m3] {
         std::fs::remove_file(&m).ok();
     }
+    server.stop().await;
 }
 
 /// A second decomposed parent disputed by the same source, for multi-entry
@@ -1023,7 +1070,7 @@ async fn each_applied_entry_reaches_the_manifest_before_the_next_one_starts(pool
     let w = seed_world(&pool).await;
     let (p2, e2, p2a) = seed_second_parent(&pool, &w).await;
     // Entry 1 = POST (1) + PATCH (2); entry 2's POST is request 3.
-    let (api, _hits) = serve_api_hanging(&pool, w.agent, Some(3)).await;
+    let (api, _hits, server) = serve_api_hanging(&pool, w.agent, Some(3)).await;
     let plan = vec![
         entry_for(&w, w.parent_edge, REL, w.parent, vec![w.atoms[1]]),
         entry_for(&w, e2, REL, p2, vec![p2a]),
@@ -1047,6 +1094,7 @@ async fn each_applied_entry_reaches_the_manifest_before_the_next_one_starts(pool
         serde_json::json!([created[0].0])
     );
     std::fs::remove_file(&manifest).ok();
+    server.stop().await;
 }
 
 /// A database error while applying an entry is recorded ON that entry and
@@ -1057,7 +1105,7 @@ async fn a_database_error_is_recorded_per_entry_and_does_not_abort_the_run(pool:
     let viewer = viewer_fixture::public_viewer(&pool).await;
     let w = seed_world(&pool).await;
     let (p2, e2, p2a) = seed_second_parent(&pool, &w).await;
-    let (api, hits) = serve_api(&pool, w.agent).await;
+    let (api, hits, server) = serve_api(&pool, w.agent).await;
     let plan = vec![
         entry_for(&w, w.parent_edge, REL, w.parent, vec![w.atoms[1]]),
         entry_for(&w, e2, REL, p2, vec![p2a]),
@@ -1083,4 +1131,5 @@ async fn a_database_error_is_recorded_per_entry_and_does_not_abort_the_run(pool:
     assert_eq!(manifest_applied_lines(&manifest).len(), 2);
     assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing was written");
     std::fs::remove_file(&manifest).ok();
+    server.stop().await;
 }
