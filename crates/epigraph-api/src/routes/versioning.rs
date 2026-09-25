@@ -642,6 +642,9 @@ pub async fn claim_history(
         })
         .collect();
 
+    // SECURITY (§2.6): each version is a distinct claim with its own
+    // ownership row — a superseded version can be public while its successor
+    // is private, or the reverse — so the batch check covers the whole chain.
     let total_versions = versions.len();
 
     Ok(Json(VersionHistoryResponse {

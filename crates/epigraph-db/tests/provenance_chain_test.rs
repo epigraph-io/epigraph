@@ -69,6 +69,7 @@ fn pos(chain: &epigraph_db::ProvenanceChain, id: Uuid) -> usize {
 /// evidence-first. `base` supports `mid`, `mid` supports `root`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supports_chain_is_returned_evidence_first(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
     let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let root = seed_claim(&pool, agent, "conclusion").await;
@@ -78,7 +79,7 @@ async fn supports_chain_is_returned_evidence_first(pool: PgPool) {
     seed_edge(&pool, mid, root, "supports").await;
     seed_edge(&pool, base, mid, "supports").await;
 
-    let chain = ProvenanceChainRepository::chain(&pool, &viewer, root, 4, None)
+    let chain = ProvenanceChainRepository::chain(&mut conn, &viewer, root, 4, None)
         .await
         .expect("chain");
 
@@ -96,6 +97,7 @@ async fn supports_chain_is_returned_evidence_first(pool: PgPool) {
 /// traversal returns just the root here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersedes_predecessor_reached_via_outgoing_edge(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
     let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let new = seed_claim(&pool, agent, "revised claim").await;
@@ -104,7 +106,7 @@ async fn supersedes_predecessor_reached_via_outgoing_edge(pool: PgPool) {
     // supersede() convention: source = new, target = old.
     seed_edge(&pool, new, old, "supersedes").await;
 
-    let chain = ProvenanceChainRepository::chain(&pool, &viewer, new, 4, None)
+    let chain = ProvenanceChainRepository::chain(&mut conn, &viewer, new, 4, None)
         .await
         .expect("chain");
 
@@ -124,6 +126,7 @@ async fn supersedes_predecessor_reached_via_outgoing_edge(pool: PgPool) {
 /// parent is behind its INCOMING edge.
 #[sqlx::test(migrations = "../../migrations")]
 async fn decomposes_to_parent_reached_via_incoming_edge(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
     let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let paragraph = seed_claim(&pool, agent, "parent paragraph").await;
@@ -131,7 +134,7 @@ async fn decomposes_to_parent_reached_via_incoming_edge(pool: PgPool) {
 
     seed_edge(&pool, paragraph, atom, "decomposes_to").await;
 
-    let chain = ProvenanceChainRepository::chain(&pool, &viewer, atom, 4, None)
+    let chain = ProvenanceChainRepository::chain(&mut conn, &viewer, atom, 4, None)
         .await
         .expect("chain");
 
@@ -145,6 +148,7 @@ async fn decomposes_to_parent_reached_via_incoming_edge(pool: PgPool) {
 /// A cycle must be REPORTED and must terminate — not error, not hang.
 #[sqlx::test(migrations = "../../migrations")]
 async fn cycle_is_reported_not_fatal(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
     let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let a = seed_claim(&pool, agent, "claim a").await;
@@ -153,7 +157,7 @@ async fn cycle_is_reported_not_fatal(pool: PgPool) {
     seed_edge(&pool, a, b, "supports").await;
     seed_edge(&pool, b, a, "supports").await;
 
-    let chain = ProvenanceChainRepository::chain(&pool, &viewer, a, 6, None)
+    let chain = ProvenanceChainRepository::chain(&mut conn, &viewer, a, 6, None)
         .await
         .expect("a cycle must not be an error");
 
@@ -170,6 +174,7 @@ async fn cycle_is_reported_not_fatal(pool: PgPool) {
 /// `max_depth` bounds the walk.
 #[sqlx::test(migrations = "../../migrations")]
 async fn max_depth_bounds_the_walk(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
     let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let ids: Vec<Uuid> = {
@@ -184,7 +189,7 @@ async fn max_depth_bounds_the_walk(pool: PgPool) {
         seed_edge(&pool, ids[i + 1], ids[i], "supports").await;
     }
 
-    let shallow = ProvenanceChainRepository::chain(&pool, &viewer, ids[0], 2, None)
+    let shallow = ProvenanceChainRepository::chain(&mut conn, &viewer, ids[0], 2, None)
         .await
         .expect("chain");
     assert_eq!(
@@ -193,7 +198,7 @@ async fn max_depth_bounds_the_walk(pool: PgPool) {
         "max_depth=2 yields root + 2 hops, not the whole 5-node chain"
     );
 
-    let deep = ProvenanceChainRepository::chain(&pool, &viewer, ids[0], 8, None)
+    let deep = ProvenanceChainRepository::chain(&mut conn, &viewer, ids[0], 8, None)
         .await
         .expect("chain");
     assert_eq!(deep.nodes.len(), 5, "max_depth=8 reaches the full chain");
@@ -204,6 +209,7 @@ async fn max_depth_bounds_the_walk(pool: PgPool) {
 /// point of following the supersedes hop).
 #[sqlx::test(migrations = "../../migrations")]
 async fn non_current_ancestors_are_included_and_flagged(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
     let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let root = seed_claim(&pool, agent, "current conclusion").await;
@@ -215,7 +221,7 @@ async fn non_current_ancestors_are_included_and_flagged(pool: PgPool) {
         .await
         .expect("retire");
 
-    let chain = ProvenanceChainRepository::chain(&pool, &viewer, root, 4, None)
+    let chain = ProvenanceChainRepository::chain(&mut conn, &viewer, root, 4, None)
         .await
         .expect("chain");
 
@@ -231,13 +237,14 @@ async fn non_current_ancestors_are_included_and_flagged(pool: PgPool) {
 /// edge is not derivation.
 #[sqlx::test(migrations = "../../migrations")]
 async fn unrelated_relationships_are_not_traversed(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
     let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let root = seed_claim(&pool, agent, "target claim").await;
     let contester = seed_claim(&pool, agent, "contesting claim").await;
     seed_edge(&pool, contester, root, "contradicts").await;
 
-    let chain = ProvenanceChainRepository::chain(&pool, &viewer, root, 4, None)
+    let chain = ProvenanceChainRepository::chain(&mut conn, &viewer, root, 4, None)
         .await
         .expect("chain");
 

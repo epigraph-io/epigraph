@@ -2134,20 +2134,21 @@ pub async fn list_by_labels(
         message: e.to_string(),
     })?;
 
-    Ok(Json(
-        rows.into_iter()
-            .map(|(c, claim_labels)| ClaimByLabelsResponse {
-                id: c.id.as_uuid(),
-                content: c.content,
-                truth_value: c.truth_value.value(),
-                agent_id: c.agent_id.as_uuid(),
-                created_at: c.created_at.to_rfc3339(),
-                labels: claim_labels,
-                is_current: c.is_current,
-                supersedes: c.supersedes.map(|s| s.as_uuid()),
-            })
-            .collect(),
-    ))
+    let items: Vec<ClaimByLabelsResponse> = rows
+        .into_iter()
+        .map(|(c, claim_labels)| ClaimByLabelsResponse {
+            id: c.id.as_uuid(),
+            content: c.content,
+            truth_value: c.truth_value.value(),
+            agent_id: c.agent_id.as_uuid(),
+            created_at: c.created_at.to_rfc3339(),
+            labels: claim_labels,
+            is_current: c.is_current,
+            supersedes: c.supersedes.map(|s| s.as_uuid()),
+        })
+        .collect();
+
+    Ok(Json(items))
 }
 
 /// Stub for non-db builds — returns an empty list.

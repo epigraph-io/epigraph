@@ -1,0 +1,16 @@
+<div class="table-wrap">
+  <table class="data graph-edges">
+    <thead>
+      <tr><th scope="col">From</th><th scope="col">Relationship</th><th scope="col">To</th></tr>
+    </thead>
+    <tbody>
+      {%- for e in edges %}
+      <tr class="graph-row--{{ e.family }}">
+        <td>{% if let Some(h) = e.source_href %}<a href="{{ h }}">{{ e.source }}</a>{% else %}{{ e.source }}{% endif %}</td>
+        <td class="graph-row__rel">{{ e.relationship }}</td>
+        <td>{% if let Some(h) = e.target_href %}<a href="{{ h }}">{{ e.target }}</a>{% else %}{{ e.target }}{% endif %}</td>
+      </tr>
+      {%- endfor %}
+    </tbody>
+  </table>
+</div>

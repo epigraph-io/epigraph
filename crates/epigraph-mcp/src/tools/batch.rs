@@ -144,10 +144,17 @@ pub async fn system_stats(
 ) -> Result<CallToolResult, McpError> {
     let detailed = params.detailed.unwrap_or(false);
 
-    let counts = epigraph_db::CorpusStatsRepository::tenant_counts(&server.pool, viewer, detailed)
+    // These two now take a connection rather than the pool; MCP is not on a
+    // ScopedPool yet, so it acquires an ordinary one and behaviour is unchanged.
+    let mut conn = server
+        .pool
+        .acquire()
+        .await
+        .map_err(|e| internal_error(epigraph_db::DbError::from(e)))?;
+    let counts = epigraph_db::CorpusStatsRepository::tenant_counts(&mut conn, viewer, detailed)
         .await
         .map_err(internal_error)?;
-    let agent_count = epigraph_db::CorpusStatsRepository::agent_count(&server.pool, viewer)
+    let agent_count = epigraph_db::CorpusStatsRepository::agent_count(&mut *conn, viewer)
         .await
         .map_err(internal_error)?;
 

@@ -2312,8 +2312,13 @@ pub async fn claim_provenance(
     };
 
     // Truncation only — there is no redacted spelling of this label any more.
-    let claim_label = if claim_row.content.len() > 60 {
-        format!("{}...", &claim_row.content[..57])
+    let claim_label = if claim_row.content.chars().count() > 60 {
+        // Count and cut in CHARS: `&content[..57]` is a byte index, and slicing a
+        // String at a non-char-boundary panics when a multi-byte character (emoji,
+        // CJK, accented latin) straddles the cut. Carried forward from the explorer
+        // branch, which fixed this before the redaction removal rewrote the arm.
+        let truncated: String = claim_row.content.chars().take(57).collect();
+        format!("{truncated}...")
     } else {
         claim_row.content.clone()
     };

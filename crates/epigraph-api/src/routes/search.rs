@@ -457,6 +457,10 @@ fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
 ///
 /// - Query is parameterized to prevent SQL injection
 /// - Special characters are safely handled by sqlx
+/// - Claim text the requester may not read is `"[REDACTED]"`, the `get_claim`
+///   convention. The requester is the authenticated `agent_id` (falling back
+///   to `client_id`); the route is on the optional-bearer public router, so an
+///   anonymous caller is `None` and sees only public claims' text.
 pub async fn semantic_search(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     #[allow(unused_variables)] State(state): State<AppState>,
@@ -901,6 +905,9 @@ pub async fn semantic_search(
                     .collect();
                 results.sort_by_key(|r| id_order.get(&r.claim_id).copied().unwrap_or(usize::MAX));
 
+                // Both `statement` fields are `claims.content`: the selected
+                // claim's, and the 200-char excerpt of each graph neighbour.
+                // One batch lookup covers the union.
                 let total = results.len() as u64;
                 let query_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -968,6 +975,7 @@ pub async fn semantic_search(
             })
             .collect();
 
+        // `statement` is `claims.content`; the flat path has no neighbours.
         let total = results.len() as u64;
         let query_time_ms = start_time.elapsed().as_millis() as u64;
 

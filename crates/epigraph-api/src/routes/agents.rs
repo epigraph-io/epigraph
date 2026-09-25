@@ -628,6 +628,9 @@ pub async fn agent_claims(
         })
         .collect();
 
+    // SECURITY (§2.6): attribution to an agent says nothing about who may
+    // read the claim — a private claim attributed to a public agent is still
+    // private. One batch lookup for the page.
     Ok(Json(PaginatedResponse {
         items,
         total,

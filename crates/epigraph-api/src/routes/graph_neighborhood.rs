@@ -1,13 +1,16 @@
 //! /api/v1/graph/neighborhoods/:id/expand — compound + atomic modes.
 //!
-//! Compound mode (this file): nodes are compound claims (those with
+//! Compound mode (the default): nodes are compound claims (those with
 //! decomposes_to children inside the neighborhood) plus standalone claims
 //! (no decomposes_to in either direction). Edges are induced from atom-level
 //! relationships (mass-weighted by `forward_strength`) plus direct
 //! compound-compound edges that exist outside the decomposition hierarchy.
 //!
-//! Atomic mode is implemented in Task 8 — for now `atomic_response` returns
-//! an empty placeholder.
+//! Atomic mode (`?mode=atomic`) returns the neighborhood's member claims
+//! themselves, the epistemic edges between them (`decomposes_to` excluded,
+//! positive `forward_strength` only), and the compound groups those atoms
+//! belong to. Neither mode applies `budget` yet, so both report
+//! `truncated: false`.
 
 use axum::{
     extract::{Path, Query, State},
@@ -470,6 +473,9 @@ async fn atomic_response(
         })
         .collect();
 
+    // Atom labels and compound-group labels are both `claims.content`, and a
+    // group's parent compound is generally not among `nodes`, so both sets go
+    // into the same single lookup.
     Ok(AtomicResponse {
         neighborhood_id,
         truncated: false,
@@ -656,6 +662,8 @@ pub async fn claim_compound_neighborhood(
         },
     );
 
+    // Centre and neighbours alike are `claims.content`; one ownership lookup
+    // covers the whole node set, matching the cost of the other swept routes.
     Ok(Json(CompoundNeighborhoodResponse {
         center_id: claim_id,
         nodes,
