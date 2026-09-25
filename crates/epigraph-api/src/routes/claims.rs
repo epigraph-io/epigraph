@@ -1998,74 +1998,35 @@ pub async fn update_labels(
     };
     crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
 
-    // ── Whose write authority the transaction is stamped with ──
+    // ── Whose write authority the transaction is stamped with: the CALLER's ──
     //
     // Migration 077's `claims_tenancy` WITH CHECK admits the UPDATE only when
     // the claim's `owner_group_id` is in `epigraph_writable_groups()`. On the
     // raw, unstamped pool that set is empty, so without the orphan
     // `claims_privacy` policy (config A) this route refused EVERY caller with
-    // 42501 — owners included.
+    // 42501, owners included. Stamped with the caller's viewer, an owner (or any
+    // writer of the owning group) relabels; a caller that cannot write the group
+    // is refused by the database with 42501, answered 403 below with nothing
+    // written. That refusal is NOT pre-empted in Rust: on a schema that still
+    // carries the orphan policies the write is admitted, and a Rust-side refusal
+    // would be a regression there.
     //
-    // 1. The CALLER's viewer, whenever it can write the owning group. This is
-    //    every owner relabelling its own claim, and an admin who is itself a
-    //    writer of that group.
-    // 2. Only for a `claims:admin` caller that cannot write it: the AUTHOR's
-    //    viewer (`claims.agent_id`), if the author can. The authority for the
-    //    act is `require_owner_or_admin` above, which already admits an admin
-    //    for any claim it can read, and production's schema admits that write
-    //    today through the orphan policy. The stamp carries that decision to
-    //    the database; it does not make one. A non-admin never reaches this
-    //    arm, so it only ever writes under its own stamp.
-    // 3. Otherwise the caller's viewer again, and the database decides: a row
-    //    neither viewer can write is refused with 42501, answered 403 below
-    //    with nothing written. NOT pre-refused here, because on a schema that
-    //    still carries the orphan policies that write is admitted, and a
-    //    Rust-side refusal would be a regression there.
-    //
-    // `Viewer::resolve` reads memberships through the SECURITY DEFINER
-    // `epigraph_live_memberships`, so it is correct on the unstamped pool, and
-    // it mints nothing.
-    let author_viewer;
-    let stamp: &epigraph_db::Viewer = if viewer.writable_groups().contains(&owner_group_id) {
-        &viewer
-    } else if auth.has_scope("claims:admin") {
-        author_viewer = epigraph_db::Viewer::resolve(&state.db_pool, claim_agent_id)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("could not resolve the claim author's viewer: {e}"),
-            })?;
-        if author_viewer.writable_groups().contains(&owner_group_id) {
-            &author_viewer
-        } else {
-            &viewer
-        }
-    } else {
-        &viewer
-    };
+    // NO AUTHORITY IS BORROWED. An earlier revision of this route stamped a
+    // `claims:admin` caller that could not write the group with the claim
+    // AUTHOR's viewer. The batch H-a review measured what that means on config
+    // A: an admin that is only a READER of a team group relabelled that group's
+    // private claims, because the author could write them, and the session named
+    // the author as its principal. The admin's own role in the group was
+    // irrelevant, the database recorded the wrong principal, and MCP
+    // `update_labels` / `patch_claim` refuse the same act. Whether `claims:admin`
+    // should carry write authority into groups the admin cannot write is the
+    // cross-agent ownership decision (H-b, #374); lending the author's stamp
+    // decided it silently, so the route now stamps the caller only.
+    let stamp: &epigraph_db::Viewer = &viewer;
 
     // Never a fallback to `state.db_pool`: an unstamped write is exactly what
     // this conversion removes.
-    let scoped = state.scoped.as_ref().ok_or_else(|| {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            handler = "update_labels",
-            "label write refused: this process was not built from a ScopedPool"
-        );
-        ApiError::InternalError {
-            message: "Failed to acquire a scoped transaction".to_string(),
-        }
-    })?;
-    let mut tx = scoped.begin_as(stamp).await.map_err(|e| {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            error = %e,
-            handler = "update_labels",
-            "could not begin a viewer-stamped transaction"
-        );
-        ApiError::InternalError {
-            message: "Failed to acquire a scoped transaction".to_string(),
-        }
-    })?;
+    let mut tx = state.write_as(stamp, "update_labels").await?;
 
     let labels = ClaimRepository::update_labels_conn(&mut tx, id, &body.add, &body.remove)
         .await

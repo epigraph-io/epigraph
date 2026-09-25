@@ -15,6 +15,10 @@
 #   OWNER  claims:write, the author of the OWN claims
 #   ADMIN  claims:write + claims:admin, a writer of no group but its own
 #   PEER   claims:write, neither
+#   RADMIN claims:write + claims:admin, a READER (not a writer) of the team group
+#          whose claims WRITER authored. The discriminator for authority
+#          lending: stamped with the author's viewer, RADMIN could relabel the
+#          team's private claims although its own role there is read-only.
 #
 # Rows (every one seeded through the SU DSN, then relabelled once):
 #   own-public       OWNER's claim, public, owned by OWNER's personal group
@@ -113,7 +117,13 @@ C_OWN_PRIV="$(claim "$OWNER" group "$OWNER_G" own-private)"
 C_OTHER_PUB="$(claim "$STRANGER" public "$STRANGER_G" other-public)"
 C_FOREIGN_PRIV="$(claim "$STRANGER" group "$TEAM_G" foreign-private)"
 C_WORLD_PUB="$(claim "$STRANGER" public "$WORLD_G" world-public)"
-for c in "$C_OWN_PUB" "$C_OWN_PRIV" "$C_OTHER_PUB" "$C_FOREIGN_PRIV" "$C_WORLD_PUB"; do
+read -r RADMIN _RADMIN_G <<<"$(seed_agent radmin)"
+read -r WRITER _WRITER_G <<<"$(seed_agent writer)"
+q "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
+   VALUES ('$TEAM_G', '$WRITER', ''::bytea, 0, 'writer'), ('$TEAM_G', '$RADMIN', ''::bytea, 0, 'reader')" >/dev/null
+C_TEAM_PRIV="$(claim "$WRITER" group "$TEAM_G" team-private)"
+C_TEAM_PUB="$(claim "$WRITER" public "$TEAM_G" team-public)"
+for c in "$C_OWN_PUB" "$C_OWN_PRIV" "$C_OTHER_PUB" "$C_FOREIGN_PRIV" "$C_WORLD_PUB" "$C_TEAM_PRIV" "$C_TEAM_PUB"; do
   [ -n "$c" ] || { echo "FAIL: a seed claim was not written"; exit 1; }
 done
 
@@ -154,6 +164,7 @@ PY
 T_OWNER="$(mint "$OWNER" claims:read,claims:write)"
 T_ADMIN="$(mint "$ADMIN" claims:read,claims:write,claims:admin)"
 T_PEER="$(mint "$PEER" claims:read,claims:write)"
+T_RADMIN="$(mint "$RADMIN" claims:read,claims:write,claims:admin)"
 
 # ── probe ──
 # One line per case: HTTP status, then whether the label landed on the row.
@@ -171,5 +182,7 @@ case_ owner/own-private       "$T_OWNER" "$C_OWN_PRIV"
 case_ admin/other-public      "$T_ADMIN" "$C_OTHER_PUB"
 case_ admin/foreign-private   "$T_ADMIN" "$C_FOREIGN_PRIV"
 case_ admin/world-public      "$T_ADMIN" "$C_WORLD_PUB"
+case_ reader-admin/team-private "$T_RADMIN" "$C_TEAM_PRIV"
+case_ reader-admin/team-public  "$T_RADMIN" "$C_TEAM_PUB"
 case_ peer/other-public       "$T_PEER"  "$C_OTHER_PUB"
 rm -f "$E2E/.hl.body.$LABEL"

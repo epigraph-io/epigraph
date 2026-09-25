@@ -553,7 +553,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 275;
+const HIGH_WATER: usize = 274;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -602,7 +602,9 @@ const HIGH_WATER: usize = 275;
 /// report_outcome), `routes/computation.rs` 10 -> 8 (bp/propagate's apply) and
 /// `routes/crud.rs` 36 -> 31 (themes/create-with-centroid), so `HIGH_WATER`
 /// 293 -> 275 with every file keeping sites, read off this test's own failure
-/// on the converted tree.
+/// on the converted tree. Dropping `PATCH /claims/:id/labels`' author-stamp
+/// arm removed its `Viewer::resolve(&state.db_pool, ..)`: `routes/claims.rs`
+/// 20 -> 19, `HIGH_WATER` 275 -> 274.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
@@ -648,7 +650,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `Viewer::resolve(&state.db_pool, author)`, a membership read through the
     // SECURITY DEFINER `epigraph_live_memberships` — the same call
     // `ViewerExtractor` makes on the same pool. 20, the row below.
-    ("routes/claims.rs", 20),
+    ("routes/claims.rs", 19),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
