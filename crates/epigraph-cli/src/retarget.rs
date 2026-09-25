@@ -331,6 +331,53 @@ impl AppliedEntry {
     pub const KIND: &'static str = "retarget_applied";
 }
 
+/// Why a manifest entry is not a well-formed `atoms` retarget, judged on the
+/// entry alone (no database): the relationship must be a conflict
+/// relationship, every chosen atom must be one the model was shown
+/// (`entry.atoms`), and the source must not be one of the atoms.
+///
+/// These are the checks a hand-edited or concatenated manifest can fail; the
+/// live-graph checks (edge in force, atoms still current atoms of the parent,
+/// endpoints current) run after it in `apply_entry`.
+pub fn entry_shape_error(entry: &RetargetPlanEntry) -> Option<String> {
+    let rel = entry.relationship.to_ascii_lowercase();
+    if !CONFLICT_RELATIONSHIPS.contains(&rel.as_str()) {
+        return Some(format!(
+            "relationship {:?} is not a conflict relationship {CONFLICT_RELATIONSHIPS:?}",
+            entry.relationship
+        ));
+    }
+    if entry.verdict != verdict::ATOMS || entry.chosen_atom_ids.is_empty() {
+        return Some(format!(
+            "verdict {:?} with {} chosen atoms is not an atoms retarget",
+            entry.verdict,
+            entry.chosen_atom_ids.len()
+        ));
+    }
+    let shown: std::collections::HashSet<Uuid> = entry.atoms.iter().map(|a| a.atom_id).collect();
+    let unshown: Vec<Uuid> = entry
+        .chosen_atom_ids
+        .iter()
+        .copied()
+        .filter(|a| !shown.contains(a))
+        .collect();
+    if !unshown.is_empty() {
+        return Some(format!(
+            "chosen atoms {unshown:?} are not among the atoms the entry lists"
+        ));
+    }
+    if entry.chosen_atom_ids.contains(&entry.source_id) || shown.contains(&entry.source_id) {
+        return Some("the source claim is listed as one of the atoms".to_string());
+    }
+    None
+}
+
+/// The conflict relationships a retarget may carry, lower-case. Available
+/// without the `db` feature; equal to
+/// `epigraph_db::repos::decomposition_priority::CONFLICT_RELATIONSHIPS`
+/// (pinned by a `db`-feature unit test).
+pub const CONFLICT_RELATIONSHIPS: [&str; 2] = ["contradicts", "refutes"];
+
 /// Ask the LLM about every item, in batches of `batch_size`. Writes nothing.
 pub async fn plan_retarget(
     items: &[RetargetItem],
@@ -633,6 +680,28 @@ mod db {
             applied.errors.push(why);
             return Ok(Some(applied));
         }
+        // A manifest is a file an operator can edit: nothing in it is trusted
+        // beyond what the live graph confirms below.
+        if let Some(why) = super::entry_shape_error(entry) {
+            applied.errors.push(format!("{why}; nothing applied"));
+            return Ok(Some(applied));
+        }
+        // Both endpoints of the conflict must still be current: a claim
+        // retired between the reviewed dry run and the apply must not gain a
+        // conflict edge, and a retired parent's atoms are not its dispute.
+        if !epigraph_db::ClaimRepository::are_all_current(
+            pool,
+            viewer,
+            &[entry.source_id, entry.parent_id],
+        )
+        .await?
+        {
+            applied.errors.push(
+                "source or parent claim is no longer current (or not visible); nothing applied"
+                    .into(),
+            );
+            return Ok(Some(applied));
+        }
 
         // The parent edge as it is NOW.
         let parent_edge = R::find_edges_by_triple(
@@ -849,6 +918,61 @@ mod tests {
                 .map(|a| (Uuid::new_v4(), a.to_string()))
                 .collect(),
         }
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn conflict_relationships_match_the_repo_layer() {
+        assert_eq!(
+            CONFLICT_RELATIONSHIPS,
+            epigraph_db::repos::decomposition_priority::CONFLICT_RELATIONSHIPS
+        );
+    }
+
+    fn plan_entry(chosen: Vec<Uuid>, atoms: Vec<Uuid>, rel: &str) -> RetargetPlanEntry {
+        RetargetPlanEntry {
+            kind: RetargetPlanEntry::KIND.into(),
+            edge_id: Uuid::new_v4(),
+            relationship: rel.into(),
+            source_id: Uuid::new_v4(),
+            parent_id: Uuid::new_v4(),
+            atoms: atoms
+                .into_iter()
+                .enumerate()
+                .map(|(index, atom_id)| AtomRef { index, atom_id })
+                .collect(),
+            verdict: verdict::ATOMS.into(),
+            reason: None,
+            chosen_atom_ids: chosen,
+            model: "fixture".into(),
+        }
+    }
+
+    #[test]
+    fn entry_shape_refuses_what_a_hand_edited_manifest_can_say() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            entry_shape_error(&plan_entry(vec![a], vec![a, b], "refutes")),
+            None
+        );
+        assert_eq!(
+            entry_shape_error(&plan_entry(vec![a], vec![a, b], "REFUTES")),
+            None
+        );
+        // A non-conflict relationship.
+        assert!(entry_shape_error(&plan_entry(vec![a], vec![a, b], "supports")).is_some());
+        // A chosen atom the entry never showed the model.
+        assert!(
+            entry_shape_error(&plan_entry(vec![Uuid::new_v4()], vec![a, b], "refutes")).is_some()
+        );
+        // Not an atoms verdict.
+        let mut whole = plan_entry(vec![a], vec![a, b], "refutes");
+        whole.verdict = verdict::WHOLE.into();
+        assert!(entry_shape_error(&whole).is_some());
+        // The source listed as an atom.
+        let mut selfish = plan_entry(vec![a], vec![a, b], "refutes");
+        selfish.source_id = a;
+        assert!(entry_shape_error(&selfish).is_some());
     }
 
     #[test]

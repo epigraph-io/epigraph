@@ -27,7 +27,10 @@ use axum::{
 use epigraph_api::routes;
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_cli::enrichment::llm_client::FixtureLlmClient;
-use epigraph_cli::retarget::{run_retarget, verdict, EdgeApiClient, RetargetOptions};
+use epigraph_cli::retarget::{
+    apply_retarget, run_retarget, verdict, AtomRef, EdgeApiClient, RetargetOptions,
+    RetargetPlanEntry,
+};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -646,6 +649,131 @@ async fn a_retired_atom_edge_blocks_the_retarget_instead_of_being_resurrected(po
         edges_between(&pool, w.source, w.atoms[1], REL).await.len(),
         1,
         "still only the retired edge"
+    );
+    std::fs::remove_file(&manifest).ok();
+}
+
+/// A manifest entry as an operator could hand-edit it.
+fn entry_for(
+    w: &World,
+    edge: Uuid,
+    rel: &str,
+    parent: Uuid,
+    atoms: Vec<Uuid>,
+) -> RetargetPlanEntry {
+    RetargetPlanEntry {
+        kind: RetargetPlanEntry::KIND.into(),
+        edge_id: edge,
+        relationship: rel.into(),
+        source_id: w.source,
+        parent_id: parent,
+        atoms: atoms
+            .iter()
+            .enumerate()
+            .map(|(index, a)| AtomRef { index, atom_id: *a })
+            .collect(),
+        verdict: verdict::ATOMS.into(),
+        reason: None,
+        chosen_atom_ids: atoms,
+        model: "hand-edited".into(),
+    }
+}
+
+/// `--retarget --apply-plan` trusts nothing in the manifest the live graph
+/// does not confirm. Each tampered entry is refused with a reason, sends no
+/// request, and writes no row:
+/// * a real `supports` edge relabelled as a retarget (would have created a
+///   `supports` edge on the atom and stamped `retargeted_to` on it);
+/// * an atom of a DIFFERENT parent;
+/// * a chosen atom the entry never listed as shown to the model.
+#[sqlx::test(migrations = "../../migrations")]
+async fn tampered_manifest_entries_are_refused_and_write_nothing(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let w = seed_world(&pool).await;
+    let supports = seed_edge(&pool, w.source, w.parent, "supports").await;
+    let other_parent = seed_claim(&pool, w.agent, "Other compound. With two parts.", 40).await;
+    let other_atom = seed_claim(&pool, w.agent, "Other atom text here.", 35).await;
+    seed_edge(&pool, other_parent, other_atom, "decomposes_to").await;
+    let (api, hits) = serve_api(&pool, w.agent).await;
+    let before = snapshot(&pool, &w).await;
+
+    let non_conflict = entry_for(&w, supports, "supports", w.parent, vec![w.atoms[0]]);
+    let foreign_atom = entry_for(&w, w.parent_edge, REL, w.parent, vec![other_atom]);
+    let mut unshown = entry_for(&w, w.parent_edge, REL, w.parent, vec![w.atoms[0]]);
+    unshown.chosen_atom_ids = vec![w.atoms[1]];
+
+    let applied = apply_retarget(&pool, &viewer, &api, &[non_conflict, foreign_atom, unshown])
+        .await
+        .unwrap();
+
+    assert_eq!(applied.len(), 3);
+    for a in &applied {
+        assert!(
+            !a.errors.is_empty(),
+            "every tampered entry is refused: {a:?}"
+        );
+        assert!(a.created_edge_ids.is_empty() && !a.parent_marked, "{a:?}");
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no request for a refused entry"
+    );
+    assert_eq!(
+        snapshot(&pool, &w).await,
+        before,
+        "a refused entry writes nothing"
+    );
+    let supports_props: serde_json::Value =
+        sqlx::query_scalar("SELECT properties FROM edges WHERE id = $1")
+            .bind(supports)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        supports_props.get("retargeted_to").is_none(),
+        "{supports_props}"
+    );
+}
+
+/// A source claim retired between the reviewed dry run and the apply gains
+/// no conflict edge: the apply re-checks both endpoints.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_endpoint_retired_after_the_dry_run_is_not_applied(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let w = seed_world(&pool).await;
+    let (api, hits) = serve_api(&pool, w.agent).await;
+    let llm = fixture(serde_json::json!({"atoms": [1]}));
+    let manifest = manifest_path();
+    let dry = run_retarget(&pool, &viewer, &llm, None, &manifest, opts(false))
+        .await
+        .unwrap();
+    assert_eq!(dry.plan[0].chosen_atom_ids, vec![w.atoms[1]]);
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(w.source)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let applied = apply_retarget(&pool, &viewer, &api, &dry.plan)
+        .await
+        .unwrap();
+
+    assert!(
+        applied[0]
+            .errors
+            .iter()
+            .any(|e| e.contains("no longer current")),
+        "{:?}",
+        applied[0]
+    );
+    assert!(applied[0].created_edge_ids.is_empty());
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert!(
+        edges_between(&pool, w.source, w.atoms[1], REL)
+            .await
+            .is_empty(),
+        "a retired source must not gain a conflict edge"
     );
     std::fs::remove_file(&manifest).ok();
 }
