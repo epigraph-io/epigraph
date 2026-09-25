@@ -1464,6 +1464,38 @@ pub async fn resolve_backlog_item(
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, sub.agent_id, "resolve_backlog_item")
             .await?;
+
+    // RE-DECIDE THE GATE ON THE WRITE TRANSACTION. The reads above ran on
+    // `gate_tx`, which is gone, and `prepare_submission` may have spent a
+    // provider round trip since. An original reassigned, or a basis privatized
+    // or deleted, inside that window would otherwise still be written against.
+    // So the original and every basis are read again through the caller's
+    // viewer, on the transaction the writes run on, and the ownership check is
+    // re-run against the author read HERE (review finding, atomicity-authz).
+    // Both reads are cheap point lookups; the gate above stays, because it is
+    // what refuses a bad request BEFORE the provider call.
+    let original_now = ClaimRepository::get_by_id(&mut *tx, viewer, original_claim_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            invalid_params(format!(
+                "claim {original_id} is no longer visible; nothing was written"
+            ))
+        })?;
+    if original_now.agent_id.as_uuid() != target_agent {
+        require_owner_or_admin(server, auth, original_now.agent_id.as_uuid()).await?;
+    }
+    for basis_uuid in &basis_ids {
+        ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(*basis_uuid))
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "basis claim {basis_uuid} is no longer visible; nothing was written"
+                ))
+            })?;
+    }
+
     let written = write_submission(&mut tx, server, viewer, &sub, "submit_claim").await?;
     let resolution_uuid = written.claim.id.as_uuid();
     let resolution_id = resolution_uuid.to_string();
