@@ -303,16 +303,33 @@ impl PlannedDecomposition {
     }
 }
 
-/// Write `plans` to `path` as JSONL (one object per line), replacing any file.
+/// Write `plans` to `path` as JSONL (one object per line). The file must NOT
+/// already exist: a plan an operator already reviewed is never silently
+/// replaced by a new LLM run (the retarget manifest has the same rule).
 ///
 /// # Errors
-/// I/O or serialization failure.
+/// `path` exists; I/O or serialization failure.
 pub fn write_plan_jsonl(
     path: &std::path::Path,
     plans: &[PlannedDecomposition],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
-    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "plan file {} already exists; pass a new --plan path (a reviewed plan is \
+                     never overwritten)",
+                    path.display()
+                )
+            } else {
+                format!("cannot create plan file {}: {e}", path.display())
+            }
+        })?;
+    let mut f = std::io::BufWriter::new(file);
     for p in plans {
         serde_json::to_writer(&mut f, p)?;
         f.write_all(b"\n")?;
@@ -1112,6 +1129,13 @@ mod tests {
         }];
         write_plan_jsonl(&path, &plans).unwrap();
         assert_eq!(read_plan_jsonl(&path).unwrap(), plans);
+
+        // A second --plan to the same path is refused, and the reviewed plan
+        // is left byte-for-byte as it was.
+        let before = std::fs::read(&path).unwrap();
+        let err = write_plan_jsonl(&path, &[]).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
 
         let mut foreign = serde_json::to_value(&plans[0]).unwrap();
         foreign["kind"] = serde_json::json!("retarget");
