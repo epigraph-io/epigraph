@@ -1766,6 +1766,8 @@ class App:
                 self.verify_pr(int(integ["pr_number"]), base, branch, "the base branch")
                 return integ
             except (ApiError, ValueError) as e:
+                if isinstance(e, ApiError) and e.status != 409:
+                    raise  # GitHub could not be asked (502): keep the recorded PR, do not forget it on a blip
                 # the recorded PR is no longer an open PR branch -> base; forget it and find or open the right one
                 log("forgetting integration PR #%s: %s" % (integ.get("pr_number"), getattr(e, "message", e)))
                 with self.store.lock:

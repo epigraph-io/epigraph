@@ -651,6 +651,22 @@ class IntegrationMergeGuardsTest(_ServerFixture):
         self.assertFalse(self.merge_calls(item))
         self.assertEqual(self.card(CLAIM_G)["status"], "awaiting_review")
 
+    def test_open_pr_keeps_the_recorded_pr_when_github_cannot_be_asked(self):
+        with self.app.store.lock:
+            integ = self.app.store.state["integration"]
+            saved = dict(integ)
+            integ.update({"branch": "integration/kanban-blip", "pr_number": 777,
+                          "pr_url": "https://github.com/example/epigraph/pull/777", "status": "pr_open"})
+        try:
+            with mock.patch.object(self.app, "gh_pr_view", side_effect=kanban.CmdError(["gh"], 1, "", "network down")):
+                status, body = self.req("POST", "/api/integration/open-pr", body={})
+            self.assertEqual(status, 502, body)
+            integ = self.app.store.state["integration"]
+            self.assertEqual((integ["pr_number"], integ["status"]), (777, "pr_open"))
+        finally:
+            with self.app.store.lock:
+                self.app.store.state["integration"] = saved
+
     def test_gh_merge_refuses_without_a_head_pin(self):
         for sha in (None, "", "abc123", "0123456789ABCDEF0123456789ABCDEF01234567"):
             with self.assertRaises(kanban.CmdError):
