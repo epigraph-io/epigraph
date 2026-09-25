@@ -585,3 +585,48 @@ async fn a_submit_failure_mid_parent_leaves_it_reapplicable(pool: PgPool) {
         ]
     );
 }
+
+/// `verify_plan` refuses lines it cannot attribute to exactly one live
+/// parent and its author:
+/// * two lines for the SAME parent (e.g. two `--plan` outputs concatenated)
+///   — both refused, where applying both gave the parent atoms [A, B, X, Y];
+/// * a line whose `agent_id` is not the parent's author — the atoms would be
+///   POSTed under someone else's identity.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_plan_refuses_duplicate_parents_and_foreign_authors(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let stranger = seed_agent(&pool).await;
+    let dup_text = compound("dup");
+    let dup = seed_claim(&pool, agent, &dup_text, 100, &[]).await;
+    let foreign_text = compound("foreign");
+    let foreign = seed_claim(&pool, agent, &foreign_text, 100, &[]).await;
+    let fine_text = compound("fine");
+    let fine = seed_claim(&pool, agent, &fine_text, 100, &[]).await;
+
+    let first = three_atom_plan(dup, agent, &dup_text);
+    let mut second = three_atom_plan(dup, agent, &dup_text);
+    second.atoms = vec!["X.".into(), "Y.".into()];
+    second.generality = vec![0, 0];
+    let mut wrong_author = three_atom_plan(foreign, agent, &foreign_text);
+    wrong_author.agent_id = stranger;
+    let good = three_atom_plan(fine, agent, &fine_text);
+
+    let (ok, drifted) = verify_plan(&pool, &viewer, vec![first, second, wrong_author, good])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ok.iter().map(|p| p.claim_id).collect::<Vec<_>>(),
+        vec![fine]
+    );
+    let why: Vec<(Uuid, PlanDrift)> = drifted.into_iter().map(|(p, w)| (p.claim_id, w)).collect();
+    assert_eq!(
+        why,
+        vec![
+            (dup, PlanDrift::DuplicateInPlan),
+            (dup, PlanDrift::DuplicateInPlan),
+            (foreign, PlanDrift::AgentChanged),
+        ]
+    );
+}

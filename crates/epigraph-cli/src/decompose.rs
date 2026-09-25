@@ -690,12 +690,22 @@ mod db_writes {
         NoLongerUndecomposed,
         /// The parent's text differs from the text the atoms were derived from.
         ContentChanged,
+        /// The plan names this parent on more than one line (two `--plan`
+        /// outputs concatenated, say). Every such line is refused: applying
+        /// both would give one parent two sets of atoms, and picking one
+        /// would be a guess about which the operator reviewed.
+        DuplicateInPlan,
+        /// The line's `agent_id` is not the live parent's author. Atoms are
+        /// POSTed under the line's `agent_id`, so a stale or edited value
+        /// would attribute them to someone else.
+        AgentChanged,
     }
 
     /// Split a plan into the lines that still describe the graph and the
-    /// lines that do not. A line applies only if its parent is still in the
-    /// undecomposed population AND its content is byte-identical to the plan
-    /// text, so atoms are never wired onto text they were not derived from.
+    /// lines that do not. A line applies only if its parent is named on no
+    /// other line, is still in the undecomposed population, has content
+    /// byte-identical to the plan text (atoms are never wired onto text they
+    /// were not derived from), and is authored by the line's `agent_id`.
     ///
     /// # Errors
     /// Database failure.
@@ -711,19 +721,33 @@ mod db_writes {
         Box<dyn std::error::Error>,
     > {
         use epigraph_db::repos::decomposition_priority::DecompositionPriorityRepository as R;
-        let ids: Vec<Uuid> = planned.iter().map(|p| p.claim_id).collect();
+        let mut lines_per_parent: std::collections::HashMap<Uuid, usize> =
+            std::collections::HashMap::new();
+        for p in &planned {
+            *lines_per_parent.entry(p.claim_id).or_default() += 1;
+        }
+        let ids: Vec<Uuid> = lines_per_parent.keys().copied().collect();
         let mut live = std::collections::HashMap::new();
         for chunk in ids.chunks(1000) {
             for c in R::list_undecomposed_by_ids(pool, viewer, chunk).await? {
-                live.insert(c.id, c.content);
+                live.insert(c.id, (c.content, c.agent_id));
             }
         }
         let mut ok = Vec::new();
         let mut drifted = Vec::new();
         for p in planned {
+            if lines_per_parent.get(&p.claim_id).copied().unwrap_or(0) > 1 {
+                drifted.push((p, PlanDrift::DuplicateInPlan));
+                continue;
+            }
             match live.get(&p.claim_id) {
                 None => drifted.push((p, PlanDrift::NoLongerUndecomposed)),
-                Some(text) if *text != p.content => drifted.push((p, PlanDrift::ContentChanged)),
+                Some((text, _)) if *text != p.content => {
+                    drifted.push((p, PlanDrift::ContentChanged))
+                }
+                Some((_, agent)) if *agent != p.agent_id => {
+                    drifted.push((p, PlanDrift::AgentChanged))
+                }
                 Some(_) => ok.push(p),
             }
         }
