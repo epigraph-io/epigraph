@@ -986,6 +986,22 @@ class App:
                 pass
         return kdir
 
+    def helper_worktree(self, tag: str) -> str:
+        """A throwaway detached worktree at remote/base for a helper agent, so it never runs in the operator's
+        checkout. The `_` prefix cannot collide with a card worktree (those are named by 8 hex digits)."""
+        cfg = self.cfg
+        path = os.path.join(cfg.worktrees_dir, "_%s-%s" % (tag, uuid.uuid4().hex[:12]))
+        with self.git_lock:
+            self.git(["fetch", cfg.remote, cfg.base_branch], timeout=300, check=False)
+            self.git(["worktree", "add", "--detach", path, "refs/remotes/%s/%s" % (cfg.remote, cfg.base_branch)],
+                     timeout=300)
+        return path
+
+    def drop_helper_worktree(self, path: str) -> None:
+        with self.git_lock:
+            self.git(["worktree", "remove", "--force", path], check=False)
+            self.git(["worktree", "prune"], check=False)
+
     def remove_worktree(self, card_id: str, delete_branch: Optional[str] = None) -> None:
         wt = os.path.join(self.cfg.worktrees_dir, short8(card_id))
         with self.git_lock:
@@ -1879,12 +1895,16 @@ class App:
         return "\n".join(lines)
 
     def _resolve_backlog(self, cards: List[Dict[str, Any]], integ: Dict[str, Any]) -> None:
-        argv = [self.cfg.claude_bin, "-p", self.resolve_prompt(cards, integ), "--output-format", "json",
-                "--permission-mode", self.cfg.permission_mode]
+        # Runs unattended after every ship, so it gets the narrowest agent the board can start: its own
+        # throwaway worktree, no built-in tools, only the resolve tool pre-approved, dontAsk for the rest.
+        argv = [self.cfg.claude_bin, "-p", self.resolve_prompt(cards, integ), "--output-format", "json"] + \
+            helper_tool_args(self.cfg.resolve_tool)
         resolved: List[str] = []
         detail = ""
+        wt: Optional[str] = None
         try:
-            out = run_cmd(argv, cwd=self.cfg.repo, timeout=900, env=agent_env(self.cfg)).stdout
+            wt = self.helper_worktree("retire")
+            out = run_cmd(argv, cwd=wt, timeout=900, env=agent_env(self.cfg)).stdout
             text = out
             try:
                 outer = json.loads(out)
@@ -1902,6 +1922,9 @@ class App:
                     pass
         except CmdError as e:
             detail = "resolve_backlog_item run failed: %s" % e
+        finally:
+            if wt:
+                self.drop_helper_worktree(wt)
         with self.store.lock:
             for c in cards:
                 card = self.store.cards.get(c["id"])

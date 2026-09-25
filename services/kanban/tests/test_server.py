@@ -862,6 +862,32 @@ class HelperAgentTest(_IsolatedRepo):
         self.assertIn("Bash", argv[argv.index("--disallowedTools") + 1].split(","))
         self.assertFalse(os.path.realpath(call["cwd"]).startswith(os.path.realpath(self.repo)), call["cwd"])
 
+    def test_retirement_agent_runs_resolve_only_in_a_throwaway_worktree(self):
+        app = self.make_app(KANBAN_PERMISSION_MODE="bypassPermissions")
+        head_before = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo, capture_output=True,
+                                     text=True, check=True).stdout
+        card = dict(kanban.new_card({"id": CLAIM_A, "content": "x"}), pr_url="https://github.com/a/b/pull/3",
+                    title="t", summary="s")
+        app.store.cards[CLAIM_A] = card
+        app._resolve_backlog([card], {"pr_url": "https://github.com/a/b/pull/4", "base": "main"})
+        call = self.recorded()[0]
+        cwd = os.path.realpath(call["cwd"])
+        self.assertNotEqual(cwd, os.path.realpath(self.repo))
+        self.assertTrue(cwd.startswith(os.path.realpath(app.cfg.worktrees_dir) + os.sep), cwd)
+        self.assertFalse(os.path.exists(call["cwd"]), "the throwaway worktree was not removed")
+        argv = call["argv"]
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "mcp__epigraph__resolve_backlog_item")
+        self.assertEqual(argv.count("--permission-mode"), 1)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")  # never the dev agents' mode
+        self.assertIn("Bash", argv[argv.index("--disallowedTools") + 1].split(","))
+        self.assertTrue(app.store.cards[CLAIM_A]["backlog_resolved"])
+        # the operator's checkout is untouched
+        self.assertEqual(subprocess.run(["git", "status", "--porcelain"], cwd=self.repo, capture_output=True,
+                                        text=True, check=True).stdout, "")
+        self.assertEqual(subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
+                                        capture_output=True, text=True, check=True).stdout, head_before)
+
     def test_agent_env_never_passes_board_secrets(self):
         cfg = kanban.Config(repo=self.repo, port=0, env={"KANBAN_AGENT_ENV_ALLOW": "GH_TOKEN,KANBAN_X,FOO"})
         env = kanban.agent_env(cfg, {"PATH": "/bin", "GH_TOKEN": "s", "KANBAN_X": "s", "FOO": "ok",
