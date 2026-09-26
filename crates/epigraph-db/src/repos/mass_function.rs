@@ -8,6 +8,83 @@ use sqlx::{FromRow, PgPool};
 use tracing::instrument;
 use uuid::Uuid;
 
+/// Why an edge-keyed BBA is being invalidated: the `p_cause` migration 115's
+/// `epigraph_cascade_delete_edge_bbas` records in its audit row, and refuses
+/// when it is anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeBbaCascade {
+    /// `ClaimRepository::mark_duplicate_with_repair_conn` retracted the
+    /// duplicate's colliding edges.
+    DedupRetractedEdge,
+    /// `epigraph_engine::retraction_cascade` re-derives the BBAs of edges a
+    /// supersede or a dedup re-sourced.
+    RetractionCascade,
+    /// `MatchCandidateRepo::retire` retracted a promoted matcher edge.
+    MatchCandidateRetire,
+}
+
+impl EdgeBbaCascade {
+    /// The literal the definer accepts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DedupRetractedEdge => "dedup_retracted_edge",
+            Self::RetractionCascade => "retraction_cascade",
+            Self::MatchCandidateRetire => "match_candidate_retire",
+        }
+    }
+}
+
+/// Delete every `mass_functions` row keyed `perspective_id = <one of
+/// edge_ids>`, returning how many went.
+///
+/// One statement, two paths, decided by migration 114's
+/// `epigraph_session_is_privileged_writer()` (the test the attach trigger and
+/// the dedup move already use):
+///
+/// * a PRIVILEGED session (superuser, BYPASSRLS, a maintenance member) runs the
+///   plain `DELETE` it always ran;
+/// * any other session calls migration 115's
+///   `epigraph_cascade_delete_edge_bbas`, which deletes only rows it can admit
+///   (the session's own; a retracted edge's; an edge whose source claim, or a
+///   retired duplicate of it, the session writes), refuses the whole call with
+///   `CD02` (42501) when a readable row is admitted by none of those, and
+///   appends one `security_events` row per call that deleted anything.
+///
+/// `sqlx::Result` rather than `DbError` so the match-candidate repository,
+/// which speaks `sqlx::Result`, calls it unchanged.
+///
+/// # Errors
+/// The query's error, including the definer's `CD01` / `CD02` refusals.
+pub async fn delete_edge_bbas<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    edge_ids: &[Uuid],
+    cause: EdgeBbaCascade,
+) -> sqlx::Result<u64> {
+    if edge_ids.is_empty() {
+        return Ok(0);
+    }
+    let n: i64 = sqlx::query_scalar(
+        r#"
+        WITH acc AS (SELECT public.epigraph_session_is_privileged_writer() AS priv),
+        own AS (
+            DELETE FROM mass_functions
+             WHERE perspective_id = ANY($1) AND (SELECT priv FROM acc)
+            RETURNING 1
+        )
+        SELECT CASE WHEN acc.priv THEN (SELECT count(*) FROM own)
+                    ELSE public.epigraph_cascade_delete_edge_bbas($1, $2)
+               END
+          FROM acc
+        "#,
+    )
+    .bind(edge_ids)
+    .bind(cause.as_str())
+    .fetch_one(executor)
+    .await?;
+    Ok(u64::try_from(n).unwrap_or(0))
+}
+
 /// A row from the mass_functions table
 #[derive(Debug, Clone, FromRow)]
 pub struct MassFunctionRow {
@@ -449,22 +526,24 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
+    ///
+    /// Migration 115: DELETE is owner-scoped, and the BBA of an edge is
+    /// routinely somebody else's row (the writer who wired the edge, or the
+    /// target claim's group), so a non-privileged session goes through the
+    /// audited cascade definer; see [`delete_edge_bbas`]. A refusal is an
+    /// `Err` (CD02), never a silent `Ok(0)`, so the cascade records it instead
+    /// of reading it as "this edge carried no BBA".
     #[instrument(skip(executor))]
     pub async fn delete_for_perspective<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         perspective_id: Uuid,
     ) -> Result<u64, DbError> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM mass_functions
-            WHERE perspective_id = $1
-            "#,
+        Ok(delete_edge_bbas(
+            executor,
+            &[perspective_id],
+            EdgeBbaCascade::RetractionCascade,
         )
-        .bind(perspective_id)
-        .execute(executor)
-        .await?;
-
-        Ok(result.rows_affected())
+        .await?)
     }
 
     /// Mark a claim's cached DS scalars as **unbacked**: NULL out

@@ -1060,6 +1060,17 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_lock_public_claim_for_attach", 114),
     ("epigraph_dedup_move_bbas", 114),
     ("epigraph_reown_legacy_writer_bbas", 114),
+    // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
+    // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
+    // the session cannot see answers false, which it would anyway), and the
+    // cascade definer's DELETE is refused by the restrictive policies, so the
+    // cascade reports CD02-shaped failures instead of invalidating. The third
+    // does NOT fail loudly: the node-delete edge trigger's DELETE is filtered,
+    // so an owner deleting its own claim silently leaves world-owned edges
+    // pointing at the deleted row. That is the stake this entry reports.
+    ("epigraph_session_writes_node", 115),
+    ("epigraph_cascade_delete_edge_bbas", 115),
+    ("epigraph_cascade_delete_node_edges", 115),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
