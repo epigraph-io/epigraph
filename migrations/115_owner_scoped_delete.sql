@@ -67,6 +67,20 @@
 -- (every claim-derived table's `claim_id`) is a referential action, and
 -- PostgreSQL runs it without consulting row security, so an owner deleting its
 -- own claim still removes every row that hangs off it, other writers' included.
+-- The same holds for the parents that are NOT tier-A rows and that the
+-- application may delete without any owner rule, so their cascades reach
+-- tier-A rows unscoped. At this migration there are five such (parent, child)
+-- pairs, all materializations rebuilt by their own jobs:
+-- `harvester_sources -> harvester_fragments` (and on to
+-- `harvester_claim_provenance`), `experiment_entities -> experiment_triples`,
+-- `experiment_entities -> experiment_entity_mentions`,
+-- `graph_clusters -> claim_cluster_membership`, and
+-- `graph_neighborhoods -> claim_neighborhood_membership` (itself cascaded from
+-- `graph_cluster_runs` and `claim_themes`). They are accepted, not gated;
+-- `owner_scoped_delete.rs::every_unscoped_fk_cascade_into_tier_a_is_listed`
+-- fails when a new one appears. A cascade from a tier-A parent (`frames` into
+-- `mass_functions`, `claim_frames` and the `ds_*` tables, say) is bounded by
+-- that parent's own DELETE rule and by section 7.
 -- The `<node>_cascade_edges` triggers are row DELETEs issued by a trigger body
 -- and DO consult policies; section 5 handles them.
 --
@@ -207,7 +221,18 @@
 -- already admitted, so the definer adds no capability beyond "deleting a node
 -- you may delete removes the edges that point at it". The other tables that
 -- use `cascade_delete_edges()` (agents, papers, analyses, tasks, events,
--- workflows, experiments) are not tier-A rows and keep 001's body.
+-- workflows, experiments, experiment_results) are not tier-A rows and keep
+-- 001's INVOKER body. That is a behaviour change for them: the edge DELETE the
+-- trigger issues is now owner-scoped too, so a non-privileged delete of such
+-- a node removes only the edges the deleting session may delete, and leaves
+-- the others (a world-owned edge to or from a public claim, for one) pointing
+-- at the deleted node. They are deliberately not moved onto the definer: most
+-- of these tables have no row security, so "a node you may delete" would be
+-- every such node, and the definer would let any session remove other groups'
+-- private edges by deleting one. No application path deletes such a node
+-- today (`agents` admits no DELETE policy at all);
+-- `owner_scoped_delete.rs::no_application_path_deletes_a_non_tier_a_edge_node`
+-- is the register that fails when one is added.
 --
 -- ===================================================================
 -- 6. GRANTS AND OWNERSHIP

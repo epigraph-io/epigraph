@@ -22,10 +22,21 @@
 //! `visibility.rs`'s `{WRITABLE:e}` deletes -- already owner-scoped),
 //! `mass_functions` (the three cascades below, and `delete_for_claim`, which
 //! has no caller), `edges` (`workflow_steps.rs`'s `step_follows` rewire, and the
-//! node-delete trigger), `claim_cluster_membership` (the bridge-cluster GC;
-//! the memberships of a deleted run also go through the `graph_clusters` FK
-//! cascade, which consults no policy). No application path deletes a registry
-//! row (`frames`, `contexts`, `perspectives`, `communities`).
+//! node-delete trigger), `claim_cluster_membership` (the bridge-cluster GC).
+//! No application path deletes a registry row (`frames`, `contexts`,
+//! `perspectives`, `communities`).
+//!
+//! # What is accepted rather than gated
+//!
+//! FK `ON DELETE CASCADE` is a referential action and consults no policy. Five
+//! (parent, child) pairs reach a tier-A child from a parent the application may
+//! delete without an owner rule (`harvester_sources`, `experiment_entities`
+//! twice, `graph_clusters`, `graph_neighborhoods`; the last is reached from
+//! `claim_themes`' rebuild and the cluster-run deletes). All are
+//! materializations. `every_unscoped_fk_cascade_into_tier_a_is_listed` is the
+//! exact register. Node tables outside tier A keep 001's invoker edge cascade,
+//! and `no_application_path_deletes_a_non_tier_a_edge_node` registers every
+//! application DELETE of one.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -1489,6 +1500,157 @@ async fn a_reader_cannot_delete_its_groups_sealed_rows(pool: PgPool) {
     assert_eq!(seen, 2, "calibration: the reader reads both rows");
     assert_eq!(by_reader, vec![0, 0], "a reader deletes neither");
     assert_eq!(by_writer, vec![1, 1], "the group's writer deletes both");
+}
+
+/// The exact register of FK `ON DELETE CASCADE` paths into a tier-A table from
+/// a parent the application may DELETE with no owner-scoped DELETE policy of
+/// its own. A referential action consults no policy, so each is a way to
+/// remove tier-A rows around 115; each listed one is a materialization (see
+/// 115 section 1). A new pair fails here until it is gated or listed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_unscoped_fk_cascade_into_tier_a_is_listed(pool: PgPool) {
+    const ACCEPTED: &[(&str, &str)] = &[
+        ("experiment_entities", "experiment_entity_mentions"),
+        ("experiment_entities", "experiment_triples"),
+        ("graph_clusters", "claim_cluster_membership"),
+        ("graph_neighborhoods", "claim_neighborhood_membership"),
+        ("harvester_sources", "harvester_fragments"),
+    ];
+    let pairs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT pc.relname::text, cc.relname::text \
+           FROM pg_constraint k \
+           JOIN pg_class cc ON cc.oid = k.conrelid \
+           JOIN pg_class pc ON pc.oid = k.confrelid \
+          WHERE k.contype = 'f' AND k.confdeltype = 'c' \
+            AND EXISTS (SELECT 1 FROM pg_policy r WHERE r.polrelid = cc.oid \
+                         AND r.polname = cc.relname || '_delete_owner') \
+            AND has_table_privilege('epigraph_app', pc.oid, 'DELETE') \
+            AND NOT EXISTS (SELECT 1 FROM pg_policy r WHERE r.polrelid = pc.oid \
+                             AND r.polcmd = 'd' AND NOT r.polpermissive) \
+          ORDER BY 1, 2",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("catalog");
+    let got: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    assert_eq!(
+        got, ACCEPTED,
+        "the unscoped FK cascades into tier-A tables changed; gate the new one or list it"
+    );
+}
+
+/// The register of application-code DELETEs of a node table outside tier A
+/// whose `<node>_cascade_edges` trigger keeps 001's INVOKER body (115 section
+/// 5). After 115 such a delete removes only the edges the session may delete,
+/// so a new one must decide what happens to the others. Keyed on
+/// `(file, table, count)` over `crates/*/src`, so a new call site is a visible
+/// diff here.
+#[test]
+fn no_application_path_deletes_a_non_tier_a_edge_node() {
+    const NODE_TABLES: &[&str] = &[
+        "agents",
+        "analyses",
+        "events",
+        "experiment_results",
+        "experiments",
+        "papers",
+        "tasks",
+        "workflows",
+    ];
+    const REGISTER: &[(&str, &str, usize, &str)] = &[
+        (
+            "epigraph-api/src/routes/reasoning.rs",
+            "agents",
+            1,
+            "#[cfg(test)] fixture cleanup",
+        ),
+        (
+            "epigraph-db/src/repos/agent.rs",
+            "agents",
+            1,
+            "AgentRepository::delete: `agents` has row security and no DELETE policy, \
+             so a non-privileged session deletes nothing",
+        ),
+        (
+            "epigraph-db/src/repos/claim.rs",
+            "agents",
+            2,
+            "#[cfg(test)] fixture cleanup",
+        ),
+        (
+            "epigraph-db/src/repos/recall_event.rs",
+            "events",
+            1,
+            "prune_telemetry_events: telemetry event rows are not edge endpoints",
+        ),
+    ];
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates dir")
+        .to_path_buf();
+    let mut found: Vec<(String, String, usize)> = Vec::new();
+    let mut crate_dirs: Vec<_> = std::fs::read_dir(&crates)
+        .expect("read crates")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    crate_dirs.sort();
+    for krate in crate_dirs {
+        let src = krate.join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        files.sort();
+        for file in files {
+            let text = std::fs::read_to_string(&file).expect("read source");
+            let lower = text.to_lowercase();
+            for table in NODE_TABLES {
+                let mut n = 0;
+                for prefix in ["delete from ", "delete from public."] {
+                    let needle = format!("{prefix}{table}");
+                    let mut at = 0;
+                    while let Some(i) = lower[at..].find(&needle) {
+                        let end = at + i + needle.len();
+                        let next = lower[end..].chars().next();
+                        if !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            n += 1;
+                        }
+                        at = end;
+                    }
+                }
+                if n > 0 {
+                    let rel = file
+                        .strip_prefix(&crates)
+                        .expect("under crates")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    found.push((rel, (*table).to_string(), n));
+                }
+            }
+        }
+    }
+    let expected: Vec<(String, String, usize)> = REGISTER
+        .iter()
+        .map(|(f, t, n, _)| ((*f).to_string(), (*t).to_string(), *n))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "an application DELETE of a non-tier-A edge node changed; see 115 section 5"
+    );
 }
 
 /// The four functions are definers owned by the maintenance role, not
