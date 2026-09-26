@@ -701,6 +701,15 @@ fn ipv6_category(v6: Ipv6Addr) -> Option<&'static str> {
             64,
             "discard-only",
         ),
+        // 100:0:0:1::/64 — dummy prefix (RFC 9780), for use where an IPv6
+        // prefix is syntactically required but no real one is. The IANA
+        // registry marks it not globally reachable. It sits beside 100::/64,
+        // which does NOT cover it.
+        (
+            Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0),
+            64,
+            "dummy prefix (RFC 9780)",
+        ),
         // 2001:db8::/32 is inside 2001::/16 but not 2001::/23; checked first
         // only for the better name.
         (
@@ -995,6 +1004,8 @@ mod tests {
             "64:ff9b::a00:1",         // NAT64 of 10.0.0.1
             "64:ff9b:1::1",           // local-use NAT64
             "100::1",                 // discard-only
+            "100:0:0:1::1",           // dummy prefix (RFC 9780)
+            "100:0:0:1:ffff::",       // dummy prefix, upper half of the /64
             "2001::1",                // Teredo
             "2001:db8::1",            // documentation
             "2001:10::1",             // ORCHID
