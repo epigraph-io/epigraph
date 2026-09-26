@@ -489,10 +489,31 @@ Current reservation:
   epigraph` after migrating; on any other cluster run it once, and
   `tenancy_required.rs::the_harness_role_can_take_the_seed_escape_hatch` names
   it when missing. **Deploy note:** before applying, (1) confirm no SERVICE
-  login holds a grant of `epigraph_seed` (`SELECT m.rolname FROM
-  pg_auth_members a JOIN pg_roles r ON r.oid = a.roleid JOIN pg_roles m ON
-  m.oid = a.member WHERE r.rolname = 'epigraph_seed'` must list no service
-  login), and (2) measure whether any superuser-DSN writer relies on the hatch
+  login reaches `epigraph_seed`, directly OR through intermediate roles, with
+  the same recursive walk `epigraph_session_is_seed()` makes:
+
+  ```sql
+  WITH RECURSIVE e(member, confers, depth) AS (
+      SELECT a.member, a.inherit_option OR a.set_option, 1
+        FROM pg_auth_members a JOIN pg_roles r ON r.oid = a.roleid
+       WHERE r.rolname = 'epigraph_seed'
+      UNION
+      SELECT a.member, e.confers AND (a.inherit_option OR a.set_option), e.depth + 1
+        FROM pg_auth_members a JOIN e ON a.roleid = e.member
+  )
+  SELECT m.rolname, m.rolcanlogin, m.rolsuper, bool_or(e.confers) AS is_seed,
+         min(e.depth) AS hops
+    FROM e JOIN pg_roles m ON m.oid = e.member
+   GROUP BY 1, 2, 3 ORDER BY 4 DESC, 1;
+  ```
+
+  No row with `rolcanlogin AND is_seed` may be a service login. A row with
+  `is_seed = false` holds only ADMIN-only edges on its path: it is NOT a
+  seed, but it can grant itself the role, so it belongs in the audit.
+  Superusers appear here only if granted; a superuser with no row is not a
+  seed after 113 (`SELECT public.epigraph_session_is_seed()` on its session
+  says so once 113 is applied). Needs PostgreSQL 16 (`inherit_option`,
+  `set_option`), as 113 itself does. (2) Measure whether any superuser-DSN writer relies on the hatch
   for a ROOT row: `SELECT count(*) FROM <root> WHERE owner_group_id =
   '00000000-0000-0000-0000-00000000dead'` for each of the six roots, grouped
   by `created_at` after the tenancy migrations; a non-zero recent count names
