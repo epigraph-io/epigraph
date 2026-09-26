@@ -2241,6 +2241,49 @@ mod tests {
         assert_eq!(result.error.as_deref(), Some("HTTP 500"));
     }
 
+    /// A resolution FAILURE is transient at delivery: the first lookup finds
+    /// nothing, so nothing is dialled and the attempt is retried with the
+    /// normal backoff; the second lookup vets, and the delivery goes through.
+    ///
+    /// Pins three things the retry loop claims and nothing else tested: the
+    /// transient arm retries instead of returning `blocked` (which would give
+    /// `success: false`, zero hits); `attempts` counts only attempts that
+    /// DIALLED (1, not 2); and the name is looked up again after a failure
+    /// (2 calls) but not after a vetted answer.
+    #[tokio::test]
+    async fn test_delivery_retries_after_a_failed_resolution() {
+        let (addr, hits, task) = counting_listener("127.0.0.1:0", OK_200).await;
+        let host = "late-dns.example";
+        let stub = std::sync::Arc::new(
+            StubResolver::new().with_sequence(host, vec![vec![], vec![addr.ip()]]),
+        );
+        let egress = EgressGuard::with_resolver(stub.clone()).exempt_socket_for_tests(addr);
+        let subscription = ssrf_sub(format!("http://{host}:{}/hook", addr.port()));
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(1000),
+            max_retries: 1,
+        };
+
+        let result =
+            deliver_to_subscription(&egress, &subscription, b"{}", "deadbeef", &config).await;
+        task.abort();
+
+        assert!(
+            result.success,
+            "a resolution failure must be retried, not treated as a refusal: {result:?}"
+        );
+        assert_eq!(
+            result.attempts, 1,
+            "only the attempt that dialled counts: {result:?}"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            stub.calls(host),
+            2,
+            "one failed lookup, one vetted lookup, and no lookup after that"
+        );
+    }
+
     /// The pinned client fails CLOSED: a name that is not the pinned one is not
     /// handed to system DNS. Without `RefuseUnpinnedNames`, reqwest falls back
     /// to its default resolver for any name missing from the overrides.
