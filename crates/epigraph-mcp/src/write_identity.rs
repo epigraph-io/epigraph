@@ -49,9 +49,13 @@
 //! transaction ([`crate::claim_helper::begin_author_stamped_tx`]) takes one, so
 //! the compiler enumerates every write site: a tool cannot stamp from an agent it
 //! chose itself. `tests/write_identity_ratchet.rs` pins the other halves — that
-//! no module under `src/tools/` resolves `server.agent_id()` directly, and that
-//! every `#[tool]` body that calls a write-tool function hands it the request's
-//! `auth`.
+//! no module under `src/tools/` resolves `server.agent_id()` directly, that no
+//! module but this one and `server.rs` calls [`WriteIdentity::from_resolved`]
+//! (it is `pub(crate)`, so the privacy alone did not stop a tool minting one;
+//! batch H-b review), that every `#[tool]` body that calls a write-tool function
+//! hands it the request's `auth` (and every write body forwards it at all, or is
+//! listed with a reason), and that `signer_agent_id()` is only ever bound as a
+//! signer.
 //!
 //! # What the SIGNER is, and why it does not move
 //!
