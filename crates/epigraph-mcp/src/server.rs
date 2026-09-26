@@ -1615,7 +1615,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override. Keys are matched against each BBA's evidence_type lowercased and strict-key: a key that is not lowercase, or not in the evidence-type vocabulary, is still stored but is returned in unknown_keys (with one sentence per key in warnings) because it can change no belief; both fields are omitted when every key is known. Unknown keys are a warning, never a refusal."
+        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override. Keys are matched against each BBA's evidence_type lowercased and strict-key: a key that is not lowercase, or not in the evidence-type vocabulary, is still stored but is returned in unknown_keys (with one sentence per key in warnings). A key that is not lowercase never applies. A lowercase key outside the vocabulary matches no BBA any ingest or edge path writes, but it DOES weight BBAs submitted through submit_ds_evidence with that same unrecognised evidence_type, which that tool accepts (it reports them in its own unknown_keys). Both fields are omitted when every key is known. Unknown keys are a warning, never a refusal."
     )]
     async fn set_source_reliability(
         &self,

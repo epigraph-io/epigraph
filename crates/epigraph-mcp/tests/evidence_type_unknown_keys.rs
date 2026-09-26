@@ -206,3 +206,76 @@ async fn set_source_reliability_reports_keys_the_lens_can_never_match(pool: PgPo
         "not normalised: {stored}"
     );
 }
+
+/// G12 review: a LOWERCASE unknown key is reported, but it is not inert. It
+/// weights every BBA submit_ds_evidence stored under that same unrecognised
+/// evidence_type, so the tool description may not say it "can change no
+/// belief". Pins the reviewer's measurement: the perspective's belief follows
+/// the unknown key's alpha.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lowercase_unknown_key_still_weights_a_bba_carrying_it(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let frame = ensure_binary_frame(&mut pool.acquire().await.unwrap(), &viewer)
+        .await
+        .unwrap();
+    let c = insert_claim(&pool, "g12 review: anecdote is weighted").await;
+    let out = submit(&server, &viewer, c, frame, "anecdote").await;
+    assert_eq!(
+        out["unknown_keys"],
+        serde_json::json!(["anecdote"]),
+        "{out}"
+    );
+
+    let created = first_text(
+        &tools::perspectives::create_perspective(
+            &server,
+            serde_json::from_value(serde_json::json!({"name": "g12 review lens"})).unwrap(),
+        )
+        .await
+        .expect("create perspective"),
+    );
+    let pid = created["perspective_id"].as_str().unwrap().to_string();
+
+    let mut beliefs = Vec::new();
+    for alpha in [0.05, 0.95] {
+        let set = first_text(
+            &tools::perspectives::set_source_reliability(
+                &server,
+                serde_json::from_value(serde_json::json!({
+                    "perspective_id": pid,
+                    "source_reliability": {"anecdote": alpha},
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            set["unknown_keys"],
+            serde_json::json!(["anecdote"]),
+            "{set}"
+        );
+        let scoped = first_text(
+            &tools::ds::scoped_belief(
+                &server,
+                &viewer,
+                serde_json::from_value(serde_json::json!({
+                    "claim_id": c.to_string(),
+                    "scope_type": "perspective",
+                    "scope_id": pid,
+                    "frame_id": frame.to_string(),
+                }))
+                .unwrap(),
+            )
+            .await
+            .expect("scoped_belief"),
+        );
+        beliefs.push(scoped["belief"].as_f64().expect("belief"));
+    }
+    // masses {0: 0.7}: belief = alpha * 0.7 under the lens.
+    assert!(
+        (beliefs[0] - 0.035).abs() < 1e-6 && (beliefs[1] - 0.665).abs() < 1e-6,
+        "the unknown key's alpha must move the belief: {beliefs:?}"
+    );
+}

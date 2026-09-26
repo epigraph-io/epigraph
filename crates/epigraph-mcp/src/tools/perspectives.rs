@@ -106,10 +106,12 @@ pub async fn set_source_reliability(
         .await
         .map_err(internal_error)?;
 
-    // Backlog 86ee2d30 (G12): a tag the lens can never apply is still stored —
+    // Backlog 86ee2d30 (G12): a tag outside the lens's reach is still stored —
     // the vocabulary is operator-extensible, so this is a WARNING, never a
-    // refusal — but the caller is told, instead of the key silently doing
-    // nothing while every matching BBA keeps its default weight.
+    // refusal — but the caller is told. A non-lowercase key can never apply. A
+    // lowercase unknown key applies only to BBAs whose evidence_type is that
+    // same unrecognised string, which only submit_ds_evidence writes (G12
+    // review measured it moving scoped_belief); for a typo it does nothing.
     let (unknown_keys, warnings) = unknown_source_reliability_keys(
         params.source_reliability.keys().map(String::as_str),
         &epigraph_engine::calibration::CalibrationConfig::from_workspace_root().unwrap_or_else(
