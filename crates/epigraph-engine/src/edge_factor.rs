@@ -729,6 +729,40 @@ pub fn effective_source_strength_with_perspective(
     (base * locality).clamp(0.0, 1.0)
 }
 
+/// Relationship-vocab strings the `auto_wire_ds_for_edge` write path may emit
+/// as a BBA's `evidence_type` before they are added to
+/// `calibration.evidence_type_aliases`. Part of the known vocabulary.
+const RELATIONSHIP_VOCAB_ALLOWLIST: &[&str] = &[
+    "supports",
+    "corroborates",
+    "refutes",
+    "supersedes",
+    "derived_support",
+    "derived_refute",
+    "derived_supersession",
+];
+
+/// The evidence-type vocabulary check: is `key` a canonical key in
+/// `calibration.evidence_type_weights`, an alias in
+/// `calibration.evidence_type_aliases`, or one of the relationship-vocab
+/// strings the edge auto-wire emits?
+///
+/// Case-insensitive, like the calibration accessors it delegates to. NOTE that
+/// the reliability OVERRIDE maps that consume such keys (a frame's
+/// `evidence_type_weights`, a perspective's `source_reliability`) are looked up
+/// STRICT-KEY against the BBA's lowercased `evidence_type`, so a known key
+/// spelled with capitals is still one those maps can never match; callers that
+/// validate an override map must check the spelling as well.
+///
+/// A key outside this vocabulary is not rejected anywhere: an unknown
+/// `evidence_type` on a BBA with no stored `source_strength` falls through
+/// [`effective_source_strength`]'s chain to the 0.5 unknown-type weight.
+#[must_use]
+pub fn is_known_evidence_type_key(key: &str, calibration: &CalibrationConfig) -> bool {
+    calibration.evidence_type_weight_present(key)
+        || RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.to_lowercase().as_str())
+}
+
 /// Phase 4 (issue #197) Q8: warn on per-frame evidence-type override
 /// keys that aren't in calibration's known vocabulary.
 ///
@@ -738,28 +772,18 @@ pub fn effective_source_strength_with_perspective(
 /// emit before they're added to `evidence_type_aliases`. Operators may
 /// legitimately register weights for future evidence types not yet in
 /// calibration.toml; this is a log signal for typos, not a hard reject.
+///
+/// The vocabulary test itself is [`is_known_evidence_type_key`], public so the
+/// MCP write surfaces that accept these keys can return the same verdict to
+/// the caller as a warning instead of only logging it (backlog 86ee2d30).
 fn warn_on_unknown_evidence_type_keys(
     frame_id: Uuid,
     map: &HashMap<String, f64>,
     calibration: &CalibrationConfig,
 ) {
-    const RELATIONSHIP_VOCAB_ALLOWLIST: &[&str] = &[
-        "supports",
-        "corroborates",
-        "refutes",
-        "supersedes",
-        "derived_support",
-        "derived_refute",
-        "derived_supersession",
-    ];
     for key in map.keys() {
-        // Map keys are already lowercased by the repo accessor; calibration
-        // accessors also lowercase internally. evidence_type_weight_present
-        // covers both canonical-key and alias resolution in one call.
-        if calibration.evidence_type_weight_present(key) {
-            continue;
-        }
-        if RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.as_str()) {
+        // Map keys are already lowercased by the repo accessor.
+        if is_known_evidence_type_key(key, calibration) {
             continue;
         }
         tracing::warn!(

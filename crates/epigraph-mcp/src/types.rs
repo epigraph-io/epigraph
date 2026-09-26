@@ -1083,7 +1083,10 @@ pub struct SubmitDsEvidenceParams {
                        [evidence_type_weights]) instead of the caller-supplied `reliability` float. \
                        When omitted (default), behavior is unchanged: the raw `reliability` float is \
                        applied and the BBA is stored with evidence_type=NULL, matching every \
-                       pre-existing caller byte-for-byte."
+                       pre-existing caller byte-for-byte. A tag outside the calibration vocabulary \
+                       (and not in the frame's evidence_type_weights override) is still stored, but \
+                       is combined at the 0.5 unknown-type reliability and returned in the \
+                       response's unknown_keys and warnings."
     )]
     #[serde(default)]
     pub evidence_type: Option<String>,
@@ -2228,6 +2231,13 @@ pub struct DsEvidenceResponse {
     /// empty. Never a refusal: the evidence was stored.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// The supplied `evidence_type`, when the belief recompute cannot resolve
+    /// it to a calibrated weight (not a calibration key or alias, and not in
+    /// the frame's own override), so the BBA was combined at the 0.5
+    /// unknown-type reliability. A WARNING, not a refusal: the BBA was stored.
+    /// A matching sentence is in `warnings`. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unknown_keys: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2772,7 +2782,7 @@ pub struct SetSourceReliabilityParams {
     pub perspective_id: String,
 
     #[schemars(
-        description = "Map of evidence-type tag -> reliability alpha in [0,1] (e.g. {\"western_clinical\":0.95,\"ayurvedic_classical\":0.15}). This is the frame-function lens read by scoped_belief. An empty map clears the override."
+        description = "Map of evidence-type tag -> reliability alpha in [0,1] (e.g. {\"empirical\":0.95,\"testimonial\":0.3}). This is the frame-function lens read by scoped_belief. It is looked up with each BBA's evidence_type LOWERCASED and strict-key, so keys must be lowercase evidence-type vocabulary (calibration.toml [evidence_type_weights] keys or [evidence_type_aliases]). Any other key is still stored but is reported back in unknown_keys and warnings, because it matches no BBA the ingest and edge paths write. An empty map clears the override."
     )]
     pub source_reliability: std::collections::HashMap<String, f64>,
 }

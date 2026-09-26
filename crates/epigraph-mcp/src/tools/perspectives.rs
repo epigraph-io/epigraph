@@ -105,11 +105,72 @@ pub async fn set_source_reliability(
     PerspectiveRepository::set_source_reliability(&server.pool, id, &params.source_reliability)
         .await
         .map_err(internal_error)?;
-    success_json(&serde_json::json!({
+
+    // Backlog 86ee2d30 (G12): a tag the lens can never apply is still stored —
+    // the vocabulary is operator-extensible, so this is a WARNING, never a
+    // refusal — but the caller is told, instead of the key silently doing
+    // nothing while every matching BBA keeps its default weight.
+    let (unknown_keys, warnings) = unknown_source_reliability_keys(
+        params.source_reliability.keys().map(String::as_str),
+        &epigraph_engine::calibration::CalibrationConfig::from_workspace_root().unwrap_or_else(
+            |_| epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback(),
+        ),
+    );
+    let mut out = serde_json::json!({
         "perspective_id": id.to_string(),
         "source_reliability": params.source_reliability,
         "status": "set",
-    }))
+    });
+    if !unknown_keys.is_empty() {
+        out["unknown_keys"] = serde_json::json!(unknown_keys);
+        out["warnings"] = serde_json::json!(warnings);
+    }
+    success_json(&out)
+}
+
+/// The keys of a perspective `source_reliability` map that the frame-function
+/// lens can never match, with one warning sentence each (backlog 86ee2d30).
+///
+/// Two ways a key is dead, both read off
+/// `edge_factor::effective_source_strength_with_perspective`, which looks the
+/// map up with the BBA's LOWERCASED `evidence_type`, strict-key:
+/// 1. the key is not lowercase — it can never equal a lowercased string;
+/// 2. the key is outside the engine's evidence-type vocabulary
+///    ([`epigraph_engine::edge_factor::is_known_evidence_type_key`]). No
+///    write path tags a BBA with such a string except `submit_ds_evidence`
+///    naming it verbatim, which reports it as unknown in turn.
+///
+/// Sorted, so the response is deterministic.
+fn unknown_source_reliability_keys<'a>(
+    keys: impl Iterator<Item = &'a str>,
+    calibration: &epigraph_engine::calibration::CalibrationConfig,
+) -> (Vec<String>, Vec<String>) {
+    let mut keys: Vec<&str> = keys.collect();
+    keys.sort_unstable();
+    let mut unknown = Vec::new();
+    let mut warnings = Vec::new();
+    for key in keys {
+        if key != key.to_lowercase() {
+            warnings.push(format!(
+                "source_reliability key {key:?} is stored but can never apply: BBA evidence \
+                 types are matched lowercased and strict-key, so spell it {:?}.",
+                key.to_lowercase()
+            ));
+            unknown.push(key.to_string());
+        } else if !epigraph_engine::edge_factor::is_known_evidence_type_key(key, calibration) {
+            warnings.push(format!(
+                "source_reliability key {key:?} is stored but is not in the evidence-type \
+                 vocabulary (calibration.toml [evidence_type_weights] keys, \
+                 [evidence_type_aliases], or the edge relationship names). It applies only to \
+                 BBAs whose evidence_type is that same unrecognised string, which no write path \
+                 produces except a submit_ds_evidence call naming it (reported there as unknown \
+                 too); if it is a typo it changes no belief. Known keys: {}.",
+                crate::tools::ds::known_evidence_type_keys().join(", ")
+            ));
+            unknown.push(key.to_string());
+        }
+    }
+    (unknown, warnings)
 }
 
 /// List all perspectives with optional pagination.

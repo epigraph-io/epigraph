@@ -121,7 +121,7 @@ pub async fn submit_ds_evidence(
     // `combination_method` stored, but neither reaches the belief (see the
     // recompute below). A caller who sends a non-default value believes it
     // does something, so the response says it did not.
-    let warnings = deprecated_parameter_warnings(method, params.gamma);
+    let mut warnings = deprecated_parameter_warnings(method, params.gamma);
 
     // Get frame from DB
     let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
@@ -161,6 +161,25 @@ pub async fn submit_ds_evidence(
     //   parameter that couldn't affect anything.
     let mut mass_fn = parse_masses_json(&frame, &params.masses)?;
     let calibrated_evidence_type = params.evidence_type.as_deref().filter(|s| !s.is_empty());
+
+    // Backlog 86ee2d30 (G12): an `evidence_type` outside the vocabulary the
+    // recompute resolves is ACCEPTED and silently combined at the 0.5
+    // unknown-type weight (`effective_source_strength`'s last tier: this path
+    // stores no `source_strength`). Report it, never refuse it — the vocabulary
+    // is operator-extensible and a new key may be deliberate.
+    let unknown_keys = match calibrated_evidence_type {
+        Some(et) if !evidence_type_resolves(server, frame_id, et).await => {
+            warnings.push(format!(
+                "evidence_type={et:?} is not in the calibration vocabulary \
+                 (calibration.toml [evidence_type_weights] keys or [evidence_type_aliases]) and \
+                 has no entry in this frame's evidence_type_weights override, so this BBA is \
+                 combined at the 0.5 unknown-type reliability. Known keys: {}.",
+                known_evidence_type_keys().join(", ")
+            ));
+            vec![et.to_string()]
+        }
+        _ => Vec::new(),
+    };
     let stored_locality_tag = if calibrated_evidence_type.is_some() {
         params.locality_tag.as_deref().unwrap_or("unknown")
     } else {
@@ -393,7 +412,53 @@ pub async fn submit_ds_evidence(
         bba_count: bba_count as i64,
         method_used: method_name,
         warnings,
+        unknown_keys,
     })
+}
+
+/// The calibration the belief recompute itself uses — same loader, same
+/// fallback as `edge_factor::compute_combined_belief` — so a vocabulary
+/// verdict here agrees with what the combine will actually do.
+fn recompute_calibration() -> epigraph_engine::calibration::CalibrationConfig {
+    epigraph_engine::calibration::CalibrationConfig::from_workspace_root().unwrap_or_else(|_| {
+        epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
+    })
+}
+
+/// Every evidence-type key the calibration resolves (canonical keys and
+/// aliases), sorted — what a caller told its key is unknown needs to see.
+pub(crate) fn known_evidence_type_keys() -> Vec<String> {
+    let c = recompute_calibration();
+    let mut keys: Vec<String> = c
+        .evidence_type_weights
+        .keys()
+        .chain(c.evidence_type_aliases.keys())
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Would the recompute resolve `evidence_type` to a real weight for a BBA on
+/// `frame_id` rather than the 0.5 unknown-type fallback? True when it is in the
+/// engine's vocabulary ([`epigraph_engine::edge_factor::is_known_evidence_type_key`])
+/// or the frame's own strict-key `evidence_type_weights` override names it
+/// (Tier 1 of `effective_source_strength`).
+///
+/// The override read is `VISIBILITY-EXEMPT` at the repo; it is spent here only
+/// on a frame this caller already read through its viewer, and only as a
+/// yes/no about the caller's own key. A failed read counts as "no override",
+/// matching the recompute's own `.ok().flatten()`.
+async fn evidence_type_resolves(server: &EpiGraphMcpFull, frame_id: uuid::Uuid, et: &str) -> bool {
+    if epigraph_engine::edge_factor::is_known_evidence_type_key(et, &recompute_calibration()) {
+        return true;
+    }
+    FrameRepository::get_per_frame_evidence_type_weights(&server.pool, frame_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|m| m.contains_key(&et.to_lowercase()))
 }
 
 /// The `warnings` a `submit_ds_evidence` call earns by sending a deprecated

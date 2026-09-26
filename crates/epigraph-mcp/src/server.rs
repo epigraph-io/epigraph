@@ -1615,7 +1615,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override."
+        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override. Keys are matched against each BBA's evidence_type lowercased and strict-key: a key that is not lowercase, or not in the evidence-type vocabulary, is still stored but is returned in unknown_keys (with one sentence per key in warnings) because it can change no belief; both fields are omitted when every key is known. Unknown keys are a warning, never a refusal."
     )]
     async fn set_source_reliability(
         &self,
@@ -1670,7 +1670,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group this server's agent cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief: both are DEPRECATED, and sending a combination_method other than Dempster, or any gamma, adds an entry to the response's warnings array (omitted when empty)."
+        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group this server's agent cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief: both are DEPRECATED, and sending a combination_method other than Dempster, or any gamma, adds an entry to the response's warnings array (omitted when empty). An evidence_type the recompute cannot resolve to a calibrated weight (not a calibration.toml [evidence_type_weights] key or [evidence_type_aliases] alias, nor in the frame's own evidence_type_weights override) is accepted and combined at the 0.5 unknown-type reliability, and is returned in unknown_keys with an explanatory entry in warnings: a warning, never a refusal."
     )]
     async fn submit_ds_evidence(
         &self,
