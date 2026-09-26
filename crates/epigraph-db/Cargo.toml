@@ -28,6 +28,12 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+# TEST SUPPORT ONLY: `ScopedPool::connect_downgraded_for_tests`. Enabled by
+# dev-dependencies alone (never by a normal dependency), so no production
+# build links it.
+test-support = []
+
 [dev-dependencies]
 tokio-test = "0.4"
 serde = { workspace = true }
