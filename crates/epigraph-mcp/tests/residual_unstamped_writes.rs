@@ -197,7 +197,13 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "tools/supersede.rs",
         "server.pool.acquire",
         2,
-        "`supersede_claim`'s and `mark_duplicate`'s retraction cascades, one acquire each. STILL \
+        "`supersede_claim`'s retraction cascade, and `mark_duplicate`'s FALLBACK acquire. \
+         `mark_duplicate` now dedups and cascades on a connection stamped from the server agent \
+         (`claim_helper::acquire_author_stamped_conn`) whenever the pool carries session stamps; \
+         the acquire counted here is its transaction-mode-pooler fallback, where a session stamp \
+         cannot survive, and is the tool's pre-stamp behaviour. Migration 115 makes an unstamped \
+         cascade's delete of another group's edge-keyed BBA a reported CD02 refusal, not a \
+         silent skip. The supersede cascade is STILL \
          UNSTAMPED, and it is a design decision rather than a missing conversion: the cascade \
          walks DOWNSTREAM claims, whose owner groups are arbitrary, so no single viewer's \
          writable set covers its target population and stamping it from `server.agent_id()` \

@@ -6568,16 +6568,20 @@ impl ClaimRepository {
         // with it. Without this, the BBA outlives its edge (nothing cascades
         // from `edges` to `mass_functions`) and keeps being combined into the
         // target's belief forever.
+        //
+        // Migration 115: those BBAs are routinely another writer's rows (or the
+        // target claim's), and DELETE is owner-scoped, so a non-privileged
+        // session removes them through the audited cascade definer, which
+        // admits a row of a RETRACTED edge -- the three guards above have just
+        // retracted every one of these. A privileged session runs the plain
+        // DELETE it always ran.
         let deleted_edge_ids: Vec<Uuid> = deleted_edges.iter().map(|(id, _)| *id).collect();
-        let deleted_bbas = if deleted_edge_ids.is_empty() {
-            0
-        } else {
-            sqlx::query("DELETE FROM mass_functions WHERE perspective_id = ANY($1)")
-                .bind(&deleted_edge_ids)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected()
-        };
+        let deleted_bbas = crate::repos::mass_function::delete_edge_bbas(
+            &mut *tx,
+            &deleted_edge_ids,
+            crate::repos::mass_function::EdgeBbaCascade::DedupRetractedEdge,
+        )
+        .await?;
 
         let retargeted: Vec<(Uuid,)> = sqlx::query_as(
             "UPDATE edges SET target_id = $1 \
@@ -6644,6 +6648,16 @@ impl ClaimRepository {
             // the whole dedup back, i.e. an existing caller would acquire a
             // brand-new failure mode. Drop the canonical-side duplicate first;
             // the row arriving from `dup` is the one whose edge survived.
+            //
+            // Migration 115: this stays a PLAIN statement. DELETE is
+            // owner-scoped, so for a non-privileged session it now removes only
+            // the canonical-side rows the session owns; a collision with
+            // somebody else's row is resolved inside `epigraph_dedup_move_bbas`
+            // below, which keeps the canonical's row and drops the duplicate's
+            // copy. It is deliberately NOT routed through a definer: the only
+            // licence one could check is "the duplicate carries a row with the
+            // same key", and the duplicate is the caller's own claim, so it
+            // could plant that row and delete any writer's BBA on any canonical.
             sqlx::query(
                 r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
                  DELETE FROM mass_functions mf

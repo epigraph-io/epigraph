@@ -180,8 +180,10 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
         "derived from claim id",
     ),
     (
-        "mass_function.rs::delete_for_perspective",
-        "derived from perspective id",
+        "mass_function.rs::delete_edge_bbas",
+        "derived from edge ids (the body moved here from `delete_for_perspective`, which now \
+         delegates; not a new write. The plain DELETE runs only for a privileged session; any \
+         other goes through migration 115's `epigraph_cascade_delete_edge_bbas`)",
     ),
     (
         "mass_function.rs::update_claim_belief",

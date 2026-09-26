@@ -1310,6 +1310,10 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
         // Listing the helper is what lets a future arm spell the bound without
         // that neighbour and still be recognised instead of false-flagged.
         "epigraph_group_roster_admits_principal",
+        // 115's writability predicate for the world-owned `edges` DELETE arm.
+        // Its body compares the node's owner with `epigraph_writable_groups()`,
+        // i.e. the CALLER's writable set, so an arm naming it is session-derived.
+        "epigraph_session_writes_node",
     ];
     // ARMS — not policies — that are row-only BY DESIGN, each with the reason.
     //

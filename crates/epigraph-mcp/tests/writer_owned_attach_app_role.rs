@@ -14,10 +14,10 @@
 //! (`fixture::downgraded_pool`). Seeding and `Viewer::resolve` run on the
 //! original superuser pool, as the fixture's own header requires.
 //!
-//! `mark_duplicate` is not driven here: the tool runs its dedup on the
-//! UNSTAMPED pool (`tools::supersede::mark_duplicate`), which the application
-//! role refuses before 114 is reached. Its repo path on a stamped application
-//! session is pinned in `epigraph-db/tests/writer_owned_derived_rows.rs::
+//! `mark_duplicate` is driven here once, for the server agent's own duplicate
+//! (it now dedups on a connection stamped from the server agent). The move of
+//! OTHER writers' BBAs on a stamped application session is pinned in
+//! `epigraph-db/tests/writer_owned_derived_rows.rs::
 //! mark_duplicate_onto_a_world_canonical_moves_every_writers_bba`.
 
 #[path = "viewer_fixture.rs"]
@@ -567,13 +567,18 @@ async fn submit_ds_evidence_on_a_writer_frame_reports_an_unwritten_cache(pool: P
     );
 }
 
-/// RESIDUAL, pinned rather than fixed here: the mark_duplicate TOOL runs its
-/// dedup on the UNSTAMPED pool, so on the application role it is refused even
-/// for the agent's own duplicate, before migration 114's dedup move is reached.
-/// When the tool moves to a stamped transaction this arm flips and must be
-/// rewritten to assert the writer-owned move instead.
+/// W14, closed: the mark_duplicate TOOL dedups on a connection stamped from the
+/// server agent (the authority `supersede_claim` writes with), so on the
+/// application role the agent's own duplicate of a WORLD canonical lands. It
+/// was refused at its first write while the tool ran on the unstamped pool.
+///
+/// The duplicate's outgoing edge collides with the canonical's, so the dedup
+/// retracts it and drops its edge-keyed BBA -- a row owned by a memberless
+/// group, which the agent does not own. Migration 115 makes DELETE owner-scoped, so that drop lands only
+/// through the audited cascade definer: the `security_events` row names the
+/// server agent and the `retracted_edge` arm.
 #[sqlx::test(migrations = "../../migrations")]
-async fn mark_duplicate_tool_is_refused_on_the_app_role_because_it_runs_unstamped(pool: PgPool) {
+async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(pool: PgPool) {
     let (server, agent, group, viewer) = app_role_server(&pool).await;
     let dup = Uuid::new_v4();
     let hash: Vec<u8> = dup.as_bytes().iter().copied().cycle().take(32).collect();
@@ -590,6 +595,50 @@ async fn mark_duplicate_tool_is_refused_on_the_app_role_because_it_runs_unstampe
     .await
     .expect("a public duplicate owned by the agent's group");
     let canonical = seed_claim(&pool, "a world canonical", 0.5).await;
+    let third = seed_claim(&pool, "a world third claim", 0.5).await;
+    let bt = binary_truth(&pool).await;
+    let mut edges = Vec::new();
+    for source in [dup, canonical] {
+        let e = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, \
+                                relationship) VALUES ($1, $2, 'claim', $3, 'claim', 'supports')",
+        )
+        .bind(e)
+        .bind(source)
+        .bind(third)
+        .execute(&pool)
+        .await
+        .expect("edge");
+        edges.push(e);
+    }
+    let dup_edge = edges[0];
+    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
+        .bind(dup_edge)
+        .bind(format!("edge {dup_edge}"))
+        .execute(&pool)
+        .await
+        .expect("edge perspective");
+    // Written by the (privileged) harness: claim-owned, i.e. owned by the
+    // memberless group the seeded claim landed in.
+    let bba = epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        third,
+        bt,
+        Some(agent),
+        Some(dup_edge),
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        Some("test"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("world-owned edge BBA");
+    let bba_owner = tenancy(&pool, "mass_functions", bba).await.0;
+    assert_eq!(bba_owner, memberless_owner(&pool, third).await);
 
     let r = epigraph_mcp::tools::supersede::mark_duplicate(
         &server,
@@ -601,13 +650,41 @@ async fn mark_duplicate_tool_is_refused_on_the_app_role_because_it_runs_unstampe
         },
         None,
     )
-    .await;
-    let e = r.expect_err("the unstamped dedup is refused on the app role");
-    assert!(e.message.contains("row-level security"), "{e:?}");
-    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
-        .bind(dup)
-        .fetch_one(&pool)
-        .await
-        .expect("dup");
-    assert!(current, "nothing was written");
+    .await
+    .expect("the stamped dedup lands on the app role");
+    let body = first_text(&r);
+    assert_eq!(body["mode"], "mark_duplicate", "{body}");
+    let (current, supersedes): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup");
+    assert!(!current, "the duplicate is retired");
+    assert_eq!(supersedes, Some(canonical));
+    let gone: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM mass_functions WHERE id = $1)")
+            .bind(bba)
+            .fetch_one(&pool)
+            .await
+            .expect("bba");
+    assert!(
+        gone,
+        "the retracted collision edge's BBA, which the agent does not own, was dropped"
+    );
+    let audit: Vec<(Option<Uuid>, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT agent_id, details->>'cause', details->'arms' FROM security_events \
+          WHERE event_type = 'derived.cascade_bba_delete'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(
+        audit[0].0,
+        Some(agent),
+        "attributed to the stamped server agent"
+    );
+    assert_eq!(audit[0].1, "dedup_retracted_edge");
+    assert_eq!(audit[0].2["retracted_edge"], 1, "{:?}", audit[0].2);
 }

@@ -331,13 +331,6 @@ impl MatchCandidateRepo {
                 .await?
                 .rows_affected();
 
-        let bbas_invalidated =
-            sqlx::query("DELETE FROM mass_functions WHERE perspective_id = ANY($1)")
-                .bind(&edge_ids)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-
         // RETRACT, do not DELETE. The edge is a primary epistemic record — the
         // assertion "the matcher claimed these two claims match, and someone
         // promoted it" — carrying `properties.decided_by`, the signature and the
@@ -348,7 +341,7 @@ impl MatchCandidateRepo {
         // Closing `valid_to` removes the edge from every reader that honours
         // `EDGE_IN_FORCE` (the derivation selector and the auto-wire guard) while
         // keeping the row queryable and the retirement reversible. The derived rows
-        // above — bp_messages, factors, mass_functions — are still deleted: those
+        // — bp_messages and factors above, mass_functions below — are still deleted: those
         // are materializations (factors come from the `edges_auto_factor` trigger,
         // BBAs are keyed `perspective_id = edge_id`), so removing them is cache
         // invalidation and they regenerate from live edges.
@@ -362,6 +355,20 @@ impl MatchCandidateRepo {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+
+        // The edge-keyed BBAs go AFTER the retraction (migration 115). DELETE
+        // is owner-scoped, and these rows are routinely somebody else's (the
+        // writer who wired the edge, or the target claim's group), so a
+        // non-privileged session removes them through the audited cascade
+        // definer, whose licence for another writer's row is exactly "its edge
+        // is retracted" -- which the statement above has just made true. A
+        // privileged session runs the plain DELETE it always ran.
+        let bbas_invalidated = crate::repos::mass_function::delete_edge_bbas(
+            &mut *tx,
+            &edge_ids,
+            crate::repos::mass_function::EdgeBbaCascade::MatchCandidateRetire,
+        )
+        .await?;
 
         sqlx::query(
             "UPDATE match_candidates

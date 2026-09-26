@@ -206,6 +206,51 @@ pub async fn begin_author_stamped_tx<'p>(
     })
 }
 
+/// [`begin_author_stamped_tx`]'s CONNECTION twin: a connection stamped with the
+/// author's tenancy context and NOT inside a transaction.
+///
+/// For a caller that opens its own transaction and then runs best-effort work
+/// after the commit on the same connection: `mark_duplicate`'s dedup
+/// (`ClaimRepository::mark_duplicate_with_repair_conn` begins a real
+/// transaction on a bare connection) followed by its retraction cascade, whose
+/// per-statement failures must not poison one another. Inside one transaction
+/// the first failed statement would abort every later one, and the dedup with
+/// them.
+///
+/// `ScopedPool::acquire_as` refuses [`epigraph_db::SessionGucMode::Transaction`]
+/// (a session-scoped stamp does not survive between statements behind a
+/// transaction-mode pooler), so a caller must check the mode first; this
+/// returns an error rather than an unstamped connection.
+///
+/// # Errors
+/// As [`begin_author_stamped_tx`], plus the `acquire_as` refusal above.
+pub async fn acquire_author_stamped_conn<'p>(
+    server: &'p EpiGraphMcpFull,
+    author_agent_id: uuid::Uuid,
+    tool_name: &'static str,
+) -> Result<epigraph_db::ScopedConn<'p>, McpError> {
+    let (scoped, author_viewer) = author_write_authority(
+        server.scoped.as_ref(),
+        &server.pool,
+        author_agent_id,
+        tool_name,
+    )
+    .await?;
+
+    scoped.acquire_as(&author_viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            author = %author_agent_id,
+            error = %e,
+            "could not acquire an author-stamped connection"
+        );
+        internal_error(format!(
+            "{tool_name}: could not acquire an author-stamped connection: {e}"
+        ))
+    })
+}
+
 /// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
 /// **`workflow-ingest-system`** agent's viewer — *not* from `server.agent_id()`.
 ///

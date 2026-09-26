@@ -124,16 +124,50 @@ pub async fn mark_duplicate(
     // (orphaned + stranded edge-factor BBAs) and hands back what still has to
     // be re-derived through the DS pipeline. Same best-effort contract as
     // supersede: the dedup's own failure is an error, the cascade's is not.
-    // Unstamped for the reason recorded on `cascade_after_supersede` above.
-    let mut cascade_conn = server.pool.acquire().await.map_err(internal_error)?;
-    let cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-        &mut cascade_conn,
-        viewer,
-        dup_claim_id.into(),
-        canon,
-    )
-    .await
-    .map_err(internal_error)?;
+    //
+    // STAMPED FROM THE MCP SERVER'S OWN AGENT when the pool can carry a
+    // session stamp, the same authority `supersede_claim` above writes with.
+    // On an unstamped connection the dedup's first write (the duplicate's
+    // `claims` row) is refused by `claims_tenancy` on the application role, so
+    // the tool could not dedup even the server agent's own claim. The stamp is
+    // on a CONNECTION, not a transaction: the dedup opens its own transaction,
+    // and the cascade that follows is best-effort per statement, which one
+    // enclosing transaction would turn into all-or-nothing. Rows the stamp
+    // cannot write (another group's) are refused and reported in the cascade's
+    // `errors`, never silently skipped (migration 115's CD02).
+    //
+    // Behind a transaction-mode pooler a session stamp does not survive, so
+    // that deployment keeps the unstamped connection it always used.
+    let session_mode = server
+        .scoped
+        .as_ref()
+        .is_some_and(|s| s.mode() == epigraph_db::SessionGucMode::Session);
+    let cascade = if session_mode {
+        let mut cascade_conn = crate::claim_helper::acquire_author_stamped_conn(
+            server,
+            server.agent_id().await?,
+            "mark_duplicate",
+        )
+        .await?;
+        epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
+            &mut cascade_conn,
+            viewer,
+            dup_claim_id.into(),
+            canon,
+        )
+        .await
+        .map_err(internal_error)?
+    } else {
+        let mut cascade_conn = server.pool.acquire().await.map_err(internal_error)?;
+        epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
+            &mut cascade_conn,
+            viewer,
+            dup_claim_id.into(),
+            canon,
+        )
+        .await
+        .map_err(internal_error)?
+    };
 
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
