@@ -45,10 +45,12 @@
 //!
 //! The `superuser_*` tests below run on NOLOGIN SUPERUSER roles this file
 //! creates, one with no grant of `epigraph_seed` and one that reaches it
-//! through an intermediate role, and each asserts its own precondition first,
-//! so a stray grant on a shared cluster fails the test instead of passing it
-//! vacuously. They do not use the harness role: whether IT is granted is
-//! cluster state this file does not own.
+//! through an intermediate role, and each asserts its own precondition first.
+//! The roles are created INSIDE a transaction that is always rolled back, so
+//! no cluster the file runs on is left holding a superuser role it did not
+//! have (see the note at the head of that section). They do not use the
+//! harness role: whether IT is granted is cluster state this file does not
+//! own.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -427,6 +429,24 @@ async fn the_same_insert_as_the_seed_role_succeeds_on_the_seed_group(pool: PgPoo
 // =============================================================================
 // Migration 113 — the seed hatch needs an EXPLICIT grant (backlog 0512ca33)
 // =============================================================================
+//
+// # The roles these tests run as exist only inside a rolled-back transaction
+//
+// Roles are CLUSTER-global, not per-database, so a role a `#[sqlx::test]`
+// creates outlives the per-test database it was created from. Two of them are
+// SUPERUSERS. An earlier revision committed them and left
+// `r2_nonseed_superuser` and `r2_seed_superuser` behind on every cluster the
+// file ever ran on. `CREATE ROLE` and `GRANT` are transactional, so every test
+// below creates its roles inside ONE transaction on ONE connection, does all of
+// its work there (the writes as the role and the reads that check them, which
+// no other connection can see), and never commits: the roles vanish with the
+// transaction, a panic included, because a dropped connection aborts it.
+//
+// Parallel tests in this binary queue on the first `CREATE ROLE` (the second
+// waits for the first transaction to end, then succeeds), and every test issues
+// the DDL in the same order, so they cannot deadlock. A COMMITTED role of the
+// same name, left by an older revision of this file, makes the first statement
+// fail with `duplicate_object`; the panic names the `DROP ROLE` to run.
 
 /// A superuser with NO grant of `epigraph_seed`, direct or indirect.
 const NONSEED_SUPERUSER: &str = "r2_nonseed_superuser";
@@ -435,64 +455,96 @@ const SEED_SUPERUSER: &str = "r2_seed_superuser";
 /// The intermediate role between [`SEED_SUPERUSER`] and `epigraph_seed`.
 const SEED_VIA: &str = "r2_seed_via";
 
-/// Run one DDL statement, tolerating the races a parallel test binary produces
-/// on cluster-global role catalogs (two tests creating the same role, or
-/// granting the same membership, at once). Each caller asserts the resulting
-/// state afterwards, so a swallowed error that left the state wrong still
-/// fails the test that needs it.
-async fn role_ddl(pool: &PgPool, stmt: &str) {
-    let block = format!(
-        "DO $$ BEGIN {stmt}; \
-         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
-    );
-    if let Err(e) = pool.execute(block.as_str()).await {
-        // `tuple concurrently updated` on a simultaneous GRANT is the one other
-        // race; the caller's precondition check decides whether it mattered.
-        eprintln!("role DDL `{stmt}` raised (tolerated, state is asserted next): {e}");
+/// The role DDL, in the one order every test issues it. See the section note.
+const ROLE_DDL: &[&str] = &[
+    "CREATE ROLE r2_nonseed_superuser NOLOGIN SUPERUSER",
+    "CREATE ROLE r2_seed_superuser NOLOGIN SUPERUSER",
+    "CREATE ROLE r2_seed_via NOLOGIN",
+    "GRANT epigraph_seed TO r2_seed_via",
+    "GRANT r2_seed_via TO r2_seed_superuser",
+];
+
+/// One connection, one open transaction, and the r2 roles created inside it.
+/// Never committed: dropping it (or `rollback`) removes the roles.
+async fn roles_tx(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.expect("begin the role transaction");
+    for stmt in ROLE_DDL {
+        tx.execute(*stmt).await.unwrap_or_else(|e| {
+            panic!(
+                "`{stmt}`: {e}. If this is `already exists`, an earlier revision of this file \
+                 COMMITTED the role on this cluster; remove it once with `DROP ROLE IF EXISTS \
+                 r2_seed_superuser, r2_admin_via, r2_seed_via, r2_admin_only, \
+                 r2_nonseed_superuser`"
+            )
+        });
     }
+    tx
 }
 
-/// Create the two superuser roles (NOLOGIN: nothing can connect as them; the
-/// tests reach them by `SET SESSION AUTHORIZATION` from the harness).
-async fn superuser_roles(pool: &PgPool) {
-    role_ddl(
-        pool,
-        &format!("CREATE ROLE {NONSEED_SUPERUSER} NOLOGIN SUPERUSER"),
-    )
-    .await;
-    role_ddl(
-        pool,
-        &format!("CREATE ROLE {SEED_SUPERUSER} NOLOGIN SUPERUSER"),
-    )
-    .await;
-    role_ddl(pool, &format!("CREATE ROLE {SEED_VIA} NOLOGIN")).await;
-    role_ddl(pool, &format!("GRANT epigraph_seed TO {SEED_VIA}")).await;
-    role_ddl(pool, &format!("GRANT {SEED_VIA} TO {SEED_SUPERUSER}")).await;
+/// `SET SESSION AUTHORIZATION role` on the transaction's connection. The
+/// harness is a superuser, which is what lets it do this and undo it.
+async fn become_role(conn: &mut sqlx::PgConnection, role: &str) {
+    conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+        .await
+        .unwrap_or_else(|e| panic!("SET SESSION AUTHORIZATION {role}: {e}"));
+}
+
+async fn reset_role(conn: &mut sqlx::PgConnection) {
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("RESET SESSION AUTHORIZATION");
+}
+
+/// Run one statement that must FAIL, inside a savepoint so the failure does
+/// not abort the enclosing transaction (and with it the roles).
+async fn refused(
+    conn: &mut sqlx::PgConnection,
+    q: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    what: &str,
+) -> sqlx::Error {
+    conn.execute("SAVEPOINT r2_refusal")
+        .await
+        .expect("savepoint");
+    let e = q.execute(&mut *conn).await.expect_err(what);
+    conn.execute("ROLLBACK TO SAVEPOINT r2_refusal")
+        .await
+        .expect("rollback to savepoint");
+    e
+}
+
+/// `(owner_group_id, visibility)` of one row, read on the transaction.
+async fn tenancy_in(conn: &mut sqlx::PgConnection, table: &str, id: Uuid) -> (Uuid, String) {
+    let row = sqlx::query(&format!(
+        "SELECT owner_group_id, visibility FROM {table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("read tenancy");
+    (row.get(0), row.get(1))
 }
 
 /// `(rolsuper, pg_has_role(session_user, 'epigraph_seed', 'MEMBER'),
 /// epigraph_session_is_seed())` as `role` sees itself.
-async fn seed_facts(pool: &PgPool, role: &str) -> (bool, bool, bool) {
-    fixture::as_role(pool, role, |mut conn| async move {
-        let r: (bool, bool, bool) = sqlx::query_as(
-            "SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = session_user), \
-                    pg_has_role(session_user, 'epigraph_seed', 'MEMBER'), \
-                    public.epigraph_session_is_seed()",
-        )
-        .fetch_one(&mut *conn)
-        .await
-        .expect("seed facts");
-        (conn, r)
-    })
+async fn seed_facts(conn: &mut sqlx::PgConnection, role: &str) -> (bool, bool, bool) {
+    become_role(conn, role).await;
+    let r: (bool, bool, bool) = sqlx::query_as(
+        "SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = session_user), \
+                pg_has_role(session_user, 'epigraph_seed', 'MEMBER'), \
+                public.epigraph_session_is_seed()",
+    )
+    .fetch_one(&mut *conn)
     .await
+    .expect("seed facts");
+    reset_role(conn).await;
+    r
 }
 
 /// The precondition of every `superuser_*` test, asserted rather than assumed:
 /// [`NONSEED_SUPERUSER`] is a superuser that `pg_has_role` calls a seed member
-/// (the trap) and that holds no grant. If someone granted it on this cluster,
-/// this fails loudly instead of letting the tests below pass on the seed arm.
-async fn assert_nonseed_superuser(pool: &PgPool) {
-    let (sup, implied, explicit) = seed_facts(pool, NONSEED_SUPERUSER).await;
+/// (the trap) and that holds no grant.
+async fn assert_nonseed_superuser(conn: &mut sqlx::PgConnection) {
+    let (sup, implied, explicit) = seed_facts(conn, NONSEED_SUPERUSER).await;
     assert!(sup, "{NONSEED_SUPERUSER} must be a superuser");
     assert!(
         implied,
@@ -502,8 +554,7 @@ async fn assert_nonseed_superuser(pool: &PgPool) {
     );
     assert!(
         !explicit,
-        "{NONSEED_SUPERUSER} holds a grant of epigraph_seed on this cluster; revoke it. The \
-         superuser_* tests need a superuser that is NOT a seed"
+        "{NONSEED_SUPERUSER} is a seed although this transaction granted it nothing"
     );
 }
 
@@ -513,19 +564,20 @@ async fn assert_nonseed_superuser(pool: &PgPool) {
 /// application role is not.
 #[sqlx::test(migrations = "../../migrations")]
 async fn superuser_seed_membership_is_explicit_not_implied(pool: PgPool) {
-    superuser_roles(&pool).await;
-    assert_nonseed_superuser(&pool).await;
+    let mut tx = roles_tx(&pool).await;
+    assert_nonseed_superuser(&mut tx).await;
     assert_eq!(
-        seed_facts(&pool, SEED_SUPERUSER).await,
+        seed_facts(&mut tx, SEED_SUPERUSER).await,
         (true, true, true),
         "a superuser granted epigraph_seed through {SEED_VIA} must be a seed: the walk over \
          pg_auth_members follows indirect grants"
     );
     assert_eq!(
-        seed_facts(&pool, "epigraph_app").await,
+        seed_facts(&mut tx, "epigraph_app").await,
         (false, false, false),
         "the application role is not a seed"
     );
+    tx.rollback().await.expect("rollback");
 }
 
 /// THE DEFECT. An undeclared claim written on a superuser session that holds
@@ -538,36 +590,34 @@ async fn superuser_seed_membership_is_explicit_not_implied(pool: PgPool) {
 /// written through superuser-DSN services became owned by nobody.
 #[sqlx::test(migrations = "../../migrations")]
 async fn superuser_undeclared_claim_takes_its_authors_group_not_the_seed_group(pool: PgPool) {
-    superuser_roles(&pool).await;
-    assert_nonseed_superuser(&pool).await;
     let (agent, personal) = fixture::seed_agent_with_group(&pool, "r2-author").await;
     let seed = fixture::seed_group(&pool).await;
+    let mut tx = roles_tx(&pool).await;
+    assert_nonseed_superuser(&mut tx).await;
 
-    let (claim, evidence) = fixture::as_role(&pool, NONSEED_SUPERUSER, |mut conn| async move {
-        let claim: Uuid = sqlx::query_scalar(
-            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
-             VALUES (gen_random_uuid(), 'undeclared on a superuser DSN', $1, 0.7, $2, true) \
-             RETURNING id",
-        )
-        .bind(vec![31u8; 32])
-        .bind(agent)
-        .fetch_one(&mut *conn)
-        .await
-        .expect("an undeclared superuser claim must be accepted, with its author's declaration");
-        let evidence: Uuid = sqlx::query_scalar(
-            "INSERT INTO evidence (id, claim_id, evidence_type, content_hash, raw_content) \
-             VALUES (gen_random_uuid(), $1, 'document', $2, 'undeclared evidence') RETURNING id",
-        )
-        .bind(claim)
-        .bind(vec![32u8; 32])
-        .fetch_one(&mut *conn)
-        .await
-        .expect("undeclared evidence inherits from its claim");
-        (conn, (claim, evidence))
-    })
-    .await;
+    become_role(&mut tx, NONSEED_SUPERUSER).await;
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
+         VALUES (gen_random_uuid(), 'undeclared on a superuser DSN', $1, 0.7, $2, true) \
+         RETURNING id",
+    )
+    .bind(vec![31u8; 32])
+    .bind(agent)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("an undeclared superuser claim must be accepted, with its author's declaration");
+    let evidence: Uuid = sqlx::query_scalar(
+        "INSERT INTO evidence (id, claim_id, evidence_type, content_hash, raw_content) \
+         VALUES (gen_random_uuid(), $1, 'document', $2, 'undeclared evidence') RETURNING id",
+    )
+    .bind(claim)
+    .bind(vec![32u8; 32])
+    .fetch_one(&mut *tx)
+    .await
+    .expect("undeclared evidence inherits from its claim");
+    reset_role(&mut tx).await;
 
-    let got = tenancy_of(&pool, "claims", claim).await;
+    let got = tenancy_in(&mut tx, "claims", claim).await;
     assert_ne!(
         got.0, seed,
         "a superuser that holds no grant of epigraph_seed took the seed escape hatch: the claim \
@@ -579,10 +629,11 @@ async fn superuser_undeclared_claim_takes_its_authors_group_not_the_seed_group(p
         "the claim must take its author's personal group, as default_decl_for_author does"
     );
     assert_eq!(
-        tenancy_of(&pool, "evidence", evidence).await,
+        tenancy_in(&mut tx, "evidence", evidence).await,
         (personal, "public".to_string()),
         "the evidence inherits its claim's owner"
     );
+    tx.rollback().await.expect("rollback");
 }
 
 /// An OPERATED author (migration 107) writes into its operator's group on the
@@ -590,8 +641,6 @@ async fn superuser_undeclared_claim_takes_its_authors_group_not_the_seed_group(p
 /// the same `epigraph_operator_actor` read first.
 #[sqlx::test(migrations = "../../migrations")]
 async fn superuser_undeclared_claim_by_an_operated_author_takes_the_operator_group(pool: PgPool) {
-    superuser_roles(&pool).await;
-    assert_nonseed_superuser(&pool).await;
     let (operator, operator_group) = fixture::seed_agent_with_group(&pool, "r2-operator").await;
     let (actor, actor_group) = fixture::seed_agent_with_group(&pool, "r2-actor").await;
     sqlx::query("SELECT * FROM epigraph_link_operator($1, $2)")
@@ -600,27 +649,28 @@ async fn superuser_undeclared_claim_by_an_operated_author_takes_the_operator_gro
         .execute(&pool)
         .await
         .expect("link the actor to its operator");
+    let mut tx = roles_tx(&pool).await;
+    assert_nonseed_superuser(&mut tx).await;
 
-    let claim = fixture::as_role(&pool, NONSEED_SUPERUSER, |mut conn| async move {
-        let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
-             VALUES (gen_random_uuid(), 'operated, undeclared', $1, 0.7, $2, true) RETURNING id",
-        )
-        .bind(vec![33u8; 32])
-        .bind(actor)
-        .fetch_one(&mut *conn)
-        .await
-        .expect("an operated author's undeclared superuser claim");
-        (conn, id)
-    })
-    .await;
+    become_role(&mut tx, NONSEED_SUPERUSER).await;
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
+         VALUES (gen_random_uuid(), 'operated, undeclared', $1, 0.7, $2, true) RETURNING id",
+    )
+    .bind(vec![33u8; 32])
+    .bind(actor)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("an operated author's undeclared superuser claim");
+    reset_role(&mut tx).await;
 
-    let got = tenancy_of(&pool, "claims", claim).await;
+    let got = tenancy_in(&mut tx, "claims", claim).await;
     assert_ne!(
         got.0, actor_group,
         "an operated author authors into its operator's group"
     );
     assert_eq!(got, (operator_group, "public".to_string()));
+    tx.rollback().await.expect("rollback");
 }
 
 /// An author whose only personal-group row is REVOKED is refused on the
@@ -628,33 +678,34 @@ async fn superuser_undeclared_claim_by_an_operated_author_takes_the_operator_gro
 /// so it is refused here too rather than stamped onto any group.
 #[sqlx::test(migrations = "../../migrations")]
 async fn superuser_undeclared_claim_by_a_revoked_author_is_refused(pool: PgPool) {
-    superuser_roles(&pool).await;
-    assert_nonseed_superuser(&pool).await;
     let (agent, _group) = fixture::seed_agent_with_group(&pool, "r2-revoked").await;
     sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
         .bind(agent)
         .execute(&pool)
         .await
         .expect("revoke the author's own row");
+    let mut tx = roles_tx(&pool).await;
+    assert_nonseed_superuser(&mut tx).await;
 
-    let err = fixture::as_role(&pool, NONSEED_SUPERUSER, |mut conn| async move {
-        let e = sqlx::query(
+    become_role(&mut tx, NONSEED_SUPERUSER).await;
+    let err = refused(
+        &mut tx,
+        sqlx::query(
             "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
              VALUES (gen_random_uuid(), 'revoked author', $1, 0.7, $2, true)",
         )
         .bind(vec![34u8; 32])
-        .bind(agent)
-        .execute(&mut *conn)
-        .await
-        .expect_err("a revoked author's undeclared claim must be refused");
-        (conn, e)
-    })
+        .bind(agent),
+        "a revoked author's undeclared claim must be refused",
+    )
     .await;
+    reset_role(&mut tx).await;
     assert_eq!(
         err.as_database_error().and_then(|e| e.code()).as_deref(),
         Some("RVK01"),
         "expected 105's RVK01 from epigraph_ensure_personal_group; got {err}"
     );
+    tx.rollback().await.expect("rollback");
 }
 
 /// A root row has no author to derive from, so a superuser that is not a seed
@@ -662,26 +713,23 @@ async fn superuser_undeclared_claim_by_a_revoked_author_is_refused(pool: PgPool)
 /// migration 113 it landed on the seed group.
 #[sqlx::test(migrations = "../../migrations")]
 async fn superuser_undeclared_root_row_is_refused(pool: PgPool) {
-    superuser_roles(&pool).await;
-    assert_nonseed_superuser(&pool).await;
-    let err = fixture::as_role(&pool, NONSEED_SUPERUSER, |mut conn| async move {
-        let e =
-            sqlx::query("INSERT INTO frames (name, hypotheses) VALUES ('r2-root', ARRAY['a','b'])")
-                .execute(&mut *conn)
-                .await
-                .err();
-        (conn, e)
-    })
-    .await
-    .expect(
+    let mut tx = roles_tx(&pool).await;
+    assert_nonseed_superuser(&mut tx).await;
+    become_role(&mut tx, NONSEED_SUPERUSER).await;
+    let err = refused(
+        &mut tx,
+        sqlx::query("INSERT INTO frames (name, hypotheses) VALUES ('r2-root', ARRAY['a','b'])"),
         "frames accepted an undeclared INSERT on a superuser that holds no grant of \
          epigraph_seed: the root row took the seed escape hatch (backlog 0512ca33)",
-    );
+    )
+    .await;
+    reset_role(&mut tx).await;
     assert_eq!(
         err.as_database_error().and_then(|e| e.code()).as_deref(),
         Some("23502"),
         "expected 23502; got {err}"
     );
+    tx.rollback().await.expect("rollback");
 }
 
 /// Structurally, from the LIVE catalog: none of the three `*_require_tenancy`
@@ -724,42 +772,40 @@ async fn superuser_no_require_tenancy_body_asks_pg_has_role(pool: PgPool) {
 /// status is not.
 #[sqlx::test(migrations = "../../migrations")]
 async fn superuser_with_an_explicit_seed_grant_still_takes_the_hatch(pool: PgPool) {
-    superuser_roles(&pool).await;
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "r2-seeded").await;
+    let seed = fixture::seed_group(&pool).await;
+    let mut tx = roles_tx(&pool).await;
     assert_eq!(
-        seed_facts(&pool, SEED_SUPERUSER).await,
+        seed_facts(&mut tx, SEED_SUPERUSER).await,
         (true, true, true),
         "precondition: {SEED_SUPERUSER} reaches epigraph_seed through {SEED_VIA}"
     );
-    let (agent, _group) = fixture::seed_agent_with_group(&pool, "r2-seeded").await;
-    let seed = fixture::seed_group(&pool).await;
-    let (claim, frame) = fixture::as_role(&pool, SEED_SUPERUSER, |mut conn| async move {
-        let claim: Uuid = sqlx::query_scalar(
-            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
-             VALUES (gen_random_uuid(), 'seeded', $1, 0.7, $2, true) RETURNING id",
-        )
-        .bind(vec![35u8; 32])
-        .bind(agent)
-        .fetch_one(&mut *conn)
-        .await
-        .expect("an explicit seed takes the hatch");
-        let frame: Uuid = sqlx::query_scalar(
-            "INSERT INTO frames (name, hypotheses) VALUES ('r2-seeded', ARRAY['a','b']) \
-             RETURNING id",
-        )
-        .fetch_one(&mut *conn)
-        .await
-        .expect("an explicit seed takes the hatch on a root");
-        (conn, (claim, frame))
-    })
-    .await;
+    become_role(&mut tx, SEED_SUPERUSER).await;
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
+         VALUES (gen_random_uuid(), 'seeded', $1, 0.7, $2, true) RETURNING id",
+    )
+    .bind(vec![35u8; 32])
+    .bind(agent)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("an explicit seed takes the hatch");
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ('r2-seeded', ARRAY['a','b']) RETURNING id",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("an explicit seed takes the hatch on a root");
+    reset_role(&mut tx).await;
     assert_eq!(
-        tenancy_of(&pool, "claims", claim).await,
+        tenancy_in(&mut tx, "claims", claim).await,
         (seed, "public".to_string())
     );
     assert_eq!(
-        tenancy_of(&pool, "frames", frame).await,
+        tenancy_in(&mut tx, "frames", frame).await,
         (seed, "public".to_string())
     );
+    tx.rollback().await.expect("rollback");
 }
 
 /// The app role cannot DDL, so it cannot put the default back.
