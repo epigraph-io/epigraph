@@ -11,33 +11,44 @@
 //!
 //! # The one thing that makes every assertion here non-vacuous
 //!
-//! Migration 074's escape hatch is
-//! `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`. The test harness
-//! connects as a **superuser**, and a superuser satisfies `pg_has_role` for
-//! every role — so on the default connection every undeclared write takes arm
-//! 4 and succeeds. A file that only ever wrote on the default connection could
-//! not observe the `23502` this migration exists to raise, and would pass on a
-//! tree where 074 had never been applied.
+//! The escape hatch is taken when the session user holds an EXPLICIT grant of
+//! `epigraph_seed` (`epigraph_session_is_seed()`, migration 113; before 113 it
+//! was `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`, which every
+//! superuser satisfies). The test harness is granted the role (CI runs
+//! `GRANT epigraph_seed TO epigraph`), so on the default connection every
+//! undeclared write takes arm 4 and succeeds. A file that only ever wrote on
+//! the default connection could not observe the `23502` this migration exists
+//! to raise, and would pass on a tree where 074 had never been applied.
 //!
 //! So the refusal assertions run inside
 //! [`fixture::as_role`]`(pool, "epigraph_app", …)`, which issues
 //! **`SET SESSION AUTHORIZATION`** — not `SET ROLE`. `SET ROLE` changes only
 //! `current_user`; the trigger reads `session_user`, so under `SET ROLE` the
-//! session is still the superuser and arm 4 still fires. That was measured, not
-//! assumed, and it is the single easiest way to write a green vacuous version
-//! of this file.
+//! session is still the harness role and arm 4 still fires. That was measured,
+//! not assumed, and it is the single easiest way to write a green vacuous
+//! version of this file.
 //!
-//! # And the corollary for anyone running the suite as a non-superuser
+//! # And the corollary for anyone running the suite on their own cluster
 //!
-//! The ~180 test fixtures across this workspace that insert claims without
-//! naming the tenancy columns survive 074 **because the harness role is a
-//! superuser**, not because of any grant. The plan's *Files* line says
-//! "`epigraph_seed` granted to the test harness pools"; on this host and in CI
-//! (`POSTGRES_USER: epigraph` on a stock `pgvector/pgvector:pg16`) that grant
-//! is implied and no `pg_auth_members` row exists. A harness that connects as a
-//! non-superuser needs `GRANT epigraph_seed TO <role>` or those fixtures start
-//! raising `23502`. [`the_harness_role_can_take_the_seed_escape_hatch`] asserts
-//! the precondition so the failure names itself.
+//! The fixtures across this workspace that insert claims or root rows without
+//! naming the tenancy columns survive 074 **because the harness role is granted
+//! `epigraph_seed`**. Until migration 113 a superuser harness needed no grant,
+//! because `pg_has_role` implied it; that implication is exactly the defect
+//! 113 closes (backlog 0512ca33: superuser-DSN services stamping production
+//! rows onto the memberless seed group). A harness without the grant sees those
+//! fixtures raise `23502`, or land on the author's personal group instead of
+//! the seed group. Run `GRANT epigraph_seed TO <harness role>` once per
+//! cluster. [`the_harness_role_can_take_the_seed_escape_hatch`] asserts the
+//! precondition so the failure names itself.
+//!
+//! # Migration 113: a superuser is not a seed by implication
+//!
+//! The `superuser_*` tests below run on NOLOGIN SUPERUSER roles this file
+//! creates, one with no grant of `epigraph_seed` and one that reaches it
+//! through an intermediate role, and each asserts its own precondition first,
+//! so a stray grant on a shared cluster fails the test instead of passing it
+//! vacuously. They do not use the harness role: whether IT is granted is
+//! cluster state this file does not own.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -309,26 +320,30 @@ async fn a5_every_tenancy_trigger_is_enabled(pool: PgPool) {
 
 /// The precondition every refusal assertion in this file rests on.
 ///
-/// If this fails, the ~180 undeclared fixture inserts across the workspace are
+/// If this fails, the undeclared fixture inserts across the workspace are
 /// about to fail too, and they will fail with the same `23502` — but scattered
 /// across a hundred unrelated test names. Asserting it once, here, is what
 /// makes that diagnosable.
+///
+/// Asked through `epigraph_session_is_seed()`, the function the three
+/// `*_require_tenancy` bodies consult since migration 113, not through
+/// `pg_has_role`, which a superuser satisfies without any grant and which is
+/// therefore no longer the question the triggers ask.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_harness_role_can_take_the_seed_escape_hatch(pool: PgPool) {
-    let ok: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_seed') \
-            AND pg_has_role(session_user, 'epigraph_seed', 'MEMBER')",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("seed membership probe");
+    let ok: bool = sqlx::query_scalar("SELECT public.epigraph_session_is_seed()")
+        .fetch_one(&pool)
+        .await
+        .expect("seed membership probe");
 
     assert!(
         ok,
-        "the test harness role must satisfy migration 074 arm 4, or every fixture in \
-         this workspace that inserts a claim without naming (visibility, \
-         owner_group_id) starts raising 23502. On a superuser connection this holds \
-         implicitly; on a non-superuser harness run `GRANT epigraph_seed TO <role>`."
+        "the test harness role must hold an EXPLICIT grant of epigraph_seed, or every \
+         fixture in this workspace that inserts a claim or a root row without naming \
+         (visibility, owner_group_id) stops taking migration 074's arm 4. Since \
+         migration 113 a superuser is NOT a seed by implication. Run \
+         `GRANT epigraph_seed TO <harness role>` once on this cluster (CI does it after \
+         the migration step)."
     );
 }
 
@@ -406,6 +421,344 @@ async fn the_same_insert_as_the_seed_role_succeeds_on_the_seed_group(pool: PgPoo
         owner, WORLD,
         "arm 4 must stamp the seed group, not world — that is what makes §8.2 A4 \
          achievable at all"
+    );
+}
+
+// =============================================================================
+// Migration 113 — the seed hatch needs an EXPLICIT grant (backlog 0512ca33)
+// =============================================================================
+
+/// A superuser with NO grant of `epigraph_seed`, direct or indirect.
+const NONSEED_SUPERUSER: &str = "r2_nonseed_superuser";
+/// A superuser that reaches `epigraph_seed` only through [`SEED_VIA`].
+const SEED_SUPERUSER: &str = "r2_seed_superuser";
+/// The intermediate role between [`SEED_SUPERUSER`] and `epigraph_seed`.
+const SEED_VIA: &str = "r2_seed_via";
+
+/// Run one DDL statement, tolerating the races a parallel test binary produces
+/// on cluster-global role catalogs (two tests creating the same role, or
+/// granting the same membership, at once). Each caller asserts the resulting
+/// state afterwards, so a swallowed error that left the state wrong still
+/// fails the test that needs it.
+async fn role_ddl(pool: &PgPool, stmt: &str) {
+    let block = format!(
+        "DO $$ BEGIN {stmt}; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+    );
+    if let Err(e) = pool.execute(block.as_str()).await {
+        // `tuple concurrently updated` on a simultaneous GRANT is the one other
+        // race; the caller's precondition check decides whether it mattered.
+        eprintln!("role DDL `{stmt}` raised (tolerated, state is asserted next): {e}");
+    }
+}
+
+/// Create the two superuser roles (NOLOGIN: nothing can connect as them; the
+/// tests reach them by `SET SESSION AUTHORIZATION` from the harness).
+async fn superuser_roles(pool: &PgPool) {
+    role_ddl(
+        pool,
+        &format!("CREATE ROLE {NONSEED_SUPERUSER} NOLOGIN SUPERUSER"),
+    )
+    .await;
+    role_ddl(
+        pool,
+        &format!("CREATE ROLE {SEED_SUPERUSER} NOLOGIN SUPERUSER"),
+    )
+    .await;
+    role_ddl(pool, &format!("CREATE ROLE {SEED_VIA} NOLOGIN")).await;
+    role_ddl(pool, &format!("GRANT epigraph_seed TO {SEED_VIA}")).await;
+    role_ddl(pool, &format!("GRANT {SEED_VIA} TO {SEED_SUPERUSER}")).await;
+}
+
+/// `(rolsuper, pg_has_role(session_user, 'epigraph_seed', 'MEMBER'),
+/// epigraph_session_is_seed())` as `role` sees itself.
+async fn seed_facts(pool: &PgPool, role: &str) -> (bool, bool, bool) {
+    fixture::as_role(pool, role, |mut conn| async move {
+        let r: (bool, bool, bool) = sqlx::query_as(
+            "SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = session_user), \
+                    pg_has_role(session_user, 'epigraph_seed', 'MEMBER'), \
+                    public.epigraph_session_is_seed()",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("seed facts");
+        (conn, r)
+    })
+    .await
+}
+
+/// The precondition of every `superuser_*` test, asserted rather than assumed:
+/// [`NONSEED_SUPERUSER`] is a superuser that `pg_has_role` calls a seed member
+/// (the trap) and that holds no grant. If someone granted it on this cluster,
+/// this fails loudly instead of letting the tests below pass on the seed arm.
+async fn assert_nonseed_superuser(pool: &PgPool) {
+    let (sup, implied, explicit) = seed_facts(pool, NONSEED_SUPERUSER).await;
+    assert!(sup, "{NONSEED_SUPERUSER} must be a superuser");
+    assert!(
+        implied,
+        "pg_has_role must report a superuser as a member of epigraph_seed; that implication \
+         is the defect migration 113 routes around, and the test is only meaningful while \
+         it holds"
+    );
+    assert!(
+        !explicit,
+        "{NONSEED_SUPERUSER} holds a grant of epigraph_seed on this cluster; revoke it. The \
+         superuser_* tests need a superuser that is NOT a seed"
+    );
+}
+
+/// What `epigraph_session_is_seed()` answers, per kind of session: a
+/// superuser without a grant is NOT a seed although `pg_has_role` says it is;
+/// a superuser that reaches the role through an intermediate grant IS; the
+/// application role is not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superuser_seed_membership_is_explicit_not_implied(pool: PgPool) {
+    superuser_roles(&pool).await;
+    assert_nonseed_superuser(&pool).await;
+    assert_eq!(
+        seed_facts(&pool, SEED_SUPERUSER).await,
+        (true, true, true),
+        "a superuser granted epigraph_seed through {SEED_VIA} must be a seed: the walk over \
+         pg_auth_members follows indirect grants"
+    );
+    assert_eq!(
+        seed_facts(&pool, "epigraph_app").await,
+        (false, false, false),
+        "the application role is not a seed"
+    );
+}
+
+/// THE DEFECT. An undeclared claim written on a superuser session that holds
+/// no grant of `epigraph_seed` must get its author's own declaration —
+/// `('public', <author's personal group>)`, what
+/// `ClaimRepository::default_decl_for_author` gives the same write on the
+/// application path — and never the memberless seed group. Its evidence
+/// inherits the same owner. Before migration 113 both landed on
+/// `('public', 00000000-…-dead)`: this is how 56 claims and 46 evidence rows
+/// written through superuser-DSN services became owned by nobody.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superuser_undeclared_claim_takes_its_authors_group_not_the_seed_group(pool: PgPool) {
+    superuser_roles(&pool).await;
+    assert_nonseed_superuser(&pool).await;
+    let (agent, personal) = fixture::seed_agent_with_group(&pool, "r2-author").await;
+    let seed = fixture::seed_group(&pool).await;
+
+    let (claim, evidence) = fixture::as_role(&pool, NONSEED_SUPERUSER, |mut conn| async move {
+        let claim: Uuid = sqlx::query_scalar(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
+             VALUES (gen_random_uuid(), 'undeclared on a superuser DSN', $1, 0.7, $2, true) \
+             RETURNING id",
+        )
+        .bind(vec![31u8; 32])
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("an undeclared superuser claim must be accepted, with its author's declaration");
+        let evidence: Uuid = sqlx::query_scalar(
+            "INSERT INTO evidence (id, claim_id, evidence_type, content_hash, raw_content) \
+             VALUES (gen_random_uuid(), $1, 'document', $2, 'undeclared evidence') RETURNING id",
+        )
+        .bind(claim)
+        .bind(vec![32u8; 32])
+        .fetch_one(&mut *conn)
+        .await
+        .expect("undeclared evidence inherits from its claim");
+        (conn, (claim, evidence))
+    })
+    .await;
+
+    let got = tenancy_of(&pool, "claims", claim).await;
+    assert_ne!(
+        got.0, seed,
+        "a superuser that holds no grant of epigraph_seed took the seed escape hatch: the claim \
+         is owned by the memberless seed group (backlog 0512ca33)"
+    );
+    assert_eq!(
+        got,
+        (personal, "public".to_string()),
+        "the claim must take its author's personal group, as default_decl_for_author does"
+    );
+    assert_eq!(
+        tenancy_of(&pool, "evidence", evidence).await,
+        (personal, "public".to_string()),
+        "the evidence inherits its claim's owner"
+    );
+}
+
+/// An OPERATED author (migration 107) writes into its operator's group on the
+/// application path, and so it does on a superuser session: the trigger asks
+/// the same `epigraph_operator_actor` read first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superuser_undeclared_claim_by_an_operated_author_takes_the_operator_group(pool: PgPool) {
+    superuser_roles(&pool).await;
+    assert_nonseed_superuser(&pool).await;
+    let (operator, operator_group) = fixture::seed_agent_with_group(&pool, "r2-operator").await;
+    let (actor, actor_group) = fixture::seed_agent_with_group(&pool, "r2-actor").await;
+    sqlx::query("SELECT * FROM epigraph_link_operator($1, $2)")
+        .bind(actor)
+        .bind(operator)
+        .execute(&pool)
+        .await
+        .expect("link the actor to its operator");
+
+    let claim = fixture::as_role(&pool, NONSEED_SUPERUSER, |mut conn| async move {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
+             VALUES (gen_random_uuid(), 'operated, undeclared', $1, 0.7, $2, true) RETURNING id",
+        )
+        .bind(vec![33u8; 32])
+        .bind(actor)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("an operated author's undeclared superuser claim");
+        (conn, id)
+    })
+    .await;
+
+    let got = tenancy_of(&pool, "claims", claim).await;
+    assert_ne!(
+        got.0, actor_group,
+        "an operated author authors into its operator's group"
+    );
+    assert_eq!(got, (operator_group, "public".to_string()));
+}
+
+/// An author whose only personal-group row is REVOKED is refused on the
+/// application path (105's `RVK01`); the superuser arm asks the same definer,
+/// so it is refused here too rather than stamped onto any group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superuser_undeclared_claim_by_a_revoked_author_is_refused(pool: PgPool) {
+    superuser_roles(&pool).await;
+    assert_nonseed_superuser(&pool).await;
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "r2-revoked").await;
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .expect("revoke the author's own row");
+
+    let err = fixture::as_role(&pool, NONSEED_SUPERUSER, |mut conn| async move {
+        let e = sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
+             VALUES (gen_random_uuid(), 'revoked author', $1, 0.7, $2, true)",
+        )
+        .bind(vec![34u8; 32])
+        .bind(agent)
+        .execute(&mut *conn)
+        .await
+        .expect_err("a revoked author's undeclared claim must be refused");
+        (conn, e)
+    })
+    .await;
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("RVK01"),
+        "expected 105's RVK01 from epigraph_ensure_personal_group; got {err}"
+    );
+}
+
+/// A root row has no author to derive from, so a superuser that is not a seed
+/// gets the D1 answer every other non-seed writer gets: `23502`. Before
+/// migration 113 it landed on the seed group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superuser_undeclared_root_row_is_refused(pool: PgPool) {
+    superuser_roles(&pool).await;
+    assert_nonseed_superuser(&pool).await;
+    let err = fixture::as_role(&pool, NONSEED_SUPERUSER, |mut conn| async move {
+        let e =
+            sqlx::query("INSERT INTO frames (name, hypotheses) VALUES ('r2-root', ARRAY['a','b'])")
+                .execute(&mut *conn)
+                .await
+                .err();
+        (conn, e)
+    })
+    .await
+    .expect(
+        "frames accepted an undeclared INSERT on a superuser that holds no grant of \
+         epigraph_seed: the root row took the seed escape hatch (backlog 0512ca33)",
+    );
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23502"),
+        "expected 23502; got {err}"
+    );
+}
+
+/// Structurally, from the LIVE catalog: none of the three `*_require_tenancy`
+/// bodies, nor `epigraph_session_is_seed()`, calls `pg_has_role` — the one
+/// predicate a superuser satisfies without a grant — and each of the three asks
+/// `epigraph_session_is_seed()` instead. The behavioural tests above cover
+/// `claims` and one root; this covers the derived body, whose seed arm no
+/// valid row can reach, and any later redefinition of the others.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superuser_no_require_tenancy_body_asks_pg_has_role(pool: PgPool) {
+    let bodies: Vec<(String, String)> = sqlx::query_as(
+        "SELECT p.proname::text, p.prosrc FROM pg_proc p \
+           JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' \
+            AND p.proname IN ('epigraph_claims_require_tenancy', \
+                              'epigraph_derived_require_tenancy', \
+                              'epigraph_root_require_tenancy', 'epigraph_session_is_seed') \
+          ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read bodies");
+    assert_eq!(bodies.len(), 4, "all four functions must exist: {bodies:?}");
+    for (name, src) in &bodies {
+        assert!(
+            !src.contains("pg_has_role("),
+            "{name} calls pg_has_role, which every superuser satisfies (migration 113)"
+        );
+        if name != "epigraph_session_is_seed" {
+            assert!(
+                src.contains("public.epigraph_session_is_seed()"),
+                "{name} must key its seed arm on public.epigraph_session_is_seed()"
+            );
+        }
+    }
+}
+
+/// The hatch itself still works for a session that WAS granted the role, here
+/// through an intermediate role, so the grant is what decides and superuser
+/// status is not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superuser_with_an_explicit_seed_grant_still_takes_the_hatch(pool: PgPool) {
+    superuser_roles(&pool).await;
+    assert_eq!(
+        seed_facts(&pool, SEED_SUPERUSER).await,
+        (true, true, true),
+        "precondition: {SEED_SUPERUSER} reaches epigraph_seed through {SEED_VIA}"
+    );
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "r2-seeded").await;
+    let seed = fixture::seed_group(&pool).await;
+    let (claim, frame) = fixture::as_role(&pool, SEED_SUPERUSER, |mut conn| async move {
+        let claim: Uuid = sqlx::query_scalar(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
+             VALUES (gen_random_uuid(), 'seeded', $1, 0.7, $2, true) RETURNING id",
+        )
+        .bind(vec![35u8; 32])
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("an explicit seed takes the hatch");
+        let frame: Uuid = sqlx::query_scalar(
+            "INSERT INTO frames (name, hypotheses) VALUES ('r2-seeded', ARRAY['a','b']) \
+             RETURNING id",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("an explicit seed takes the hatch on a root");
+        (conn, (claim, frame))
+    })
+    .await;
+    assert_eq!(
+        tenancy_of(&pool, "claims", claim).await,
+        (seed, "public".to_string())
+    );
+    assert_eq!(
+        tenancy_of(&pool, "frames", frame).await,
+        (seed, "public".to_string())
     );
 }
 
