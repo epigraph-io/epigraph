@@ -2215,13 +2215,18 @@ pub trait HttpClient: Send + Sync {
 /// follows no redirect and uses no proxy. It is the same construction the
 /// API's webhook dispatcher delivers with, so the two paths cannot drift.
 ///
-/// A 3xx is returned to the caller as a response, never followed.
+/// A 3xx is returned to the caller as a response, never followed. The
+/// response body is read up to [`Self::MAX_RESPONSE_BODY`] bytes and no
+/// further.
 #[derive(Debug, Clone, Copy)]
 pub struct PinnedHttpClient {
     timeout: Duration,
 }
 
 impl PinnedHttpClient {
+    /// The most response-body bytes kept; the rest is not read.
+    pub const MAX_RESPONSE_BODY: usize = 64 * 1024;
+
     /// A client whose requests time out after `timeout`.
     #[must_use]
     pub const fn new(timeout: Duration) -> Self {
@@ -2268,7 +2273,19 @@ impl HttpClient for PinnedHttpClient {
             }
         })?;
         let status_code = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
+        // Bounded read: the receiver controls the body, and the handler copies
+        // it into job output and error strings. Stop at the cap rather than
+        // buffering whatever a hostile endpoint streams until the timeout.
+        let mut response = response;
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            let room = PinnedHttpClient::MAX_RESPONSE_BODY - bytes.len();
+            bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            if bytes.len() >= PinnedHttpClient::MAX_RESPONSE_BODY {
+                break;
+            }
+        }
+        let body = String::from_utf8_lossy(&bytes).into_owned();
         Ok(HttpResponse { status_code, body })
     }
 }

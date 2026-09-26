@@ -2256,6 +2256,42 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// The jobs crate's sanctioned client keeps at most
+    /// `MAX_RESPONSE_BODY` bytes of what the receiver sends: the receiver is
+    /// untrusted and the handler copies the body into job output.
+    #[tokio::test]
+    async fn test_jobs_pinned_http_client_caps_the_response_body() {
+        use epigraph_jobs::HttpClient as _;
+        let cap = epigraph_jobs::PinnedHttpClient::MAX_RESPONSE_BODY;
+        let big = cap * 4;
+        let mut raw =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {big}\r\nConnection: close\r\n\r\n")
+                .into_bytes();
+        raw.extend(std::iter::repeat_n(b'x', big));
+        let response_bytes: &'static [u8] = Box::leak(raw.into_boxed_slice());
+        let (addr, _hits, task) = counting_listener("127.0.0.1:0", response_bytes).await;
+        let host = "jobs-bigbody.example";
+        let egress =
+            stub_egress(StubResolver::new().with(host, [addr.ip()])).exempt_socket_for_tests(addr);
+        let target = egress
+            .vet(&format!("http://{host}:{}/hook", addr.port()))
+            .await
+            .expect("exempt listener vets");
+
+        let response = epigraph_jobs::PinnedHttpClient::new(std::time::Duration::from_secs(5))
+            .post(&target, std::collections::HashMap::new(), "{}")
+            .await
+            .expect("the receiver answers");
+        task.abort();
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(
+            response.body.len(),
+            cap,
+            "the body must be truncated at the cap, not buffered whole"
+        );
+    }
+
     /// The jobs crate's sanctioned client does not follow a redirect: the 3xx
     /// comes back as the response and the hop target is never dialled.
     #[tokio::test]
