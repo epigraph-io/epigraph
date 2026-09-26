@@ -460,8 +460,10 @@ Current reservation:
   members (measured on a deployed database 2026-09-22: 56 `claims`, 46
   `evidence`). 113 adds the invoker function
   `epigraph_session_is_seed()` (a walk over `pg_auth_members` from
-  `session_user`; no `pg_has_role`, no `rolsuper`; EXECUTE left to PUBLIC like
-  `epigraph_bypass()`), keys the seed arm of all three `*_require_tenancy`
+  `session_user` along edges that confer the role, `inherit_option OR
+  set_option`, so an ADMIN-only grant is not a seed; no `pg_has_role`, no
+  `rolsuper`; EXECUTE left to PUBLIC like `epigraph_bypass()`; requires
+  PostgreSQL 16), keys the seed arm of all three `*_require_tenancy`
   bodies on it, and gives `epigraph_claims_require_tenancy` one new arm: a
   SUPERUSER session that is not an explicit seed gets its author's own
   declaration — `('public', <acting operator's personal group>)` through

@@ -454,14 +454,25 @@ const NONSEED_SUPERUSER: &str = "r2_nonseed_superuser";
 const SEED_SUPERUSER: &str = "r2_seed_superuser";
 /// The intermediate role between [`SEED_SUPERUSER`] and `epigraph_seed`.
 const SEED_VIA: &str = "r2_seed_via";
+/// A non-superuser holding an ADMIN-only grant of `epigraph_seed` (admin true,
+/// inherit false, set false): it administers the role's membership, it is not
+/// a member that acts as it.
+const ADMIN_ONLY: &str = "r2_admin_only";
+/// A non-superuser holding an ADMIN-only grant of [`SEED_VIA`], which is itself
+/// a real seed: the ADMIN-only edge is one hop removed from `epigraph_seed`.
+const ADMIN_VIA: &str = "r2_admin_via";
 
 /// The role DDL, in the one order every test issues it. See the section note.
 const ROLE_DDL: &[&str] = &[
     "CREATE ROLE r2_nonseed_superuser NOLOGIN SUPERUSER",
     "CREATE ROLE r2_seed_superuser NOLOGIN SUPERUSER",
     "CREATE ROLE r2_seed_via NOLOGIN",
+    "CREATE ROLE r2_admin_only NOLOGIN",
+    "CREATE ROLE r2_admin_via NOLOGIN",
     "GRANT epigraph_seed TO r2_seed_via",
     "GRANT r2_seed_via TO r2_seed_superuser",
+    "GRANT epigraph_seed TO r2_admin_only WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
+    "GRANT r2_seed_via TO r2_admin_via WITH ADMIN TRUE, INHERIT FALSE, SET FALSE",
 ];
 
 /// One connection, one open transaction, and the r2 roles created inside it.
@@ -577,6 +588,33 @@ async fn superuser_seed_membership_is_explicit_not_implied(pool: PgPool) {
         (false, false, false),
         "the application role is not a seed"
     );
+    tx.rollback().await.expect("rollback");
+}
+
+/// An ADMIN-only grant (admin true, inherit false, set false) administers the
+/// role's membership; it does not confer the role. `pg_has_role(..., 'MEMBER')`
+/// counts it anyway, which is the same shape of trap as superuser implication:
+/// a session nobody granted the role to would take the hatch. PostgreSQL 16
+/// also writes such grants without anyone choosing to, so this is not only a
+/// hand-made case. Neither the direct edge nor an ADMIN-only edge one hop from
+/// `epigraph_seed` may make a seed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_only_grant_of_the_seed_role_is_not_a_seed(pool: PgPool) {
+    let mut tx = roles_tx(&pool).await;
+    for role in [ADMIN_ONLY, ADMIN_VIA] {
+        let (sup, implied, explicit) = seed_facts(&mut tx, role).await;
+        assert!(!sup, "{role} is not a superuser");
+        assert!(
+            implied,
+            "precondition: pg_has_role(MEMBER) counts {role}'s ADMIN-only edge; without that \
+             the test would not be exercising the trap"
+        );
+        assert!(
+            !explicit,
+            "{role} holds only an ADMIN-only grant on the path to epigraph_seed and was \
+             reported a seed: an edge that confers neither INHERIT nor SET was followed"
+        );
+    }
     tx.rollback().await.expect("rollback");
 }
 

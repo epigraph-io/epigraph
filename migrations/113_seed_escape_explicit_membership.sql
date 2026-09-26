@@ -39,10 +39,28 @@
 --
 -- (a) `public.epigraph_session_is_seed()` — TRUE only when `session_user` IS
 --     `epigraph_seed` or reaches it through a chain of `pg_auth_members`
---     grants. It never calls `pg_has_role` and never reads `rolsuper`, so a
+--     grants each of which CONFERS the role (`inherit_option OR set_option`).
+--     It never calls `pg_has_role` and never reads `rolsuper`, so a
 --     superuser is a seed only if it was granted the role like anyone else.
 --     The role-existence guard is kept (074 ops F4): with no `epigraph_seed`
 --     role the answer is false, not an error.
+--
+--     An ADMIN-only edge (`admin_option` true, `inherit_option` and
+--     `set_option` both false) is NOT followed. Such a grant lets its holder
+--     administer the role's membership, not act as the role, and PostgreSQL 16
+--     writes one on its own in a case nobody chose: a non-superuser CREATEROLE
+--     role that creates a role is given an ADMIN-only grant back to it.
+--     `pg_has_role(..., 'MEMBER')` counts that edge (measured on 16.13: MEMBER
+--     true, USAGE false, SET false), so following it would make "whoever ran
+--     the migrations on a cluster without a superuser" a seed, which is the
+--     implication this file exists to remove, in another form. The ADMIN
+--     holder can still GRANT the role to itself; that is an explicit act, and
+--     it then passes this test like any other grant.
+--
+--     `inherit_option` and `set_option` are PostgreSQL 16 columns of
+--     `pg_auth_members`; this file requires PostgreSQL 16 or later, which is
+--     what the project already documents and what CI and every measured
+--     deployment run.
 --
 -- (b) The three bodies take the seed arm on that function instead of on
 --     `pg_has_role`. Nothing else in the seed arm changes.
@@ -164,10 +182,14 @@ LANGUAGE sql STABLE PARALLEL SAFE SET search_path = pg_catalog, pg_temp AS $$
     -- Every role that reaches `epigraph_seed` through GRANTs: its direct
     -- members, then their members, and so on. UNION de-duplicates, so the walk
     -- terminates (PostgreSQL also refuses circular grants).
+    -- Only edges that confer the role are followed (section 1a): an
+    -- ADMIN-only grant administers membership and is not one.
     members(oid) AS (
         SELECT m.member FROM pg_catalog.pg_auth_members m JOIN seed s ON m.roleid = s.oid
+         WHERE m.inherit_option OR m.set_option
         UNION
         SELECT m.member FROM pg_catalog.pg_auth_members m JOIN members x ON m.roleid = x.oid
+         WHERE m.inherit_option OR m.set_option
     )
     SELECT EXISTS (
         SELECT 1
