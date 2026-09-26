@@ -1814,9 +1814,21 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "mass_function.rs",
+        "delete_edge_bbas",
+        "WRITE: DELETE of the `mass_functions` rows keyed on the given edges, the cascade half of \
+         a dedup, a retraction or a match-candidate retirement. Nothing to filter by viewer: a \
+         privileged session runs the plain DELETE, and any other session goes through migration \
+         115's `epigraph_cascade_delete_edge_bbas`, which reads the SESSION's own groups and \
+         writable set, admits only the rows it may delete, refuses the whole call (CD02) \
+         otherwise, and audits each call that deleted anything.",
+    ),
+    (
+        "mass_function.rs",
         "delete_for_perspective",
         "WRITE: DELETE from `mass_functions` for one perspective, the retraction half of a \
-         re-combination. Authorised by the table's policy on the caller's stamped connection.",
+         re-combination. Delegates to `delete_edge_bbas` (cause `retraction_cascade`), so it is \
+         authorised by migration 115's cascade definer on the caller's connection, not by a \
+         viewer.",
     ),
     (
         "mass_function.rs",
