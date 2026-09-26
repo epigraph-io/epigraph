@@ -208,6 +208,8 @@ def is_our_agent(pid: Optional[int], session_id: Optional[str], started: Optiona
 # Blocker texts the board itself generates for run lifecycle failures; superseded by a new run.
 LIFECYCLE_BLOCKER_PREFIXES = ("Agent exited with code ", "Could not start agent:", "Agent process was lost",
                               "Agent reported failure:")
+# Blockers the board raises when it cannot publish a run's branch or PR; a new run supersedes them.
+PUBLISH_BLOCKER_PREFIX = "Publishing failed: "
 
 
 def extract_json_array(text: str) -> Optional[list]:
@@ -298,11 +300,14 @@ AGENT_ENV_NEVER = frozenset(("EPIGRAPH_TOKEN", "EPIGRAPH_JWT_SECRET", "GH_TOKEN"
 # also governs Grep the same way). Out-of-tree reads (gh credentials, ~/.claude.json, /proc/<pid>/environ) therefore
 # go through the permission mode instead of being pre-approved.
 # The deny list covers the merge/admin surface. Prefix patterns matched by Claude Code -- a guard rail, not a sandbox.
+# `git push` is denied OUTRIGHT: a prefix rule can only match how a command starts, so `git push --force:*` style
+# rules missed `git push origin HEAD:main`, a trailing `--force`, `+src:dst` and `:dst`. The board pushes the card
+# branch itself when the agent exits (App.push_card_branch) and opens the PR, so agents never need to push.
 DEV_ALLOWED_TOOLS = ("Read(./**)", "TodoWrite")
 DEV_DISALLOWED_TOOLS = (
     "Bash(gh pr merge:*)", "Bash(gh pr close:*)", "Bash(gh pr reopen:*)", "Bash(gh pr review:*)",
     "Bash(gh api:*)", "Bash(gh repo:*)", "Bash(gh release:*)", "Bash(gh secret:*)", "Bash(gh auth:*)",
-    "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --delete:*)", "Bash(git push --mirror:*)",
+    "Bash(git push:*)",
     "Bash(curl:*)", "Bash(wget:*)",
     "mcp__epigraph__resolve_backlog_item", "mcp__epigraph__update_labels", "mcp__epigraph__patch_claim",
 )
@@ -1056,6 +1061,48 @@ class App:
         except CmdError as e:
             log("could not delete %s on %s: %s" % (branch, self.cfg.remote, e))
 
+    def push_card_branch(self, card: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        """Push a card's own `kanban/*` branch for its agent, which is denied `git push` (DEV_DISALLOWED_TOOLS).
+
+        Only the branch the board recorded for the card is pushed, never the worktree's HEAD, with an explicit
+        NON-force `refs/heads/B:refs/heads/B` refspec through self.git (hooks off, scrubbed env, pinned remote).
+        A rewritten history is therefore rejected by the remote instead of forced. Returns (has_work, problem):
+        has_work is True when the branch holds commits beyond the integration branch."""
+        branch = str(card.get("branch") or "")
+        integration = str(card.get("integration_branch") or "")
+        if (not BRANCH_NAME_RE.match(branch) or not branch.startswith("kanban/") or ".." in branch
+                or branch.endswith((".lock", "/")) or branch in (self.cfg.base_branch, integration)):
+            return False, "the board refused to push %r: it is not this card's kanban/* branch" % branch
+        ref = "refs/heads/" + branch
+        try:
+            with self.git_lock:
+                if self.git(["rev-parse", "--verify", "--quiet", ref], check=False).returncode != 0:
+                    return False, None  # nothing was ever committed on it
+                ahead = self.git(["rev-list", "--count",
+                                  "refs/remotes/%s/%s..%s" % (self.cfg.remote, integration, ref)], check=False)
+                if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+                    return False, None
+                out = self.git(["push", self.cfg.remote, "%s:%s" % (ref, ref)], timeout=300, check=False)
+        except CmdError as e:  # e.g. the remote URL changed since startup, or git itself could not run
+            return True, "the board could not push %s: %s" % (branch, e)
+        if out.returncode != 0:
+            return True, ("the board could not push %s to %s (a rewritten history is never force-pushed): %s"
+                          % (branch, self.cfg.remote, (out.stderr or "").strip()[-400:]))
+        return True, None
+
+    def open_card_pr(self, card: Dict[str, Any], summary: str) -> Tuple[Optional[str], Optional[int]]:
+        """Open the card's PR into its integration branch (agents no longer do). Title from board-known fields."""
+        branch, integration = str(card.get("branch") or ""), str(card.get("integration_branch") or "")
+        title = (card.get("title") or "backlog item %s" % short8(card["id"]))[:200]
+        body = "\n".join(["Opened by the EpiGraph kanban board for its development agent. Review before Accept.", "",
+                          "Backlog claim: `%s`" % card["id"], "", "## Agent summary", "",
+                          (summary or "(none)")[:8000]])
+        out = self.gh(["pr", "create", "--base", integration, "--head", branch, "--title", title, "--body", body],
+                      timeout=120).stdout
+        url = next((valid_pr_url(line) for line in out.splitlines() if valid_pr_url(line)), None)
+        number = valid_pr_number(pr_number_from_url(url))
+        return (url, number) if url and number else (None, None)
+
     def remote_branch_exists(self, name: str) -> bool:
         out = self.git(["ls-remote", "--heads", self.cfg.remote, "refs/heads/" + name], timeout=60).stdout
         return bool(out.strip())
@@ -1430,7 +1477,9 @@ class App:
             "Do this:",
             "1. Address every point of the review, staying strictly within the scope of this backlog item.",
             "2. Follow CLAUDE.md (Epistemic Commit Protocol; never run integration tests against the live `epigraph` DB).",
-            "3. Run the relevant tests / `cargo check`, commit, and `git push` to the same branch so the PR updates.",
+            "3. Run the relevant tests / `cargo check` and commit on the same branch. Do NOT run `git push` in any form "
+            "and never rewrite commits already on the branch: when you exit, the board pushes the branch (never forced) "
+            "so the PR updates.",
             "4. Do NOT merge anything, do NOT touch `%s`, do NOT call resolve_backlog_item." % self.cfg.base_branch,
             "5. Append blockers to `.kanban/blockers.jsonl` as soon as you find them, one JSON object per line: "
             "{\"text\": \"...\", \"severity\": \"blocker\"|\"warning\"}.",
@@ -1480,7 +1529,9 @@ class App:
                 pending = card.get("pending") or {"kind": "develop", "text": ""}
                 add_history(card, "started", "%s run #%d" % (pending.get("kind"), card["run_n"]))
                 for b in unresolved_blockers(card):
-                    if b.get("source") == "agent" and str(b.get("text") or "").startswith(LIFECYCLE_BLOCKER_PREFIXES):
+                    text = str(b.get("text") or "")
+                    if ((b.get("source") == "agent" and text.startswith(LIFECYCLE_BLOCKER_PREFIXES))
+                            or (b.get("source") == "board" and text.startswith(PUBLISH_BLOCKER_PREFIX))):
                         b["resolved"] = True
                         b["note"] = "superseded by run #%d" % card["run_n"]
                         b["resolved_at"] = now_iso()
@@ -1660,11 +1711,28 @@ class App:
         if pr_url and not pr_number:
             pr_url = None
         stopped = card.get("status") == "stopped" or card.get("column") != "develop"
+        rstatus = str((report or {}).get("status") or "").lower()
+        # Agents are denied `git push`: the board publishes the card branch and, for a finished run, opens the PR.
+        publish_problems: List[str] = []
+        has_work = False
+        if card.get("branch") and not stopped:
+            has_work, problem = self.push_card_branch(card)
+            if problem:
+                publish_problems.append(problem)
         if not pr_url and card.get("branch") and not stopped:
             try:
                 pr_url, pr_number = self.gh_pr_for_head(card["branch"], card.get("integration_branch") or None)
             except (CmdError, ValueError) as e:
                 log("gh pr list failed for %s: %s" % (card["branch"], e))
+            else:
+                if not pr_url and has_work and not publish_problems and rstatus == "done":
+                    try:
+                        pr_url, pr_number = self.open_card_pr(card, str((report or {}).get("summary") or ""))
+                        if not pr_url:
+                            publish_problems.append("the board ran gh pr create for %s but got no PR URL back"
+                                                    % card["branch"])
+                    except CmdError as e:
+                        publish_problems.append("the board could not open the PR for %s: %s" % (card["branch"], e))
 
         with self.store.lock:
             card = self.store.cards.get(card_id)
@@ -1691,10 +1759,12 @@ class App:
                         add_blocker(card, str(b["text"]), str(b.get("severity") or "blocker"), "agent")
             elif tail.result_text and not card.get("summary"):
                 card["summary"] = tail.result_text[:8000]
+            for problem in publish_problems:
+                log("%s: %s" % (short8(card_id), problem))
+                add_blocker(card, PUBLISH_BLOCKER_PREFIX + problem, "blocker", "board")
             if pr_url:
                 card["pr_url"] = pr_url
                 card["pr_number"] = pr_number
-            rstatus = str((report or {}).get("status") or "").lower()
             if report is None and not pr_url:
                 card["status"] = "failed"
                 add_blocker(card, "Agent exited with code %s without a report%s"

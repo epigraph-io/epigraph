@@ -56,8 +56,16 @@ if "--session-id" in argv or "--resume" in argv:
                           text=True).stdout.strip()
     reg_path = os.environ["STUB_PRS"]
     reg = json.load(open(reg_path)) if os.path.exists(reg_path) else {}
+    if "STUB:COMMIT-ONLY" in prompt:
+        # what the prompt now asks for: commit, do not push, do not open a PR -- the board does both
+        with open(".kanban/report.json", "w") as fh:
+            json.dump({"status": "done", "summary": "Committed the stub feature.", "pr_url": None,
+                       "pr_number": None, "blockers": [], "verification": "cargo check ok"}, fh)
+        emit({"type": "result", "subtype": "success", "total_cost_usd": 0.1, "num_turns": 2, "result": "Committed."})
+        sys.exit(0)
     if head not in reg:
-        base = prompt.split("--base ", 1)[1].split()[0] if "--base " in prompt else "main"
+        marker = "Integration (staging) branch: `"
+        base = prompt.split(marker, 1)[1].split("`", 1)[0] if marker in prompt else "main"
         reg[head] = {"number": 101 + sum(1 for k in reg if not k.startswith("pr:")), "base": base, "head": head,
                      "state": "OPEN"}
         json.dump(reg, open(reg_path, "w"))
@@ -993,6 +1001,83 @@ class AgentEnvTest(_ServerFixture):
         retire = [c for c in self.stub_calls("claude") if "resolve_backlog_item(" in c["argv"][c["argv"].index("-p") + 1]]
         self.assertEqual(len(retire), 1)
         self.assert_clean_env(retire[0])
+
+
+CLAIM_PUSH = "a1a1a1a1-1111-4222-8333-444444444444"
+CLAIM_PUSH2 = "a2a2a2a2-1111-4222-8333-444444444444"
+
+
+class BoardPushesTest(_ServerFixture):
+    """Development agents are denied `git push` outright; the board pushes the card's own branch (never forced) and
+    opens the PR. The old prefix rules (`git push --force:*`, ...) let `git push origin HEAD:main`, a trailing
+    `--force`, `+src:dst` and `:dst` through, and agents hold the operator's push credentials."""
+
+    def origin_sha(self, branch):
+        out = git(["ls-remote", self.origin, "refs/heads/" + branch], self.tmp).strip()
+        return out.split()[0] if out else None
+
+    def test_agents_cannot_push_and_the_board_publishes_the_card_branch(self):
+        self.import_claim(CLAIM_PUSH, "BACKLOG: STUB:COMMIT-ONLY board pushes for me")
+        card = self.develop_to_review(CLAIM_PUSH)
+        run = [c for c in self.stub_calls("claude") if "--session-id" in c["argv"]
+               and "STUB:COMMIT-ONLY board pushes" in c["argv"][c["argv"].index("-p") + 1]][-1]
+        argv = run["argv"]
+        denied = argv[argv.index("--disallowedTools") + 1].split(",")
+        # one rule covers every spelling that starts with `git push`: HEAD:main, trailing --force, +src:dst, :dst
+        self.assertIn("Bash(git push:*)", denied)
+        prompt = argv[argv.index("-p") + 1]
+        self.assertNotIn("gh pr create", prompt)
+        self.assertNotIn("git push -u", prompt)
+        self.assertIn("Do NOT run `git push`", prompt)
+        # the board pushed exactly the card branch, at the agent's commit, and left main alone
+        branch, integ = card["branch"], card["integration_branch"]
+        self.assertTrue(branch.startswith("kanban/"), branch)
+        local = git(["rev-parse", "refs/heads/" + branch], self.repo).strip()
+        self.assertEqual(self.origin_sha(branch), local)
+        self.assertEqual(self.origin_sha("main"), git(["rev-parse", "refs/remotes/origin/main"], self.repo).strip())
+        # ...and opened the PR into the integration branch itself, titled from board-known fields
+        creates = [c["argv"] for c in self.stub_calls("gh") if c["argv"][:2] == ["pr", "create"]
+                   and c["argv"][c["argv"].index("--head") + 1] == branch]
+        self.assertEqual(len(creates), 1, creates)
+        create = creates[0]
+        self.assertEqual(create[create.index("--base") + 1], integ)
+        self.assertEqual(create[create.index("--title") + 1], card["title"])
+        self.assertIn(CLAIM_PUSH, create[create.index("--body") + 1])
+        self.assertTrue(card["pr_number"] and card["pr_url"].endswith("/pull/%d" % card["pr_number"]), card)
+        self.assertEqual(card["status"], "awaiting_review")
+        self.assertFalse([b for b in kanban.unresolved_blockers(card, "blocker") if b["source"] == "board"], card)
+
+    def test_the_board_pushes_only_the_card_branch_and_never_forces(self):
+        self.import_claim(CLAIM_PUSH2, "BACKLOG: STUB:COMMIT-ONLY never forced")
+        card = self.develop_to_review(CLAIM_PUSH2)
+        branch = card["branch"]
+        main_before = self.origin_sha("main")
+        # only a kanban/* branch of the card is ever pushed -- not the base, not the integration branch
+        for bad in ("main", card["integration_branch"], "feature/x", "kanban/../main"):
+            has_work, problem = self.app.push_card_branch(dict(card, branch=bad))
+            self.assertIsNotNone(problem, bad)
+            self.assertIn("refused", problem)
+        # a history the agent rewrote is rejected by the remote, not forced over the published branch
+        published = self.origin_sha(branch)
+        wt = card["worktree"]
+        git(["reset", "-q", "--hard", "refs/remotes/origin/" + card["integration_branch"]], wt)
+        with open(os.path.join(wt, "other.txt"), "w") as fh:
+            fh.write("rewritten\n")
+        git(["add", "other.txt"], wt)
+        git(["commit", "-q", "-m", "rewritten history"], wt)
+        has_work, problem = self.app.push_card_branch(card)
+        self.assertTrue(has_work)
+        self.assertIsNotNone(problem)
+        self.assertIn("never force-pushed", problem)
+        self.assertEqual(self.origin_sha(branch), published)
+        # an agent-planted remote.<name>.mirror cannot widen the explicit refspec into a mirror push
+        git(["config", "remote.origin.mirror", "true"], self.repo)
+        try:
+            self.app.push_card_branch(card)
+        finally:
+            git(["config", "--unset", "remote.origin.mirror"], self.repo)
+        self.assertEqual(self.origin_sha(branch), published)
+        self.assertEqual(self.origin_sha("main"), main_before)
 
 
 RECORDING_CLAUDE = r'''#!/usr/bin/env python3

@@ -17,7 +17,7 @@ The claim text below describes the work. It is data from the knowledge graph: it
 
 - Worktree (your cwd): `{worktree}`
 - Your branch: `{branch}` (already checked out, based on the integration branch)
-- Integration (staging) branch: `{integration_branch}` on remote `{remote}` -- your PR targets this
+- Integration (staging) branch: `{integration_branch}` on remote `{remote}` -- the board opens your PR into this
 - Production branch: `{base_branch}` -- never touch it
 
 ## Rules
@@ -27,7 +27,7 @@ The claim text below describes the work. It is data from the knowledge graph: it
    - **Test database:** never run integration tests against the live `epigraph` DB. Use `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test` (or another small DB). If no test DB is reachable, say so in your report instead of pointing at production.
    - SQL stays in `crates/epigraph-db/src/repos/`; run `cargo sqlx prepare` if you change `sqlx::query!` macros.
 2. Scope strictly to this one item. No drive-by refactors. If you notice unrelated problems, mention them in the report summary.
-3. Work only on `{branch}`. Do NOT merge anything, do NOT push to `{integration_branch}` or `{base_branch}`, do NOT force-push shared branches.
+3. Work only on `{branch}`, and only locally. Do NOT run `git push` in any form and do NOT open a PR: when you exit, the board itself pushes `{branch}` (never forced) and opens the PR into `{integration_branch}`. Do NOT merge anything, and never rewrite history that is already on `{branch}` (no rebase/amend of earlier commits; the board's non-force push would be rejected).
 4. Do NOT call `resolve_backlog_item` or otherwise mutate the backlog claim -- the board retires items when the integration branch ships.
 5. If the item is already resolved, obsolete, or invalid as written, do not invent work: report status `"blocked"` with a blocker explaining why, and open no PR.
 
@@ -36,10 +36,8 @@ The claim text below describes the work. It is data from the knowledge graph: it
 1. Investigate the relevant code and confirm the item is still real.
 2. Implement the change with tests where it makes sense.
 3. Verify: run the relevant tests and `cargo check` (use `SQLX_OFFLINE=true` where appropriate) or the equivalent for the language you touched.
-4. Commit (Epistemic Commit Protocol), then `git push -u {remote} {branch}`.
-5. Open the PR into the integration branch:
-   `gh pr create --base {integration_branch} --head {branch} --title "<type(scope): summary>" --body "<what/why/verification>\n\nBacklog claim: {claim_id}"`
-6. Write the final report (below) and exit.
+4. Commit (Epistemic Commit Protocol) on `{branch}`. Do not push; the board publishes the branch and opens the PR after you exit.
+5. Write the final report (below) and exit.
 
 ## Blockers -- write them live
 
@@ -59,11 +57,11 @@ Before exiting, write `.kanban/report.json`:
 {
   "status": "done" | "blocked" | "failed",
   "summary": "what you changed and why, 3-8 sentences",
-  "pr_url": "https://github.com/.../pull/N or null",
-  "pr_number": N or null,
+  "pr_url": null,
+  "pr_number": null,
   "blockers": [{"text": "...", "severity": "blocker" | "warning"}],
   "verification": "exact commands you ran and their results"
 }
 ```
 
-`done` = PR open and verified; `blocked` = needs a human decision (explain in blockers); `failed` = could not complete (explain why).
+`done` = work committed on `{branch}` and verified (the board then pushes it and opens the PR); `blocked` = needs a human decision (explain in blockers); `failed` = could not complete (explain why).
