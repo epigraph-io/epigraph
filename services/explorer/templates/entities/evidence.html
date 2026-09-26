@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block title %}{{ kind.label }} evidence · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("entities.css") }}">
+{%- endblock %}
+
+{% block content %}
+<header class="entity-head">
+  <p class="entity-kind">Evidence</p>
+  <h1>{{ kind.label }} evidence</h1>
+  {%- if let Some(raw) = kind.recorded_as %}
+  <p class="small muted">Recorded as “{{ raw }}”.</p>
+  {%- endif %}
+</header>
+
+<section class="section" aria-labelledby="content-title">
+  <h2 id="content-title" class="section__title">Content</h2>
+  {%- if let Some(c) = content %}
+  <div class="evidence-content prose">{{ c.text }}</div>
+  {%- if c.cut %}
+  <p class="small muted">This content is long; only the beginning is shown.</p>
+  {%- endif %}
+  {%- else %}
+  <p class="muted">No content was recorded for this evidence.</p>
+  {%- endif %}
+</section>
+
+<section class="section" aria-labelledby="source-title">
+  <h2 id="source-title" class="section__title">Source</h2>
+  {%- if sources.is_empty() %}
+  <p class="muted">No source was recorded.</p>
+  {%- else %}
+  <ul class="link-list">
+    {%- for s in sources %}
+    <li><span class="muted small">{{ s.kind }}</span>
+      {% if let Some(href) = s.href %}<a href="{{ href }}" rel="noopener noreferrer">{{ s.text }}</a>{% else %}<span class="mono">{{ s.text }}</span>{% endif %}</li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+</section>
+
+<section class="section" aria-labelledby="linked-title">
+  <h2 id="linked-title" class="section__title">Linked claim</h2>
+  {%- if let Some(lc) = linked_claim %}
+  {%- match lc.text %}
+  {%- when Degraded::Available { data } %}
+  <p><a class="entity-row__text" href="{{ lc.url }}">{{ data.text }}</a></p>
+  {%- when Degraded::Unavailable { reason } %}
+  <p><a href="{{ lc.url }}">Claim {{ lc.short }}</a></p>
+  <p class="section-unavailable">{{ reason }}</p>
+  {%- endmatch %}
+  {%- else %}
+  <p class="muted">No claim is linked to this evidence by a claim-to-evidence edge.</p>
+  {%- endif %}
+  {%- if let Some(url) = agent_url %}
+  <p><a href="{{ url }}">The agent linked to this evidence</a></p>
+  {%- endif %}
+</section>
+
+<section class="section" aria-labelledby="details-title">
+  <h2 id="details-title" class="section__title">Details</h2>
+  <dl class="meta card">
+    <dt>Evidence id</dt>
+    <dd class="mono">{{ id }}</dd>
+    {%- for (label, value) in meta %}
+    <dt>{{ label }}</dt>
+    <dd>{{ value }}</dd>
+    {%- endfor %}
+    {%- if let Some(h) = content_hash %}
+    <dt>Content hash</dt>
+    <dd class="mono small">{{ h }}</dd>
+    {%- endif %}
+  </dl>
+</section>
+{% endblock %}

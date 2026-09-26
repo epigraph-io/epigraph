@@ -1,0 +1,9 @@
+<aside class="notice graph-permalink" aria-label="About this address">
+  <p><strong>This {{ what }} view is not a permalink.</strong> Clustering mints new ids every time it runs, so this address stops working after the next run.</p>
+  {%- if let Some(s) = share %}
+  <p class="graph-permalink__share">Share the claim instead: <a href="{{ s.href }}">{{ s.url }}</a>
+    <button type="button" class="button-quiet graph-share" data-share-url="{{ s.url }}" hidden>Copy claim link</button></p>
+  {%- else %}
+  <p class="small muted">Open this view from a claim's graph page to get a link you can share.</p>
+  {%- endif %}
+</aside>

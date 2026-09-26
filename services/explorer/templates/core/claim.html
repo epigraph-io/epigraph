@@ -1,0 +1,249 @@
+{% extends "base.html" %}
+
+{% block title %}{{ og.title }} · {{ ctx.product_name() }}{% endblock %}
+
+{% block og %}
+{% include "core/og.html" %}
+{% endblock %}
+
+{% block head %}<link rel="stylesheet" href="{{ ctx.static_url("core.css") }}">{% endblock %}
+
+{% block content %}
+<article class="claim" aria-labelledby="claim-title">
+  <header class="claim__header">
+    <h1 id="claim-title" class="claim__kicker">Claim <code>{{ view.short_id() }}</code></h1>
+    <blockquote class="claim-text claim__content">{{ view.content() }}</blockquote>
+    {%- if !view.claim.labels.is_empty() %}
+    <ul class="labels" aria-label="Labels">
+      {%- for l in view.claim.labels %}
+      <li class="label">{{ l }}</li>
+      {%- endfor %}
+    </ul>
+    {%- endif %}
+    <nav class="claim__nav" aria-label="Other views of this claim">
+      <a href="{{ view.urls.graph }}">Graph</a>
+      <a href="{{ view.urls.provenance }}">Derivation chain</a>
+      <a href="{{ view.urls.history }}">Version history</a>
+    </nav>
+  </header>
+
+  <div class="claim-layout">
+    <div class="claim-layout__main">
+
+      <section class="section" aria-labelledby="connections-title">
+        <h2 id="connections-title" class="section__title">Connections</h2>
+        {%- match view.outlinks %}
+        {%- when Degraded::Available { data } %}
+        {%- if data.is_empty() %}
+        <p class="muted">This claim has no connections yet.</p>
+        {%- else %}
+        {%- if data.truncated %}
+        <p class="notice notice--warn small">This claim has {{ data.total_edges }} connections; the connection limit cut the list to {{ data.shown_edges }}. <a href="{{ data.graph_url }}">Open the graph view</a> to explore them visually.</p>
+        {%- endif %}
+        {%- for fam in data.families %}
+        <section class="outlinks__family outlinks__family--{{ fam.slug() }}" aria-label="{{ fam.title }}">
+          <h3 class="outlinks__family-title">{{ fam.title }}</h3>
+          {%- for g in fam.groups %}
+          <h4 class="outlinks__heading">{{ g.heading }} <span class="muted small">({{ g.neighbours.len() }})</span></h4>
+          <ul class="link-list outlinks__list">
+            {%- for n in g.neighbours %}
+            <li>
+              {%- if let Some(href) = n.href %}
+              <a href="{{ href }}">{{ n.text }}</a>
+              {%- else %}
+              <span class="outlinks__plain">{{ n.text }}</span>
+              {%- endif %}
+              <span class="muted small">{{ n.entity_type }}{% if n.is_current == Some(false) %} · superseded{% endif %}</span>
+            </li>
+            {%- endfor %}
+          </ul>
+          {%- endfor %}
+        </section>
+        {%- endfor %}
+        {%- endif %}
+        {%- when Degraded::Unavailable { reason } %}
+        <p class="section-unavailable">{{ reason }}</p>
+        {%- endmatch %}
+      </section>
+
+      <section class="section" aria-labelledby="evidence-title">
+        <h2 id="evidence-title" class="section__title">Evidence</h2>
+        {%- match view.evidence %}
+        {%- when Degraded::Available { data } %}
+        {%- if data.is_empty() %}
+        <p class="muted">No evidence is recorded for this claim.</p>
+        {%- else %}
+        <ul class="link-list evidence-list">
+          {%- for e in data %}
+          <li class="evidence-item">
+            <p class="evidence-item__meta small">
+              <span class="label">{{ e.type_label }}</span>
+              {%- if let Some(h) = e.href %} <a href="{{ h }}">Evidence details</a>{% endif %}
+              {%- if !e.created.is_empty() %} <span class="muted">{{ e.created }}</span>{% endif %}
+            </p>
+            {%- if !e.content.is_empty() %}
+            <p class="evidence-item__text">{{ e.content }}</p>
+            {%- endif %}
+            {%- if let Some(s) = e.source %}
+            <p class="small">Source:
+              {%- if let Some(h) = s.href %} <a href="{{ h }}" rel="noopener noreferrer nofollow">{{ s.text }}</a>{% else %} {{ s.text }}{% endif %}</p>
+            {%- endif %}
+          </li>
+          {%- endfor %}
+        </ul>
+        {%- endif %}
+        {%- when Degraded::Unavailable { reason } %}
+        <p class="section-unavailable">{{ reason }}</p>
+        {%- endmatch %}
+
+        {%- for (key, title, section) in edge_sections() %}
+        <h3 id="{{ key }}-title">{{ title }}</h3>
+        {%- match section %}
+        {%- when Degraded::Available { data } %}
+        {%- if data.is_empty() %}
+        <p class="muted small">None linked.</p>
+        {%- else %}
+        <ul class="link-list evidence-list evidence-list--{{ key }}" aria-labelledby="{{ key }}-title">
+          {%- for e in data %}
+          <li class="evidence-item">
+            <p class="evidence-item__meta small"><a href="{{ e.href }}">Evidence details</a> <span class="muted">strength {{ e.strength_display() }}{% if !e.created.is_empty() %} · {{ e.created }}{% endif %}</span></p>
+            {%- if let Some(c) = e.content %}
+            <p class="evidence-item__text">{{ c }}</p>
+            {%- endif %}
+          </li>
+          {%- endfor %}
+        </ul>
+        {%- endif %}
+        {%- when Degraded::Unavailable { reason } %}
+        <p class="section-unavailable">{{ reason }}</p>
+        {%- endmatch %}
+        {%- endfor %}
+      </section>
+
+      <section class="section" aria-labelledby="challenges-title">
+        <h2 id="challenges-title" class="section__title">Challenges</h2>
+        {%- match view.challenges %}
+        {%- when Degraded::Available { data } %}
+        {%- if data.is_empty() %}
+        <p class="muted">Nobody has challenged this claim.</p>
+        {%- else %}
+        <ul class="link-list challenge-list">
+          {%- for c in data %}
+          <li class="challenge challenge--{{ c.state }}">
+            <p class="small"><span class="label">{{ c.type_label }}</span> <span class="challenge__state">{{ c.state }}</span>
+              {%- if let Some(h) = c.challenger_href %} · <a href="{{ h }}">{{ c.challenger }}</a>{% else %} · <span class="muted">{{ c.challenger }}</span>{% endif %}
+              {%- if let Some(d) = c.created %} · <span class="muted">{{ d }}</span>{% endif %}
+              {%- if let Some(d) = c.resolved %} · <span class="muted">resolved {{ d }}</span>{% endif %}</p>
+            {%- if !c.explanation.is_empty() %}
+            <p>{{ c.explanation }}</p>
+            {%- endif %}
+          </li>
+          {%- endfor %}
+        </ul>
+        {%- endif %}
+        {%- when Degraded::Unavailable { reason } %}
+        <p class="section-unavailable">{{ reason }}</p>
+        {%- endmatch %}
+      </section>
+
+      <section class="section" aria-labelledby="provenance-title">
+        <h2 id="provenance-title" class="section__title">Provenance</h2>
+        <p class="small muted">How this claim was produced: its reasoning trace and the evidence behind it. For the claims it was derived from, see the <a href="{{ view.urls.provenance }}">derivation chain</a>; for earlier and later versions, the <a href="{{ view.urls.history }}">version history</a>.</p>
+        {%- match view.provenance %}
+        {%- when Degraded::Available { data } %}
+        {%- if data.is_empty() %}
+        <p class="muted">No reasoning trace or evidence is recorded.</p>
+        {%- else %}
+        <ul class="link-list provenance-list">
+          {%- for row in data %}
+          <li>
+            <ol class="provenance-path">
+              {%- for s in row.steps %}
+              {%- if !loop.first %}
+              <li class="provenance-path__sep" aria-hidden="true">→</li>
+              {%- endif %}
+              <li class="provenance-path__step provenance-path__step--{{ s.entity_type }}">
+                <span class="muted small">{{ s.entity_type }}</span>
+                {%- if let Some(h) = s.href %} <a href="{{ h }}">{{ s.text }}</a>{% else %} <span>{{ s.text }}</span>{% endif %}
+              </li>
+              {%- endfor %}
+            </ol>
+            {%- if let Some(src) = row.source %}
+            <p class="small">Source:
+              {%- if let Some(h) = src.href %} <a href="{{ h }}" rel="noopener noreferrer nofollow">{{ src.text }}</a>{% else %} {{ src.text }}{% endif %}</p>
+            {%- endif %}
+          </li>
+          {%- endfor %}
+        </ul>
+        {%- endif %}
+        {%- when Degraded::Unavailable { reason } %}
+        <p class="section-unavailable">{{ reason }}</p>
+        {%- endmatch %}
+      </section>
+    </div>
+
+    <aside class="claim-layout__aside" aria-label="Claim details">
+      <section class="card claim-panel" aria-labelledby="belief-title">
+        <h2 id="belief-title" class="section__title">Truth and belief</h2>
+        <dl class="meta">
+          <dt>Truth value</dt>
+          <dd><span class="num">{{ view.truth_display() }}</span>{% if let Some(t) = truth() %} <meter class="claim-meter" min="0" max="1" value="{{ t }}">{{ view.truth_display() }}</meter>{% endif %}</dd>
+          <dt>Belief (BetP)</dt>
+          <dd><span class="num">{{ betp_display() }}</span>{% if let Some(p) = betp() %} <meter class="claim-meter" min="0" max="1" value="{{ p }}">{{ betp_display() }}</meter>{% endif %}</dd>
+        </dl>
+        <p class="small muted">The truth value is derived from evidence; belief is the Dempster–Shafer pignistic probability.</p>
+        {%- if let Some(reason) = view.belief.reason() %}
+        <p class="section-unavailable">{{ reason }}</p>
+        {%- else %}
+        <dl class="meta small">
+          {%- for (label, value) in belief_rows() %}
+          <dt>{{ label }}</dt><dd class="num">{{ value }}</dd>
+          {%- endfor %}
+        </dl>
+        {%- endif %}
+      </section>
+
+      <section class="card claim-panel" aria-labelledby="placement-title">
+        <h2 id="placement-title" class="section__title">Placement</h2>
+        {%- match view.placement %}
+        {%- when Degraded::Available { data } %}
+        {%- if data.is_empty() %}
+        <p class="small muted">This claim is not placed in the latest clustering run.</p>
+        {%- else %}
+        <ul class="link-list">
+          {%- if let Some(h) = data.theme_href %}<li><a href="{{ h }}">Theme</a></li>{% endif %}
+          {%- if let Some(h) = data.community_href %}<li><a href="{{ h }}">Community</a></li>{% endif %}
+          {%- if let Some(h) = data.neighborhood_href %}<li><a href="{{ h }}">Neighborhood</a></li>{% endif %}
+        </ul>
+        <p class="small muted">These views are rebuilt whenever clustering re-runs, so they are not permalinks. To share, link to this claim instead.</p>
+        {%- endif %}
+        {%- if let Some(r) = data.run_completed %}
+        <p class="small muted">Clustering run completed {{ r }}.</p>
+        {%- endif %}
+        {%- when Degraded::Unavailable { reason } %}
+        <p class="section-unavailable">{{ reason }}</p>
+        {%- endmatch %}
+      </section>
+
+      <section class="card claim-panel" aria-labelledby="details-title">
+        <h2 id="details-title" class="section__title">Details</h2>
+        <dl class="meta small">
+          <dt>Id</dt><dd><code>{{ view.id }}</code></dd>
+          {%- if let Some(h) = view.urls.agent %}
+          <dt>Submitted by</dt><dd><a href="{{ h }}">Agent</a></dd>
+          {%- endif %}
+          {%- if !view.created_display().is_empty() %}
+          <dt>Created</dt><dd>{{ view.created_display() }}</dd>
+          {%- endif %}
+          {%- if !view.updated_display().is_empty() %}
+          <dt>Updated</dt><dd>{{ view.updated_display() }}</dd>
+          {%- endif %}
+          {%- if let Some(t) = view.claim.trace_id %}
+          <dt>Reasoning trace</dt><dd><code>{{ t }}</code></dd>
+          {%- endif %}
+        </dl>
+      </section>
+    </aside>
+  </div>
+</article>
+{% endblock %}

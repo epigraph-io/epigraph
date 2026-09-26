@@ -1464,6 +1464,23 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `epigraph-mcp/tests/recall_audit_wiring.rs::the_audit_row_is_not_written_on_the_unstamped_pool`.",
     ),
     (
+        "cluster_run.rs",
+        "latest",
+        "Reads `graph_cluster_runs` for the newest completed run; the statement's FROM is that \
+         table alone and it joins nothing. The row is `(run_id, completed_at, degraded)` -- an \
+         operational record of when the clusterer last finished, with no claim content and no \
+         claim id. `graph_cluster_runs` is NOT in migration 062's tier_a array, so it has neither \
+         a `visibility` nor an `owner_group_id` column for a predicate to name, and \
+         `routes/graph_neighborhood.rs::expand` records that measured at migration head 92 it \
+         carries no row-level security either. The tenancy decision belongs to the membership \
+         tables this run id is then used against -- `claim_cluster_membership` and \
+         `claim_neighborhood_membership`, both of which ARE in tier_a -- and \
+         `ClusterRunRepository::claim_placement`, the caller that matters, takes a `&Viewer` and \
+         splices it onto both of them plus the `claims` existence probe. SCOPE: the Explorer \
+         branch widened the executor from `&PgPool` so the three `expand` handlers can pass their \
+         viewer-stamped connection and keep one connection per request. The SQL is unchanged.",
+    ),
+    (
         "method.rs",
         "get",
         "Reads `methods` by primary key, and the statement's FROM is `methods` alone -- it joins \

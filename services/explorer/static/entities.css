@@ -1,0 +1,263 @@
+/* Entities area: claim history and provenance, agent, frame, evidence pages.
+ * Builds on app.css custom properties; no inline styles (CSP style-src 'self').
+ */
+
+/* ---- page head ---------------------------------------------------------- */
+
+.entity-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-5);
+  font-size: 0.95rem;
+}
+
+.entity-tabs a[aria-current="page"] {
+  color: var(--text);
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.entity-head {
+  margin-bottom: var(--space-5);
+}
+
+.entity-head h1 {
+  overflow-wrap: anywhere;
+}
+
+.entity-head h1.claim-text {
+  font-size: 1.35rem;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.entity-kind {
+  margin: 0 0 var(--space-1);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.entity-row__text {
+  display: block;
+  max-width: var(--measure);
+  overflow-wrap: break-word;
+}
+
+/* ---- badges ------------------------------------------------------------- */
+
+.badge {
+  display: inline-block;
+  padding: 0 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.badge--current {
+  border-color: var(--support);
+  color: var(--support);
+}
+
+.badge--superseded {
+  font-style: italic;
+}
+
+.badge--duplicate,
+.badge--cycle {
+  background: var(--warn-bg);
+  border-color: var(--warn-border);
+  color: var(--text);
+}
+
+/* ---- version history ---------------------------------------------------- */
+
+.version-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-4);
+  border-left: 2px solid var(--border);
+}
+
+.version {
+  position: relative;
+  padding: var(--space-3) 0 var(--space-3) var(--space-5);
+}
+
+.version::before {
+  content: "";
+  position: absolute;
+  left: -0.4rem;
+  top: 1.15rem;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--border);
+}
+
+.version--current::before {
+  background: var(--support);
+  border-color: var(--support);
+}
+
+.version--requested {
+  background: var(--surface);
+  border-radius: var(--radius);
+}
+
+.version__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+}
+
+.version__title {
+  font-weight: 650;
+}
+
+.version__text {
+  max-width: var(--measure);
+  margin: var(--space-2) 0 var(--space-1);
+  overflow-wrap: break-word;
+}
+
+/* ---- provenance chain --------------------------------------------------- */
+
+.depth-form,
+.sort-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+.chain-note {
+  margin-bottom: var(--space-4);
+}
+
+.chain-note p:last-child {
+  margin-bottom: 0;
+}
+
+.chain {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.chain-level {
+  position: relative;
+  padding-left: var(--space-5);
+  border-left: 2px solid var(--border);
+}
+
+.chain-level:first-child {
+  border-left-color: var(--accent);
+}
+
+.chain-level__title {
+  margin: 0;
+  padding: var(--space-4) 0 var(--space-2);
+  font-size: 1rem;
+  color: var(--text-muted);
+}
+
+.chain-nodes {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: var(--space-3);
+}
+
+.chain-node {
+  padding: var(--space-3) var(--space-4);
+}
+
+.chain-node--superseded {
+  border-style: dashed;
+}
+
+.chain-node__badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.chain-node__badges:empty {
+  display: none;
+}
+
+.chain-node__text {
+  margin: var(--space-1) 0 var(--space-2);
+  overflow-wrap: break-word;
+}
+
+.chain-links {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-2);
+  font-size: 0.95rem;
+}
+
+.chain-links li {
+  overflow-wrap: break-word;
+}
+
+.rel {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.chain-node .label {
+  margin-right: var(--space-1);
+}
+
+.cycle a {
+  overflow-wrap: break-word;
+}
+
+/* ---- agent / frame / evidence ------------------------------------------- */
+
+.pager {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.share-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 0 var(--space-5);
+}
+
+.share-table th {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.share-table meter {
+  width: 100%;
+  min-width: 4rem;
+}
+
+.hypotheses li {
+  overflow-wrap: break-word;
+}
+
+.evidence-content {
+  white-space: pre-wrap;
+  font-size: 1rem;
+  line-height: 1.6;
+}

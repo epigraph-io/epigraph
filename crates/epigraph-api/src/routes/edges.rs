@@ -2312,8 +2312,15 @@ pub async fn claim_provenance(
     };
 
     // Truncation only — there is no redacted spelling of this label any more.
-    let claim_label = if claim_row.content.len() > 60 {
-        format!("{}...", &claim_row.content[..57])
+    // Count and cut in CHARS, not bytes: `&content[..57]` panics whenever a
+    // multi-byte character (μ, é, —, °) straddles byte 57, and with no
+    // CatchPanicLayer the client just sees the connection dropped.
+    // `str::floor_char_boundary` is still unstable at the workspace
+    // rust-version, so count characters explicitly. Same rule as the
+    // `load_subgraph` labels.
+    let claim_label = if claim_row.content.chars().count() > 60 {
+        let truncated: String = claim_row.content.chars().take(57).collect();
+        format!("{truncated}...")
     } else {
         claim_row.content.clone()
     };

@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} · Graph · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("graph.css") }}">
+<script src="{{ ctx.static_url("graph.js") }}" defer></script>
+{% endblock %}
+
+{% block content %}
+<p class="graph-crumbs small"><a href="{{ claim_href }}">← Back to the claim</a></p>
+<h1 class="graph-title">Claim graph</h1>
+<p class="claim-text graph-lead">{{ title }}</p>
+{%- if truncated %}
+<p class="notice notice--warn small">This claim has {{ total_edges }} connections; the graph shows the {{ shown_edges }} most recent.</p>
+{%- endif %}
+
+{% include "graph/_canvas.html" %}
+
+<noscript>
+<section class="section" aria-labelledby="neighbours-title">
+  <h2 id="neighbours-title" class="section__title">Connections</h2>
+  <p class="small muted">The interactive graph needs JavaScript. Here are the same connections as a list.</p>
+  {%- if neighbours.is_empty() %}
+  <p class="muted">No connections to show.</p>
+  {%- else %}
+  <ul class="link-list graph-list">
+    {%- for n in neighbours %}
+    <li class="graph-row graph-row--{{ n.family }}">
+      <span class="graph-row__rel">{% if n.outgoing %}{{ n.relationship }} →{% else %}← {{ n.relationship }}{% endif %}</span>
+      {% if let Some(href) = n.href %}<a href="{{ href }}">{{ n.label }}</a>{% else %}<span>{{ n.label }}</span>{% endif %}
+      <span class="small muted">{{ n.entity_type }}</span>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+</section>
+</noscript>
+
+<section class="section" aria-labelledby="placement-title">
+  <h2 id="placement-title" class="section__title">Where this claim sits</h2>
+  {%- match placement %}
+  {%- when Degraded::Available { data } %}
+  {%- if data.is_empty() %}
+  <p class="muted">This claim is not part of the latest clustering run.</p>
+  {%- else %}
+  <ul class="link-list">
+    {%- if let Some(h) = data.theme %}
+    <li><a href="{{ h }}">Its theme</a></li>
+    {%- endif %}
+    {%- if let Some(h) = data.community %}
+    <li><a href="{{ h }}">Its community</a></li>
+    {%- endif %}
+    {%- if let Some(h) = data.neighborhood %}
+    <li><a href="{{ h }}">Its neighbourhood</a></li>
+    {%- endif %}
+  </ul>
+  <p class="small muted">These views are regenerated whenever clustering re-runs{% if let Some(t) = data.run_completed_at %} (this run finished {{ t }}){% endif %}. To share, link to the claim.</p>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">{{ reason }}</p>
+  {%- endmatch %}
+</section>
+{% endblock %}
