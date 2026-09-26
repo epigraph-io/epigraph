@@ -202,6 +202,7 @@ pub async fn cascade_after_supersede(
     let targets = invalidate_and_rewire(
         &mut *conn,
         viewer,
+        frame_id,
         new_claim_id,
         &edges,
         &mut visited,
@@ -293,6 +294,7 @@ pub async fn cascade_after_dedup(
     let resourced = invalidate_and_rewire(
         &mut *conn,
         viewer,
+        frame_id,
         canonical_id,
         &repair.resourced_edges,
         &mut visited,
@@ -333,9 +335,11 @@ pub async fn cascade_after_dedup(
 /// Only edges that actually carried a BBA become targets. An edge whose source
 /// was factorless at wire time has no derived record to repair, so recomputing
 /// its target would be a write with no cause — the cascade stays surgical.
+#[allow(clippy::too_many_arguments)]
 async fn invalidate_and_rewire(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
+    frame_id: Uuid,
     source_id: Uuid,
     edges: &[(Uuid, Uuid, String)],
     visited: &mut HashSet<Uuid>,
@@ -449,6 +453,29 @@ async fn invalidate_and_rewire(
             );
             continue;
         }
+        // THE TARGET MUST BE REPAIRABLE BY THIS CALLER, IN THE SAME SAVEPOINT
+        // (batch H-b review, measured on config A). The invalidation and the
+        // target's repair used to commit separately: `mass_functions_tenancy`
+        // admits a DELETE of any PUBLIC row (DELETE is checked against USING
+        // only), so a caller deleted a FOREIGN public target's edge BBA, and
+        // then `repair_targets` failed on `claims` RLS, leaving the evidence
+        // gone and the cached belief stale (T: BBAs 1 -> 0, belief 0.7). The
+        // repair is now attempted here too, before this savepoint commits: a
+        // target the caller cannot write rolls back ITS OWN invalidation, so it
+        // keeps both its BBA and a belief that matches it, and is reported.
+        // `repair_targets` still runs strictly last and writes the final value;
+        // this attempt only decides whether the invalidation may stand.
+        if let Err(e) = repair_one(&mut sp, viewer, frame_id, *target_id).await {
+            let _ = sp.rollback().await;
+            report.note_error(
+                &format!("repair claim {target_id} after invalidating edge {edge_id}"),
+                format!(
+                    "{e}; the edge BBA was NOT invalidated (rolled back), so the target keeps \
+                     its supporter and a belief consistent with it"
+                ),
+            );
+            continue;
+        }
         if let Err(e) = sp.commit().await {
             report.note_error(&format!("release savepoint for edge {edge_id}"), e);
             continue;
@@ -460,6 +487,44 @@ async fn invalidate_and_rewire(
         }
     }
     queued
+}
+
+/// PROBE whether this caller can repair `target_id`: run the same writes
+/// [`repair_targets`] would (recompute it from its surviving BBAs, or clear its
+/// cache when none survive) inside a nested savepoint that is ALWAYS rolled
+/// back. Used inside an edge's savepoint to decide whether the edge's
+/// invalidation may commit; see [`invalidate_and_rewire`]. Rolled back rather
+/// than kept so that `repair_targets` still makes (and reports) the one final
+/// write strictly last, and a cleared cache is still reported as `unbacked`.
+async fn repair_one(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    frame_id: Uuid,
+    target_id: Uuid,
+) -> Result<(), String> {
+    let mut probe = conn
+        .begin()
+        .await
+        .map_err(|e| format!("savepoint for the repair probe: {e}"))?;
+    let outcome =
+        match recompute_claim_belief_on_frame(&mut probe, viewer, target_id, frame_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                match MassFunctionRepository::get_for_claim(&mut *probe, viewer, target_id).await {
+                    Ok(rows) if rows.is_empty() => {
+                        MassFunctionRepository::clear_claim_belief(&mut *probe, target_id)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("clear unbacked belief: {e}"))
+                    }
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(format!("check surviving BBAs: {e}")),
+                }
+            }
+            Err(e) => Err(format!("recompute: {e}")),
+        };
+    let _ = probe.rollback().await;
+    outcome
 }
 
 /// Recompute each target, or mark it unbacked when nothing survives, recording
