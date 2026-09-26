@@ -330,7 +330,7 @@ pub async fn store_workflow(
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
-    let submitter = workflow_ingest_submitter(&state, &mut tx, None, &viewer, &extraction).await?;
+    let submitter = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
     let result =
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
@@ -1737,7 +1737,6 @@ pub async fn ingest_workflow(
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
     let submitter = workflow_ingest_submitter(
-        &state,
         &mut tx,
         auth_ctx.as_ref().map(|a| &a.0),
         &viewer,
@@ -2104,7 +2103,6 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
 /// Returns the recorded submitter.
 #[cfg(feature = "db")]
 async fn workflow_authority(
-    state: &AppState,
     conn: &mut sqlx::PgConnection,
     auth: Option<&crate::middleware::bearer::AuthContext>,
     caller: Option<Uuid>,
@@ -2150,7 +2148,6 @@ async fn workflow_authority(
 /// An unknown name is left to the executor, which reports it as not found.
 #[cfg(feature = "db")]
 async fn require_api_workflow_authority(
-    state: &AppState,
     conn: &mut sqlx::PgConnection,
     auth: &crate::middleware::bearer::AuthContext,
     canonical_name: &str,
@@ -2161,7 +2158,7 @@ async fn require_api_workflow_authority(
             message: format!("could not resolve the workflow: {e}"),
         })?;
     if let Some(head) = head {
-        workflow_authority(state, conn, Some(auth), auth.agent_id, head).await?;
+        workflow_authority(conn, Some(auth), auth.agent_id, head).await?;
     }
     Ok(())
 }
@@ -2173,7 +2170,6 @@ async fn require_api_workflow_authority(
 /// principal, which `ViewerExtractor` resolved from the token.
 #[cfg(feature = "db")]
 async fn workflow_ingest_submitter(
-    state: &AppState,
     conn: &mut sqlx::PgConnection,
     auth: Option<&crate::middleware::bearer::AuthContext>,
     viewer: &epigraph_db::Viewer,
@@ -2190,7 +2186,7 @@ async fn workflow_ingest_submitter(
         None => None,
     };
     let parent_owner = match parent {
-        Some(parent_id) => workflow_authority(state, conn, auth, caller, parent_id).await?,
+        Some(parent_id) => workflow_authority(conn, auth, caller, parent_id).await?,
         None => None,
     };
     let exists = epigraph_db::WorkflowRepository::find_root_by_canonical(
@@ -2238,7 +2234,7 @@ pub async fn add_step(
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps").await?;
-    require_api_workflow_authority(&state, &mut tx, &auth, &req.canonical_name).await?;
+    require_api_workflow_authority(&mut tx, &auth, &req.canonical_name).await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
         &req.canonical_name,
@@ -2273,7 +2269,7 @@ pub async fn delete_step(
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps/delete").await?;
-    require_api_workflow_authority(&state, &mut tx, &auth, &req.canonical_name).await?;
+    require_api_workflow_authority(&mut tx, &auth, &req.canonical_name).await?;
     let r =
         epigraph_ingest_executor::delete_step(&mut tx, &req.canonical_name, req.step_lineage_id)
             .await
