@@ -300,6 +300,17 @@ fn slugify_workflow_goal(s: &str) -> String {
         .join("-")
 }
 
+const DEFAULT_WORKFLOW_CONFIDENCE: f64 = 0.8;
+
+/// Resolve the caller-supplied workflow confidence: `None` and NaN fall back to
+/// 0.8; every other value (including +/-inf) is clamped to 0.0..=1.0.
+fn resolve_workflow_confidence(c: Option<f64>) -> f64 {
+    match c {
+        Some(v) if !v.is_nan() => v.clamp(0.0, 1.0),
+        _ => DEFAULT_WORKFLOW_CONFIDENCE,
+    }
+}
+
 /// Store a new hierarchical workflow.
 ///
 /// Input shape stays simple (`goal` + `steps[]`); internally builds a
@@ -319,6 +330,7 @@ pub async fn store_workflow(
     let canonical_name = slugify_workflow_goal(&params.goal);
     let prereqs = params.prerequisites.unwrap_or_default();
     let tags = params.tags.unwrap_or_default();
+    let confidence = resolve_workflow_confidence(params.confidence);
 
     let phases = if params.steps.is_empty() {
         vec![]
@@ -337,7 +349,7 @@ pub async fn store_workflow(
                     rationale: String::new(),
                     operations: vec![],
                     generality: vec![],
-                    confidence: 0.8,
+                    confidence,
                     // Flat store_workflow steps have no operation atoms, so no
                     // evidence_type source; the BBA-wiring loop only fires for
                     // level-3 atoms.
@@ -1221,5 +1233,41 @@ pub mod __test_only {
         pgvec: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         find_workflow_post_embed(server, viewer, &params, pgvec).await
+    }
+}
+
+#[cfg(test)]
+mod confidence_tests {
+    use super::resolve_workflow_confidence;
+
+    #[test]
+    fn none_defaults_to_0_8() {
+        assert_eq!(resolve_workflow_confidence(None), 0.8);
+    }
+
+    #[test]
+    fn in_range_passes_through() {
+        assert_eq!(resolve_workflow_confidence(Some(0.3)), 0.3);
+    }
+
+    #[test]
+    fn above_one_clamps_to_one() {
+        assert_eq!(resolve_workflow_confidence(Some(1.7)), 1.0);
+    }
+
+    #[test]
+    fn negative_clamps_to_zero() {
+        assert_eq!(resolve_workflow_confidence(Some(-0.5)), 0.0);
+    }
+
+    #[test]
+    fn nan_falls_back_to_default() {
+        assert_eq!(resolve_workflow_confidence(Some(f64::NAN)), 0.8);
+    }
+
+    #[test]
+    fn infinities_clamp() {
+        assert_eq!(resolve_workflow_confidence(Some(f64::INFINITY)), 1.0);
+        assert_eq!(resolve_workflow_confidence(Some(f64::NEG_INFINITY)), 0.0);
     }
 }

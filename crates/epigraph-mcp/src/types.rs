@@ -726,7 +726,7 @@ pub struct StoreWorkflowParams {
     #[schemars(description = "Expected outcome when the workflow succeeds")]
     pub expected_outcome: Option<String>,
 
-    #[schemars(description = "Confidence in this workflow (0.0-1.0, default 0.5 — unproven)")]
+    #[schemars(description = "Confidence in this workflow's steps (default 0.8; clamped to 0.0-1.0)")]
     pub confidence: Option<f64>,
 
     #[schemars(description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows'])")]
