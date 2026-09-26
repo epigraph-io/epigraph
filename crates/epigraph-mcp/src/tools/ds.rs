@@ -306,6 +306,23 @@ pub async fn submit_ds_evidence(
     .map_err(internal_error)?
     .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
+    // Migration 114: on a public claim this caller does not own, the BBA is the
+    // caller's own row, but the claim's frame assignment and its cached belief
+    // stay the owner's. Say so in the response rather than let a kept
+    // hypothesis_index or an un-re-pointed cache look like a silent drop.
+    if epigraph_db::repos::foreign_attach::is_foreign_public_claim(&mut tx, claim_id)
+        .await
+        .map_err(internal_error)?
+    {
+        warnings.push(format!(
+            "claim {claim_id} is a public claim this caller does not own: this BBA is stored, \
+             owned by the caller's group and public. The claim's frame assignment keeps the \
+             hypothesis_index its owner set, and the claim's cached belief (the belief \
+             returned here) is refreshed only when it already carries this frame or carries \
+             none; a non-owner never re-points it to another frame."
+        ));
+    }
+
     FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
         .await
         .map_err(internal_error)?;

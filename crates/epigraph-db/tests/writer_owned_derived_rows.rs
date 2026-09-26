@@ -554,9 +554,13 @@ async fn a_non_owners_aggregate_writes_are_claim_owned_audited_and_leave_truth_a
                 },
             )
             .await;
-            let class =
-                MassFunctionRepository::update_claim_classification(&mut *conn, fresh, "supported")
-                    .await;
+            let class = MassFunctionRepository::update_claim_classification(
+                &mut *conn,
+                fresh,
+                "supported",
+                frame,
+            )
+            .await;
             let clear = MassFunctionRepository::clear_claim_belief(&mut *conn, assigned).await;
             (conn, (unstamped, a_fresh, a_assigned, belief, class, clear))
         })
@@ -566,7 +570,10 @@ async fn a_non_owners_aggregate_writes_are_claim_owned_audited_and_leave_truth_a
     assert!(e.to_string().contains("row-level security"), "{e}");
     a_fresh.expect("non-owner frame assignment");
     a_assigned.expect("non-owner assignment onto an existing one");
-    belief.expect("non-owner DS cache write");
+    assert!(
+        belief.expect("non-owner DS cache write"),
+        "a claim with no cached frame is SEEDED by a non-owner's combination"
+    );
     class.expect("non-owner classification write");
     assert_eq!(
         clear.expect("non-owner clear"),
@@ -730,4 +737,129 @@ async fn a_private_claim_the_writer_cannot_read_answers_like_a_missing_one(pool:
         .await
         .expect("count");
     assert_eq!(n, 0);
+}
+
+/// The claim's cache carries ONE frame's combination. A non-owner may refresh it
+/// on that frame but may NOT re-point it to another frame -- here one the writer
+/// just created, holding only its own BBA -- which would replace the claim's
+/// cross-writer combination on the writer's own authority. The writer's BBA on
+/// the other frame is still stored (writer-owned); the cache, its frame and its
+/// classification are untouched and no audit row is written for the refused
+/// re-point. (Found in the MCP rehearsal: `submit_ds_evidence` on a writer-made
+/// frame moved a world claim's pignistic from its binary_truth combination.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_owner_refreshes_the_claims_belief_frame_but_never_re_points_it(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (writer, writer_group) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let claim = fixture::seed_public_claim(&pool, author, "cache on frame A").await;
+    let frame_a = seed_frame(&pool, "wo-frame-A").await;
+    let frame_b = seed_frame(&pool, "wo-frame-B-writer-made").await;
+    // The owner-side state: the cache carries frame A's combination.
+    sqlx::query(
+        "UPDATE claims SET belief = 0.5, plausibility = 0.9, pignistic_prob = 0.7, \
+                           mass_on_empty = 0, mass_on_missing = 0, belief_frame_id = $2, \
+                           classification = 'supported' WHERE id = $1",
+    )
+    .bind(claim)
+    .bind(frame_a)
+    .execute(&pool)
+    .await
+    .expect("owner-side cache on frame A");
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (mf_b, on_b, class_b, on_a) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, writer).await;
+            let mf_b = MassFunctionRepository::store_with_perspective(
+                &mut *conn,
+                claim,
+                frame_b,
+                Some(writer),
+                None,
+                &serde_json::json!({"1": 0.95, "0,1": 0.05}),
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await;
+            let on_b = MassFunctionRepository::update_claim_belief(
+                &mut *conn,
+                claim,
+                CachedBelief {
+                    belief: 0.0,
+                    plausibility: 0.05,
+                    mass_on_empty: 0.0,
+                    pignistic_prob: Some(0.025),
+                    mass_on_missing: 0.0,
+                    belief_frame_id: Some(frame_b),
+                },
+            )
+            .await;
+            let class_b = MassFunctionRepository::update_claim_classification(
+                &mut *conn,
+                claim,
+                "contradicted",
+                frame_b,
+            )
+            .await;
+            let on_a = MassFunctionRepository::update_claim_belief(
+                &mut *conn,
+                claim,
+                CachedBelief {
+                    belief: 0.55,
+                    plausibility: 0.92,
+                    mass_on_empty: 0.0,
+                    pignistic_prob: Some(0.735),
+                    mass_on_missing: 0.0,
+                    belief_frame_id: Some(frame_a),
+                },
+            )
+            .await;
+            (conn, (mf_b, on_b, class_b, on_a))
+        })
+        .await;
+
+    let mf_b = mf_b.expect("the writer's BBA on its own frame is stored");
+    assert_eq!(
+        tenancy(&pool, "mass_functions", mf_b).await,
+        (writer_group, "public".to_string(), true)
+    );
+    assert!(
+        !on_b.expect("a refused re-point is a no-op, not an error"),
+        "the cache must NOT be re-pointed to the writer's frame"
+    );
+    class_b.expect("a refused classification is a no-op, not an error");
+    assert!(
+        on_a.expect("refresh on the cache's own frame"),
+        "a non-owner DOES refresh the combination on the frame the cache carries"
+    );
+
+    let (frame, betp, class): (Option<Uuid>, Option<f64>, Option<String>) = sqlx::query_as(
+        "SELECT belief_frame_id, pignistic_prob, classification FROM claims WHERE id = $1",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("claim cache");
+    assert_eq!(frame, Some(frame_a), "the cache still carries frame A");
+    assert_eq!(
+        betp,
+        Some(0.735),
+        "refreshed on A, never replaced by B's 0.025"
+    );
+    assert_eq!(
+        class.as_deref(),
+        Some("supported"),
+        "B's verdict never lands"
+    );
+    let events = audit_events(&pool, claim).await;
+    assert_eq!(
+        events,
+        vec![(Some(writer), "belief_cache".to_string())],
+        "one audit row, for the refresh on A; none for the refused re-point"
+    );
 }

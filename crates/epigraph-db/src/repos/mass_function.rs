@@ -567,6 +567,13 @@ impl MassFunctionRepository {
     /// a `claims.foreign_aggregate_write` audit event. Every other session runs
     /// the UPDATE below exactly as before.
     ///
+    /// Returns whether the claim's cache was written. `false` for a claim that
+    /// does not exist (as before, silently), and for a non-owner whose frame is
+    /// not the one the claim's cache carries: a non-owner refreshes the cache on
+    /// THAT frame or seeds it when there is none, and never re-points it (the
+    /// frame that carries a claim's belief is the owner's decision; migration
+    /// 114, section 5). The caller's BBA is stored either way.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor))]
@@ -574,7 +581,7 @@ impl MassFunctionRepository {
         executor: E,
         claim_id: Uuid,
         cached: CachedBelief,
-    ) -> Result<(), DbError> {
+    ) -> Result<bool, DbError> {
         // claims_{belief,plausibility,mass_empty}_bounds — see helper at
         // epigraph_ds::measures::clamp_claim_belief_measures.
         // Note: helper threads pignistic_prob between plausibility and mass_on_empty;
@@ -601,13 +608,14 @@ impl MassFunctionRepository {
                 RETURNING 1
             )
             SELECT CASE WHEN acc.foreign_public
-                        THEN public.epigraph_foreign_belief_cache($6, $1, $2, $3, $4, $5, $7)
+                        THEN public.epigraph_foreign_belief_cache($6, $1, $2, $3, $4, $5, $7) > 0
+                        ELSE (SELECT count(*) FROM own) > 0
                    END
               FROM acc
             "#,
             foreign = crate::repos::foreign_attach::foreign_public_claim("$6"),
         );
-        sqlx::query(&sql)
+        let written = sqlx::query_scalar::<_, bool>(&sql)
             .bind(belief)
             .bind(plausibility)
             .bind(mass_on_empty)
@@ -615,10 +623,10 @@ impl MassFunctionRepository {
             .bind(mass_on_missing)
             .bind(claim_id)
             .bind(cached.belief_frame_id)
-            .execute(executor)
+            .fetch_one(executor)
             .await?;
 
-        Ok(())
+        Ok(written)
     }
 
     /// Write the CDST classification label for a claim.
@@ -632,6 +640,10 @@ impl MassFunctionRepository {
     /// combine cascade computes a classification, so only it calls this.
     /// The extra UPDATE lands on the recompute (maintenance) path, not an
     /// online read path.
+    ///
+    /// `belief_frame_id` is the frame whose combination the verdict is about.
+    /// The owner's statement ignores it (unchanged); a non-owner's verdict is
+    /// written only when that frame is the one the claim's cache carries.
     ///
     /// # A non-owner on a public claim (migration 114)
     ///
@@ -651,6 +663,7 @@ impl MassFunctionRepository {
         executor: E,
         claim_id: Uuid,
         classification: &str,
+        belief_frame_id: Uuid,
     ) -> Result<(), DbError> {
         let sql = format!(
             r#"
@@ -661,7 +674,7 @@ impl MassFunctionRepository {
                 RETURNING 1
             )
             SELECT CASE WHEN acc.foreign_public
-                        THEN public.epigraph_foreign_claim_classification($2, $1)
+                        THEN public.epigraph_foreign_claim_classification($2, $1, $3)
                    END
               FROM acc
             "#,
@@ -670,6 +683,7 @@ impl MassFunctionRepository {
         sqlx::query(&sql)
             .bind(classification)
             .bind(claim_id)
+            .bind(belief_frame_id)
             .execute(executor)
             .await?;
         Ok(())

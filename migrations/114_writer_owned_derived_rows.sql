@@ -182,8 +182,15 @@
 -- effective hypothesis_index.
 -- `epigraph_foreign_belief_cache(claim, belief, plausibility, mass_on_empty,
 -- pignistic_prob, mass_on_missing, belief_frame_id)`,
--- `epigraph_foreign_claim_classification(claim, classification)` and
--- `epigraph_foreign_belief_clear(claim)`: the three writes of the DS cache.
+-- `epigraph_foreign_claim_classification(claim, classification,
+-- belief_frame_id)` and `epigraph_foreign_belief_clear(claim)`: the three
+-- writes of the DS cache. The cache carries ONE frame's combination
+-- (`claims.belief_frame_id`); a non-owner refreshes it only on THAT frame (or
+-- seeds it when the claim has none) and never re-points it to another frame --
+-- one it created, say, holding only its own BBA -- which would replace the
+-- claim's cross-writer combination on the writer's own authority. A refused
+-- re-point is a no-op returning 0, not an error: the writer's BBA is stored
+-- regardless, and which frame carries the belief stays the owner's decision.
 --
 -- Each first calls `epigraph_foreign_aggregate_target(claim)`, which refuses:
 --   * FA01 (42501) no session principal: nothing to attribute the write to;
@@ -216,6 +223,15 @@
 -- `epigraph_writer_group()` are granted to `epigraph_app` and
 -- `epigraph_maintenance`; the target check is granted to nobody (only the
 -- definers, as its owner, call it). Guarded, as every such block since 060 is.
+--
+-- DEPLOY ORDER: apply 114 BEFORE any binary built with it serves. The repo
+-- layer's aggregate writes (`FrameRepository::assign_claim`,
+-- `MassFunctionRepository::{update_claim_belief, update_claim_classification,
+-- clear_claim_belief}`) call `epigraph_session_is_privileged_writer()` on EVERY
+-- call, the owner's and a superuser's included, so such a binary against a
+-- database below 114 fails every DS wiring with "function ... does not exist".
+-- A binary built WITHOUT 114 against a database at 114 is unaffected (its
+-- statements are the ones 114 leaves in place for every non-foreign session).
 --
 -- Undo: DROP the eight triggers and six functions this file creates, restore
 -- 110's two arm bodies, then DROP COLUMN writer_owned on the three tables
@@ -652,8 +668,19 @@ RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, public AS $$
 DECLARE v_owner uuid := public.epigraph_foreign_aggregate_target(p_claim);
-        v_before jsonb; v_after jsonb;
+        v_before jsonb; v_after jsonb; v_frame uuid;
 BEGIN
+    -- The cache carries ONE frame's combination (`belief_frame_id`). A non-owner
+    -- may refresh it on THAT frame (every writer's BBAs there, recombined), or
+    -- seed it when the claim has none; it may NOT re-point it to another frame
+    -- -- e.g. one it just created, holding only its own BBA -- which would
+    -- replace the claim's cross-writer combination on its own authority. Which
+    -- frame carries a claim's belief is the owner's decision. A refused re-point
+    -- is a no-op (0), not an error: the writer's BBA is stored either way.
+    SELECT c.belief_frame_id INTO v_frame FROM public.claims c WHERE c.id = p_claim;
+    IF v_frame IS NOT NULL AND v_frame IS DISTINCT FROM p_belief_frame_id THEN
+        RETURN 0;
+    END IF;
     -- A cached triple no mass function can represent is refused rather than
     -- stored: Bel <= BetP <= Pl (the `claims_*_bounds` checks bound each value
     -- to [0, 1] but do not order them).
@@ -691,14 +718,21 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_foreign_belief_cache(
     double precision, uuid) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION public.epigraph_foreign_claim_classification(
-    p_claim uuid, p_classification text)
+    p_claim uuid, p_classification text, p_belief_frame_id uuid)
 RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, public AS $$
 DECLARE v_owner uuid := public.epigraph_foreign_aggregate_target(p_claim);
-        v_before text;
+        v_before text; v_frame uuid;
 BEGIN
-    SELECT c.classification INTO v_before FROM public.claims c WHERE c.id = p_claim;
+    -- The verdict on the combination of `p_belief_frame_id`: written only when
+    -- that is the frame the claim's cache carries (the belief-cache definer's
+    -- rule), so a non-owner cannot relabel a claim from another frame.
+    SELECT c.classification, c.belief_frame_id INTO v_before, v_frame
+      FROM public.claims c WHERE c.id = p_claim;
+    IF v_frame IS DISTINCT FROM p_belief_frame_id THEN
+        RETURN 0;
+    END IF;
     UPDATE public.claims SET classification = p_classification, updated_at = now()
      WHERE id = p_claim;
     IF v_before IS DISTINCT FROM p_classification THEN
@@ -709,7 +743,7 @@ BEGIN
     END IF;
     RETURN 1;
 END $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_foreign_claim_classification(uuid, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.epigraph_foreign_claim_classification(uuid, text, uuid) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION public.epigraph_foreign_belief_clear(p_claim uuid)
 RETURNS integer
@@ -761,7 +795,7 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_foreign_belief_cache(uuid, double precision, '
                 'double precision, double precision, double precision, double precision, uuid) '
                 'OWNER TO epigraph_maintenance';
-        EXECUTE 'ALTER FUNCTION public.epigraph_foreign_claim_classification(uuid, text) '
+        EXECUTE 'ALTER FUNCTION public.epigraph_foreign_claim_classification(uuid, text, uuid) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_foreign_belief_clear(uuid) '
                 'OWNER TO epigraph_maintenance';
@@ -771,7 +805,7 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_belief_cache(uuid, '
                 'double precision, double precision, double precision, double precision, '
                 'double precision, uuid) TO epigraph_maintenance';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_claim_classification(uuid, text) '
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_claim_classification(uuid, text, uuid) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_belief_clear(uuid) '
                 'TO epigraph_maintenance';
@@ -783,7 +817,7 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_belief_cache(uuid, '
                 'double precision, double precision, double precision, double precision, '
                 'double precision, uuid) TO epigraph_app';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_claim_classification(uuid, text) '
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_claim_classification(uuid, text, uuid) '
                 'TO epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_belief_clear(uuid) '
                 'TO epigraph_app';

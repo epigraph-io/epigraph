@@ -473,13 +473,18 @@ Current reservation:
   (`epigraph_foreign_claim_frame`, `_belief_cache`, `_claim_classification`,
   `_belief_clear`; one `security_events` row per effective write,
   `event_type = 'claims.foreign_aggregate_write'`), which never write
-  `truth_value`, `labels` or `content`; the repo layer
+  `truth_value`, `labels` or `content`, and never RE-POINT the cache to another
+  frame (a non-owner refreshes the combination on the frame the claim's cache
+  carries, or seeds it when there is none); the repo layer
   (`repos/foreign_attach.rs`) routes to them with the same statement, so an
   owner / admin / maintenance write is unchanged. Replaces NO function 113
   replaces, so 113 and 114 apply in either order. Registered with
   `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Behaviour in
   `epigraph-db/tests/writer_owned_derived_rows.rs` (all arms as
-  `epigraph_app`). **No undo runbook ships**: undo is in the file's header.
+  `epigraph_app`). **Deploy order: apply 114 BEFORE any binary built with it
+  serves** -- the repo layer calls `epigraph_session_is_privileged_writer()` on
+  every aggregate write, owners' included, and no server refuses to boot on a
+  lower database head. **No undo runbook ships**: undo is in the file's header.
   **Applied to throwaway databases only (5433, with 113), NOT to any deployed
   database.**
 
