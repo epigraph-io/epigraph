@@ -129,6 +129,22 @@ pub async fn submit_ds_evidence(
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
 
+    // Read the claim through the caller's viewer BEFORE anything is written, so a
+    // group-private claim the caller cannot read gives exactly the answer a
+    // nonexistent id gives. Without this read the first write below was the
+    // first thing to touch the claim, and it answered an unreadable private
+    // claim with a row-level-security refusal and a nonexistent one with a
+    // foreign-key error: an existence oracle. (Migration 114 then decides who
+    // owns what this call writes: see the tool description.)
+    epigraph_db::ClaimRepository::get_by_id(
+        &server.pool,
+        viewer,
+        epigraph_core::ClaimId::from_uuid(claim_id),
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
+
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;
 

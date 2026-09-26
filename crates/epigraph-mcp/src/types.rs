@@ -1367,7 +1367,21 @@ pub struct VerifyResponse {
 pub struct UpdateResponse {
     pub claim_id: String,
     pub truth_before: f64,
+    /// The claim's `truth_value` after this call. Equal to `truth_before` when
+    /// [`Self::truth_written`] is `false`.
     pub truth_after: f64,
+    /// Whether this call wrote the claim's `truth_value`. `false` when the
+    /// caller attached to a PUBLIC claim it does not own (migration 114): the
+    /// evidence and its BBA are the caller's own rows (owned by the caller's
+    /// group, public), the claim's DS belief cache (`belief` / `plausibility`
+    /// / `pignistic_prob` below) is recombined over every writer's mass
+    /// functions, and the claim ROW's `truth_value` stays the owner's.
+    pub truth_written: bool,
+    /// `"claim_owner"` when the caller could write the claim (the evidence
+    /// inherits the claim's owner, as before), `"writer"` when it attached to a
+    /// public claim it does not own and the evidence and BBA are owned by the
+    /// caller's own group (migration 114).
+    pub evidence_owner: &'static str,
     pub evidence_id: String,
     /// Whether the Dempster-Shafer wiring for this submission landed. Always
     /// `true` in a response.

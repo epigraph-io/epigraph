@@ -1130,6 +1130,28 @@ pub async fn update_with_evidence(
         crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
             .await?;
 
+    // ── MIGRATION 114: A NON-OWNER ATTACHING TO A PUBLIC CLAIM ──────────
+    //
+    // Asked on THIS stamped transaction, so "can read" and "can write" are the
+    // session's own answers. When true, the evidence row and its BBA are the
+    // caller's (the `<table>_attach_writer` trigger owns them by the caller's
+    // group, public), the DS cache is refreshed through the audited definer
+    // path inside `update_claim_belief`, and the claim ROW is not written: its
+    // `truth_value` and `labels` stay the owner's. A label merge is therefore
+    // refused HERE, before anything is written, rather than dropped silently
+    // after the evidence lands (dropped run-tag labels were backlog f14592cb).
+    let foreign_claim =
+        epigraph_db::repos::foreign_attach::is_foreign_public_claim(&mut tx, claim_id)
+            .await
+            .map_err(internal_error)?;
+    if foreign_claim && !params.labels.is_empty() {
+        return Err(invalid_params(format!(
+            "claim {claim_id} is a public claim this caller does not own: evidence can be \
+             attached (it is owned by the caller's group and stays public), but its labels \
+             belong to the claim's owner. Resubmit without `labels`; nothing was written."
+        )));
+    }
+
     EvidenceRepository::create(&mut *tx, &evidence)
         .await
         .map_err(internal_error)?;
@@ -1240,8 +1262,18 @@ pub async fn update_with_evidence(
     // its `…_lands_when_the_session_carries_the_claims_own_group` pair; the same
     // statement holds for `challenge_claim` and `submit_ds_evidence`, and each
     // states it at its own site. It is a tenancy-model decision, not a defect here.
-    let after_truth = TruthValue::clamped(ds.pignistic_prob);
-    {
+    //
+    // MIGRATION 114: on a public claim the caller does not own, neither update
+    // runs (labels were refused above) and `truth_after` reports the unchanged
+    // value. The recombined DS belief is still returned below.
+    let after_truth = if foreign_claim {
+        claim.truth_value
+    } else {
+        TruthValue::clamped(ds.pignistic_prob)
+    };
+    if foreign_claim {
+        tx.commit().await.map_err(internal_error)?;
+    } else {
         ClaimRepository::update_truth_value_conn(
             &mut tx,
             ClaimId::from_uuid(claim_id),
@@ -1287,6 +1319,12 @@ pub async fn update_with_evidence(
         claim_id: claim_id.to_string(),
         truth_before: before,
         truth_after: after_truth.value(),
+        truth_written: !foreign_claim,
+        evidence_owner: if foreign_claim {
+            "writer"
+        } else {
+            "claim_owner"
+        },
         evidence_id: evidence.id.as_uuid().to_string(),
         belief_wired: true,
         bba_stored: true,
