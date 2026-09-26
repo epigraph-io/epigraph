@@ -1367,7 +1367,21 @@ pub struct VerifyResponse {
 pub struct UpdateResponse {
     pub claim_id: String,
     pub truth_before: f64,
+    /// The claim's `truth_value` after this call. Equal to `truth_before` when
+    /// [`Self::truth_written`] is `false`.
     pub truth_after: f64,
+    /// Whether this call wrote the claim's `truth_value`. `false` when the
+    /// caller attached to a PUBLIC claim it does not own (migration 114): the
+    /// evidence and its BBA are the caller's own rows (owned by the caller's
+    /// group, public), the claim's DS belief cache (`belief` / `plausibility`
+    /// / `pignistic_prob` below) is recombined over every writer's mass
+    /// functions, and the claim ROW's `truth_value` stays the owner's.
+    pub truth_written: bool,
+    /// `"claim_owner"` when the caller could write the claim (the evidence
+    /// inherits the claim's owner, as before), `"writer"` when it attached to a
+    /// public claim it does not own and the evidence and BBA are owned by the
+    /// caller's own group (migration 114).
+    pub evidence_owner: &'static str,
     pub evidence_id: String,
     /// Whether the Dempster-Shafer wiring for this submission landed. Always
     /// `true` in a response.
@@ -1401,7 +1415,16 @@ pub struct UpdateResponse {
     /// written before a late-step failure is rolled back with everything else —
     /// so no response can carry `false`. Retained for client compatibility.
     pub bba_stored: bool,
-    /// Always absent from a response since D2. #497 reported the DS wiring's
+    /// Whether the claim's cached Dempster-Shafer columns now hold the
+    /// `belief` / `plausibility` / `pignistic_prob` below. Always `true` for a
+    /// caller that can write the claim. `false` when a non-owner of a public
+    /// claim may not write its cache on this frame (migration 114: the cache
+    /// is refreshed only on the frame it already carries, and seeded only on
+    /// `binary_truth` when the claim has none): the evidence and its BBA are
+    /// stored, the values below are this call's combination, and `warning`
+    /// says so.
+    pub cache_written: bool,
+    /// Always absent from a response since D2.#497 reported the DS wiring's
     /// step-prefixed error here on its best-effort path; that text is now the
     /// tool's -32603 error MESSAGE instead, because the failure rolls the whole
     /// submission back. Kept (skipped when `None`) for client compatibility.
@@ -1413,10 +1436,11 @@ pub struct UpdateResponse {
     pub plausibility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
-    /// Populated ONLY when supporting evidence *lowered* the pignistic
-    /// probability (weak/high-ignorance-mass BBA on a claim with no prior DS
-    /// state). This is mathematically correct Dempster-Shafer combination —
-    /// the warning exists so callers don't mistake it for a bug.
+    /// Populated when supporting evidence *lowered* the pignistic probability
+    /// (weak/high-ignorance-mass BBA on a claim with no prior DS state; this is
+    /// mathematically correct Dempster-Shafer combination, and the warning
+    /// exists so callers don't mistake it for a bug), and when
+    /// [`Self::cache_written`] is `false`. Several notes are joined by a space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -2185,9 +2209,23 @@ pub struct ReportWorkflowOutcomeResponse {
     pub workflow_id: String,
     pub evidence_id: String,
     pub truth_before: f64,
+    /// The workflow claim's `truth_value` after this call. Equal to
+    /// `truth_before` when [`Self::truth_written`] is `false`.
     pub truth_after: f64,
+    /// Whether this call wrote the workflow claim's `truth_value`. `false` when
+    /// the caller reported on a PUBLIC workflow claim it does not own
+    /// (migration 114): the outcome evidence and its BBA are the caller's own
+    /// rows (owned by the caller's group, public), and the claim ROW stays its
+    /// owner's.
+    pub truth_written: bool,
+    /// Whether the workflow claim's cached Dempster-Shafer columns were written
+    /// by this call. See [`UpdateResponse::cache_written`].
+    pub cache_written: bool,
     pub total_uses: i64,
     pub success_rate: f64,
+    /// Present when [`Self::cache_written`] is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -47,6 +47,14 @@ pub struct DsAutoResult {
     pub mass_on_conflict: Prob,
     pub mass_on_missing: Prob,
     pub frame_id: Uuid,
+    /// Whether the claim's cached DS columns were written with the values
+    /// above. `false` when the caller is a non-owner of a public claim whose
+    /// cache it may not write on this frame (migration 114: a non-owner
+    /// refreshes a cache only on the frame it already carries, and seeds one
+    /// only on `binary_truth` when the claim has no cache at all). The BBA is
+    /// stored either way; the values above are then this call's combination,
+    /// NOT what the claim's cache holds.
+    pub cache_written: bool,
 }
 
 /// Entry for batch DS wiring (used by `do_ingest_document`).
@@ -467,7 +475,7 @@ pub async fn auto_wire_ds_for_claim(
     let (bel, pl, betp, conflict, missing) = compute_measures(&discounted);
 
     // Update claim DS columns
-    MassFunctionRepository::update_claim_belief(
+    let cache_written = MassFunctionRepository::update_claim_belief(
         &mut *conn,
         claim_id,
         epigraph_db::CachedBelief {
@@ -489,6 +497,7 @@ pub async fn auto_wire_ds_for_claim(
         mass_on_conflict: conflict,
         mass_on_missing: missing,
         frame_id,
+        cache_written,
     })
 }
 
@@ -692,7 +701,7 @@ pub async fn auto_wire_ds_update(
         }
     }
 
-    MassFunctionRepository::update_claim_belief(
+    let cache_written = MassFunctionRepository::update_claim_belief(
         &mut *conn,
         claim_id,
         epigraph_db::CachedBelief {
@@ -714,6 +723,7 @@ pub async fn auto_wire_ds_update(
         mass_on_conflict: conflict,
         mass_on_missing: missing,
         frame_id,
+        cache_written,
     })
 }
 

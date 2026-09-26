@@ -1025,7 +1025,7 @@ async fn recompute_combined_belief(
         return Ok(());
     };
 
-    MassFunctionRepository::update_claim_belief(
+    let written = MassFunctionRepository::update_claim_belief(
         &mut *conn,
         claim_id,
         epigraph_db::CachedBelief {
@@ -1040,8 +1040,11 @@ async fn recompute_combined_belief(
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
 
-    if let Some(label) = preview.classification {
-        MassFunctionRepository::update_claim_classification(&mut *conn, claim_id, &label)
+    // The verdict belongs to the cache it describes: when the cache was not
+    // written (a non-owner on a frame the claim's cache does not carry,
+    // migration 114), neither is its classification.
+    if let (true, Some(label)) = (written, preview.classification) {
+        MassFunctionRepository::update_claim_classification(&mut *conn, claim_id, &label, frame_id)
             .await
             .map_err(|e| format!("update_claim_classification: {e}"))?;
     }

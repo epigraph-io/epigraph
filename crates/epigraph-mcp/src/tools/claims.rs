@@ -1067,11 +1067,6 @@ pub async fn update_with_evidence(
     // on the strength of a submission the caller was told had failed.
     epigraph_db::reject_unexpanded_labels(&params.labels).map_err(db_caller_error)?;
 
-    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(claim_id))
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
-
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let pub_key = server.signer.public_key();
@@ -1129,6 +1124,40 @@ pub async fn update_with_evidence(
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
             .await?;
+
+    // Read the claim through the caller's viewer on THIS stamped transaction,
+    // before anything is written, as `submit_ds_evidence` does. Not on
+    // `server.pool`: that is an unstamped application connection in
+    // production, which RLS lets see no group-private row whatever the viewer
+    // says, so an agent adding evidence to its OWN group-private claim was told
+    // "not found". An unreadable private claim and a nonexistent id still give
+    // the same answer.
+    let claim = ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(claim_id))
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
+
+    // ── MIGRATION 114: A NON-OWNER ATTACHING TO A PUBLIC CLAIM ──────────
+    //
+    // Asked on THIS stamped transaction, so "can read" and "can write" are the
+    // session's own answers. When true, the evidence row and its BBA are the
+    // caller's (the `<table>_attach_writer` trigger owns them by the caller's
+    // group, public), the DS cache is refreshed through the audited definer
+    // path inside `update_claim_belief`, and the claim ROW is not written: its
+    // `truth_value` and `labels` stay the owner's. A label merge is therefore
+    // refused HERE, before anything is written, rather than dropped silently
+    // after the evidence lands (dropped run-tag labels were backlog f14592cb).
+    let foreign_claim =
+        epigraph_db::repos::foreign_attach::is_foreign_public_claim(&mut tx, claim_id)
+            .await
+            .map_err(internal_error)?;
+    if foreign_claim && !params.labels.is_empty() {
+        return Err(invalid_params(format!(
+            "claim {claim_id} is a public claim this caller does not own: evidence can be \
+             attached (it is owned by the caller's group and stays public), but its labels \
+             belong to the claim's owner. Resubmit without `labels`; nothing was written."
+        )));
+    }
 
     EvidenceRepository::create(&mut *tx, &evidence)
         .await
@@ -1240,8 +1269,18 @@ pub async fn update_with_evidence(
     // its `…_lands_when_the_session_carries_the_claims_own_group` pair; the same
     // statement holds for `challenge_claim` and `submit_ds_evidence`, and each
     // states it at its own site. It is a tenancy-model decision, not a defect here.
-    let after_truth = TruthValue::clamped(ds.pignistic_prob);
-    {
+    //
+    // MIGRATION 114: on a public claim the caller does not own, neither update
+    // runs (labels were refused above) and `truth_after` reports the unchanged
+    // value. The recombined DS belief is still returned below.
+    let after_truth = if foreign_claim {
+        claim.truth_value
+    } else {
+        TruthValue::clamped(ds.pignistic_prob)
+    };
+    if foreign_claim {
+        tx.commit().await.map_err(internal_error)?;
+    } else {
         ClaimRepository::update_truth_value_conn(
             &mut tx,
             ClaimId::from_uuid(claim_id),
@@ -1269,12 +1308,30 @@ pub async fn update_with_evidence(
     // pignistic-to-pignistic; when the claim had no prior DS state the column is
     // NULL, so fall back to the truth_value the fresh BBA combined against.
     let pre_belief = pre_pignistic.unwrap_or(before);
-    let warning = (params.supports && ds.pignistic_prob < pre_belief).then(|| {
-        "Supporting evidence decreased belief — the new evidence has high \
-         ignorance mass relative to the prior; this is mathematically correct \
-         DS combination, not a bug."
-            .to_string()
-    });
+    let mut warnings: Vec<String> = Vec::new();
+    if params.supports && ds.pignistic_prob < pre_belief {
+        warnings.push(
+            "Supporting evidence decreased belief — the new evidence has high \
+             ignorance mass relative to the prior; this is mathematically correct \
+             DS combination, not a bug."
+                .to_string(),
+        );
+    }
+    // Migration 114: a non-owner refreshes a claim's cached belief only on the
+    // frame the cache already carries, and seeds one only on `binary_truth`
+    // when the claim has no cache at all. When that refused the write, the
+    // belief / plausibility / pignistic_prob below are THIS call's combination
+    // and the claim's cache still holds its previous values: say so.
+    if !ds.cache_written {
+        warnings.push(format!(
+            "claim {claim_id}'s cached belief was NOT updated: it is carried on another frame \
+             (or on an older cache with no recorded frame), which a non-owner does not \
+             re-point. Your evidence and its BBA are stored; belief, plausibility and \
+             pignistic_prob in this response are this call's combination on binary_truth, \
+             not the claim's cached values."
+        ));
+    }
+    let warning = (!warnings.is_empty()).then(|| warnings.join(" "));
 
     // `belief_wired` / `bba_stored` / `ds_wire_error` are #497's response fields,
     // kept because clients may already read them. Under D2 a success response is
@@ -1287,9 +1344,16 @@ pub async fn update_with_evidence(
         claim_id: claim_id.to_string(),
         truth_before: before,
         truth_after: after_truth.value(),
+        truth_written: !foreign_claim,
+        evidence_owner: if foreign_claim {
+            "writer"
+        } else {
+            "claim_owner"
+        },
         evidence_id: evidence.id.as_uuid().to_string(),
         belief_wired: true,
         bba_stored: true,
+        cache_written: ds.cache_written,
         ds_wire_error: None,
         belief: Some(ds.belief),
         plausibility: Some(ds.plausibility),

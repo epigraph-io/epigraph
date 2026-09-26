@@ -287,6 +287,43 @@ pub async fn submit_ds_evidence(
         crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_ds_evidence")
             .await?;
 
+    // Read the claim through the caller's viewer BEFORE anything is written, on
+    // the stamped transaction (not `server.pool`, which is an unstamped
+    // application connection in production and hides every group-private row
+    // from RLS whatever the viewer says). A group-private claim the caller
+    // cannot read then gives exactly the answer a nonexistent id gives. Without
+    // this read the first write below was the first thing to touch the claim,
+    // and it answered an unreadable private claim with a row-level-security
+    // refusal and a nonexistent one with a foreign-key error: an existence
+    // oracle. (Migration 114 then decides who owns what this call writes: see
+    // the tool description.)
+    epigraph_db::ClaimRepository::get_by_id(
+        &mut *tx,
+        viewer,
+        epigraph_core::ClaimId::from_uuid(claim_id),
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
+
+    // Migration 114: on a public claim this caller does not own, the BBA is the
+    // caller's own row, but the claim's frame assignment and its cached belief
+    // stay the owner's. Say so in the response rather than let a kept
+    // hypothesis_index or an un-re-pointed cache look like a silent drop.
+    if epigraph_db::repos::foreign_attach::is_foreign_public_claim(&mut tx, claim_id)
+        .await
+        .map_err(internal_error)?
+    {
+        warnings.push(format!(
+            "claim {claim_id} is a public claim this caller does not own: this BBA is stored, \
+             owned by the caller's group and public. The claim's frame assignment keeps the \
+             hypothesis_index its owner set (a missing binary_truth assignment can only be \
+             created at index 0), and the claim's cached belief (the belief returned here) is \
+             refreshed only when it already carries this frame, or seeded on binary_truth when \
+             the claim has no cache at all; a non-owner never re-points it to another frame."
+        ));
+    }
+
     FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
         .await
         .map_err(internal_error)?;
@@ -378,12 +415,14 @@ pub async fn submit_ds_evidence(
     // found" with 1 BBA and 1 `claim_frames` row committed, and so did a
     // request viewer that cannot read the claim. On the transaction the read
     // sees what the author's stamp sees, which is the row it just updated.
-    let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing): (
-        f64,
-        f64,
-        f64,
+    #[allow(clippy::type_complexity)]
+    let (c_belief, c_plausibility, c_mass_on_empty, c_pignistic_prob, c_mass_on_missing, c_frame): (
         Option<f64>,
-        f64,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<uuid::Uuid>,
     ) = {
         // PR-09: this is a per-id belief oracle over a caller-supplied uuid —
         // it returns the BetP and mass distribution of any claim in the corpus.
@@ -410,7 +449,8 @@ pub async fn submit_ds_evidence(
         // `fetch_one` gave `RowNotFound` -> internal_error. Strictly better,
         // and recorded in the PR-09 ledger's behaviour_changes.
         let sql = viewer.splice(
-            "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
+            "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing,
+                    belief_frame_id
              FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
             2,
         );
@@ -424,6 +464,46 @@ pub async fn submit_ds_evidence(
             .ok_or_else(|| {
                 rmcp::model::ErrorData::invalid_request(format!("claim {claim_id} not found"), None)
             })?
+    };
+
+    // Migration 114: the claim's cache carries THIS frame's combination only
+    // when the recompute above was allowed to write it. A non-owner of a public
+    // claim refreshes a cache only on the frame it already carries, and seeds
+    // one only on `binary_truth` when the claim has none, so the cache may
+    // still describe another frame (or an older frameless combination), or be
+    // empty. Then the response reports this frame's combination, computed by
+    // the same write-free pipeline, and says the cache was not updated, rather
+    // than presenting another frame's cache as this call's belief (or failing
+    // on an empty one after the BBA was stored).
+    let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing) = match (
+        c_frame == Some(frame_id),
+        c_belief,
+        c_plausibility,
+        c_mass_on_empty,
+        c_mass_on_missing,
+    ) {
+        (true, Some(b), Some(pl), Some(me), Some(mm)) => (b, pl, me, c_pignistic_prob, mm),
+        _ => {
+            let preview = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+                &mut tx, viewer, claim_id, frame_id,
+            )
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| internal_error("no BBA on this frame after storing one"))?;
+            warnings.push(format!(
+                "claim {claim_id}'s cached belief was NOT updated by this call: it carries another \
+                 frame (or an older cache with no recorded frame, or none on a frame other than \
+                 binary_truth), which a non-owner does not re-point or seed. belief, plausibility \
+                 and pignistic_prob here are this frame's combination, not the claim's cache."
+            ));
+            (
+                preview.belief,
+                preview.plausibility,
+                preview.conflict_k,
+                Some(preview.pignistic_prob),
+                preview.missing_mass,
+            )
+        }
     };
 
     tx.commit().await.map_err(internal_error)?;

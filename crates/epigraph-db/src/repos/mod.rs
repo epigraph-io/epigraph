@@ -31,6 +31,7 @@ pub mod evidence;
 pub mod evidence_encryption;
 pub mod experiment;
 pub mod factor;
+pub mod foreign_attach;
 pub mod frame;
 pub mod gap;
 pub mod graph_view;

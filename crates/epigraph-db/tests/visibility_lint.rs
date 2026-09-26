@@ -472,6 +472,16 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "foreign_attach.rs",
+        "is_foreign_public_claim",
+        "ROUTING QUESTION, not a disclosure (migration 114). Returns one boolean: whether the \
+         STAMPED session would attach to this claim as a non-owner. Its read of `claims` is the \
+         session's own RLS-filtered read (the answer for a claim the session cannot see is \
+         `false`, the same as for a missing one), it projects no column, and every caller \
+         (`update_with_evidence`, `submit_ds_evidence`, `report_workflow_outcome`) asks it on the \
+         same stamped transaction on which the claim is read through the caller's viewer.",
+    ),
+    (
         "claim.rs",
         "supersede_conn",
         "WRITE. The body of `supersede`, moved onto a caller-owned connection so the HTTP route \
