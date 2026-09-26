@@ -1870,15 +1870,19 @@ pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 /// arms are what make it reachable: agents linked to the same operator are
 /// co-owners, so a new identity may retire the items of every other agent
 /// under its operator. With that in place the stdio half takes the normal
-/// ownership rule — the author, an agent acting for the author's operator, or
-/// (per-process random signer only) the undeclared-signer arm. Everyone else
-/// is refused; an admin retiring across operators uses the audited admin path,
-/// which needs an authenticated `claims:admin` token (batch H-b, D2).
+/// ownership rule — the author, or an agent acting for the author's operator.
+/// The undeclared-signer arm (a per-process random signer, no `--agent-key` /
+/// `--agent-model`) is REFUSED here: it admits on UNDECIDABLE ownership, and
+/// the batch H-b review measured it adding `resolved` to a foreign claim on
+/// config B. Everyone else is refused; an admin retiring across operators uses
+/// the audited admin path, which needs an authenticated `claims:admin` token
+/// (batch H-b, D2).
 ///
-/// The one population this newly refuses is a stdio agent retiring a claim by
-/// an agent it shares no operator with (unlinked fleet agents included): the
+/// The populations this newly refuses: a stdio agent retiring a claim by an
+/// agent it shares no operator with (unlinked fleet agents included) — the
 /// `release/epiclaw/CLAUDE.md` procedure that relabels cross-agent items with
-/// `update_labels` now works only between agents linked to one operator.
+/// `update_labels` now works only between agents linked to one operator — and
+/// an undeclared-signer stdio server retiring anything it did not author.
 ///
 /// Removing `backlog` also takes an item out of the open-backlog query and is
 /// NOT gated here: it is free vocabulary on stdio (the batch H-b bar freezes
@@ -1928,6 +1932,26 @@ async fn gate_retirement_label(
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
     let grant = require_owner_or_admin(server, auth, caller, claim.agent_id.as_uuid()).await?;
+    // THE UNDECLARED-SIGNER ARM DOES NOT RETIRE (batch H-b review). That arm
+    // admits a cross-agent mutation because ownership is UNDECIDABLE on a stdio
+    // server with a per-process random signer, not because it is decided in
+    // the caller's favour. For the retirement label that is exactly #374's
+    // hole: measured on config B, such a server added `resolved` to a FOREIGN
+    // claim through `update_labels`. Its own claims are unaffected (they pass
+    // the author arm first), and `resolve_backlog_item`, which leaves the
+    // `Resolves <id>:` trail this gate exists to protect, keeps the arm.
+    if grant == OwnershipGrant::UndeclaredSigner {
+        return Err(invalid_params(format!(
+            "claim {claim_id} is owned by agent {}; this stdio server has no declared signer \
+             identity (--agent-key / --agent-model absent), so whether caller agent {} owns it \
+             cannot be decided, and adding or removing '{RETIREMENT_LABEL}' needs a decided \
+             owner. Run the server under the owning agent's key (or one linked to the same \
+             operator), use resolve_backlog_item, or use the audited admin path over HTTP. \
+             Nothing was written.",
+            claim.agent_id.as_uuid(),
+            caller.agent_id()
+        )));
+    }
     Ok(Some(grant))
 }
 

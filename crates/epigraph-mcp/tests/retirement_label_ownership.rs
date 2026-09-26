@@ -21,9 +21,10 @@
 //!   control for cross-agent taxonomy maintenance;
 //! * with `auth = None` (stdio) the retirement label takes the ownership rule
 //!   since batch H-b (#374's stdio half): the author, or an agent linked to
-//!   the author's operator (#503), or a per-process random signer
-//!   (undecidable, allowed). A declared stdio signer that shares no operator
-//!   with the author is refused. The old
+//!   the author's operator (#503). A declared stdio signer that shares no
+//!   operator with the author is refused, and so is a per-process random
+//!   signer on anything it did not author (its arm admits on undecidable
+//!   ownership, which the retirement label no longer accepts). The old
 //!   carve-out existed because a model-bumped fleet agent could not reach its
 //!   predecessor's items; #503's operator arms are what reach them now.
 
@@ -365,20 +366,47 @@ async fn update_labels_admits_resolved_for_the_author_and_a_same_operator_siblin
         .contains(&"resolved".to_string()));
 }
 
-/// A per-process random signer keeps its pre-existing warn-and-allow arm: its
-/// ownership comparison is undecidable, not failed (`require_owner_or_admin`).
+/// Batch H-b review (authority-attack, low), measured on config B: a stdio
+/// server with no `--agent-key` / `--agent-model` added `resolved` to a
+/// FOREIGN claim, because `require_owner_or_admin`'s undeclared-signer arm
+/// admits on UNDECIDABLE ownership. That is #374's hole on the one transport
+/// the stdio half was meant to close, so the retirement gate refuses that arm.
+/// This arm was `an_undeclared_stdio_signer_may_still_retire`, which pinned the
+/// opposite. Calibration: the same server still retires the claims it
+/// authored (the author arm runs first).
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_undeclared_stdio_signer_may_still_retire(pool: PgPool) {
+async fn an_undeclared_stdio_signer_cannot_retire_a_claim_it_did_not_author(pool: PgPool) {
     let claim = seed_claim_with_labels(&pool, "undeclared-signer item", &["backlog"]).await;
     let viewer = fixture::public_viewer(&pool).await;
     let server = common::build_scoped_test_server_generated_signer(
         pool.clone(),
         fixture::scoped_pool(&pool).await,
     );
-    stdio_retire(&server, &viewer, claim)
+    let err = stdio_retire(&server, &viewer, claim)
         .await
-        .expect("an undeclared signer's comparison is undecidable, so it is allowed");
-    assert!(labels_of(&pool, claim)
+        .expect_err("undecidable ownership does not retire another agent's item");
+    assert!(
+        err.message.contains("no declared signer"),
+        "{}",
+        err.message
+    );
+    assert!(!labels_of(&pool, claim)
+        .await
+        .contains(&"resolved".to_string()));
+
+    let me = server.server_agent_id().await.expect("server agent");
+    let mine =
+        seed_claim_with_labels(&pool, "the undeclared signer's own item", &["backlog"]).await;
+    sqlx::query("UPDATE claims SET agent_id = $2 WHERE id = $1")
+        .bind(mine)
+        .bind(me)
+        .execute(&pool)
+        .await
+        .expect("author the claim as this server's generated agent");
+    stdio_retire(&server, &viewer, mine)
+        .await
+        .expect("the author arm still admits the server's own item");
+    assert!(labels_of(&pool, mine)
         .await
         .contains(&"resolved".to_string()));
 }
