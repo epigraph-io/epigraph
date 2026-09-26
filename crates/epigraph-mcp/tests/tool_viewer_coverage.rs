@@ -112,11 +112,11 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     // now acquire a viewer, spend its `writable_groups()`/principal on
     // `epigraph_authz::GroupPolicyGate`, and refuse a caller who is neither the
     // node's owner nor a writer in its owning group.
-    // The batch H-b review removed `publish_event`: over HTTP its actor must be
-    // the request's principal, read off the viewer.
+    // The batch H-b review removed `publish_event` (over HTTP its actor must be
+    // the request's principal, read off the viewer) and
+    // `set_source_reliability` (read, owned and written as that principal).
     "create_frame",
     "report_hierarchical_outcome",
-    "set_source_reliability",
     "structure_source",
     // pure-CPU, no DB
     "list_mcp_tools",

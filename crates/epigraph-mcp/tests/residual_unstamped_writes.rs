@@ -187,13 +187,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          the static `instance_wide()` arm admits it unstamped.",
     ),
     (
-        "tools/perspectives.rs",
-        "PerspectiveRepository::set_source_reliability",
-        1,
-        "`set_source_reliability`. Same registry table as above; an UPDATE rather than an INSERT, \
-         and the static arm covers it for the same reason.",
-    ),
-    (
         "tools/themes.rs",
         "run_theme_kmeans",
         1,

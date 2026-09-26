@@ -1060,6 +1060,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          projects back only the row this statement just inserted; `create_strict` delegates to it.",
     ),
     (
+        "perspective.rs",
+        "set_source_reliability_conn",
+        "WRITE of one caller-named `perspectives` row's `properties.source_reliability` on the \
+         caller's STAMPED connection (batch H-b review). There is no read to filter: \
+         `perspectives`' own row security decides the UPDATE with the stamp's write authority, \
+         and the MCP caller has already read the row through its viewer on the same \
+         transaction; the returned count lets it refuse a write that changed nothing.",
+    ),
+    (
         "workflow.rs",
         "ingest_anchors",
         "READ of `workflows` only: three `find_root_by_canonical` / `head_by_canonical` lookups \
@@ -1857,6 +1866,15 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ of `workflows` by `canonical_name` (latest generation). `workflows` has no row \
          security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
          viewer to filter; batch H-b's H3 check resolves the workflow a step op names with it.",
+    ),
+    (
+        "perspective.rs",
+        "set_reliability_map",
+        "WRITE of one caller-named `perspectives` row's reliability map (the body the pool \
+         forms and `set_source_reliability_conn` share; executor-generic since the batch H-b \
+         review so the MCP tool can run it on its stamped transaction and count the rows). \
+         There is no read to filter: `perspectives`' row security decides the UPDATE with the \
+         executor's stamp, and it stays the one ungated write `write_gate_lint` registers.",
     ),
     (
         "security_event.rs",

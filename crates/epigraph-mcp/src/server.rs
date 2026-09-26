@@ -1704,14 +1704,19 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override."
+        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override. Written with the calling agent's write authority (the authenticated caller over HTTP, this server's own agent on stdio): a perspective you cannot read reports not found, one you cannot write is refused, and neither writes anything. Over HTTP it also requires the perspective's owner, the owner's operator, or claims:admin."
     )]
     async fn set_source_reliability(
         &self,
         Parameters(params): Parameters<SetSourceReliabilityParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::perspectives::set_source_reliability(self, params).await
+        // A viewer since the batch H-b review: the perspective is read, owned
+        // and written with the request's principal.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::perspectives::set_source_reliability(self, viewer, params, auth).await
     }
 
     #[tool(description = "List all perspectives with optional limit.")]

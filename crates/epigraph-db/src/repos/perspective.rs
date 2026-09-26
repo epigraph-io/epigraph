@@ -154,15 +154,15 @@ impl PerspectiveRepository {
     /// Merge a `tag → factor` map into `properties.<field>` without disturbing
     /// other `properties` entries. The path element is parameterised (bound as
     /// `text[]`), so callers supply a static field name — no SQL injection.
-    #[instrument(skip(pool, map))]
-    async fn set_reliability_map(
-        pool: &PgPool,
+    #[instrument(skip(executor, map))]
+    async fn set_reliability_map<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         field: &str,
         map: &std::collections::HashMap<String, f64>,
-    ) -> Result<(), DbError> {
+    ) -> Result<u64, DbError> {
         let value = serde_json::to_value(map).unwrap_or(serde_json::Value::Null);
-        sqlx::query(
+        let done = sqlx::query(
             r#"
             UPDATE perspectives
             SET properties = jsonb_set(
@@ -177,9 +177,9 @@ impl PerspectiveRepository {
         .bind(id)
         .bind(field)
         .bind(value)
-        .execute(pool)
+        .execute(executor)
         .await?;
-        Ok(())
+        Ok(done.rows_affected())
     }
 
     /// Set this perspective's source-reliability map (evidence-type tag → α ∈
@@ -193,7 +193,32 @@ impl PerspectiveRepository {
         id: Uuid,
         reliability: &std::collections::HashMap<String, f64>,
     ) -> Result<(), DbError> {
-        Self::set_reliability_map(pool, id, "source_reliability", reliability).await
+        Self::set_reliability_map(pool, id, "source_reliability", reliability)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::set_source_reliability`] on the CALLER's connection, returning
+    /// how many rows it changed (batch H-b review).
+    ///
+    /// The pool form returns `()` and runs unstamped, and MCP
+    /// `set_source_reliability` answered `status: set` on it for a
+    /// group-private foreign perspective (the UPDATE's USING filtered the row
+    /// out: 0 rows) and for a nonexistent id. This one runs on the caller's
+    /// stamped transaction, so `perspectives`' row security decides with the
+    /// caller's write authority, and the count lets the caller refuse a write
+    /// that changed nothing.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the UPDATE fails (a `42501` from
+    /// `WITH CHECK` included).
+    pub async fn set_source_reliability_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        reliability: &std::collections::HashMap<String, f64>,
+    ) -> Result<u64, DbError> {
+        // The one registered ungated write (`write_gate_lint`), not a second.
+        Self::set_reliability_map(&mut *conn, id, "source_reliability", reliability).await
     }
 
     /// Set this perspective's locality-reliability map (`locality_tag` → factor
@@ -207,7 +232,9 @@ impl PerspectiveRepository {
         id: Uuid,
         reliability: &std::collections::HashMap<String, f64>,
     ) -> Result<(), DbError> {
-        Self::set_reliability_map(pool, id, "locality_reliability", reliability).await
+        Self::set_reliability_map(pool, id, "locality_reliability", reliability)
+            .await
+            .map(|_| ())
     }
 
     /// Ensure a synthetic "evidence_grounded" perspective row exists with the
