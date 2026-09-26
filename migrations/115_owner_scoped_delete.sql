@@ -32,8 +32,14 @@
 -- body owned by `epigraph_maintenance`) are the first two disjuncts of every
 -- policy here, as in 077.
 --
--- UPDATE is NOT changed here. 077's UPDATE side (USING = the read predicate,
--- WITH CHECK = the writable set, plus the world arm on `edges` and the four
+-- UPDATE of `owner_group_id` IS changed here, because the DELETE rule depends
+-- on it: a session that could move a row into its own group with an UPDATE
+-- could then delete it as that group's writer. 077's UPDATE admits exactly
+-- that (USING = the read predicate, WITH CHECK = the writable set), so section
+-- 7 makes `owner_group_id` (and `edges.co_owner_group_id`) immutable to every
+-- non-privileged session on every table below, as 114 already did for
+-- `evidence`, `mass_functions` and `reasoning_traces`. The rest of 077's
+-- UPDATE side (the other columns, and the world arm on `edges` and the four
 -- registries) is a separate item; section 3 states the one place this file's
 -- admission leans on it.
 --
@@ -199,14 +205,32 @@
 -- SELECT / INSERT / UPDATE only; this is the narrowest grant under which the
 -- bodies work, and a maintenance login already bypasses every policy here.
 --
+-- ===================================================================
+-- 7. OWNER IMMUTABILITY (`epigraph_owner_immutable_guard`)
+-- ===================================================================
+--
+-- A BEFORE UPDATE OF `owner_group_id` row trigger, `<table>_owner_immutable`,
+-- on each of the 21 tables of section 1 that 114's `<table>_writer_owner_guard`
+-- does not already cover (on `edges` it also watches `co_owner_group_id`). It
+-- refuses (42501) a change of the owner from any session that is not
+-- privileged in 114's sense (`epigraph_session_is_privileged_writer()`: a
+-- superuser or BYPASSRLS role, a maintenance login, or a body running as the
+-- maintenance role). A WITH CHECK cannot see the OLD row, so this has to be a
+-- trigger. `UPDATE OF` fires only when the statement's SET list names the
+-- column, so the tenancy triggers that restamp an owner from the row's parent
+-- or endpoints (074, 070/072) are unaffected, and the propagation, privatization,
+-- backfill and operator re-own paths all run as the maintenance role. No
+-- application path re-owns one of these rows.
+--
 -- DEPLOY ORDER: apply 115 BEFORE any binary built with it serves: the repo
 -- layer calls `epigraph_cascade_delete_edge_bbas` for every non-privileged
 -- cascade. A binary built without 115 against a database at 115 runs its old
 -- plain statements, which the policies then scope to owned rows.
 --
--- Undo: DROP the 24 `<table>_delete_owner` policies; point the three
+-- Undo: DROP the 24 `<table>_delete_owner` policies and the 21
+-- `<table>_owner_immutable` triggers; point the three
 -- `<node>_cascade_edges` triggers back at `cascade_delete_edges('<type>')`;
--- restore 114's body of `epigraph_dedup_move_bbas`; DROP the three new
+-- restore 114's body of `epigraph_dedup_move_bbas`; DROP the four new
 -- functions; REVOKE DELETE ON mass_functions, edges FROM epigraph_maintenance.
 -- Checked before claiming: no `origin/*` ref carries a `115`.
 
@@ -481,6 +505,59 @@ CREATE TRIGGER traces_cascade_edges BEFORE DELETE ON public.reasoning_traces
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_cascade_delete_node_edges('trace');
 
 -- ===================================================================
+-- 7. OWNER IMMUTABILITY
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_owner_immutable_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF public.epigraph_session_is_privileged_writer() THEN RETURN NEW; END IF;
+    RAISE EXCEPTION 'epigraph tenancy: an UPDATE of % changes owner_group_id or '
+                    'co_owner_group_id; only a maintenance session re-owns a row',
+                    TG_TABLE_NAME
+        USING ERRCODE = '42501';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_owner_immutable_guard() FROM PUBLIC;
+
+DO $$
+DECLARE t text;
+        guarded text[] := ARRAY[
+          'claims',
+          'triples','entity_mentions','claim_versions',
+          'ds_combined_beliefs','ds_bayesian_divergence','claim_frames',
+          'harvester_claim_provenance',
+          'challenges','experiment_triples',
+          'experiment_entity_mentions','claim_clusters','claim_cluster_membership',
+          'claim_neighborhood_membership','claim_signature_revocations',
+          'harvester_fragments',
+          'frames','contexts','perspectives','communities'];
+BEGIN
+    FOREACH t IN ARRAY guarded LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_class c
+                         JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = 'public' AND c.relname = t
+                          AND c.relkind IN ('r', 'p')) THEN
+            CONTINUE;
+        END IF;
+        EXECUTE format('DROP TRIGGER IF EXISTS %I ON public.%I', t || '_owner_immutable', t);
+        EXECUTE format(
+          'CREATE TRIGGER %I BEFORE UPDATE OF owner_group_id ON public.%I
+             FOR EACH ROW
+             WHEN (OLD.owner_group_id IS DISTINCT FROM NEW.owner_group_id)
+             EXECUTE FUNCTION public.epigraph_owner_immutable_guard()',
+          t || '_owner_immutable', t);
+    END LOOP;
+END $$;
+
+DROP TRIGGER IF EXISTS edges_owner_immutable ON public.edges;
+CREATE TRIGGER edges_owner_immutable BEFORE UPDATE OF owner_group_id, co_owner_group_id
+    ON public.edges
+    FOR EACH ROW
+    WHEN (OLD.owner_group_id IS DISTINCT FROM NEW.owner_group_id
+          OR OLD.co_owner_group_id IS DISTINCT FROM NEW.co_owner_group_id)
+    EXECUTE FUNCTION public.epigraph_owner_immutable_guard();
+
+-- ===================================================================
 -- 6. OWNERSHIP AND GRANTS
 -- ===================================================================
 DO $$ BEGIN
@@ -492,6 +569,8 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_dedup_move_bbas(uuid, uuid, uuid[]) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_cascade_delete_node_edges() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_owner_immutable_guard() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT DELETE ON public.mass_functions, public.edges TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_session_writes_node(uuid, text) '

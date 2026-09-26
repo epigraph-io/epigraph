@@ -527,7 +527,11 @@ Current reservation:
   `epigraph_cascade_delete_node_edges()`, 001's statement in a maintenance-owned
   definer, so deleting a node one may delete still removes every edge pointing
   at it. `epigraph_maintenance` gains DELETE on `mass_functions` and `edges`.
-  Registered with `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Behaviour
+  The DELETE rule reads `owner_group_id`, so it depends on that column being
+  immutable to a non-privileged UPDATE: a `<table>_owner_immutable` BEFORE
+  UPDATE OF `owner_group_id` trigger (`epigraph_owner_immutable_guard`; on
+  `edges` also `co_owner_group_id`) refuses (42501) a re-own on the 21 tables
+  114's `<table>_writer_owner_guard` does not already cover. Registered with `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Behaviour
   in `epigraph-db/tests/owner_scoped_delete.rs` (arms as `epigraph_app`).
   **Deploy order: apply 115 BEFORE any binary built with it serves.** Undo is in
   the file's header. **Applied to throwaway databases only (5433, with 113 and

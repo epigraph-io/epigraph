@@ -875,18 +875,148 @@ async fn privileged_sessions_delete_edge_bbas_exactly_as_before(pool: PgPool) {
 }
 
 // ===========================================================================
+// 3b. The owner cannot be moved first (section 7).
+// ===========================================================================
+
+/// The DELETE rule reads `owner_group_id`, so it holds only while a
+/// non-privileged session cannot rewrite that column. A bystander Z tries to
+/// move each world-owned row into its own group and then delete it: a world
+/// claim carrying X's writer-owned BBA, a registry frame (whose FK cascade
+/// would take every BBA on it), the claim's `claim_frames` row, and a
+/// public-public edge (its owner, and its co-owner). Every re-own is refused
+/// with 42501, every follow-up DELETE removes 0, and every row survives. The
+/// harness superuser (a privileged session, as the operator re-own and
+/// privatization paths are) still re-owns the claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_privileged_session_cannot_reown_a_row_and_then_delete_it(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    let (z, z_group) = fixture::seed_agent_with_group(&pool, "bystander-z").await;
+    let claim = fixture::seed_public_claim(&pool, author, "a world claim").await;
+    let other = fixture::seed_public_claim(&pool, author, "another world claim").await;
+    let bt = seed_frame(&pool, "binary_truth").await;
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0)",
+    )
+    .bind(claim)
+    .bind(bt)
+    .execute(&pool)
+    .await
+    .expect("seed the claim's frame assignment");
+    let edge = fixture::seed_edge(&pool, claim, other).await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (mf, seen, outcomes) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, x).await;
+        let mf = store_bba(&mut conn, claim, bt, x, None).await;
+        stamp(&mut conn, &p, z).await;
+        // Calibration: Z reads every target, so a 0 below is not the read rule.
+        let seen: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM claims WHERE id = $1) \
+                  + (SELECT count(*) FROM frames WHERE id = $2) \
+                  + (SELECT count(*) FROM claim_frames WHERE claim_id = $1) \
+                  + (SELECT count(*) FROM edges WHERE id = $3)",
+        )
+        .bind(claim)
+        .bind(bt)
+        .bind(edge)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read as Z");
+        let mut outcomes = Vec::new();
+        // `claim_frames` has no `id`; the claim has exactly one assignment.
+        for (table, key, set, id) in [
+            ("claims", "id", "owner_group_id = $2", claim),
+            ("frames", "id", "owner_group_id = $2", bt),
+            ("claim_frames", "claim_id", "owner_group_id = $2", claim),
+            ("edges", "id", "owner_group_id = $2", edge),
+            (
+                "edges",
+                "id",
+                "visibility = 'group', co_owner_group_id = $2",
+                edge,
+            ),
+        ] {
+            let reown = sqlx::query(&format!("UPDATE {table} SET {set} WHERE {key} = $1"))
+                .bind(id)
+                .bind(z_group)
+                .execute(&mut *conn)
+                .await
+                .map(|r| r.rows_affected())
+                .map_err(|e| {
+                    e.as_database_error()
+                        .and_then(|d| d.code().map(|c| c.to_string()))
+                        .unwrap_or_else(|| e.to_string())
+                });
+            let deleted = sqlx::query(&format!("DELETE FROM {table} WHERE {key} = $1"))
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("DELETE FROM {table}: {e}"))
+                .rows_affected();
+            outcomes.push((table, set, reown, deleted));
+        }
+        (conn, (mf, seen, outcomes))
+    })
+    .await;
+
+    assert_eq!(seen, 4, "calibration: Z reads all four world-owned rows");
+    for (table, set, reown, deleted) in &outcomes {
+        assert_eq!(
+            reown,
+            &Err("42501".to_string()),
+            "{table} SET {set}: a non-privileged re-own is refused"
+        );
+        assert_eq!(*deleted, 0, "{table}: the follow-up DELETE removes nothing");
+    }
+    for (table, id) in [
+        ("claims", claim),
+        ("frames", bt),
+        ("edges", edge),
+        ("mass_functions", mf),
+    ] {
+        assert!(exists(&pool, table, id).await, "{table} {id} survived");
+    }
+    let cf_left: i64 = sqlx::query_scalar("SELECT count(*) FROM claim_frames WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("claim_frames");
+    assert_eq!(cf_left, 1, "the claim's frame assignment survived");
+
+    // Privileged: the operator re-own shape still lands.
+    let n = sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(z_group)
+        .execute(&pool)
+        .await
+        .expect("superuser re-own")
+        .rows_affected();
+    assert_eq!(n, 1, "a privileged session re-owns as before");
+}
+
+// ===========================================================================
 // 4. The catalog.
 // ===========================================================================
 
 /// The ratchet: every relation carrying both tenancy columns under row
 /// security, bar the principal-keyed `recall_events`, has a RESTRICTIVE
-/// FOR DELETE policy. A 25th such table added without one fails here.
+/// FOR DELETE policy, and a BEFORE UPDATE row trigger that keeps its owner
+/// immutable to a non-privileged session (115's `<t>_owner_immutable`, or
+/// 114's `<t>_writer_owner_guard`), without which the policy can be walked
+/// around by re-owning the row first. A 25th such table added without both
+/// fails here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPool) {
-    let rows: Vec<(String, bool)> = sqlx::query_as(
+    let rows: Vec<(String, bool, bool)> = sqlx::query_as(
         "SELECT c.relname::text, \
                 EXISTS (SELECT 1 FROM pg_policy p \
-                         WHERE p.polrelid = c.oid AND p.polcmd = 'd' AND NOT p.polpermissive) \
+                         WHERE p.polrelid = c.oid AND p.polcmd = 'd' AND NOT p.polpermissive), \
+                EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_proc f ON f.oid = t.tgfoid \
+                         WHERE t.tgrelid = c.oid AND NOT t.tgisinternal AND t.tgenabled <> 'D' \
+                           AND f.proname IN ('epigraph_owner_immutable_guard', \
+                                             'epigraph_writer_owner_guard')) \
            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
           WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND c.relrowsecurity \
             AND c.relname <> 'recall_events' \
@@ -906,12 +1036,21 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     );
     let missing: Vec<&String> = rows
         .iter()
-        .filter(|(_, has)| !has)
-        .map(|(t, _)| t)
+        .filter(|(_, has, _)| !has)
+        .map(|(t, _, _)| t)
         .collect();
     assert!(
         missing.is_empty(),
         "no restrictive DELETE policy on {missing:?}"
+    );
+    let unguarded: Vec<&String> = rows
+        .iter()
+        .filter(|(_, _, guarded)| !guarded)
+        .map(|(t, _, _)| t)
+        .collect();
+    assert!(
+        unguarded.is_empty(),
+        "owner_group_id is re-ownable by a non-privileged UPDATE on {unguarded:?}"
     );
 }
 
