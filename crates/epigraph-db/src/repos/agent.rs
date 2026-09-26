@@ -1628,6 +1628,44 @@ impl AgentRepository {
         .await?)
     }
 
+    /// [`Self::link_retired_agent`] for a FORMER shared HTTP signer, through
+    /// migration 116's `epigraph_link_retired_shared_signer` (batch HTTP-id).
+    ///
+    /// 107's retire refuses an agent whose OPERATED_BY auth-lineage names more
+    /// than one principal (the shared-signer fingerprint, 107 section 9). This
+    /// variant admits it only when every such principal other than the agent
+    /// itself and `operator_id` is in `attested`: the maintenance caller's
+    /// statement that every write the signer made for those principals belongs
+    /// to the operator. The lineage check is a sanity check, not proof (edges
+    /// exist only since lineage recording shipped, and are forgeable in the
+    /// direction that refuses more); the attestation is the authority, and is
+    /// recorded in `security_events` (`operator.shared_signer_retired`) and on
+    /// the OPERATED_BY edge. Every other refusal is 107's retire, unchanged, and
+    /// the link is retired with no membership.
+    ///
+    /// Same authorization: EXECUTE-able by `epigraph_maintenance` only.
+    ///
+    /// # Errors
+    /// As [`Self::link_retired_agent`], plus `DbError::QueryFailed` (55000)
+    /// naming each unattested lineage principal; nothing is written.
+    pub async fn link_retired_shared_signer(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        operator_id: Uuid,
+        attested: &[Uuid],
+    ) -> Result<RetiredLinkOutcome, DbError> {
+        Ok(sqlx::query_as::<_, RetiredLinkOutcome>(
+            "SELECT operator_group_id, group_created, link_created, link_retired, \
+                    edge_created, membership_live \
+               FROM public.epigraph_link_retired_shared_signer($1, $2, $3)",
+        )
+        .bind(agent_id)
+        .bind(operator_id)
+        .bind(attested)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
     /// Tier-B projection of one agent, filtered by what `viewer` may see.
     ///
     /// `agents` is deliberately **not** a tenancy-partitioned table: authorship
