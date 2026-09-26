@@ -1244,10 +1244,15 @@ async fn a_non_privileged_session_cannot_reown_a_row_and_then_delete_it(pool: Pg
                 .execute(&mut *conn)
                 .await
                 .map(|r| r.rows_affected())
-                .map_err(|e| {
-                    e.as_database_error()
-                        .and_then(|d| d.code().map(|c| c.to_string()))
-                        .unwrap_or_else(|| e.to_string())
+                // The SQLSTATE alone would not say WHICH rule refused: an RLS
+                // WITH CHECK violation is 42501 too (the co-owner re-own also
+                // fails 077's check). The guard's message pins section 7.
+                .map_err(|e| match e.as_database_error() {
+                    Some(d) if d.message().contains("only a maintenance session re-owns") => {
+                        format!("{} owner guard", d.code().unwrap_or_default())
+                    }
+                    Some(d) => format!("{} {}", d.code().unwrap_or_default(), d.message()),
+                    None => e.to_string(),
                 });
             let deleted = sqlx::query(&format!("DELETE FROM {table} WHERE {key} = $1"))
                 .bind(id)
@@ -1265,7 +1270,7 @@ async fn a_non_privileged_session_cannot_reown_a_row_and_then_delete_it(pool: Pg
     for (table, set, reown, deleted) in &outcomes {
         assert_eq!(
             reown,
-            &Err("42501".to_string()),
+            &Err("42501 owner guard".to_string()),
             "{table} SET {set}: a non-privileged re-own is refused"
         );
         assert_eq!(*deleted, 0, "{table}: the follow-up DELETE removes nothing");
