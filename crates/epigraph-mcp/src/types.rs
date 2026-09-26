@@ -1045,17 +1045,25 @@ pub struct SubmitDsEvidenceParams {
     )]
     pub reliability: Option<f64>,
 
+    // DEPRECATED in the description, deliberately NOT `#[deprecated]`: the
+    // attribute would fire on ds.rs's own reads and fail `-D warnings`, and an
+    // agent reads the description, not the attribute. Backlog 82dcff9d (G5):
+    // honouring a per-call method would re-introduce the second, divergent
+    // combine that backlog 2bffdfdc removed, which needs a design decision.
     #[schemars(
-        description = "Combination method label: Dempster (default), Conjunctive, YagerOpen, \
-                       YagerClosed, DuboisPrade, Inagaki. Validated, stored on the BBA and echoed \
-                       as method_used, but it does NOT change the returned belief: the claim's \
-                       belief is always recomputed by the shared adaptive combine."
+        description = "DEPRECATED: accepted and stored, no effect on belief. Combination method \
+                       label: Dempster (default), Conjunctive, YagerOpen, YagerClosed, DuboisPrade, \
+                       Inagaki. It is validated (an unknown name is refused), stored on the BBA and \
+                       echoed as method_used, but the claim's belief is always recomputed by the \
+                       shared adaptive combine that recompute_beliefs uses, whatever this says. Any \
+                       value other than Dempster adds an entry to the response's warnings."
     )]
     pub combination_method: Option<String>,
 
     #[schemars(
-        description = "Inagaki gamma parameter. Currently has no effect: it is neither stored nor \
-                       used by the belief recompute."
+        description = "DEPRECATED: accepted, NOT stored, no effect on belief. Inagaki gamma \
+                       parameter; the belief recompute never reads it. Sending any value adds an \
+                       entry to the response's warnings."
     )]
     pub gamma: Option<f64>,
 
@@ -2214,6 +2222,12 @@ pub struct DsEvidenceResponse {
     pub mass_on_missing: f64,
     pub bba_count: i64,
     pub method_used: String,
+    /// Human-readable notes about inputs that were ACCEPTED but do not do what
+    /// their name suggests (e.g. a non-default `combination_method` or any
+    /// `gamma`, neither of which changes the returned belief). Omitted when
+    /// empty. Never a refusal: the evidence was stored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

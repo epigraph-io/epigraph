@@ -117,6 +117,12 @@ pub async fn submit_ds_evidence(
         .unwrap_or(CombinationMethod::Dempster);
     let method_name = format!("{method:?}");
 
+    // Backlog 82dcff9d (G5): both parameters are deprecated — accepted, and
+    // `combination_method` stored, but neither reaches the belief (see the
+    // recompute below). A caller who sends a non-default value believes it
+    // does something, so the response says it did not.
+    let warnings = deprecated_parameter_warnings(method, params.gamma);
+
     // Get frame from DB
     let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
         .await
@@ -386,7 +392,32 @@ pub async fn submit_ds_evidence(
         mass_on_missing,
         bba_count: bba_count as i64,
         method_used: method_name,
+        warnings,
     })
+}
+
+/// The `warnings` a `submit_ds_evidence` call earns by sending a deprecated
+/// parameter a non-default value (backlog 82dcff9d, G5).
+///
+/// Dempster is the default and is what an omitted `combination_method` parses
+/// to, so it earns nothing; `gamma` has no default at all, so ANY value does.
+fn deprecated_parameter_warnings(method: CombinationMethod, gamma: Option<f64>) -> Vec<String> {
+    let mut out = Vec::new();
+    if !matches!(method, CombinationMethod::Dempster) {
+        out.push(format!(
+            "combination_method={method:?} is deprecated: it was stored on the BBA and is \
+             echoed as method_used, but it did not change the returned belief. The claim's \
+             belief is always recomputed by the shared adaptive combine (the one \
+             recompute_beliefs uses)."
+        ));
+    }
+    if let Some(g) = gamma {
+        out.push(format!(
+            "gamma={g} is deprecated: it was neither stored nor used, and did not change the \
+             returned belief."
+        ));
+    }
+    out
 }
 
 pub async fn get_belief(
