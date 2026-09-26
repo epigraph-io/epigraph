@@ -62,10 +62,11 @@ const WORLD: Uuid = Uuid::nil();
 /// neither tenancy column.
 ///
 /// Before migration 074 that meant 062's DEFAULTs supplied the world group and
-/// arm (a) counted the write. After 074 it means arm 4: on the harness role
-/// (which satisfies `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`
-/// because it is a superuser) the row is stamped `('public', <seed group>)`,
-/// and on `epigraph_app` the same statement raises `23502`.
+/// arm (a) counted the write. After 074 it means arm 4: on the harness role,
+/// which CI grants `epigraph_seed` (migration 113; before 113 a superuser took
+/// the hatch through `pg_has_role` implication without any grant), the row is
+/// stamped `('public', <seed group>)`, and on `epigraph_app` the same statement
+/// raises `23502`.
 async fn insert_undeclared_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
     let id = Uuid::new_v4();
     let mut hash = vec![0u8; 32];
@@ -212,9 +213,11 @@ async fn evolve_step_lineage_also_inherits_tenancy(pool: PgPool) {
 /// What replaced it, and why it is a different shape rather than a tweak:
 ///
 /// * **The counter can no longer be exercised at all on this harness.** Arm 4
-///   (`pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`) returns before
-///   the counting arm, and a superuser satisfies `pg_has_role` for every role —
-///   so on the test connection an undeclared insert is STAMPED, not counted.
+///   (the seed escape hatch) returns before the counting arm, and the harness
+///   role takes it: CI grants it `epigraph_seed` (migration 113; before 113 a
+///   superuser satisfied the arm's `pg_has_role` test for every role without
+///   any grant) — so on the test connection an undeclared insert is STAMPED,
+///   not counted.
 ///   Under `SET SESSION AUTHORIZATION epigraph_app` it RAISES, so it is not
 ///   counted there either. There is no role on this host that both reaches the
 ///   counting arm and can write, because migration 074 deleted that arm.
@@ -1597,8 +1600,9 @@ async fn insert_harvester_source(pool: &PgPool) -> Uuid {
 /// produces is measured rather than assumed: `harvester_fragments` is a
 /// migration-074 parentless ROOT armed by `epigraph_root_require_tenancy()`,
 /// whose seed arm COALESCEs an undeclared insert to `('public', <seed group>)`
-/// on a session that satisfies `pg_has_role(session_user, 'epigraph_seed',
-/// 'MEMBER')` — which the superuser harness role does. It is NOT world. A
+/// on a session that holds a grant of `epigraph_seed` — which the harness
+/// role does, because CI grants it (migration 113; before 113 the arm asked
+/// `pg_has_role`, which a superuser satisfies without one). It is NOT world. A
 /// predicate matching only the world sentinel would leave every row written this
 /// way exactly where it found it, which is why 089 names both sentinels.
 async fn insert_undeclared_fragment(pool: &PgPool, source: Uuid, text: &str) -> Uuid {
@@ -1804,7 +1808,8 @@ async fn an_already_owned_fragment_is_not_re_stamped_by_a_later_claim(pool: PgPo
 /// `insert_undeclared_fragment`, which lands `('public', <seed group>)` — not
 /// world — because migration 074's root arm COALESCEs an undeclared insert to the
 /// SEED sentinel on a session that is a member of `epigraph_seed`, which the
-/// superuser harness role is. `fixture::seed_public_claim` is
+/// harness role is because CI grants it (migration 113).
+/// `fixture::seed_public_claim` is
 /// `('public', <world>)`. So deleting `c.owner_group_id <> <world>` from
 /// migration 089 writes **world over seed** — the owner moves and the visibility
 /// does not — and a visibility-only assertion stays green. Capturing the tuple
