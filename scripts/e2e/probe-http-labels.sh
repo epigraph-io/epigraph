@@ -37,6 +37,10 @@
 #                    ADMIN is not in
 #   world-public     STRANGER's claim, public, owned by the WORLD group, which no
 #                    viewer can write
+# The PATCH lines (batch H-b review) drive `PATCH /api/v1/claims/:id` with
+# `add_labels: [tag, "resolved"]` and a properties merge on fresh own /
+# world-owned / other-agent claims: an admin into a group it cannot write must
+# land THROUGH THE AUDITED PATH (audit=1, principal=ADMIN), never bare.
 # Each line prints the HTTP status AND whether the label is on the row
 # afterwards, read back through the SU DSN: a 200 over an unchanged row and an
 # error over a changed one are both failures that only the row reveals.
@@ -204,4 +208,30 @@ case_ reader-admin/team-private "$T_RADMIN" "$C_TEAM_PRIV"
 case_ reader-admin/team-public  "$T_RADMIN" "$C_TEAM_PUB"
 case_ peer/other-public       "$T_PEER"  "$C_OTHER_PUB"
 case_ nogrant-admin/team-public "$T_NOGRANT" "$C_TEAM_PUB"
+
+# PATCH /api/v1/claims/:id (batch H-b review, compat-and-R3 MEDIUM). The review
+# measured an admin's `add_labels: [tag, "resolved"]` here on config B landing on
+# a world-owned claim with NO audit row (the route wrote on the unstamped pool,
+# admitted by the orphan policy). Since the fix a claims:admin write into a
+# group the admin cannot write takes the audited admin path, as /labels does.
+# Fresh claims, so the /labels cases above do not pre-populate the audit count.
+C_P_WORLD="$(claim "$STRANGER" public "$WORLD_G" patch-world-public)"
+C_P_OTHER="$(claim "$STRANGER" public "$STRANGER_G" patch-other-public)"
+C_P_OWN="$(claim "$OWNER" public "$OWNER_G" patch-own-public)"
+pcase() {  # $1 case name, $2 token, $3 claim
+  local tag="hlp-$1" status landed
+  status="$(curl -s -o "$E2E/.hl.body.$LABEL" -w '%{http_code}' -X PATCH \
+    -H "Authorization: Bearer $2" -H 'Content-Type: application/json' \
+    "http://127.0.0.1:$PORT/api/v1/claims/$3" -d "{\"add_labels\":[\"$tag\",\"resolved\"],\"properties\":{\"hlp\":1}}")"
+  landed="$(q "SELECT '$tag' = ANY(labels) AND 'resolved' = ANY(labels) FROM claims WHERE id = '$3'")"
+  audits="$(q "SELECT count(*) FROM security_events WHERE event_type = 'claims.admin_write' AND details->>'claim_id' = '$3'")"
+  principal="$(q "SELECT CASE details->>'admin_agent_id' WHEN '$ADMIN' THEN 'ADMIN' ELSE COALESCE(details->>'admin_agent_id','-') END FROM security_events WHERE event_type = 'claims.admin_write' AND details->>'claim_id' = '$3' ORDER BY created_at DESC LIMIT 1")"
+  printf 'PATCH %-30s status=%s label_on_row=%s audit=%s principal=%s  %s\n' "$1" "$status" "$landed" "$audits" "${principal:--}" \
+    "$(head -c 120 "$E2E/.hl.body.$LABEL" | tr '\n' ' ')"
+}
+pcase owner/own-public        "$T_OWNER"   "$C_P_OWN"
+pcase admin/world-public      "$T_ADMIN"   "$C_P_WORLD"
+pcase admin/other-public      "$T_ADMIN"   "$C_P_OTHER"
+pcase nogrant-admin/other-public "$T_NOGRANT" "$C_P_OTHER"
+pcase peer/other-public       "$T_PEER"    "$C_P_OTHER"
 rm -f "$E2E/.hl.body.$LABEL"
