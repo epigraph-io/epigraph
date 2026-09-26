@@ -447,9 +447,45 @@ Current reservation:
   ref and no open PR carries a `110`. **Applied to a throwaway database only,
   NOT to any deployed database.**
 
-- **111+**: public next
+- **111–113**: HELD — 111/112 for batch H-b (`origin/fix/batch-h-b-authority`,
+  PR #512) and 113 for batch R2 (`origin/fix/batch-r2-superuser-dsn-escape`,
+  PR #511). Their entries land with them.
 
-Next public migration **outside both reserved tenancy ranges** must be `111` or
+- **114**: public `writer_owned_derived_rows` — a row an agent ATTACHES to a
+  PUBLIC claim it cannot write is owned by the WRITER's group and stays public
+  (operator decision 2026-09-26, batch W-own). `evidence`, `mass_functions` and
+  `reasoning_traces` gain `writer_owned boolean NOT NULL DEFAULT false` and a
+  BEFORE INSERT trigger `<table>_attach_writer` (SECURITY INVOKER; sorts before
+  `<table>_require_tenancy`) that, for a non-privileged session with a principal
+  that can READ a public claim whose owner it cannot WRITE, owns the row by
+  `epigraph_writer_group()` (#503's rule: the acting operator's personal group,
+  else the principal's own personal group, only when writable; never minted),
+  with `writer_owned = true`. Every other case is left to 074 exactly as before.
+  A BEFORE UPDATE guard `<table>_writer_owner_guard` refuses a change of
+  `owner_group_id` / `writer_owned` from a non-maintenance session (077 alone
+  admitted moving any public derived row into one's own group). Arm (c)
+  (`epigraph_inherit_tenancy_stmt`) skips writer-owned rows as it skips pinned
+  evidence; arm (d) (`epigraph_propagate_tenancy`) never moves their owner and
+  lets their visibility follow the claim (privatizing narrows them); the
+  `derived text[]` literal is 072's byte for byte. Per-claim aggregates
+  (`claim_frames`, the `claims` DS cache columns) stay CLAIM-owned and a
+  non-owner reaches them only through four audited definers
+  (`epigraph_foreign_claim_frame`, `_belief_cache`, `_claim_classification`,
+  `_belief_clear`; one `security_events` row per effective write,
+  `event_type = 'claims.foreign_aggregate_write'`), which never write
+  `truth_value`, `labels` or `content`; the repo layer
+  (`repos/foreign_attach.rs`) routes to them with the same statement, so an
+  owner / admin / maintenance write is unchanged. Replaces NO function 113
+  replaces, so 113 and 114 apply in either order. Registered with
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Behaviour in
+  `epigraph-db/tests/writer_owned_derived_rows.rs` (all arms as
+  `epigraph_app`). **No undo runbook ships**: undo is in the file's header.
+  **Applied to throwaway databases only (5433, with 113), NOT to any deployed
+  database.**
+
+- **115+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `115` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
