@@ -11,15 +11,18 @@
 //! no configuration in this workspace compiles: `epigraph-api`'s default features
 //! are `["db"]`. Extending them would have added an assertion nothing runs.
 //!
-//! # The policy, and what these tests deliberately do not claim
+//! # The policy
 //!
-//! Rejection here is by **scheme**, by **IP literal**, and by the small set of
-//! names RFC 6761 reserves to loopback. Every other hostname is accepted on its
-//! face, so none of these tests asserts anything about DNS: there is no
-//! resolution in the checked path, on purpose, and the registration-time check is
-//! not a defence against a name that merely resolves somewhere private. See
-//! `routes/webhooks.rs::validate_webhook_url`'s doc for the full statement of
-//! what the policy does not cover.
+//! Rejection is by **scheme**, by **IP literal**, by the names RFC 6761
+//! reserves to loopback — and, since backlog c89b65b0, by **what a name
+//! resolves to**: registration resolves the host once and refuses it if any
+//! answer is internal or if it does not resolve. See
+//! `routes/webhooks.rs::validate_webhook_url`'s doc for the full statement,
+//! including the delivery-time re-vet and address pinning.
+//!
+//! No test here touches real DNS. `common::spawn_app` installs a stub resolver
+//! that answers every name with one public address; the resolution tests use
+//! `common::spawn_app_with_webhook_egress` with their own stub.
 //!
 //! `a_conventional_https_target_is_still_accepted` is the control, and it is not
 //! optional: a validator that refuses everything satisfies every rejection test
@@ -172,30 +175,73 @@ async fn whitespace_does_not_separate_the_judged_url_from_the_stored_one() {
     );
 }
 
-/// A hostname is accepted even though it could resolve anywhere. Asserted, not
-/// implied: it is the boundary of the policy, and a future change that started
-/// resolving names here would make registration latency a function of DNS and
-/// would need to be a deliberate decision rather than a side effect.
+/// Backlog c89b65b0 over HTTP: registration RESOLVES the host.
 ///
-/// The fixture is under `.example` (RFC 2606), which never resolves and carries
-/// no loopback semantics, so what this pins is "names are not resolved" and
-/// nothing else. An earlier revision used a name that is on the default
-/// `/etc/hosts` loopback line of several distributions, which would have pinned
-/// "a loopback name is acceptable" as intended behaviour — an assertion a later
-/// author narrowing the name side would have had to delete in order to make
-/// their change.
+/// This test used to be `a_hostname_is_not_resolved_and_is_accepted_on_its_face`
+/// and asserted 201 for a name the guard never looked up — the boundary it
+/// pinned was the hole. It is inverted, not deleted, so the boundary move is
+/// recorded where the old one was:
+///
+/// * a public name whose record points at loopback → 400, naming the address;
+/// * one pointing at the metadata address → 400;
+/// * one with a round-robin answer containing ONE internal member → 400;
+/// * one that does not resolve at all → 400 (nothing can be vetted);
+/// * the control: one resolving only to a public address → 201.
+///
+/// The stub stands in for DNS; the names are RFC 2606 `.example`, so nothing
+/// here would resolve for real anyway.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_hostname_is_not_resolved_and_is_accepted_on_its_face() {
-    let (addr, _shutdown) = spawn().await;
+async fn a_hostname_is_resolved_and_refused_if_any_answer_is_internal() {
+    use epigraph_jobs::egress::{EgressGuard, StubResolver};
+    let stub = StubResolver::new()
+        .with("loopback-alias.example", ["127.0.0.1".parse().unwrap()])
+        .with(
+            "metadata-alias.example",
+            ["169.254.169.254".parse().unwrap()],
+        )
+        .with(
+            "mixed.example",
+            [
+                "93.184.216.34".parse().unwrap(),
+                "10.0.0.9".parse().unwrap(),
+            ],
+        )
+        .with(
+            "consumer.public.example",
+            ["93.184.216.34".parse().unwrap()],
+        );
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app_with_webhook_egress(
+        &url,
+        EgressGuard::with_resolver(std::sync::Arc::new(stub)),
+    )
+    .await;
     let token = writer_token().await;
 
-    let resp = register(addr, &token, "http://consumer.internal.example/hook").await;
+    for (target, needle) in [
+        ("http://loopback-alias.example/hook", "127.0.0.1"),
+        ("http://metadata-alias.example/hook", "169.254.169.254"),
+        ("https://mixed.example/hook", "10.0.0.9"),
+        ("https://nxdomain.example/hook", "could not be resolved"),
+    ] {
+        let resp = register(addr, &token, target).await;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(
+            status, 400,
+            "{target} must be refused at registration: {body}"
+        );
+        assert!(
+            body.contains(needle),
+            "{target}: the refusal must say why ({needle}): {body}"
+        );
+    }
+
+    let resp = register(addr, &token, "http://consumer.public.example/hook").await;
     assert_eq!(
         resp.status(),
         201,
-        "the registration-time check judges IP literals and the reserved-to-\
-         loopback name set only; any other name is accepted and DNS rebinding is \
-         explicitly out of scope; got {}",
+        "a name resolving only to public addresses must register; got {}",
         resp.status()
     );
 }

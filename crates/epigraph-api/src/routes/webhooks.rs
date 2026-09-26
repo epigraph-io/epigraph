@@ -136,202 +136,56 @@ pub struct WebhookRegistration {
 /// A 32-character secret provides adequate entropy for HMAC-SHA256 signing.
 const MIN_SECRET_LENGTH: usize = 32;
 
-/// The two URL schemes a delivery target may use.
-const ALLOWED_WEBHOOK_SCHEMES: &[&str] = &["http", "https"];
-
 // =============================================================================
 // DELIVERY-TARGET POLICY
 // =============================================================================
 
-/// Is this URL an acceptable webhook delivery target?
+/// Is this URL an acceptable webhook delivery target **on its face**?
 ///
 /// Returns `Ok(())` when it is, or `Err(reason)` with a message safe to return
 /// to the caller (it repeats back only what the caller already supplied).
 ///
-/// # The policy, positively
+/// This is the no-DNS half of the policy, and it is
+/// `epigraph_jobs::egress::parse_and_classify` — the ONE shared egress module
+/// every outbound webhook path uses, so the API and `epigraph-jobs` cannot hold
+/// two definitions of "internal". It checks, in order:
 ///
-/// 1. The string must parse as an absolute URL.
-/// 2. Its scheme must be `http` or `https`. That excludes `file:`, `gopher:`,
-///    `ftp:`, `data:` and everything else `reqwest` might or might not attempt.
-/// 3. It must have a host.
-/// 4. If that host is an **IP literal**, it must not be loopback, link-local,
-///    a private range, or the unspecified address. IPv4-mapped IPv6 literals
-///    (`::ffff:127.0.0.1`) are unwrapped and judged as the IPv4 address they
-///    name, so the mapped spelling is not a way around rule 4.
-/// 5. If that host is a **name**, it must not be one of the names RFC 6761
-///    reserves to loopback: `localhost`, or anything under `.localhost`.
-///    Compared case-insensitively with a trailing root dot stripped.
+/// 1. The string parses as an absolute URL (after trimming).
+/// 2. The scheme is `http` or `https`.
+/// 3. There is a host.
+/// 4. An **IP literal** host is outside the egress table: loopback, private,
+///    link-local (metadata), CGNAT, multicast, broadcast, documentation and the
+///    other non-global special-purpose ranges, and every IPv6 spelling that
+///    embeds one of those (IPv4-mapped, IPv4-compatible, NAT64, 6to4).
+/// 5. A **name** host is not one RFC 6761 reserves to loopback (`localhost`,
+///    `*.localhost`, case-insensitive, trailing dot ignored).
 ///
-/// # Rule 5 is a static denylist, not a resolution
+/// # A name that passes here is NOT yet accepted
 ///
-/// It exists because rule 4 alone judged `http://127.0.0.1/hook` and accepted
-/// `http://localhost/hook` — the same socket, and the ordinary spelling of it.
-/// `url::Url::parse` yields `Host::Domain` for anything that is not a numeric
-/// literal, so without this rule the most likely internal target a caller types
-/// was the one spelling that got through.
+/// A name is only as safe as what it resolves to. The second half of the
+/// policy is `EgressGuard::vet`, which resolves the name ONCE and refuses it if
+/// ANY answer is internal (or if it does not resolve). It runs:
 ///
-/// This is NOT a retreat from "no DNS resolution here". RFC 6761 §6.3 reserves
-/// these names to loopback *by definition*: they are not loopback because a
-/// record says so today and might say otherwise tomorrow, which is precisely
-/// what makes them judgeable without a resolver. Every other name is still
-/// accepted on its face. The boundary drawn below is unmoved.
+/// * at **registration**, in [`register_webhook`], through
+///   `AppState::webhook_egress`, after the cheap checks; and
+/// * at **every delivery**, in `deliver_to_subscription`, which then dials
+///   ONLY the vetted addresses (see [`pinned_client`]). That is the DNS
+///   rebinding defence: the client never resolves the name itself, so a
+///   record that changes between the check and the send changes nothing.
 ///
-/// # What this policy does NOT cover — stated, not implied
+/// Because delivery re-vets, rows grandfathered in `webhook_subscriptions`
+/// (re-armed by boot hydration without passing through registration) are held
+/// to the same policy every time they are delivered to.
 ///
-/// * **DNS rebinding is not covered, and neither is any other name that
-///   resolves somewhere internal.** Rule 5 covers the names that are reserved to
-///   loopback; it does not and cannot cover a name that merely *resolves* to a
-///   private address — `internal-consumer.corp.example` is accepted, as is a
-///   name placed on the loopback line of the delivering host's `/etc/hosts`.
-///   The check runs at registration, against
-///   the literal the caller supplied. A *hostname* is accepted on its face; if
-///   it resolves to a private address at delivery time — either because it
-///   always did, or because the record changed afterwards — this function has
-///   already returned `Ok`. Closing that is a different control (egress policy
-///   on the delivering process, or resolve-and-recheck immediately before each
-///   POST), and no resolution happens here deliberately: resolving inside a
-///   request handler makes registration latency a function of DNS and makes
-///   this crate's tests depend on the network.
-/// * **It applies at REGISTRATION only, so existing rows are grandfathered.**
-///   `bin/server.rs` re-hydrates `AppState::webhook_store` from
-///   `WebhookSubscriptionRepository::list_active` on every boot, so any row
-///   already in `webhook_subscriptions` is re-armed on the next deploy without
-///   passing through here. Rows written before this check are unaffected by it;
-///   auditing them is an operator task, not something this function performs.
+/// # What this still does NOT cover — stated, not implied
+///
+/// * **It is not an allowlist.** Any public host is accepted.
 /// * **Migration 085's constraint is unchanged.** `CHECK (btrim(url) <> '')`
-///   still mirrors only the non-empty check. That migration is applied; this
-///   policy lives in the handler, not the schema, and the schema was not
-///   touched.
-/// * **It is not an allowlist.** Any public host is accepted. This narrows the
-///   set of targets that are reachable-but-internal; it does not constrain who
-///   may be POSTed to.
+///   still mirrors only the non-empty check; the policy lives in code.
 fn validate_webhook_url(raw: &str) -> Result<(), String> {
-    // `.trim()` HERE and not only at the call site. `register_webhook` trims
-    // before calling and stores the trimmed string, so on that path this is a
-    // no-op — but `deliver_to_subscription` re-checks `subscription.url` from
-    // the in-memory store, which other code paths can insert into without
-    // passing through the handler. A leading space would make `Url::parse`
-    // fail there and turn a policy verdict into a parse error.
-    let parsed = url::Url::parse(raw.trim())
-        .map_err(|e| format!("Webhook URL is not a valid absolute URL: {e}"))?;
-
-    if !ALLOWED_WEBHOOK_SCHEMES.contains(&parsed.scheme()) {
-        return Err(format!(
-            "Webhook URL scheme must be one of {:?}, got {:?}",
-            ALLOWED_WEBHOOK_SCHEMES,
-            parsed.scheme()
-        ));
-    }
-
-    let Some(host) = parsed.host() else {
-        return Err("Webhook URL must name a host".to_string());
-    };
-
-    // IP LITERALS are judged as addresses. A NAME is judged only against the
-    // reserved-to-loopback set, and is otherwise accepted on its face — see
-    // "What this policy does NOT cover" above.
-    //
-    // THE VERDICT COMES FROM `epigraph_jobs`, THE CATEGORY FROM THIS MODULE.
-    // `epigraph-jobs`'s `ConfigurableWebhookHandler` is a SECOND webhook
-    // delivery surface with its own SSRF gate (`is_internal_ip`), so two
-    // independent classifiers here would be two definitions of "internal" that
-    // can drift — and the one that drifts open is the one nobody notices.
-    // `is_internal_addr` is a superset of `internal_address_category`'s
-    // judgement in every case (it treats the whole of `0.0.0.0/8` as internal
-    // where `Ipv4Addr::is_unspecified` names only `0.0.0.0`), so delegating is
-    // never a loosening. `internal_address_category` and
-    // `is_reserved_loopback_name` survive to NAME the rule the caller tripped;
-    // they no longer decide it, and a category of `None` under a `true` verdict
-    // simply yields the generic message.
-    let addr = match host {
-        url::Host::Ipv4(v4) => std::net::IpAddr::V4(v4),
-        // An IPv4-mapped literal is the same destination written differently.
-        url::Host::Ipv6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => std::net::IpAddr::V4(v4),
-            None => std::net::IpAddr::V6(v6),
-        },
-        url::Host::Domain(name) => {
-            if epigraph_jobs::is_internal_ip(name) {
-                let category = if is_reserved_loopback_name(name) {
-                    "loopback name reserved by RFC 6761"
-                } else {
-                    "internal host"
-                };
-                return Err(format!(
-                    "Webhook URL must not target an internal address ({category}): {name}"
-                ));
-            }
-            return Ok(());
-        }
-    };
-
-    if epigraph_jobs::is_internal_addr(addr) {
-        let category = internal_address_category(addr).unwrap_or("internal");
-        return Err(format!(
-            "Webhook URL must not target an internal address ({category}): {addr}"
-        ));
-    }
-
-    Ok(())
-}
-
-/// Is `name` one of the names RFC 6761 reserves to loopback?
-///
-/// `localhost` and any label under `.localhost`, compared case-insensitively
-/// with a single trailing root dot stripped (`localhost.` is the same name).
-///
-/// Deliberately only these. It is a special-use-name denylist, not a guess at
-/// which names might point somewhere internal: other reserved-ish names, and any
-/// name an operator has pointed at a private address in their own DNS or hosts
-/// file, are still accepted, because judging them would require either
-/// resolution or a guess about someone else's naming, and the policy above
-/// commits to neither. That boundary is stated there rather than narrowed here.
-fn is_reserved_loopback_name(name: &str) -> bool {
-    let n = name.trim_end_matches('.').to_ascii_lowercase();
-    n == "localhost" || n.ends_with(".localhost")
-}
-
-/// Name the reason `addr` is internal, or `None` if it is not.
-///
-/// The category is returned rather than a bare `bool` so the 400 says which
-/// rule the caller tripped.
-///
-/// IPv6 unique-local (`fc00::/7`) and link-local (`fe80::/10`) are checked from
-/// `segments()` rather than with `Ipv6Addr::is_unique_local` /
-/// `is_unicast_link_local`, which are unstable (`#![feature(ip)]`). The masks
-/// are the ones those methods use.
-fn internal_address_category(addr: std::net::IpAddr) -> Option<&'static str> {
-    match addr {
-        std::net::IpAddr::V4(v4) => {
-            if v4.is_loopback() {
-                Some("loopback")
-            } else if v4.is_link_local() {
-                // Covers 169.254.0.0/16, which is where cloud instance-metadata
-                // services live.
-                Some("link-local")
-            } else if v4.is_private() {
-                Some("private range")
-            } else if v4.is_unspecified() {
-                Some("unspecified")
-            } else {
-                None
-            }
-        }
-        std::net::IpAddr::V6(v6) => {
-            let first = v6.segments()[0];
-            if v6.is_loopback() {
-                Some("loopback")
-            } else if (first & 0xffc0) == 0xfe80 {
-                Some("link-local")
-            } else if (first & 0xfe00) == 0xfc00 {
-                Some("unique-local")
-            } else if v6.is_unspecified() {
-                Some("unspecified")
-            } else {
-                None
-            }
-        }
-    }
+    epigraph_jobs::egress::parse_and_classify(raw)
+        .map(|_| ())
+        .map_err(|denied| denied.to_string())
 }
 
 // =============================================================================
@@ -370,13 +224,14 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 ///
 /// # Delivery-target policy
 ///
-/// The URL is checked against [`validate_webhook_url`], which requires an
-/// `http`/`https` scheme and refuses loopback, link-local, private-range and
-/// unspecified IP **literals**. Read that function's doc for the four things
-/// this policy deliberately does not cover — chiefly that DNS rebinding is out
-/// of scope (a hostname is accepted on its face) and that the check applies at
-/// registration only, so rows already in `webhook_subscriptions` are
-/// grandfathered and re-armed by boot hydration on every deploy.
+/// The URL is checked twice. First against [`validate_webhook_url`] (shape,
+/// scheme, IP literals, reserved loopback names — no DNS), early, next to the
+/// other cheap checks. Then, after the principal check and just before
+/// anything is persisted, its host is RESOLVED through
+/// `AppState::webhook_egress` and refused if any answer is internal or if it
+/// does not resolve. Resolution runs last so a request that fails a cheap
+/// check never costs a DNS lookup. Delivery re-vets on every send and dials
+/// only the vetted addresses; see [`validate_webhook_url`]'s doc.
 ///
 /// The check sits in the handler BODY, not in an extractor and not in the
 /// schema. Body, because it is a validation of the parsed payload and belongs
@@ -406,7 +261,9 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 ///
 /// - 400 Bad Request: empty URL; a URL that is unparseable, non-`http(s)`, or
 ///   aimed at an internal/loopback/link-local host (see
-///   [`validate_webhook_url`]); or a secret shorter than 32 characters
+///   [`validate_webhook_url`]); a host NAME that resolves to any internal
+///   address or does not resolve at all; or a secret shorter than 32
+///   characters
 /// - 401 Unauthorized: Missing or invalid Bearer token, or a token that names
 ///   no `agents.id`
 /// - 403 Forbidden: Missing `webhooks:write` scope
@@ -465,6 +322,21 @@ pub async fn register_webhook(
                 .into(),
         });
     };
+
+    // 3b. Resolve the host ONCE and refuse it if ANY answer is internal, or if
+    //     it does not resolve (backlog c89b65b0: a public name with a record
+    //     pointing at loopback or the metadata address passed step 1b on its
+    //     face). Last of the checks, so every cheaper refusal above costs no
+    //     DNS lookup. Nothing is pinned here — registration never dials — and
+    //     delivery re-vets every send, so this is the early, caller-visible
+    //     verdict rather than the only one.
+    state
+        .webhook_egress
+        .vet(registration.url.trim())
+        .await
+        .map_err(|denied| ApiError::BadRequest {
+            message: denied.to_string(),
+        })?;
 
     // 4. Create the subscription
     //
@@ -1188,14 +1060,14 @@ async fn agent_may_receive(pool: &sqlx::PgPool, agent_id: Uuid, ids: &[Uuid]) ->
 /// visible only in the `webhook.delivery.suppressed` tracing target.
 ///
 /// # Arguments
-/// * `client` - HTTP client for making requests
+/// * `egress` - the egress guard every delivery is vetted and pinned through
 /// * `pool` - the pool the per-subscriber visibility probe runs on
 /// * `webhook_store` - The shared webhook subscription store
 /// * `event` - The event to deliver
 /// * `config` - Delivery configuration (timeout, retries)
 #[cfg(feature = "db")]
 pub async fn deliver_event(
-    client: &reqwest::Client,
+    egress: &epigraph_jobs::egress::EgressGuard,
     pool: &sqlx::PgPool,
     webhook_store: &crate::state::WebhookStore,
     event: &epigraph_events::EpiGraphEvent,
@@ -1226,7 +1098,7 @@ pub async fn deliver_event(
 
     for sub in &subscriptions {
         let signature = sign_webhook_payload(&sub.secret, &payload_bytes);
-        let result = deliver_to_subscription(client, sub, &payload_bytes, &signature, config).await;
+        let result = deliver_to_subscription(egress, sub, &payload_bytes, &signature, config).await;
         results.push(result);
     }
 
@@ -1247,7 +1119,7 @@ pub async fn deliver_event(
 /// `cargo check -p epigraph-api --no-default-features`.
 #[cfg(not(feature = "db"))]
 pub async fn deliver_event(
-    _client: &reqwest::Client,
+    _egress: &epigraph_jobs::egress::EgressGuard,
     webhook_store: &crate::state::WebhookStore,
     event: &epigraph_events::EpiGraphEvent,
     _config: &WebhookDeliveryConfig,
@@ -1286,95 +1158,133 @@ pub struct WebhookDeliveryResult {
 
 /// Deliver a payload to a single webhook subscription with retry logic
 ///
-/// Re-validates the target URL immediately before dialling. The registration
-/// gate is not sufficient on its own: the store is an in-memory map that other
-/// code paths can insert into, and subscriptions registered before the gate
-/// existed would otherwise stay deliverable for the lifetime of the process.
+/// # Vet once, pin, then send — the SSRF and DNS-rebinding guard
+///
+/// 1. `egress.vet(url)`: parse, classify, resolve the host ONCE, refuse if any
+///    answer is internal. The registration gate is not sufficient on its own:
+///    the store is an in-memory map other code paths insert into, boot
+///    hydration re-arms rows that never passed the current gate, and a name's
+///    records can change after registration.
+/// 2. [`pinned_client`]: a client that can reach ONLY the vetted addresses.
+///    The URL is sent unchanged (so `Host` and TLS SNI are the registered
+///    host's), but the client never resolves the name itself — a rebinding
+///    answer arriving after step 1 is never consulted.
+/// 3. Every retry reuses the same pinned client. Nothing is re-resolved
+///    between attempts.
+///
+/// A resolution FAILURE is transient: it is retried with the same backoff as a
+/// connection failure, and nothing is dialled until a resolution is vetted. A
+/// refusal (internal address, bad URL) is terminal with `attempts: 0` — no
+/// connection was opened.
 async fn deliver_to_subscription(
-    client: &reqwest::Client,
+    egress: &epigraph_jobs::egress::EgressGuard,
     subscription: &crate::state::WebhookSubscription,
     payload: &[u8],
     signature: &str,
     config: &WebhookDeliveryConfig,
 ) -> WebhookDeliveryResult {
-    // SSRF guard: refuse to make the request at all. `attempts: 0` records
-    // that no connection was opened, distinguishing a blocked target from one
-    // that was dialled and refused the connection.
-    if let Err(reason) = validate_webhook_url(&subscription.url) {
+    let blocked = |reason: String| {
         tracing::warn!(
             subscription_id = %subscription.id,
             reason = %reason,
             "Refusing webhook delivery to disallowed target URL"
         );
-        return WebhookDeliveryResult {
+        WebhookDeliveryResult {
             subscription_id: subscription.id,
             success: false,
             status_code: None,
             attempts: 0,
             error: Some(format!("blocked by SSRF guard: {reason}")),
-        };
-    }
+        }
+    };
 
     let mut last_error = None;
+    // (vetted target, client pinned to it) — built once, reused by every retry.
+    let mut pinned: Option<(epigraph_jobs::egress::VettedTarget, reqwest::Client)> = None;
+    let mut dialled = 0u32;
 
     for attempt in 0..=config.max_retries {
-        match client
-            .post(&subscription.url)
-            .header("Content-Type", "application/json")
-            .header("X-EpiGraph-Signature", signature)
-            .header("X-EpiGraph-Event", "webhook")
-            .timeout(config.timeout)
-            .body(payload.to_vec())
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                if response.status().is_success() {
-                    return WebhookDeliveryResult {
-                        subscription_id: subscription.id,
-                        success: true,
-                        status_code: Some(status),
-                        attempts: attempt + 1,
-                        error: None,
-                    };
+        if pinned.is_none() {
+            match egress.vet(&subscription.url).await {
+                Ok(target) => match pinned_client(&target, config.timeout) {
+                    Ok(client) => pinned = Some((target, client)),
+                    Err(e) => {
+                        return WebhookDeliveryResult {
+                            subscription_id: subscription.id,
+                            success: false,
+                            status_code: None,
+                            attempts: 0,
+                            error: Some(format!("could not build pinned HTTP client: {e}")),
+                        };
+                    }
+                },
+                Err(denied) if denied.is_transient() => {
+                    last_error = Some(denied.to_string());
                 }
-
-                // A 3xx is a redirect the client refused to follow (see
-                // `dispatcher_client_builder`). Surface it as its own terminal
-                // failure rather than a generic `HTTP 307` that retries: the
-                // hop target was never classified by the guard, retrying just
-                // re-asks the same attacker-controlled endpoint, and naming it
-                // is what makes the attempt visible in the logs at all.
-                if response.status().is_redirection() {
-                    let location = response
-                        .headers()
-                        .get(reqwest::header::LOCATION)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("<none>")
-                        .to_string();
-                    tracing::warn!(
-                        subscription_id = %subscription.id,
-                        status,
-                        location = %location,
-                        "Refusing to follow webhook redirect; target was never validated"
-                    );
-                    return WebhookDeliveryResult {
-                        subscription_id: subscription.id,
-                        success: false,
-                        status_code: Some(status),
-                        attempts: attempt + 1,
-                        error: Some(format!(
-                            "refused to follow redirect (HTTP {status}) to `{location}`: \
-                             only the registered URL is SSRF-validated"
-                        )),
-                    };
-                }
-
-                last_error = Some(format!("HTTP {status}"));
+                Err(denied) => return blocked(denied.to_string()),
             }
-            Err(e) => {
-                last_error = Some(e.to_string());
+        }
+
+        if let Some((target, client)) = &pinned {
+            dialled += 1;
+            match client
+                .post(target.url().clone())
+                .header("Content-Type", "application/json")
+                .header("X-EpiGraph-Signature", signature)
+                .header("X-EpiGraph-Event", "webhook")
+                .timeout(config.timeout)
+                .body(payload.to_vec())
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    if response.status().is_success() {
+                        return WebhookDeliveryResult {
+                            subscription_id: subscription.id,
+                            success: true,
+                            status_code: Some(status),
+                            attempts: dialled,
+                            error: None,
+                        };
+                    }
+
+                    // A 3xx is a redirect the client refused to follow (see
+                    // `dispatcher_client_builder`). Surface it as its own
+                    // terminal failure rather than a generic `HTTP 307` that
+                    // retries: the hop target was never vetted, retrying just
+                    // re-asks the same attacker-controlled endpoint, and naming
+                    // it is what makes the attempt visible in the logs at all.
+                    if response.status().is_redirection() {
+                        let location = response
+                            .headers()
+                            .get(reqwest::header::LOCATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("<none>")
+                            .to_string();
+                        tracing::warn!(
+                            subscription_id = %subscription.id,
+                            status,
+                            location = %location,
+                            "Refusing to follow webhook redirect; target was never validated"
+                        );
+                        return WebhookDeliveryResult {
+                            subscription_id: subscription.id,
+                            success: false,
+                            status_code: Some(status),
+                            attempts: dialled,
+                            error: Some(format!(
+                                "refused to follow redirect (HTTP {status}) to `{location}`: \
+                                 only the registered URL is SSRF-validated"
+                            )),
+                        };
+                    }
+
+                    last_error = Some(format!("HTTP {status}"));
+                }
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                }
             }
         }
 
@@ -1389,36 +1299,81 @@ async fn deliver_to_subscription(
         subscription_id: subscription.id,
         success: false,
         status_code: None,
-        attempts: config.max_retries + 1,
+        // Only attempts that actually dialled count; a delivery whose host
+        // never resolved opened no connection.
+        attempts: dialled,
         error: last_error,
     }
 }
 
-/// Build the HTTP client the dispatcher delivers with.
+/// Build the base HTTP client configuration the dispatcher delivers with.
 ///
-/// Single construction site on purpose: the SSRF guard is a property of this
-/// client as much as of `validate_webhook_url`, so a second ad-hoc
-/// `reqwest::Client::new()` on the delivery path would silently reinstate the
-/// default redirect policy. Tests build through this function for the same
-/// reason — a test that configured its own client would prove nothing about
-/// what the server actually dials with.
+/// Single construction site on purpose: the SSRF guard is a property of the
+/// client as much as of the egress check, so an ad-hoc `reqwest::Client::new()`
+/// on the delivery path would silently reinstate the defaults this refuses.
+/// [`pinned_client`] builds every delivery client from here.
 ///
-/// `Policy::none()` is the load-bearing setting: `validate_webhook_url` only
-/// ever classifies `subscription.url`, so with reqwest's default policy (follow
-/// up to 10 hops) a registered public endpoint can answer `307 Location:
-/// http://169.254.169.254/…` and the signed payload is delivered to a host the
-/// guard had just rejected by name. A webhook receiver has no legitimate reason
-/// to redirect, so refusing outright is preferred over a `Policy::custom` that
-/// re-runs the guard per hop.
-///
-/// **Both `cfg` arms of [`start_webhook_dispatcher`] build through it.** The
-/// `db` arm gained a `pool` parameter in PR-10 and nothing else; a client
-/// constructed inline in only one arm is a redirect policy that holds in one
-/// build configuration and not the other.
+/// * `Policy::none()`: the egress check only ever vets the registered URL, so
+///   with reqwest's default policy (follow up to 10 hops) a registered public
+///   endpoint could answer `307 Location: http://169.254.169.254/…` and the
+///   signed payload would reach a host the guard had just refused. A webhook
+///   receiver has no legitimate reason to redirect.
+/// * `no_proxy()`: reqwest honours `HTTP(S)_PROXY` by default, and a proxy
+///   resolves the target name ITSELF — which would bypass the pinned addresses
+///   entirely and let the proxy reach whatever the name rebinds to. Webhook
+///   delivery therefore always connects directly.
 pub fn dispatcher_client_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+}
+
+/// A DNS resolver that resolves nothing.
+///
+/// Installed as the pinned client's fallback so that a name reqwest does NOT
+/// find in the pinned overrides — a spelling mismatch, a future reqwest change
+/// in how the override key is formed — fails the request instead of silently
+/// falling through to system DNS, which is exactly the unvetted resolution
+/// pinning exists to prevent. Fail closed.
+#[derive(Debug)]
+struct RefuseUnpinnedNames;
+
+impl reqwest::dns::Resolve for RefuseUnpinnedNames {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let name = name.as_str().to_string();
+        Box::pin(async move {
+            Err(format!(
+                "webhook delivery refused to resolve {name}: only the vetted, pinned \
+                 addresses may be dialled"
+            )
+            .into())
+        })
+    }
+}
+
+/// The client one delivery sends with: [`dispatcher_client_builder`], pinned to
+/// the vetted addresses of `target`.
+///
+/// For a name, `resolve_to_addrs(domain, vetted)` makes the connector use
+/// exactly the addresses the guard judged, and [`RefuseUnpinnedNames`] makes
+/// every other lookup fail. An IP-literal URL is dialled directly (reqwest
+/// does not resolve literals) and was itself the vetted address.
+///
+/// # Errors
+///
+/// A reqwest build failure (TLS backend initialisation). The caller treats it
+/// as a failed delivery; nothing is sent.
+pub fn pinned_client(
+    target: &epigraph_jobs::egress::VettedTarget,
+    timeout: std::time::Duration,
+) -> reqwest::Result<reqwest::Client> {
+    let mut builder =
+        dispatcher_client_builder(timeout).dns_resolver(std::sync::Arc::new(RefuseUnpinnedNames));
+    if let Some(domain) = target.domain() {
+        builder = builder.resolve_to_addrs(domain, target.addrs());
+    }
+    builder.build()
 }
 
 /// Start the webhook dispatcher background task
@@ -1432,6 +1387,11 @@ pub fn dispatcher_client_builder(timeout: std::time::Duration) -> reqwest::Clien
 /// is a filter on tenancy, which is applied per-subscriber inside
 /// [`deliver_event`]. A dispatcher that subscribed to a subset would silently
 /// stop delivering event types nobody remembered to list.
+///
+/// Deliveries are vetted and pinned through `EgressGuard::system()` — the
+/// operating system's resolver. It is constructed HERE, not read from
+/// `AppState`, so a fixture's stub resolver can never become the one
+/// production deliveries dial by.
 ///
 /// # Arguments
 /// * `event_bus` - The shared event bus to subscribe to
@@ -1450,61 +1410,56 @@ pub fn start_webhook_dispatcher(
     webhook_store: crate::state::WebhookStore,
     config: WebhookDeliveryConfig,
 ) -> epigraph_events::SubscriptionId {
-    // Deliberately NOT `unwrap_or_default()`: `reqwest::Client::default()`
-    // carries reqwest's default redirect policy, so a build failure would hand
-    // the dispatcher a client that follows hops into the internal network —
-    // the exact bypass `Policy::none()` exists to close, reinstated silently
-    // and only on the unhappy path. Failing loudly at startup is the safe
-    // direction.
-    let client = dispatcher_client_builder(config.timeout)
+    // Fail loudly at startup if the TLS backend cannot initialise, rather than
+    // discovering it as a failed delivery on the first event. Every delivery
+    // builds its own pinned client from the same builder.
+    let _ = dispatcher_client_builder(config.timeout)
         .build()
-        .expect("webhook dispatcher HTTP client must build; a default client would drop the no-redirect SSRF policy");
-    start_webhook_dispatcher_with_client(event_bus, pool, webhook_store, config, client)
+        .expect("webhook dispatcher HTTP client must build");
+    start_webhook_dispatcher_with_egress(
+        event_bus,
+        pool,
+        webhook_store,
+        config,
+        epigraph_jobs::egress::EgressGuard::system(),
+    )
 }
 
-/// [`start_webhook_dispatcher`] over a caller-supplied client.
+/// [`start_webhook_dispatcher`] over a caller-supplied egress guard.
 ///
-/// # This seam exists because the delivery-time SSRF guard closed the old one
+/// # The seam is a GUARD, never a client
 ///
-/// `deliver_to_subscription` re-validates `subscription.url` immediately before
-/// dialling (backlog `cf05eb0d`), because the store is an in-memory map other
-/// code paths insert into and rows registered before the gate existed would
-/// otherwise stay deliverable for the process lifetime. A consequence, and not
-/// an incidental one: **a loopback sink is unreachable through this dispatcher
-/// by design.** `tests/webhook_dispatcher_wiring.rs` previously pointed a
-/// subscription straight at a `wiremock::MockServer` on `127.0.0.1` — the guard
-/// refuses it, and the test's positive control failed.
-///
-/// A behavioural test of the dispatcher therefore needs a host the guard
-/// ACCEPTS (a name under RFC 2606 `.example`, which is judged on its face
-/// because no DNS resolution happens in the guard) pointed at a local listener
-/// with reqwest's `.resolve()` — which requires the client to be injectable.
-/// That is the whole of what this function adds.
-///
-/// **It weakens nothing.** The client still comes from
-/// [`dispatcher_client_builder`], the SSRF guard still runs per delivery, and
-/// `.resolve()` overrides only DNS — it cannot make the guard accept an address
-/// literal it would otherwise refuse. A test that pointed this at
-/// `http://127.0.0.1/` would still be refused.
+/// This used to accept a finished `reqwest::Client`, so a behavioural test
+/// could point an RFC 2606 `.example` name at a local listener with
+/// `ClientBuilder::resolve`. Now that every delivery resolves, vets and pins
+/// its own client, a caller-supplied client carrying `.resolve()` overrides
+/// would be precisely the bypass pinning exists to close — so the seam takes
+/// the guard (its resolver) instead. A test supplies a `StubResolver`; the
+/// stub's answers are still judged by the egress table, so pointing a name at
+/// `127.0.0.1` is refused unless the test ALSO exempts that exact socket with
+/// `exempt_socket_for_tests`, which exists only under `epigraph-jobs`'s
+/// `test-support` feature (a dev-dependency of this crate, absent from release
+/// builds).
 #[cfg(feature = "db")]
-pub fn start_webhook_dispatcher_with_client(
+pub fn start_webhook_dispatcher_with_egress(
     event_bus: &crate::state::SharedEventBus,
     pool: sqlx::PgPool,
     webhook_store: crate::state::WebhookStore,
     config: WebhookDeliveryConfig,
-    client: reqwest::Client,
+    egress: epigraph_jobs::egress::EgressGuard,
 ) -> epigraph_events::SubscriptionId {
     let store = webhook_store;
     let cfg = std::sync::Arc::new(config);
+    let egress = std::sync::Arc::new(egress);
 
     event_bus.subscribe(vec![], move |event| {
-        let client = client.clone();
+        let egress = std::sync::Arc::clone(&egress);
         let pool = pool.clone();
         let store = store.clone();
         let cfg = std::sync::Arc::clone(&cfg);
 
         tokio::spawn(async move {
-            let results = deliver_event(&client, &pool, &store, &event, &cfg).await;
+            let results = deliver_event(&egress, &pool, &store, &event, &cfg).await;
             for result in &results {
                 if !result.success {
                     tracing::warn!(
@@ -1531,26 +1486,17 @@ pub fn start_webhook_dispatcher(
     webhook_store: crate::state::WebhookStore,
     config: WebhookDeliveryConfig,
 ) -> epigraph_events::SubscriptionId {
-    // Deliberately NOT `unwrap_or_default()`: `reqwest::Client::default()`
-    // carries reqwest's default redirect policy, so a build failure would hand
-    // the dispatcher a client that follows hops into the internal network —
-    // the exact bypass `Policy::none()` above exists to close, reinstated
-    // silently and only on the unhappy path. Failing loudly at startup is the
-    // safe direction.
-    let client = dispatcher_client_builder(config.timeout)
-        .build()
-        .expect("webhook dispatcher HTTP client must build; a default client would drop the no-redirect SSRF policy");
-
+    let egress = std::sync::Arc::new(epigraph_jobs::egress::EgressGuard::system());
     let store = webhook_store;
     let cfg = std::sync::Arc::new(config);
 
     event_bus.subscribe(vec![], move |event| {
-        let client = client.clone();
+        let egress = std::sync::Arc::clone(&egress);
         let store = store.clone();
         let cfg = std::sync::Arc::clone(&cfg);
 
         tokio::spawn(async move {
-            let _ = deliver_event(&client, &store, &event, &cfg).await;
+            let _ = deliver_event(&egress, &store, &event, &cfg).await;
         });
     })
 }
@@ -1837,7 +1783,7 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn test_deliver_event_with_no_subscriptions_does_not_touch_the_pool() {
-        let client = reqwest::Client::new();
+        let egress = stub_egress(StubResolver::new());
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nobody")
@@ -1851,14 +1797,54 @@ mod tests {
         };
         let config = WebhookDeliveryConfig::default();
 
-        let results = deliver_event(&client, &pool, &store, &event, &config).await;
+        let results = deliver_event(&egress, &pool, &store, &event, &config).await;
         assert!(
             results.is_empty(),
             "No subscriptions means no delivery results"
         );
     }
 
-    // ---- SSRF guard (backlog cf05eb0d) ----
+    // ---- SSRF guard (backlogs cf05eb0d, c89b65b0, 3289b067) ----
+
+    use epigraph_jobs::egress::{EgressGuard, StubResolver};
+
+    /// A guard over a stub resolver: no test in this module touches real DNS.
+    fn stub_egress(stub: StubResolver) -> EgressGuard {
+        EgressGuard::with_resolver(std::sync::Arc::new(stub))
+    }
+
+    /// A loopback listener that counts accepted connections and answers each
+    /// request with `response`. Returns (addr, counter, task).
+    async fn counting_listener(
+        bind: &str,
+        response: &'static [u8],
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&connections);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (addr, connections, task)
+    }
+
+    const OK_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const ERR_500: &[u8] =
+        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
     /// A subscription that never passed through `register_webhook` — inserted
     /// straight into the store, which is exactly the case the delivery-side
@@ -1918,7 +1904,7 @@ mod tests {
             }
         });
 
-        let client = reqwest::Client::new();
+        let egress = stub_egress(StubResolver::new());
         let subscription = ssrf_sub(format!("http://{addr}/hook"));
         let config = WebhookDeliveryConfig {
             timeout: std::time::Duration::from_millis(500),
@@ -1926,7 +1912,7 @@ mod tests {
         };
 
         let results =
-            [deliver_to_subscription(&client, &subscription, b"{}", "deadbeef", &config).await];
+            [deliver_to_subscription(&egress, &subscription, b"{}", "deadbeef", &config).await];
 
         // Give any in-flight connection a chance to be accepted before we
         // read the counter, so a pre-fix run is definitely observed.
@@ -1959,7 +1945,7 @@ mod tests {
     ///
     /// `localhost.` resolves to 127.0.0.1 exactly like `localhost`, but it
     /// survives WHATWG normalisation as a domain, so before the trailing-dot
-    /// strip in `epigraph_jobs::is_internal_ip` the guard allowed it and this
+    /// strip in the guard's reserved-name check the guard allowed it and this
     /// harness recorded one real TCP connection to loopback — the very outcome
     /// `test_deliver_event_does_not_dial_internal_target` asserts is
     /// impossible, defeated by appending one character.
@@ -1980,7 +1966,10 @@ mod tests {
             }
         });
 
-        let client = reqwest::Client::new();
+        // The stub would happily resolve `localhost.` to the listener — the
+        // name must be refused BEFORE any resolver is consulted.
+        let egress =
+            stub_egress(StubResolver::new().with("localhost.", ["127.0.0.1".parse().unwrap()]));
         let subscription = ssrf_sub(format!("http://localhost.:{port}/hook"));
         let config = WebhookDeliveryConfig {
             timeout: std::time::Duration::from_millis(500),
@@ -1988,7 +1977,7 @@ mod tests {
         };
 
         let results =
-            [deliver_to_subscription(&client, &subscription, b"{}", "deadbeef", &config).await];
+            [deliver_to_subscription(&egress, &subscription, b"{}", "deadbeef", &config).await];
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         accept_task.abort();
@@ -2025,10 +2014,12 @@ mod tests {
     /// success. This test is that attack, with the metadata endpoint stood in
     /// for by a loopback listener that counts connections.
     ///
-    /// The entry host is a *domain* the guard allows, resolved to the local
-    /// entry listener with reqwest's DNS override, so the request genuinely
-    /// leaves the dispatcher (asserted) and the hop is refused by the redirect
-    /// policy rather than by the URL guard or by DNS failure.
+    /// The entry host is a *domain* the stub resolver points at the local
+    /// entry listener, whose exact socket the test guard exempts, so the
+    /// request genuinely leaves the dispatcher (asserted) and the hop is
+    /// refused by the redirect policy rather than by the URL guard or by DNS
+    /// failure. The hop listener is NOT exempt: even a followed hop by name
+    /// would be refused.
     #[tokio::test]
     async fn test_delivery_does_not_follow_redirect_to_internal_target() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2079,23 +2070,20 @@ mod tests {
             }
         });
 
-        // The dispatcher's own client, with DNS for the entry domain pointed
-        // at the local entry listener. `resolve` ignores the port in the
-        // SocketAddr, so the URL carries it.
+        // The stub resolves the entry domain to the local entry listener, and
+        // the guard exempts exactly that socket; the URL carries the port.
         let entry_host = "webhook-entry.example.com";
         let config = WebhookDeliveryConfig {
             timeout: std::time::Duration::from_millis(1000),
             max_retries: 0,
         };
-        let client = super::dispatcher_client_builder(config.timeout)
-            .resolve(entry_host, entry_addr)
-            .build()
-            .expect("dispatcher client must build");
+        let egress = stub_egress(StubResolver::new().with(entry_host, [entry_addr.ip()]))
+            .exempt_socket_for_tests(entry_addr);
 
         let subscription = ssrf_sub(format!("http://{entry_host}:{}/hook", entry_addr.port()));
 
         let results =
-            [deliver_to_subscription(&client, &subscription, b"{}", "deadbeef", &config).await];
+            [deliver_to_subscription(&egress, &subscription, b"{}", "deadbeef", &config).await];
 
         // Give a followed redirect time to land before reading the counter, so
         // an unguarded run is definitely observed.
@@ -2137,6 +2125,164 @@ mod tests {
             "failure must be attributed to the refused redirect: {:?}",
             results[0].error
         );
+    }
+
+    /// Backlog c89b65b0 at delivery: a NAME whose record points at loopback
+    /// must not be dialled. Before resolution existed the delivery re-check
+    /// judged only the literal host, so this harness recorded one real TCP
+    /// connection to the listener.
+    #[tokio::test]
+    async fn test_delivery_does_not_dial_a_name_that_resolves_internal() {
+        let (addr, connections, task) = counting_listener("127.0.0.1:0", OK_200).await;
+        let host = "loopback-alias.example";
+        let egress = stub_egress(StubResolver::new().with(host, [addr.ip()]));
+        let subscription = ssrf_sub(format!("http://{host}:{}/hook", addr.port()));
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(500),
+            max_retries: 1,
+        };
+
+        let result =
+            deliver_to_subscription(&egress, &subscription, b"{}", "deadbeef", &config).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        task.abort();
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a name resolving to loopback must not be dialled"
+        );
+        assert!(!result.success);
+        assert_eq!(result.attempts, 0, "refused before any connection");
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("SSRF guard") && error.contains("127.0.0.1"),
+            "refusal must be the guard's and name the resolved address: {error}"
+        );
+    }
+
+    /// Backlog 3289b067: DNS rebinding. The hostile resolver answers the FIRST
+    /// lookup with the vetted listener and every later lookup with an internal
+    /// one on the same port (127.0.0.2 — all of 127/8 is loopback on Linux).
+    /// Delivery must resolve ONCE and send every attempt, retries included, to
+    /// the vetted address: the rebinding answer must never be consulted.
+    ///
+    /// The vetted listener answers 500 so the dispatcher retries; with
+    /// `max_retries: 2` that is three attempts on one pinned resolution.
+    #[tokio::test]
+    async fn test_delivery_is_pinned_to_the_vetted_resolution() {
+        // Same port on two loopback addresses. Bind the rebind target first on
+        // an ephemeral port, then try to take the same port on 127.0.0.1.
+        let (rebind_addr, rebind_hits, rebind_task, vetted_addr, vetted_hits, vetted_task) = loop {
+            let (r_addr, r_hits, r_task) = counting_listener("127.0.0.2:0", OK_200).await;
+            match tokio::net::TcpListener::bind(("127.0.0.1", r_addr.port())).await {
+                Ok(probe) => {
+                    drop(probe);
+                    let (v_addr, v_hits, v_task) =
+                        counting_listener(&format!("127.0.0.1:{}", r_addr.port()), ERR_500).await;
+                    break (r_addr, r_hits, r_task, v_addr, v_hits, v_task);
+                }
+                Err(_) => r_task.abort(),
+            }
+        };
+        assert_eq!(rebind_addr.port(), vetted_addr.port());
+
+        let host = "rebind.example";
+        let stub = std::sync::Arc::new(
+            StubResolver::new()
+                .with_sequence(host, vec![vec![vetted_addr.ip()], vec![rebind_addr.ip()]]),
+        );
+        // Exempt ONLY the vetted socket: 127.0.0.2 is refused if it is ever
+        // vetted, so a guard that re-resolved per attempt would fail loudly
+        // instead of silently succeeding.
+        let egress = EgressGuard::with_resolver(stub.clone()).exempt_socket_for_tests(vetted_addr);
+        let subscription = ssrf_sub(format!("http://{host}:{}/hook", vetted_addr.port()));
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(1000),
+            max_retries: 2,
+        };
+
+        let result =
+            deliver_to_subscription(&egress, &subscription, b"{}", "deadbeef", &config).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        rebind_task.abort();
+        vetted_task.abort();
+
+        assert_eq!(
+            rebind_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the rebinding answer must never be dialled"
+        );
+        assert_eq!(
+            vetted_hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every attempt, retries included, must reach the vetted address: {result:?}"
+        );
+        assert_eq!(
+            stub.calls(host),
+            1,
+            "the host must be resolved exactly once"
+        );
+        assert_eq!(result.attempts, 3);
+        assert_eq!(result.error.as_deref(), Some("HTTP 500"));
+    }
+
+    /// The pinned client fails CLOSED: a name that is not the pinned one is not
+    /// handed to system DNS. Without `RefuseUnpinnedNames`, reqwest falls back
+    /// to its default resolver for any name missing from the overrides.
+    #[tokio::test]
+    async fn test_pinned_client_refuses_to_resolve_other_names() {
+        let egress = stub_egress(
+            StubResolver::new().with("pinned.example", ["93.184.216.34".parse().unwrap()]),
+        );
+        let target = egress
+            .vet("http://pinned.example/hook")
+            .await
+            .expect("public name vets");
+        let client = super::pinned_client(&target, std::time::Duration::from_secs(2))
+            .expect("pinned client builds");
+
+        let err = client
+            .post("http://unpinned.example/hook")
+            .send()
+            .await
+            .expect_err("an unpinned name must not resolve");
+        let chain = {
+            let mut msgs = vec![err.to_string()];
+            let mut src = std::error::Error::source(&err);
+            while let Some(e) = src {
+                msgs.push(e.to_string());
+                src = e.source();
+            }
+            msgs.join(" | ")
+        };
+        assert!(
+            chain.contains("only the vetted, pinned addresses may be dialled"),
+            "the failure must be the fail-closed resolver, not a DNS lookup: {chain}"
+        );
+    }
+
+    /// Positive control for pinning a fully-qualified name: `hooks.example.`
+    /// (trailing root dot) must still reach its vetted address, i.e. the pin
+    /// key and reqwest's lookup key agree on the dotted spelling.
+    #[tokio::test]
+    async fn test_pinned_delivery_reaches_a_trailing_dot_name() {
+        let (addr, hits, task) = counting_listener("127.0.0.1:0", OK_200).await;
+        let egress = stub_egress(StubResolver::new().with("fqdn.example.", [addr.ip()]))
+            .exempt_socket_for_tests(addr);
+        let subscription = ssrf_sub(format!("http://fqdn.example.:{}/hook", addr.port()));
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(1000),
+            max_retries: 0,
+        };
+
+        let result =
+            deliver_to_subscription(&egress, &subscription, b"{}", "deadbeef", &config).await;
+        task.abort();
+
+        assert!(result.success, "FQDN delivery must succeed: {result:?}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

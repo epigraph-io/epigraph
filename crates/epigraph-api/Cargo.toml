@@ -123,6 +123,10 @@ epigraph-privacy = { workspace = true }
 # TEST TARGET IS IN, and events emitted from `src/` are never captured. Same
 # version and same feature as `epigraph-mcp`, which set this precedent.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# `test-support` exposes `EgressGuard::exempt_socket_for_tests`, which lets a
+# webhook delivery test reach ONE exact local listener. Dev-dependency only, so
+# a release build of `server` does not contain it.
+epigraph-jobs = { workspace = true, features = ["test-support"] }
 
 [[test]]
 name = "boot_secret_gate_test"

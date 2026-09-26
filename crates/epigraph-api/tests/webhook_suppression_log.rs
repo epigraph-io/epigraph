@@ -73,6 +73,16 @@ fn store_of(subs: &[WebhookSubscription]) -> WebhookStore {
     Arc::new(tokio::sync::RwLock::new(map))
 }
 
+/// The delivery egress guard for these tests: a stub resolver that answers
+/// nothing. Every target here is the literal `127.0.0.1:1`, which the guard
+/// refuses before resolving, so no DNS is involved and an attempted delivery
+/// still yields a result entry — the discriminator these tests count.
+fn no_dns_egress() -> epigraph_jobs::egress::EgressGuard {
+    epigraph_jobs::egress::EgressGuard::with_resolver(std::sync::Arc::new(
+        epigraph_jobs::egress::StubResolver::new(),
+    ))
+}
+
 /// A suppressed subscriber is REPORTED, not merely dropped.
 ///
 /// Current-thread runtime, deliberately: `traced_test` enters its span on the
@@ -92,7 +102,7 @@ async fn suppressing_a_subscriber_emits_the_suppression_target() {
     let store = store_of(&[outside.clone(), inside.clone()]);
 
     let results = deliver_event(
-        &reqwest::Client::new(),
+        &no_dns_egress(),
         &pool,
         &store,
         &epigraph_events::EpiGraphEvent::ClaimSubmitted {
