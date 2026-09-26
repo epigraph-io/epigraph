@@ -165,17 +165,59 @@ pub fn unauthorized(resource_metadata_url: Option<&str>, error: &str) -> Respons
     resp
 }
 
-/// Build an [`AuthContext`] that holds every scope the tool registry knows
-/// about (derived from [`crate::scope_map::SCOPE_MAP`] so new scopes are
-/// covered automatically).
+/// Whether a principal-less caller on the `--allow-unauthenticated-http`
+/// listener may WRITE (batch HTTP-id).
 ///
-/// Used ONLY on the `--allow-unauthenticated-http` path. There, the operator
-/// has explicitly opted out of Bearer auth, so no real token is validated and
-/// no `AuthContext` would otherwise be attached — which makes the per-tool
-/// scope gate (`server::enforce_tool_scope`, applied to every HTTP call) reject
-/// *everything* with "no auth context", rendering the flag misleading (backlog
-/// bug `be2a3391`). Injecting this permissive context lets calls through, which
-/// is exactly what the operator asked for.
+/// # The decision: refused by default
+///
+/// That listener validates no credential, so no request on it names a human.
+/// Every write it made was authored by the listener's own signer agent (the
+/// injected context's `agent_id`), which belongs to no human, so a write there
+/// can never satisfy "every HTTP write is authored by an agent that belongs to
+/// the calling human". And whatever such writes create accumulates under one
+/// shared identity that no human owns and none can retire over HTTP; linking
+/// that identity to a human afterwards is what migration 107 section 9
+/// refuses. So the default is [`Self::Refused`]: the injected context carries
+/// only the `:read` scopes, the per-tool scope gate refuses every write tool
+/// before dispatch (the maintenance tools included), and
+/// `EpiGraphMcpFull::write_identity` refuses a principal-less context without
+/// a write scope as a second, independent layer. Reads are unchanged. A caller
+/// that needs to write uses an authenticated (`--jwt-secret`) listener, where
+/// its writes are authored by its own agent.
+///
+/// [`Self::AsListenerSigner`] (`--allow-unauthenticated-writes`) keeps the
+/// pre-HTTP-id behaviour for a trusted local socket such as the e2e harness:
+/// writes are authored by the listener's signer, which the start-up and
+/// per-call gates (`operator::refuse_operated_http_signer`,
+/// `operator::refuse_linked_http_signer`) keep UNLINKED, so it never carries
+/// any human's authority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnauthenticatedWrites {
+    /// Reads only; every write is refused (the default).
+    #[default]
+    Refused,
+    /// Writes allowed, authored by the listener's own unlinked signer.
+    AsListenerSigner,
+}
+
+/// Build the [`AuthContext`] injected on the `--allow-unauthenticated-http`
+/// listener: the listener's own signer as the principal, a NIL `client_id` and
+/// `jti` (no token was presented; see [`is_principal_less`]), and the scopes
+/// `writes` allows, derived from [`crate::scope_map::SCOPE_MAP`] so new scopes
+/// are covered automatically.
+///
+/// Used ONLY on that path. There no real token is validated and no
+/// `AuthContext` would otherwise be attached, which makes the per-tool scope
+/// gate (`server::enforce_tool_scope`, applied to every HTTP call) reject
+/// *everything* with "no auth context" (backlog bug `be2a3391`). Injecting this
+/// context lets through the calls the operator allowed.
+///
+/// # Scopes (batch HTTP-id)
+///
+/// With [`UnauthenticatedWrites::Refused`] (the default) only the scopes that
+/// end in `:read` are carried, so the scope gate refuses every `claims:write`
+/// and `claims:admin` tool. Before batch HTTP-id this context carried every
+/// scope, `claims:admin` included, with no human behind any of it.
 ///
 /// # Tenancy (PR-09)
 ///
@@ -196,10 +238,16 @@ pub fn unauthorized(resource_metadata_url: Option<&str>, error: &str) -> Respons
 /// `'public'` and backfills nothing; the difference appears the moment PR-12's
 /// backfill writes the first `'group'` row. Operators who do not want that
 /// should not be running `--allow-unauthenticated-http`.
-pub fn unauthenticated_context(server_agent_id: Option<uuid::Uuid>) -> AuthContext {
+pub fn unauthenticated_context(
+    server_agent_id: Option<uuid::Uuid>,
+    writes: UnauthenticatedWrites,
+) -> AuthContext {
     let mut scopes: Vec<String> = crate::scope_map::SCOPE_MAP
         .iter()
         .map(|(_, scope)| (*scope).to_string())
+        .filter(|scope| {
+            writes == UnauthenticatedWrites::AsListenerSigner || scope.ends_with(":read")
+        })
         .collect();
     scopes.sort();
     scopes.dedup();
@@ -211,6 +259,19 @@ pub fn unauthenticated_context(server_agent_id: Option<uuid::Uuid>) -> AuthConte
         scopes,
         jti: uuid::Uuid::nil(),
     }
+}
+
+/// Whether `auth` is the context [`unauthenticated_context`] injects: no token
+/// was presented, so it names no client and no token id.
+///
+/// A context validated from a real token carries the token's `sub` as
+/// `client_id` and a random `jti` (`epigraph_auth::JwtConfig::issue_access_token`),
+/// so both being nil identifies the injected context. A token forged with
+/// both ids nil would only be treated MORE strictly (as principal-less), never
+/// less.
+#[must_use]
+pub fn is_principal_less(auth: &AuthContext) -> bool {
+    auth.client_id.is_nil() && auth.jti.is_nil()
 }
 
 /// Something that can resolve the server's own `agents.id`, retrying on failure.
@@ -297,6 +358,9 @@ pub struct UnauthenticatedPrincipal {
     /// the clone axum makes per request, which is the whole point: a per-request
     /// copy would bound nothing.
     last_attempt: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// What the injected context allows (batch HTTP-id). The derived default is
+    /// [`UnauthenticatedWrites::Refused`], so defaulting still cannot widen.
+    writes: UnauthenticatedWrites,
 }
 
 /// How long an unresolved principal waits before consulting the source again.
@@ -311,6 +375,7 @@ impl std::fmt::Debug for UnauthenticatedPrincipal {
         f.debug_struct("UnauthenticatedPrincipal")
             .field("warm", &self.warm)
             .field("has_source", &self.source.is_some())
+            .field("writes", &self.writes)
             .finish()
     }
 }
@@ -332,6 +397,7 @@ impl UnauthenticatedPrincipal {
             source: Some(source),
             cooldown: DEFAULT_RESOLUTION_COOLDOWN,
             last_attempt: std::sync::Arc::default(),
+            writes: UnauthenticatedWrites::Refused,
         }
     }
 
@@ -349,6 +415,19 @@ impl UnauthenticatedPrincipal {
     pub fn warmed_with(mut self, id: uuid::Uuid) -> Self {
         self.warm = Some(id);
         self
+    }
+
+    /// Set whether the injected context may write; see [`UnauthenticatedWrites`].
+    #[must_use]
+    pub fn with_writes(mut self, writes: UnauthenticatedWrites) -> Self {
+        self.writes = writes;
+        self
+    }
+
+    /// What the injected context allows.
+    #[must_use]
+    pub fn writes(&self) -> UnauthenticatedWrites {
+        self.writes
     }
 
     /// May the source be consulted right now? Stamps the attempt if so.
@@ -424,9 +503,10 @@ impl UnauthenticatedPrincipal {
     }
 }
 
-/// Axum middleware for the `--allow-unauthenticated-http` listener: inject the
-/// permissive [`unauthenticated_context`] into every request so the downstream
-/// scope gate passes. Mirrors how [`bearer_auth_middleware`] inserts a
+/// Axum middleware for the `--allow-unauthenticated-http` listener: inject
+/// [`unauthenticated_context`] into every request so the downstream scope gate
+/// admits what the principal allows (reads only, unless it was built
+/// [`UnauthenticatedPrincipal::with_writes`] `AsListenerSigner`). Mirrors how [`bearer_auth_middleware`] inserts a
 /// *validated* `AuthContext`, minus the validation. Attach this ONLY when the
 /// operator passed `--allow-unauthenticated-http` (enforced in `main.rs`).
 ///
@@ -442,7 +522,7 @@ pub async fn inject_unauthenticated_context(
 ) -> Response {
     let server_agent_id = principal.agent_id().await;
     req.extensions_mut()
-        .insert(unauthenticated_context(server_agent_id));
+        .insert(unauthenticated_context(server_agent_id, principal.writes));
     next.run(req).await
 }
 
@@ -801,5 +881,117 @@ mod tests {
         let reason = rejection_reason(cfg.validate_token(&token).unwrap_err().kind());
         assert!(!reason.contains(&token[..16]));
         assert!(reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+    }
+
+    // ── batch HTTP-id: the principal-less context is read-only by default ──
+
+    /// Every scope the kernel's tool map uses, split by whether it reads.
+    fn map_scopes() -> (Vec<String>, Vec<String>) {
+        let mut all: Vec<String> = crate::scope_map::SCOPE_MAP
+            .iter()
+            .map(|(_, s)| (*s).to_string())
+            .collect();
+        all.sort();
+        all.dedup();
+        all.into_iter().partition(|s| s.ends_with(":read"))
+    }
+
+    /// The default carries the read scopes and NO write or admin scope, so the
+    /// scope gate refuses every write tool on the principal-less listener. The
+    /// map must actually contain write scopes, or this would pass over nothing.
+    #[test]
+    fn the_default_principal_less_context_carries_read_scopes_only() {
+        let (reads, writes) = map_scopes();
+        assert!(!reads.is_empty() && !writes.is_empty());
+        let ctx =
+            unauthenticated_context(Some(uuid::Uuid::new_v4()), UnauthenticatedWrites::default());
+        let mut got = ctx.scopes.clone();
+        got.sort();
+        assert_eq!(got, reads, "only the :read scopes");
+        for w in &writes {
+            assert!(
+                !ctx.has_scope(w),
+                "a principal-less context must not carry {w}"
+            );
+        }
+    }
+
+    /// The opt-in (`--allow-unauthenticated-writes`) keeps the pre-HTTP-id
+    /// scope set, every scope in the map.
+    #[test]
+    fn the_opt_in_principal_less_context_carries_every_scope() {
+        let (reads, writes) = map_scopes();
+        let ctx = unauthenticated_context(None, UnauthenticatedWrites::AsListenerSigner);
+        for s in reads.iter().chain(writes.iter()) {
+            assert!(ctx.has_scope(s), "opt-in context must carry {s}");
+        }
+    }
+
+    /// The marker the write refusal keys on: the injected context is
+    /// principal-less; a context validated from a real token never is.
+    #[test]
+    fn only_the_injected_context_is_principal_less() {
+        for writes in [
+            UnauthenticatedWrites::Refused,
+            UnauthenticatedWrites::AsListenerSigner,
+        ] {
+            assert!(is_principal_less(&unauthenticated_context(
+                Some(uuid::Uuid::new_v4()),
+                writes
+            )));
+        }
+        let cfg = JwtConfig::from_secret(b"a-test-secret-that-is-long-enough-000");
+        let (token, _) = cfg
+            .issue_access_token(
+                uuid::Uuid::new_v4(),
+                vec!["claims:read".into(), "claims:write".into()],
+                "human",
+                None,
+                Some(uuid::Uuid::new_v4()),
+                chrono::Duration::minutes(5),
+            )
+            .unwrap();
+        let validated: AuthContext = cfg.validate_token(&token).unwrap().into();
+        assert!(!is_principal_less(&validated));
+    }
+
+    /// The middleware injects what the principal allows: nothing to write by
+    /// default, everything with the opt-in.
+    #[tokio::test]
+    async fn the_middleware_injects_the_principals_write_setting() {
+        async fn echo_can_write(req: Request) -> Response {
+            let can = req
+                .extensions()
+                .get::<AuthContext>()
+                .is_some_and(|c| c.has_scope("claims:write"));
+            can.to_string().into_response()
+        }
+        for (principal, want) in [
+            (UnauthenticatedPrincipal::unresolvable(), "false"),
+            (
+                UnauthenticatedPrincipal::unresolvable()
+                    .with_writes(UnauthenticatedWrites::AsListenerSigner),
+                "true",
+            ),
+        ] {
+            use tower::ServiceExt;
+            let router = axum::Router::new()
+                .route("/probe", axum::routing::get(echo_can_write))
+                .layer(axum::middleware::from_fn_with_state(
+                    principal,
+                    inject_unauthenticated_context,
+                ));
+            let resp = router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/probe")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+            assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), want);
+        }
     }
 }

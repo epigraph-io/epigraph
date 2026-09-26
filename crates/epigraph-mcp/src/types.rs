@@ -1819,7 +1819,7 @@ pub struct StructureSourceParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkHierarchicalParams {
     #[schemars(
-        description = "UUID of the source claim. Written with YOUR agent's authority (the authenticated caller over HTTP, this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused. Either refusal writes nothing."
+        description = "UUID of the source claim. Written with YOUR agent's authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused. Either refusal writes nothing."
     )]
     pub source_claim_id: String,
 
@@ -1934,7 +1934,7 @@ pub struct DeleteEdgeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkAlternativeParams {
     #[schemars(
-        description = "UUID of the first competing claim. Written with YOUR agent's authority (the authenticated caller over HTTP, this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
+        description = "UUID of the first competing claim. Written with YOUR agent's authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
     )]
     pub claim_a: String,
 
@@ -1980,7 +1980,7 @@ pub struct LinkAlternativeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkEpistemicParams {
     #[schemars(
-        description = "UUID of the source claim (the evidence / asserting side). Written with YOUR agent's authority (the authenticated caller over HTTP, this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
+        description = "UUID of the source claim (the evidence / asserting side). Written with YOUR agent's authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
     )]
     pub source_claim_id: String,
 
@@ -2813,7 +2813,7 @@ pub struct CreatePerspectiveParams {
     pub description: Option<String>,
 
     #[schemars(
-        description = "UUID of the agent who owns this perspective (defaults to the calling agent: the authenticated caller over HTTP, this server's own agent on stdio). Over HTTP it must be your own agent id; another agent's id is refused."
+        description = "UUID of the agent who owns this perspective (defaults to the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio). Over HTTP it must be your own agent id; another agent's id is refused."
     )]
     pub owner_agent_id: Option<String>,
 

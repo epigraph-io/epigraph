@@ -87,6 +87,20 @@ struct Cli {
     #[arg(long)]
     allow_unauthenticated_http: bool,
 
+    /// Let callers of an `--allow-unauthenticated-http` listener WRITE, authored
+    /// by this listener's own signer agent.
+    ///
+    /// Off by default (batch HTTP-id): such a caller presents no credential, so
+    /// no human is named, and an HTTP write is authored by the calling human's
+    /// agent. Without this flag that listener is read-only for its callers
+    /// (every write tool is refused by the scope gate). With it, writes are
+    /// authored by the signer, which the listener's start-up and per-call gates
+    /// keep unlinked from any operator, so it carries no human's authority.
+    /// Meant for a trusted local socket (e.g. the e2e harness), not for a
+    /// listener any remote caller can reach. Requires `--allow-unauthenticated-http`.
+    #[arg(long)]
+    allow_unauthenticated_writes: bool,
+
     /// Additional `Host` / `Origin` authority to accept on the HTTP listener
     /// (repeatable; comma-separated in the env var).
     ///
@@ -304,6 +318,34 @@ fn check_listen_auth_mode(
     }
 }
 
+/// Validate `--allow-unauthenticated-writes` (batch HTTP-id) and turn it into
+/// the injected context's write setting.
+///
+/// The flag only means something on the listener that injects a principal-less
+/// context, so it is refused anywhere else rather than silently ignored: an
+/// operator who passes it on a `--jwt-secret` listener or on stdio has a wrong
+/// picture of what their callers can do.
+fn unauthenticated_writes(
+    listen: Option<&str>,
+    allow_unauthenticated_http: bool,
+    allow_unauthenticated_writes: bool,
+) -> Result<epigraph_mcp::auth::UnauthenticatedWrites, String> {
+    use epigraph_mcp::auth::UnauthenticatedWrites;
+    if !allow_unauthenticated_writes {
+        return Ok(UnauthenticatedWrites::Refused);
+    }
+    if listen.is_none() || !allow_unauthenticated_http {
+        return Err(
+            "--allow-unauthenticated-writes applies only to an --allow-unauthenticated-http \
+             listener (--listen unix:/abs/path --allow-unauthenticated-http). An authenticated \
+             listener authors every write as the caller's own agent, and stdio as this \
+             process's agent; neither has a principal-less caller to let write."
+                .to_string(),
+        );
+    }
+    Ok(UnauthenticatedWrites::AsListenerSigner)
+}
+
 /// Attach the privileged pool the three MCP maintenance tools lease from, when
 /// one can be vouched for. Otherwise attach NOTHING: the tools then refuse
 /// loudly, and the rest of the server serves normally.
@@ -471,6 +513,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
+    let unauthenticated_writes = match unauthenticated_writes(
+        cli.listen.as_deref(),
+        cli.allow_unauthenticated_http,
+        cli.allow_unauthenticated_writes,
+    ) {
+        Ok(writes) => writes,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
+        }
+    };
 
     // Operator gate (see `epigraph_mcp::operator`). Signer SELECTION is pure, so
     // it runs here, before the DB connect, and only its side effects (printing a
@@ -785,7 +838,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let probe = Arc::new(sessions.session());
                 let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
                     probe.clone() as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
-                );
+                )
+                .with_writes(unauthenticated_writes);
+                // Batch HTTP-id: say at boot which one this listener is.
+                match unauthenticated_writes {
+                    epigraph_mcp::auth::UnauthenticatedWrites::Refused => tracing::info!(
+                        "--allow-unauthenticated-http listener is READ-ONLY for its callers \
+                         (no authenticated principal, so no author): write tools are refused. \
+                         Writes go through an authenticated (--jwt-secret) listener."
+                    ),
+                    epigraph_mcp::auth::UnauthenticatedWrites::AsListenerSigner => {
+                        tracing::warn!(
+                            "--allow-unauthenticated-writes: callers of this listener write as its \
+                             own signer agent, which no human owns. Use it only on a trusted local \
+                             socket."
+                        );
+                    }
+                }
                 match probe.server_agent_id().await {
                     Ok(id) => principal.warmed_with(id),
                     Err(e) => {
@@ -1017,6 +1086,46 @@ mod listen_auth_gate_tests {
             let err = check_listen_auth_mode(listen, None, false)
                 .expect_err("--listen with no auth mode must be refused");
             assert!(err.contains("--jwt-secret"), "got: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod unauthenticated_writes_gate_tests {
+    use super::unauthenticated_writes;
+    use epigraph_mcp::auth::UnauthenticatedWrites;
+
+    const UNIX: &str = "unix:/run/epigraph-mcp.sock";
+
+    /// Batch HTTP-id: without the flag the principal-less listener is
+    /// read-only, on every transport.
+    #[test]
+    fn writes_are_refused_unless_the_flag_is_given() {
+        for (listen, unauth) in [(Some(UNIX), true), (Some(UNIX), false), (None, false)] {
+            assert_eq!(
+                unauthenticated_writes(listen, unauth, false),
+                Ok(UnauthenticatedWrites::Refused)
+            );
+        }
+    }
+
+    /// The flag opts the principal-less listener into signer-authored writes.
+    #[test]
+    fn the_flag_on_an_unauthenticated_listener_allows_signer_writes() {
+        assert_eq!(
+            unauthenticated_writes(Some(UNIX), true, true),
+            Ok(UnauthenticatedWrites::AsListenerSigner)
+        );
+    }
+
+    /// Anywhere else the flag is refused, not ignored: an authenticated
+    /// listener has no principal-less caller, and neither does stdio.
+    #[test]
+    fn the_flag_without_an_unauthenticated_listener_is_refused() {
+        for (listen, unauth) in [(Some(UNIX), false), (None, false), (None, true)] {
+            let err = unauthenticated_writes(listen, unauth, true)
+                .expect_err("the flag must be refused without an unauthenticated listener");
+            assert!(err.contains("--allow-unauthenticated-http"), "got: {err}");
         }
     }
 }
