@@ -473,7 +473,8 @@ Current reservation:
   application path (105's RVK01/RVK02 refusals propagate). The author's group
   is resolved only when the writer left `owner_group_id` NULL; a writer that
   named the owner keeps it, and no personal group is minted for a row that
-  does not use it. A non-seed
+  does not use it. The API's boot posture probes ask the same question through
+  `epigraph_db::repos::seed_posture`. A non-seed
   superuser's undeclared ROOT row (frames, contexts, perspectives,
   communities, harvester_fragments, recall_events) now RAISES 23502 like any
   other non-seed writer's: those tables have no author to derive from. The

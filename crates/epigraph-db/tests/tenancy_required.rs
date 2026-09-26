@@ -631,6 +631,62 @@ async fn an_admin_only_grant_of_the_seed_role_is_not_a_seed(pool: PgPool) {
     tx.rollback().await.expect("rollback");
 }
 
+/// The API's two boot posture probes ask the seed question through
+/// `seed_posture::SESSION_IS_SEED_SQL`, an inline copy of 113's walk (one
+/// statement has to parse below 113 too, so it cannot name the function
+/// directly). The copy must give the trigger's answer for every kind of
+/// session, and below 113 it must not error and must give 074's answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_boot_probe_asks_the_seed_question_the_triggers_ask(pool: PgPool) {
+    use epigraph_db::repos::seed_posture::{SEED_FUNCTION_EXISTS_SQL, SESSION_IS_SEED_SQL};
+    let both = format!(
+        "SELECT {SESSION_IS_SEED_SQL}, public.epigraph_session_is_seed(), \
+                {SEED_FUNCTION_EXISTS_SQL}"
+    );
+    let mut tx = roles_tx(&pool).await;
+    for (role, want) in [
+        (NONSEED_SUPERUSER, false),
+        (SEED_SUPERUSER, true),
+        (ADMIN_ONLY, false),
+        (ADMIN_VIA, false),
+        ("epigraph_app", false),
+    ] {
+        become_role(&mut tx, role).await;
+        let got: (bool, bool, bool) = sqlx::query_as(&both)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or_else(|e| panic!("probe as {role}: {e}"));
+        reset_role(&mut tx).await;
+        assert_eq!(
+            got,
+            (want, want, true),
+            "as {role}: (boot probe, epigraph_session_is_seed(), function exists). The boot \
+             probe must answer the question the triggers ask"
+        );
+    }
+
+    // Below 113 the function does not exist. Functions are per database, so
+    // dropping it here touches no other test; the rollback restores it.
+    tx.execute("DROP FUNCTION public.epigraph_session_is_seed()")
+        .await
+        .expect("drop the function inside the transaction");
+    become_role(&mut tx, NONSEED_SUPERUSER).await;
+    let below: (bool, bool) = sqlx::query_as(&format!(
+        "SELECT {SESSION_IS_SEED_SQL}, {SEED_FUNCTION_EXISTS_SQL}"
+    ))
+    .fetch_one(&mut *tx)
+    .await
+    .expect("below 113 the probe must still parse and run");
+    reset_role(&mut tx).await;
+    assert_eq!(
+        below,
+        (true, false),
+        "below 113 the triggers ask pg_has_role, which a superuser satisfies, so the probe must \
+         report the superuser as a seed there"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
 /// THE DEFECT. An undeclared claim written on a superuser session that holds
 /// no grant of `epigraph_seed` must get its author's own declaration —
 /// `('public', <author's personal group>)`, what

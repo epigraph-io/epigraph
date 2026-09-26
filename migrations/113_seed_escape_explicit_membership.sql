@@ -171,7 +171,15 @@
 -- `epigraph_session_is_seed()` is a plain invoker function: it reads only
 -- `pg_roles` and `pg_auth_members`, which every role can read, and it reports
 -- only on the CALLER's own session user, so it is left EXECUTE-able by PUBLIC,
--- as `epigraph_bypass()` is, for the API's boot posture probe.
+-- as `epigraph_bypass()` is. The API's two boot posture probes
+-- (`AppState::probe_rls_posture`, `AppState::warn_on_privileged_connection`)
+-- ask the same question through
+-- `epigraph_db::repos::seed_posture::SESSION_IS_SEED_SQL`, an inline copy of
+-- this walk gated on this function existing, because one statement must
+-- parse on a database below 113 too, and a reference to a function that does
+-- not exist is a parse-time error even in an untaken CASE branch.
+-- `tenancy_required.rs::the_boot_probe_asks_the_seed_question_the_triggers_ask`
+-- pins the copy to this function, role kind by role kind.
 --
 -- Idempotent: CREATE OR REPLACE only.
 SET LOCAL lock_timeout = '3s';

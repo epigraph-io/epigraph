@@ -56,6 +56,7 @@ pub mod recall_event;
 pub mod refresh_token;
 pub mod scoped_belief;
 pub mod security_event;
+pub mod seed_posture;
 pub mod semantic_link;
 pub mod sheaf;
 pub mod span;
