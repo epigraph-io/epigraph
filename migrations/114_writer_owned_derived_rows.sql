@@ -57,6 +57,20 @@
 --     semantics; the cache is recomputable from the stored mass functions at
 --     any time (`recompute_beliefs`), and every such write is audited.
 --
+-- KNOWN LIMITATION, NOT CLOSED HERE (review finding W8): the combination treats
+-- every stored BBA as an independent source. One writer that submits N
+-- differently-worded pieces of evidence (each `update_with_evidence` keys its
+-- BBA by a fresh evidence id), or wires N edges from claims it authored, is
+-- combined as N sources, and can on its own move a public claim's CACHED
+-- belief (belief / plausibility / pignistic_prob, and the classification
+-- derived from them) arbitrarily close to 0 or 1. It cannot move `truth_value`,
+-- labels or content, and every cache write is attributed in `security_events`.
+-- Bounding one writer's weight needs a per-writer reduction (e.g. averaging
+-- each writer group's writer-owned BBAs into one before Dempster's rule)
+-- applied at EVERY combine site that reads stored BBAs -- the engine
+-- recompute, `ds_auto`, the belief/assess/hypothesis routes and the read-side
+-- belief queries -- or reads and writes would disagree. That is its own change.
+--
 -- WHY THE DEFINER TAKES THE CACHE VALUES FROM THE CALLER rather than computing
 -- them: the combination runs in Rust (`epigraph_ds::combination`, with the
 -- per-frame reliability discount read from `calibration.toml` on disk and the
@@ -93,7 +107,12 @@
 --       before (the row inherits the claim's owner).
 --   (e) A PUBLIC claim the session can see but not write: the row is owned by
 --       the writer's default write group (`epigraph_writer_group()`), with
---       `visibility = 'public'` and `writer_owned = true`.
+--       `visibility = 'public'` and `writer_owned = true`. Decided on the claim
+--       row LOCKED `FOR NO KEY UPDATE` (`epigraph_lock_public_claim_for_attach`,
+--       a definer that locks and returns a PUBLIC claim only), so an attach and
+--       a privatization of the same claim serialise: whichever commits second
+--       sees the other (review finding W6). A claim privatized or re-owned to a
+--       writable group while the attach waited falls back to 074 and 077.
 --   (f) A group-private claim the session can read but not write: left as
 --       before, so 077's WITH CHECK refuses it. Writer-owned rows exist only
 --       on public claims.
@@ -131,8 +150,9 @@
 -- claim's tenancy. Left alone it would re-stamp a writer-owned row to the
 -- claim's (world) owner at the NEXT insert on that claim. For the three
 -- writer tables it now skips `writer_owned` rows, exactly as 110 skips pinned
--- evidence. A writer-owned row's visibility already equals its claim's (arm
--- (e) set it, and arm (d) below keeps it so), so there is nothing to re-sync.
+-- evidence. A writer-owned row exists only on a public claim (arm (e) creates
+-- it public, arm (d) below un-flags it when the claim narrows), so there is
+-- nothing to re-sync.
 --
 -- Arm (d) `epigraph_propagate_tenancy` (AFTER UPDATE STATEMENT on claims) on a
 -- claim owner/visibility change:
@@ -141,15 +161,26 @@
 --     `AND NOT d.writer_owned` conjunct on the three writer tables' loop
 --     iterations only). The `derived text[]` literal is byte-for-byte 072's,
 --     because `epigraph_cli::operator::tables::parse_derived_array` reads it.
---   * writer-owned rows: the OWNER NEVER CHANGES (the writer's contribution is
---     the writer's, whoever the claim moves to) and the VISIBILITY FOLLOWS the
---     claim, so privatizing a claim narrows the rows attached to it and never
---     leaves them wider than it. A pinned evidence row is excluded here too:
---     110's statement keeps it 'group'. The UPDATE runs only when a count
---     finds a row to change, so a claim change with no writer-owned row issues
---     exactly 110's statements (`tenancy_triggers.rs::
---     propagation_is_one_pass_per_statement_not_one_per_row` observes the
---     number of UPDATEs on `evidence`).
+--   * writer-owned rows, while the claim stays PUBLIC: untouched. Their owner
+--     is the writer's whoever the claim moves to, and they are already public
+--     (or 'group', for pinned evidence, which 110's statement keeps).
+--   * writer-owned rows, when the claim NARROWS to non-public (review finding
+--     W5, a deliberate decision): they become the CLAIM's -- owner and
+--     visibility follow the claim, `writer_owned` is cleared, pinned evidence
+--     included. The alternative, keeping the writer as owner and narrowing only
+--     the visibility, leaves rows about a private claim readable by the
+--     writer's group (an operator's other agents included) and invisible to,
+--     and undeletable by, the claim's own owner: disjoint, not narrower, and
+--     sequestering evidence from the one party that now holds the claim.
+--     Privatization's seal already encrypts every evidence row of a sealed
+--     claim with the claim group's key, the writer's included, so the writer
+--     loses the plaintext either way. The writer stays recorded as the row's
+--     author (`evidence.signer_id`, `mass_functions.source_agent_id`); on
+--     re-publication the rows follow the claim as claim-owned rows.
+--   The writer-owned UPDATE runs only when a count finds a row to change, so a
+--   claim change with no writer-owned row issues exactly 110's statements
+--   (`tenancy_triggers.rs::propagation_is_one_pass_per_statement_not_one_per_row`
+--   observes the number of UPDATEs on `evidence`).
 --
 -- ===================================================================
 -- 4. THE OWNER GUARD (`epigraph_writer_owner_guard`, BEFORE UPDATE ROW)
@@ -161,8 +192,12 @@
 -- ownership steal that was harmless while every row copied its claim (the
 -- next arm-(c) re-sync put it back) and is not once arm (c) stops re-syncing
 -- writer-owned rows. The guard refuses (42501) a change of `owner_group_id` or
--- `writer_owned` from any session that is not privileged in the sense of
--- section 2(b). The propagation arms, the operator CLI (hide-evidence,
+-- `writer_owned`, and a change of `claim_id` or `visibility` on a writer-owned
+-- row, from any session that is not privileged in the sense of section 2(b)
+-- (review finding W7): a writer-owned row's parent and visibility track a claim
+-- that is not the writer's, so the writer may not re-point it at another claim
+-- (a private one included) or widen it past its claim. The dedup BBA move
+-- (section 5b) is the one sanctioned claim_id change, and runs as a definer. The propagation arms, the operator CLI (hide-evidence,
 -- reown) and privatization all run as `epigraph_maintenance` and are
 -- unaffected. SECURITY INVOKER, so `current_user` is the role that issued the
 -- UPDATE (or the maintenance owner of the definer that did).
@@ -182,12 +217,21 @@
 -- `epigraph_foreign_claim_classification(claim, classification,
 -- belief_frame_id)` and `epigraph_foreign_belief_clear(claim)`: the three
 -- writes of the DS cache. The cache carries ONE frame's combination
--- (`claims.belief_frame_id`); a non-owner refreshes it only on THAT frame (or
--- seeds it when the claim has none) and never re-points it to another frame --
--- one it created, say, holding only its own BBA -- which would replace the
--- claim's cross-writer combination on the writer's own authority. A refused
--- re-point is a no-op returning 0, not an error: the writer's BBA is stored
--- regardless, and which frame carries the belief stays the owner's decision.
+-- (`claims.belief_frame_id`); a non-owner refreshes it only on THAT frame and
+-- never re-points it to another frame -- one it created, say, holding only its
+-- own BBA -- which would replace the claim's cross-writer combination on the
+-- writer's own authority. It SEEDS a cache only when every cache column is
+-- NULL, and only on the canonical `binary_truth` frame: an older cache with no
+-- recorded frame is "frame unknown", not "no cache" (review finding W1). A
+-- refused write is a no-op returning 0, not an error: the writer's BBA is
+-- stored regardless, and which frame carries the belief stays the owner's
+-- decision. The clear refuses unless the cache's frame is recorded and no
+-- mass function is left on the claim on any frame.
+--
+-- The claim-frame definer refuses (FA07, 22023) to CREATE a `binary_truth`
+-- assignment at any hypothesis_index but 0 (TRUE): that index is what every
+-- reader takes as the claim's own truth, and on a world claim nobody could
+-- correct a non-owner's FALSE binding afterwards (review finding W2).
 --
 -- Each first calls `epigraph_foreign_aggregate_target(claim)`, which refuses:
 --   * FA01 (42501) no session principal: nothing to attribute the write to;
@@ -197,7 +241,10 @@
 --   * FA03 (22023) a claim the session CAN write: the ordinary RLS path is the
 --     one to use, and the repo layer takes it (this is defensive);
 --   * FA04 (42501) a group-private claim the session can read but not write,
---     with the text 077's WITH CHECK gives, so the refusal is what it was.
+--     with the text 077's WITH CHECK gives, so the refusal is what it was;
+--   * FA06 (42501) a principal with no writable group of its own
+--     (`epigraph_writer_group()` is NULL), which the attach trigger would not
+--     let attach a row either (review finding W13); 077's text again.
 -- and then appends one `security_events` row (`event_type =
 -- 'claims.foreign_aggregate_write'`, `agent_id` = the session principal, the
 -- claim, its owning group, the action and the values before and after), in
@@ -216,10 +263,18 @@
 --
 -- Ownership and grants: every function here is owned by
 -- `epigraph_maintenance` (so `epigraph_definer_bypass()` is true in the
--- definers), EXECUTE revoked from PUBLIC; the four aggregate definers and
--- `epigraph_writer_group()` are granted to `epigraph_app` and
--- `epigraph_maintenance`; the target check is granted to nobody (only the
--- definers, as its owner, call it). Guarded, as every such block since 060 is.
+-- definers), EXECUTE revoked from PUBLIC; the four aggregate definers, the
+-- attach lock (5 / 2(e)), the dedup move (5b) and `epigraph_writer_group()`
+-- are granted to `epigraph_app` and `epigraph_maintenance`; the legacy re-own
+-- (5c) to `epigraph_maintenance` only; the target check and the audit writer
+-- to nobody (only the definers, as their owner, call them). Guarded, as every
+-- such block since 060 is.
+--
+-- RUNBOOK, before the agents move to the application role: run
+-- `SELECT public.epigraph_reown_legacy_writer_bbas(<batch>)` as a maintenance
+-- login until it returns 0 (section 5c). Without it, an agent that re-submits a
+-- BBA it stored while its server ran privileged is refused (077 on the legacy
+-- claim-owned row its upsert conflicts with).
 --
 -- DEPLOY ORDER: apply 114 BEFORE any binary built with it serves. The repo
 -- layer's aggregate writes (`FrameRepository::assign_claim`,
@@ -230,7 +285,7 @@
 -- A binary built WITHOUT 114 against a database at 114 is unaffected (its
 -- statements are the ones 114 leaves in place for every non-foreign session).
 --
--- Undo: DROP the eight triggers and six functions this file creates, restore
+-- Undo: DROP the six triggers and thirteen functions this file creates, restore
 -- 110's two arm bodies, then DROP COLUMN writer_owned on the three tables
 -- (after `reown`-ing any writer-owned row whose writer should not keep it).
 -- Checked before claiming: no `origin/*` ref carries a `114`; 111/112 (H-b)
@@ -303,6 +358,29 @@ BEGIN
     RETURN false;
 END $$;
 
+-- Section 2(e)'s row lock (review finding W6). Without it an attach racing a
+-- privatization could commit a PUBLIC writer-owned row onto a claim that had
+-- just become private: the privatizing UPDATE's arm (d) cannot see the attach's
+-- uncommitted row, and arm (c) skips writer-owned rows, so nothing repairs it.
+-- `FOR NO KEY UPDATE`, not `FOR SHARE`: two non-owners attaching to the same
+-- claim would each hold SHARE and then each UPDATE the claim's cache through
+-- the belief-cache definer, which deadlocks; NO KEY UPDATE serialises them
+-- instead, and still does not conflict with the KEY SHARE an ordinary foreign
+-- key check takes. A definer, so the lock does not depend on the session's
+-- UPDATE policy; it returns (and locks) a PUBLIC claim only, so it is no oracle
+-- for a private one. Re-evaluated on the locked version, so a claim privatized
+-- while we waited comes back as no row.
+CREATE OR REPLACE FUNCTION public.epigraph_lock_public_claim_for_attach(p_claim uuid)
+RETURNS TABLE (o_owner uuid, o_vis character varying(16))
+LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT c.owner_group_id, c.visibility
+      FROM public.claims c
+     WHERE c.id = p_claim AND c.visibility = 'public'
+       FOR NO KEY UPDATE
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_lock_public_claim_for_attach(uuid) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION public.epigraph_attach_writer_owner() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER
 SET search_path = public, pg_temp AS $$
@@ -324,6 +402,11 @@ BEGIN
     -- (e) Public, readable, not writable: the writer's row.
     w := public.epigraph_writer_group();
     IF w IS NULL THEN RETURN NEW; END IF;
+    -- ... decided on the LOCKED claim row (W6). Privatized or re-owned to a
+    -- writable group while we waited: left to 074, and 077 decides, as before.
+    SELECT l.o_owner, l.o_vis INTO g, v
+      FROM public.epigraph_lock_public_claim_for_attach(NEW.claim_id) l;
+    IF NOT FOUND OR g = ANY (public.epigraph_writable_groups()) THEN RETURN NEW; END IF;
     NEW.owner_group_id := w;
     NEW.visibility     := 'public';
     NEW.writer_owned   := true;
@@ -339,8 +422,9 @@ LANGUAGE plpgsql SECURITY INVOKER
 SET search_path = public, pg_temp AS $$
 BEGIN
     IF public.epigraph_session_is_privileged_writer() THEN RETURN NEW; END IF;
-    RAISE EXCEPTION 'epigraph tenancy: %.% changes owner_group_id or writer_owned; only a '
-                    'maintenance session re-owns a derived row', TG_TABLE_NAME, OLD.id
+    RAISE EXCEPTION 'epigraph tenancy: %.% changes owner_group_id or writer_owned, or the '
+                    'claim_id or visibility of a writer-owned row; only a maintenance session '
+                    're-owns a derived row or moves a writer-owned one', TG_TABLE_NAME, OLD.id
         USING ERRCODE = '42501';
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_writer_owner_guard() FROM PUBLIC;
@@ -357,10 +441,14 @@ BEGIN
           t || '_attach_writer', t);
         EXECUTE format('DROP TRIGGER IF EXISTS %I ON public.%I', t || '_writer_owner_guard', t);
         EXECUTE format(
-          'CREATE TRIGGER %I BEFORE UPDATE OF owner_group_id, writer_owned ON public.%I
+          'CREATE TRIGGER %I BEFORE UPDATE OF owner_group_id, writer_owned, claim_id, visibility
+             ON public.%I
              FOR EACH ROW
              WHEN (OLD.owner_group_id IS DISTINCT FROM NEW.owner_group_id
-                   OR OLD.writer_owned IS DISTINCT FROM NEW.writer_owned)
+                   OR OLD.writer_owned IS DISTINCT FROM NEW.writer_owned
+                   OR (OLD.writer_owned
+                       AND (OLD.claim_id IS DISTINCT FROM NEW.claim_id
+                            OR OLD.visibility IS DISTINCT FROM NEW.visibility)))
              EXECUTE FUNCTION public.epigraph_writer_owner_guard()',
           t || '_writer_owner_guard', t);
     END LOOP;
@@ -446,29 +534,33 @@ BEGIN
                             'of % rows (RLS filtered?)', actual, expected;
         END IF;
     END IF;
-    -- 114: WRITER-OWNED rows. The owner is the writer's and never follows the
-    -- claim; the visibility does, so a privatized claim never leaves a row
-    -- attached to it wider than itself. Pinned evidence is 110's (above).
+    -- 114: WRITER-OWNED rows. While the claim stays public they are left
+    -- alone: their owner is the writer's whoever the claim moves to, and their
+    -- visibility is already the claim's (or narrower, for pinned evidence).
+    -- When the claim NARROWS to non-public they become the claim's: owner and
+    -- visibility follow the claim and the flag is cleared (review finding W5).
+    -- Keeping the writer as owner there would leave rows about a private claim
+    -- readable by the writer's group and hidden from the claim's own owner,
+    -- which is sequestering evidence from the one party who now holds the
+    -- claim; privatization's seal already encrypts every evidence row of the
+    -- claim with the claim group's key, the writer's included. Pinned evidence
+    -- is re-owned too (its visibility is 'group' either way, set above).
     -- Issued only when a count finds a row to change.
     FOREACH t IN ARRAY writer_tables LOOP
-        IF t = 'evidence' THEN
-            pin_skip := ' AND NOT EXISTS (SELECT 1 FROM public.evidence_visibility_pins vp'
-                        ' WHERE vp.evidence_id = d.id)';
-        ELSE
-            pin_skip := '';
-        END IF;
         EXECUTE format(
           'SELECT count(*) FROM %I d JOIN changed ch ON ch.id = d.claim_id
              WHERE d.writer_owned
-               AND d.visibility IS DISTINCT FROM ch.visibility', t) || pin_skip
+               AND ch.visibility IS DISTINCT FROM ''public''', t)
           INTO expected;
         IF expected > 0 THEN
             EXECUTE format(
-              'UPDATE %I d SET visibility = ch.visibility
+              'UPDATE %I d SET owner_group_id = ch.owner_group_id,
+                               visibility     = ch.visibility,
+                               writer_owned   = false
                  FROM changed ch
                 WHERE ch.id = d.claim_id
                   AND d.writer_owned
-                  AND d.visibility IS DISTINCT FROM ch.visibility', t) || pin_skip;
+                  AND ch.visibility IS DISTINCT FROM ''public''', t);
             GET DIAGNOSTICS actual = ROW_COUNT;
             IF actual <> expected THEN
                 RAISE EXCEPTION 'epigraph tenancy: propagation to writer-owned % updated % '
@@ -605,6 +697,14 @@ BEGIN
             USING ERRCODE = '42501',
                   DETAIL = 'FA04: a non-owner may attach only to a PUBLIC claim';
     END IF;
+    -- The attach trigger's own precondition (section 2(e)): a principal with no
+    -- group of its own to write (a read-only principal) attaches nothing, so it
+    -- writes no aggregate either. Same text as 077's refusal, as before 114.
+    IF public.epigraph_writer_group() IS NULL THEN
+        RAISE EXCEPTION 'new row violates row-level security policy for table "claims"'
+            USING ERRCODE = '42501',
+                  DETAIL = 'FA06: a non-owner write needs a writable group of the writer''s own';
+    END IF;
     RETURN v_owner;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_foreign_aggregate_target(uuid) FROM PUBLIC;
@@ -639,6 +739,22 @@ SET search_path = pg_catalog, public AS $$
 DECLARE v_owner uuid := public.epigraph_foreign_aggregate_target(p_claim);
         v_n bigint; v_idx integer;
 BEGIN
+    -- The canonical `binary_truth` frame's index is what every reader takes as
+    -- the claim's OWN truth (`edge_factor::resolve_hypothesis_index`,
+    -- `belief_query::get_belief`; `ds_auto` is hard-wired to index 0 there).
+    -- A non-owner may create that assignment only at 0 (TRUE): binding a world
+    -- claim to FALSE would be permanent, because no member of the world group
+    -- exists to correct it (review finding W2). `frames.name` is UNIQUE
+    -- (`frames_name_key`), so the name cannot be spoofed by a second frame.
+    IF COALESCE(p_hypothesis_index, 0) <> 0
+       AND NOT EXISTS (SELECT 1 FROM public.claim_frames cf
+                        WHERE cf.claim_id = p_claim AND cf.frame_id = p_frame)
+       AND EXISTS (SELECT 1 FROM public.frames f
+                    WHERE f.id = p_frame AND f.name = 'binary_truth') THEN
+        RAISE EXCEPTION 'FA07: a non-owner may assign claim % to binary_truth only at '
+            'hypothesis_index 0 (TRUE), not %; nothing was written', p_claim, p_hypothesis_index
+            USING ERRCODE = '22023';
+    END IF;
     -- Owned by the CLAIM's group: the frame assignment is the claim's, and an
     -- existing one is never changed from here.
     INSERT INTO public.claim_frames (claim_id, frame_id, hypothesis_index,
@@ -665,17 +781,36 @@ RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, public AS $$
 DECLARE v_owner uuid := public.epigraph_foreign_aggregate_target(p_claim);
-        v_before jsonb; v_after jsonb; v_frame uuid;
+        v_before jsonb; v_after jsonb; v_frame uuid; v_cached boolean;
 BEGIN
     -- The cache carries ONE frame's combination (`belief_frame_id`). A non-owner
     -- may refresh it on THAT frame (every writer's BBAs there, recombined), or
-    -- seed it when the claim has none; it may NOT re-point it to another frame
-    -- -- e.g. one it just created, holding only its own BBA -- which would
-    -- replace the claim's cross-writer combination on its own authority. Which
-    -- frame carries a claim's belief is the owner's decision. A refused re-point
-    -- is a no-op (0), not an error: the writer's BBA is stored either way.
-    SELECT c.belief_frame_id INTO v_frame FROM public.claims c WHERE c.id = p_claim;
-    IF v_frame IS NOT NULL AND v_frame IS DISTINCT FROM p_belief_frame_id THEN
+    -- SEED it when the claim has no cache at all; it may NOT re-point it to
+    -- another frame -- e.g. one it just created, holding only its own BBA --
+    -- which would replace the claim's cross-writer combination on its own
+    -- authority. Which frame carries a claim's belief is the owner's decision.
+    -- A refused write is a no-op (0), not an error: the BBA is stored either way.
+    --
+    -- A cache with NO frame recorded (written before `belief_frame_id` existed:
+    -- the common shape among older claims) is "frame unknown", never "no cache":
+    -- treating it as seedable would let one non-owner BBA overwrite it and then
+    -- own the frame (review finding W1). So a seed needs every cache column NULL,
+    -- and it lands only on the canonical `binary_truth` frame, the designated
+    -- summary frame; a non-owner cannot make a frame of its own choosing the one
+    -- that carries a claim's belief. Backfilling `belief_frame_id` for older
+    -- caches is a maintenance recompute, not this path.
+    SELECT c.belief_frame_id,
+           (c.belief IS NOT NULL OR c.plausibility IS NOT NULL
+            OR c.pignistic_prob IS NOT NULL OR c.classification IS NOT NULL)
+      INTO v_frame, v_cached
+      FROM public.claims c WHERE c.id = p_claim;
+    IF v_frame IS NULL THEN
+        IF v_cached THEN RETURN 0; END IF;
+        IF NOT EXISTS (SELECT 1 FROM public.frames f
+                        WHERE f.id = p_belief_frame_id AND f.name = 'binary_truth') THEN
+            RETURN 0;
+        END IF;
+    ELSIF v_frame IS DISTINCT FROM p_belief_frame_id THEN
         RETURN 0;
     END IF;
     -- A cached triple no mass function can represent is refused rather than
@@ -747,8 +882,18 @@ RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, public AS $$
 DECLARE v_owner uuid := public.epigraph_foreign_aggregate_target(p_claim);
-        v_before jsonb; v_n bigint;
+        v_before jsonb; v_n bigint; v_frame uuid;
 BEGIN
+    -- Clears a cache only when no mass function is left on the claim on ANY
+    -- frame (the retraction cascade's own precondition, re-checked here so a
+    -- direct call cannot wipe a backed cache), and only a cache whose frame is
+    -- recorded: an older frameless cache is "frame unknown" (see the
+    -- belief-cache definer) and is left to a maintenance recompute.
+    SELECT c.belief_frame_id INTO v_frame FROM public.claims c WHERE c.id = p_claim;
+    IF v_frame IS NULL
+       OR EXISTS (SELECT 1 FROM public.mass_functions m WHERE m.claim_id = p_claim) THEN
+        RETURN 0;
+    END IF;
     SELECT jsonb_build_object('belief', c.belief, 'plausibility', c.plausibility,
                               'pignistic_prob', c.pignistic_prob,
                               'classification', c.classification)
@@ -770,6 +915,170 @@ BEGIN
     RETURN v_n::integer;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_foreign_belief_clear(uuid) FROM PUBLIC;
+
+-- ===================================================================
+-- 5b. THE DEDUP BBA MOVE (review finding W4(b))
+-- ===================================================================
+-- `ClaimRepository::mark_duplicate_with_repair_conn` moves the edge-keyed BBAs
+-- of the edges it re-targeted from the duplicate onto the canonical claim. As a
+-- plain UPDATE that fails on the application role in three ways once rows can
+-- be writer-owned: another writer's writer-owned BBA on the duplicate is not
+-- the caller's to UPDATE (077), the owner guard refuses a writer-owned row's
+-- `claim_id` change (section 4), and a moved row left claim-owned-but-unflagged
+-- on a canonical the caller cannot write is re-stamped to that claim's owner by
+-- the next arm-(c) insert, after which its own source agent can no longer
+-- replace it. This definer does the move for a non-privileged session, bounded
+-- to what a dedup may move:
+--   * the session must be able to WRITE the duplicate, and the duplicate must
+--     already be marked a duplicate of the canonical (`supersedes`), i.e. the
+--     caller is inside a dedup it was allowed to make (FA08 otherwise);
+--   * only BBAs keyed by an edge that now targets the canonical claim move;
+--   * the canonical must be readable (FA02 otherwise, same text as missing);
+--     if the session cannot write it, it must be public (FA04 otherwise).
+-- Ownership of the moved rows, by where they land:
+--   * a PUBLIC canonical the session cannot write: every moved row is
+--     writer-owned and public, its owner kept (the writer's for a writer-owned
+--     row, the duplicate's owner -- the deduplicating session's own group --
+--     for the rest);
+--   * a PUBLIC canonical the session can write: a writer-owned row keeps its
+--     owner and flag, every other row takes the canonical's owner (a projection
+--     of the claim, as arm (c) would make it);
+--   * a non-public canonical (writable): every moved row becomes the claim's,
+--     flag cleared (section 3, arm (d)'s narrowing rule).
+-- Audited (`dedup_bba_move`) when the canonical is not the session's to write.
+CREATE OR REPLACE FUNCTION public.epigraph_dedup_move_bbas(
+    p_dup uuid, p_canonical uuid, p_perspectives uuid[])
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, public AS $$
+DECLARE v_principal uuid := public.epigraph_principal_id();
+        v_w uuid[] := public.epigraph_writable_groups();
+        v_dup_owner uuid; v_dup_sup uuid;
+        v_c_owner uuid; v_c_vis character varying(16);
+        v_c_writable boolean; v_n bigint;
+BEGIN
+    IF v_principal IS NULL THEN
+        RAISE EXCEPTION 'FA01: a non-owner write to a claim''s aggregate needs a session '
+            'principal (epigraph.principal_id) to attribute it to; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+    SELECT c.owner_group_id, c.supersedes INTO v_dup_owner, v_dup_sup
+      FROM public.claims c WHERE c.id = p_dup;
+    IF NOT FOUND OR NOT (v_dup_owner = ANY (v_w)) OR v_dup_sup IS DISTINCT FROM p_canonical THEN
+        RAISE EXCEPTION 'FA08: claim % is not a duplicate of % that this session may move '
+            'BBAs from; nothing was written', p_dup, p_canonical USING ERRCODE = '42501';
+    END IF;
+    SELECT c.owner_group_id, c.visibility INTO v_c_owner, v_c_vis
+      FROM public.claims c WHERE c.id = p_canonical;
+    IF NOT FOUND OR NOT (v_c_vis = 'public'
+                         OR v_c_owner = ANY (public.epigraph_session_groups())) THEN
+        RAISE EXCEPTION 'FA02: claim % not found', p_canonical USING ERRCODE = 'P0002';
+    END IF;
+    v_c_writable := v_c_owner = ANY (v_w);
+    IF NOT v_c_writable AND v_c_vis IS DISTINCT FROM 'public' THEN
+        RAISE EXCEPTION 'new row violates row-level security policy for table "mass_functions"'
+            USING ERRCODE = '42501',
+                  DETAIL = 'FA04: a non-owner may attach only to a PUBLIC claim';
+    END IF;
+
+    UPDATE public.mass_functions mf
+       SET claim_id       = p_canonical,
+           owner_group_id = CASE
+                              WHEN NOT v_c_writable THEN mf.owner_group_id
+                              WHEN v_c_vis = 'public' AND mf.writer_owned THEN mf.owner_group_id
+                              ELSE v_c_owner END,
+           visibility     = v_c_vis,
+           writer_owned   = CASE
+                              WHEN v_c_vis IS DISTINCT FROM 'public' THEN false
+                              WHEN NOT v_c_writable THEN true
+                              ELSE mf.writer_owned END
+     WHERE mf.claim_id = p_dup
+       AND mf.perspective_id = ANY (p_perspectives)
+       AND EXISTS (SELECT 1 FROM public.edges e
+                    WHERE e.id = mf.perspective_id
+                      AND e.target_id = p_canonical AND e.target_type = 'claim');
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    IF v_n > 0 AND NOT v_c_writable THEN
+        PERFORM public.epigraph_foreign_aggregate_audit(
+            p_canonical, v_c_owner, 'dedup_bba_move',
+            jsonb_build_object('from_claim_id', p_dup),
+            jsonb_build_object('moved', v_n));
+    END IF;
+    RETURN v_n;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_dedup_move_bbas(uuid, uuid, uuid[]) FROM PUBLIC;
+
+-- ===================================================================
+-- 5c. LEGACY BBAs: RE-OWN TO THEIR SOURCE AGENT (review finding W3)
+-- ===================================================================
+-- A BBA stored before this file by a privileged session on a public claim is
+-- owned by the claim's group (typically the world group) and not flagged. Its
+-- own source agent, once on the application role, cannot REPLACE it:
+-- `MassFunctionRepository::store_with_perspective` upserts on (claim, frame,
+-- source agent, perspective), the ON CONFLICT DO UPDATE lands on that legacy
+-- row, and 077's WITH CHECK refuses its owner. This re-owns such rows to what
+-- section 2(e) would have made them: owned by the source agent's operator's
+-- personal group (the `operator_links` record, retired links included:
+-- `epigraph_operator_of_author`, the "whose are this author's rows?" read), else
+-- by the agent's own personal group; public; `writer_owned = true`. Only rows
+-- that are still a projection of a PUBLIC claim whose owning group the source
+-- agent holds no live writer/admin membership in. A row whose agent has neither
+-- group stays as it is.
+--
+-- MAINTENANCE ONLY (EXECUTE granted to `epigraph_maintenance` alone), and NOT
+-- run by this migration: privileged servers keep writing claim-owned BBAs until
+-- the agents move to the application role, so it is run IMMEDIATELY BEFORE that
+-- move (and may be re-run: it is idempotent). `p_limit` bounds one call, for a
+-- large table under a short lock_timeout; NULL means all. Returns the number of
+-- rows re-owned and writes one `security_events` row per call that changed any.
+CREATE OR REPLACE FUNCTION public.epigraph_reown_legacy_writer_bbas(p_limit integer DEFAULT NULL)
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, public AS $$
+DECLARE v_n bigint;
+BEGIN
+    WITH base AS (
+        SELECT mf.id, c.owner_group_id AS c_owner,
+               COALESCE(
+                 (SELECT o.operator_group_id
+                    FROM public.epigraph_operator_of_author(mf.source_agent_id) o
+                   ORDER BY o.retired, o.operator_id LIMIT 1),
+                 (SELECT g.id FROM public.groups g
+                   WHERE g.did_key = 'did:epigraph:personal:' || mf.source_agent_id::text
+                     AND g.kind = 'personal'
+                     AND g.created_by_agent_id = mf.source_agent_id)) AS w
+          FROM public.mass_functions mf
+          JOIN public.claims c ON c.id = mf.claim_id
+         WHERE NOT mf.writer_owned
+           AND mf.source_agent_id IS NOT NULL
+           AND c.visibility = 'public'
+           AND mf.visibility = 'public'
+           AND mf.owner_group_id = c.owner_group_id
+           AND NOT EXISTS (SELECT 1 FROM public.group_memberships m
+                            WHERE m.group_id = c.owner_group_id
+                              AND m.agent_id = mf.source_agent_id
+                              AND m.revoked_at IS NULL
+                              AND m.role IN ('admin', 'writer'))
+    ), cand AS (
+        SELECT b.id, b.w FROM base b
+         WHERE b.w IS NOT NULL AND b.w <> b.c_owner
+         ORDER BY b.id
+         LIMIT p_limit
+    )
+    UPDATE public.mass_functions mf
+       SET owner_group_id = cand.w, writer_owned = true
+      FROM cand
+     WHERE mf.id = cand.id;
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    IF v_n > 0 THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('derived.legacy_writer_reown', NULL, true,
+                jsonb_build_object('table', 'mass_functions', 'rows', v_n,
+                                   'limit', p_limit, 'migration', 114));
+    END IF;
+    RETURN v_n;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_reown_legacy_writer_bbas(integer) FROM PUBLIC;
 
 -- ===================================================================
 -- 6. OWNERSHIP AND GRANTS
@@ -796,6 +1105,18 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_foreign_belief_clear(uuid) '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_lock_public_claim_for_attach(uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_dedup_move_bbas(uuid, uuid, uuid[]) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_reown_legacy_writer_bbas(integer) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_lock_public_claim_for_attach(uuid) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_dedup_move_bbas(uuid, uuid, uuid[]) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_reown_legacy_writer_bbas(integer) '
+                'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_writer_group() TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_claim_frame(uuid, uuid, integer) '
                 'TO epigraph_maintenance';
@@ -817,6 +1138,10 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_claim_classification(uuid, text, uuid) '
                 'TO epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_foreign_belief_clear(uuid) '
+                'TO epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_lock_public_claim_for_attach(uuid) '
+                'TO epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_dedup_move_bbas(uuid, uuid, uuid[]) '
                 'TO epigraph_app';
     END IF;
 END $$;

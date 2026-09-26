@@ -460,24 +460,37 @@ Current reservation:
   that can READ a public claim whose owner it cannot WRITE, owns the row by
   `epigraph_writer_group()` (#503's rule: the acting operator's personal group,
   else the principal's own personal group, only when writable; never minted),
-  with `writer_owned = true`. Every other case is left to 074 exactly as before.
+  with `writer_owned = true`, decided on the claim row locked `FOR NO KEY
+  UPDATE` (`epigraph_lock_public_claim_for_attach`) so an attach and a
+  privatization serialise. Every other case is left to 074 exactly as before.
   A BEFORE UPDATE guard `<table>_writer_owner_guard` refuses a change of
-  `owner_group_id` / `writer_owned` from a non-maintenance session (077 alone
-  admitted moving any public derived row into one's own group). Arm (c)
+  `owner_group_id` / `writer_owned`, and of a writer-owned row's `claim_id` /
+  `visibility`, from a non-maintenance session (077 alone admitted moving any
+  public derived row into one's own group). Arm (c)
   (`epigraph_inherit_tenancy_stmt`) skips writer-owned rows as it skips pinned
-  evidence; arm (d) (`epigraph_propagate_tenancy`) never moves their owner and
-  lets their visibility follow the claim (privatizing narrows them); the
-  `derived text[]` literal is 072's byte for byte. Per-claim aggregates
+  evidence; arm (d) (`epigraph_propagate_tenancy`) never moves their owner while
+  the claim stays public, and hands them to the claim (owner, visibility, flag
+  cleared) when it narrows; the `derived text[]` literal is 072's byte for
+  byte. Per-claim aggregates
   (`claim_frames`, the `claims` DS cache columns) stay CLAIM-owned and a
   non-owner reaches them only through four audited definers
   (`epigraph_foreign_claim_frame`, `_belief_cache`, `_claim_classification`,
   `_belief_clear`; one `security_events` row per effective write,
   `event_type = 'claims.foreign_aggregate_write'`), which never write
-  `truth_value`, `labels` or `content`, and never RE-POINT the cache to another
+  `truth_value`, `labels` or `content`, never RE-POINT the cache to another
   frame (a non-owner refreshes the combination on the frame the claim's cache
-  carries, or seeds it when there is none); the repo layer
+  carries, and seeds one only on `binary_truth` when every cache column is
+  NULL, so an older frameless cache is never overwritten), never create a
+  `binary_truth` assignment at an index other than 0, and require the writer to
+  hold a writable group of its own; the repo layer
   (`repos/foreign_attach.rs`) routes to them with the same statement, so an
-  owner / admin / maintenance write is unchanged. Replaces NO function 113
+  owner / admin / maintenance write is unchanged. `epigraph_dedup_move_bbas`
+  moves a dedup's edge-keyed BBAs for a non-privileged session (writer-owned on
+  a public canonical it cannot write). `epigraph_reown_legacy_writer_bbas`
+  (maintenance only, NOT run by the migration) re-owns BBAs stored before 114 by
+  a privileged session to their source agent's group, so the agent can replace
+  them once on the application role: **run it immediately before the agents
+  move to the application role**. Replaces NO function 113
   replaces, so 113 and 114 apply in either order. Registered with
   `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Behaviour in
   `epigraph-db/tests/writer_owned_derived_rows.rs` (all arms as

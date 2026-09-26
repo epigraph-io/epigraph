@@ -370,9 +370,10 @@ async fn the_claims_own_writer_still_inherits_the_claims_owner(pool: PgPool) {
 
 /// Arm (c): a LATER insert on the same claim, by the claim's owner and by a
 /// maintenance-class session, re-syncs the claim's rows and must not re-stamp
-/// the writer's row to the claim's owner. Arm (d): privatizing the claim
-/// narrows the writer's row to 'group' and keeps its owner; the owner's own
-/// rows follow the claim; a re-own leaves the writer's owner alone.
+/// the writer's row to the claim's owner. Arm (d): re-owning the still-PUBLIC
+/// claim leaves the writer's owner alone; privatizing it hands the writer's row
+/// to the claim (owner and visibility follow, flag cleared: review finding W5),
+/// after which it follows the claim like any claim-owned row.
 #[sqlx::test(migrations = "../../migrations")]
 async fn writer_rows_survive_both_propagation_arms_and_narrow_with_the_claim(pool: PgPool) {
     let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "owner").await;
@@ -405,23 +406,8 @@ async fn writer_rows_survive_both_propagation_arms_and_narrow_with_the_claim(poo
         (owner_group, "public".to_string(), false)
     );
 
-    // Arm (d): privatize (a narrowing; the harness is the maintenance-class writer).
-    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
-        .bind(claim)
-        .execute(&pool)
-        .await
-        .expect("privatize the claim");
-    assert_eq!(
-        tenancy(&pool, "evidence", w_ev).await,
-        (writer_group, "group".to_string(), true),
-        "privatizing the claim narrows the writer's row and never moves its owner"
-    );
-    assert_eq!(
-        tenancy(&pool, "evidence", o_ev).await,
-        (owner_group, "group".to_string(), false)
-    );
-
-    // Re-own to another group: the owner's rows follow, the writer's owner stays.
+    // Arm (d), claim still PUBLIC: re-own it. The owner's rows follow, the
+    // writer's owner stays (the harness is the maintenance-class writer).
     let (_, new_group) = fixture::seed_agent_with_group(&pool, "new-owner").await;
     sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
         .bind(claim)
@@ -431,7 +417,24 @@ async fn writer_rows_survive_both_propagation_arms_and_narrow_with_the_claim(poo
         .expect("re-own the claim");
     assert_eq!(
         tenancy(&pool, "evidence", w_ev).await,
-        (writer_group, "group".to_string(), true)
+        (writer_group, "public".to_string(), true),
+        "re-owning a public claim never moves the writer's row"
+    );
+    assert_eq!(
+        tenancy(&pool, "evidence", o_ev).await,
+        (new_group, "public".to_string(), false)
+    );
+
+    // Arm (d), claim NARROWED: the writer's row becomes the claim's.
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("privatize the claim");
+    assert_eq!(
+        tenancy(&pool, "evidence", w_ev).await,
+        (new_group, "group".to_string(), false),
+        "privatizing hands the writer's row to the claim's owner, narrowed and un-flagged"
     );
     assert_eq!(
         tenancy(&pool, "evidence", o_ev).await,
@@ -519,7 +522,8 @@ async fn a_non_owners_aggregate_writes_are_claim_owned_audited_and_leave_truth_a
     let (writer, _) = fixture::seed_agent_with_group(&pool, "writer").await;
     let fresh = fixture::seed_public_claim(&pool, author, "no frame yet").await;
     let assigned = fixture::seed_public_claim(&pool, author, "already assigned").await;
-    let frame = seed_frame(&pool, "wo-frame-8").await;
+    // `binary_truth`: the only frame a non-owner may SEED a claim's cache on.
+    let frame = seed_frame(&pool, "binary_truth").await;
     // The common shape: a world-owned assignment already exists.
     FrameRepository::assign_claim(&pool, assigned, frame, Some(0))
         .await
@@ -572,7 +576,7 @@ async fn a_non_owners_aggregate_writes_are_claim_owned_audited_and_leave_truth_a
     a_assigned.expect("non-owner assignment onto an existing one");
     assert!(
         belief.expect("non-owner DS cache write"),
-        "a claim with no cached frame is SEEDED by a non-owner's combination"
+        "a claim with no cache at all is SEEDED by a non-owner's binary_truth combination"
     );
     class.expect("non-owner classification write");
     assert_eq!(
@@ -862,4 +866,782 @@ async fn a_non_owner_refreshes_the_claims_belief_frame_but_never_re_points_it(po
         vec![(Some(writer), "belief_cache".to_string())],
         "one audit row, for the refresh on A; none for the refused re-point"
     );
+}
+
+// ===========================================================================
+// Review round 2 (PR #514): the prod-shaped and adversarial arms.
+// ===========================================================================
+
+async fn store_bba(
+    conn: &mut PgConnection,
+    claim: Uuid,
+    frame: Uuid,
+    agent: Uuid,
+    perspective: Option<Uuid>,
+    masses: serde_json::Value,
+) -> Result<Uuid, epigraph_db::DbError> {
+    MassFunctionRepository::store_with_perspective(
+        &mut *conn,
+        claim,
+        frame,
+        Some(agent),
+        perspective,
+        &masses,
+        None,
+        Some("test"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+}
+
+fn cache(belief: f64, plausibility: f64, betp: f64, frame: Uuid) -> CachedBelief {
+    CachedBelief {
+        belief,
+        plausibility,
+        mass_on_empty: 0.0,
+        pignistic_prob: Some(betp),
+        mass_on_missing: 0.0,
+        belief_frame_id: Some(frame),
+    }
+}
+
+async fn cached(pool: &PgPool, claim: Uuid) -> (Option<Uuid>, Option<f64>, Option<String>) {
+    sqlx::query_as(
+        "SELECT belief_frame_id, pignistic_prob, classification FROM claims WHERE id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("claim cache")
+}
+
+/// W1. The common older shape: a cache (belief / pignistic / classification)
+/// with NO `belief_frame_id`. A non-owner must not treat it as "no cache" and
+/// seed over it -- that would replace the claim's belief with one BBA's
+/// measures and then hand the frame to the writer. Seeding needs every cache
+/// column NULL and lands on `binary_truth` only, and the clear definer touches
+/// neither a frameless cache nor one still backed by a mass function.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_frameless_legacy_cache_is_never_seeded_over_and_only_binary_truth_seeds(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (writer, _) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let legacy = fixture::seed_public_claim(&pool, author, "legacy frameless cache").await;
+    let fresh_own = fixture::seed_public_claim(&pool, author, "no cache, writer frame").await;
+    let fresh_bt = fixture::seed_public_claim(&pool, author, "no cache, binary_truth").await;
+    let backed = fixture::seed_public_claim(&pool, author, "framed cache, backed").await;
+    let bt = seed_frame(&pool, "binary_truth").await;
+    let own = seed_frame(&pool, "wo-writer-made-frame").await;
+    sqlx::query(
+        "UPDATE claims SET belief = 0.8, plausibility = 0.9, pignistic_prob = 0.85, \
+                           classification = 'supported', belief_frame_id = NULL WHERE id = $1",
+    )
+    .bind(legacy)
+    .execute(&pool)
+    .await
+    .expect("legacy frameless cache");
+    sqlx::query(
+        "UPDATE claims SET belief = 0.7, plausibility = 0.8, pignistic_prob = 0.75, \
+                           belief_frame_id = $2 WHERE id = $1",
+    )
+    .bind(backed)
+    .bind(bt)
+    .execute(&pool)
+    .await
+    .expect("framed cache");
+    {
+        let mut h = pool.acquire().await.expect("acquire");
+        store_bba(
+            &mut h,
+            backed,
+            bt,
+            author,
+            None,
+            serde_json::json!({"0": 0.7, "0,1": 0.3}),
+        )
+        .await
+        .expect("harness BBA backing the framed cache");
+    }
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (on_legacy, class_legacy, clear_legacy, on_own, on_bt, clear_backed) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, writer).await;
+            let a = MassFunctionRepository::update_claim_belief(
+                &mut *conn,
+                legacy,
+                cache(0.0, 0.05, 0.025, bt),
+            )
+            .await;
+            let b = MassFunctionRepository::update_claim_classification(
+                &mut *conn,
+                legacy,
+                "contradicted",
+                bt,
+            )
+            .await;
+            let c = MassFunctionRepository::clear_claim_belief(&mut *conn, legacy).await;
+            let d = MassFunctionRepository::update_claim_belief(
+                &mut *conn,
+                fresh_own,
+                cache(0.1, 0.2, 0.15, own),
+            )
+            .await;
+            let e = MassFunctionRepository::update_claim_belief(
+                &mut *conn,
+                fresh_bt,
+                cache(0.6, 0.9, 0.75, bt),
+            )
+            .await;
+            let f = MassFunctionRepository::clear_claim_belief(&mut *conn, backed).await;
+            (conn, (a, b, c, d, e, f))
+        })
+        .await;
+
+    assert!(
+        !on_legacy.expect("a refused seed is a no-op, not an error"),
+        "a frameless older cache must NOT be overwritten by one non-owner BBA"
+    );
+    class_legacy.expect("a refused classification is a no-op");
+    assert_eq!(
+        clear_legacy.expect("clear"),
+        0,
+        "a frameless cache is not cleared"
+    );
+    assert!(
+        !on_own.expect("no-op"),
+        "a non-owner cannot make a frame of its own the one carrying a claim's belief"
+    );
+    assert!(
+        on_bt.expect("seed"),
+        "an uncached claim IS seeded on binary_truth"
+    );
+    assert_eq!(
+        clear_backed.expect("clear"),
+        0,
+        "a cache still backed by a mass function is not cleared"
+    );
+
+    assert_eq!(
+        cached(&pool, legacy).await,
+        (None, Some(0.85), Some("supported".to_string())),
+        "the older cache is untouched"
+    );
+    assert_eq!(cached(&pool, fresh_own).await, (None, None, None));
+    assert_eq!(cached(&pool, fresh_bt).await, (Some(bt), Some(0.75), None));
+    assert_eq!(cached(&pool, backed).await.1, Some(0.75));
+    for (c, want) in [(legacy, 0), (fresh_own, 0), (fresh_bt, 1), (backed, 0)] {
+        assert_eq!(
+            audit_events(&pool, c).await.len(),
+            want,
+            "{c}: an audit row only for an effective write"
+        );
+    }
+}
+
+/// W2. The `binary_truth` index is what every reader takes as the claim's own
+/// truth. A non-owner may not CREATE that assignment at index 1 (FALSE): on a
+/// world claim nobody could correct it. Index 0 is created; a second writer
+/// asking for 1 afterwards keeps 0; another frame's index is not constrained.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_owner_cannot_bind_a_world_claim_to_false_on_binary_truth(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, _) = fixture::seed_agent_with_group(&pool, "writer-w").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    let c1 = fixture::seed_public_claim(&pool, author, "binary claim").await;
+    let c2 = fixture::seed_public_claim(&pool, author, "axis claim").await;
+    let bt = seed_frame(&pool, "binary_truth").await;
+    let axis = seed_frame(&pool, "wo-axis").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (false_first, true_first, x_false, axis_one) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, w).await;
+            let a = FrameRepository::assign_claim(&mut *conn, c1, bt, Some(1)).await;
+            let b = FrameRepository::assign_claim(&mut *conn, c1, bt, Some(0)).await;
+            stamp(&mut conn, &p, x).await;
+            let c = FrameRepository::assign_claim(&mut *conn, c1, bt, Some(1)).await;
+            let d = FrameRepository::assign_claim(&mut *conn, c2, axis, Some(1)).await;
+            (conn, (a, b, c, d))
+        })
+        .await;
+
+    let e = false_first.expect_err("a non-owner's FALSE binding on binary_truth is refused");
+    assert!(e.to_string().contains("FA07"), "{e}");
+    true_first.expect("index 0 is created");
+    x_false.expect("an existing assignment is kept, not an error");
+    axis_one.expect("another frame's index is not constrained");
+
+    let idx = |c: Uuid, f: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<i32>>(
+                "SELECT hypothesis_index FROM claim_frames WHERE claim_id = $1 AND frame_id = $2",
+            )
+            .bind(c)
+            .bind(f)
+            .fetch_all(&pool)
+            .await
+            .expect("claim_frames")
+        }
+    };
+    assert_eq!(idx(c1, bt).await, vec![Some(0)], "c1 stays bound to TRUE");
+    assert_eq!(idx(c2, axis).await, vec![Some(1)]);
+    assert_eq!(
+        audit_events(&pool, c1).await,
+        vec![(Some(w), "claim_frame_attach".to_string())],
+        "the refused binding wrote no audit row"
+    );
+}
+
+/// W3. A BBA a privileged server stored before 114 on a world claim is owned by
+/// the world group, so its own source agent cannot replace it on the
+/// application role (the upsert lands on that row and 077 refuses its owner).
+/// The maintenance re-own hands it to the agent (its operator's group for an
+/// operated agent), after which the replacement lands. A row whose agent can
+/// write the claim's own group is left claim-owned. Batched and idempotent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_claim_owned_bba_is_replaceable_after_the_maintenance_reown(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, w_group) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let (operator, operator_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operated, _) = fixture::seed_agent_with_group(&pool, "operated").await;
+    let (member, member_group) = fixture::seed_agent_with_group(&pool, "member").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, operated, operator)
+            .await
+            .expect("link");
+    }
+    let cw = fixture::seed_public_claim(&pool, author, "world claim with legacy BBAs").await;
+    let cm = seed_public_claim_owned_by(&pool, member, member_group, "member's claim").await;
+    let frame = seed_frame(&pool, "wo-legacy").await;
+    let (w_row, p_row, m_row) = {
+        let mut h = pool.acquire().await.expect("acquire");
+        let m = serde_json::json!({"0": 0.6, "0,1": 0.4});
+        (
+            store_bba(&mut h, cw, frame, w, None, m.clone())
+                .await
+                .expect("legacy W"),
+            store_bba(&mut h, cw, frame, operated, None, m.clone())
+                .await
+                .expect("legacy operated"),
+            store_bba(&mut h, cm, frame, member, None, m)
+                .await
+                .expect("legacy member"),
+        )
+    };
+    assert_eq!(
+        tenancy(&pool, "mass_functions", w_row).await,
+        (WORLD, "public".into(), false)
+    );
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let replace = |pool: PgPool| async move {
+        let p = pool.clone();
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, w).await;
+            let r = store_bba(
+                &mut conn,
+                cw,
+                frame,
+                w,
+                None,
+                serde_json::json!({"1": 0.3, "0,1": 0.7}),
+            )
+            .await;
+            (conn, r)
+        })
+        .await
+    };
+    let before = replace(pool.clone()).await;
+    let e = before.expect_err("the legacy row blocks its own agent's replacement");
+    assert!(e.to_string().contains("row-level security"), "{e}");
+
+    let calls: Vec<i64> = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let mut out = Vec::new();
+        for limit in [Some(1_i32), None, None] {
+            out.push(
+                sqlx::query_scalar::<_, i64>("SELECT public.epigraph_reown_legacy_writer_bbas($1)")
+                    .bind(limit)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .expect("maintenance re-own"),
+            );
+        }
+        (conn, out)
+    })
+    .await;
+    assert_eq!(
+        calls,
+        vec![1, 1, 0],
+        "batched by the limit, then idempotent"
+    );
+
+    assert_eq!(
+        tenancy(&pool, "mass_functions", w_row).await,
+        (w_group, "public".into(), true)
+    );
+    assert_eq!(
+        tenancy(&pool, "mass_functions", p_row).await,
+        (operator_group, "public".into(), true),
+        "an operated agent's legacy row goes to its OPERATOR's group"
+    );
+    assert_eq!(
+        tenancy(&pool, "mass_functions", m_row).await,
+        (member_group, "public".into(), false),
+        "a row whose agent can write the claim's group stays the claim's"
+    );
+    let after = replace(pool.clone())
+        .await
+        .expect("the agent now replaces its own BBA");
+    assert_eq!(after, w_row, "an upsert of the same key, not a new row");
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'derived.legacy_writer_reown'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("events");
+    assert_eq!(events, 2, "one audit row per call that re-owned anything");
+}
+
+async fn seed_perspective(pool: &PgPool, id: Uuid) {
+    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
+        .bind(id)
+        .bind(format!("edge {id}"))
+        .execute(pool)
+        .await
+        .expect("seed edge perspective");
+}
+
+/// W4(b). A writer marks its own claim a duplicate of a WORLD-owned canonical.
+/// The edge-keyed BBAs on the duplicate -- its own and ANOTHER writer's -- move
+/// with their edges and come out writer-owned (so neither is re-stamped to the
+/// world by a later insert), the canonical gets its binary_truth assignment
+/// through the audited definer, and a duplicate bound to FALSE cannot pass
+/// that binding to a canonical it does not own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_onto_a_world_canonical_moves_every_writers_bba(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, w_group) = fixture::seed_agent_with_group(&pool, "dedup-writer").await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "other-writer").await;
+    let dup = seed_public_claim_owned_by(&pool, w, w_group, "the duplicate").await;
+    let dup_false = seed_public_claim_owned_by(&pool, w, w_group, "a FALSE-bound dup").await;
+    let sw = seed_public_claim_owned_by(&pool, w, w_group, "W's source").await;
+    let sx = seed_public_claim_owned_by(&pool, x, x_group, "X's source").await;
+    let canonical = fixture::seed_public_claim(&pool, author, "world canonical").await;
+    let canonical2 = fixture::seed_public_claim(&pool, author, "world canonical 2").await;
+    let bt = seed_frame(&pool, "binary_truth").await;
+    let ex = fixture::seed_edge(&pool, sx, dup).await;
+    let ew = fixture::seed_edge(&pool, sw, dup).await;
+    let ef = fixture::seed_edge(&pool, sw, dup_false).await;
+    for e in [ex, ew, ef] {
+        seed_perspective(&pool, e).await;
+    }
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (x_bba, w_bba, repair, refused) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            let m = serde_json::json!({"0": 0.6, "0,1": 0.4});
+            stamp(&mut conn, &p, x).await;
+            let x_bba = store_bba(&mut conn, dup, bt, x, Some(ex), m.clone()).await;
+            stamp(&mut conn, &p, w).await;
+            FrameRepository::assign_claim(&mut *conn, dup, bt, Some(0))
+                .await
+                .expect("W binds its own dup");
+            FrameRepository::assign_claim(&mut *conn, dup_false, bt, Some(1))
+                .await
+                .expect("W may bind its OWN claim to FALSE");
+            let w_bba = store_bba(&mut conn, dup, bt, w, Some(ew), m.clone()).await;
+            store_bba(&mut conn, dup_false, bt, w, Some(ef), m)
+                .await
+                .expect("W's BBA on the FALSE-bound dup");
+            let repair = epigraph_db::ClaimRepository::mark_duplicate_with_repair_conn(
+                &mut conn,
+                epigraph_core::ClaimId::from_uuid(dup),
+                epigraph_core::ClaimId::from_uuid(canonical),
+            )
+            .await;
+            let refused = epigraph_db::ClaimRepository::mark_duplicate_with_repair_conn(
+                &mut conn,
+                epigraph_core::ClaimId::from_uuid(dup_false),
+                epigraph_core::ClaimId::from_uuid(canonical2),
+            )
+            .await;
+            (conn, (x_bba, w_bba, repair, refused))
+        })
+        .await;
+    let x_bba = x_bba.expect("X attaches to W's public claim");
+    let w_bba = w_bba.expect("W's own BBA");
+    assert_eq!(
+        tenancy(&pool, "mass_functions", x_bba).await,
+        (x_group, "public".into(), true)
+    );
+    let repair = repair.expect("the dedup onto a world canonical lands on the app role");
+    assert_eq!(repair.moved_bbas, 2);
+
+    for (id, group, what) in [(x_bba, x_group, "X's"), (w_bba, w_group, "W's")] {
+        let on: Uuid = sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("moved row");
+        assert_eq!(on, canonical, "{what} BBA moved with its edge");
+        assert_eq!(
+            tenancy(&pool, "mass_functions", id).await,
+            (group, "public".into(), true),
+            "{what} BBA is writer-owned on the world canonical"
+        );
+    }
+    // A later insert on the canonical (arm (c)) must not re-stamp them.
+    fixture::seed_evidence(&pool, canonical, "reference").await;
+    assert_eq!(tenancy(&pool, "mass_functions", w_bba).await.0, w_group);
+
+    let (owner, idx): (Uuid, Option<i32>) = sqlx::query_as(
+        "SELECT owner_group_id, hypothesis_index FROM claim_frames \
+          WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(canonical)
+    .bind(bt)
+    .fetch_one(&pool)
+    .await
+    .expect("canonical assignment");
+    assert_eq!(
+        (owner, idx),
+        (WORLD, Some(0)),
+        "claim-owned, created via the definer"
+    );
+    let actions: Vec<String> = audit_events(&pool, canonical)
+        .await
+        .into_iter()
+        .map(|(_, a)| a)
+        .collect();
+    assert!(
+        actions.contains(&"claim_frame_attach".to_string()),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&"dedup_bba_move".to_string()),
+        "{actions:?}"
+    );
+
+    let e = refused.expect_err("a FALSE binding cannot pass to a world canonical");
+    assert!(e.to_string().contains("FA07"), "{e}");
+    let still_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(dup_false)
+        .fetch_one(&pool)
+        .await
+        .expect("dup_false");
+    assert!(still_current, "the refused dedup wrote nothing");
+}
+
+/// W5. After the claim's owner privatizes it, what a writer had attached is
+/// the OWNER's: the owner sees it and can remove it, and the writer's group no
+/// longer sees rows about a claim it cannot read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn privatizing_a_claim_hands_its_writer_owned_rows_to_the_claims_owner(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "owner").await;
+    let (writer, _) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let claim = seed_public_claim_owned_by(&pool, owner, owner_group, "to be privatized").await;
+    let frame = seed_frame(&pool, "wo-priv").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (ev, mf) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, writer).await;
+        let ev = insert_evidence(&mut conn, claim, "before-privatize")
+            .await
+            .expect("attach");
+        let mf = store_bba(
+            &mut conn,
+            claim,
+            frame,
+            writer,
+            None,
+            serde_json::json!({"0": 0.9, "0,1": 0.1}),
+        )
+        .await
+        .expect("attach BBA");
+        (conn, (ev, mf))
+    })
+    .await;
+
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("the owner privatizes (harness)");
+
+    let p = pool.clone();
+    let (w_sees, o_sees, o_deletes) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            let q = "SELECT (SELECT count(*) FROM evidence WHERE id = $1) \
+                      + (SELECT count(*) FROM mass_functions WHERE id = $2)";
+            stamp(&mut conn, &p, writer).await;
+            let w_sees: i64 = sqlx::query_scalar(q)
+                .bind(ev)
+                .bind(mf)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("w");
+            stamp(&mut conn, &p, owner).await;
+            let o_sees: i64 = sqlx::query_scalar(q)
+                .bind(ev)
+                .bind(mf)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("o");
+            let o_deletes = sqlx::query("DELETE FROM evidence WHERE id = $1")
+                .bind(ev)
+                .execute(&mut *conn)
+                .await
+                .expect("owner deletes")
+                .rows_affected();
+            (conn, (w_sees, o_sees, o_deletes))
+        })
+        .await;
+    assert_eq!(
+        o_sees, 2,
+        "the claim's owner sees what was attached to its claim"
+    );
+    assert_eq!(o_deletes, 1, "and can remove it");
+    assert_eq!(
+        w_sees, 0,
+        "the writer's group no longer sees rows about a private claim"
+    );
+    assert_eq!(
+        tenancy(&pool, "mass_functions", mf).await,
+        (owner_group, "group".into(), false)
+    );
+}
+
+/// W6. An attach and a privatization of the same claim serialise on the claim
+/// row, in both orders, so no PUBLIC writer-owned row survives on a private
+/// claim. Attach first: the privatization waits for it and then hands the row
+/// to the owner. Privatization first: the attach waits, sees a private claim,
+/// and is refused as before 114.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attach_and_a_privatization_of_the_same_claim_serialise(pool: PgPool) {
+    use std::time::Duration;
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "owner").await;
+    let (writer, _) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let c1 = seed_public_claim_owned_by(&pool, owner, owner_group, "attach first").await;
+    let c2 = seed_public_claim_owned_by(&pool, owner, owner_group, "privatize first").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    // Order 1: the attach holds its transaction open while the privatization runs.
+    let p = pool.clone();
+    let ev = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        use sqlx::Executor;
+        stamp(&mut conn, &p, writer).await;
+        conn.execute("BEGIN").await.expect("begin");
+        let ev = insert_evidence(&mut conn, c1, "racing")
+            .await
+            .expect("attach");
+        let pp = p.clone();
+        let privatize = tokio::spawn(async move {
+            sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+                .bind(c1)
+                .execute(&pp)
+                .await
+                .expect("privatize")
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !privatize.is_finished(),
+            "the privatization must wait for the attach's claim lock"
+        );
+        conn.execute("COMMIT").await.expect("commit the attach");
+        tokio::time::timeout(Duration::from_secs(10), privatize)
+            .await
+            .expect("the privatization proceeds once the attach commits")
+            .expect("join");
+        (conn, ev)
+    })
+    .await;
+    assert_eq!(
+        tenancy(&pool, "evidence", ev).await,
+        (owner_group, "group".into(), false),
+        "the privatization saw the committed attach and handed it to the owner"
+    );
+
+    // Order 2: the privatization holds the claim row while the attach runs.
+    let mut btx = pool.begin().await.expect("begin privatization");
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(c2)
+        .execute(&mut *btx)
+        .await
+        .expect("privatize, uncommitted");
+    let committer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        btx.commit().await.expect("commit privatization");
+    });
+    let p = pool.clone();
+    let late = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, writer).await;
+        let r = tokio::time::timeout(
+            Duration::from_secs(10),
+            insert_evidence(&mut conn, c2, "late"),
+        )
+        .await
+        .expect("the attach proceeds once the privatization commits");
+        (conn, r)
+    })
+    .await;
+    committer.await.expect("join");
+    let e = late.expect_err("an attach that waited on a privatization is refused");
+    assert!(e.to_string().contains("row-level security"), "{e}");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence WHERE claim_id = $1")
+        .bind(c2)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(n, 0);
+}
+
+/// W7. A writer owns its row, but the row's parent and visibility track a
+/// claim that is not the writer's: re-pointing it at another claim (a private
+/// one, or an id that does not exist) and changing its visibility are refused
+/// with ONE message, before any foreign-key check (no existence oracle).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writer_cannot_repoint_or_rescope_its_own_writer_owned_row(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (writer, writer_group) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let world = fixture::seed_public_claim(&pool, author, "world").await;
+    let private = fixture::seed_group_claim(&pool, author, author_group, "private").await;
+    let frame = seed_frame(&pool, "wo-repoint").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (ev, mf, to_private, to_missing, rescope, mf_to_private) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, writer).await;
+            let ev = insert_evidence(&mut conn, world, "mine")
+                .await
+                .expect("attach");
+            let mf = store_bba(
+                &mut conn,
+                world,
+                frame,
+                writer,
+                None,
+                serde_json::json!({"0": 0.5, "0,1": 0.5}),
+            )
+            .await
+            .expect("attach BBA");
+            let upd = |sql: &'static str, id: Uuid, v: Uuid| (sql, id, v);
+            let mut out = Vec::new();
+            for (sql, id, v) in [
+                upd(
+                    "UPDATE evidence SET claim_id = $2 WHERE id = $1",
+                    ev,
+                    private,
+                ),
+                upd(
+                    "UPDATE evidence SET claim_id = $2 WHERE id = $1",
+                    ev,
+                    Uuid::new_v4(),
+                ),
+                upd(
+                    "UPDATE mass_functions SET claim_id = $2 WHERE id = $1",
+                    mf,
+                    private,
+                ),
+            ] {
+                out.push(
+                    sqlx::query(sql)
+                        .bind(id)
+                        .bind(v)
+                        .execute(&mut *conn)
+                        .await
+                        .map(|r| r.rows_affected()),
+                );
+            }
+            let rescope = sqlx::query("UPDATE evidence SET visibility = 'group' WHERE id = $1")
+                .bind(ev)
+                .execute(&mut *conn)
+                .await
+                .map(|r| r.rows_affected());
+            let mut out = out.into_iter();
+            let (a, b, c) = (
+                out.next().unwrap(),
+                out.next().unwrap(),
+                out.next().unwrap(),
+            );
+            (conn, (ev, mf, a, b, rescope, c))
+        })
+        .await;
+
+    let msg = |r: Result<u64, sqlx::Error>, what: &str| {
+        r.expect_err(what)
+            .to_string()
+            .replace(&ev.to_string(), "<row>")
+            .replace(&mf.to_string(), "<row>")
+    };
+    let a = msg(to_private, "re-pointing at a private claim is refused");
+    let b = msg(to_missing, "re-pointing at a missing claim is refused");
+    assert!(a.contains("moves a writer-owned one"), "{a}");
+    assert_eq!(a, b, "a private target and a missing one answer alike");
+    assert!(msg(rescope, "rescoping is refused").contains("moves a writer-owned one"));
+    assert!(msg(mf_to_private, "BBA re-point refused").contains("moves a writer-owned one"));
+    assert_eq!(
+        tenancy(&pool, "evidence", ev).await,
+        (writer_group, "public".into(), true)
+    );
+    let on: Uuid = sqlx::query_scalar("SELECT claim_id FROM evidence WHERE id = $1")
+        .bind(ev)
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+    assert_eq!(on, world);
+}
+
+/// W13. A principal with no writable group of its own attaches nothing (the
+/// trigger leaves its row to 077), so it writes no aggregate through the
+/// definers either, even called directly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_principal_with_no_writable_group_writes_no_aggregate(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (reader, reader_group) = fixture::seed_agent_with_group(&pool, "reader").await;
+    sqlx::query("UPDATE group_memberships SET role = 'reader' WHERE agent_id = $1")
+        .bind(reader)
+        .execute(&pool)
+        .await
+        .expect("downgrade to reader");
+    let claim = fixture::seed_public_claim(&pool, author, "world").await;
+    let bt = seed_frame(&pool, "binary_truth").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let (direct, via_repo) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', $1, false), \
+                    set_config('epigraph.writable_group_ids', '', false), \
+                    set_config('epigraph.principal_id', $2, false)",
+        )
+        .bind(reader_group.to_string())
+        .bind(reader.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp a read-only principal");
+        let direct = sqlx::query_scalar::<_, i32>(
+            "SELECT public.epigraph_foreign_belief_cache($1, 0.6, 0.9, 0, 0.75, 0, $2)",
+        )
+        .bind(claim)
+        .bind(bt)
+        .fetch_one(&mut *conn)
+        .await;
+        let via_repo = FrameRepository::assign_claim(&mut *conn, claim, bt, Some(0)).await;
+        (conn, (direct, via_repo))
+    })
+    .await;
+    let e = direct.expect_err("a read-only principal seeds no cache");
+    assert!(e.to_string().contains("row-level security"), "{e}");
+    via_repo.expect_err("nor a frame assignment");
+    assert_eq!(cached(&pool, claim).await, (None, None, None));
+    assert!(audit_events(&pool, claim).await.is_empty());
 }

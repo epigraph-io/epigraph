@@ -477,8 +477,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "ROUTING QUESTION, not a disclosure (migration 114). Returns one boolean: whether the \
          STAMPED session would attach to this claim as a non-owner. Its read of `claims` is the \
          session's own RLS-filtered read (the answer for a claim the session cannot see is \
-         `false`, the same as for a missing one), it projects no column, and the caller \
-         (`update_with_evidence`) has already read the claim through its viewer.",
+         `false`, the same as for a missing one), it projects no column, and every caller \
+         (`update_with_evidence`, `submit_ds_evidence`, `report_workflow_outcome`) asks it on the \
+         same stamped transaction on which the claim is read through the caller's viewer.",
     ),
     (
         "claim.rs",

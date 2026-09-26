@@ -6605,17 +6605,37 @@ impl ClaimRepository {
             // `canonical` must be assigned to every frame whose BBAs it is
             // about to inherit, or the frame-scoped read paths
             // (`claim_frames.hypothesis_index`) would not see them.
-            sqlx::query(
+            //
+            // Migration 114: when `canonical` is a PUBLIC claim this session
+            // cannot write (typically world-owned), its `claim_frames` rows are
+            // the claim's aggregate and the plain INSERT is refused by 077, so
+            // the SAME statement routes each copy through
+            // `epigraph_foreign_claim_frame` instead ([`crate::repos::
+            // foreign_attach`]), exactly as `FrameRepository::assign_claim`
+            // does. Every other session runs the INSERT below unchanged. A
+            // duplicate bound at a non-zero index on `binary_truth` cannot give
+            // that binding to a canonical it does not own (FA07), so such a
+            // dedup is refused with nothing written.
+            let frame_copy = format!(
                 r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-                 INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
-                 SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf 
-                 WHERE cf.claim_id = $2 
-                 ON CONFLICT (claim_id, frame_id) DO NOTHING"#,
-            )
-            .bind(canon_uuid)
-            .bind(dup_uuid)
-            .execute(&mut *tx)
-            .await?;
+                 WITH acc AS (SELECT {foreign} AS foreign_public),
+                 own AS (
+                     INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
+                     SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf, acc
+                     WHERE cf.claim_id = $2 AND NOT acc.foreign_public
+                     ON CONFLICT (claim_id, frame_id) DO NOTHING
+                     RETURNING 1
+                 )
+                 SELECT count(public.epigraph_foreign_claim_frame($1, cf.frame_id, cf.hypothesis_index))
+                   FROM claim_frames cf, acc
+                  WHERE cf.claim_id = $2 AND acc.foreign_public"#,
+                foreign = crate::repos::foreign_attach::foreign_public_claim("$1"),
+            );
+            sqlx::query(&frame_copy)
+                .bind(canon_uuid)
+                .bind(dup_uuid)
+                .execute(&mut *tx)
+                .await?;
 
             // Guard `mass_functions_unique_per_perspective`
             // (claim_id, frame_id, source_agent_id, perspective_id, NULLS NOT
@@ -6642,16 +6662,34 @@ impl ClaimRepository {
             .execute(&mut *tx)
             .await?;
 
-            moved_bbas = sqlx::query(
-                "UPDATE mass_functions SET claim_id = $1 \
-                 WHERE claim_id = $2 AND perspective_id = ANY($3)",
-            )
-            .bind(canon_uuid)
-            .bind(dup_uuid)
-            .bind(&retargeted_ids)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            // Migration 114: a NON-PRIVILEGED session moves the BBAs through
+            // `epigraph_dedup_move_bbas`, because the plain UPDATE is refused
+            // on the application role as soon as a row is writer-owned (another
+            // writer's row is not this session's to UPDATE, and the owner guard
+            // refuses a writer-owned row's `claim_id` change), and because a
+            // row moved onto a canonical this session cannot write must come
+            // out writer-owned, or the next arm-(c) insert re-stamps it to the
+            // canonical's owner. A privileged session (superuser, BYPASSRLS,
+            // maintenance) runs the UPDATE below exactly as before.
+            let move_sql = r#"
+                WITH acc AS (SELECT public.epigraph_session_is_privileged_writer() AS priv),
+                own AS (
+                    UPDATE mass_functions SET claim_id = $1
+                    WHERE claim_id = $2 AND perspective_id = ANY($3)
+                      AND (SELECT priv FROM acc)
+                    RETURNING 1
+                )
+                SELECT CASE WHEN acc.priv THEN (SELECT count(*) FROM own)
+                            ELSE public.epigraph_dedup_move_bbas($2, $1, $3)
+                       END
+                  FROM acc"#;
+            let moved: i64 = sqlx::query_scalar(move_sql)
+                .bind(canon_uuid)
+                .bind(dup_uuid)
+                .bind(&retargeted_ids)
+                .fetch_one(&mut *tx)
+                .await?;
+            moved_bbas = u64::try_from(moved).unwrap_or(0);
         }
 
         // Outgoing edges are re-sourced at `canonical`. Their BBAs live on the

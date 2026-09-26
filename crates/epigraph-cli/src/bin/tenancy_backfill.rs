@@ -1053,6 +1053,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_foreign_belief_cache", 114),
     ("epigraph_foreign_claim_classification", 114),
     ("epigraph_foreign_belief_clear", 114),
+    // The attach lock returns (and locks) a PUBLIC claim only: under a
+    // non-member owner its RLS read finds nothing and the attach falls back to
+    // 074 and 077's refusal. The dedup move's `mass_functions` UPDATE and the
+    // legacy re-own's UPDATE are refused by the tenancy policies the same way.
+    ("epigraph_lock_public_claim_for_attach", 114),
+    ("epigraph_dedup_move_bbas", 114),
+    ("epigraph_reown_legacy_writer_bbas", 114),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
