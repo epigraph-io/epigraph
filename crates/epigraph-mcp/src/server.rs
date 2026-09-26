@@ -788,7 +788,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Query epistemic claims by truth value threshold. Returns claims with their truth values and epistemic status."
+        description = "Query epistemic claims by belief-score range (min_truth / max_truth), newest first. The score is the claim's Dempster-Shafer pignistic probability when it has DS state, else its authored truth_value: the same score recall's min_truth gates on, so a claim refuted by epistemic edges is found by max_truth even while its stale truth_value is high. Each result carries truth_value (the authored value, unchanged) and belief_score (what the range compared). Current claims only unless is_current=false. Returns claims with their labels and retirement state."
     )]
     async fn query_claims(
         &self,

@@ -780,19 +780,24 @@ pub async fn query_claims(
     // current-only.
     let is_current = params.is_current.or(Some(true));
 
-    // Filter by truth range AND retirement state in SQL (before LIMIT) so
-    // matching claims outside the most-recent `limit` rows are still reachable
-    // (bug 5a55a48e) and excluded rows don't consume the limit budget.
+    // Filter by the BELIEF SCORE range AND retirement state in SQL (before
+    // LIMIT) so matching claims outside the most-recent `limit` rows are still
+    // reachable (bug 5a55a48e) and excluded rows don't consume the limit
+    // budget. The score is the DS pignistic probability when the claim has a
+    // DS cache, else `truth_value` — the same score `recall`'s `min_truth`
+    // gates on (GitHub #395). This used to filter the stale authored
+    // `truth_value`, so a refuted claim (BetP 0.18, `truth_value` 0.78) never
+    // entered a `max_truth=0.4` assessment queue.
     let claims =
-        ClaimRepository::list_by_truth_range(&server.pool, viewer, min, max, is_current, limit, 0)
+        ClaimRepository::list_by_belief_range(&server.pool, viewer, min, max, is_current, limit, 0)
             .await
             .map_err(internal_error)?;
 
-    // No per-id access map. `list_by_truth_range` is spliced with `viewer`, so
+    // No per-id access map. `list_by_belief_range` is spliced with `viewer`, so
     // a claim this caller may not read is not in `claims`. The map existed to
     // fail closed on an id the batch helper skipped — a hazard created by
     // doing the check in a second pass keyed by id, which no longer happens.
-    let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
+    let ids: Vec<Uuid> = claims.iter().map(|(c, _)| c.id.as_uuid()).collect();
 
     // Populate labels via a single batch round-trip for all returned ids
     // (backlog babd5904: this handler previously hardcoded `labels: Vec::new()`
@@ -806,7 +811,7 @@ pub async fn query_claims(
 
     let results: Vec<ClaimResponse> = claims
         .into_iter()
-        .map(|c| {
+        .map(|(c, score)| {
             let id = c.id.as_uuid();
             ClaimResponse {
                 id: id.to_string(),
@@ -817,10 +822,12 @@ pub async fn query_claims(
                 created_at: c.created_at.to_rfc3339(),
                 labels: labels_map.get(&id).cloned().unwrap_or_default(),
                 // The row's real retirement state, not a hardcoded `true` /
-                // `None` (backlog a85ee585) — `list_by_truth_range` now
+                // `None` (backlog a85ee585) — `list_by_belief_range`
                 // projects both columns.
                 is_current: c.is_current,
                 supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
+                // What min_truth / max_truth were compared against.
+                belief_score: Some(score),
             }
         })
         .collect();
@@ -922,6 +929,7 @@ pub async fn get_claim(
             labels,
             is_current: claim.is_current,
             supersedes: claim.supersedes.map(|s| s.as_uuid().to_string()),
+            belief_score: None,
         },
         classification,
         lensed_belief,
@@ -2101,6 +2109,7 @@ pub async fn query_undecomposed_claims(
                 labels: Vec::new(),
                 is_current: true,
                 supersedes: None,
+                belief_score: None,
             }
         })
         .collect();

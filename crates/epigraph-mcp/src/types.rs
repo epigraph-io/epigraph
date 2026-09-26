@@ -147,10 +147,19 @@ pub struct SubmitClaimParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryClaimsParams {
-    #[schemars(description = "Minimum balanced truth value (0.0-1.0)")]
+    #[schemars(
+        description = "Minimum belief score (0.0-1.0, default 0.0). The score is the claim's \
+                       Dempster-Shafer pignistic probability when it has DS state, else its \
+                       truth_value — the same score recall's min_truth gates on — and each result \
+                       reports it as belief_score."
+    )]
     pub min_truth: Option<f64>,
 
-    #[schemars(description = "Maximum balanced truth value (0.0-1.0)")]
+    #[schemars(
+        description = "Maximum belief score (0.0-1.0, default 1.0), on the same score as \
+                       min_truth. A claim refuted by epistemic evidence has a low belief score even \
+                       when its authored truth_value is still high, so max_truth=0.4 finds it."
+    )]
     pub max_truth: Option<f64>,
 
     #[schemars(description = "Maximum number of results (default 20)")]
@@ -1192,6 +1201,15 @@ pub struct ClaimResponse {
     pub is_current: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
+    /// The scalar a truth range was compared against (GitHub #395): the
+    /// Dempster-Shafer pignistic probability when the claim carries a DS cache,
+    /// else `truth_value` — the same score `recall`'s `min_truth` gates on.
+    /// Set by `query_claims`, whose `min_truth`/`max_truth` filter on it;
+    /// omitted by tools that apply no truth range. `belief_score !=
+    /// truth_value` means epistemic evidence has moved the claim away from its
+    /// authored value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belief_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
