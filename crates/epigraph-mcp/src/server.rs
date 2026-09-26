@@ -1632,14 +1632,19 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Manually publish an event to the graph event log for audit and traceability."
+        description = "Manually publish an event to the graph event log for audit and traceability. Over an authenticated (HTTP) connection the event's actor is the calling agent: actor_id may be omitted (it defaults to you) and any other agent's id is refused with nothing written."
     )]
     async fn publish_event(
         &self,
         Parameters(params): Parameters<PublishEventParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::events::publish_event(self, params).await
+        // A viewer since the batch H-b review, for the write identity the
+        // actor must match over HTTP.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::events::publish_event(self, viewer, params, auth).await
     }
 
     // ── Batch / Staging / Stats (3 tools) ──
@@ -1684,7 +1689,7 @@ impl EpiGraphMcpFull {
     // ── Perspectives & Ownership (6 tools) ──
 
     #[tool(
-        description = "Create a new perspective (viewpoint) for scoped belief reasoning. Perspectives can be associated with frames and agents."
+        description = "Create a new perspective (viewpoint) for scoped belief reasoning. Perspectives can be associated with frames and agents. The perspective is owned by the calling agent (the authenticated caller over HTTP, this server's own agent on stdio); over HTTP an owner_agent_id naming any other agent is refused with nothing written."
     )]
     async fn create_perspective(
         &self,

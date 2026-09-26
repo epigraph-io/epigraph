@@ -30,11 +30,23 @@ pub async fn create_perspective(
         return Err(invalid_params("confidence_calibration must be in [0, 1]"));
     }
 
+    // The caller (batch H-b, D1), not the shared server signer. Over the
+    // authenticated transport a DIFFERENT owner is refused (batch H-b review:
+    // an OAuth caller created a perspective owned by, with a PERSPECTIVE_OF
+    // edge to, a foreign agent); stdio keeps the parameter as given.
+    let me = server.write_identity(auth, viewer).await?.agent_id();
     let owner_agent_id = if let Some(ref id) = params.owner_agent_id {
-        Some(parse_uuid(id)?)
+        let requested = parse_uuid(id)?;
+        if auth.is_some() && requested != me {
+            return Err(invalid_params(format!(
+                "owner_agent_id {requested} is not the calling agent ({me}); over an \
+                 authenticated connection a perspective is owned by its caller. Omit \
+                 owner_agent_id or pass your own. Nothing was written."
+            )));
+        }
+        Some(requested)
     } else {
-        // The caller (batch H-b, D1), not the shared server signer.
-        Some(server.write_identity(auth, viewer).await?.agent_id())
+        Some(me)
     };
 
     let frame_ids: Vec<uuid::Uuid> = params

@@ -2391,7 +2391,9 @@ pub struct PublishEventParams {
     #[schemars(description = "Event type (e.g. 'claim.created', 'analysis.completed')")]
     pub event_type: String,
 
-    #[schemars(description = "UUID of the actor (agent) triggering this event")]
+    #[schemars(
+        description = "UUID of the actor (agent) triggering this event. Over an authenticated (HTTP) connection it must be your own agent id (omitted, it defaults to you); another agent's id is refused. On stdio it is recorded as given."
+    )]
     pub actor_id: Option<String>,
 
     #[schemars(
@@ -2596,7 +2598,7 @@ pub struct CreatePerspectiveParams {
     pub description: Option<String>,
 
     #[schemars(
-        description = "UUID of the agent who owns this perspective (defaults to the calling agent: the authenticated caller over HTTP, this server's own agent on stdio)"
+        description = "UUID of the agent who owns this perspective (defaults to the calling agent: the authenticated caller over HTTP, this server's own agent on stdio). Over HTTP it must be your own agent id; another agent's id is refused."
     )]
     pub owner_agent_id: Option<String>,
 
