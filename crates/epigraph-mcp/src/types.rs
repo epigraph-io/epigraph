@@ -2200,6 +2200,10 @@ pub struct NeighborhoodEdge {
 #[derive(Debug, Serialize)]
 pub struct NeighborhoodResponse {
     pub node_id: String,
+    /// The node's entity type(s) as recorded on the edges this caller can see
+    /// ('claim', 'paper', 'workflow', 'agent', ...). Normally one; empty when
+    /// the node has no visible edges.
+    pub node_types: Vec<String>,
     pub edge_count: usize,
     pub edges: Vec<NeighborhoodEdge>,
 }

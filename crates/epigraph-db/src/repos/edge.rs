@@ -686,6 +686,47 @@ impl EdgeRepository {
             .collect())
     }
 
+    /// The entity types node `node_id` carries as an edge endpoint, from the
+    /// edges this viewer can see: every distinct `source_type` of an edge
+    /// leaving it and `target_type` of an edge entering it, sorted.
+    ///
+    /// Backlog cdd8d097 / aedde855 (G9). [`Self::get_by_source`] and
+    /// [`Self::get_by_target`] key on `(id, type)`, and the graph tools passed
+    /// the literal `"claim"`, so a paper, workflow or agent node returned no
+    /// edges at all. The edges table is the one place every endpoint type is
+    /// recorded, whatever table backs it (`entity_types` is operator-extensible),
+    /// so the node's real type is read from there rather than probed table by
+    /// table. Normally one type; more than one only if two tables share a UUID,
+    /// and then the caller reads each.
+    ///
+    /// Filtered by the co-owner-aware edge predicate, so it reveals a type only
+    /// through an edge the viewer could already read.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn endpoint_types<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        node_id: Uuid,
+    ) -> Result<Vec<String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT t FROM ( \
+                 SELECT e.source_type AS t FROM edges e \
+                 WHERE e.source_id = $1 /* {EDGE_VISIBILITY:e} */ \
+                 UNION \
+                 SELECT e.target_type AS t FROM edges e \
+                 WHERE e.target_id = $1 /* {EDGE_VISIBILITY:e} */ \
+             ) types ORDER BY t",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql).bind(node_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// List the claim→claim edges leaving `source_id` that can carry an
     /// edge-factor BBA on their target, restricted to targets that are still
     /// `is_current`.

@@ -1487,7 +1487,7 @@ impl EpiGraphMcpFull {
     // ── Graph (2 tools) ──
 
     #[tool(
-        description = "Get the immediate graph neighborhood of any node — all connected edges with optional relationship and direction filters."
+        description = "Get the immediate graph neighborhood of any node (a claim, paper, workflow, agent, or any other entity type) — all connected edges you can see, with optional relationship and direction filters. The node's type is read from its visible edges and returned as node_types; edges are read under each of those types, so a paper's asserts edges or a workflow's executes edges are returned, not only a claim's."
     )]
     async fn get_neighborhood(
         &self,
@@ -1500,7 +1500,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Multi-hop graph walk from a starting node. BFS traversal with optional relationship filter and truth threshold."
+        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label and truth_value), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only."
     )]
     async fn traverse(
         &self,
