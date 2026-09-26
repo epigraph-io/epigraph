@@ -21,9 +21,10 @@
 //!
 //! # Never on a shared HTTP listener
 //!
-//! An HTTP listener authors EVERY authenticated caller's claims as its one
-//! signer agent. If that signer were operated, every OAuth caller would write
-//! into the operator's group and inherit the operator's ownership. So
+//! An HTTP listener used to author EVERY caller's claims as its one signer
+//! agent (before batch H-b), and its principal-less callers still act AS that
+//! signer. If that signer were operated, those callers would write into the
+//! operator's group and inherit the operator's ownership. So
 //! [`check_operator_transport`] refuses `--operator-id` with `--listen` before
 //! any database work, [`refuse_operated_http_signer`] refuses to start an HTTP
 //! listener whose signer ALREADY has an operator link (recorded by some earlier
@@ -36,6 +37,28 @@
 //! (`AgentRepository::operates_agents`, migration 107 section 9): on
 //! `--allow-unauthenticated-http` every caller IS the signer, and would satisfy
 //! "caller is the operator of the claim's author" for every linked agent.
+//!
+//! ## Why the gate stays strict after batch HTTP-id
+//!
+//! Since batch H-b an authenticated caller's writes are authored by the
+//! caller's own agent, and since batch HTTP-id a caller with no authenticated
+//! principal writes nothing unless the listener opts in. So a listener's
+//! signer now authors nothing by default, and a FORMER shared signer can be
+//! link-retired to its human (migration 116's attested variant). That does
+//! not make a retired link on a RUNNING signer safe, and both checks keep
+//! refusing one:
+//!
+//! * the signer is still the READ principal of the principal-less listener
+//!   and still signs every digest, so a membership that predates the retire
+//!   would widen what that listener's callers read;
+//! * "authors nothing" is a runtime property the start-up gate cannot verify
+//!   (`--allow-unauthenticated-writes` turns signer authoring back on);
+//! * a retired identity's key may be exposed (migration 107 section 7), and a
+//!   key that ever served as a shared signer should not run again.
+//!
+//! The supported sequence is therefore: move the listener to a FRESH
+//! `--agent-key`, confirm the former signer authors nothing new, then
+//! link-retire it. The refusal texts below say so.
 //!
 //! Both HTTP checks read the AUTHOR record (`AgentRepository::operator_of_author`,
 //! retired links included), not the actor read. That is a REFUSAL-only use of
@@ -157,10 +180,11 @@ fn linked_http_signer_reason(agent_id: Uuid, link: &AuthorOperator) -> String {
         "an acting link"
     };
     format!(
-        "this HTTP listener's signer agent {agent_id} has an operator link to {} ({kind}). An \
-         HTTP listener authors every caller's claims as that one agent, so every caller would \
-         write with the operator's ownership. Run the listener under a different --agent-key; \
-         the link record is permanent.",
+        "this HTTP listener's signer agent {agent_id} has an operator link to {} ({kind}). A \
+         listener's principal-less callers act as that one agent and it signs every digest, so \
+         serving under it would lend them the operator's ownership. Run the listener under a \
+         FRESH --agent-key (a retired former signer's key must not run again); the link record \
+         is permanent.",
         link.operator_id
     )
 }
