@@ -875,6 +875,295 @@ async fn privileged_sessions_delete_edge_bbas_exactly_as_before(pool: PgPool) {
 }
 
 // ===========================================================================
+// 3a. The arms, one condition at a time.
+// ===========================================================================
+
+/// A claim row with an explicit `supersedes` / `is_current`, seeded on the
+/// superuser harness connection: the shape a dedup leaves behind.
+async fn seed_claim_row(
+    pool: &PgPool,
+    agent: Uuid,
+    group: Uuid,
+    supersedes: Option<Uuid>,
+    is_current: bool,
+    tag: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, supersedes) \
+         VALUES ($1, $2, $3, 0.5, $4, $5, 'public', $6, $7)",
+    )
+    .bind(id)
+    .bind(format!("owner-scoped delete fixture claim {tag}"))
+    .bind(&hash)
+    .bind(agent)
+    .bind(is_current)
+    .bind(group)
+    .bind(supersedes)
+    .execute(pool)
+    .await
+    .expect("seed a claim row");
+    id
+}
+
+/// Make `agent` a READER (not a writer) of `group`.
+async fn add_reader(pool: &PgPool, group: Uuid, agent: Uuid) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("seed reader membership");
+}
+
+/// A BBA stored on the superuser connection, so it inherits its claim's
+/// tenancy (a privileged session takes 114's arm (b)).
+async fn store_bba_privileged(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    source_agent: Uuid,
+    perspective: Uuid,
+) -> Uuid {
+    let mut conn = pool.acquire().await.expect("acquire");
+    store_bba(&mut conn, claim, frame, source_agent, Some(perspective)).await
+}
+
+fn is_cd02(r: &Result<u64, epigraph_db::DbError>) -> bool {
+    matches!(r, Err(e) if e.to_string().contains("CD02"))
+}
+
+/// The DELETE rule is the WRITABLE set, not the read set. R is a `reader` of
+/// W's group G: it reads G's public claim, G's private claim and W's evidence,
+/// and deletes none of them. Through the cascade definer R cannot remove G's
+/// edge-keyed BBA either (its owner arm is the writable set too): CD02.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reader_of_a_group_deletes_none_of_its_rows(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, g) = fixture::seed_agent_with_group(&pool, "writer-w").await;
+    let (r, _) = fixture::seed_agent_with_group(&pool, "reader-r").await;
+    add_reader(&pool, g, r).await;
+    let public_claim = seed_public_claim_owned_by(&pool, w, g, "G's public claim").await;
+    let private_claim = fixture::seed_group_claim(&pool, w, g, "G's private claim").await;
+    let source = fixture::seed_public_claim(&pool, author, "a world source").await;
+    let bt = seed_frame(&pool, "binary_truth").await;
+    let edge = fixture::seed_edge(&pool, source, public_claim).await;
+    seed_perspective(&pool, edge).await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (ev, mf, seen, deleted, cascade) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, w).await;
+            let ev = insert_evidence(&mut conn, public_claim, "w").await;
+            let mf = store_bba(&mut conn, public_claim, bt, author, Some(edge)).await;
+            stamp(&mut conn, &p, r).await;
+            // Calibration: R reads all four, so a 0 is the DELETE rule.
+            let seen: i64 = sqlx::query_scalar(
+                "SELECT (SELECT count(*) FROM claims WHERE id IN ($1, $2)) \
+                      + (SELECT count(*) FROM evidence WHERE id = $3) \
+                      + (SELECT count(*) FROM mass_functions WHERE id = $4)",
+            )
+            .bind(public_claim)
+            .bind(private_claim)
+            .bind(ev)
+            .bind(mf)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read as R");
+            let mut deleted = Vec::new();
+            for (t, id) in [
+                ("evidence", ev),
+                ("mass_functions", mf),
+                ("claims", private_claim),
+                ("claims", public_claim),
+            ] {
+                deleted.push(delete_by_id(&mut conn, t, id).await);
+            }
+            let cascade = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+            (conn, (ev, mf, seen, deleted, cascade))
+        })
+        .await;
+    assert_eq!(seen, 4, "calibration: a reader reads every G row");
+    assert_eq!(deleted, vec![0, 0, 0, 0], "a reader deletes no G row");
+    assert!(is_cd02(&cascade), "{cascade:?}");
+    assert_eq!(
+        writer_owned(&pool, "mass_functions", mf).await,
+        (g, false),
+        "fixture shape: the BBA is G's own row"
+    );
+    for (t, id) in [
+        ("evidence", ev),
+        ("mass_functions", mf),
+        ("claims", private_claim),
+        ("claims", public_claim),
+    ] {
+        assert!(exists(&pool, t, id).await, "{t} {id} survived");
+    }
+}
+
+/// The "retired duplicate of the source" arm needs all three of its
+/// conditions. W writes d1, which supersedes S1 but is still CURRENT, and d2,
+/// which is retired and supersedes S2 but was authored by W while the BBA on
+/// S2's edge is attributed to X. W is refused (CD02) on both edges. Once d1 is
+/// retired, the same call on S1's edge lands: the refusal was the
+/// `NOT is_current` condition, not the fixture.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_retired_duplicate_arm_needs_a_retired_duplicate_by_the_same_author(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, wg) = fixture::seed_agent_with_group(&pool, "dedup-w").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    let s1 = fixture::seed_public_claim(&pool, author, "world source one").await;
+    let s2 = fixture::seed_public_claim(&pool, author, "world source two").await;
+    let target = fixture::seed_public_claim(&pool, author, "world target").await;
+    let d1 = seed_claim_row(&pool, w, wg, Some(s1), true, "current dup of S1").await;
+    let _d2 = seed_claim_row(&pool, w, wg, Some(s2), false, "retired dup of S2").await;
+    let bt = seed_frame(&pool, "binary_truth").await;
+    let e1 = fixture::seed_edge(&pool, s1, target).await;
+    let e2 = fixture::seed_edge(&pool, s2, target).await;
+    seed_perspective(&pool, e1).await;
+    seed_perspective(&pool, e2).await;
+    // Both rows are public world-owned (they inherit the world target), so
+    // W reads them and the owner arm cannot admit them.
+    let b1 = store_bba_privileged(&pool, target, bt, w, e1).await;
+    let b2 = store_bba_privileged(&pool, target, bt, x, e2).await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (current_dup, other_author) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, w).await;
+            let a = MassFunctionRepository::delete_for_perspective(&mut *conn, e1).await;
+            let b = MassFunctionRepository::delete_for_perspective(&mut *conn, e2).await;
+            (conn, (a, b))
+        })
+        .await;
+    assert!(
+        is_cd02(&current_dup),
+        "a CURRENT claim superseding S is not a retired duplicate: {current_dup:?}"
+    );
+    assert!(
+        is_cd02(&other_author),
+        "a retired duplicate by another author does not license X's row: {other_author:?}"
+    );
+    assert!(exists(&pool, "mass_functions", b1).await);
+    assert!(exists(&pool, "mass_functions", b2).await);
+
+    // Calibration: retire d1, and the same call lands through the arm.
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(d1)
+        .execute(&pool)
+        .await
+        .expect("retire d1");
+    let p = pool.clone();
+    let retired = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, e1).await;
+        (conn, n)
+    })
+    .await;
+    assert_eq!(retired.expect("the retired duplicate's author"), 1);
+    assert!(!exists(&pool, "mass_functions", b1).await);
+    let audit = cascade_audit(&pool).await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0].3["source_writer"], 1, "{:?}", audit[0].3);
+}
+
+/// The cascade definer only ever considers rows the SESSION can read. On a
+/// retracted edge a bystander Z removes the public BBA through the
+/// retracted-edge arm, and leaves the private BBA of group H keyed on the same
+/// edge alone, exactly as the invoker statement always did.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_cascade_never_touches_a_row_the_session_cannot_read(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "private-h").await;
+    let (z, _) = fixture::seed_agent_with_group(&pool, "bystander-z").await;
+    let source = fixture::seed_public_claim(&pool, author, "world source").await;
+    let target = fixture::seed_public_claim(&pool, author, "world target").await;
+    let h_claim = fixture::seed_group_claim(&pool, h, hg, "H's private claim").await;
+    let bt = seed_frame(&pool, "binary_truth").await;
+    let edge = fixture::seed_edge(&pool, source, target).await;
+    seed_perspective(&pool, edge).await;
+    let public_bba = store_bba_privileged(&pool, target, bt, author, edge).await;
+    let private_bba = store_bba_privileged(&pool, h_claim, bt, author, edge).await;
+    assert_eq!(
+        writer_owned(&pool, "mass_functions", private_bba).await.0,
+        hg,
+        "fixture shape: H's private row"
+    );
+    sqlx::query("UPDATE edges SET valid_to = now() - interval '1 minute' WHERE id = $1")
+        .bind(edge)
+        .execute(&pool)
+        .await
+        .expect("retract the edge");
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let n = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, z).await;
+        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        (conn, n)
+    })
+    .await;
+    assert_eq!(
+        n.expect("the retracted-edge arm"),
+        1,
+        "only the readable row"
+    );
+    assert!(!exists(&pool, "mass_functions", public_bba).await);
+    assert!(
+        exists(&pool, "mass_functions", private_bba).await,
+        "a row Z cannot read is not Z's to cascade-delete"
+    );
+}
+
+/// The CO-owner of an edge deletes it. C's own group is the co-owner of an
+/// edge from W's private claim (owner G1) to C's private claim (co-owner
+/// G2); C is also a reader of G1, so it READS the edge (072's intersection)
+/// while writing only the co-owner.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edges_co_owner_deletes_it(pool: PgPool) {
+    let (w, g1) = fixture::seed_agent_with_group(&pool, "owner-w").await;
+    let (c, g2) = fixture::seed_agent_with_group(&pool, "co-owner-c").await;
+    add_reader(&pool, g1, c).await;
+    let from = fixture::seed_group_claim(&pool, w, g1, "W's private claim").await;
+    let to = fixture::seed_group_claim(&pool, c, g2, "C's private claim").await;
+    let edge = fixture::seed_edge(&pool, from, to).await;
+    let shape: (Uuid, Option<Uuid>) =
+        sqlx::query_as("SELECT owner_group_id, co_owner_group_id FROM edges WHERE id = $1")
+            .bind(edge)
+            .fetch_one(&pool)
+            .await
+            .expect("edge shape");
+    assert_eq!(
+        shape,
+        (g1, Some(g2)),
+        "fixture shape: owned by G1, co-owned by G2"
+    );
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (seen, deleted) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, c).await;
+        let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE id = $1")
+            .bind(edge)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read as C");
+        let deleted = delete_by_id(&mut conn, "edges", edge).await;
+        (conn, (seen, deleted))
+    })
+    .await;
+    assert_eq!(seen, 1, "calibration: C reads the co-owned edge");
+    assert_eq!(deleted, 1, "the co-owner's writer deletes the edge");
+}
+
+// ===========================================================================
 // 3b. The owner cannot be moved first (section 7).
 // ===========================================================================
 
@@ -1052,6 +1341,32 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
         unguarded.is_empty(),
         "owner_group_id is re-ownable by a non-privileged UPDATE on {unguarded:?}"
     );
+
+    // Existence is not the rule: a `USING (true)`, or one keyed on the READ
+    // set, would satisfy the check above. Each table's restrictive DELETE
+    // policy must key the owner on the WRITABLE set and must not name the
+    // read set at all.
+    let quals: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, pg_get_expr(p.polqual, p.polrelid) \
+           FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+          WHERE p.polcmd = 'd' AND NOT p.polpermissive \
+            AND p.polname = c.relname || '_delete_owner' \
+          ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("delete policy quals");
+    assert_eq!(quals.len(), 24, "{quals:?}");
+    for (table, qual) in &quals {
+        assert!(
+            qual.contains("owner_group_id = ANY") && qual.contains("epigraph_writable_groups()"),
+            "{table}_delete_owner must key the owner on the writable set: {qual}"
+        );
+        assert!(
+            !qual.contains("epigraph_session_groups()"),
+            "{table}_delete_owner must not admit on the read set: {qual}"
+        );
+    }
 }
 
 /// The four functions are definers owned by the maintenance role, not
