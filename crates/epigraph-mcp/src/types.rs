@@ -1177,7 +1177,7 @@ pub struct ClaimResponse {
     pub supersedes: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SubmitClaimResponse {
     pub claim_id: String,
     pub truth_value: f64,
@@ -2401,25 +2401,120 @@ pub struct BatchSubmitClaimsParams {
     pub claims: Vec<BatchClaimEntry>,
 }
 
+/// One entry of `batch_submit_claims`: every field `submit_claim` accepts
+/// (backlog 73657204).
+///
+/// This used to carry five of `SubmitClaimParams`'s nine fields, and the batch
+/// tool hard-coded the other four — `methodology: "inductive_generalization"`
+/// (which sets the trust modifier), `source_url: None`, `reasoning: None`,
+/// `novelty_threshold: None` — so a batch submission could not say how a claim
+/// was derived or where its evidence came from.
+///
+/// # Why the two structs cannot drift again
+///
+/// They are kept separate only because two fields are REQUIRED on
+/// `submit_claim` and optional here (`methodology`, `confidence`), which a
+/// flattened shared struct cannot express. Drift is closed in both directions
+/// at compile time by `From<BatchClaimEntry> for SubmitClaimParams`: it
+/// destructures this struct exhaustively with no `..` (a field added here is a
+/// hard error, E0027, until the pattern binds it, and a bound field that is not
+/// passed through is an unused variable, which `-D warnings` refuses) and builds
+/// `SubmitClaimParams` with a full struct literal (a field added there and
+/// missing here is a missing-field error). The schema-level ratchet
+/// `tests/batch_submit_claims_parity.rs` additionally pins that this entry's
+/// advertised properties are a superset of `submit_claim`'s.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BatchClaimEntry {
     #[schemars(description = "The claim content")]
     pub content: String,
 
-    #[schemars(description = "Evidence text")]
+    #[schemars(
+        description = "How the claim was derived; the same vocabulary as submit_claim's \
+                       methodology (direct_observation, instrumental, statistical_analysis, \
+                       deductive_logic, inductive_generalization, ...). Optional: when omitted \
+                       the entry is submitted as inductive_generalization, which is what every \
+                       batch entry used before this field existed. An unknown value refuses \
+                       THIS entry only (reported in results/error_details) and writes nothing \
+                       for it; the other entries still land."
+    )]
+    #[serde(default)]
+    pub methodology: Option<String>,
+
+    #[schemars(description = "Evidence text. Stored permanently for human audit.")]
     pub evidence_data: String,
 
-    #[schemars(description = "Evidence type: empirical, statistical, logical, testimonial")]
+    #[schemars(
+        description = "Evidence type: empirical, statistical, logical, testimonial, circumstantial"
+    )]
     pub evidence_type: String,
 
-    #[schemars(description = "Confidence 0.0-1.0")]
+    #[schemars(description = "Confidence 0.0-1.0 (default 0.5)")]
     pub confidence: Option<f64>,
+
+    #[schemars(
+        description = "Source URL, DOI, or reference for the evidence, as in submit_claim. \
+                       Optional but strongly recommended."
+    )]
+    #[serde(default)]
+    pub source_url: Option<String>,
+
+    #[schemars(
+        description = "Why the evidence supports this claim, as in submit_claim. Stored on the \
+                       entry's reasoning trace."
+    )]
+    #[serde(default)]
+    pub reasoning: Option<String>,
 
     #[schemars(
         description = "Optional labels to attach to the new claim (e.g. ['backlog','bug'])"
     )]
     #[serde(default)]
     pub labels: Vec<String>,
+
+    #[schemars(
+        description = "Semantic novelty gate threshold for this entry, exactly as submit_claim's \
+                       novelty_threshold (default 0.05; 0.0 always inserts)."
+    )]
+    #[serde(default)]
+    pub novelty_threshold: Option<f64>,
+}
+
+/// The methodology a batch entry gets when it names none — the value every
+/// batch entry was hard-coded to before [`BatchClaimEntry::methodology`]
+/// existed, so an existing caller's submissions are unchanged.
+pub const BATCH_DEFAULT_METHODOLOGY: &str = "inductive_generalization";
+
+/// The confidence a batch entry gets when it names none (unchanged).
+pub const BATCH_DEFAULT_CONFIDENCE: f64 = 0.5;
+
+impl From<BatchClaimEntry> for SubmitClaimParams {
+    fn from(entry: BatchClaimEntry) -> Self {
+        // EXHAUSTIVE on both sides, deliberately: no `..` in the pattern and
+        // none in the literal. See `BatchClaimEntry`'s doc for why that is the
+        // drift guard.
+        let BatchClaimEntry {
+            content,
+            methodology,
+            evidence_data,
+            evidence_type,
+            confidence,
+            source_url,
+            reasoning,
+            labels,
+            novelty_threshold,
+        } = entry;
+        Self {
+            content,
+            methodology: methodology.unwrap_or_else(|| BATCH_DEFAULT_METHODOLOGY.to_string()),
+            evidence_data,
+            evidence_type,
+            confidence: confidence.unwrap_or(BATCH_DEFAULT_CONFIDENCE),
+            source_url,
+            reasoning,
+            labels,
+            novelty_threshold,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

@@ -141,8 +141,22 @@ pub async fn submit_claim(
     viewer: &epigraph_db::visibility::Viewer,
     params: SubmitClaimParams,
 ) -> Result<CallToolResult, McpError> {
+    success_json(&submit_claim_response(server, viewer, params).await?)
+}
+
+/// `submit_claim` as a typed response rather than a serialized tool result.
+///
+/// `batch_submit_claims` calls this per entry and returns each entry's FULL
+/// response (backlog 73657204). It used to call [`submit_claim`] and re-parse
+/// the JSON text for `claim_id` alone, discarding truth_value, content_hash,
+/// embedded and the whole Dempster-Shafer block for every batch entry.
+pub(crate) async fn submit_claim_response(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: SubmitClaimParams,
+) -> Result<SubmitClaimResponse, McpError> {
     let sub = match prepare_submission(server, viewer, params).await? {
-        PreparedSubmission::Existing(response) => return Ok(response),
+        PreparedSubmission::Existing(response) => return Ok(*response),
         PreparedSubmission::Fresh(sub) => *sub,
     };
     let mut tx =
@@ -157,7 +171,7 @@ pub async fn submit_claim(
 enum PreparedSubmission {
     /// The novelty gate matched an existing claim: this is the response, and
     /// nothing is to be written.
-    Existing(CallToolResult),
+    Existing(Box<SubmitClaimResponse>),
     /// A submission to write.
     Fresh(Box<Submission>),
 }
@@ -307,8 +321,8 @@ async fn prepare_submission(
                         "novelty gate: nearest claim {existing_id} vanished before read-back"
                     ))
                 })?;
-                return Ok(PreparedSubmission::Existing(success_json(
-                    &SubmitClaimResponse {
+                return Ok(PreparedSubmission::Existing(Box::new(
+                    SubmitClaimResponse {
                         claim_id: existing_id.to_string(),
                         truth_value: existing.truth_value.value(),
                         content_hash: ContentHasher::to_hex(&existing.content_hash),
@@ -318,7 +332,7 @@ async fn prepare_submission(
                         pignistic_prob: None,
                         frame_id: None,
                     },
-                )?));
+                )));
             }
             // Insert / InsertFlagged: stash the already-generated,
             // pgvector-formatted embedding so the was_created branch below
@@ -568,7 +582,7 @@ async fn finish_submission(
     sub: Submission,
     written: WrittenSubmission,
     tool_name: &'static str,
-) -> Result<CallToolResult, McpError> {
+) -> Result<SubmitClaimResponse, McpError> {
     let Submission {
         params,
         agent_id,
@@ -656,7 +670,7 @@ async fn finish_submission(
         claim.truth_value.value()
     };
 
-    success_json(&SubmitClaimResponse {
+    Ok(SubmitClaimResponse {
         claim_id: claim_uuid.to_string(),
         truth_value: final_truth,
         content_hash: ContentHasher::to_hex(&content_hash),

@@ -7,6 +7,20 @@ use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
 /// Batch submit multiple claims (max 100).
+///
+/// Each entry is converted with `From<BatchClaimEntry> for SubmitClaimParams`
+/// (every `submit_claim` field passes through; see that impl for the drift
+/// guard) and submitted through the SAME pipeline as `submit_claim`, one entry
+/// at a time, each on its own transaction. A refused entry — an unknown
+/// methodology or evidence_type, a bad label, a refused write — is refused
+/// before or inside its own transaction, so it writes nothing and the other
+/// entries still land.
+///
+/// # Response (additive only)
+///
+/// `submitted`, `errors` and `error_details` are unchanged. `results` is new:
+/// one object per entry, in input order, `{index, status: "ok", ...the full
+/// submit_claim response}` or `{index, status: "error", error}`.
 pub async fn batch_submit_claims(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -20,43 +34,29 @@ pub async fn batch_submit_claims(
     }
 
     let _agent_id = server.agent_id().await?;
-    let mut submitted = Vec::new();
+    let mut submitted = 0_usize;
     let mut errors = Vec::new();
+    let mut results = Vec::with_capacity(params.claims.len());
 
-    for (i, entry) in params.claims.iter().enumerate() {
-        let claim_params = SubmitClaimParams {
-            content: entry.content.clone(),
-            methodology: "inductive_generalization".to_string(),
-            evidence_data: entry.evidence_data.clone(),
-            evidence_type: entry.evidence_type.clone(),
-            confidence: entry.confidence.unwrap_or(0.5),
-            source_url: None,
-            reasoning: None,
-            labels: entry.labels.clone(),
-            novelty_threshold: None,
-        };
+    for (i, entry) in params.claims.into_iter().enumerate() {
+        let claim_params = SubmitClaimParams::from(entry);
 
-        match crate::tools::claims::submit_claim(server, viewer, claim_params).await {
-            Ok(result) => {
-                // Extract claim_id from the JSON text content returned by submit_claim
-                let claim_id = result
-                    .content
-                    .first()
-                    .and_then(|c| c.as_text())
-                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
-                    .and_then(|v| {
-                        v.get("claim_id")
-                            .and_then(|id| id.as_str())
-                            .map(String::from)
-                    })
-                    .unwrap_or_default();
-                submitted.push(serde_json::json!({
-                    "index": i,
-                    "status": "ok",
-                    "claim_id": claim_id,
-                }));
+        match crate::tools::claims::submit_claim_response(server, viewer, claim_params).await {
+            Ok(response) => {
+                submitted += 1;
+                let mut row = serde_json::to_value(&response).map_err(internal_error)?;
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("index".into(), serde_json::json!(i));
+                    obj.insert("status".into(), serde_json::json!("ok"));
+                }
+                results.push(row);
             }
             Err(e) => {
+                results.push(serde_json::json!({
+                    "index": i,
+                    "status": "error",
+                    "error": e.message,
+                }));
                 errors.push(serde_json::json!({
                     "index": i,
                     "error": format!("{e:?}"),
@@ -67,9 +67,10 @@ pub async fn batch_submit_claims(
 
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::json!({
-            "submitted": submitted.len(),
+            "submitted": submitted,
             "errors": errors.len(),
             "error_details": errors,
+            "results": results,
         })
         .to_string(),
     )]))
