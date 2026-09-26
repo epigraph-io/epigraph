@@ -255,6 +255,27 @@ jobs:
         # pass under --no-default-features today.
         run: cargo check -p epigraph-api --no-default-features --locked
 
+  # services/kanban is standard-library-only Python with its own end-to-end
+  # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
+  # patched). Without this job that suite ran only at author time. Nothing in it
+  # reaches GitHub, the EpiGraph API or a real `claude`, so it needs no secrets,
+  # no service container and no toolchain beyond the runner's own python3 --
+  # hence no extra (unpinned-by-SHA) setup action either.
+  kanban:
+    name: Kanban board tests
+    runs-on: ubuntu-latest
+    # The suite takes well under a minute; 15 cuts off a hung stub or agent.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: services/kanban
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Python version
+        run: python3 --version
+      - name: Run kanban tests
+        run: python3 -m unittest discover -s tests -v
+
   # Advisory, NOT a merge gate. cargo audit checks Cargo.lock against the
   # RustSec DB fetched at run time, so a blocking gate would red-light every
   # open PR the moment a new advisory lands on any transitive dependency —
