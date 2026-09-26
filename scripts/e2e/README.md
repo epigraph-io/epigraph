@@ -320,6 +320,7 @@ unless it says otherwise.
 | same (B) | T repaired (unbacked) | same |
 | HTTP `PATCH /api/v1/claims/:id`, admin, world-owned / other agent's claim (B) | 200, **0 audit rows** | 200, 1 audit row, principal = ADMIN |
 | same (A) | 500 (RLS) | 200 through the audited path |
+| HTTP `PUT /api/v1/claims/:id`, admin, other agent's claim | B 200, 0 audit rows; A 500 | **unchanged: B 200, 0 audit rows** (open D2 gap, R3 item 2) |
 
 ### What moved on config B, stated
 
@@ -438,6 +439,13 @@ decision or conversion before the operator drops `claims_privacy`,
      private (the `claims:admin` cross-group case of `PATCH` is now the audited
      admin path; the owner's own `PATCH` stays 500 on B too, "Failed to record
      provenance", before and after the review revision);
+   - **OPEN D2 GAP: `PUT /api/v1/claims/:id` by `claims:admin` across groups is
+     NOT on the audited path.** Measured (`probe-http-labels.sh`, the `PUT`
+     line), before and after the review revision: B 200 with the property on
+     the row and **0 audit rows**; A 500. PUT also writes `truth_value` and
+     `embedding`, which migration 111's definer does not carry, so routing it
+     there is its own decision (extend the definer, or refuse cross-group PUT
+     for admins and point them at PATCH). An R3 blocker either way;
    - `PATCH /api/v1/edges/:id`: no ownership check, only `edges:write` (MCP
      `patch_edge` now requires the source claim's owner over HTTP; the route
      does not);

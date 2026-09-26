@@ -234,4 +234,16 @@ pcase admin/world-public      "$T_ADMIN"   "$C_P_WORLD"
 pcase admin/other-public      "$T_ADMIN"   "$C_P_OTHER"
 pcase nogrant-admin/other-public "$T_NOGRANT" "$C_P_OTHER"
 pcase peer/other-public       "$T_PEER"    "$C_P_OTHER"
+
+# PUT /api/v1/claims/:id by claims:admin across groups: NOT on the audited path
+# (an open D2 gap; README R3 item 2). Printed so the gap stays measured: the
+# expected shape on B is 200 with the property on the row and audit=0.
+C_PUT_OTHER="$(claim "$STRANGER" public "$STRANGER_G" put-other-public)"
+status="$(curl -s -o "$E2E/.hl.body.$LABEL" -w '%{http_code}' -X PUT \
+  -H "Authorization: Bearer $T_ADMIN" -H 'Content-Type: application/json' \
+  "http://127.0.0.1:$PORT/api/v1/claims/$C_PUT_OTHER" -d '{"properties":{"hlput":1}}')"
+printf 'PUT   %-30s status=%s prop_on_row=%s audit=%s  %s\n' admin/other-public "$status" \
+  "$(q "SELECT properties ? 'hlput' FROM claims WHERE id = '$C_PUT_OTHER'")" \
+  "$(q "SELECT count(*) FROM security_events WHERE event_type = 'claims.admin_write' AND details->>'claim_id' = '$C_PUT_OTHER'")" \
+  "$(head -c 100 "$E2E/.hl.body.$LABEL" | tr '\n' ' ')"
 rm -f "$E2E/.hl.body.$LABEL"
