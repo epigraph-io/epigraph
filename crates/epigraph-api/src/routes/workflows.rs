@@ -2217,26 +2217,19 @@ async fn audit_api_admin_workflow_write(
 ) -> Result<(), ApiError> {
     let record = serde_json::json!({
         "action": action,
-        "admin_agent_id": admin,
-        "client_id": auth.client_id,
-        "token_jti": auth.jti,
         "workflow_id": workflow_id,
         "submitter": submitter,
         "write": details,
     });
-    epigraph_db::SecurityEventRepository::log_conn(
+    // Migration 112's definer: this transaction is stamped from the system
+    // agent, whose session `security_events_append` would refuse an admin row.
+    epigraph_db::SecurityEventRepository::admin_audit_write(
         &mut *conn,
-        &epigraph_db::SecurityEventRow {
-            id: Uuid::new_v4(),
-            event_type: "workflows.admin_write".to_string(),
-            agent_id: Some(admin),
-            success: Some(true),
-            details: record,
-            ip_address: None,
-            user_agent: None,
-            correlation_id: Some(auth.jti.to_string()),
-            created_at: chrono::Utc::now(),
-        },
+        auth.client_id,
+        auth.jti,
+        admin,
+        "workflows.admin_write",
+        &record,
     )
     .await
     .map_err(|e| ApiError::InternalError {

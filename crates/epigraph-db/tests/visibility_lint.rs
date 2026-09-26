@@ -1060,6 +1060,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          projects back only the row this statement just inserted; `create_strict` delegates to it.",
     ),
     (
+        "security_event.rs",
+        "admin_audit_write",
+        "WRITE through migration 112's SECURITY DEFINER `epigraph_admin_audit_write` (batch \
+         H-b review): one `security_events` row for an admin workflow write, after re-checking \
+         the token's `oauth_clients` grant. There is no read to filter; the row is the audit \
+         of a write the caller just made on the same transaction.",
+    ),
+    (
         "perspective.rs",
         "set_source_reliability_conn",
         "WRITE of one caller-named `perspectives` row's `properties.source_reliability` on the \

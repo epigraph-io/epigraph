@@ -477,9 +477,34 @@ Current reservation:
   `111`. **Applied to a throwaway database only, NOT to any deployed
   database.**
 
-- **112+**: public next
+- **112**: public `admin_audit_write` — the audit row for an admin write that
+  needs no definer of its own (batch H-b review; H3's workflow admin arm). One
+  SECURITY DEFINER, `epigraph_admin_audit_write(client, jti, admin,
+  event_type, details)`, owned by `epigraph_maintenance`, EXECUTE revoked from
+  PUBLIC and granted to `epigraph_app` and `epigraph_maintenance`. It re-checks
+  the grant with 111's predicate (`oauth_clients.id` = the token's `sub`,
+  active, `claims:admin` granted, bound to `admin`; `ADM02`), accepts only
+  `workflows.admin_write` (`ADM03`), and writes one `security_events` row
+  attributed to the admin on the caller's transaction. It exists because that
+  transaction is stamped from `workflow-ingest-system`, and
+  `security_events_append` admits an attributed row only for the session
+  principal: measured, a plain INSERT of the admin's row was refused there.
+  Called from MCP `add_step` / `delete_step` / `ingest_workflow` /
+  `improve_workflow_hierarchy` (`tools::workflow_authority`) and the HTTP
+  step / ingest routes, only when the workflow gate admitted the caller through
+  its admin arm. Registered in
+  `schema_contract.rs::migration_112_admin_audit_definer_is_owned_and_granted`
+  and `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Inside internal's
+  `060–112`, like 111. **No undo runbook ships**: undo is `DROP FUNCTION
+  public.epigraph_admin_audit_write(uuid, uuid, uuid, text, jsonb)` with a
+  binary that no longer calls it (such a binary refuses the workflow admin arm
+  with 42883 rather than writing unaudited). Checked before claiming: no
+  `origin/*` ref carries a `112`. **Applied to a throwaway database only, NOT to
+  any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `112` or
+- **113+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `113` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

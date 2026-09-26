@@ -1044,6 +1044,11 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // CLOSED — its UPDATE of the FORCEd `claims` is RLS-filtered and it raises
     // "not found" — so the stake is the admin path silently OFF.
     ("epigraph_admin_patch_claim", 111),
+    // 112, the admin audit row for a write that needs no definer of its own
+    // (batch H-b review, the workflow admin arm). Under a non-bypassing owner it
+    // fails CLOSED: `security_events_append` refuses the row and the admin
+    // write rolls back with it.
+    ("epigraph_admin_audit_write", 112),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

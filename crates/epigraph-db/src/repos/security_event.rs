@@ -150,6 +150,40 @@ impl SecurityEventRepository {
         Ok(live)
     }
 
+    /// Write an admin audit row through migration 112's SECURITY DEFINER
+    /// `epigraph_admin_audit_write`, on the CALLER's transaction, so it commits
+    /// or rolls back with the admin write it records.
+    ///
+    /// For an admin write whose rows need no definer of their own (the workflow
+    /// admin arm: its rows are written on the system stamp). A plain INSERT is
+    /// refused there by `security_events_append`, which admits an attributed
+    /// row only for the SESSION principal (the system agent, not the admin);
+    /// measured on config A. The definer re-checks the token's client record
+    /// with migration 111's predicate (`ADM02`) and records `admin` as the
+    /// event's agent. `event_type` must be one the function lists (`ADM03`).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` carrying the definer's `42501` (`ADM01` /
+    /// `ADM02`) or `22023` (`ADM03`) refusal; nothing is written then.
+    pub async fn admin_audit_write(
+        conn: &mut sqlx::PgConnection,
+        client_id: Uuid,
+        token_jti: Uuid,
+        admin: Uuid,
+        event_type: &str,
+        details: &JsonValue,
+    ) -> Result<(), DbError> {
+        sqlx::query("SELECT public.epigraph_admin_audit_write($1, $2, $3, $4, $5)")
+            .bind(client_id)
+            .bind(token_jti)
+            .bind(admin)
+            .bind(event_type)
+            .bind(details)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
     /// Query security events matching optional filter criteria.
     ///
     /// Results are ordered by `created_at DESC` (most recent first).

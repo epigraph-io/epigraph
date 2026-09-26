@@ -1310,3 +1310,41 @@ async fn migration_111_admin_write_definer_is_owned_and_granted(pool: PgPool) {
         assert_eq!(can, expected, "{role} EXECUTE on the admin definer");
     }
 }
+
+/// Migration 112 (batch H-b review): the workflow admin arm's audit definer,
+/// same template as 111.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_112_admin_audit_definer_is_owned_and_granted(pool: PgPool) {
+    let signature = "public.epigraph_admin_audit_write(uuid, uuid, uuid, text, jsonb)";
+    let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+           FROM pg_proc p \
+           JOIN pg_namespace n ON n.oid = p.pronamespace \
+           JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_admin_audit_write'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, owner, vol, acl) =
+        meta.expect("public.epigraph_admin_audit_write must exist (migration 112)");
+    assert!(secdef, "the admin audit definer must stay SECURITY DEFINER");
+    assert_eq!(
+        owner, "epigraph_maintenance",
+        "the admin audit definer's owner"
+    );
+    assert_eq!(vol, "v", "the admin audit definer writes: VOLATILE");
+    assert!(
+        acl.is_some(),
+        "an explicit ACL, never the default (PUBLIC EXECUTE)"
+    );
+    for (role, expected) in [("public", false), ("epigraph_app", true)] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(role)
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on the admin audit definer");
+    }
+}

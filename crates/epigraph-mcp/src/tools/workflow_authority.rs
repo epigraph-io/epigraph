@@ -185,29 +185,27 @@ pub(crate) async fn audit_admin_workflow_write(
     submitter: Option<uuid::Uuid>,
     details: serde_json::Value,
 ) -> Result<(), McpError> {
-    let (client_id, jti) = auth.map_or((None, None), |a| (Some(a.client_id), Some(a.jti)));
+    let Some(token) = auth else {
+        return Err(internal_error(format!(
+            "{tool_name}: an admin workflow write with no token to audit. Nothing was written."
+        )));
+    };
     let record = serde_json::json!({
         "action": tool_name,
-        "admin_agent_id": caller.agent_id(),
-        "client_id": client_id,
-        "token_jti": jti,
         "workflow_id": workflow_id,
         "submitter": submitter,
         "write": details,
     });
-    epigraph_db::SecurityEventRepository::log_conn(
+    // Migration 112's definer, not an INSERT: this transaction is stamped from
+    // the system agent, and `security_events_append` admits an attributed row
+    // only for the session principal (measured: the INSERT was refused).
+    epigraph_db::SecurityEventRepository::admin_audit_write(
         &mut *conn,
-        &epigraph_db::SecurityEventRow {
-            id: uuid::Uuid::new_v4(),
-            event_type: "workflows.admin_write".to_string(),
-            agent_id: Some(caller.agent_id()),
-            success: Some(true),
-            details: record,
-            ip_address: None,
-            user_agent: None,
-            correlation_id: jti.map(|j| j.to_string()),
-            created_at: chrono::Utc::now(),
-        },
+        token.client_id,
+        token.jti,
+        caller.agent_id(),
+        "workflows.admin_write",
+        &record,
     )
     .await
     .map_err(|e| {
