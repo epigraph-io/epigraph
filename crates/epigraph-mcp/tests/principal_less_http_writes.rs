@@ -321,3 +321,69 @@ async fn an_opt_in_principal_less_write_is_the_unlinked_signers(pool: PgPool) {
         .expect("links");
     assert_eq!(links, 0, "the signer is linked to no human");
 }
+
+/// The payoff of goal 2: a FORMER shared signer's backlog item becomes its
+/// human's to retire over HTTP once the signer is link-retired to the human
+/// through migration 116's attested retire. Before the link the human is
+/// neither author nor operator and is refused; after it the ownership gate's
+/// operator arm admits the human and the resolution is the human's.
+///
+/// Superuser harness: this pins the GATE. On a clean schema (config A) the
+/// label write itself also needs the item's owner group to be writable by the
+/// human, which `epigraph-operator reown-claims` provides; the probe
+/// (`probe-httpid.sh retired`, with `E2E_OPERATOR_BIN`) measures that half.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_human_retires_a_former_signers_item_after_the_attested_link(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (human, human_group) = fixture::seed_agent_with_group(&pool, "httpid-operator").await;
+    let (former_signer, _) = fixture::seed_agent_with_group(&pool, "httpid-old-signer").await;
+    let (other, _) = fixture::seed_agent_with_group(&pool, "httpid-other-principal").await;
+    for principal in [human, other] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+        )
+        .bind(former_signer)
+        .bind(principal)
+        .execute(&pool)
+        .await
+        .expect("auth-lineage edge");
+    }
+    let item: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels) \
+         VALUES (gen_random_uuid(), 'HTTP-id: an item the old signer wrote', \
+                 decode(md5(random()::text) || md5(random()::text), 'hex'), 0.6, $1, \
+                 ARRAY['backlog']) RETURNING id",
+    )
+    .bind(former_signer)
+    .fetch_one(&pool)
+    .await
+    .expect("the former signer's item");
+    let viewer = Viewer::resolve(&pool, human).await.expect("viewer");
+    let token = human_token(human);
+
+    tools::claims::resolve_backlog_item(&server, &viewer, resolve(item, "not yet"), Some(&token))
+        .await
+        .expect_err("before the link the human neither wrote it nor operates its author");
+    assert!(!has_label(&pool, item, "resolved").await);
+
+    let linked: bool = sqlx::query_scalar(
+        "SELECT link_retired FROM public.epigraph_link_retired_shared_signer($1, $2, $3)",
+    )
+    .bind(former_signer)
+    .bind(human)
+    .bind(vec![other])
+    .fetch_one(&pool)
+    .await
+    .expect("the attested retire");
+    assert!(linked);
+
+    tools::claims::resolve_backlog_item(&server, &viewer, resolve(item, "mine"), Some(&token))
+        .await
+        .expect("after the link the human is the author's operator");
+    assert!(has_label(&pool, item, "resolved").await);
+    assert_eq!(
+        resolutions_of(&pool, item).await,
+        vec![(human, human_group)]
+    );
+}

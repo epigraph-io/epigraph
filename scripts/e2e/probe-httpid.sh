@@ -43,6 +43,12 @@
 #                  Defaults to E2E_SU_DSN.
 #   E2E_AGENT_KEY  32-byte hex seed for the listener's signer (public throwaway
 #                  default). The `retired` arm derives two more per run.
+#   E2E_OPERATOR_BIN  an `epigraph-operator` binary. When set, the `retired`
+#                  arm records the attested link through its `link-retired
+#                  --attest-shared-signer` (dry run, then --apply) instead of
+#                  raw SQL, and, where the items are still open afterwards
+#                  (config A), re-owns them with `reown-claims` and retires
+#                  them again: the runbook's sequence, on the real binaries.
 : "${E2E_SU_DSN:?set E2E_SU_DSN (superuser DSN for the throwaway e2e database)}"
 : "${E2E_APP_DSN:?set E2E_APP_DSN (least-privilege app DSN; rolbypassrls MUST be false)}"
 E2E_MAINT_DSN="${E2E_MAINT_DSN:-$E2E_SU_DSN}"
@@ -307,7 +313,21 @@ if want retired; then
     echo "   $(qm "SELECT link_created, link_retired, membership_live FROM public.epigraph_link_retired_shared_signer('$OLD','$HU',ARRAY['$HU']::uuid[])" | head -1 | cut -c1-200)"
     echo "   links: $(q "SELECT count(*) FROM operator_links WHERE agent_id='$OLD'")"
     echo "--- 116 attested variant, attesting the service principal (expect: linked, retired, no membership, one audit row)"
-    echo "   $(qm "SELECT link_created, link_retired, membership_live FROM public.epigraph_link_retired_shared_signer('$OLD','$HU',ARRAY['$SV']::uuid[])" | head -1 | cut -c1-200)"
+    if [ -n "${E2E_OPERATOR_BIN:-}" ]; then
+      # The real operator CLI on the maintenance DSN: a dry run, then --apply.
+      printf '%s\n' "$OLD" > "$E2E/hid.agents.$LABEL"
+      EPIGRAPH_OPERATOR_MAINTENANCE_DSN="$E2E_MAINT_DSN" "$E2E_OPERATOR_BIN" link-retired \
+        --agents-file "$E2E/hid.agents.$LABEL" --operator "$HU" --attest-shared-signer "$SV" 2>/dev/null \
+        | sed 's/^/   CLI dry run: /' | cut -c1-160
+      echo "   links after the dry run: $(q "SELECT count(*) FROM operator_links WHERE agent_id='$OLD'")"
+      EPIGRAPH_OPERATOR_MAINTENANCE_DSN="$E2E_MAINT_DSN" "$E2E_OPERATOR_BIN" link-retired \
+        --agents-file "$E2E/hid.agents.$LABEL" --operator "$HU" --attest-shared-signer "$SV" --apply 2>/dev/null \
+        | sed 's/^/   CLI apply: /' | cut -c1-160
+      echo "   CLI exit=${PIPESTATUS[0]}"
+      rm -f "$E2E/hid.agents.$LABEL"
+    else
+      echo "   $(qm "SELECT link_created, link_retired, membership_live FROM public.epigraph_link_retired_shared_signer('$OLD','$HU',ARRAY['$SV']::uuid[])" | head -1 | cut -c1-200)"
+    fi
     echo "   links: $(q "SELECT string_agg(CASE operator_id WHEN '$HU' THEN 'HUMAN' ELSE operator_id::text END||' retired='||retired, ',') FROM operator_links WHERE agent_id='$OLD'") memberships in human group=$(q "SELECT count(*) FROM group_memberships m JOIN groups g ON g.id=m.group_id WHERE m.agent_id='$OLD' AND g.did_key='did:epigraph:personal:$HU' AND m.revoked_at IS NULL") audit=$(q "SELECT count(*) FROM security_events WHERE event_type='operator.shared_signer_retired' AND agent_id='$OLD'")"
   else
     echo "   (migration 116 absent: no attested variant on this database)"
@@ -323,6 +343,32 @@ if want retired; then
   RES=$(field "$R" resolution_claim_id)
   echo "   resolve_backlog_item, owned by the former signer's group: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$I3' AND 'resolved'=ANY(labels)") resolution author=$(name "$(q "SELECT agent_id FROM claims WHERE id='${RES:-00000000-0000-0000-0000-000000000000}'")")"
   stop_server
+  OPEN=$(q "SELECT count(*) FROM claims WHERE id IN ('$I1','$I2','$I3') AND NOT ('resolved'=ANY(labels))")
+  if [ "$OPEN" != "0" ] && [ -n "${E2E_OPERATOR_BIN:-}" ] && [ "$(q "SELECT count(*) FROM operator_links WHERE agent_id='$OLD'")" != "0" ]; then
+    # On a clean schema the operator's stamp cannot write a row owned by the
+    # former signer's group or by the world group. The runbook's answer is to
+    # re-own the items into the operator's group first (epigraph-operator
+    # reown-claims, which accepts claims whose author has a retired link).
+    echo "--- $OPEN still open: re-own them into the human's group (reown-claims --derived follow-claim), then retire over HTTP again"
+    printf '%s\n%s\n%s\n' "$I1" "$I2" "$I3" > "$E2E/hid.claims.$LABEL"
+    rm -f "$E2E/hid.manifest.$LABEL.jsonl"
+    # reown-claims must SET SESSION AUTHORIZATION epigraph_app for its
+    # readability invariant, which only a superuser login may: the SU DSN.
+    EPIGRAPH_OPERATOR_MAINTENANCE_DSN="$E2E_SU_DSN" "$E2E_OPERATOR_BIN" reown-claims \
+      --claims-file "$E2E/hid.claims.$LABEL" --operator "$HU" --derived follow-claim \
+      --manifest-out "$E2E/hid.manifest.$LABEL.jsonl" --apply 2>&1 | tail -4 | sed 's/^/   reown: /' | cut -c1-160
+    echo "   owners now: $(q "SELECT string_agg(CASE owner_group_id WHEN '$HG' THEN 'HUMAN-GROUP' ELSE owner_group_id::text END, ',') FROM claims WHERE id IN ('$I1','$I2','$I3')")"
+    start_server auth "$NEW_KEY" || { echo "FAIL: new-key listener"; tail -20 "$LOG"; exit 1; }
+    R=$(tool update_labels "{\"claim_id\":\"$I1\",\"add\":[\"resolved\"]}")
+    echo "   update_labels +resolved (was the former signer's group): $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$I1' AND 'resolved'=ANY(labels)")"
+    R=$(tool update_labels "{\"claim_id\":\"$I2\",\"add\":[\"resolved\"]}")
+    echo "   update_labels +resolved (was world-owned): $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$I2' AND 'resolved'=ANY(labels)")"
+    R=$(tool resolve_backlog_item "{\"original_id\":\"$I3\",\"resolution_content\":\"httpid former-signer item resolved after reown $LABEL\"}")
+    RES=$(field "$R" resolution_claim_id)
+    echo "   resolve_backlog_item (was the former signer's group): $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$I3' AND 'resolved'=ANY(labels)") resolution author=$(name "$(q "SELECT agent_id FROM claims WHERE id='${RES:-00000000-0000-0000-0000-000000000000}'")")"
+    stop_server
+    rm -f "$E2E/hid.claims.$LABEL" "$E2E/hid.manifest.$LABEL.jsonl"
+  fi
   BEARER=""
 fi
 
