@@ -48,7 +48,12 @@ struct Cli {
     database_url: String,
 
     /// Ed25519 secret key (64 hex chars). If omitted, generates a new keypair.
-    #[arg(long)]
+    ///
+    /// Also read from `EPIGRAPH_MCP_AGENT_KEY` (batch HTTP-id), so a service
+    /// can keep the key in a 0600 environment file instead of its command
+    /// line, which any local user can read (`ps`, `systemctl show`). The value
+    /// is never printed by `--help`.
+    #[arg(long, env = "EPIGRAPH_MCP_AGENT_KEY", hide_env_values = true)]
     agent_key: Option<String>,
 
     /// OpenAI API key for embedding generation. If omitted, uses mock embeddings.
