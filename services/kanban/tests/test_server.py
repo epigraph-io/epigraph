@@ -1545,6 +1545,39 @@ class SessionSecretTest(unittest.TestCase):
 
 
 class RecoverTest(unittest.TestCase):
+    def test_a_reattached_agent_is_warned_about_once_at_startup_while_unpaired(self):
+        # README, Safety notes: a still-running agent is reattached (not restarted), and the board logs ONE warning
+        # at startup while the pairing link is unredeemed; a queued card gets its own "waits for pairing" line.
+        tmp = tempfile.mkdtemp(prefix="kanban-reattach-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        home = os.path.join(tmp, "home")
+        os.makedirs(home)
+        running = dict(kanban.new_card({"id": CLAIM_C, "content": "x"}), column="develop", status="running",
+                       pid=4242, session_id="s-1", log_path=os.path.join(tmp, "x.jsonl"), run_n=1)
+        queued = dict(kanban.new_card({"id": CLAIM_A, "content": "y"}), column="develop", status="queued",
+                      pending={"kind": "develop", "text": ""})
+        with open(os.path.join(home, "state.json"), "w") as fh:
+            json.dump({"cards": {CLAIM_C: running, CLAIM_A: queued}}, fh)
+        app = kanban.App(kanban.Config(repo=tmp, port=0, env={"KANBAN_HOME": home, "KANBAN_GH_BIN": "/nonexistent"}))
+        lines = []
+        with mock.patch.object(kanban, "is_our_agent", return_value=True), \
+                mock.patch.object(kanban.App, "_monitor", lambda *a: None), \
+                mock.patch.object(kanban, "log", lines.append):
+            app.recover()
+        self.assertEqual(app.store.cards[CLAIM_C]["status"], "running")  # reattached, not restarted
+        warnings = [l for l in lines if l.startswith("WARNING:") and "pairing link" in l]
+        self.assertEqual(len(warnings), 1, lines)
+        self.assertIn("1 agent(s)", warnings[0])
+        self.assertTrue([l for l in lines if "queued card(s) will start only after the pairing link" in l], lines)
+        # once paired, a restart logs no such warning
+        lines.clear()
+        app.pair_code = None
+        with mock.patch.object(kanban, "is_our_agent", return_value=True), \
+                mock.patch.object(kanban.App, "_monitor", lambda *a: None), \
+                mock.patch.object(kanban, "log", lines.append):
+            app.recover()
+        self.assertFalse([l for l in lines if "pairing link" in l], lines)
+
     def test_recover_ignores_recycled_pid_and_resets_merging_integration(self):
         tmp = tempfile.mkdtemp(prefix="kanban-recover-")
         try:
