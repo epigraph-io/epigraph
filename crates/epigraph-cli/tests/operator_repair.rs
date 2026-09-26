@@ -1,5 +1,6 @@
-//! `epigraph-operator reown-seed` (backlog 0512ca33), driven through the real
-//! binary against a `#[sqlx::test]` database migrated 001 → head.
+//! `epigraph-operator reown-seed` (backlog 0512ca33) and `strip-label` /
+//! `strip-label-reverse` (backlog f6310444), driven through the real binary
+//! against a `#[sqlx::test]` database migrated 001 → head.
 //!
 //! # The reown-seed fixture
 //!
@@ -30,6 +31,7 @@ use viewer_fixture as fixture;
 const BIN: &str = env!("CARGO_BIN_EXE_epigraph-operator");
 const DSN_ENV: &str = "EPIGRAPH_OPERATOR_MAINTENANCE_DSN";
 const SEED: Uuid = Uuid::from_u128(0xdead);
+const BAD_LABEL: &str = "group:$EPICLAW_GROUP_ID";
 
 struct Run {
     code: i32,
@@ -423,5 +425,196 @@ async fn reown_seed_holds_a_listed_claim_the_seed_group_does_not_own(pool: PgPoo
         public(SEED),
         "an unlisted claim is not touched when a list is given"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// strip-label
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn labels_of(pool: &PgPool, id: Uuid) -> Vec<String> {
+    sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+fn owned(xs: &[&str]) -> Vec<String> {
+    xs.iter().map(|s| (*s).to_string()).collect()
+}
+
+struct LabelFx {
+    both: Uuid,
+    once: Uuid,
+    clean: Uuid,
+}
+
+async fn label_fixture(pool: &PgPool) -> LabelFx {
+    let (agent, group) = fixture::seed_agent_with_group(pool, "labels").await;
+    // Out of alphabetical order and with the bad value twice, so a sort or a
+    // de-duplication of the array (what update_labels does) is visible.
+    let both = claim_owned(
+        pool,
+        agent,
+        group,
+        &["zeta", BAD_LABEL, "alpha", BAD_LABEL, "mu"],
+    )
+    .await;
+    let once = claim_owned(pool, agent, group, &[BAD_LABEL, "b", "b"]).await;
+    let clean = claim_owned(pool, agent, group, &["zeta", "alpha"]).await;
+    LabelFx { both, once, clean }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn strip_label_dry_run_writes_nothing(pool: PgPool) {
+    let fx = label_fixture(&pool).await;
+    let dir = scratch_dir();
+    let mf = dir.join("strip.jsonl");
+    let before = snapshot(&pool, false).await;
+    let r = run_op(
+        &pool,
+        &["strip-label", "--manifest-out", mf.to_str().unwrap()],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains("PLAN: 2 claim(s) carry it"),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains(&fx.both.to_string()), "{}", r.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, false).await,
+        "a strip-label dry run",
+    );
+    assert!(!mf.exists(), "a dry run writes no manifest");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn strip_label_removes_only_that_value_and_reverses_exactly(pool: PgPool) {
+    let fx = label_fixture(&pool).await;
+    let dir = scratch_dir();
+    let mf = dir.join("strip.jsonl");
+    let before = snapshot(&pool, true).await;
+
+    let r = run_op(
+        &pool,
+        &[
+            "strip-label",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(
+        labels_of(&pool, fx.both).await,
+        owned(&["zeta", "alpha", "mu"]),
+        "every occurrence goes, every other label keeps its place (no sort, no de-dup)"
+    );
+    assert_eq!(labels_of(&pool, fx.once).await, owned(&["b", "b"]));
+    assert_eq!(labels_of(&pool, fx.clean).await, owned(&["zeta", "alpha"]));
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE $1 = ANY(labels)")
+        .bind(BAD_LABEL)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+
+    let rr = run_op(
+        &pool,
+        &[
+            "strip-label-reverse",
+            "--manifest",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(rr.code, 0, "{}", rr.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "strip-label then strip-label-reverse",
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn strip_label_reverse_holds_a_claim_changed_since(pool: PgPool) {
+    let fx = label_fixture(&pool).await;
+    let dir = scratch_dir();
+    let mf = dir.join("strip.jsonl");
+    let r = run_op(
+        &pool,
+        &[
+            "strip-label",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    sqlx::query("UPDATE claims SET labels = array_append(labels, 'later') WHERE id = $1")
+        .bind(fx.once)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rr = run_op(
+        &pool,
+        &[
+            "strip-label-reverse",
+            "--manifest",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(
+        rr.code,
+        3,
+        "a held claim makes the exit code 3\n{}",
+        rr.show()
+    );
+    assert!(
+        rr.stdout.contains(&format!("HELD\t{}", fx.once)),
+        "{}",
+        rr.show()
+    );
+    assert_eq!(labels_of(&pool, fx.once).await, owned(&["b", "b", "later"]));
+    assert_eq!(
+        labels_of(&pool, fx.both).await,
+        owned(&["zeta", BAD_LABEL, "alpha", BAD_LABEL, "mu"]),
+        "the untouched claim is still restored"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn strip_label_refuses_a_label_the_write_path_accepts(pool: PgPool) {
+    let fx = label_fixture(&pool).await;
+    let dir = scratch_dir();
+    let mf = dir.join("strip.jsonl");
+    let r = run_op(
+        &pool,
+        &[
+            "strip-label",
+            "--label",
+            "zeta",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(r.stderr.contains("refusing"), "{}", r.show());
+    assert_eq!(labels_of(&pool, fx.clean).await, owned(&["zeta", "alpha"]));
+    assert!(!mf.exists());
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -158,7 +158,7 @@ pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow, RotateOutcome};
 pub use group_membership::{GroupMembershipRepository, MembershipRow, RevokeOutcome};
 pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};
-pub use operator_repair::OperatorRepairRepository;
+pub use operator_repair::{LabelledClaim, OperatorRepairRepository};
 pub use pattern_template::{PatternTemplateRepository, PatternTemplateRow};
 pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORIZER_ID};
 pub use refresh_token::{RefreshTokenRepository, RefreshTokenRow};

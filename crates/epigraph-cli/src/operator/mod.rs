@@ -1,7 +1,7 @@
 //! `epigraph-operator`: the reviewed, in-repo tool for the one-time operator
 //! ownership backfill that migration 107 left out of scope.
 //!
-//! Five subcommands, each dry-run by default:
+//! Seven subcommands, each dry-run by default:
 //!
 //! * `link-retired` — call `epigraph_link_retired_agent` for a list of
 //!   historical agent identities, so the operator OWNS their claims while the
@@ -21,6 +21,9 @@
 //!   the memberless seed group (backlog 0512ca33) to the owner their author's
 //!   declaration gives them, one re-own manifest per target group; reversed
 //!   by `reown-reverse` (`seed`'s module doc).
+//! * `strip-label` / `strip-label-reverse` — remove one label value the write
+//!   path's validator rejects (backlog f6310444) from every claim carrying it,
+//!   exactly, under a manifest, and put it back (`labels`' module doc).
 //!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
@@ -51,6 +54,7 @@
 //! conditioned on row security being active): it is unconditional.
 
 pub mod hide;
+pub mod labels;
 pub mod link;
 pub mod manifest;
 pub mod reown;
