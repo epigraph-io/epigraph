@@ -27,6 +27,8 @@ environment, and every script refuses with a usage message when either is unset.
 | `E2E_APP_DSN` | yes | The least-privilege DSN the server connects as. **`rolbypassrls` MUST be `false`** or every arm is vacuous. |
 | `OPENAI_API_KEY` | for the D1 arm | `probe-embed.sh` **refuses to run without it**: with no key the embedder fails *before touching the database*, so `embedding IS NOT NULL` would measure the absence of a key rather than the presence of a write. The other scripts treat the embedder as best-effort. |
 | `E2E_AGENT_KEY` | no | 32-byte hex Ed25519 seed for the server's own agent. Defaults to a deliberately public throwaway seed. |
+| `E2E_UNAUTH_WRITES` | no | Batch HTTP-id made an `--allow-unauthenticated-http` listener read-only for its callers. Every script that writes through that listener passes `${E2E_UNAUTH_WRITES---allow-unauthenticated-writes}`, the opt-in. Set it EMPTY to run a binary that predates the flag (clap rejects an unknown argument). |
+| `E2E_OPERATOR_BIN` | for `probe-httpid.sh retired`'s CLI half | An `epigraph-operator` binary. Without it that arm records the link with raw SQL and skips the re-own step. |
 
 > **`E2E_AGENT_KEY` is a parameter for a reason.** An earlier revision of these
 > scripts inlined a `--agent-key` value that is the **live production**
@@ -85,6 +87,7 @@ precisely why production admits writes a clean schema refuses.
 | `probe-batch-h.sh <binary> <label> <a\|b> [arm ...]` | The arms that need **group-private** rows, which no other script seeds: `patch_claim`, the five edge tools, `resolve_backlog_item` (public and private basis, plus an injected mid-call refusal), `submit_claim`'s DS wiring (plus an injected BBA refusal), `supersede_claim`, `theme_cluster` (all-or-nothing, with a pre-existing theme), and the three maintenance tools under four server configurations (`MAINTENANCE_DATABASE_URL` unset, set to the app login, set to `E2E_MAINT_DSN`, and unset with a bypass-capable APPLICATION DSN), plus `maint_auth`: the same tools over authenticated HTTP (`--jwt-secret`, secret random per run) with a `claims:write` and a `claims:admin` bearer; `caller_auth` (batch H-b): a caller that is not the server's signer authors, owns and signs its own claims, writes its own and is refused a foreign one, and a `claims:admin` bearer with a live client grant writes a foreign one through the AUDITED ADMIN PATH (audit row, admin as principal) while one without the grant is refused; `op_http`: the operator's bearer on its linked agent's claims; and the review revision's `review_http` (the H3 lineage takeover, the workflow admin arm with and without a client grant, a teammate's `update_labels`, a forged perspective owner / event actor, a stranger's `patch_edge`, `set_source_reliability` over nothing), `unauth_listener` (the production socket's injected `claims:admin` context on foreign rows) and `cascade` (a supersede whose downstream includes a claim the caller cannot write). Every case runs on an OWN-group row, which a correctly stamped write must land, and a FOREIGN-group row, which must fail loudly and write nothing on config A. Needs `jq`. |
 | `probe-http-labels.sh <server binary> <label> <a\|b>` | **HTTP**: `PATCH /api/v1/claims/:id/labels` on the real `epigraph-api` `server` binary, connected as `E2E_APP_DSN`, with HS256 tokens minted per run under a random secret. Callers OWNER / ADMIN (`claims:admin`) / PEER / RADMIN (`claims:admin`, a READER of the team group) / NOGRANT (`claims:admin` in the token, no client grant) against own-public, own-private, another agent's public, foreign-private, world-owned and team rows. Prints the status, whether the label is on the row and the claim's `claims.admin_write` audit count, read back through the SU DSN. Also `PATCH /api/v1/claims/:id` (labels + properties) for owner / admin / no-grant admin / peer, with the audit count and the recorded principal. ADMIN and RADMIN carry an `oauth_clients` grant, which the audited admin path re-checks. Needs `python3`. |
 | `probe-http-writes.sh <server binary> <label> <a\|b> [arm ...]` | **HTTP**: the claim writers batch H-a stamped — `supersede`, `DELETE /workflows/:id` and `/workflows/:id/outcome` on legacy flat workflow claims, `bp/propagate` with `apply_updates`, `themes/create-with-centroid` — for an owner, an admin and a peer, printing the status AND the rows read back (is_current, truth, counters, executions, BetP, themes). Needs `python3`. |
+| `probe-httpid.sh <binary> <label> <a\|b> [arm ...]` | Batch HTTP-id: WHO an HTTP MCP write is authored as. `oauth`: a HUMAN principal (client_type `human`, the consent flow's shape) on an authenticated listener writes `submit_claim` / `memorize` / `update_with_evidence` and retires its own backlog item. `unauth`: the principal-less listener's writes, a `claims:admin` tool, a read and an attempt on the human's item, by default and (when the binary has it) with `--allow-unauthenticated-writes`. `retired`: a FORMER shared signer (two principals through one key) link-retired to the human: 107's retire, 116's attested retire (through `epigraph-operator link-retired --attest-shared-signer` when `E2E_OPERATOR_BIN` is set), then the human retiring the signer's items over HTTP on a fresh key, re-owning them first where the schema requires it. `startup`: both listener kinds on a link-retired key. The bearer is hand-minted with `/oauth/token`'s claim shape; the mint path is not exercised. |
 | `probe-operator.sh <binary> <label> <a\|b>` | OP-AUTHOR (batch H-b): an agent linked on the SU DSN and restarted on the APP DSN authors a stdio `submit_claim` owned by its operator's group, DS-wired and embedded. Every model carries a per-run nonce (agents and links survive TRUNCATE). And the stdio operator self-link's two REFUSALS through the real binary (migrations 105 + 107): `--operator-id` on the least-privilege DSN must exit non-zero with the EXECUTE-grant text and write no link or membership (OP-APP); an operator whose own personal-group row is only revoked must refuse with `RVK01` and stay revoked (OP-RVK01); a live operator on the same DSN must link (OP-LIVE, the calibration). The transport refusal, the HTTP listener's linked-signer refusal and the no-revival restart are `operator_startup_gate_test.rs`'s. OP-RVK01 and OP-LIVE run the server on `E2E_SU_DSN`, because the link function is EXECUTE-able by a maintenance or superuser login only. |
 | `embed-verdict.sh` | How many committed claims carry a vector. |
 | `drive.sh <binary> <label> <a\|b>` | `set-config` + `run-e2e` + the embedding verdict, in one call. |
@@ -406,6 +409,51 @@ item additive or a fix (measured by the review, TIP vs BASE, unless noted):
 4. **Migrations 111 and 112** must be applied, and their definers owned by
    `epigraph_maintenance` (`tenancy_backfill verify` checks both); without them
    the admin paths refuse with 42883, writing nothing.
+
+## Measured: batch HTTP-id (caller identity) at its tip
+
+`probe-httpid.sh`, all four arms. `BASE` is batch H-b's tip (`1a08ad89`),
+`TIP` this branch; the same fresh `*_test` database on the test cluster
+(001 -> 112 for BASE, -> 116 for TIP), the server on a login in
+`epigraph_app`, the link functions on a login in `epigraph_maintenance`,
+`reown-claims` on the SU DSN (it must switch `session_user`). A and B gave the
+same verdicts except where a row says otherwise.
+
+| case | BASE | TIP |
+|---|---|---|
+| human OAuth principal: `submit_claim` / `memorize` | author HUMAN, owner HUMAN-GROUP, signer = the listener | same |
+| human: `update_with_evidence` | evidence owned by HUMAN-GROUP, mass source HUMAN | same |
+| human retires its own backlog item | OK, resolution authored by HUMAN | same |
+| principal-less listener: the three writes | **OK, authored by the listener's SIGNER, in its group (0 -> 2)** | Forbidden at the scope gate (named cause), 0 rows |
+| principal-less: a `claims:admin` tool (`sweep_semantic_duplicates`) | reached the tool | Forbidden at the scope gate |
+| principal-less: a read (`query_claims`) | OK | OK |
+| principal-less: retire the human's item | ERR (`ADM02`), nothing written | Forbidden, nothing written |
+| `--allow-unauthenticated-writes`: the three writes / the human's item | n/a | authored by the unlinked SIGNER / ERR `ADM02`, nothing written |
+| former shared signer (lineage to 2 principals): 107's retire | refused (55000, shared-signer fingerprint) | same |
+| 116 attesting only the human | n/a | refused, names the unattested principal, 0 links |
+| 116 via `link-retired --attest-shared-signer`: dry run / `--apply` | n/a | LINKED-RETIRED, 0 links / retired link, 0 memberships, 1 audit row, exit 0 |
+| human retires the former signer's items (its group, world-owned, `resolve_backlog_item`) after the link | n/a | B: OK x3, resolution by HUMAN. A: **42501 x3** (the human cannot write those owner groups) |
+| same on A after `reown-claims --derived follow-claim` of the 3 items | n/a | 3 moved, invariants held; OK x3, resolution by HUMAN |
+| a listener on a link-retired key (both kinds) | refuses to start | same |
+
+`probe-batch-h.sh patch_claim resolve caller_auth op_http unauth_listener` at
+TIP on A, with the scripts' new opt-in: every verdict as in the batch H-b
+tables above.
+
+### What moved, stated
+
+* **The `--allow-unauthenticated-http` listener is read-only for its callers
+  by default.** Every write that listener used to author as its signer is now
+  refused before dispatch. Anything that writes through such a listener must
+  move to an authenticated listener (its writes are then its own), or the
+  listener must pass `--allow-unauthenticated-writes` and accept an author
+  that belongs to no human. Identify what writes through it BEFORE deploying.
+* **`EPIGRAPH_MCP_AGENT_KEY`** now supplies `--agent-key`, so a listener's key
+  can live in a 0600 environment file instead of its command line.
+* **A former shared signer can be link-retired** (migration 116), on a
+  maintenance login, with the other principals it carried attested. On a
+  clean schema its items then still need `reown-claims` before their human can
+  retire them over HTTP; on today's configuration B they do not.
 
 ## R3 checklist: what still blocks dropping the orphan policies
 
