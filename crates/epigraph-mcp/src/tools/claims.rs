@@ -2118,72 +2118,74 @@ pub async fn query_undecomposed_claims(
 }
 
 #[cfg(test)]
-mod dedup_block_tests {
-    //! The novelty-gate arm of `dedup_block` cannot be reached through
-    //! `EpiGraphMcpFull` in a test process (its embedder hard-codes OpenAI; see
-    //! `tests/novelty_gate_test.rs`), so its list is pinned here. The
-    //! content-hash arm is additionally measured end-to-end in
-    //! `tests/dedup_response_signal.rs`.
-    use super::dedup_block;
-    use crate::types::{DedupBy, SubmitClaimParams};
+mod tests {
+    // Nested in `tests` because `tests/no_inline_sql_in_tools.rs` requires the first
+    // `#[cfg(test)]` in a tools file to introduce `mod tests` and be the last item.
+    mod dedup_block_tests {
+        //! The novelty-gate arm of `dedup_block` cannot be reached through
+        //! `EpiGraphMcpFull` in a test process (its embedder hard-codes OpenAI; see
+        //! `tests/novelty_gate_test.rs`), so its list is pinned here. The
+        //! content-hash arm is additionally measured end-to-end in
+        //! `tests/dedup_response_signal.rs`.
+        use super::super::dedup_block;
+        use crate::types::{DedupBy, SubmitClaimParams};
 
-    fn params() -> SubmitClaimParams {
-        SubmitClaimParams {
-            content: "c".into(),
-            methodology: "direct_observation".into(),
-            evidence_data: "e".into(),
-            evidence_type: "logical".into(),
-            confidence: 0.5,
-            source_url: Some("u".into()),
-            reasoning: Some("r".into()),
-            labels: vec!["l".into()],
-            novelty_threshold: Some(0.1),
+        fn params() -> SubmitClaimParams {
+            SubmitClaimParams {
+                content: "c".into(),
+                methodology: "direct_observation".into(),
+                evidence_data: "e".into(),
+                evidence_type: "logical".into(),
+                confidence: 0.5,
+                source_url: Some("u".into()),
+                reasoning: Some("r".into()),
+                labels: vec!["l".into()],
+                novelty_threshold: Some(0.1),
+            }
         }
-    }
 
-    #[test]
-    fn a_novelty_gate_hit_discards_every_supplied_input() {
-        let d = dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &params());
-        assert!(d.inputs_applied.is_empty(), "{d:?}");
-        for want in [
-            "content",
-            "methodology",
-            "evidence_data",
-            "evidence_type",
-            "confidence",
-            "source_url",
-            "reasoning",
-            "labels",
-        ] {
-            assert!(d.inputs_discarded.contains(&want), "{want}: {d:?}");
+        #[test]
+        fn a_novelty_gate_hit_discards_every_supplied_input() {
+            let d = dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &params());
+            assert!(d.inputs_applied.is_empty(), "{d:?}");
+            for want in [
+                "content",
+                "methodology",
+                "evidence_data",
+                "evidence_type",
+                "confidence",
+                "source_url",
+                "reasoning",
+                "labels",
+            ] {
+                assert!(d.inputs_discarded.contains(&want), "{want}: {d:?}");
+            }
+            assert!(
+                !d.inputs_discarded.contains(&"novelty_threshold"),
+                "the threshold decided the hit; it was not discarded: {d:?}"
+            );
         }
-        assert!(
-            !d.inputs_discarded.contains(&"novelty_threshold"),
-            "the threshold decided the hit; it was not discarded: {d:?}"
-        );
-    }
 
-    #[test]
-    fn unsupplied_inputs_are_listed_nowhere() {
-        let mut p = params();
-        p.source_url = None;
-        p.reasoning = None;
-        p.labels.clear();
-        p.novelty_threshold = None;
-        for by in [DedupBy::NoveltyGate, DedupBy::ContentHash] {
-            let d = dedup_block(by, uuid::Uuid::nil(), &p);
-            for absent in ["source_url", "reasoning", "labels", "novelty_threshold"] {
-                assert!(
-                    !d.inputs_applied.contains(&absent) && !d.inputs_discarded.contains(&absent),
-                    "{absent} listed for {by:?}: {d:?}"
-                );
+        #[test]
+        fn unsupplied_inputs_are_listed_nowhere() {
+            let mut p = params();
+            p.source_url = None;
+            p.reasoning = None;
+            p.labels.clear();
+            p.novelty_threshold = None;
+            for by in [DedupBy::NoveltyGate, DedupBy::ContentHash] {
+                let d = dedup_block(by, uuid::Uuid::nil(), &p);
+                for absent in ["source_url", "reasoning", "labels", "novelty_threshold"] {
+                    assert!(
+                        !d.inputs_applied.contains(&absent)
+                            && !d.inputs_discarded.contains(&absent),
+                        "{absent} listed for {by:?}: {d:?}"
+                    );
+                }
             }
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
     use super::parse_methodology;
     use epigraph_core::Methodology;
     use epigraph_engine::calibration::CalibrationConfig;
