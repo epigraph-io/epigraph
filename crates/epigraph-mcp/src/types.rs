@@ -1254,7 +1254,10 @@ pub enum DedupBy {
 /// `tools::claims::dedup_block` and `tools::memory::memorize_dedup_block` decide
 /// them. Only inputs the caller actually supplied are listed (an absent
 /// `source_url`, `reasoning` or `novelty_threshold`, or empty `labels`/`tags`,
-/// appear in neither list).
+/// appear in neither list). On `batch_submit_claims`, an entry's omitted
+/// `methodology` or `confidence` is filled from the batch defaults and is
+/// likewise in neither list (`tools::batch::SuppliedByEntry`), although the
+/// content-hash path still records the default on the trace it writes.
 ///
 /// On EVERY dedup hit the existing claim's belief and truth_value are left
 /// unchanged: this call's confidence and evidence are never combined into the

@@ -259,3 +259,60 @@ async fn batch_submit_claims_reports_dedup_per_entry(pool: PgPool) {
         "{json}"
     );
 }
+
+/// G11/G15 review: a batch entry that OMITS methodology and confidence gets the
+/// batch defaults, and `Deduplicated` lists only inputs the caller supplied, so
+/// neither may appear in either list. The same entry with both supplied must
+/// list both as applied (the content-hash path writes a reasoning trace
+/// carrying them).
+#[sqlx::test(migrations = "../../migrations")]
+async fn batch_dedup_lists_only_inputs_the_entry_supplied(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let omitted = "g11 review: defaults are not inputs (omitted)";
+    let supplied = "g11 review: defaults are not inputs (supplied)";
+
+    let params: epigraph_mcp::types::BatchSubmitClaimsParams =
+        serde_json::from_value(serde_json::json!({
+            "claims": [
+                {"content": omitted, "evidence_data": "one", "evidence_type": "logical"},
+                {"content": omitted, "evidence_data": "two", "evidence_type": "logical",
+                 "labels": ["g11-review"]},
+                {"content": supplied, "evidence_data": "one", "evidence_type": "logical",
+                 "methodology": "deductive_logic", "confidence": 0.7},
+                {"content": supplied, "evidence_data": "two", "evidence_type": "logical",
+                 "methodology": "deductive_logic", "confidence": 0.7},
+            ]
+        }))
+        .unwrap();
+    let json = first_text(
+        &epigraph_mcp::tools::batch::batch_submit_claims(&server, &viewer, params)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(json["submitted"], 4, "{json}");
+
+    let omitted_block = &json["results"][1]["deduplicated"];
+    assert_eq!(omitted_block["by"], "content_hash", "{json}");
+    assert_eq!(
+        strs(&omitted_block["inputs_applied"]),
+        vec!["evidence_data", "evidence_type", "labels"],
+        "a defaulted methodology/confidence is not a supplied input: {json}"
+    );
+    assert!(
+        strs(&omitted_block["inputs_discarded"]).is_empty(),
+        "{json}"
+    );
+
+    let supplied_block = &json["results"][3]["deduplicated"];
+    assert_eq!(
+        strs(&supplied_block["inputs_applied"]),
+        vec![
+            "methodology",
+            "evidence_data",
+            "evidence_type",
+            "confidence"
+        ],
+        "{json}"
+    );
+}

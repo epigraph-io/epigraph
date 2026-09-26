@@ -39,11 +39,21 @@ pub async fn batch_submit_claims(
     let mut results = Vec::with_capacity(params.claims.len());
 
     for (i, entry) in params.claims.into_iter().enumerate() {
+        // Read BEFORE the conversion fills the batch defaults: once converted,
+        // a defaulted methodology or confidence is indistinguishable from a
+        // supplied one.
+        let supplied = SuppliedByEntry {
+            methodology: entry.methodology.is_some(),
+            confidence: entry.confidence.is_some(),
+        };
         let claim_params = SubmitClaimParams::from(entry);
 
         match crate::tools::claims::submit_claim_response(server, viewer, claim_params).await {
-            Ok(response) => {
+            Ok(mut response) => {
                 submitted += 1;
+                if let Some(d) = response.deduplicated.as_mut() {
+                    supplied.unlist_defaulted_inputs(d);
+                }
                 let mut row = serde_json::to_value(&response).map_err(internal_error)?;
                 if let Some(obj) = row.as_object_mut() {
                     obj.insert("index".into(), serde_json::json!(i));
@@ -74,6 +84,36 @@ pub async fn batch_submit_claims(
         })
         .to_string(),
     )]))
+}
+
+/// Which of the inputs that `From<BatchClaimEntry> for SubmitClaimParams`
+/// defaults the entry actually carried.
+#[derive(Debug, Clone, Copy)]
+struct SuppliedByEntry {
+    methodology: bool,
+    confidence: bool,
+}
+
+impl SuppliedByEntry {
+    /// Drop a defaulted `methodology` / `confidence` from both lists of a
+    /// `deduplicated` block.
+    ///
+    /// `tools::claims::dedup_block` lists both unconditionally, because they
+    /// are required on `submit_claim` and so always caller-supplied there. A
+    /// batch entry may omit them and get `BATCH_DEFAULT_METHODOLOGY` /
+    /// `BATCH_DEFAULT_CONFIDENCE` instead, and `Deduplicated` promises to list
+    /// only inputs the caller supplied (G11/G15 review: an entry that omitted
+    /// both was told its `methodology` and `confidence` had been applied). The
+    /// default is still what the content-hash path records on the new
+    /// reasoning trace; it is simply not an input of this call.
+    fn unlist_defaulted_inputs(self, d: &mut Deduplicated) {
+        let defaulted = |name: &&str| {
+            (*name == "methodology" && !self.methodology)
+                || (*name == "confidence" && !self.confidence)
+        };
+        d.inputs_applied.retain(|n| !defaulted(n));
+        d.inputs_discarded.retain(|n| !defaulted(n));
+    }
 }
 
 /// Stage claims for validation without persisting.
@@ -180,4 +220,65 @@ pub async fn system_stats(
     Ok(CallToolResult::success(vec![Content::text(
         stats.to_string(),
     )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(by: DedupBy, applied: &[&'static str], discarded: &[&'static str]) -> Deduplicated {
+        Deduplicated {
+            by,
+            existing_claim_id: uuid::Uuid::nil().to_string(),
+            inputs_applied: applied.to_vec(),
+            inputs_discarded: discarded.to_vec(),
+        }
+    }
+
+    /// The novelty-gate arm lists `methodology` and `confidence` as DISCARDED
+    /// unconditionally; a batch entry that omitted them must see neither.
+    #[test]
+    fn a_defaulted_input_leaves_both_lists_and_a_supplied_one_stays() {
+        let omitted = SuppliedByEntry {
+            methodology: false,
+            confidence: false,
+        };
+        let mut gate = block(
+            DedupBy::NoveltyGate,
+            &[],
+            &[
+                "content",
+                "methodology",
+                "evidence_data",
+                "evidence_type",
+                "confidence",
+            ],
+        );
+        omitted.unlist_defaulted_inputs(&mut gate);
+        assert_eq!(
+            gate.inputs_discarded,
+            vec!["content", "evidence_data", "evidence_type"]
+        );
+
+        let only_methodology = SuppliedByEntry {
+            methodology: true,
+            confidence: false,
+        };
+        let mut hash = block(
+            DedupBy::ContentHash,
+            &[
+                "methodology",
+                "evidence_data",
+                "evidence_type",
+                "confidence",
+                "labels",
+            ],
+            &[],
+        );
+        only_methodology.unlist_defaulted_inputs(&mut hash);
+        assert_eq!(
+            hash.inputs_applied,
+            vec!["methodology", "evidence_data", "evidence_type", "labels"]
+        );
+    }
 }
