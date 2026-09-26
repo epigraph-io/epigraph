@@ -12,7 +12,7 @@
 --     with the CLAIM's `(owner_group_id, visibility)`;
 --   * 077's `<table>_tenancy` WITH CHECK then asks whether that owner is in
 --     the session's `epigraph_writable_groups()`;
---   * 473,114 of 480,115 production claims are owned by the WORLD group,
+--   * most public claims are owned by the WORLD group,
 --     which is memberless by design (`locked_decisions.rs::
 --     d2_world_and_seed_remain_memberless`), so it is in nobody's writable
 --     set, and every such attachment raised 42501.
@@ -21,9 +21,8 @@
 -- as a writer with its own personal group: `update_with_evidence` refused on
 -- "evidence", `submit_ds_evidence` refused on "claim_frames", and
 -- `link_epistemic` returned `belief_wired: false` ("edge auto-wire failed:
--- assign_claim ... claim_frames"). Production logged 70 such claim_frames
--- refusals from the application-role HTTPS MCP in 22 hours: belief mass that
--- was silently never recorded.
+-- assign_claim ... claim_frames"): belief mass that was silently never
+-- recorded.
 --
 -- The operator's rule: a row an agent ATTACHES to a public claim it cannot
 -- write is owned by the WRITER's group and stays PUBLIC; ownership of the
@@ -168,9 +167,7 @@
 -- unaffected. SECURITY INVOKER, so `current_user` is the role that issued the
 -- UPDATE (or the maintenance owner of the definer that did).
 --
--- MEASURED AND NOT CHANGED HERE: DELETE. 077's USING admits any public row,
--- so an application session can DELETE any public derived row, writer-owned
--- or not. That predates this file and is recorded for its own batch.
+-- DELETE policy: tracked separately.
 --
 -- ===================================================================
 -- 5. THE AGGREGATE DEFINERS

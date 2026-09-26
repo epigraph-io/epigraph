@@ -16,8 +16,8 @@
 //!
 //! # The claims are world-owned, like production's
 //!
-//! 473,114 of 480,115 production claims are `('public', world)` and authored by
-//! somebody else; `fixture::seed_public_claim` produces exactly that shape.
+//! Most public claims are `('public', world)` and authored by somebody else;
+//! `fixture::seed_public_claim` produces exactly that shape.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -520,7 +520,7 @@ async fn a_non_owners_aggregate_writes_are_claim_owned_audited_and_leave_truth_a
     let fresh = fixture::seed_public_claim(&pool, author, "no frame yet").await;
     let assigned = fixture::seed_public_claim(&pool, author, "already assigned").await;
     let frame = seed_frame(&pool, "wo-frame-8").await;
-    // Production's shape: a world-owned assignment already exists (125k rows).
+    // The common shape: a world-owned assignment already exists.
     FrameRepository::assign_claim(&pool, assigned, frame, Some(0))
         .await
         .expect("harness assignment");

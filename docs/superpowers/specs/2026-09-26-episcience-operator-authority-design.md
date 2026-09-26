@@ -10,19 +10,17 @@ schema determine, plus the conclusions those measurements support.
 
 ## 1. Where EpiScience is today
 
-| Concern | Today |
+| Concern | Today (what the code determines) |
 |---|---|
-| DB credential | the kernel's superuser DSN for both `episcience` (HTTP) and `episcience-mcp` |
+| DB credential and session role | a deployment detail, recorded out of tree; the design below does not depend on it |
 | Epigraph crates | pinned to a pre-tenancy revision (`4a93f038`): no `ScopedPool`, no `Viewer`, no stamping |
-| Identity of MCP writes | ONE fixed service agent (`EPIGRAPH_SERVICE_AGENT_ID`) for every tool call, whoever called |
+| Identity of MCP writes | a configured service identity, not the calling human |
 | Identity of HTTP writes | the bearer's `agent_id` (falls back to `sub`), validated with the kernel's JWT key (`episcience-api/src/middleware.rs`) |
 | Kernel writes | `add_observation` inserts `claims` directly, undeclared (no `visibility` / `owner_group_id`); other kernel writes go through the kernel API with a service token |
 | Federation | `epigraph-mcp` forwards the CALLER's bearer verbatim to `episcience-mcp` on every `tools/call` (`federation/client.rs::invoke_once`) -- and `episcience-mcp` ignores it |
 
 So the human's OAuth token already reaches EpiScience on the MCP path; nothing
-consumes it. Every MCP write is attributed to one service agent and runs with
-superuser authority, i.e. with more authority than any human has and with no
-record of which human asked.
+consumes it, and no record says which human asked for an MCP write.
 
 ## 2. The pipeline, stated once
 
@@ -44,7 +42,7 @@ The same four pieces epigraph already has, reused rather than re-invented:
    (signature, `exp`, `aud = epigraph-api` when configured) and additionally
    asks the kernel whether the client is still `active` (the same
    `oauth_clients` record 111's definer re-reads). No token, or a token the
-   kernel no longer honours: the call is refused. The fixed service agent is
+   kernel no longer honours: the call is refused. The service identity is
    retired from the request path (it stays only as the author of background
    jobs, section 5).
 2. **One operated agent per (deployment, human).** Deterministic from the
@@ -119,18 +117,23 @@ acting operator's personal group, else its personal group, minted if absent),
 and REFUSE an undeclared root-table insert (23502).
 
 * `add_observation` is EpiScience's one direct kernel write; it is a `claims`
-  insert, so under 113 on the current superuser DSN its rows land owned by the
-  **service agent's personal group** (public) instead of the seed group. That
-  is correct attribution for what the code actually does (one service author),
-  and it is the only kernel table EpiScience writes directly (measured: no
-  direct INSERT into any root or derived table elsewhere in its crates).
-* Of R2's options: **E2 (a dedicated non-seed superuser login for EpiScience)**
-  is preferred over *keep* -- same 113 behaviour, but the kernel's own superuser
-  credential stops being shared with an extension and the sessions become
-  attributable. **E3 (a seed login)** is rejected: it keeps stamping the seed
-  group, which is the defect 113 exists to end. E1 is the port below.
-* Once 114 is deployed nothing changes for EpiScience's interim: a superuser
-  session is privileged, so 114 leaves its writes on the old path.
+  insert, so under 113 on a privileged, non-seed login its rows land owned by
+  the **service identity's personal group** (public) instead of the seed group.
+  That is correct attribution for what the code actually does (one service
+  author), and it is the only kernel table EpiScience writes directly (no direct
+  INSERT into any root or derived table elsewhere in its crates).
+* Of R2's options: **E2 (a dedicated non-seed login for EpiScience)** is
+  preferred over *keep* -- same 113 behaviour, but EpiScience's sessions become
+  attributable to EpiScience alone. **E3 (a seed login)** is rejected: it keeps
+  stamping the seed group, which is the defect 113 exists to end. E1 is the port
+  below.
+* **The interim is time-limited, and it is not the design.** E2 is still a
+  privileged login held by an extension. A privileged session is left on the
+  old path by 114 (section 2(b) of that migration), so EpiScience's attachments
+  keep the pre-114 claim-owned shape and none of the writer-owned rule applies to
+  them. The interim ends when the E1 port (section 6) lands; its deadline and
+  owner are recorded in the operator's private notes, and E1 is re-reviewed if
+  the deadline passes rather than letting the interim become permanent.
 
 ## 6. The port work list (E1)
 
