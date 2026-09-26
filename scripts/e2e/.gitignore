@@ -30,3 +30,5 @@ bhh.*
 .oplock.*
 op.*.err
 op.*.out
+.hidlock.*
+hidh.*
