@@ -415,12 +415,14 @@ pub async fn submit_ds_evidence(
     // found" with 1 BBA and 1 `claim_frames` row committed, and so did a
     // request viewer that cannot read the claim. On the transaction the read
     // sees what the author's stamp sees, which is the row it just updated.
-    let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing): (
-        f64,
-        f64,
-        f64,
+    #[allow(clippy::type_complexity)]
+    let (c_belief, c_plausibility, c_mass_on_empty, c_pignistic_prob, c_mass_on_missing, c_frame): (
         Option<f64>,
-        f64,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<uuid::Uuid>,
     ) = {
         // PR-09: this is a per-id belief oracle over a caller-supplied uuid —
         // it returns the BetP and mass distribution of any claim in the corpus.
@@ -447,7 +449,8 @@ pub async fn submit_ds_evidence(
         // `fetch_one` gave `RowNotFound` -> internal_error. Strictly better,
         // and recorded in the PR-09 ledger's behaviour_changes.
         let sql = viewer.splice(
-            "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing
+            "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing,
+                    belief_frame_id
              FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
             2,
         );
@@ -461,6 +464,46 @@ pub async fn submit_ds_evidence(
             .ok_or_else(|| {
                 rmcp::model::ErrorData::invalid_request(format!("claim {claim_id} not found"), None)
             })?
+    };
+
+    // Migration 114: the claim's cache carries THIS frame's combination only
+    // when the recompute above was allowed to write it. A non-owner of a public
+    // claim refreshes a cache only on the frame it already carries, and seeds
+    // one only on `binary_truth` when the claim has none, so the cache may
+    // still describe another frame (or an older frameless combination), or be
+    // empty. Then the response reports this frame's combination, computed by
+    // the same write-free pipeline, and says the cache was not updated, rather
+    // than presenting another frame's cache as this call's belief (or failing
+    // on an empty one after the BBA was stored).
+    let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing) = match (
+        c_frame == Some(frame_id),
+        c_belief,
+        c_plausibility,
+        c_mass_on_empty,
+        c_mass_on_missing,
+    ) {
+        (true, Some(b), Some(pl), Some(me), Some(mm)) => (b, pl, me, c_pignistic_prob, mm),
+        _ => {
+            let preview = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+                &mut tx, viewer, claim_id, frame_id,
+            )
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| internal_error("no BBA on this frame after storing one"))?;
+            warnings.push(format!(
+                "claim {claim_id}'s cached belief was NOT updated by this call: it carries another \
+                 frame (or an older cache with no recorded frame, or none on a frame other than \
+                 binary_truth), which a non-owner does not re-point or seed. belief, plausibility \
+                 and pignistic_prob here are this frame's combination, not the claim's cache."
+            ));
+            (
+                preview.belief,
+                preview.plausibility,
+                preview.conflict_k,
+                Some(preview.pignistic_prob),
+                preview.missing_mass,
+            )
+        }
     };
 
     tx.commit().await.map_err(internal_error)?;

@@ -446,3 +446,168 @@ async fn report_workflow_outcome_on_a_world_workflow_claim_leaves_its_truth_alon
         "the workflow claim's truth stays its owner's"
     );
 }
+
+async fn set_frameless_cache(pool: &PgPool, claim: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET belief = 0.8, plausibility = 0.9, pignistic_prob = 0.85, \
+                           mass_on_empty = 0, mass_on_missing = 0, belief_frame_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("older frameless cache");
+}
+
+/// link_epistemic into a world claim whose cache is an older frameless one:
+/// the edge's BBA is stored (belief_wired=true) but the cache is not
+/// overwritten, and target_belief reports the cache AS STORED, not a value the
+/// database does not hold.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_epistemic_reports_the_stored_cache_when_it_may_not_write_it(pool: PgPool) {
+    let (server, _agent, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let source = seed_claim_with_belief(&pool, 0.8, 0.95, Some(0.9)).await;
+    let target = seed_claim(&pool, "a world target with an older cache", 0.5).await;
+    memberless_owner(&pool, target).await;
+    set_frameless_cache(&pool, target).await;
+
+    let res = epigraph_mcp::tools::link_epistemic::link_epistemic(
+        &server,
+        &viewer,
+        LinkEpistemicParams {
+            source_claim_id: source.to_string(),
+            target_claim_id: target.to_string(),
+            relationship: "supports".into(),
+            properties: None,
+        },
+    )
+    .await
+    .expect("link_epistemic on the app role");
+    let body = first_text(&res);
+    assert_eq!(
+        body["belief_wired"], true,
+        "the edge's BBA was stored: {body}"
+    );
+    let edge = parse_uuid_field(&body, "edge_id");
+    let bba: Uuid = sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+    )
+    .bind(target)
+    .bind(edge)
+    .fetch_one(&pool)
+    .await
+    .expect("the edge's BBA");
+    assert_eq!(
+        tenancy(&pool, "mass_functions", bba).await,
+        (group, "public".into(), true)
+    );
+    let stored = claim_row(&pool, target).await.3;
+    assert_eq!(stored, Some(0.85), "the older cache is not overwritten");
+    assert_eq!(
+        body["target_belief"]["pignistic_prob"].as_f64(),
+        stored,
+        "target_belief is the cache as stored: {body}"
+    );
+}
+
+/// submit_ds_evidence onto an uncached world claim on a frame the writer made:
+/// the BBA is stored, the cache is not seeded (only binary_truth seeds), and the
+/// response returns this frame's combination with a warning instead of failing
+/// on the empty cache after the BBA was written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_ds_evidence_on_a_writer_frame_reports_an_unwritten_cache(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let own = epigraph_db::FrameRepository::create(
+        &pool,
+        "wown-writer-frame",
+        Some("a writer-made frame"),
+        &["h_yes".to_string(), "h_no".to_string()],
+    )
+    .await
+    .expect("writer frame")
+    .id;
+    let claim = seed_claim(&pool, "an uncached world claim", 0.5).await;
+    memberless_owner(&pool, claim).await;
+
+    let params: SubmitDsEvidenceParams = serde_json::from_value(serde_json::json!({
+        "claim_id": claim.to_string(),
+        "frame_id": own.to_string(),
+        "hypothesis_index": 0,
+        "masses": {"0": 0.7, "0,1": 0.3},
+    }))
+    .expect("params");
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, params)
+        .await
+        .expect("the BBA lands and the call answers");
+    let body = first_text(&res);
+    let warnings = body["warnings"].to_string();
+    assert!(warnings.contains("NOT updated"), "{body}");
+    assert!(
+        body["pignistic_prob"].as_f64().unwrap_or(0.0) > 0.5,
+        "the response carries this frame's combination: {body}"
+    );
+    assert_eq!(
+        claim_row(&pool, claim).await.3,
+        None,
+        "a non-owner never seeds a cache on a frame of its own"
+    );
+    let bba: Uuid = sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE claim_id = $1 AND source_agent_id = $2",
+    )
+    .bind(claim)
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("the BBA");
+    assert_eq!(
+        tenancy(&pool, "mass_functions", bba).await,
+        (group, "public".into(), true)
+    );
+}
+
+/// RESIDUAL, pinned rather than fixed here: the mark_duplicate TOOL runs its
+/// dedup on the UNSTAMPED pool, so on the application role it is refused even
+/// for the agent's own duplicate, before migration 114's dedup move is reached.
+/// When the tool moves to a stamped transaction this arm flips and must be
+/// rewritten to assert the writer-owned move instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_tool_is_refused_on_the_app_role_because_it_runs_unstamped(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    let dup = Uuid::new_v4();
+    let hash: Vec<u8> = dup.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'my duplicate', $2, 0.5, $3, true, 'public', $4)",
+    )
+    .bind(dup)
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("a public duplicate owned by the agent's group");
+    let canonical = seed_claim(&pool, "a world canonical", 0.5).await;
+
+    let r = epigraph_mcp::tools::supersede::mark_duplicate(
+        &server,
+        &viewer,
+        epigraph_mcp::types::MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        None,
+    )
+    .await;
+    let e = r.expect_err("the unstamped dedup is refused on the app role");
+    assert!(e.message.contains("row-level security"), "{e:?}");
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(dup)
+        .fetch_one(&pool)
+        .await
+        .expect("dup");
+    assert!(current, "nothing was written");
+}
