@@ -27,14 +27,16 @@
 //! control failed, 0 POSTs against 1 expected — the guard refused the dial. The
 //! bypass the guard closes is the one this fixture was using.
 //!
-//! So the sink is now addressed by a NAME under RFC 2606 `.example`, which the
-//! guard accepts on its face because it performs no DNS resolution, and
-//! reqwest is told to resolve that name to the wiremock port with
-//! `ClientBuilder::resolve`. The client is handed to
-//! `start_webhook_dispatcher_with_client`. `.resolve()` overrides DNS and
-//! nothing else: it cannot make the guard accept an address literal, so the
-//! SSRF property is untouched and only the reachability of the test's own sink
-//! is restored.
+//! So the sink is addressed by a NAME under RFC 2606 `.example`. Delivery now
+//! RESOLVES that name (backlog c89b65b0) and dials only the vetted answer
+//! (3289b067), so the test supplies the dispatcher's egress guard instead of a
+//! client: a `StubResolver` points the name at wiremock's loopback address, and
+//! `exempt_socket_for_tests` (the `test-support` feature, dev-only) exempts
+//! exactly wiremock's socket. That is the only way to a loopback sink, and it
+//! is narrow by construction: any other port, any IP-literal URL, and any other
+//! internal answer are still refused. The seam used to take a finished
+//! `reqwest::Client`; it no longer does, because a client carrying `.resolve()`
+//! overrides is precisely the unpinned bypass the guard now closes.
 //!
 //! # Why the assertion is a received request and not a result vector
 //!
@@ -78,10 +80,9 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_api::routes::webhooks::{
-    dispatcher_client_builder, start_webhook_dispatcher_with_client, WebhookDeliveryConfig,
-};
+use epigraph_api::routes::webhooks::{start_webhook_dispatcher_with_egress, WebhookDeliveryConfig};
 use epigraph_api::state::{SharedEventBus, WebhookStore, WebhookSubscription};
+use epigraph_jobs::egress::{EgressGuard, StubResolver};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -96,22 +97,20 @@ const SINK_B: &str = "/sink-b";
 
 /// The name the subscriptions are addressed by.
 ///
-/// RFC 2606 reserves `.example`, so it never resolves anywhere real and carries
-/// no loopback semantics — the same choice, for the same reason, as
-/// `webhook_url_policy_test.rs::a_hostname_is_not_resolved_and_is_accepted_on_its_face`.
-/// The guard accepts it; `ClientBuilder::resolve` is what points it at wiremock.
+/// RFC 2606 reserves `.example`, so it never resolves anywhere real; the stub
+/// resolver below is the only thing that gives it an address.
 const SINK_HOST: &str = "dispatcher-sink.example";
 
-/// The dispatcher's own client, with DNS for [`SINK_HOST`] pointed at `sink`.
+/// The dispatcher's egress guard, with [`SINK_HOST`] resolving to `sink` and
+/// exactly `sink`'s socket exempted from the internal-address refusal.
 ///
-/// Built through `dispatcher_client_builder` and not `reqwest::Client::new()`:
-/// a test that configured its own client would prove nothing about what the
-/// server actually dials with, and would silently drop the no-redirect policy.
-fn client_resolving_to(sink: &MockServer, config: &WebhookDeliveryConfig) -> reqwest::Client {
-    dispatcher_client_builder(config.timeout)
-        .resolve(SINK_HOST, *sink.address())
-        .build()
-        .expect("dispatcher client must build")
+/// The dispatcher still builds its own pinned client per delivery through
+/// `dispatcher_client_builder` — no-redirect, no-proxy — so what is dialled is
+/// what the server dials with.
+fn egress_resolving_to(sink: &MockServer) -> EgressGuard {
+    let addr = *sink.address();
+    EgressGuard::with_resolver(Arc::new(StubResolver::new().with(SINK_HOST, [addr.ip()])))
+        .exempt_socket_for_tests(addr)
 }
 
 /// `http://dispatcher-sink.example:<wiremock port><path>`.
@@ -229,12 +228,12 @@ async fn a_published_event_reaches_the_subscriber_who_may_read_its_claim_and_no_
     // the `EventBus` until someone passes that id to `EventBus::unsubscribe`.
     // `bin/server.rs::main` binds it the same way and for the same reason.
     let config = fast_config();
-    let _dispatcher = start_webhook_dispatcher_with_client(
+    let _dispatcher = start_webhook_dispatcher_with_egress(
         &bus,
         pool.clone(),
         store.clone(),
         config.clone(),
-        client_resolving_to(&sink, &config),
+        egress_resolving_to(&sink),
     );
 
     bus.publish(claim_submitted(claim_b, agent_b))
@@ -287,12 +286,12 @@ async fn the_event_type_filter_still_applies_through_the_dispatcher() {
 
     let bus: SharedEventBus = Arc::new(epigraph_events::EventBus::new(64));
     let config = fast_config();
-    let _dispatcher = start_webhook_dispatcher_with_client(
+    let _dispatcher = start_webhook_dispatcher_with_egress(
         &bus,
         pool.clone(),
         store.clone(),
         config.clone(),
-        client_resolving_to(&sink, &config),
+        egress_resolving_to(&sink),
     );
 
     bus.publish(claim_submitted(claim, agent))

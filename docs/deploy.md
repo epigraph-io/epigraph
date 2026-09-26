@@ -340,6 +340,11 @@ this section; §1's scopes are the ones these routes check.
 
 ### 1c. `POST /api/v1/webhooks` now refuses internal delivery targets
 
+> **Superseded in part** by [Webhook egress guard](#webhook-egress-guard--names-are-resolved-and-every-delivery-is-re-vetted-and-pinned)
+> below: names are now resolved, the range table is wider, and delivery re-vets
+> every send, so the first two boundaries listed here no longer hold. Kept as
+> the record of what shipped with PR-03.
+
 Registration validates the URL. **400** is returned for a scheme other than
 `http`/`https`, for a URL that does not parse or names no host, for an IP
 **literal** that is loopback, link-local, private-range or unspecified
@@ -1157,3 +1162,104 @@ library recall has no principal at all, so there is no personal group to name
 and migration 062's `recall_events_group_needs_real_group` CHECK forbids
 substituting a sentinel. Rows from that path remain `('public', world)` and are
 identifiable by `agent_id IS NULL`.
+
+## Webhook egress guard — names are resolved, and every delivery is re-vetted and pinned
+
+One shared module, `epigraph_jobs::egress`, now decides whether a webhook
+destination may be dialled, for `POST /api/v1/webhooks`, for the API's
+delivery dispatcher, and for `epigraph-jobs`' `ConfigurableWebhookHandler`. It
+supersedes the first two boundaries in PR-03 §1c above. No migration ships
+with it; it takes effect when the binaries roll. Four behaviour changes are
+visible to webhook owners or operators.
+
+### 1. Registration resolves the host, and refuses it if any answer is internal
+
+`POST /api/v1/webhooks` resolves a host **name** once, via the operating
+system's resolver, bounded to 5 seconds. It returns **400** when:
+
+* **any** address in the answer is internal (see §3). A round-robin answer
+  with one internal member is refused as a whole, because a client may try
+  any member;
+* the name **does not resolve**, returns no addresses, or times out. Nothing
+  can be vetted, so nothing is stored. This includes a *transient* resolver
+  failure, and the registering client should retry.
+
+Both cases return the **same** body, naming only the host ("Webhook URL host
+`<host>` is not an acceptable public destination"). The resolved address, its
+range and the resolver's error text are the server's resolver's answer, not
+anything the caller supplied, so they are not returned: echoing them would let
+any `webhooks:write` holder learn what internal-only names resolve to. They are
+logged at WARN as `Refusing webhook registration: target host failed egress
+vetting`, with the caller's `agent_id`. **Operators:** because a transient
+resolver failure now looks like any other refusal to the caller, a burst of
+these 400s is diagnosed from that log line, and the API host's resolver should
+be checked before the caller is suspected. What a caller can still observe is
+201 versus 400 and how long the lookup took; those cannot be removed without
+dropping the registration-time check, and are accepted.
+
+IP-literal URLs are judged as before, without resolution, and their refusal
+still names the literal (it is the caller's own input).
+
+### 2. BREAKING for existing rows — every delivery re-vets, so grandfathered internal targets stop receiving
+
+PR-03 §1c said the check applied at registration only and that rows already
+in `webhook_subscriptions` kept being delivered to. **That asymmetry is
+reversed.** Each delivery now resolves the name, applies the same policy,
+and refuses the send if any answer is internal. The result is logged at WARN
+as `Refusing webhook delivery to disallowed target URL` with
+`attempts: 0` (nothing was dialled). An existing subscription that points at
+an internal consumer therefore **stops being delivered to** on the first
+event after the roll, with no error visible to the subscriber.
+
+Delivery then connects **only** to the addresses it vetted: the name is not
+resolved a second time by the HTTP client, so a record that changes between
+the check and the send (DNS rebinding) is never consulted. `Host` and TLS SNI
+are still the registered host's. All retries of one delivery reuse that one
+resolution; a resolution failure is retried with the normal backoff, and
+nothing is dialled until a resolution is vetted.
+
+**Operator action before rolling:** audit `webhook_subscriptions` for active
+rows whose host is, or resolves to, an internal address, and decide per row
+whether to re-point it at a public endpoint or deactivate it. There is no
+allowlist override; an internal consumer needs a public-facing endpoint.
+
+### 3. The refused range table is wider
+
+Previously refused: loopback, link-local, RFC 1918 private, unspecified, and
+IPv6 loopback/link-local/unique-local, plus IPv4-mapped spellings. Now also
+refused, as literals and as resolved answers:
+
+* **CGNAT `100.64.0.0/10`** — commonly used by overlay VPNs, so a consumer
+  reached over such a network is now refused;
+* the **documentation** ranges (TEST-NET-1/2/3, `2001:db8::/32`);
+* multicast, limited broadcast, `0.0.0.0/8`, `192.0.0.0/24`, benchmarking
+  `198.18.0.0/15`, reserved `240.0.0.0/4`, IPv6 site-local `fec0::/10`, and
+  the other not-globally-reachable IANA special-purpose blocks;
+* every IPv6 form that **embeds** an internal IPv4 address: IPv4-mapped,
+  IPv4-compatible, NAT64 `64:ff9b::/96` and 6to4 `2002::/16` are judged by the
+  IPv4 address they carry (so a NAT64 or 6to4 form of a *public* address is
+  still accepted — DNS64 synthesises these for ordinary names).
+
+URL parsing is WHATWG (`url::Url`) everywhere, so userinfo tricks and
+alternate numeric spellings of loopback are judged as the address they name.
+
+### 4. Webhook delivery ignores `HTTP_PROXY` / `HTTPS_PROXY`
+
+The API's delivery client is built with `no_proxy()`: a forward proxy resolves
+the target name itself, which would bypass the pinned addresses. **A
+deployment that routes outbound webhook traffic through a proxy must instead
+allow direct egress from the API process** (on the webhook ports its
+subscribers use). Other outbound HTTP from the process is unaffected. Redirects
+are still refused.
+
+### Scope
+
+`epigraph-jobs` now ships the one sanctioned production `HttpClient`,
+`PinnedHttpClient`. It builds each request's client with
+`epigraph_jobs::egress::pinned_client`, the same function the API's delivery
+dispatcher uses, so both paths dial only the vetted addresses, never resolve
+the name again (a fallback resolver refuses every other name), and follow no
+redirects or proxies. Nothing in this repository wires
+`ConfigurableWebhookHandler` into a runner yet; when something does, it should
+pass `PinnedHttpClient`. The `HttpClient` trait stays open for test mocks, so a
+second production implementation is a review red flag, not a compile error.

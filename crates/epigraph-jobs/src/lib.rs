@@ -61,6 +61,8 @@ mod db_reputation_service;
 pub use db_reputation_service::DbReputationService;
 
 pub mod cluster_graph;
+pub mod egress;
+pub use egress::is_internal_addr;
 pub mod coordination;
 pub mod privatization;
 pub mod theme_cluster_rebuild;
@@ -2161,12 +2163,36 @@ pub enum HttpError {
 /// Trait for HTTP client implementations.
 ///
 /// This trait enables dependency injection for testing with mock clients.
+///
+/// # The egress contract — an implementation that breaks it reopens SSRF
+///
+/// [`ConfigurableWebhookHandler`] hands the client an
+/// [`egress::VettedTarget`], not a URL string: the URL has been parsed, its
+/// host resolved ONCE, and every resolved address checked against the egress
+/// table. An implementation MUST:
+///
+/// 1. connect only to [`egress::VettedTarget::addrs`] — never resolve
+///    [`egress::VettedTarget::domain`] again (with reqwest:
+///    `resolve_to_addrs(domain, addrs)` plus a `dns_resolver` that refuses
+///    every other name, so a missed override fails closed);
+/// 2. send to [`egress::VettedTarget::url`] unchanged, so the `Host` header and
+///    TLS SNI/certificate name are the registered host's;
+/// 3. not follow redirects (a hop is a new, unvetted destination) and not use
+///    a proxy (the proxy would resolve the name itself).
+///
+/// Resolving the name again is DNS rebinding: a hostile server answers the
+/// guard with a public address and the client with an internal one.
+///
+/// **Production code should use [`PinnedHttpClient`]**, which meets the
+/// contract by construction (it builds from [`egress::pinned_client`], the same
+/// function the API's delivery dispatcher uses). The trait stays open so tests
+/// can inject mocks; a new production implementation is a review red flag.
 #[async_trait]
 pub trait HttpClient: Send + Sync {
-    /// Send an HTTP POST request.
+    /// Send an HTTP POST request to a vetted target.
     ///
     /// # Arguments
-    /// * `url` - Target URL
+    /// * `target` - The vetted URL and the only addresses it may be dialled on
     /// * `headers` - HTTP headers as key-value pairs
     /// * `body` - Request body
     ///
@@ -2174,10 +2200,94 @@ pub trait HttpClient: Send + Sync {
     /// The HTTP response on success, or an error on failure.
     async fn post(
         &self,
-        url: &str,
+        target: &egress::VettedTarget,
         headers: std::collections::HashMap<String, String>,
         body: &str,
     ) -> Result<HttpResponse, HttpError>;
+}
+
+/// The sanctioned production [`HttpClient`].
+///
+/// Each `post` builds its client with [`egress::pinned_client`], so it
+/// connects only to [`egress::VettedTarget::addrs`] (a fallback resolver
+/// refuses every other name, so a missed override fails closed rather than
+/// reaching system DNS), sends to [`egress::VettedTarget::url`] unchanged,
+/// follows no redirect and uses no proxy. It is the same construction the
+/// API's webhook dispatcher delivers with, so the two paths cannot drift.
+///
+/// A 3xx is returned to the caller as a response, never followed. The
+/// response body is read up to [`Self::MAX_RESPONSE_BODY`] bytes and no
+/// further.
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedHttpClient {
+    timeout: Duration,
+}
+
+impl PinnedHttpClient {
+    /// The most response-body bytes kept; the rest is not read.
+    pub const MAX_RESPONSE_BODY: usize = 64 * 1024;
+
+    /// A client whose requests time out after `timeout`.
+    #[must_use]
+    pub const fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Default for PinnedHttpClient {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(30))
+    }
+}
+
+#[async_trait]
+impl HttpClient for PinnedHttpClient {
+    async fn post(
+        &self,
+        target: &egress::VettedTarget,
+        headers: std::collections::HashMap<String, String>,
+        body: &str,
+    ) -> Result<HttpResponse, HttpError> {
+        let client = egress::pinned_client(target, self.timeout).map_err(|e| {
+            HttpError::ConnectionFailed {
+                reason: format!("could not build pinned HTTP client: {e}"),
+            }
+        })?;
+        let mut request = client.post(target.url().clone()).body(body.to_string());
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request.send().await.map_err(|e| {
+            if e.is_timeout() {
+                HttpError::Timeout {
+                    duration: self.timeout,
+                }
+            } else if e.is_connect() {
+                HttpError::ConnectionFailed {
+                    reason: e.to_string(),
+                }
+            } else {
+                HttpError::TransientFailure {
+                    message: e.to_string(),
+                }
+            }
+        })?;
+        let status_code = response.status().as_u16();
+        // Bounded read: the receiver controls the body, and the handler copies
+        // it into job output and error strings. Stop at the cap rather than
+        // buffering whatever a hostile endpoint streams until the timeout.
+        let mut response = response;
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            let room = PinnedHttpClient::MAX_RESPONSE_BODY - bytes.len();
+            bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            if bytes.len() >= PinnedHttpClient::MAX_RESPONSE_BODY {
+                break;
+            }
+        }
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        Ok(HttpResponse { status_code, body })
+    }
 }
 
 /// Trait for webhook configuration repository.
@@ -2262,11 +2372,10 @@ pub fn verify_hmac_signature(secret: &str, payload: &str, signature: &str) -> bo
 /// with or without a port (`[::1]`, `[fe80::1]:8080`), an `ipv4:port` pair, or
 /// a hostname.
 ///
-/// Blocks:
-/// - Loopback (127.0.0.0/8, `::1`)
-/// - Private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7)
-/// - Link-local (169.254.0.0/16, fe80::/10)
-/// - Localhost variants
+/// Blocks every address [`egress::internal_category`] names (loopback,
+/// private, link-local, CGNAT, multicast, broadcast, documentation and the
+/// other non-global special-purpose ranges, and IPv6 forms that embed an
+/// internal IPv4 address), plus the `localhost` names.
 ///
 /// Hostnames that are not IP literals are *allowed*: this function does no DNS
 /// resolution, so a name that resolves to an internal address is not caught
@@ -2324,112 +2433,26 @@ pub fn is_internal_ip(host: &str) -> bool {
     }
 }
 
-/// Classify an already-parsed IP address as internal/private (SSRF protection).
+/// Extract the host of a URL, as the HTTP client will see it.
 ///
-/// This is the address-level half of [`is_internal_ip`]. Prefer it when the
-/// caller already holds a parsed address (e.g. `url::Host::Ipv4` / `Ipv6`), so
-/// no host-string re-parsing — and no parsing ambiguity — is involved.
+/// Parses with [`url::Url`] (WHATWG), so userinfo is stripped, IPv6 literals
+/// keep their brackets (`[::1]`), and alternate IPv4 spellings are normalised
+/// (`127.1` → `127.0.0.1`). The previous substring slicer returned
+/// `example.com@127.0.0.1` for a userinfo URL and `[` for a bracketed IPv6 one.
 ///
-/// # Returns
-/// `true` if the address is internal and should be blocked, `false` if it's safe.
-#[must_use]
-pub fn is_internal_addr(addr: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-
-    match addr {
-        IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-
-            // Loopback: 127.0.0.0/8
-            if octets[0] == 127 {
-                return true;
-            }
-
-            // Private: 10.0.0.0/8
-            if octets[0] == 10 {
-                return true;
-            }
-
-            // Private: 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
-            if octets[0] == 172 && (16..=31).contains(&octets[1]) {
-                return true;
-            }
-
-            // Private: 192.168.0.0/16
-            if octets[0] == 192 && octets[1] == 168 {
-                return true;
-            }
-
-            // Link-local: 169.254.0.0/16
-            if octets[0] == 169 && octets[1] == 254 {
-                return true;
-            }
-
-            // 0.0.0.0/8 (current network)
-            if octets[0] == 0 {
-                return true;
-            }
-
-            false
-        }
-        IpAddr::V6(ipv6) => {
-            // Loopback ::1
-            if ipv6.is_loopback() {
-                return true;
-            }
-
-            // Unspecified ::
-            if ipv6.is_unspecified() {
-                return true;
-            }
-
-            // Check for IPv4-mapped addresses
-            if let Some(ipv4) = ipv6.to_ipv4_mapped() {
-                let octets = ipv4.octets();
-                if octets[0] == 127
-                    || octets[0] == 10
-                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-                    || (octets[0] == 192 && octets[1] == 168)
-                    || (octets[0] == 169 && octets[1] == 254)
-                    || octets[0] == 0
-                {
-                    return true;
-                }
-            }
-
-            // Unique local addresses (fc00::/7)
-            let segments = ipv6.segments();
-            if (segments[0] & 0xfe00) == 0xfc00 {
-                return true;
-            }
-
-            // Link-local (fe80::/10)
-            if (segments[0] & 0xffc0) == 0xfe80 {
-                return true;
-            }
-
-            false
-        }
-    }
-}
-
-/// Extract host from a URL for SSRF checking.
+/// Classification belongs to [`egress::parse_and_classify`]; this remains for
+/// callers that only need the host string.
 ///
 /// # Returns
-/// The host portion of the URL, or `None` if parsing fails.
+/// The normalised host, or `None` if the URL does not parse, is not
+/// `http`/`https`, or has no host.
 #[must_use]
 pub fn extract_host_from_url(url: &str) -> Option<String> {
-    // Simple URL parsing - extract host between :// and next / or :
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-
-    let host_end = without_scheme
-        .find('/')
-        .unwrap_or(without_scheme.len())
-        .min(without_scheme.find(':').unwrap_or(without_scheme.len()));
-
-    Some(without_scheme[..host_end].to_string())
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    if !egress::ALLOWED_SCHEMES.contains(&parsed.scheme()) {
+        return None;
+    }
+    parsed.host_str().map(str::to_string)
 }
 
 // ============================================================================
@@ -2506,6 +2529,7 @@ pub struct ConfigurableWebhookHandler {
     http_client: std::sync::Arc<dyn HttpClient>,
     webhook_repo: std::sync::Arc<dyn WebhookRepository>,
     default_timeout: Duration,
+    egress: egress::EgressGuard,
 }
 
 impl ConfigurableWebhookHandler {
@@ -2523,7 +2547,16 @@ impl ConfigurableWebhookHandler {
             http_client,
             webhook_repo,
             default_timeout: Duration::from_secs(30),
+            egress: egress::EgressGuard::system(),
         }
+    }
+
+    /// Replace the egress guard (tests: a guard over
+    /// [`egress::StubResolver`], so no real DNS is consulted).
+    #[must_use]
+    pub fn with_egress_guard(mut self, guard: egress::EgressGuard) -> Self {
+        self.egress = guard;
+        self
     }
 
     /// Set default timeout for HTTP requests.
@@ -2610,12 +2643,25 @@ impl JobHandler for ConfigurableWebhookHandler {
             });
         }
 
-        // SSRF protection: Check for internal IP addresses
-        if let Some(host) = extract_host_from_url(&config.url) {
-            if is_internal_ip(&host) {
-                return Err(JobError::SsrfBlocked { address: host });
+        // SSRF protection: parse the URL, judge the normalised authority,
+        // resolve a name ONCE and refuse it if any answer is internal (see
+        // `egress`). The vetted addresses travel to the client, which must
+        // dial only those — see the `HttpClient` contract.
+        let target = match self.egress.vet(&config.url).await {
+            Ok(target) => target,
+            Err(denied) => {
+                return Err(match denied.blocked_destination() {
+                    Some(address) => JobError::SsrfBlocked { address },
+                    // A resolution failure can clear on its own; retry it.
+                    None if denied.is_transient() => JobError::ProcessingFailed {
+                        message: denied.to_string(),
+                    },
+                    None => JobError::PermanentFailure {
+                        message: denied.to_string(),
+                    },
+                });
             }
-        }
+        };
 
         // Serialize payload to JSON
         let body = serde_json::to_string(&notification_payload).map_err(|e| {
@@ -2637,7 +2683,7 @@ impl JobHandler for ConfigurableWebhookHandler {
         // Send HTTP request with timeout
         let result = tokio::time::timeout(
             timeout_duration,
-            self.http_client.post(&config.url, headers, &body),
+            self.http_client.post(&target, headers, &body),
         )
         .await;
 
@@ -2660,7 +2706,10 @@ impl JobHandler for ConfigurableWebhookHandler {
                         },
                     }),
 
-                    // Redirect: 3xx - treat as success (client should follow redirects)
+                    // Redirect: 3xx - recorded, NOT followed (the `HttpClient`
+                    // contract forbids following: the hop target was never
+                    // vetted). The registered endpoint answered, so the job
+                    // is done.
                     300..=399 => Ok(JobResult {
                         output: serde_json::json!({
                             "webhook_id": webhook_id.to_string(),

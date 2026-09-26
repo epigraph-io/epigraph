@@ -377,6 +377,17 @@ pub struct AppState {
     /// Stores registered webhook subscriptions for event notification delivery.
     /// Uses `Arc<RwLock<HashMap>>` for thread-safe concurrent access.
     pub webhook_store: WebhookStore,
+    /// Egress guard for webhook REGISTRATION (`POST /api/v1/webhooks`).
+    ///
+    /// Resolves the target's host once and refuses it if any answer is
+    /// internal (`epigraph_jobs::egress`). Every constructor installs the
+    /// operating-system resolver; [`Self::with_webhook_egress`] replaces it,
+    /// which is how tests supply a `StubResolver` instead of real DNS.
+    ///
+    /// Delivery does NOT read this field: the dispatcher is started with its
+    /// own guard in `bin/server.rs` (`start_webhook_dispatcher`), so a test
+    /// fixture's stub here can never become the resolver deliveries dial by.
+    pub webhook_egress: epigraph_jobs::egress::EgressGuard,
     /// Optional harvester gRPC client for claim extraction
     ///
     /// When present, the `POST /api/v1/harvest` endpoint forwards text
@@ -985,6 +996,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1000)),
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
+            webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -1029,6 +1041,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1000)),
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
+            webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -1058,6 +1071,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1000)),
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
+            webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -1256,6 +1270,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1000)),
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
+            webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -1287,6 +1302,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1000)),
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
+            webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -1320,6 +1336,7 @@ impl AppState {
             event_bus: Arc::new(EventBus::new(1000)),
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
+            webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -1799,6 +1816,14 @@ impl AppState {
             );
         }
         Ok(())
+    }
+
+    /// Replace the webhook-registration egress guard. See
+    /// [`Self::webhook_egress`].
+    #[must_use]
+    pub fn with_webhook_egress(mut self, guard: epigraph_jobs::egress::EgressGuard) -> Self {
+        self.webhook_egress = guard;
+        self
     }
 
     /// Set the rate limiter for this state (builder pattern)
