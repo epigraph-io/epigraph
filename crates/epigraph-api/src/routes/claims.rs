@@ -1810,18 +1810,21 @@ pub async fn patch_claim(
     // The admin path runs on a transaction stamped from the ADMIN's own viewer
     // (so `epigraph.principal_id` is the admin, which the definer records);
     // every other caller on the pool transaction this route always used.
-    let mut pool_tx = None;
-    let mut scoped_tx = None;
-    let tx: &mut sqlx::PgConnection =
-        if admin_path {
-            &mut **scoped_tx.insert(state.write_as(&viewer, "patch_claim").await?)
-        } else {
-            &mut **pool_tx.insert(state.db_pool.begin().await.map_err(|e| {
-                ApiError::DatabaseError {
+    let mut pool_tx: Option<sqlx::Transaction<'_, sqlx::Postgres>> = None;
+    let mut scoped_tx: Option<epigraph_db::ScopedTx<'_>> = None;
+    let tx: &mut sqlx::PgConnection = if admin_path {
+        scoped_tx.insert(state.write_as(&viewer, "patch_claim").await?)
+    } else {
+        pool_tx.insert(
+            state
+                .db_pool
+                .begin()
+                .await
+                .map_err(|e| ApiError::DatabaseError {
                     message: format!("Failed to begin transaction: {e}"),
-                }
-            })?)
-        };
+                })?,
+        )
+    };
 
     // ── 6 & 7. Fetch before-state and apply mutations atomically ─────────────
     let (before_labels, after_labels, before_props, after_props, before_trace, after_trace) =

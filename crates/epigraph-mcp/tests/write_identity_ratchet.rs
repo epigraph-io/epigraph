@@ -23,17 +23,17 @@
 //! 4. **Only the resolver constructs a `WriteIdentity`** (batch H-b review):
 //!    `from_resolved` is `pub(crate)`, and the review measured a tool module
 //!    minting one from the signer that passed scans 1-3.
-//! 2b. **Every write body forwards `auth`, or is listed with its reason** (batch
-//!    H-b review): scan 2 sees only a literal `None`, so a body that forgot the
-//!    token entirely was invisible.
 //! 5. **The signer accessor only ever names a signer** (batch H-b review):
 //!    `signer_agent_id()` returns the same agent `server.agent_id()` does, so
 //!    scan 1 alone let a tool author as the shared signer through it.
+//! 6. **Every write body forwards `auth`, or is listed with its reason** ("scan
+//!    2b", batch H-b review): scan 2 sees only a literal `None`, so a body that
+//!    forgot the token entirely was invisible.
 //!
 //! Verified load-bearing by reverting: re-adding `let agent_id =
 //! server.agent_id().await?;` to `tools/memory.rs` fails scan 1, and changing
 //! `submit_claim(self, viewer, params, auth)` to `..., None)` in `server.rs`
-//! fails scan 2. Scans 4, 2b and 5 each fail on their own planted mutation (see
+//! fails scan 2. Scans 4, 5 and 6 each fail on their own planted mutation (see
 //! each test's doc), while scans 1-3 pass on all three.
 
 use std::path::{Path, PathBuf};
