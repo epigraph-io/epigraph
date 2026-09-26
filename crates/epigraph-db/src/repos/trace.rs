@@ -516,6 +516,7 @@ impl ReasoningTraceRepository {
             "abductive" => Ok(Methodology::Abductive),
             "analogical" => Ok(Methodology::Abductive), // Map to closest
             "statistical" => Ok(Methodology::BayesianInference),
+            "observational" => Ok(Methodology::Instrumental),
             _ => Err(DbError::InvalidData {
                 reason: format!("Unknown reasoning type: {}", s),
             }),
@@ -629,6 +630,61 @@ mod tests {
             trace_from_claim, known_agent_id,
             "Trace fetched by claim must have correct agent ID"
         );
+    }
+
+    /// `reasoning_type = 'observational'` is storable and reads back as Instrumental.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_observational_reasoning_type_round_trips(pool: sqlx::PgPool) {
+        let agent_id = Uuid::new_v4();
+        let mut public_key = [0u8; 32];
+        public_key[..16].copy_from_slice(&agent_id.as_bytes()[..16]);
+        sqlx::query("INSERT INTO agents (id, public_key, display_name) VALUES ($1, $2, $3)")
+            .bind(agent_id)
+            .bind(&public_key[..])
+            .bind("Observational Agent")
+            .execute(&pool)
+            .await
+            .expect("Failed to create agent");
+
+        let claim_id = Uuid::new_v4();
+        let content_hash = blake3::hash(b"observational claim");
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(claim_id)
+        .bind("observational claim")
+        .bind(content_hash.as_bytes().as_slice())
+        .bind(0.5f64)
+        .bind(agent_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to create claim");
+
+        let trace_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO reasoning_traces (id, claim_id, reasoning_type, confidence, explanation) \
+             VALUES ($1, $2, 'observational', 0.7, 'saw it')",
+        )
+        .bind(trace_id)
+        .bind(claim_id)
+        .execute(&pool)
+        .await
+        .expect("observational must satisfy reasoning_type_valid");
+
+        let viewer = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
+        let by_id = ReasoningTraceRepository::get_by_id(&pool, &viewer, TraceId::from_uuid(trace_id))
+            .await
+            .expect("get_by_id must not error on observational")
+            .expect("trace exists");
+        assert_eq!(by_id.methodology, Methodology::Instrumental);
+
+        let by_claim =
+            ReasoningTraceRepository::get_by_claim(&pool, &viewer, ClaimId::from_uuid(claim_id))
+                .await
+                .expect("get_by_claim must not error on observational");
+        assert_eq!(by_claim.len(), 1);
+        assert_eq!(by_claim[0].methodology, Methodology::Instrumental);
     }
 
     /// Test: Verify that get_parents and get_children return correct agent IDs
