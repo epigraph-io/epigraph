@@ -133,6 +133,10 @@ pub async fn record_outcome(
 }
 
 /// POST /api/v1/policy-challenges — create a pending challenge claim.
+///
+/// Idempotent on `(host, port, protocol)`: a repeat request answers `200`
+/// with the id of the challenge the first one created, whatever that
+/// challenge's status is now, and writes nothing.
 #[cfg(feature = "db")]
 pub async fn create_challenge(
     State(state): State<AppState>,
@@ -169,26 +173,92 @@ pub async fn create_challenge(
         epigraph_db::ClaimRepository::default_decl_for_author_pool(&state.db_pool, sys_agent_id)
             .await?;
 
-    let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, \
-                             visibility, owner_group_id) \
-         VALUES ($1, $2, $3, 0.5, ARRAY['policy','policy:challenge'], $4, $5, $6) \
-         RETURNING id",
+    // Idempotent on (host, port, protocol). `content` is a pure function of
+    // those three fields and the author is the one system agent, so a repeat
+    // request names the same (content_hash, agent_id) pair as the first. It
+    // must answer with the challenge that pair already names rather than
+    // insert a second one.
+    //
+    // The existing row is FOUND, not inferred from a unique violation.
+    // `uq_claims_content_hash_agent` (migration 013) is absent on the
+    // long-lived production database (migrations/README.md, "Known schema
+    // drift"), so a handler that relied on the constraint firing would 500 on
+    // a fresh database and silently mint a duplicate pending challenge on
+    // production. The lookup works with or without the constraint.
+    //
+    // The transaction-scoped advisory lock serializes concurrent creates of
+    // the same challenge, so two first requests racing each other cannot both
+    // miss the lookup and both insert -- which, again, nothing else prevents
+    // where the constraint is absent. The two-key form keeps this lock space
+    // disjoint from the single-key `hashtext('epigraph.*')` locks elsewhere.
+    //
+    // The lookup projects `id` only, and the repeat answers `{ "id" }`, the
+    // same shape as a first create; the challenge's state is
+    // `GET /api/v1/policy-challenges/:id`'s to serve.
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to create challenge: {e}"),
+        })?;
+
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtext('epigraph.policy_challenge'), hashtext($1))",
     )
     .bind(&content)
-    .bind(content_hash.as_slice())
-    .bind(sys_agent_id)
-    .bind(serde_json::json!({
-        "host": req.host,
-        "port": req.port,
-        "protocol": req.protocol,
-        "status": "pending",
-    }))
-    .bind(decl.visibility_bind())
-    .bind(decl.owner_group_bind())
-    .fetch_one(&state.db_pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to create challenge: {e}"),
+    })?;
+
+    // Taken AFTER the lock, as its own statement, so under READ COMMITTED it
+    // reads a snapshot that includes a racing request's committed insert.
+    // Ordered because production already holds duplicates from before this
+    // lookup existed; the oldest is the one every repeat keeps answering with.
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM claims \
+         WHERE content_hash = $1 AND agent_id = $2 \
+           AND 'policy:challenge' = ANY(labels) \
+         ORDER BY created_at, id \
+         LIMIT 1",
+    )
+    .bind(content_hash.as_slice())
+    .bind(sys_agent_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to look up existing challenge: {e}"),
+    })?;
+
+    let id = match existing {
+        Some(id) => id,
+        None => sqlx::query_scalar(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, \
+                                 visibility, owner_group_id) \
+             VALUES ($1, $2, $3, 0.5, ARRAY['policy','policy:challenge'], $4, $5, $6) \
+             RETURNING id",
+        )
+        .bind(&content)
+        .bind(content_hash.as_slice())
+        .bind(sys_agent_id)
+        .bind(serde_json::json!({
+            "host": req.host,
+            "port": req.port,
+            "protocol": req.protocol,
+            "status": "pending",
+        }))
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to create challenge: {e}"),
+        })?,
+    };
+
+    tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("Failed to create challenge: {e}"),
     })?;
 
@@ -457,6 +527,245 @@ mod tests {
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 1);
         assert_eq!(policies[0]["host"], "example.com");
+    }
+
+    // ── create_challenge idempotency ──
+
+    /// A `claims:write` caller, injected the way the bearer middleware would.
+    /// Without it `create_challenge` answers 401 before reaching the insert,
+    /// and every assertion below would be about the auth gate instead.
+    fn challenge_router(state: AppState) -> Router {
+        let principal = Uuid::new_v4();
+        Router::new()
+            .route("/api/v1/policy-challenges", post(create_challenge))
+            .layer(axum::Extension(crate::middleware::bearer::AuthContext {
+                client_id: principal,
+                agent_id: Some(principal),
+                owner_id: Some(principal),
+                client_type: crate::middleware::bearer::ClientType::Service,
+                scopes: vec!["claims:write".to_string()],
+                jti: Uuid::new_v4(),
+            }))
+            .with_state(state)
+    }
+
+    /// POST one challenge and return (status, body-as-text).
+    async fn post_challenge(state: AppState, body: &serde_json::Value) -> (StatusCode, String) {
+        let response = challenge_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/policy-challenges")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// POST and require a 200 carrying an id; return the id.
+    async fn create_ok(state: AppState, body: &serde_json::Value, which: &str) -> Uuid {
+        let (status, text) = post_challenge(state, body).await;
+        assert_eq!(status, StatusCode::OK, "{which} create: body={text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap_or_else(|| panic!("{which} create: no id in body={text}"))
+    }
+
+    /// Rows that are the challenge for `body` — counted on the SUPERUSER pool,
+    /// so RLS cannot hide a duplicate from the count.
+    async fn challenge_rows(pool: &PgPool, body: &serde_json::Value) -> i64 {
+        let text = format!(
+            "Network access challenge: {}:{} ({})",
+            body["host"].as_str().unwrap(),
+            body["port"].as_i64().unwrap(),
+            body["protocol"].as_str().unwrap_or("any")
+        );
+        // Keyed on the hash, not the text: selecting on the content column
+        // would charge this test helper to `viewer_route_table_lint.rs`'s
+        // inline-content-read register, which it is not.
+        let hash = epigraph_crypto::ContentHasher::hash(text.as_bytes());
+        sqlx::query_scalar(
+            "SELECT count(*) FROM claims \
+             WHERE content_hash = $1 AND 'policy:challenge' = ANY(labels)",
+        )
+        .bind(hash.as_slice())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The fresh-database shape: `uq_claims_content_hash_agent` is present, so
+    /// a second identical insert is a unique violation. Before the lookup the
+    /// repeat answered 500 `Failed to create challenge: ... duplicate key`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_challenge_repeat_returns_the_existing_challenge(pool: PgPool) {
+        let body = serde_json::json!({ "host": "idem.example", "port": 8443, "protocol": "https" });
+
+        let first = create_ok(test_state(pool.clone()), &body, "first").await;
+        let second = create_ok(test_state(pool.clone()), &body, "repeat").await;
+
+        assert_eq!(
+            second, first,
+            "a repeat must answer the existing challenge's id"
+        );
+        assert_eq!(
+            challenge_rows(&pool, &body).await,
+            1,
+            "a repeat must write nothing"
+        );
+
+        // A different tuple is a different challenge — the lookup is keyed on
+        // the tuple, not on "any challenge exists".
+        let other = serde_json::json!({ "host": "idem.example", "port": 8443, "protocol": "http" });
+        let third = create_ok(test_state(pool.clone()), &other, "other-protocol").await;
+        assert_ne!(
+            third, first,
+            "a different (host, port, protocol) is a new challenge"
+        );
+    }
+
+    /// The PRODUCTION shape: `migrations/README.md` records that the
+    /// long-lived database has no `uq_claims_content_hash_agent`. There the
+    /// repeat never errored — it silently inserted a second pending challenge.
+    /// A fix that only caught the unique violation would still do that.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_challenge_repeat_is_idempotent_without_the_unique_constraint(pool: PgPool) {
+        sqlx::query("ALTER TABLE claims DROP CONSTRAINT uq_claims_content_hash_agent")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let body = serde_json::json!({ "host": "drift.example", "port": 443, "protocol": "https" });
+
+        let first = create_ok(test_state(pool.clone()), &body, "first").await;
+        let second = create_ok(test_state(pool.clone()), &body, "repeat").await;
+
+        assert_eq!(
+            second, first,
+            "a repeat must answer the existing challenge's id"
+        );
+        assert_eq!(
+            challenge_rows(&pool, &body).await,
+            1,
+            "with the constraint absent, a repeat must still not mint a duplicate"
+        );
+    }
+
+    /// Concurrent first requests for one tuple, constraint absent: the
+    /// advisory lock is the only thing that keeps them from all missing the
+    /// lookup and all inserting.
+    ///
+    /// A race is probabilistic, so the arm runs several rounds. Measured with
+    /// the lock deleted, a single 8-racer round minted duplicates in 7 of 9
+    /// runs; six independent rounds make a lock-less handler pass this arm
+    /// with probability well under 1 in 1000. With the lock the outcome is not
+    /// probabilistic at all: the racers are serialized.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_first_creates_yield_one_challenge_without_the_unique_constraint(
+        pool: PgPool,
+    ) {
+        sqlx::query("ALTER TABLE claims DROP CONSTRAINT uq_claims_content_hash_agent")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Resolve the system agent and its group once, so the racers contend
+        // on the challenge insert and not on agent provisioning.
+        let seed = serde_json::json!({ "host": "seed.example", "port": 1, "protocol": "tcp" });
+        create_ok(test_state(pool.clone()), &seed, "seed").await;
+
+        for round in 0..6 {
+            let body = serde_json::json!({ "host": "race.example", "port": 9000 + round, "protocol": "tcp" });
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let state = test_state(pool.clone());
+                let body = body.clone();
+                handles.push(tokio::spawn(async move {
+                    create_ok(state, &body, "racer").await
+                }));
+            }
+            let mut ids = std::collections::BTreeSet::new();
+            for h in handles {
+                ids.insert(h.await.unwrap());
+            }
+            assert_eq!(
+                ids.len(),
+                1,
+                "round {round}: every racer must answer the same challenge: {ids:?}"
+            );
+            assert_eq!(
+                challenge_rows(&pool, &body).await,
+                1,
+                "round {round}: racers must insert once"
+            );
+        }
+    }
+
+    /// The repeat path on a NON-BYPASSING role. `#[sqlx::test]` connects as
+    /// `epigraph` — superuser, BYPASSRLS — so no policy filters the arms
+    /// above. Here the repeat runs on a pool whose every connection is
+    /// `SET SESSION AUTHORIZATION epigraph_app`, unstamped, which is what the
+    /// handler's `db_pool` is once the DSN is repointed at the app role.
+    ///
+    /// An unstamped `epigraph_app` session has no writable groups, so any
+    /// INSERT into `claims` fails `claims_tenancy`'s WITH CHECK (42501) —
+    /// before the unique index is consulted. A repeat that still attempted the
+    /// insert (main's handler, and a catch-the-23505 fix alike) answers 500
+    /// here. The lookup reads the challenge, which is `visibility = 'public'`
+    /// (`default_decl_for_author_pool`), and never reaches the insert.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_challenge_repeat_is_idempotent_on_the_app_role(pool: PgPool) {
+        let body =
+            serde_json::json!({ "host": "app-role.example", "port": 5000, "protocol": "https" });
+
+        // First create as the superuser, so the agent, its group and the row
+        // are exactly what the handler writes rather than a hand-built copy.
+        let first = create_ok(test_state(pool.clone()), &body, "first").await;
+
+        let opts = (*pool.connect_options()).clone();
+        let app_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::Executor::execute(conn, "SET SESSION AUTHORIZATION epigraph_app").await?;
+                    Ok(())
+                })
+            })
+            .connect_with(opts)
+            .await
+            .unwrap();
+        let (user, privileged): (String, bool) = sqlx::query_as(
+            "SELECT current_user::text, rolsuper OR rolbypassrls \
+             FROM pg_roles WHERE rolname = current_user",
+        )
+        .fetch_one(&app_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            user, "epigraph_app",
+            "CALIBRATION: the repeat must run as the app role"
+        );
+        assert!(
+            !privileged,
+            "CALIBRATION: the app role must be subject to RLS, or this arm proves nothing"
+        );
+
+        let second = create_ok(test_state(app_pool), &body, "repeat on epigraph_app").await;
+
+        assert_eq!(
+            second, first,
+            "the app-role repeat must answer the existing challenge"
+        );
+        assert_eq!(
+            challenge_rows(&pool, &body).await,
+            1,
+            "a repeat must write nothing"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
