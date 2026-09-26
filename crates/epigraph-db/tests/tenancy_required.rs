@@ -569,6 +569,19 @@ async fn assert_nonseed_superuser(conn: &mut sqlx::PgConnection) {
     );
 }
 
+/// An agent with NO personal group and no membership anywhere.
+async fn bare_agent(pool: &PgPool) -> Uuid {
+    let agent = Uuid::new_v4();
+    let pk: Vec<u8> = agent.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent)
+        .bind(&pk)
+        .execute(pool)
+        .await
+        .expect("bare agent");
+    agent
+}
+
 /// What `epigraph_session_is_seed()` answers, per kind of session: a
 /// superuser without a grant is NOT a seed although `pg_has_role` says it is;
 /// a superuser that reaches the role through an intermediate grant IS; the
@@ -742,6 +755,97 @@ async fn superuser_undeclared_claim_by_a_revoked_author_is_refused(pool: PgPool)
         err.as_database_error().and_then(|e| e.code()).as_deref(),
         Some("RVK01"),
         "expected 105's RVK01 from epigraph_ensure_personal_group; got {err}"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// As [`NONSEED_SUPERUSER`], insert a claim by `author` that NAMES
+/// `owner_group_id` and omits only `visibility`; returns its id.
+async fn half_declared_claim(
+    conn: &mut sqlx::PgConnection,
+    author: Uuid,
+    named: Uuid,
+    hash: u8,
+) -> Uuid {
+    become_role(conn, NONSEED_SUPERUSER).await;
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             owner_group_id) \
+         VALUES (gen_random_uuid(), 'owner named, visibility omitted', $1, 0.7, $2, true, $3) \
+         RETURNING id",
+    )
+    .bind(vec![hash; 32])
+    .bind(author)
+    .bind(named)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "a superuser write that names owner_group_id was refused for author {author}: {e}. \
+             The author's own group was resolved although the row does not use it"
+        )
+    });
+    reset_role(conn).await;
+    id
+}
+
+/// A writer that NAMES the owner and omits only `visibility` gets its owner
+/// kept and `'public'`, whatever the AUTHOR's own memberships are. The
+/// superuser arm must not resolve the author's group for such a row: doing so
+/// refused the write with `RVK01` when the author's own membership was revoked,
+/// although the row was never going to use that group. 074's seed arm did not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superuser_half_declared_claim_by_a_revoked_author_keeps_its_named_owner(pool: PgPool) {
+    let (_owner_agent, named) = fixture::seed_agent_with_group(&pool, "r2-named").await;
+    let (revoked, _g) = fixture::seed_agent_with_group(&pool, "r2-half-revoked").await;
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(revoked)
+        .execute(&pool)
+        .await
+        .expect("revoke the author's own row");
+    let mut tx = roles_tx(&pool).await;
+    assert_nonseed_superuser(&mut tx).await;
+
+    let id = half_declared_claim(&mut tx, revoked, named, 36).await;
+    assert_eq!(
+        tenancy_in(&mut tx, "claims", id).await,
+        (named, "public".to_string()),
+        "the named owner is kept and the omitted visibility is 'public'"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// The same half-declared write by an author with NO personal group must not
+/// mint one. Resolving the author's group for a row that names another owner
+/// minted a personal group and an admin membership as a side effect of a
+/// write that did not use them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superuser_half_declared_claim_mints_no_personal_group_for_its_author(pool: PgPool) {
+    let (_owner_agent, named) = fixture::seed_agent_with_group(&pool, "r2-named").await;
+    let groupless = bare_agent(&pool).await;
+    let mut tx = roles_tx(&pool).await;
+    assert_nonseed_superuser(&mut tx).await;
+
+    let id = half_declared_claim(&mut tx, groupless, named, 37).await;
+    assert_eq!(
+        tenancy_in(&mut tx, "claims", id).await,
+        (named, "public".to_string()),
+        "the named owner is kept and the omitted visibility is 'public'"
+    );
+    let (groups, memberships): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM groups \
+                  WHERE did_key = 'did:epigraph:personal:' || $1::text \
+                     OR created_by_agent_id = $1), \
+                (SELECT count(*) FROM group_memberships WHERE agent_id = $1)",
+    )
+    .bind(groupless)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("count the groupless author's groups");
+    assert_eq!(
+        (groups, memberships),
+        (0, 0),
+        "a write that named its owner minted a personal group for its author"
     );
     tx.rollback().await.expect("rollback");
 }

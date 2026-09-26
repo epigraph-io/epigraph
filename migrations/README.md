@@ -470,7 +470,10 @@ Current reservation:
   `epigraph_operator_actor`, else `('public', <author's personal group>)`
   through `epigraph_ensure_personal_group` — which is exactly what
   `ClaimRepository::default_decl_for_author` gives the same write on the
-  application path (105's RVK01/RVK02 refusals propagate). A non-seed
+  application path (105's RVK01/RVK02 refusals propagate). The author's group
+  is resolved only when the writer left `owner_group_id` NULL; a writer that
+  named the owner keeps it, and no personal group is minted for a row that
+  does not use it. A non-seed
   superuser's undeclared ROOT row (frames, contexts, perspectives,
   communities, harvester_fragments, recall_events) now RAISES 23502 like any
   other non-seed writer's: those tables have no author to derive from. The

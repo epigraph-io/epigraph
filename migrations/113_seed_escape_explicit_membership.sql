@@ -71,7 +71,12 @@
 --     the application path — the author's ACTING operator's personal group
 --     (`epigraph_operator_actor`, 107) if it has one, else the author's own
 --     personal group (`epigraph_ensure_personal_group`, 105), and
---     `visibility = 'public'` unless the writer named one. Resolved through
+--     `visibility = 'public'` unless the writer named one. The author's group
+--     is resolved ONLY when the writer left `owner_group_id` NULL: a writer
+--     that named the owner and omitted only `visibility` gets its owner kept
+--     and `'public'`, and neither mints a personal group for the author nor is
+--     refused because of the author's own memberships, because that group is
+--     not going to be used. Resolved through
 --     the same two definers, in the same order, so the kernel and the Rust
 --     write path cannot give one author two owners. 105's refusals propagate:
 --     an author whose only personal-group rows are revoked (RVK01), or whose
@@ -272,14 +277,20 @@ BEGIN
 
     -- 4b. A superuser that is not a seed: the author's own declaration, as
     --     `ClaimRepository::default_decl_for_author` resolves it (section 1c).
+    --     The author's group is resolved only when the writer did not name the
+    --     owner: resolving it anyway would mint a personal group, or refuse
+    --     over the author's revoked membership, for a group this row will not
+    --     use.
     IF COALESCE((SELECT r.rolsuper FROM pg_catalog.pg_roles r
                   WHERE r.rolname = session_user), false) THEN
-        SELECT a.operator_group_id INTO g
-          FROM public.epigraph_operator_actor(NEW.agent_id) a;
-        IF g IS NULL THEN
-            g := public.epigraph_ensure_personal_group(NEW.agent_id);
+        IF NEW.owner_group_id IS NULL THEN
+            SELECT a.operator_group_id INTO g
+              FROM public.epigraph_operator_actor(NEW.agent_id) a;
+            IF g IS NULL THEN
+                g := public.epigraph_ensure_personal_group(NEW.agent_id);
+            END IF;
+            NEW.owner_group_id := g;
         END IF;
-        NEW.owner_group_id := COALESCE(NEW.owner_group_id, g);
         NEW.visibility := COALESCE(NEW.visibility, 'public');
         RETURN NEW;
     END IF;
