@@ -501,9 +501,41 @@ Current reservation:
   **Applied to throwaway databases only (5433, with 113), NOT to any deployed
   database.**
 
-- **115+**: public next
+- **115**: public `owner_scoped_delete` (batch W9) — DELETE is owner-scoped on
+  every tier-A table. 077's FOR ALL policies used the READ predicate as DELETE's
+  USING, so the rows a session could remove were the rows it could read. One
+  RESTRICTIVE, FOR DELETE policy per table (`<table>_delete_owner`, 24 tables:
+  every relation carrying both tenancy columns bar the principal-keyed
+  `recall_events`) now also requires the row's owner in the session's writable
+  set; on `edges` the owner or the co-owner, or, for an edge between two public
+  endpoints (world-owned by 070's trigger), a writer of the edge's SOURCE node
+  (`epigraph_session_writes_node`, a caller-bound boolean definer). Privileged
+  sessions (`epigraph_bypass()`, `epigraph_definer_bypass()`) are unchanged.
+  The three code paths that invalidate other writers' edge-keyed BBAs (the
+  dedup's retracted collision edges, the retraction cascade's re-sourced edges,
+  the match-candidate retirement, now reordered to retract first) call
+  `epigraph_cascade_delete_edge_bbas(edge_ids, cause)` for a non-privileged
+  session: it admits a readable row that is the session's own, that belongs to
+  a retracted edge, or whose edge's source claim (or a retired duplicate of it
+  authored by the row's source agent) the session writes; refuses the whole call
+  (CD02, 42501) otherwise; and appends one `security_events` row
+  (`derived.cascade_bba_delete`) per call that deleted anything. The dedup's
+  canonical-side collision pre-delete stays a plain (now owner-scoped)
+  statement; a residual collision is resolved inside `epigraph_dedup_move_bbas`
+  (redefined, same signature) by dropping the duplicate's copy. The
+  `claims` / `evidence` / `reasoning_traces` `_cascade_edges` triggers run
+  `epigraph_cascade_delete_node_edges()`, 001's statement in a maintenance-owned
+  definer, so deleting a node one may delete still removes every edge pointing
+  at it. `epigraph_maintenance` gains DELETE on `mass_functions` and `edges`.
+  Registered with `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Behaviour
+  in `epigraph-db/tests/owner_scoped_delete.rs` (arms as `epigraph_app`).
+  **Deploy order: apply 115 BEFORE any binary built with it serves.** Undo is in
+  the file's header. **Applied to throwaway databases only (5433, with 113 and
+  114), NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `115` or
+- **116+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `116` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
