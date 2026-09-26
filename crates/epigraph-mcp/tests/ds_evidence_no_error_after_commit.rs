@@ -141,7 +141,7 @@ async fn an_own_group_claim_on_an_app_role_pool_is_not_error_with_commit(pool: P
         .await
         .expect("viewer");
 
-    let res = tools::ds::submit_ds_evidence(&server, &viewer, params(claim, frame)).await;
+    let res = tools::ds::submit_ds_evidence(&server, &viewer, params(claim, frame), None).await;
     assert_no_error_with_commit(&pool, claim, &res).await;
     // The agent owns the claim and can read it, so this one must SUCCEED: a
     // refusal here would be the old post-commit read's false "not found".
@@ -163,6 +163,6 @@ async fn a_caller_who_cannot_read_the_claim_gets_error_with_nothing_written(pool
     let server = server_on(pool.clone(), scoped);
     let viewer = fixture::public_viewer(&pool).await;
 
-    let res = tools::ds::submit_ds_evidence(&server, &viewer, params(claim, frame)).await;
+    let res = tools::ds::submit_ds_evidence(&server, &viewer, params(claim, frame), None).await;
     assert_no_error_with_commit(&pool, claim, &res).await;
 }

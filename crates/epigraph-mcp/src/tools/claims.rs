@@ -140,8 +140,9 @@ pub async fn submit_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: SubmitClaimParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    success_json(&submit_claim_response(server, viewer, params).await?)
+    success_json(&submit_claim_response(server, viewer, params, auth).await?)
 }
 
 /// `submit_claim` as a typed response rather than a serialized tool result.
@@ -154,13 +155,14 @@ pub(crate) async fn submit_claim_response(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: SubmitClaimParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<SubmitClaimResponse, McpError> {
-    let sub = match prepare_submission(server, viewer, params).await? {
+    let sub = match prepare_submission(server, viewer, params, auth).await? {
         PreparedSubmission::Existing(response) => return Ok(*response),
         PreparedSubmission::Fresh(sub) => *sub,
     };
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, sub.agent_id, "submit_claim").await?;
+        crate::claim_helper::begin_author_stamped_tx(server, sub.author, "submit_claim").await?;
     let written = write_submission(&mut tx, server, viewer, &sub, "submit_claim").await?;
     // COMMIT. Everything after this line is post-commit and best-effort.
     tx.commit().await.map_err(internal_error)?;
@@ -253,7 +255,9 @@ enum PreparedSubmission {
 /// by [`prepare_submission`] before any transaction opens.
 struct Submission {
     params: SubmitClaimParams,
+    author: crate::write_identity::WriteIdentity,
     agent_id: Uuid,
+    signer_agent_id: Uuid,
     agent_id_typed: AgentId,
     pub_key: [u8; 32],
     confidence: f64,
@@ -290,6 +294,7 @@ async fn prepare_submission(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     mut params: SubmitClaimParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<PreparedSubmission, McpError> {
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
@@ -310,8 +315,13 @@ async fn prepare_submission(
     // per rejected row.
     epigraph_db::reject_unexpanded_labels(&params.labels).map_err(db_caller_error)?;
 
-    let agent_id = server.agent_id().await?;
+    // The AUTHOR is the request's own principal (batch H-b, D1): the caller over
+    // HTTP, this server's agent on stdio. The SIGNER stays this server's key; the
+    // two are recorded apart (`claims.signer_id`, `evidence.signer_id`).
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
     let agent_id_typed = AgentId::from_uuid(agent_id);
+    let signer_agent_id = server.signer_agent_id().await?;
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.clamp(0.0, 1.0);
 
@@ -429,7 +439,9 @@ async fn prepare_submission(
 
     Ok(PreparedSubmission::Fresh(Box::new(Submission {
         params,
+        author,
         agent_id,
+        signer_agent_id,
         agent_id_typed,
         pub_key,
         confidence,
@@ -457,6 +469,7 @@ async fn write_submission(
         params,
         agent_id,
         agent_id_typed,
+        signer_agent_id,
         pub_key,
         confidence,
         weight,
@@ -465,8 +478,14 @@ async fn write_submission(
         evidence_type,
         ..
     } = sub;
-    let (agent_id, agent_id_typed, pub_key, confidence, weight) =
-        (*agent_id, *agent_id_typed, *pub_key, *confidence, *weight);
+    let (agent_id, agent_id_typed, signer_agent_id, pub_key, confidence, weight) = (
+        *agent_id,
+        *agent_id_typed,
+        *signer_agent_id,
+        *pub_key,
+        *confidence,
+        *weight,
+    );
     // ── THE ONE TRANSACTION THIS SUBMISSION RUNS IN ─────────────────────
     //
     // Claim + labels + Trace + Evidence + the two verb-edges + `update_trace_id`
@@ -491,8 +510,14 @@ async fn write_submission(
     // and a provider round trip must not hold a transaction open.
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
-    let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&mut *conn, viewer, claim, tool_name).await?;
+    let (claim, was_created) = crate::claim_helper::create_claim_idempotent(
+        &mut *conn,
+        viewer,
+        claim,
+        Some(signer_agent_id),
+        tool_name,
+    )
+    .await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Already validated above, before the claim write. This call can now only
@@ -509,8 +534,13 @@ async fn write_submission(
     // Build Evidence + Trace from this submission. Both are noun-claims with
     // their own UUIDs and signatures regardless of was_created.
     let evidence_hash = ContentHasher::hash(params.evidence_data.as_bytes());
+    // `Evidence::agent_id` IS `evidence.signer_id` (the table has no author
+    // column), and the digest is signed with THIS SERVER's key below. So it names
+    // the signer, not the author: naming the author recorded a caller's agent as
+    // the signer of a signature it never made, which `SignatureVerifier` then
+    // checks against the wrong public key.
     let evidence = Evidence::new(
-        agent_id_typed,
+        AgentId::from_uuid(signer_agent_id),
         pub_key,
         evidence_hash,
         evidence_type.clone(),
@@ -1032,6 +1062,7 @@ pub async fn update_with_evidence(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: UpdateWithEvidenceParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     // Two addressing modes, exactly one required: id-mode (`claim_id`) or
     // name-mode (`canonical_name` + `step_index`), the latter resolved through
@@ -1072,14 +1103,17 @@ pub async fn update_with_evidence(
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
-    let agent_id = server.agent_id().await?;
-    let agent_id_typed = AgentId::from_uuid(agent_id);
+    // Author = the request's principal (batch H-b, D1); signer = this server.
+    // See `prepare_submission` for why the evidence row names the SIGNER.
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
+    let signer_agent_id = server.signer_agent_id().await?;
     let pub_key = server.signer.public_key();
 
     // Create evidence
     let evidence_hash = ContentHasher::hash(params.evidence_data.as_bytes());
     let mut evidence = Evidence::new(
-        agent_id_typed,
+        AgentId::from_uuid(signer_agent_id),
         pub_key,
         evidence_hash,
         evidence_type,
@@ -1127,7 +1161,7 @@ pub async fn update_with_evidence(
     // this same transaction satisfies it. The two writes no longer need separate
     // commits to be orderable.
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
+        crate::claim_helper::begin_author_stamped_tx(server, author, "update_with_evidence")
             .await?;
 
     EvidenceRepository::create(&mut *tx, &evidence)
@@ -1229,8 +1263,8 @@ pub async fn update_with_evidence(
     // strength of a submission the caller was told had failed — the placement rule
     // the caller-label validation at the top of this function already follows.
     //
-    // IT SERVES ONLY CLAIMS THIS SERVER'S
-    // GROUP OWNS. The stamp carries `server.agent_id()`'s writable set, and
+    // IT SERVES ONLY CLAIMS THE CALLER'S
+    // GROUPS OWN. The stamp carries the write identity's writable set, and
     // `claims_tenancy`'s `WITH CHECK` asks about the ROW's `owner_group_id` — the
     // TARGET claim's group, not the evidence author's. So `update_with_evidence`
     // against another agent's claim stays refused on a cleanly-migrated schema,
@@ -1304,17 +1338,25 @@ pub async fn update_with_evidence(
 /// (the HTTP layer's check on PATCH `/api/v1/claims/:id/labels`) but
 /// scoped to the MCP entry path. Two callers, two policies:
 ///
+/// `caller` is the request's [`crate::write_identity::WriteIdentity`] — the
+/// same principal the write that follows authors and stamps as (batch H-b,
+/// D1), so the gate and the stamp cannot name two different agents.
+///
 /// - **HTTP (`auth = Some(_)`):** allow if the token carries
-///   `claims:admin` OR the caller's principal (`owner_id` falling back
-///   to `client_id`) equals `target_agent_id`. This is the path that
-///   unblocks cross-agent backlog retirement for admin-scope holders
-///   (backlog item `a4cc08a6`).
+///   `claims:admin`, OR `caller` (= `auth.agent_id`) authored the claim, OR
+///   (legacy, hand-minted tokens only) the token's `owner_id`/`client_id`
+///   equals `target_agent_id`, OR the operator arm below admits `caller`.
+///   The `claims:admin` arm is the path that unblocks cross-agent backlog
+///   retirement for admin-scope holders (backlog item `a4cc08a6`).
 /// - **stdio (`auth = None`):** the MCP server has no per-request
-///   identity, so degrade to comparing the claim's author against the
-///   server's own signer agent. Preserves the legacy behavior for
+///   identity, so `caller` is the server's own signer agent and the claim's
+///   author is compared against it. Preserves the legacy behavior for
 ///   non-HTTP callers without re-opening the cross-agent abuse vector —
 ///   *provided* that signer agent is a stable identity. When it is not,
 ///   see the `signer_identity_declared` arm below.
+///
+/// Returns WHICH arm admitted the caller ([`OwnershipGrant`]), because the
+/// admin arm alone carries no write authority of its own.
 ///
 /// ## The undeclared-signer arm
 ///
@@ -1408,42 +1450,55 @@ pub async fn update_with_evidence(
 pub(crate) async fn require_owner_or_admin(
     server: &EpiGraphMcpFull,
     auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
     target_agent_id: uuid::Uuid,
-) -> Result<(), McpError> {
+) -> Result<OwnershipGrant, McpError> {
+    let caller_agent = caller.agent_id();
     if let Some(auth) = auth {
         if auth.has_scope("claims:admin") {
-            return Ok(());
+            return Ok(OwnershipGrant::Admin);
         }
+        // THE AUTHOR ARM, keyed on `agents.id` (batch H-b, D1). Since D1 an
+        // authenticated caller's claims are authored as `auth.agent_id`, which
+        // `caller` carries (it is the request viewer's principal). Before, this
+        // branch compared only `owner_id` / `client_id` below, which are
+        // `oauth_clients.id` values (`tools::viewer`'s module doc), so a caller
+        // could not own the claims it had just written.
+        if caller_agent == target_agent_id {
+            return Ok(OwnershipGrant::Author);
+        }
+        // LEGACY, kept so no existing grant is withdrawn: a hand-minted token
+        // whose `sub`/`owner_id` is itself an `agents.id` (the e2e probes mint
+        // exactly that). It compares an `oauth_clients.id` to an `agents.id`,
+        // so on a real OAuth token it can only ever match by collision.
         let principal = auth.owner_id.unwrap_or(auth.client_id);
         if principal == target_agent_id {
-            return Ok(());
+            return Ok(OwnershipGrant::Author);
         }
         // Between the principal check and the denial, deliberately: every
         // ALLOW above is unchanged. One visible difference on the DENY path: a
         // failed operator lookup (e.g. a database without migration 107) now
         // returns an internal error instead of the ownership denial text — the
         // gate does not decide on an answer it did not get.
-        if let Some(caller) = auth.agent_id {
-            // `allow_actor = false`: operated agents are stdio-only.
-            if operator_arm_allows(server, caller, target_agent_id, false).await? {
-                return Ok(());
-            }
+        // `allow_actor = false`: operated agents are stdio-only.
+        if operator_arm_allows(server, caller_agent, target_agent_id, false).await? {
+            return Ok(OwnershipGrant::Operator);
         }
         return Err(McpError {
             code: rmcp::model::ErrorCode::INVALID_PARAMS,
             message: format!(
                 "claim is owned by agent {target_agent_id}; \
-                 caller principal {principal} cannot retire it \
-                 (requires claims:admin scope or ownership)"
+                 caller agent {caller_agent} (principal {principal}) cannot retire it \
+                 (requires claims:admin scope or ownership: authorship, or being the \
+                 author's operator)"
             )
             .into(),
             data: None,
         });
     }
 
-    let caller_agent = server.agent_id().await?;
     if caller_agent == target_agent_id {
-        return Ok(());
+        return Ok(OwnershipGrant::Author);
     }
 
     if !server.signer_identity_declared {
@@ -1459,7 +1514,7 @@ pub(crate) async fn require_owner_or_admin(
              owner-equality fallback is undecidable. Pass --agent-key to restore strict \
              ownership enforcement."
         );
-        return Ok(());
+        return Ok(OwnershipGrant::UndeclaredSigner);
     }
 
     // The operator arm runs AFTER the undeclared-signer arm, so that arm is
@@ -1470,7 +1525,7 @@ pub(crate) async fn require_owner_or_admin(
     // operated (`operator::check_operator_transport` refuses it) nor anyone's
     // operator.
     if operator_arm_allows(server, caller_agent, target_agent_id, true).await? {
-        return Ok(());
+        return Ok(OwnershipGrant::Operator);
     }
 
     Err(McpError {
@@ -1479,13 +1534,34 @@ pub(crate) async fn require_owner_or_admin(
             "claim is owned by agent {target_agent_id}; \
              caller agent {caller_agent} cannot retire it. This transport carries no \
              AuthContext, and {caller_agent} is this server's declared signer identity \
-             (--agent-key / --agent-model), so ownership is enforced against it. Use an \
+             (--agent-key / --agent-model), so ownership is enforced against it: only the \
+             author, or an agent acting for the author's operator, may. Use an \
              authenticated HTTP listener with a claims:admin token, or run this server \
              under the owning agent's key."
         )
         .into(),
         data: None,
     })
+}
+
+/// Which arm of [`require_owner_or_admin`] admitted a caller.
+///
+/// Returned rather than discarded because ONE arm changes how the write must be
+/// made. `Admin` is the only grant that carries no write authority of its own:
+/// the other arms admit a caller whose own stamp can normally write the claim's
+/// owner group (the author's personal group, or its operator's, which an acting
+/// agent is a writer of). An `Admin` caller that cannot write the owner group
+/// must not borrow anyone's stamp (batch H-b, D2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnershipGrant {
+    /// The caller authored the claim.
+    Author,
+    /// The caller is (or acts for) the operator of the claim's author (#503).
+    Operator,
+    /// stdio, with a per-process random signer: undecidable, allowed.
+    UndeclaredSigner,
+    /// An authenticated `claims:admin` caller.
+    Admin,
 }
 
 /// The operator arm of [`require_owner_or_admin`]; see its doc for the rule.
@@ -1501,7 +1577,7 @@ pub(crate) async fn require_owner_or_admin(
 ///
 /// `allow_actor` is `false` on the HTTP transport: there only `caller ==
 /// author_op(target)` (the operator itself) is admitted, never the actor arm.
-async fn operator_arm_allows(
+pub(crate) async fn operator_arm_allows(
     server: &EpiGraphMcpFull,
     caller: uuid::Uuid,
     target: uuid::Uuid,
@@ -1559,7 +1635,8 @@ async fn operator_arm_allows(
 /// `claims_tenancy`'s WITH CHECK refuses on an unstamped session, so on a
 /// cleanly-migrated schema that partial state was the normal outcome.
 ///
-/// The stamp is `server.agent_id()`'s, the author of the resolution claim, as
+/// The stamp is the write identity's (the caller over HTTP, the server agent on
+/// stdio), the author of the resolution claim, as
 /// for every other MCP write. The label PATCH therefore succeeds for an item
 /// owned by that agent's group, which is the item the stdio ownership gate
 /// admits. A `claims:admin` HTTP caller retiring ANOTHER agent's item is
@@ -1585,12 +1662,10 @@ pub async fn resolve_backlog_item(
     // call the embedding provider (the novelty gate), and a provider round trip
     // must not hold a transaction open. This one only reads; dropping it rolls
     // back nothing.
-    let mut gate_tx = crate::claim_helper::begin_author_stamped_tx(
-        server,
-        server.agent_id().await?,
-        "resolve_backlog_item",
-    )
-    .await?;
+    let caller = server.write_identity(auth, viewer).await?;
+    let mut gate_tx =
+        crate::claim_helper::begin_author_stamped_tx(server, caller, "resolve_backlog_item")
+            .await?;
 
     // Confirm the target exists; we do NOT require the "backlog" label —
     // a stricter precondition belongs to the call site (HTTP filters /
@@ -1609,7 +1684,7 @@ pub async fn resolve_backlog_item(
     // fall back to the legacy agent-equality check against the server's
     // own signer agent — preserves backward compat for non-HTTP callers.
     let target_agent = original.agent_id.as_uuid();
-    require_owner_or_admin(server, auth, target_agent).await?;
+    let mut grant = require_owner_or_admin(server, auth, caller, target_agent).await?;
 
     // Resolve the closure basis BEFORE anything is created.
     //
@@ -1672,7 +1747,7 @@ pub async fn resolve_backlog_item(
         // never suppress or flag them via the semantic gate.
         novelty_threshold: Some(0.0),
     };
-    let sub = match prepare_submission(server, viewer, submit_params).await? {
+    let sub = match prepare_submission(server, viewer, submit_params, auth).await? {
         PreparedSubmission::Fresh(sub) => *sub,
         // Unreachable at `novelty_threshold = 0.0`: no distance is below zero,
         // so the gate never returns an existing claim for a resolution. Refused
@@ -1690,7 +1765,7 @@ pub async fn resolve_backlog_item(
     // THE ONE TRANSACTION. Resolution claim, `justifies` edges and the label
     // PATCH all run on it; see the function doc.
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, sub.agent_id, "resolve_backlog_item")
+        crate::claim_helper::begin_author_stamped_tx(server, sub.author, "resolve_backlog_item")
             .await?;
 
     // RE-DECIDE THE GATE ON THE WRITE TRANSACTION. The reads above ran on
@@ -1711,7 +1786,8 @@ pub async fn resolve_backlog_item(
             ))
         })?;
     if original_now.agent_id.as_uuid() != target_agent {
-        require_owner_or_admin(server, auth, original_now.agent_id.as_uuid()).await?;
+        grant =
+            require_owner_or_admin(server, auth, caller, original_now.agent_id.as_uuid()).await?;
     }
     for basis_uuid in &basis_ids {
         ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(*basis_uuid))
@@ -1788,15 +1864,45 @@ pub async fn resolve_backlog_item(
     // 3. PATCH the original's labels: add "resolved", keep "backlog". In the
     //    same transaction: a refusal here rolls back the resolution claim and
     //    its edges, so an item is never left open beside a resolution of it.
+    //
+    //    A `claims:admin` caller retiring an item in a group it cannot write
+    //    takes the audited admin path for THIS step (batch H-b, D2): the
+    //    resolution claim and its edges are the admin's own, in the admin's own
+    //    group, and only the original's label crosses the group boundary, through
+    //    the definer that records the admin as principal and writes the audit
+    //    row. Same transaction, so the whole retirement is still one fact.
+    let owner_group =
+        crate::tools::admin_write::owner_group_of(&mut tx, viewer, original_id).await?;
     let after_labels =
-        ClaimRepository::update_labels_conn(&mut tx, original_id, &["resolved".to_string()], &[])
+        if crate::tools::admin_write::takes_admin_path(Some(grant), viewer, owner_group) {
+            crate::tools::admin_write::admin_patch(
+                &mut tx,
+                auth,
+                original_id,
+                epigraph_db::AdminClaimAction::ResolveBacklogItem,
+                &["resolved".to_string()],
+                &[],
+                None,
+                None,
+            )
+            .await?
+            .labels
+        } else {
+            ClaimRepository::update_labels_conn(
+                &mut tx,
+                original_id,
+                &["resolved".to_string()],
+                &[],
+            )
             .await
             .map_err(|e| {
                 internal_error(format!(
-            "resolve_backlog_item: could not label {original_id} resolved: {e}. Nothing was \
-             written: the resolution claim and its basis edges were rolled back with it."
-        ))
-            })?;
+                    "resolve_backlog_item: could not label {original_id} resolved: {e}. Nothing \
+                     was written: the resolution claim and its basis edges were rolled back \
+                     with it."
+                ))
+            })?
+        };
 
     tx.commit().await.map_err(internal_error)?;
 
@@ -1834,8 +1940,8 @@ pub const JUSTIFIES_RELATIONSHIP: &str = "justifies";
 pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 
 /// Apply `resolve_backlog_item`'s ownership gate to a free-form label mutation,
-/// but ONLY when it touches [`RETIREMENT_LABEL`] and ONLY on a transport that
-/// carries an `AuthContext` (issue #374).
+/// but ONLY when it touches [`RETIREMENT_LABEL`] (issue #374). On EVERY
+/// transport since batch H-b.
 ///
 /// ## The asymmetry this closes
 ///
@@ -1856,49 +1962,55 @@ pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 /// Both directions are gated: *removing* `resolved` un-retires a claim, which is
 /// the same authority as retiring it.
 ///
-/// ## Why only the authenticated transport — and what stays open
+/// ## The stdio half (#374), closed in batch H-b
 ///
-/// `auth = None` means stdio, and stdio is NOT a trust boundary here: the
-/// process that spawned the server handed it `--database-url`, so it already
-/// holds unmediated write access to every row this gate protects (the same
-/// argument [`require_owner_or_admin`]'s doc comment makes for its own stdio
-/// arm). Gating it would also break a live, documented workflow rather than an
-/// abuse: `epiclaw-host`'s baked `release/epiclaw/CLAUDE.md` instructs every
-/// scheduled agent to retire cross-agent backlog items with exactly
-/// `update_labels(original_id, add=["resolved"])`, because `resolve_backlog_item`
-/// refuses them.
+/// This gate used to return `Ok` whenever `auth` was `None`, so any stdio
+/// caller could add `resolved` to a claim it did not own. It was left open
+/// because the sanctioned path was unreachable for the fleet: epiclaw's
+/// scheduled agents run with a DECLARED signer (`EPIGRAPH_AGENT_MODEL`,
+/// `main::select_signer` rung 1), and `require_owner_or_admin`'s stdio arm
+/// compared the claim's author against that one agent, so a model bump (a new
+/// identity) could not retire its predecessor's items at all. #503's operator
+/// arms are what make it reachable: agents linked to the same operator are
+/// co-owners, so a new identity may retire the items of every other agent
+/// under its operator. With that in place the stdio half takes the normal
+/// ownership rule — the author, or an agent acting for the author's operator.
+/// The undeclared-signer arm (a per-process random signer, no `--agent-key` /
+/// `--agent-model`) is REFUSED here: it admits on UNDECIDABLE ownership, and
+/// the batch H-b review measured it adding `resolved` to a foreign claim on
+/// config B. Everyone else is refused; an admin retiring across operators uses
+/// the audited admin path, which needs an authenticated `claims:admin` token
+/// (batch H-b, D2).
 ///
-/// That refusal is real and was **re-measured, not assumed**: the epiclaw
-/// agent-runner exports `EPIGRAPH_AGENT_MODEL` /
-/// `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` (`agent-runner/src/index.ts`,
-/// `agentIdentityEnv`), so `main::select_signer` takes rung 1 and
-/// `signer_identity_declared` is **true** for the fleet — the
-/// warn-and-allow `!signer_identity_declared` arm does not cover them. Gating
-/// stdio here would therefore leave those agents with no way to retire a
-/// backlog item at all.
+/// The populations this newly refuses: a stdio agent retiring a claim by an
+/// agent it shares no operator with (unlinked fleet agents included) — the
+/// `release/epiclaw/CLAUDE.md` procedure that relabels cross-agent items with
+/// `update_labels` now works only between agents linked to one operator — and
+/// an undeclared-signer stdio server retiring anything it did not author.
 ///
-/// So this closes the remotely-reachable half and leaves the local half as it
-/// was. The stdio bypass remains open by design until the sanctioned path is
-/// reachable for the fleet; issue #374 stays open for that half.
+/// Removing `backlog` also takes an item out of the open-backlog query and is
+/// NOT gated here: it is free vocabulary on stdio (the batch H-b bar freezes
+/// stdio free labels), and over HTTP the whole label mutation is gated anyway.
+/// Whether `backlog` removal is a retirement is an open operator decision
+/// (scripts/e2e/README.md, R3 checklist).
+#[allow(clippy::too_many_arguments)]
 async fn gate_retirement_label(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
     claim_id: Uuid,
     add: &[String],
     remove: &[String],
-) -> Result<(), McpError> {
+) -> Result<Option<OwnershipGrant>, McpError> {
     let touches_retirement = add
         .iter()
         .chain(remove.iter())
         .any(|l| l == RETIREMENT_LABEL);
     if !touches_retirement {
-        return Ok(());
+        return Ok(None);
     }
-    let Some(auth) = auth else {
-        return Ok(());
-    };
 
     // Only fetched on the gated path, so the common label mutation keeps its
     // single round-trip. This also means a `resolved` mutation now reports
@@ -1923,7 +2035,28 @@ async fn gate_retirement_label(
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
-    require_owner_or_admin(server, Some(auth), claim.agent_id.as_uuid()).await
+    let grant = require_owner_or_admin(server, auth, caller, claim.agent_id.as_uuid()).await?;
+    // THE UNDECLARED-SIGNER ARM DOES NOT RETIRE (batch H-b review). That arm
+    // admits a cross-agent mutation because ownership is UNDECIDABLE on a stdio
+    // server with a per-process random signer, not because it is decided in
+    // the caller's favour. For the retirement label that is exactly #374's
+    // hole: measured on config B, such a server added `resolved` to a FOREIGN
+    // claim through `update_labels`. Its own claims are unaffected (they pass
+    // the author arm first), and `resolve_backlog_item`, which leaves the
+    // `Resolves <id>:` trail this gate exists to protect, keeps the arm.
+    if grant == OwnershipGrant::UndeclaredSigner {
+        return Err(invalid_params(format!(
+            "claim {claim_id} is owned by agent {}; this stdio server has no declared signer \
+             identity (--agent-key / --agent-model absent), so whether caller agent {} owns it \
+             cannot be decided, and adding or removing '{RETIREMENT_LABEL}' needs a decided \
+             owner. Run the server under the owning agent's key (or one linked to the same \
+             operator), use resolve_backlog_item, or use the audited admin path over HTTP. \
+             Nothing was written.",
+            claim.agent_id.as_uuid(),
+            caller.agent_id()
+        )));
+    }
+    Ok(Some(grant))
 }
 
 pub async fn update_labels(
@@ -1942,38 +2075,76 @@ pub async fn update_labels(
     // it, so nothing is persisted — only the reported code was wrong here.
     //
     // Author-stamped, because this is an `UPDATE claims` and `claims_tenancy`'s
-    // WITH CHECK refuses it on an unstamped session. The stamp is the MCP
-    // server's own agent, which is what makes the SANCTIONED case work: the
-    // stdio ownership gate above degrades to "the claim's author is this server's
-    // agent", so the row is owned by the group this session can write. A
-    // `claims:admin` HTTP caller relabelling ANOTHER agent's claim is still
-    // refused on a cleanly-migrated schema, because the row is owned by that
-    // agent's group and no viewer this process can resolve carries write
-    // authority there — the same residual `challenge_claim` carries, and a
-    // tenancy-model question rather than a stamping one.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(
-        server,
-        server.agent_id().await?,
-        "update_labels",
-    )
-    .await?;
-    // The gate reads on the SAME stamped transaction; a refusal drops `tx`, which
-    // rolls back, so nothing is written.
-    gate_retirement_label(
+    // WITH CHECK refuses it on an unstamped session. The stamp is the CALLER's
+    // (batch H-b, D1): an author, or an operator over its agents' claims, writes
+    // the group its own stamp can write. A `claims:admin` caller relabelling a
+    // claim in a group it cannot write takes the audited admin path instead
+    // (D2, `tools::admin_write`): same transaction (stamped from the ADMIN, never
+    // the author), a definer that re-checks the grant and writes the audit row.
+    let caller = server.write_identity(auth, viewer).await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, caller, "update_labels").await?;
+    // OWNERSHIP OF THE WHOLE MUTATION on the authenticated transport, exactly as
+    // `patch_claim` and the HTTP twin (`PATCH /api/v1/claims/:id/labels`,
+    // `require_owner_or_admin`) require. Batch H-b review, measured on config A:
+    // with only the retirement label gated here, a teammate that is a writer of
+    // the team group owning a colleague's claim relabelled it through
+    // `update_labels` (D1 gave its stamp that reach) while `patch_claim` with
+    // the identical labels refused it. On stdio free labels stay ungated, the
+    // batch H-b bar (stdio changes only for #374); the retirement label is
+    // gated on every transport below. The read is on the SAME stamped
+    // transaction; a refusal drops `tx`, which rolls back, so nothing is
+    // written.
+    let grant = if auth.is_some() {
+        let target = ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(id))
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
+        Some(require_owner_or_admin(server, auth, caller, target.agent_id.as_uuid()).await?)
+    } else {
+        None
+    };
+    let retirement_grant = gate_retirement_label(
         server,
         &mut tx,
         viewer,
         auth,
+        caller,
         id,
         &params.add,
         &params.remove,
     )
     .await?;
-    let labels = ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
-        .await
-        .map_err(db_caller_error)?;
+    let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;
+    let admin_path = crate::tools::admin_write::takes_admin_path(
+        grant.or(retirement_grant),
+        viewer,
+        owner_group,
+    );
+    let labels = if admin_path {
+        crate::tools::admin_write::admin_patch(
+            &mut tx,
+            auth,
+            id,
+            epigraph_db::AdminClaimAction::UpdateLabels,
+            &params.add,
+            &params.remove,
+            None,
+            None,
+        )
+        .await?
+        .labels
+    } else {
+        ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
+            .await
+            .map_err(db_caller_error)?
+    };
     tx.commit().await.map_err(internal_error)?;
-    success_json(&serde_json::json!({ "claim_id": id, "labels": labels }))
+    success_json(&serde_json::json!({
+        "claim_id": id,
+        "labels": labels,
+        "admin_path": admin_path,
+    }))
 }
 
 pub async fn patch_claim(
@@ -1996,7 +2167,7 @@ pub async fn patch_claim(
             "at least one of trace_id/properties/add_labels/remove_labels required",
         ));
     }
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT, and every read
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1), and every read
     // and write below runs on it.
     //
     // This was `server.pool.begin()`: atomic, but carrying no tenancy context,
@@ -2006,21 +2177,14 @@ pub async fn patch_claim(
     // `patch_claim_atomic_conn` took a `&mut sqlx::Transaction`, which a
     // `ScopedTx` is not. It now takes the connection a `ScopedTx` derefs to.
     //
-    // THE STAMP IS `server.agent_id()`'s, the same as `update_labels`, and for
-    // the same reason. Every claim this MCP process writes is authored by that
-    // agent and owned by its group, so that is the population the stamp admits.
-    // A claim owned by another agent's group is refused loudly (`42501` from the
-    // UPDATE, or not-found from the row lock). Nothing is written, because the
-    // refusal aborts this transaction and it is never committed. Whether a
-    // `claims:admin` caller should carry write authority into a group this
-    // process cannot write is the cross-agent ownership question (#374), not a
-    // stamping one.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(
-        server,
-        server.agent_id().await?,
-        "patch_claim",
-    )
-    .await?;
+    // THE STAMP IS THE WRITE IDENTITY's, the same as `update_labels`, and for
+    // the same reason. A claim owned by a group the caller cannot write is
+    // refused loudly (`42501` from the UPDATE, or not-found from the row lock),
+    // with nothing written — unless the caller holds `claims:admin`, in which
+    // case the whole patch takes the audited admin path (batch H-b, D2).
+    let caller = server.write_identity(auth, viewer).await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, caller, "patch_claim").await?;
 
     // The CALLER's read authority, on the same transaction. Before this,
     // `patch_claim` checked caller visibility only on the retirement-label path
@@ -2039,43 +2203,71 @@ pub async fn patch_claim(
     // who could merely READ a server-authored claim could rewrite its trace and
     // properties with the server's write authority (batch H-a review,
     // atomicity-authz). Only when `auth` is present: on stdio the caller IS the
-    // process that holds the DSN, and a cross-agent patch there is the
-    // #374 stdio half, left open by design (see `gate_retirement_label`).
-    if auth.is_some() {
-        require_owner_or_admin(server, auth, target.agent_id.as_uuid()).await?;
-    }
+    // process that holds the DSN, and a cross-agent patch of trace/properties
+    // there stays ungated (batch H-b left stdio unchanged except for the
+    // retirement label, which `gate_retirement_label` below now gates on every
+    // transport, #374).
+    let grant = if auth.is_some() {
+        Some(require_owner_or_admin(server, auth, caller, target.agent_id.as_uuid()).await?)
+    } else {
+        None
+    };
 
     // Same gate as `update_labels`: `patch_claim` also accepts
     // `add_labels`/`remove_labels`, so leaving it ungated would just move the
     // bypass one tool over (issue #374).
-    gate_retirement_label(
+    let retirement_grant = gate_retirement_label(
         server,
         &mut tx,
         viewer,
         auth,
+        caller,
         id,
         &params.add_labels,
         &params.remove_labels,
     )
     .await?;
-    let diff = ClaimRepository::patch_claim_atomic_conn(
-        &mut tx,
-        ClaimId::from_uuid(id),
-        &PatchClaimInput {
-            trace_id: trace,
-            properties: params.properties.clone(),
-            add_labels: params.add_labels.clone(),
-            remove_labels: params.remove_labels.clone(),
-        },
-    )
-    .await
-    .map_err(db_caller_error)?;
+    let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;
+    let admin_path = crate::tools::admin_write::takes_admin_path(
+        grant.or(retirement_grant),
+        viewer,
+        owner_group,
+    );
+    let (after_labels, after_props, after_trace) = if admin_path {
+        let w = crate::tools::admin_write::admin_patch(
+            &mut tx,
+            auth,
+            id,
+            epigraph_db::AdminClaimAction::PatchClaim,
+            &params.add_labels,
+            &params.remove_labels,
+            params.properties.as_ref(),
+            trace,
+        )
+        .await?;
+        (w.labels, w.properties, w.trace_id)
+    } else {
+        let diff = ClaimRepository::patch_claim_atomic_conn(
+            &mut tx,
+            ClaimId::from_uuid(id),
+            &PatchClaimInput {
+                trace_id: trace,
+                properties: params.properties.clone(),
+                add_labels: params.add_labels.clone(),
+                remove_labels: params.remove_labels.clone(),
+            },
+        )
+        .await
+        .map_err(db_caller_error)?;
+        (diff.after_labels, diff.after_props, diff.after_trace)
+    };
     tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({
         "claim_id": id,
-        "after_labels": diff.after_labels,
-        "after_properties": diff.after_props,
-        "after_trace": diff.after_trace,
+        "after_labels": after_labels,
+        "after_properties": after_props,
+        "after_trace": after_trace,
+        "admin_path": admin_path,
     }))
 }
 

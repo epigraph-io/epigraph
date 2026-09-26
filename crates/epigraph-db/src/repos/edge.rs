@@ -901,6 +901,31 @@ impl EdgeRepository {
         Ok(q.fetch_one(executor).await?)
     }
 
+    /// The `(source_type, source_id)` of edge `id`, read through `viewer`, or
+    /// `None` when the edge does not exist or the viewer cannot see it (batch
+    /// H-b review: MCP `patch_edge`'s ownership check keys on the edge's SOURCE,
+    /// whose author asserted it). Run it on the same transaction as the write.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn source_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<(String, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.source_type::text, e.source_id FROM edges e \
+              WHERE e.id = $1 /* {EDGE_VISIBILITY:e} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String, Uuid)>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
+
     /// Retract edges by closing their validity interval instead of deleting them.
     ///
     /// This is the non-destructive counterpart to `DELETE FROM edges`. The row —

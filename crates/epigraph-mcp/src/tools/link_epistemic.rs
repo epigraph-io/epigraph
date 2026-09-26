@@ -144,8 +144,9 @@ pub async fn link_epistemic(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: LinkEpistemicParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_link_epistemic(server, viewer, params).await
+    do_link_epistemic(server, viewer, params, auth).await
 }
 
 /// Core logic factored out so integration tests can call it directly without
@@ -155,6 +156,7 @@ pub async fn do_link_epistemic(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: LinkEpistemicParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let source_id = parse_uuid(&params.source_claim_id)?;
     let target_id = parse_uuid(&params.target_claim_id)?;
@@ -181,7 +183,7 @@ pub async fn do_link_epistemic(
         ));
     }
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT. The existence
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1). The existence
     // reads, the edge, the belief wiring, the `edge.added` event and the belief
     // readback all run on it, and it commits once.
     //
@@ -206,15 +208,16 @@ pub async fn do_link_epistemic(
     // other outcome. That keeps the old contract: `belief_wired` and the committed
     // state cannot disagree.
     //
-    // THE STAMP IS `server.agent_id()`'s, as for every other MCP write. An
+    // THE STAMP IS THE WRITE IDENTITY's (`EpiGraphMcpFull::write_identity`), as for every other MCP write. An
     // endpoint in another agent's private group is refused loudly by the edge's
     // WITH CHECK, or for a co-owned edge by RETURNING's intersection read, and
     // nothing is written. Whether a caller should carry write authority into a
     // group this process cannot write is the cross-agent ownership question
     // (#374), not a stamping one.
-    let actor_id = server.agent_id().await?;
+    let actor = server.write_identity(auth, viewer).await?;
+    let actor_id = actor.agent_id();
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "link_epistemic").await?;
+        crate::claim_helper::begin_author_stamped_tx(server, actor, "link_epistemic").await?;
 
     // Verify both claims exist via the repo layer (SQL stays in epigraph-db).
     // Disambiguate which side is missing.

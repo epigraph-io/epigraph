@@ -54,6 +54,7 @@ async fn submit_claim_reports_a_content_hash_hit_and_what_it_kept(pool: PgPool) 
             &server,
             &viewer,
             submit(content, "first evidence", &["g11-a"]),
+            None,
         )
         .await
         .expect("first submit"),
@@ -66,7 +67,7 @@ async fn submit_claim_reports_a_content_hash_hit_and_what_it_kept(pool: PgPool) 
     let mut again = submit(content, "second, different evidence", &["g11-b"]);
     again.novelty_threshold = Some(0.2);
     let second = first_text(
-        &epigraph_mcp::tools::claims::submit_claim(&server, &viewer, again)
+        &epigraph_mcp::tools::claims::submit_claim(&server, &viewer, again, None)
             .await
             .expect("resubmit"),
     );
@@ -132,7 +133,7 @@ async fn an_empirical_source_url_is_reported_discarded(pool: PgPool) {
     let content = "g11: empirical evidence keeps no url";
     let mut p = submit(content, "ev", &[]);
     p.evidence_type = "empirical".into();
-    epigraph_mcp::tools::claims::submit_claim(&server, &viewer, p)
+    epigraph_mcp::tools::claims::submit_claim(&server, &viewer, p, None)
         .await
         .unwrap();
 
@@ -140,7 +141,7 @@ async fn an_empirical_source_url_is_reported_discarded(pool: PgPool) {
     p.evidence_type = "empirical".into();
     let url = p.source_url.clone().unwrap();
     let second = first_text(
-        &epigraph_mcp::tools::claims::submit_claim(&server, &viewer, p)
+        &epigraph_mcp::tools::claims::submit_claim(&server, &viewer, p, None)
             .await
             .unwrap(),
     );
@@ -186,6 +187,7 @@ async fn memorize_reports_a_content_hash_hit(pool: PgPool) {
                 tags: Some(vec!["g11-m1".into()]),
                 novelty_threshold: None,
             },
+            None,
         )
         .await
         .unwrap(),
@@ -202,6 +204,7 @@ async fn memorize_reports_a_content_hash_hit(pool: PgPool) {
                 tags: Some(vec!["g11-m2".into()]),
                 novelty_threshold: None,
             },
+            None,
         )
         .await
         .unwrap(),
@@ -246,7 +249,7 @@ async fn batch_submit_claims_reports_dedup_per_entry(pool: PgPool) {
         }))
         .unwrap();
     let json = first_text(
-        &epigraph_mcp::tools::batch::batch_submit_claims(&server, &viewer, params)
+        &epigraph_mcp::tools::batch::batch_submit_claims(&server, &viewer, params, None)
             .await
             .unwrap(),
     );
@@ -286,7 +289,7 @@ async fn batch_dedup_lists_only_inputs_the_entry_supplied(pool: PgPool) {
         }))
         .unwrap();
     let json = first_text(
-        &epigraph_mcp::tools::batch::batch_submit_claims(&server, &viewer, params)
+        &epigraph_mcp::tools::batch::batch_submit_claims(&server, &viewer, params, None)
             .await
             .unwrap(),
     );

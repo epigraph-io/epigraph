@@ -73,14 +73,99 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &WorkflowExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<(IngestWorkflowResponse, Vec<(uuid::Uuid, String)>), McpError> {
+    // H3 (batch H-b): the submitter is recorded by THIS entry point, never
+    // taken from the caller's metadata; see `tools::workflow_authority`.
+    let caller = server.write_identity(auth, viewer).await?;
+    let mut extraction = extraction.clone();
+    crate::tools::workflow_authority::strip_submitter(&mut extraction.source.metadata);
+    let extraction = &extraction;
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
 
     let (_system_agent_id, mut tx) =
         crate::claim_helper::begin_system_ingest_stamped_tx(server, "workflow_ingest").await?;
+
+    // WHICH EXISTING ROWS THIS INGEST TOUCHES (batch H-b, H3 review): the exact
+    // row (a re-ingest, which the executor short-circuits), the head of the
+    // lineage `canonical_name` already names (a new generation of it, parent
+    // or no parent), and exactly the row the executor links as `parent_id`.
+    let anchors = epigraph_db::WorkflowRepository::ingest_anchors(
+        &mut tx,
+        &extraction.source.canonical_name,
+        extraction.source.generation as i32,
+        extraction.source.parent_canonical_name.as_deref(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let creating = anchors.existing.is_none();
+    // `inherited`: `Some(x)` = the new row inherits submitter `x` (possibly no
+    // record); `None` = a brand-new lineage, whose submitter is the caller.
+    let mut inherited: Option<Option<uuid::Uuid>> = None;
+    let mut admin_write = false;
+    if creating {
+        let mut checked: Vec<uuid::Uuid> = Vec::with_capacity(2);
+        for anchor in [anchors.lineage_head, anchors.linked_parent]
+            .into_iter()
+            .flatten()
+        {
+            if checked.contains(&anchor) {
+                continue;
+            }
+            checked.push(anchor);
+            let grant = crate::tools::workflow_authority::require_workflow_authority(
+                server,
+                &mut tx,
+                auth,
+                caller,
+                anchor,
+                "workflow_ingest",
+            )
+            .await?;
+            admin_write |= grant.admin;
+            // The lineage head is checked first, so a new generation of an
+            // existing name inherits ITS submitter; a new name forked from a
+            // parent inherits the parent's.
+            inherited.get_or_insert(grant.owner);
+        }
+    }
+
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, extraction)
         .await
         .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
+    // Recorded only when THIS call created the row: a re-ingest of an existing
+    // (possibly pre-H-b, unrecorded) workflow must not make its caller the owner.
+    let submitter = inherited.unwrap_or(Some(caller.agent_id()));
+    if creating {
+        if let Some(submitter) = submitter {
+            epigraph_db::WorkflowRepository::record_submitter(
+                &mut *tx,
+                result.workflow_id,
+                submitter,
+            )
+            .await
+            .map_err(internal_error)?;
+        }
+    }
+    if admin_write {
+        crate::tools::workflow_authority::audit_admin_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            "workflow_ingest",
+            result.workflow_id,
+            submitter,
+            serde_json::json!({
+                "canonical_name": extraction.source.canonical_name,
+                "generation": extraction.source.generation,
+                "parent_canonical_name": extraction.source.parent_canonical_name,
+                "lineage_head_before": anchors.lineage_head,
+                "linked_parent": anchors.linked_parent,
+                "claims_ingested": result.claims_ingested,
+            }),
+        )
+        .await?;
+    }
     tx.commit()
         .await
         .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
@@ -289,9 +374,10 @@ pub async fn do_ingest_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &WorkflowExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let (response, inserted) =
-        execute_workflow_ingest_with_inserted(server, viewer, extraction).await?;
+        execute_workflow_ingest_with_inserted(server, viewer, extraction, auth).await?;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue —
@@ -327,8 +413,9 @@ pub async fn ingest_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: IngestWorkflowParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_ingest_workflow(server, viewer, &params.extraction).await
+    do_ingest_workflow(server, viewer, &params.extraction, auth).await
 }
 
 // ── improve_workflow_hierarchy ─────────────────────────────────────────────
@@ -366,6 +453,7 @@ async fn improve_workflow_hierarchy_with_inserted(
     viewer: &epigraph_db::visibility::Viewer,
     parent_canonical_name: &str,
     mut extraction: WorkflowExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<(ImproveWorkflowHierarchyResponse, Vec<(uuid::Uuid, String)>), McpError> {
     let parent_max = epigraph_db::WorkflowRepository::max_generation_by_canonical(
         &server.pool,
@@ -387,7 +475,7 @@ async fn improve_workflow_hierarchy_with_inserted(
     extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
 
     let (response, inserted) =
-        execute_workflow_ingest_with_inserted(server, viewer, &extraction).await?;
+        execute_workflow_ingest_with_inserted(server, viewer, &extraction, auth).await?;
 
     let improve_response = ImproveWorkflowHierarchyResponse {
         parent_canonical_name: parent_canonical_name.to_string(),
@@ -453,6 +541,7 @@ pub async fn improve_workflow_hierarchy(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: ImproveWorkflowHierarchyParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     // Save goal before params.extraction is consumed by improve_workflow_hierarchy_with_inserted.
     let goal = params.extraction.source.goal.clone();
@@ -461,6 +550,7 @@ pub async fn improve_workflow_hierarchy(
         viewer,
         &params.parent_canonical_name,
         params.extraction,
+        auth,
     )
     .await?;
 

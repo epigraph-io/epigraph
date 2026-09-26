@@ -208,27 +208,20 @@ async fn declared_signer_still_denies_cross_agent_supersede_without_auth(pool: P
 /// owner-equality is enforceable.
 #[sqlx::test(migrations = "../../migrations")]
 async fn generated_signer_does_not_relax_the_authenticated_path(pool: PgPool) {
-    use epigraph_auth::{AuthContext, ClientType};
-
     let server =
         build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let foreign_claim = seed_claim(&pool, foreign_agent).await;
 
-    // Authenticated, but neither admin nor the owner.
-    let auth = AuthContext {
-        client_id: Uuid::new_v4(),
-        agent_id: None,
-        owner_id: Some(Uuid::new_v4()),
-        client_type: ClientType::Service,
-        scopes: vec!["claims:write".to_string()],
-        jti: Uuid::new_v4(),
-    };
+    // Authenticated, but neither admin nor the owner. A REAL agent principal
+    // (batch H-b, D1): a token with no `agent_id` is refused before the gate,
+    // for want of an author, which would not test the gate at all.
+    let (_caller, auth, caller_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
 
     let err = supersede_claim(
         &server,
-        &fixture::public_viewer(&pool).await,
+        &caller_viewer,
         SupersedeClaimParams {
             claim_id: foreign_claim.as_uuid().to_string(),
             content: "must not be written".to_string(),

@@ -187,28 +187,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          the static `instance_wide()` arm admits it unstamped.",
     ),
     (
-        "tools/perspectives.rs",
-        "PerspectiveRepository::set_source_reliability",
-        1,
-        "`set_source_reliability`. Same registry table as above; an UPDATE rather than an INSERT, \
-         and the static arm covers it for the same reason.",
-    ),
-    (
-        "tools/supersede.rs",
-        "server.pool.acquire",
-        2,
-        "`supersede_claim`'s and `mark_duplicate`'s retraction cascades, one acquire each. STILL \
-         UNSTAMPED, and it is a design decision rather than a missing conversion: the cascade \
-         walks DOWNSTREAM claims, whose owner groups are arbitrary, so no single viewer's \
-         writable set covers its target population and stamping it from `server.agent_id()` \
-         would refuse some rows while looking converted. Which authority a retraction cascade \
-         carries across group boundaries is a tenancy-model question, not a mechanical \
-         conversion. \
-         REGISTERED UNDER `server.pool.acquire` for the same reason as `dedup_sweep.rs` above: \
-         the engine now takes `&mut PgConnection`, so the cascade call names no pool and only \
-         the acquire is visible to this scan.",
-    ),
-    (
         "tools/themes.rs",
         "run_theme_kmeans",
         1,

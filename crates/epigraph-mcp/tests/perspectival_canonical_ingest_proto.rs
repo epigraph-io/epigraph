@@ -65,6 +65,7 @@ async fn add_evidence(
             strength,
             labels: vec![],
         },
+        None,
     )
     .await
     .expect("update_with_evidence");

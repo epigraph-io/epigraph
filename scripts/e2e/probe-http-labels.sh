@@ -19,6 +19,15 @@
 #          whose claims WRITER authored. The discriminator for authority
 #          lending: stamped with the author's viewer, RADMIN could relabel the
 #          team's private claims although its own role there is read-only.
+#   NOGRANT claims:write + claims:admin in the TOKEN, but no oauth_clients row
+#          granting it (batch H-b, D2: migration 111 re-checks the grant on the
+#          token's client record, so this admin is refused and nothing lands).
+#
+# ADMIN and RADMIN each get an ACTIVE oauth_clients row whose id is the token's
+# `sub` and which grants claims:admin, bound to the agent: the record
+# `oauth/token.rs` mints an admin token from. Since batch H-b an admin write into
+# a group the admin cannot write goes through the AUDITED ADMIN PATH, and the
+# `audit=` column counts that admin's `claims.admin_write` security events.
 #
 # Rows (every one seeded through the SU DSN, then relabelled once):
 #   own-public       OWNER's claim, public, owned by OWNER's personal group
@@ -28,6 +37,10 @@
 #                    ADMIN is not in
 #   world-public     STRANGER's claim, public, owned by the WORLD group, which no
 #                    viewer can write
+# The PATCH lines (batch H-b review) drive `PATCH /api/v1/claims/:id` with
+# `add_labels: [tag, "resolved"]` and a properties merge on fresh own /
+# world-owned / other-agent claims: an admin into a group it cannot write must
+# land THROUGH THE AUDITED PATH (audit=1, principal=ADMIN), never bare.
 # Each line prints the HTTP status AND whether the label is on the row
 # afterwards, read back through the SU DSN: a 200 over an unchanged row and an
 # error over a changed one are both failures that only the row reveals.
@@ -161,7 +174,15 @@ sig = hmac.new(os.environ["SECRET"].encode(), f"{head}.{body}".encode(), hashlib
 print(f"{head}.{body}.{b64(sig)}")
 PY
 }
+# The admin grants (see the header). The row's id is the token's `sub`.
+for A in "$ADMIN" "$RADMIN"; do
+  q "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, granted_scopes, status, agent_id)
+     VALUES ('$A', 'hl-admin-$A', 'hl admin', 'human', ARRAY['claims:read','claims:write','claims:admin'],
+             ARRAY['claims:read','claims:write','claims:admin'], 'active', '$A')" >/dev/null
+done
+read -r NOGRANT _NOGRANT_G <<<"$(seed_agent nogrant)"
 T_OWNER="$(mint "$OWNER" claims:read,claims:write)"
+T_NOGRANT="$(mint "$NOGRANT" claims:read,claims:write,claims:admin)"
 T_ADMIN="$(mint "$ADMIN" claims:read,claims:write,claims:admin)"
 T_PEER="$(mint "$PEER" claims:read,claims:write)"
 T_RADMIN="$(mint "$RADMIN" claims:read,claims:write,claims:admin)"
@@ -174,7 +195,8 @@ case_() {  # $1 case name, $2 token, $3 claim
     -H "Authorization: Bearer $2" -H 'Content-Type: application/json' \
     "http://127.0.0.1:$PORT/api/v1/claims/$3/labels" -d "{\"add\":[\"$tag\"]}")"
   landed="$(q "SELECT '$tag' = ANY(labels) FROM claims WHERE id = '$3'")"
-  printf '%-36s status=%s label_on_row=%s  %s\n' "$1" "$status" "$landed" \
+  audits="$(q "SELECT count(*) FROM security_events WHERE event_type = 'claims.admin_write' AND details->>'claim_id' = '$3'")"
+  printf '%-36s status=%s label_on_row=%s audit=%s  %s\n' "$1" "$status" "$landed" "$audits" \
     "$(head -c 140 "$E2E/.hl.body.$LABEL" | tr '\n' ' ')"
 }
 case_ owner/own-public        "$T_OWNER" "$C_OWN_PUB"
@@ -185,4 +207,43 @@ case_ admin/world-public      "$T_ADMIN" "$C_WORLD_PUB"
 case_ reader-admin/team-private "$T_RADMIN" "$C_TEAM_PRIV"
 case_ reader-admin/team-public  "$T_RADMIN" "$C_TEAM_PUB"
 case_ peer/other-public       "$T_PEER"  "$C_OTHER_PUB"
+case_ nogrant-admin/team-public "$T_NOGRANT" "$C_TEAM_PUB"
+
+# PATCH /api/v1/claims/:id (batch H-b review, compat-and-R3 MEDIUM). The review
+# measured an admin's `add_labels: [tag, "resolved"]` here on config B landing on
+# a world-owned claim with NO audit row (the route wrote on the unstamped pool,
+# admitted by the orphan policy). Since the fix a claims:admin write into a
+# group the admin cannot write takes the audited admin path, as /labels does.
+# Fresh claims, so the /labels cases above do not pre-populate the audit count.
+C_P_WORLD="$(claim "$STRANGER" public "$WORLD_G" patch-world-public)"
+C_P_OTHER="$(claim "$STRANGER" public "$STRANGER_G" patch-other-public)"
+C_P_OWN="$(claim "$OWNER" public "$OWNER_G" patch-own-public)"
+pcase() {  # $1 case name, $2 token, $3 claim
+  local tag="hlp-$1" status landed
+  status="$(curl -s -o "$E2E/.hl.body.$LABEL" -w '%{http_code}' -X PATCH \
+    -H "Authorization: Bearer $2" -H 'Content-Type: application/json' \
+    "http://127.0.0.1:$PORT/api/v1/claims/$3" -d "{\"add_labels\":[\"$tag\",\"resolved\"],\"properties\":{\"hlp\":1}}")"
+  landed="$(q "SELECT '$tag' = ANY(labels) AND 'resolved' = ANY(labels) FROM claims WHERE id = '$3'")"
+  audits="$(q "SELECT count(*) FROM security_events WHERE event_type = 'claims.admin_write' AND details->>'claim_id' = '$3'")"
+  principal="$(q "SELECT CASE details->>'admin_agent_id' WHEN '$ADMIN' THEN 'ADMIN' ELSE COALESCE(details->>'admin_agent_id','-') END FROM security_events WHERE event_type = 'claims.admin_write' AND details->>'claim_id' = '$3' ORDER BY created_at DESC LIMIT 1")"
+  printf 'PATCH %-30s status=%s label_on_row=%s audit=%s principal=%s  %s\n' "$1" "$status" "$landed" "$audits" "${principal:--}" \
+    "$(head -c 120 "$E2E/.hl.body.$LABEL" | tr '\n' ' ')"
+}
+pcase owner/own-public        "$T_OWNER"   "$C_P_OWN"
+pcase admin/world-public      "$T_ADMIN"   "$C_P_WORLD"
+pcase admin/other-public      "$T_ADMIN"   "$C_P_OTHER"
+pcase nogrant-admin/other-public "$T_NOGRANT" "$C_P_OTHER"
+pcase peer/other-public       "$T_PEER"    "$C_P_OTHER"
+
+# PUT /api/v1/claims/:id by claims:admin across groups: NOT on the audited path
+# (an open D2 gap; README R3 item 2). Printed so the gap stays measured: the
+# expected shape on B is 200 with the property on the row and audit=0.
+C_PUT_OTHER="$(claim "$STRANGER" public "$STRANGER_G" put-other-public)"
+status="$(curl -s -o "$E2E/.hl.body.$LABEL" -w '%{http_code}' -X PUT \
+  -H "Authorization: Bearer $T_ADMIN" -H 'Content-Type: application/json' \
+  "http://127.0.0.1:$PORT/api/v1/claims/$C_PUT_OTHER" -d '{"properties":{"hlput":1}}')"
+printf 'PUT   %-30s status=%s prop_on_row=%s audit=%s  %s\n' admin/other-public "$status" \
+  "$(q "SELECT properties ? 'hlput' FROM claims WHERE id = '$C_PUT_OTHER'")" \
+  "$(q "SELECT count(*) FROM security_events WHERE event_type = 'claims.admin_write' AND details->>'claim_id' = '$C_PUT_OTHER'")" \
+  "$(head -c 100 "$E2E/.hl.body.$LABEL" | tr '\n' ' ')"
 rm -f "$E2E/.hl.body.$LABEL"

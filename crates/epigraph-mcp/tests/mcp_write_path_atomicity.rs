@@ -223,7 +223,7 @@ async fn submit_claim_without_a_scoped_pool_refuses_and_writes_nothing(pool: PgP
     let server = server_without_scoped(&pool, 0xB1);
     let content = format!("no-scoped submit {}", Uuid::new_v4());
 
-    let err = tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+    let err = tools::claims::submit_claim(&server, &viewer, submit_params(&content), None)
         .await
         .expect_err(
             "a server with no ScopedPool cannot stamp the author's tenancy context, so it must \
@@ -249,7 +249,7 @@ async fn memorize_without_a_scoped_pool_refuses_and_writes_nothing(pool: PgPool)
     let server = server_without_scoped(&pool, 0xB2);
     let content = format!("no-scoped memorize {}", Uuid::new_v4());
 
-    let err = tools::memory::memorize(&server, &viewer, memorize_params(&content))
+    let err = tools::memory::memorize(&server, &viewer, memorize_params(&content), None)
         .await
         .expect_err("memorize must refuse without a ScopedPool, for submit_claim's reasons");
     assert!(
@@ -278,7 +278,7 @@ async fn a_refused_trace_rolls_the_claim_back_in_submit_claim(pool: PgPool) {
     refuse_every_trace_insert(&pool).await;
     let content = format!("rollback submit {}", Uuid::new_v4());
 
-    let err = tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+    let err = tools::claims::submit_claim(&server, &viewer, submit_params(&content), None)
         .await
         .expect_err("the refused trace must surface as an error");
     assert!(
@@ -313,7 +313,7 @@ async fn a_refused_trace_rolls_the_claim_back_in_memorize(pool: PgPool) {
     refuse_every_trace_insert(&pool).await;
     let content = format!("rollback memorize {}", Uuid::new_v4());
 
-    tools::memory::memorize(&server, &viewer, memorize_params(&content))
+    tools::memory::memorize(&server, &viewer, memorize_params(&content), None)
         .await
         .expect_err("the refused trace must surface as an error");
 
@@ -339,7 +339,7 @@ async fn the_committed_submission_carries_claim_trace_evidence_and_link(pool: Pg
     let (server, _scoped) = server_with_scoped(&pool, 0xB5).await;
     let content = format!("happy submit {}", Uuid::new_v4());
 
-    tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+    tools::claims::submit_claim(&server, &viewer, submit_params(&content), None)
         .await
         .expect("CALIBRATION: a submission on a stamped connection must succeed");
 
@@ -388,7 +388,7 @@ async fn a_brand_new_authors_first_submission_carries_a_writable_stamp(pool: PgP
     let (server, _scoped) = server_with_scoped(&pool, 0xC1).await;
     let content = format!("first submission by a never-seen author {}", Uuid::new_v4());
 
-    tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+    tools::claims::submit_claim(&server, &viewer, submit_params(&content), None)
         .await
         .expect(
             "the FIRST submission by an author with no pre-existing personal group must land. \
@@ -444,7 +444,7 @@ async fn an_author_with_no_live_writable_membership_is_refused_before_anything_i
     let (server, _scoped) = server_with_scoped(&pool, 0xC2).await;
 
     let first = format!("establish the author {}", Uuid::new_v4());
-    tools::claims::submit_claim(&server, &viewer, submit_params(&first))
+    tools::claims::submit_claim(&server, &viewer, submit_params(&first), None)
         .await
         .expect("CALIBRATION: the first submission establishes the author and its group");
     let author = author_of(&pool, claim_id_for(&pool, &first).await).await;
@@ -462,7 +462,7 @@ async fn an_author_with_no_live_writable_membership_is_refused_before_anything_i
     );
 
     let content = format!("submission with no writable group {}", Uuid::new_v4());
-    let err = tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+    let err = tools::claims::submit_claim(&server, &viewer, submit_params(&content), None)
         .await
         .expect_err(
             "an author with no live admin/writer membership cannot satisfy any tier-A WITH \
@@ -521,7 +521,7 @@ async fn a_refused_event_insert_does_not_abort_the_submission(pool: PgPool) {
     .expect("install the refusing trigger");
 
     let content = format!("event-refused submit {}", Uuid::new_v4());
-    tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+    tools::claims::submit_claim(&server, &viewer, submit_params(&content), None)
         .await
         .expect(
             "a refused `events` INSERT is observability, not the write. The submission must \
@@ -615,7 +615,7 @@ async fn a_memorize_retry_over_an_existing_orphan_repairs_its_provenance(pool: P
     let (server, _scoped) = server_with_scoped(&pool, 0xB6).await;
     let content = format!("orphan memorize {}", Uuid::new_v4());
 
-    tools::memory::memorize(&server, &viewer, memorize_params(&content))
+    tools::memory::memorize(&server, &viewer, memorize_params(&content), None)
         .await
         .expect("the first memorize establishes the row");
     let claim = claim_id_for(&pool, &content).await;
@@ -625,7 +625,7 @@ async fn a_memorize_retry_over_an_existing_orphan_repairs_its_provenance(pool: P
     assert!(trace_id_of(&pool, claim).await.is_none());
     assert_eq!(counts_for(&pool, claim).await, (0, 0));
 
-    tools::memory::memorize(&server, &viewer, memorize_params(&content))
+    tools::memory::memorize(&server, &viewer, memorize_params(&content), None)
         .await
         .expect("the retry must succeed");
 
@@ -654,14 +654,14 @@ async fn a_submit_claim_retry_over_an_existing_orphan_links_its_trace(pool: PgPo
     let (server, _scoped) = server_with_scoped(&pool, 0xB7).await;
     let content = format!("orphan submit {}", Uuid::new_v4());
 
-    tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+    tools::claims::submit_claim(&server, &viewer, submit_params(&content), None)
         .await
         .expect("the first submission establishes the row");
     let claim = claim_id_for(&pool, &content).await;
     strip_provenance(&pool, claim).await;
     assert!(trace_id_of(&pool, claim).await.is_none());
 
-    tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+    tools::claims::submit_claim(&server, &viewer, submit_params(&content), None)
         .await
         .expect("the retry must succeed");
 
@@ -688,6 +688,7 @@ async fn a_resubmit_over_a_healthy_claim_keeps_its_canonical_trace(pool: PgPool)
         &server,
         &viewer,
         submit_params_with_evidence(&content, "healthy resubmit, first evidence"),
+        None,
     )
     .await
     .expect("first submission");
@@ -703,6 +704,7 @@ async fn a_resubmit_over_a_healthy_claim_keeps_its_canonical_trace(pool: PgPool)
         &server,
         &viewer,
         submit_params_with_evidence(&content, "healthy resubmit, second evidence"),
+        None,
     )
     .await
     .expect("resubmit");

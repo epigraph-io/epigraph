@@ -40,8 +40,9 @@ pub async fn link_alternative(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: LinkAlternativeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_link_alternative(server, viewer, params).await
+    do_link_alternative(server, viewer, params, auth).await
 }
 
 /// Core wiring logic factored out so integration tests can call it directly
@@ -51,6 +52,7 @@ pub async fn do_link_alternative(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: LinkAlternativeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let a = parse_uuid(&params.claim_a)?;
     let b = parse_uuid(&params.claim_b)?;
@@ -63,7 +65,7 @@ pub async fn do_link_alternative(
         ));
     }
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT. Every read and
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1). Every read and
     // the INSERT run on it. Same reasoning as `link_hierarchical`: the INSERT on
     // the unstamped pool was admitted only for a world-owned edge (two public
     // endpoints), and the READS on it could not see a group-private endpoint at
@@ -72,7 +74,7 @@ pub async fn do_link_alternative(
     // with nothing written (#374 owns whether it should be).
     let mut tx = crate::claim_helper::begin_author_stamped_tx(
         server,
-        server.agent_id().await?,
+        server.write_identity(auth, viewer).await?,
         "link_alternative",
     )
     .await?;

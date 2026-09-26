@@ -45,6 +45,7 @@ async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(po
             confidence: None,
             tags: None,
         },
+        None,
     )
     .await
     .expect("store_workflow must succeed");
@@ -93,6 +94,7 @@ async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(po
             quality: None,
             goal_text: Some(goal.clone()),
         },
+        None,
     )
     .await
     .expect("report_workflow_outcome must succeed for hierarchical id");
@@ -170,6 +172,7 @@ async fn report_outcome_still_handles_legacy_flat_workflow_claim_id(pool: PgPool
             quality: Some(0.8),
             goal_text: None,
         },
+        None,
     )
     .await
     .expect("legacy flat workflow path must still succeed");
@@ -216,6 +219,7 @@ async fn report_outcome_404s_for_truly_unknown_id(pool: PgPool) {
             quality: None,
             goal_text: None,
         },
+        None,
     )
     .await
     .expect_err("unknown id must error");

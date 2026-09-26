@@ -46,8 +46,9 @@ pub async fn link_hierarchical(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: LinkHierarchicalParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_link_hierarchical(server, viewer, params).await
+    do_link_hierarchical(server, viewer, params, auth).await
 }
 
 /// Core wiring logic factored out so integration tests can call it directly
@@ -57,6 +58,7 @@ pub async fn do_link_hierarchical(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: LinkHierarchicalParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let source_id = parse_uuid(&params.source_claim_id)?;
     let target_id = parse_uuid(&params.target_claim_id)?;
@@ -78,7 +80,7 @@ pub async fn do_link_hierarchical(
         ));
     }
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT. The two
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1). The two
     // existence reads and the INSERT all run on it.
     //
     // The INSERT used to run on the unstamped pool. `edges_tenancy`'s WITH CHECK
@@ -94,7 +96,7 @@ pub async fn do_link_hierarchical(
     // Converting only the INSERT would have been a conversion its own target
     // population could never reach.
     //
-    // THE STAMP IS `server.agent_id()`'s, as for every other MCP write: the edge
+    // THE STAMP IS THE WRITE IDENTITY's (`EpiGraphMcpFull::write_identity`), as for every other MCP write: the edge
     // is owned by an endpoint's group, and the population this admits is the
     // server agent's own claims. An endpoint in another agent's private group is
     // refused loudly by the WITH CHECK (or, for a co-owned edge, by RETURNING's
@@ -103,7 +105,7 @@ pub async fn do_link_hierarchical(
     // ownership question (#374), not a stamping one.
     let mut tx = crate::claim_helper::begin_author_stamped_tx(
         server,
-        server.agent_id().await?,
+        server.write_identity(auth, viewer).await?,
         "link_hierarchical",
     )
     .await?;

@@ -168,6 +168,7 @@ pub async fn decide_match_candidate(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: DecideMatchCandidateParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     server.reject_if_read_only()?;
     let candidate_id = parse_uuid(&params.candidate_id)?;
@@ -176,7 +177,7 @@ pub async fn decide_match_candidate(
     let repo = MatchCandidateRepo::new(server.pool.clone());
     let row = repo.get(candidate_id).await.map_err(internal_error)?;
 
-    let acting_agent = server.agent_id().await?;
+    let acting_agent = server.write_identity(auth, viewer).await?.agent_id();
 
     // Already-decided gate — transport parity with
     // `routes/cross_source.rs::decide_candidate`'s `reject_if_decided`
@@ -312,12 +313,14 @@ pub async fn decide_match_candidate(
 /// materializations that regenerate from live edges.
 pub async fn retire_match_candidate(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: RetireMatchCandidateParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     server.reject_if_read_only()?;
     let candidate_id = parse_uuid(&params.candidate_id)?;
     let repo = MatchCandidateRepo::new(server.pool.clone());
-    let acting_agent = server.agent_id().await?;
+    let acting_agent = server.write_identity(auth, viewer).await?.agent_id();
 
     let outcome = repo
         .retire(candidate_id, Some(acting_agent))

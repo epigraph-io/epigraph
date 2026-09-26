@@ -131,6 +131,17 @@ pub struct ScoredHierarchicalWorkflowRow {
     pub similarity: f64,
 }
 
+/// What [`WorkflowRepository::ingest_anchors`] found; see its doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IngestAnchors {
+    /// The exact `(canonical_name, generation)` row, if it already exists.
+    pub existing: Option<Uuid>,
+    /// The latest generation already stored under `canonical_name`.
+    pub lineage_head: Option<Uuid>,
+    /// The row the executor will link as `parent_id`, if any.
+    pub linked_parent: Option<Uuid>,
+}
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -172,6 +183,128 @@ impl WorkflowRepository {
         .execute(executor)
         .await?;
         Ok(())
+    }
+
+    /// The `metadata` key a `workflows` row records its SUBMITTER under (batch
+    /// H-b, H3): the agent whose write created the row. Namespaced so it cannot
+    /// collide with a caller's own metadata, and stripped from caller-supplied
+    /// metadata by every ingest entry point, so it can only be written by
+    /// [`Self::record_submitter`].
+    pub const SUBMITTER_KEY: &'static str = "epigraph_submitted_by";
+
+    /// The recorded submitter of workflow `id`, if any.
+    ///
+    /// `None` for a row written before batch H-b (nothing recorded who created
+    /// it) and for a variant of such a row, which inherits "no owner" rather
+    /// than having one invented for it. `workflows` has no row security
+    /// (`relrowsecurity = false`), so this read needs no stamp.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn submitter_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata->>$2 END \
+                   FROM workflows WHERE id = $1",
+        )
+        .bind(id)
+        .bind(Self::SUBMITTER_KEY)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row
+            .and_then(|(v,)| v)
+            .and_then(|v| Uuid::parse_str(&v).ok()))
+    }
+
+    /// Record `agent` as the submitter of workflow `id`, ONCE: a row that
+    /// already records one keeps it (a re-ingest by another caller must never
+    /// take a workflow over). Returns whether it wrote.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the statement fails.
+    pub async fn record_submitter<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        agent: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
+            // `metadata` may hold a JSON `null` (an extraction with no
+            // metadata serializes that way), which `jsonb_set` refuses as a
+            // scalar: normalise anything that is not an object to `{}`.
+            "UPDATE workflows \
+                SET metadata = jsonb_set( \
+                        CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata \
+                             ELSE '{}'::jsonb END, \
+                        ARRAY[$2], to_jsonb($3::text)) \
+              WHERE id = $1 \
+                AND NOT (jsonb_typeof(metadata) = 'object' AND metadata ? $2)",
+        )
+        .bind(id)
+        .bind(Self::SUBMITTER_KEY)
+        .bind(agent.to_string())
+        .execute(executor)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// The latest-generation workflow row for `canonical_name`.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn head_by_canonical<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        canonical_name: &str,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM workflows WHERE canonical_name = $1 ORDER BY generation DESC LIMIT 1",
+        )
+        .bind(canonical_name)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
+    /// The existing rows an ingest of `(canonical_name, generation)` with
+    /// `parent_canonical_name` would touch or link (batch H-b, H3 review):
+    ///
+    /// * `existing` — the exact `(canonical_name, generation)` row. When it is
+    ///   present the ingest is a re-ingest: since the plan walk became one
+    ///   transaction a recorded row always has its `executes` edges, so the
+    ///   executor short-circuits and writes nothing.
+    /// * `lineage_head` — the latest generation already stored under
+    ///   `canonical_name`. A NEW generation of a name that already has rows is a
+    ///   generation of THAT lineage, whether or not the caller names a parent;
+    ///   without this, a caller could ingest `generation + 1` with no parent,
+    ///   record itself as submitter and then pass every head-keyed authority
+    ///   check (the takeover the review measured).
+    /// * `linked_parent` — exactly the row the executor links as `parent_id`
+    ///   (`find_root_by_canonical(parent, generation - 1)`, the same saturating
+    ///   arithmetic), so authority is checked against the row actually linked,
+    ///   not a different generation of the parent's name.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if a query fails.
+    pub async fn ingest_anchors(
+        conn: &mut sqlx::PgConnection,
+        canonical_name: &str,
+        generation: i32,
+        parent_canonical_name: Option<&str>,
+    ) -> Result<IngestAnchors, sqlx::Error> {
+        let existing = Self::find_root_by_canonical(&mut *conn, canonical_name, generation).await?;
+        let lineage_head = Self::head_by_canonical(&mut *conn, canonical_name).await?;
+        let linked_parent = match parent_canonical_name {
+            Some(pcn) => {
+                Self::find_root_by_canonical(&mut *conn, pcn, generation.saturating_sub(1)).await?
+            }
+            None => None,
+        };
+        Ok(IngestAnchors {
+            existing,
+            lineage_head,
+            linked_parent,
+        })
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.

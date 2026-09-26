@@ -302,6 +302,7 @@ async fn build_two_hop_fixture(
             relationship: "supports".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("A supports MID");
@@ -315,6 +316,7 @@ async fn build_two_hop_fixture(
             relationship: "supports".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("MID supports B");
@@ -541,6 +543,7 @@ async fn graph_expansion_does_not_promote_a_level_3_atom(pool: PgPool) {
                 relationship: "supports".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("A supports target");

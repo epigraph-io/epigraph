@@ -58,6 +58,7 @@ async fn add_evidence(
             strength,
             labels: vec![],
         },
+        None,
     )
     .await;
     assert!(

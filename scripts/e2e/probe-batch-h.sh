@@ -30,6 +30,29 @@
 #                 random per-run secret that is never written to disk): a
 #                 claims:write-only bearer with no membership must be refused
 #                 before the tool body runs; a claims:admin bearer is admitted
+#   caller_auth   batch H-b over AUTHENTICATED HTTP, with a caller that is NOT
+#                 the server's signer: submit_claim is authored, owned and
+#                 signed as D1 says (verify_claim valid), the caller's own
+#                 patch_claim / update_labels land, a foreign claim is refused;
+#                 a claims:admin bearer whose client record grants it relabels
+#                 and patches a foreign claim through the AUDITED ADMIN PATH
+#                 (migration 111: admin recorded, security_events row); an
+#                 admin bearer with no such grant is refused, nothing written
+#   op_http       #503's operator arm over AUTHENTICATED HTTP: the operator's
+#                 claims:write bearer patches, relabels and resolves its linked
+#                 agent's claims (owned by the operator's group) on the APP DSN
+#   review_http   the batch H-b review's authority attacks over AUTHENTICATED
+#                 HTTP: the H3 lineage takeover (a parentless generation+1),
+#                 the workflow admin arm with and without a client grant, a
+#                 teammate's update_labels, a forged perspective owner / event
+#                 actor, a stranger's patch_edge, set_source_reliability over
+#                 nothing; every attack must fail and write nothing
+#   unauth_listener  the --allow-unauthenticated-http shape (injected
+#                 claims:admin, nil client): foreign update_labels (free and
+#                 resolved), resolve_backlog_item and add_step; D2 refuses all
+#   cascade       supersede_claim whose downstream includes a FOREIGN public
+#                 claim: it must keep its edge BBA and belief (and be reported)
+#                 on A, and be repaired on B
 #
 # WHY THIS PROBE EXISTS. Every other arm in this directory seeds its claims
 # through submit_claim, and submit_claim writes PUBLIC claims. An edge between
@@ -78,7 +101,7 @@ BIN="${1:?usage: probe-batch-h.sh <binary> <label> <a|b> [arm ...]}"
 LABEL="${2:?label}"
 CFG="${3:?a|b}"
 shift 3
-ARMS="${*:-patch_claim edges resolve submit_ds supersede theme maintenance maint_auth}"
+ARMS="${*:-patch_claim edges resolve submit_ds supersede theme maintenance maint_auth caller_auth op_http review_http unauth_listener cascade}"
 command -v jq >/dev/null || { echo "probe-batch-h.sh needs jq to read tool responses" >&2; exit 2; }
 E2E="$(cd "$(dirname "$0")" && pwd)"
 SOCK="$E2E/bh.sock.$LABEL"
@@ -457,6 +480,283 @@ PY
   stop_server
   BEARER=""
   JWT_SECRET=""
+fi
+
+# ── caller_auth: batch H-b D1 + D2 over AUTHENTICATED HTTP ─────────────────
+# The transport batch H-b changes. Every arm above runs unauthenticated, where
+# the caller IS the server agent, so a write stamped from the wrong agent is
+# invisible there. Here the server's signer (MA) is NOT the caller: a
+# claims:write bearer for agent CA (own personal group CG) and a claims:admin
+# bearer for agent AD whose token `sub` is an oauth_clients row granting it
+# claims:admin (migration 111 re-checks exactly that record).
+# `mint_as <sub> <agent> <scopes>`: HS256 with this run's secret.
+mint_as() {
+  SECRET="$JWT_SECRET" python3 - "$1" "$2" "$3" <<'PY'
+import base64, hashlib, hmac, json, os, sys, time, uuid
+sub, agent, scopes = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+now = int(time.time()) - 2
+claims = {"sub": sub, "iss": "epigraph", "aud": "epigraph-api", "exp": now + 3600,
+          "iat": now, "nbf": now, "jti": str(uuid.uuid4()), "scopes": scopes,
+          "client_type": "human", "owner_id": sub, "agent_id": agent}
+head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+body = b64(json.dumps(claims).encode())
+sig = hmac.new(os.environ["SECRET"].encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
+print(f"{head}.{body}.{b64(sig)}")
+PY
+}
+# A fresh agent with its personal group, minted through 105's definer.
+new_agent() {
+  local id
+  id=$(q "INSERT INTO agents (public_key, display_name) VALUES (decode(md5(random()::text)||md5(random()::text),'hex'), 'batch-h-b $1 $LABEL') RETURNING id" | head -1)
+  q "SELECT public.epigraph_ensure_personal_group('$id')" >/dev/null
+  printf '%s' "$id"
+}
+personal_group() { q "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:$1'"; }
+admin_audits() { q "SELECT count(*) FROM security_events WHERE event_type='claims.admin_write' AND agent_id='$1'"; }
+
+if want caller_auth; then
+  echo
+  echo "=== caller_auth: authenticated MCP writes carry the CALLER's authority (D1) and the audited admin path (D2) ==="
+  JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  CA=$(new_agent caller); CG=$(personal_group "$CA")
+  AD=$(new_agent admin);  AG=$(personal_group "$AD")
+  ADC=$(q "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, granted_scopes, status, agent_id)
+          VALUES (gen_random_uuid(), 'bh-admin-'||gen_random_uuid(), 'batch-h-b admin', 'human',
+                  ARRAY['claims:read','claims:write','claims:admin'], ARRAY['claims:read','claims:write','claims:admin'], 'active', '$AD') RETURNING id" | head -1)
+  echo "### caller=$CA ($CG) admin=$AD ($AG, client $ADC) server signer=$MA foreign=$FA ($FG)"
+  C_AUTH_FOR=$(seed "Batch H-b foreign public $LABEL" public "$FG" "$FA" "ARRAY['backlog']::text[]")
+  C_AUTH_FOR2=$(seed "Batch H-b foreign public two $LABEL" public "$FG" "$FA" "ARRAY['backlog']::text[]")
+
+  stop_server
+  BEARER="$(mint_as "$(q "SELECT gen_random_uuid()")" "$CA" claims:read,claims:write)"
+  start_server auth
+  echo "--- claims:write bearer for the caller (expect A and B: authored+owned by the caller; own writes OK; foreign refused)"
+  R=$(tool submit_claim "{\"content\":\"Batch H-b caller claim $LABEL\",\"methodology\":\"extraction\",\"evidence_data\":\"probe\",\"evidence_type\":\"empirical\",\"confidence\":0.7,\"novelty_threshold\":0.0}")
+  CC=$(field "$R" claim_id)
+  echo "   submit_claim: $(verdict "$R") | author=$(q "SELECT CASE agent_id WHEN '$CA' THEN 'CALLER' WHEN '$MA' THEN 'SERVER' ELSE agent_id::text END FROM claims WHERE id='$CC'") owner=$(q "SELECT CASE owner_group_id WHEN '$CG' THEN 'CALLER-GROUP' ELSE owner_group_id::text END FROM claims WHERE id='$CC'") signer=$(q "SELECT CASE signer_id WHEN '$MA' THEN 'SERVER' ELSE COALESCE(signer_id::text,'none') END FROM claims WHERE id='$CC'") bbas=$(q "SELECT count(*) FROM mass_functions WHERE claim_id='$CC'")"
+  R=$(tool verify_claim "{\"claim_id\":\"$CC\"}")
+  echo "   verify_claim: $(verdict "$R") signed=$(field "$R" signed) signature_valid=$(field "$R" signature_valid) hash_check=$(field "$R" hash_check)"
+  R=$(tool patch_claim "{\"claim_id\":\"$CC\",\"properties\":{\"bhb\":1}}")
+  echo "   patch_claim own: $(verdict "$R") | patched=$(q "SELECT count(*) FROM claims WHERE id='$CC' AND properties ? 'bhb'")"
+  R=$(tool update_labels "{\"claim_id\":\"$CC\",\"add\":[\"resolved\"]}")
+  echo "   update_labels own +resolved: $(verdict "$R") admin_path=$(field "$R" admin_path) | labelled=$(q "SELECT count(*) FROM claims WHERE id='$CC' AND 'resolved'=ANY(labels)")"
+  R=$(tool patch_claim "{\"claim_id\":\"$C_AUTH_FOR\",\"properties\":{\"bhb\":1}}")
+  echo "   patch_claim foreign: $(verdict "$R") | patched=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND properties ? 'bhb'")"
+  R=$(tool update_labels "{\"claim_id\":\"$C_AUTH_FOR\",\"add\":[\"resolved\"]}")
+  echo "   update_labels foreign +resolved: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND 'resolved'=ANY(labels)")"
+  R=$(tool update_labels "{\"claim_id\":\"$C_AUTH_FOR\",\"add\":[\"bhb-free\"]}")
+  echo "   update_labels foreign +free label (A and B: ERR, the whole mutation needs ownership over HTTP since the batch H-b review): $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND 'bhb-free'=ANY(labels)")"
+  echo "   non-admin audit rows: $(admin_audits "$CA")"
+
+  stop_server
+  BEARER="$(mint_as "$ADC" "$AD" claims:read,claims:write,claims:admin)"
+  start_server auth
+  echo "--- claims:admin bearer, a live grant on its client record (expect A and B: foreign relabel OK through the audited path, admin recorded)"
+  BEFORE=$(admin_audits "$AD")
+  R=$(tool update_labels "{\"claim_id\":\"$C_AUTH_FOR\",\"add\":[\"resolved\"]}")
+  echo "   update_labels foreign +resolved: $(verdict "$R") admin_path=$(field "$R" admin_path) | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND 'resolved'=ANY(labels)") audit $BEFORE->$(admin_audits "$AD") principal=$(q "SELECT CASE details->>'admin_agent_id' WHEN '$AD' THEN 'ADMIN' ELSE details->>'admin_agent_id' END FROM security_events WHERE event_type='claims.admin_write' AND agent_id='$AD' ORDER BY created_at DESC LIMIT 1") author_recorded_as=$(q "SELECT CASE details->>'claim_author' WHEN '$FA' THEN 'TARGET-AUTHOR' ELSE details->>'claim_author' END FROM security_events WHERE event_type='claims.admin_write' AND agent_id='$AD' ORDER BY created_at DESC LIMIT 1")"
+  R=$(tool patch_claim "{\"claim_id\":\"$C_AUTH_FOR2\",\"properties\":{\"bhb_admin\":1},\"remove_labels\":[\"backlog\"]}")
+  echo "   patch_claim foreign: $(verdict "$R") admin_path=$(field "$R" admin_path) | patched=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR2' AND properties ? 'bhb_admin' AND NOT ('backlog'=ANY(labels))") audit=$(admin_audits "$AD")"
+  R=$(tool update_labels "{\"claim_id\":\"$C_FOR_PRIV2\",\"add\":[\"resolved\"]}")
+  echo "   update_labels foreign PRIVATE (unreadable): $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_FOR_PRIV2' AND 'resolved'=ANY(labels)")"
+
+  stop_server
+  BEARER="$(mint_as "$(q "SELECT gen_random_uuid()")" "$AD" claims:read,claims:write,claims:admin)"
+  start_server auth
+  echo "--- claims:admin bearer whose sub is NOT a client record granting it (expect: refused, nothing written, no audit row)"
+  BEFORE=$(admin_audits "$AD")
+  q "UPDATE claims SET labels = ARRAY['backlog'] WHERE id='$C_AUTH_FOR'" >/dev/null
+  R=$(tool update_labels "{\"claim_id\":\"$C_AUTH_FOR\",\"add\":[\"resolved\"]}")
+  echo "   update_labels foreign +resolved: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$C_AUTH_FOR' AND 'resolved'=ANY(labels)") audit $BEFORE->$(admin_audits "$AD")"
+  stop_server
+  BEARER=""
+  JWT_SECRET=""
+fi
+
+# ── op_http: #503's operator arm over AUTHENTICATED HTTP (merge report) ─────
+# An HTTP MCP server on the APP DSN whose signer (MA) is unrelated to the
+# operator, and a claims:read,claims:write bearer for the OPERATOR acting on
+# public claims authored by its linked agent and owned by the operator's
+# personal group (where #503 puts an operated agent's claims). Before batch H-b
+# every call passed require_owner_or_admin's operator arm and then failed 42501
+# on A with nothing written: the transaction was stamped from MA.
+if want op_http; then
+  echo
+  echo "=== op_http: the operator's bearer on its linked agent's claims (expect A and B: OK, written) ==="
+  JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  OP=$(new_agent operator); OPG=$(personal_group "$OP")
+  LA=$(new_agent linked)
+  q "SELECT public.epigraph_link_operator('$LA', '$OP')" >/dev/null
+  echo "### operator=$OP ($OPG) linked=$LA link=$(q "SELECT count(*) FROM operator_links WHERE agent_id='$LA' AND operator_id='$OP'")"
+  L1=$(seed "Batch H-b operated claim one $LABEL" public "$OPG" "$LA" "ARRAY['backlog']::text[]")
+  L2=$(seed "Batch H-b operated claim two $LABEL" public "$OPG" "$LA" "ARRAY['backlog']::text[]")
+  L3=$(seed "Batch H-b operated claim three $LABEL" public "$OPG" "$LA" "ARRAY['backlog']::text[]")
+  stop_server
+  BEARER="$(mint_as "$(q "SELECT gen_random_uuid()")" "$OP" claims:read,claims:write)"
+  start_server auth
+  R=$(tool patch_claim "{\"claim_id\":\"$L1\",\"properties\":{\"bhb_op\":1}}")
+  echo "   patch_claim: $(verdict "$R") | patched=$(q "SELECT count(*) FROM claims WHERE id='$L1' AND properties ? 'bhb_op'")"
+  R=$(tool update_labels "{\"claim_id\":\"$L2\",\"add\":[\"resolved\"]}")
+  echo "   update_labels +resolved: $(verdict "$R") admin_path=$(field "$R" admin_path) | labelled=$(q "SELECT count(*) FROM claims WHERE id='$L2' AND 'resolved'=ANY(labels)")"
+  R=$(tool resolve_backlog_item "{\"original_id\":\"$L3\",\"resolution_content\":\"retired by the operator over HTTP\"}")
+  RES=$(field "$R" resolution_claim_id)
+  echo "   resolve_backlog_item: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$L3' AND 'resolved'=ANY(labels)") resolution_author=$(q "SELECT CASE agent_id WHEN '$OP' THEN 'OPERATOR' WHEN '$MA' THEN 'SERVER' ELSE agent_id::text END FROM claims WHERE id='${RES:-00000000-0000-0000-0000-000000000000}'")"
+  stop_server
+  BEARER=""
+  JWT_SECRET=""
+fi
+
+# ── review_http: the batch H-b review's authority attacks over AUTHENTICATED HTTP
+# Each case names the finding it re-measures, prints the verdict AND the rows.
+# Identities are per-run (agents and links survive TRUNCATE).
+#   H3 lineage   a stranger ingests generation 1 of the victim's workflow with
+#                NO parent (was: OK, recorded the stranger, then admitted it and
+#                locked the victim out); expect ERR and 0 new rows, victim OK
+#   H3 admin     add_step by a claims:admin token whose client grants nothing
+#                (was: OK on the scope alone, no audit) and by one whose client
+#                grants it (OK, one workflows.admin_write row)
+#   labels       a teammate (writer of the team group owning the victim's
+#                claim) relabels it with update_labels (was: OK) and patch_claim
+#   attribution  create_perspective owner / publish_event actor = the victim
+#   patch_edge   a stranger retires the victim's world-owned edge (was: OK)
+#   reliability  set_source_reliability on a random uuid (was: OK over
+#                nothing) and on the victim's perspective
+wf_json() {  # $1 canonical, $2 generation, $3 summary, $4 step text
+  printf '{"source":{"canonical_name":"%s","goal":"Review probe workflow %s","generation":%s,"authors":[],"tags":[],"metadata":{}},"thesis":"Review probe thesis %s %s","thesis_derivation":"TopDown","phases":[{"title":"Phase","summary":"%s","steps":[{"compound":"%s","rationale":"probe","operations":[],"generality":[1],"confidence":0.8}]}],"relationships":[]}' \
+    "$1" "$1" "$2" "$1" "$2" "$3" "$4"
+}
+wf_rows() { q "SELECT string_agg(generation||':'||CASE metadata->>'epigraph_submitted_by' WHEN '$V' THEN 'VICTIM' WHEN '$ATK' THEN 'ATTACKER' ELSE COALESCE(metadata->>'epigraph_submitted_by','none') END, ' ' ORDER BY generation) FROM workflows WHERE canonical_name='$1'"; }
+wf_steps() { q "SELECT count(*) FROM edges e JOIN workflows w ON w.id=e.source_id WHERE w.canonical_name='$1' AND e.relationship='executes'"; }
+wf_audits() { q "SELECT count(*) FROM security_events WHERE event_type='workflows.admin_write' AND agent_id='$1'"; }
+as_bearer() {  # $1 sub, $2 agent, $3 scopes
+  stop_server
+  BEARER="$(mint_as "$1" "$2" "$3")"
+  start_server auth
+}
+
+if want review_http; then
+  echo
+  echo "=== review_http: the batch H-b review's authority attacks (expect A and B: every attack ERR, nothing written; every calibration OK) ==="
+  JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  V=$(new_agent victim); ATK=$(new_agent attacker); TM=$(new_agent teammate); WA=$(new_agent wfadmin)
+  WAC=$(q "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, granted_scopes, status, agent_id)
+          VALUES (gen_random_uuid(), 'rv-wfadmin-'||gen_random_uuid(), 'review wf admin', 'human',
+                  ARRAY['claims:read','claims:write','claims:admin'], ARRAY['claims:read','claims:write','claims:admin'], 'active', '$WA') RETURNING id" | head -1)
+  TG=$(q "INSERT INTO groups (display_name, did_key, public_key, kind) VALUES ('review team $LABEL', 'did:rv:team:$LABEL:'||gen_random_uuid(), decode(repeat('ab',32),'hex'), 'team') RETURNING id" | head -1)
+  q "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) VALUES ('$TG','$V','\\x00',0,'admin'), ('$TG','$TM','\\x00',0,'writer')" >/dev/null
+  WF="rv-victim-wf-$LABEL"
+  echo "### victim=$V attacker=$ATK teammate=$TM wfadmin=$WA (client $WAC) team=$TG"
+
+  as_bearer "$(q "SELECT gen_random_uuid()")" "$V" claims:read,claims:write
+  R=$(tool ingest_workflow "{\"extraction\":$(wf_json "$WF" 0 "victim gen0 $LABEL" "victim step one $LABEL")}")
+  echo "   H3 victim ingest gen0: $(verdict "$R") | rows=$(wf_rows "$WF")"
+
+  as_bearer "$(q "SELECT gen_random_uuid()")" "$ATK" claims:read,claims:write
+  R=$(tool ingest_workflow "{\"extraction\":$(wf_json "$WF" 1 "attacker gen1 $LABEL" "attacker step $LABEL")}")
+  echo "   H3 attacker ingest gen1, no parent (expect ERR): $(verdict "$R") | rows=$(wf_rows "$WF")"
+  R=$(tool add_step "{\"canonical_name\":\"$WF\",\"step_text\":\"attacker add_step $LABEL\"}")
+  echo "   H3 attacker add_step (expect ERR): $(verdict "$R") | steps=$(wf_steps "$WF")"
+
+  as_bearer "$(q "SELECT gen_random_uuid()")" "$V" claims:read,claims:write
+  R=$(tool add_step "{\"canonical_name\":\"$WF\",\"step_text\":\"victim add_step $LABEL\"}")
+  echo "   H3 victim add_step (expect OK): $(verdict "$R") | steps=$(wf_steps "$WF")"
+
+  as_bearer "$(q "SELECT gen_random_uuid()")" "$WA" claims:read,claims:write,claims:admin
+  BEFORE=$(wf_steps "$WF")
+  R=$(tool add_step "{\"canonical_name\":\"$WF\",\"step_text\":\"grantless admin step $LABEL\"}")
+  echo "   H3 admin, NO client grant (expect ERR ADM02): $(verdict "$R") | steps $BEFORE->$(wf_steps "$WF") audits=$(wf_audits "$WA")"
+  as_bearer "$WAC" "$WA" claims:read,claims:write,claims:admin
+  R=$(tool add_step "{\"canonical_name\":\"$WF\",\"step_text\":\"granted admin step $LABEL\"}")
+  echo "   H3 admin, live client grant (expect OK + 1 audit): $(verdict "$R") | steps=$(wf_steps "$WF") audits=$(wf_audits "$WA")"
+
+  VC=$(seed "Review victim team claim $LABEL" public "$TG" "$V" "ARRAY['backlog']::text[]")
+  as_bearer "$(q "SELECT gen_random_uuid()")" "$TM" claims:read,claims:write
+  R=$(tool update_labels "{\"claim_id\":\"$VC\",\"add\":[\"wontfix\"],\"remove\":[\"backlog\"]}")
+  echo "   labels teammate update_labels (expect ERR): $(verdict "$R") | labels=$(q "SELECT labels FROM claims WHERE id='$VC'")"
+  R=$(tool patch_claim "{\"claim_id\":\"$VC\",\"remove_labels\":[\"backlog\"]}")
+  echo "   labels teammate patch_claim (calibration, ERR): $(verdict "$R") | labels=$(q "SELECT labels FROM claims WHERE id='$VC'")"
+
+  R=$(tool create_perspective "{\"name\":\"rv forged owner $LABEL\",\"owner_agent_id\":\"$V\"}")
+  echo "   attribution create_perspective owner=victim (expect ERR): $(verdict "$R") | rows=$(q "SELECT count(*) FROM perspectives WHERE name='rv forged owner $LABEL'") perspective_of_victim=$(q "SELECT count(*) FROM edges e JOIN perspectives p ON p.id=e.source_id WHERE p.name='rv forged owner $LABEL' AND e.relationship='PERSPECTIVE_OF'")"
+  R=$(tool publish_event "{\"event_type\":\"rv.forged.$LABEL\",\"actor_id\":\"$V\",\"payload\":{}}")
+  echo "   attribution publish_event actor=victim (expect ERR): $(verdict "$R") | events=$(q "SELECT count(*) FROM events WHERE event_type='rv.forged.$LABEL'")"
+  R=$(tool publish_event "{\"event_type\":\"rv.own.$LABEL\",\"payload\":{}}")
+  echo "   attribution publish_event no actor (expect OK, actor=teammate): $(verdict "$R") | actor=$(q "SELECT CASE actor_id WHEN '$TM' THEN 'CALLER' ELSE COALESCE(actor_id::text,'none') END FROM events WHERE event_type='rv.own.$LABEL'")"
+
+  VP1=$(seed "Review victim public one $LABEL" public "$(personal_group "$V")" "$V")
+  VP2=$(seed "Review victim public two $LABEL" public "$(personal_group "$V")" "$V")
+  VE=$(q "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) VALUES ('$VP1','claim','$VP2','claim','decomposes_to','{}'::jsonb) RETURNING id" | head -1)
+  as_bearer "$(q "SELECT gen_random_uuid()")" "$ATK" claims:read,claims:write
+  R=$(tool patch_edge "{\"edge_id\":\"$VE\",\"valid_to\":\"2020-01-01T00:00:00Z\"}")
+  echo "   patch_edge stranger on the victim's edge (owner_group=$(q "SELECT owner_group_id FROM edges WHERE id='$VE'" | cut -c1-8)) (expect ERR): $(verdict "$R") | valid_to=$(q "SELECT COALESCE(valid_to::text,'open') FROM edges WHERE id='$VE'")"
+
+  R=$(tool set_source_reliability "{\"perspective_id\":\"$(q "SELECT gen_random_uuid()")\",\"source_reliability\":{\"empirical\":0.3}}")
+  echo "   reliability random uuid (expect ERR not found): $(verdict "$R")"
+  VPER=$(q "INSERT INTO perspectives (name, owner_agent_id, perspective_type, visibility, owner_group_id) VALUES ('rv victim lens $LABEL', '$V', 'analytical', 'public', '00000000-0000-0000-0000-000000000000') RETURNING id" | head -1)
+  R=$(tool set_source_reliability "{\"perspective_id\":\"$VPER\",\"source_reliability\":{\"empirical\":0.3}}")
+  echo "   reliability stranger on the victim's lens (expect ERR): $(verdict "$R") | stored=$(q "SELECT COALESCE(properties->>'source_reliability','none') FROM perspectives WHERE id='$VPER'")"
+  stop_server
+  BEARER=""
+  JWT_SECRET=""
+fi
+
+# ── unauth_listener: the production socket shape (--allow-unauthenticated-http)
+# The injected context carries every scope, claims:admin included, with a NIL
+# client_id. The review measured these three as OK at BASE on B (orphan policy)
+# and ERR ADM02 at the first H-b tip. Expect at this tip, A and B: ERR, nothing
+# written — D2's rule (no admin principal to audit) — plus add_step on another
+# submitter's workflow, which the scope alone no longer admits.
+if want unauth_listener; then
+  echo
+  echo "=== unauth_listener: foreign writes through the injected claims:admin context (expect A and B: ERR, nothing written) ==="
+  stop_server
+  start_server none
+  UF1=$(seed "Unauth foreign free-label $LABEL" public "$FG" "$FA" "ARRAY['backlog']::text[]")
+  UF2=$(seed "Unauth foreign retire $LABEL" public "$FG" "$FA" "ARRAY['backlog']::text[]")
+  UF3=$(seed "Unauth foreign resolve $LABEL" public "$FG" "$FA" "ARRAY['backlog']::text[]")
+  R=$(tool update_labels "{\"claim_id\":\"$UF1\",\"add\":[\"ul-free\"]}")
+  echo "   update_labels foreign +free: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$UF1' AND 'ul-free'=ANY(labels)")"
+  R=$(tool update_labels "{\"claim_id\":\"$UF2\",\"add\":[\"resolved\"]}")
+  echo "   update_labels foreign +resolved: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$UF2' AND 'resolved'=ANY(labels)")"
+  R=$(tool resolve_backlog_item "{\"original_id\":\"$UF3\",\"resolution_content\":\"unauth listener probe $LABEL\"}")
+  echo "   resolve_backlog_item foreign: $(verdict "$R") | item_resolved=$(q "SELECT count(*) FROM claims WHERE id='$UF3' AND 'resolved'=ANY(labels)") resolutions=$(q "SELECT count(*) FROM claims WHERE content LIKE 'Resolves $UF3:%'")"
+  UWF="ul-wf-$LABEL"
+  R=$(tool ingest_workflow "{\"extraction\":$(wf_json "$UWF" 0 "unauth gen0 $LABEL" "unauth step one $LABEL")}")
+  q "UPDATE workflows SET metadata = COALESCE(NULLIF(metadata, 'null'::jsonb), '{}'::jsonb) || jsonb_build_object('epigraph_submitted_by', '$FA') WHERE canonical_name='$UWF'" >/dev/null
+  echo "   (seeded $UWF: $(verdict "$R"), submitter re-recorded as the foreign agent)"
+  R=$(tool add_step "{\"canonical_name\":\"$UWF\",\"step_text\":\"unauth step $LABEL\"}")
+  echo "   add_step on a foreign submitter's workflow: $(verdict "$R") | steps=$(wf_steps "$UWF")"
+  stop_server
+fi
+
+# ── cascade: supersede an OWN supporter of an own target O and a FOREIGN public
+# target T whose edge BBA (public, foreign group) is seeded by the SU DSN. The
+# review measured, first H-b tip, config A: T's edge BBA deleted (1 -> 0) while
+# its belief stayed 0.7 (stale). Expect A: T keeps its BBA (1 -> 1) and belief,
+# named in belief_cascade.errors; O repaired. B: both repaired, as before.
+if want cascade; then
+  echo
+  echo "=== cascade: a supersede whose downstream includes a claim the caller cannot write ==="
+  stop_server
+  start_server none
+  R=$(tool submit_claim "{\"content\":\"cascade source S $LABEL\",\"methodology\":\"extraction\",\"evidence_data\":\"probe\",\"evidence_type\":\"empirical\",\"confidence\":0.8,\"novelty_threshold\":0.0}")
+  S=$(field "$R" claim_id)
+  R=$(tool submit_claim "{\"content\":\"cascade own target O $LABEL\",\"methodology\":\"extraction\",\"evidence_data\":\"probe\",\"evidence_type\":\"empirical\",\"confidence\":0.6,\"novelty_threshold\":0.0}")
+  O=$(field "$R" claim_id)
+  T=$(q "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, visibility, owner_group_id, belief, plausibility, pignistic_prob) VALUES (gen_random_uuid(), 'cascade foreign target T $LABEL', decode(md5(random()::text)||md5(random()::text),'hex'), 0.6, '$FA', 'public', '$FG', 0.7, 0.9, 0.8) RETURNING id" | head -1)
+  R=$(tool link_epistemic "{\"source_claim_id\":\"$S\",\"target_claim_id\":\"$O\",\"relationship\":\"supports\"}")
+  EO=$(q "SELECT id FROM edges WHERE source_id='$S' AND target_id='$O' AND relationship='supports'")
+  ET=$(q "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) VALUES ('$S','claim','$T','claim','supports','{}'::jsonb) RETURNING id" | head -1)
+  q "INSERT INTO perspectives (id, name, description, owner_agent_id, properties, perspective_type, frame_ids, extraction_method, confidence_calibration, owner_group_id, visibility) SELECT '$ET', name||' T', description, owner_agent_id, properties, perspective_type, frame_ids, extraction_method, confidence_calibration, '$FG', 'public' FROM perspectives WHERE id='$EO'" >/dev/null
+  q "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, perspective_id, owner_group_id, visibility, combination_method, source_strength, evidence_type, locality_tag)
+     SELECT '$T', frame_id, source_agent_id, masses, '$ET', '$FG', 'public', combination_method, source_strength, evidence_type, locality_tag FROM mass_functions WHERE perspective_id='$EO' LIMIT 1" >/dev/null
+  q "INSERT INTO claim_frames (claim_id, frame_id) SELECT '$T', frame_id FROM mass_functions WHERE perspective_id='$EO' LIMIT 1 ON CONFLICT DO NOTHING" >/dev/null 2>&1
+  echo "   before: O edge BBAs=$(q "SELECT count(*) FROM mass_functions WHERE perspective_id='$EO'") O belief=$(q "SELECT COALESCE(round(belief::numeric,2)::text,'NULL') FROM claims WHERE id='$O'") | T edge BBAs=$(q "SELECT count(*) FROM mass_functions WHERE perspective_id='$ET'") T belief=$(q "SELECT belief FROM claims WHERE id='$T'")"
+  R=$(tool supersede_claim "{\"claim_id\":\"$S\",\"content\":\"cascade replacement for S $LABEL\",\"truth_value\":0.5,\"reason\":\"probe\"}")
+  echo "   supersede: $(verdict "$R") | errors=$(printf '%s' "$R" | jq -c '.result.content[0].text | fromjson | .belief_cascade.errors | map(.[0:90])' 2>/dev/null) invalidated=$(field "$R" belief_cascade.invalidated_bbas)"
+  echo "   after:  S current=$(q "SELECT is_current FROM claims WHERE id='$S'") O edge BBAs=$(q "SELECT count(*) FROM mass_functions WHERE perspective_id='$EO'") O belief=$(q "SELECT COALESCE(round(belief::numeric,2)::text,'NULL') FROM claims WHERE id='$O'") | T edge BBAs=$(q "SELECT count(*) FROM mass_functions WHERE perspective_id='$ET'") T belief=$(q "SELECT COALESCE(belief::text,'NULL') FROM claims WHERE id='$T'")"
+  stop_server
 fi
 
 echo

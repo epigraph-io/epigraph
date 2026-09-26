@@ -509,3 +509,77 @@ pub fn parse_uuid_field(json: &Value, key: &str) -> Uuid {
         .parse()
         .expect("valid UUID")
 }
+
+/// THIS SERVER's own agent holding a `claims:admin` token, with the viewer the
+/// request would have resolved for it (batch H-b, D1).
+///
+/// `admin_auth()` above carries no `agent_id`, and since D1 a write tool
+/// refuses such a token — it has no author, exactly as `request_viewer`
+/// refuses it no reader — so a test that needs an admin CALLER needs one with
+/// an `agents.id` and a matching viewer. The server's own agent is the
+/// cheapest real one: `agent_id()` has already provisioned its personal group.
+pub async fn server_admin(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+) -> (AuthContext, epigraph_db::visibility::Viewer) {
+    let agent = server.server_agent_id().await.expect("server agent");
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, None)
+        .await
+        .expect("the server agent's viewer");
+    (
+        AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: Some(agent),
+            owner_id: None,
+            client_type: ClientType::Service,
+            scopes: vec!["claims:admin".to_string()],
+            jti: Uuid::new_v4(),
+        },
+        viewer,
+    )
+}
+
+/// Record `token`'s client as an ACTIVE `oauth_clients` row granting
+/// `claims:admin`, bound to the token's agent — what `oauth/token.rs` mints an
+/// admin token from. Migration 111's audited admin path re-checks exactly this
+/// record, so a test whose admin writes into a group it cannot write needs it
+/// (batch H-b, D2); a hand-minted token with no such row is refused there.
+pub async fn seed_admin_grant(pool: &PgPool, token: &AuthContext) {
+    sqlx::query(
+        "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id) \
+         VALUES ($1, $2, 'test admin', 'human', ARRAY['claims:admin'], ARRAY['claims:admin'], \
+                 'active', $3)",
+    )
+    .bind(token.client_id)
+    .bind(format!("test-admin-{}", token.client_id))
+    .bind(token.agent_id)
+    .execute(pool)
+    .await
+    .expect("seed the admin token's client record");
+}
+
+/// A real agent with a live personal group, a `claims:write`-style token that
+/// names it the way `oauth/token.rs` does (`sub`/`owner_id` are
+/// `oauth_clients` ids, only `agent_id` is an `agents.id`), and its viewer.
+pub async fn seed_caller(
+    pool: &PgPool,
+    scopes: &[&str],
+) -> (Uuid, AuthContext, epigraph_db::visibility::Viewer) {
+    let agent = seed_agent(pool).await;
+    personal_group_of(pool, agent).await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, agent)
+        .await
+        .expect("caller viewer");
+    (
+        agent,
+        AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: Some(agent),
+            owner_id: Some(Uuid::new_v4()),
+            client_type: ClientType::Agent,
+            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            jti: Uuid::new_v4(),
+        },
+        viewer,
+    )
+}

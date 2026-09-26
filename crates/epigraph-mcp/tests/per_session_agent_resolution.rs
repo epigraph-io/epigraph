@@ -132,6 +132,7 @@ async fn control_a_new_session_of_a_live_server_agent_ingests(pool: PgPool) {
         IngestDocumentInlineParams {
             extraction: doc("10.9999/per-session-control"),
         },
+        None,
     )
     .await
     .expect("a live personal membership must be admitted by a new session");
@@ -180,6 +181,7 @@ async fn a_new_session_does_not_revive_a_revoked_server_agent(pool: PgPool) {
         IngestDocumentInlineParams {
             extraction: doc("10.9999/per-session-revoked"),
         },
+        None,
     )
     .await;
 
@@ -239,6 +241,7 @@ async fn a_restarted_process_does_not_revive_a_revoked_server_agent(pool: PgPool
         IngestDocumentInlineParams {
             extraction: doc("10.9999/per-session-restarted"),
         },
+        None,
     )
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(3000)).await;

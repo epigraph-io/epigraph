@@ -106,7 +106,7 @@ async fn run(
         "epigraph-cli ingest_document runs entirely on MaintenancePool, whose role bypasses RLS",
     );
 
-    let result = do_ingest_document(&server, viewer, &extraction)
+    let result = do_ingest_document(&server, viewer, &extraction, None)
         .await
         .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
     let text = result

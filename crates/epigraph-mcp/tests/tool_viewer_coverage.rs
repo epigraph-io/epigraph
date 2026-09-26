@@ -101,21 +101,22 @@ use std::path::{Path, PathBuf};
 ///     `claim_themes` `tenancy_exempt` residual **without its stated control**;
 ///     that is the single largest thing PR-09 does not deliver.
 const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
+    // Batch H-b removed `challenge_claim`, `create_perspective`,
+    // `ingest_document_spine` and `retire_match_candidate`: each now authors or
+    // records its acting agent as the request's principal
+    // (`EpiGraphMcpFull::write_identity`), which is read off the viewer. It
+    // also removed `add_step` and `delete_step`, which now check the caller's
+    // authority over the workflow (H3).
     // write / decide — PR-16 owns the SQL write-side predicate for these.
     // `assign_ownership` and `update_partition` left this list in PR-11: they
     // now acquire a viewer, spend its `writable_groups()`/principal on
     // `epigraph_authz::GroupPolicyGate`, and refuse a caller who is neither the
     // node's owner nor a writer in its owning group.
-    "add_step",
-    "challenge_claim",
+    // The batch H-b review removed `publish_event` (over HTTP its actor must be
+    // the request's principal, read off the viewer) and
+    // `set_source_reliability` (read, owned and written as that principal).
     "create_frame",
-    "create_perspective",
-    "delete_step",
-    "ingest_document_spine",
-    "publish_event",
     "report_hierarchical_outcome",
-    "retire_match_candidate",
-    "set_source_reliability",
     "structure_source",
     // pure-CPU, no DB
     "list_mcp_tools",

@@ -54,6 +54,7 @@ pub async fn evolve_step(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: EvolveStepParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let level = params.level.unwrap_or(2);
     if level != 2 && level != 3 {
@@ -89,7 +90,7 @@ pub async fn evolve_step(
             "provide a parent step: either `parent_id`, or both `canonical_name` and `step_index`",
         ));
     };
-    let agent_id = server.agent_id().await?;
+    let agent_id = server.write_identity(auth, viewer).await?.agent_id();
 
     let result = epigraph_db::ClaimRepository::evolve_step(
         &server.pool,

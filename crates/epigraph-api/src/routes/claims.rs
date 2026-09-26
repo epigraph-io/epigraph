@@ -1769,25 +1769,101 @@ pub async fn patch_claim(
         })?;
     crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
 
-    // ── 5. Open transaction — all mutations + provenance are atomic ──────────
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to begin transaction: {e}"),
+    // ── 4a. THE AUDITED ADMIN PATH (batch H-b, D2; review finding) ───────────
+    // A `claims:admin` caller whose own writable set does not hold the claim's
+    // owning group goes through migration 111's definer, exactly as
+    // `PATCH /api/v1/claims/:id/labels` and MCP `patch_claim` do. Measured by
+    // the review on config B before this: an admin `PATCH /api/v1/claims/:id`
+    // with `add_labels: [.., "resolved"]` on a world-owned public claim landed
+    // (200, label on the row) through the orphan policy with NO audit row and
+    // no admin principal, bypassing D2 on the one route it had not reached.
+    // The owning group is read through the CALLER's viewer; a claim the admin
+    // cannot read is 404, as on the labels route. Every other caller keeps the
+    // pre-existing (unstamped) path, which R3 item 2 still lists.
+    let admin_path = if auth.has_scope("claims:admin") {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "patch_claim",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
         })?;
-
-    // ── 6 & 7. Fetch before-state and apply mutations atomically ─────────────
-    let patch_input = epigraph_db::PatchClaimInput {
-        trace_id: request.trace_id,
-        properties: request.properties.clone(),
-        add_labels: request.add_labels.clone().unwrap_or_default(),
-        remove_labels: request.remove_labels.clone().unwrap_or_default(),
+        let (_, owner_group_id) = ClaimRepository::write_target_of(&mut *read, &viewer, id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB error fetching claim owner: {e}"),
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                entity: "Claim".to_string(),
+                id: id.to_string(),
+            })?;
+        !viewer.writable_groups().contains(&owner_group_id)
+    } else {
+        false
     };
 
-    let diff =
-        epigraph_db::ClaimRepository::patch_claim_atomic_conn(&mut tx, claim_id, &patch_input)
+    // ── 5. Open transaction — all mutations + provenance are atomic ──────────
+    // The admin path runs on a transaction stamped from the ADMIN's own viewer
+    // (so `epigraph.principal_id` is the admin, which the definer records);
+    // every other caller on the pool transaction this route always used.
+    let mut pool_tx: Option<sqlx::Transaction<'_, sqlx::Postgres>> = None;
+    let mut scoped_tx: Option<epigraph_db::ScopedTx<'_>> = None;
+    let tx: &mut sqlx::PgConnection = if admin_path {
+        scoped_tx.insert(state.write_as(&viewer, "patch_claim").await?)
+    } else {
+        pool_tx.insert(
+            state
+                .db_pool
+                .begin()
+                .await
+                .map_err(|e| ApiError::DatabaseError {
+                    message: format!("Failed to begin transaction: {e}"),
+                })?,
+        )
+    };
+
+    // ── 6 & 7. Fetch before-state and apply mutations atomically ─────────────
+    let (before_labels, after_labels, before_props, after_props, before_trace, after_trace) =
+        if admin_path {
+            let w = ClaimRepository::admin_patch_claim_conn(
+                &mut *tx,
+                epigraph_db::AdminToken {
+                    client_id: auth.client_id,
+                    jti: auth.jti,
+                },
+                id,
+                epigraph_db::AdminClaimAction::PatchClaim,
+                request.add_labels.as_deref().unwrap_or_default(),
+                request.remove_labels.as_deref().unwrap_or_default(),
+                request.properties.as_ref(),
+                request.trace_id,
+            )
+            .await
+            .map_err(|e| admin_patch_error(e, id))?;
+            (
+                w.before_labels,
+                w.labels,
+                w.before_properties,
+                w.properties,
+                w.before_trace_id,
+                w.trace_id,
+            )
+        } else {
+            let patch_input = epigraph_db::PatchClaimInput {
+                trace_id: request.trace_id,
+                properties: request.properties.clone(),
+                add_labels: request.add_labels.clone().unwrap_or_default(),
+                remove_labels: request.remove_labels.clone().unwrap_or_default(),
+            };
+            let diff = epigraph_db::ClaimRepository::patch_claim_atomic_conn(
+                &mut *tx,
+                claim_id,
+                &patch_input,
+            )
             .await
             .map_err(|e| match e {
                 epigraph_db::DbError::NotFound { id: eid, .. } => ApiError::NotFound {
@@ -1805,16 +1881,18 @@ pub async fn patch_claim(
                     message: other.to_string(),
                 },
             })?;
-
-    let before_labels = diff.before_labels;
-    let after_labels = diff.after_labels;
-    let before_props = diff.before_props;
-    let after_props = diff.after_props;
-    let before_trace = diff.before_trace;
-    let after_trace = diff.after_trace;
+            (
+                diff.before_labels,
+                diff.after_labels,
+                diff.before_props,
+                diff.after_props,
+                diff.before_trace,
+                diff.after_trace,
+            )
+        };
 
     // ── 8. Re-fetch updated claim (for response) ─────────────────────────────
-    let updated_claim = ClaimRepository::get_by_id_conn(&mut tx, &viewer, claim_id)
+    let updated_claim = ClaimRepository::get_by_id_conn(&mut *tx, &viewer, claim_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),
@@ -1867,7 +1945,7 @@ pub async fn patch_claim(
     // ── 11. Append provenance — fail hard, inside transaction ────────────────
     let principal_id = auth.owner_id.unwrap_or(auth.client_id);
     ProvenanceRepository::append_conn(
-        &mut tx,
+        &mut *tx,
         "claim",
         id,
         "patch",
@@ -1887,11 +1965,60 @@ pub async fn patch_claim(
     })?;
 
     // ── 12. Commit ───────────────────────────────────────────────────────────
-    tx.commit().await.map_err(|e| ApiError::InternalError {
-        message: format!("Failed to commit transaction: {e}"),
-    })?;
+    if let Some(t) = scoped_tx.take() {
+        t.commit().await.map_err(|e| ApiError::InternalError {
+            message: format!("Failed to commit transaction: {e}"),
+        })?;
+    }
+    if let Some(t) = pool_tx.take() {
+        t.commit().await.map_err(|e| ApiError::InternalError {
+            message: format!("Failed to commit transaction: {e}"),
+        })?;
+    }
 
     Ok(Json(updated_claim.into()))
+}
+
+/// The audited admin path's refusals, mapped as `PATCH /labels` maps them:
+/// `InvalidData` (an unexpanded shell label) 400, `P0002` (no claim) 404,
+/// `42501` (no live grant on the token's client record, or no principal) 403.
+#[cfg(feature = "db")]
+fn admin_patch_error(e: epigraph_db::DbError, id: Uuid) -> ApiError {
+    let code = match &e {
+        epigraph_db::DbError::QueryFailed { source } => source
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .map(|c| c.to_string()),
+        _ => None,
+    };
+    match (e, code.as_deref()) {
+        (epigraph_db::DbError::InvalidData { reason }, _) => ApiError::ValidationError {
+            field: "add_labels".to_string(),
+            reason,
+        },
+        (_, Some("P0002")) => ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: id.to_string(),
+        },
+        (e, Some("42501")) => {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "patch_claim",
+                claim = %id,
+                error = %e,
+                "the audited admin path refused the token"
+            );
+            ApiError::Forbidden {
+                reason: "the audited admin path refused this token: it needs a live \
+                         claims:admin grant on the token's own client record; nothing was \
+                         written"
+                    .to_string(),
+            }
+        }
+        (other, _) => ApiError::DatabaseError {
+            message: other.to_string(),
+        },
+    }
 }
 
 /// Stub for non-db builds
@@ -2021,12 +2148,91 @@ pub async fn update_labels(
     // `update_labels` / `patch_claim` refuse the same act. Whether `claims:admin`
     // should carry write authority into groups the admin cannot write is the
     // cross-agent ownership decision (H-b, #374); lending the author's stamp
-    // decided it silently, so the route now stamps the caller only.
+    // decided it silently, so the route stamps the caller only.
+    //
+    // THE AUDITED ADMIN PATH (batch H-b, D2). A `claims:admin` caller whose own
+    // writable set does not hold the claim's owning group no longer gets a bare
+    // 403: its write goes through migration 111's
+    // `epigraph_admin_patch_claim`, on this SAME caller-stamped transaction (so
+    // `epigraph.principal_id` is the ADMIN), which re-checks the token's client
+    // record for a live `claims:admin` grant, writes the labels and records a
+    // `security_events` row (`claims.admin_write`: admin, token, target,
+    // before/after). Everyone else stays on the caller's own stamp. MCP
+    // `update_labels` routes identically (`epigraph-mcp/src/tools/admin_write.rs`).
     let stamp: &epigraph_db::Viewer = &viewer;
+    let admin_path =
+        auth.has_scope("claims:admin") && !viewer.writable_groups().contains(&owner_group_id);
 
     // Never a fallback to `state.db_pool`: an unstamped write is exactly what
     // this conversion removes.
     let mut tx = state.write_as(stamp, "update_labels").await?;
+
+    if admin_path {
+        let written = ClaimRepository::admin_patch_claim_conn(
+            &mut tx,
+            epigraph_db::AdminToken {
+                client_id: auth.client_id,
+                jti: auth.jti,
+            },
+            id,
+            epigraph_db::AdminClaimAction::UpdateLabels,
+            &body.add,
+            &body.remove,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| match e {
+            epigraph_db::DbError::InvalidData { reason } => ApiError::ValidationError {
+                field: "add".to_string(),
+                reason,
+            },
+            epigraph_db::DbError::QueryFailed { ref source }
+                if source
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .as_deref()
+                    == Some("P0002") =>
+            {
+                ApiError::NotFound {
+                    entity: "Claim".to_string(),
+                    id: id.to_string(),
+                }
+            }
+            epigraph_db::DbError::QueryFailed { ref source }
+                if source
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .as_deref()
+                    == Some("42501") =>
+            {
+                tracing::warn!(
+                    target: "tenancy.scoped_write",
+                    handler = "update_labels",
+                    claim = %id,
+                    owner_group = %owner_group_id,
+                    error = %e,
+                    "the audited admin path refused the token"
+                );
+                ApiError::Forbidden {
+                    reason: "the audited admin path refused this token: it needs a live \
+                             claims:admin grant on the token's own client record; nothing \
+                             was written"
+                        .to_string(),
+                }
+            }
+            other => ApiError::DatabaseError {
+                message: other.to_string(),
+            },
+        })?;
+        tx.commit().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to commit transaction: {e}"),
+        })?;
+        return Ok(Json(UpdateLabelsResponse {
+            id,
+            labels: written.labels,
+        }));
+    }
 
     let labels = ClaimRepository::update_labels_conn(&mut tx, id, &body.add, &body.remove)
         .await

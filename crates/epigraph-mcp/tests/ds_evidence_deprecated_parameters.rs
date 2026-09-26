@@ -76,6 +76,7 @@ async fn a_non_default_method_and_any_gamma_are_warned_about_and_change_nothing(
             &server,
             &viewer,
             params(plain_claim, frame, serde_json::json!({})),
+            None,
         )
         .await
         .expect("plain submit"),
@@ -95,6 +96,7 @@ async fn a_non_default_method_and_any_gamma_are_warned_about_and_change_nothing(
                 frame,
                 serde_json::json!({"combination_method": "Dempster"}),
             ),
+            None,
         )
         .await
         .unwrap(),
@@ -114,6 +116,7 @@ async fn a_non_default_method_and_any_gamma_are_warned_about_and_change_nothing(
                 frame,
                 serde_json::json!({"combination_method": "YagerOpen", "gamma": 0.4}),
             ),
+            None,
         )
         .await
         .expect("yager submit is accepted, not refused"),
