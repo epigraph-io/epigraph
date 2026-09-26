@@ -584,6 +584,46 @@ async fn unauthenticated_http_refuses_write_tools_by_default() {
     );
 }
 
+/// Every kernel tool in `SCOPE_MAP` on the default principal-less listener:
+/// each `claims:read` tool passes the scope gate (reads are unchanged), and
+/// every other tool is refused there with the principal-less cause. Pins the
+/// whole map, so a tool added later lands on the right side by its scope.
+#[tokio::test]
+async fn unauthenticated_http_splits_the_whole_scope_map_by_read_scope() {
+    let addr = spawn_unauth_server().await;
+    let url = format!("http://{addr}/mcp");
+    let c = client();
+    let session_id = mcp_handshake(&c, &url, "unused-no-bearer").await;
+    let (mut reads, mut refused) = (0, 0);
+    for (tool, scope) in epigraph_mcp::scope_map::SCOPE_MAP {
+        let (_status, body) = call_tool(
+            &c,
+            &url,
+            "unused-no-bearer",
+            &session_id,
+            tool,
+            serde_json::json!({}),
+        )
+        .await;
+        if scope.ends_with(":read") {
+            reads += 1;
+            assert!(
+                !body.contains("requires scope") && !body.contains("no authenticated principal"),
+                "{tool} ({scope}) must pass the scope gate on the principal-less listener; got: \
+                 {body}"
+            );
+        } else {
+            refused += 1;
+            assert!(
+                body.contains(&format!("requires scope '{scope}'"))
+                    && body.contains("no authenticated principal"),
+                "{tool} ({scope}) must be refused at the scope gate; got: {body}"
+            );
+        }
+    }
+    assert!(reads > 0 && refused > 0, "both sides exercised");
+}
+
 /// With the opt-in, the same write tool passes the scope gate (it then fails at
 /// the deliberately unreachable database, which is not auth-shaped).
 #[tokio::test]

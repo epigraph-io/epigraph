@@ -250,8 +250,15 @@ unauth_arm() {  # $1 = unauth | unauthw
   echo "   claims authored by SIGNER: $CL_BEFORE->$(q "SELECT count(*) FROM claims WHERE agent_id='$SIG'")"
   R=$(tool sweep_semantic_duplicates '{"dry_run":true}')
   echo "   sweep_semantic_duplicates (a claims:admin tool): $(verdict "$R")"
-  R=$(tool query_claims '{"limit":1}')
-  echo "   query_claims (a read): $(verdict "$R")"
+  # Reads must keep working on the read-only listener: one per read-tool family
+  # (no claims:read tool resolves a write identity; recall's audit row is the
+  # only write a read makes, and it is not author-stamped).
+  for READ in 'query_claims {"limit":1}' 'query_claims_by_label {"labels":["backlog"]}' \
+              "get_claim {\"claim_id\":\"${HUMAN_ITEM:-00000000-0000-0000-0000-000000000000}\"}" \
+              'recall {"query":"httpid backlog"}' 'list_events {"limit":1}'; do
+    R=$(tool "${READ%% *}" "${READ#* }")
+    echo "   ${READ%% *} (a read): $(verdict "$R")"
+  done
   if [ -n "$HUMAN_ITEM" ]; then
     R=$(tool update_labels "{\"claim_id\":\"$HUMAN_ITEM\",\"add\":[\"resolved\"]}")
     echo "   update_labels +resolved on the HUMAN's item: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$HUMAN_ITEM' AND 'resolved'=ANY(labels)")"
