@@ -1070,12 +1070,18 @@ class BoardPushesTest(_ServerFixture):
         self.assertIsNotNone(problem)
         self.assertIn("never force-pushed", problem)
         self.assertEqual(self.origin_sha(branch), published)
-        # an agent-planted remote.<name>.mirror cannot widen the explicit refspec into a mirror push
+        # an agent-planted remote.<name>.mirror cannot widen the explicit refspec into a mirror push. Local main is
+        # moved AHEAD of origin first, so a mirror push (which pushes every local ref, forced) would visibly move it.
+        local_main = git(["rev-parse", "refs/heads/main"], self.repo).strip()
+        git(["update-ref", "refs/heads/main", git(["rev-parse", "refs/heads/" + branch], self.repo).strip()],
+            self.repo)
         git(["config", "remote.origin.mirror", "true"], self.repo)
         try:
-            self.app.push_card_branch(card)
+            has_work, problem = self.app.push_card_branch(card)
         finally:
             git(["config", "--unset", "remote.origin.mirror"], self.repo)
+            git(["update-ref", "refs/heads/main", local_main], self.repo)
+        self.assertIsNotNone(problem)  # git refuses --mirror with a refspec; nothing is sent
         self.assertEqual(self.origin_sha(branch), published)
         self.assertEqual(self.origin_sha("main"), main_before)
 
