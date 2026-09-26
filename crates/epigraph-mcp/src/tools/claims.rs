@@ -1580,7 +1580,7 @@ pub async fn resolve_backlog_item(
     // fall back to the legacy agent-equality check against the server's
     // own signer agent — preserves backward compat for non-HTTP callers.
     let target_agent = original.agent_id.as_uuid();
-    require_owner_or_admin(server, auth, caller, target_agent).await?;
+    let mut grant = require_owner_or_admin(server, auth, caller, target_agent).await?;
 
     // Resolve the closure basis BEFORE anything is created.
     //
@@ -1682,7 +1682,8 @@ pub async fn resolve_backlog_item(
             ))
         })?;
     if original_now.agent_id.as_uuid() != target_agent {
-        require_owner_or_admin(server, auth, caller, original_now.agent_id.as_uuid()).await?;
+        grant =
+            require_owner_or_admin(server, auth, caller, original_now.agent_id.as_uuid()).await?;
     }
     for basis_uuid in &basis_ids {
         ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(*basis_uuid))
@@ -1768,21 +1769,27 @@ pub async fn resolve_backlog_item(
     //    row. Same transaction, so the whole retirement is still one fact.
     let owner_group =
         crate::tools::admin_write::owner_group_of(&mut tx, viewer, original_id).await?;
-    let after_labels = if crate::tools::admin_write::takes_admin_path(auth, viewer, owner_group) {
-        crate::tools::admin_write::admin_patch(
-            &mut tx,
-            auth,
-            original_id,
-            epigraph_db::AdminClaimAction::ResolveBacklogItem,
-            &["resolved".to_string()],
-            &[],
-            None,
-            None,
-        )
-        .await?
-        .labels
-    } else {
-        ClaimRepository::update_labels_conn(&mut tx, original_id, &["resolved".to_string()], &[])
+    let after_labels =
+        if crate::tools::admin_write::takes_admin_path(Some(grant), viewer, owner_group) {
+            crate::tools::admin_write::admin_patch(
+                &mut tx,
+                auth,
+                original_id,
+                epigraph_db::AdminClaimAction::ResolveBacklogItem,
+                &["resolved".to_string()],
+                &[],
+                None,
+                None,
+            )
+            .await?
+            .labels
+        } else {
+            ClaimRepository::update_labels_conn(
+                &mut tx,
+                original_id,
+                &["resolved".to_string()],
+                &[],
+            )
             .await
             .map_err(|e| {
                 internal_error(format!(
@@ -1791,7 +1798,7 @@ pub async fn resolve_backlog_item(
                      with it."
                 ))
             })?
-    };
+        };
 
     tx.commit().await.map_err(internal_error)?;
 
@@ -1872,6 +1879,12 @@ pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 /// an agent it shares no operator with (unlinked fleet agents included): the
 /// `release/epiclaw/CLAUDE.md` procedure that relabels cross-agent items with
 /// `update_labels` now works only between agents linked to one operator.
+///
+/// Removing `backlog` also takes an item out of the open-backlog query and is
+/// NOT gated here: it is free vocabulary on stdio (the batch H-b bar freezes
+/// stdio free labels), and over HTTP the whole label mutation is gated anyway.
+/// Whether `backlog` removal is a retirement is an open operator decision
+/// (scripts/e2e/README.md, R3 checklist).
 #[allow(clippy::too_many_arguments)]
 async fn gate_retirement_label(
     server: &EpiGraphMcpFull,
@@ -1882,13 +1895,13 @@ async fn gate_retirement_label(
     claim_id: Uuid,
     add: &[String],
     remove: &[String],
-) -> Result<(), McpError> {
+) -> Result<Option<OwnershipGrant>, McpError> {
     let touches_retirement = add
         .iter()
         .chain(remove.iter())
         .any(|l| l == RETIREMENT_LABEL);
     if !touches_retirement {
-        return Ok(());
+        return Ok(None);
     }
 
     // Only fetched on the gated path, so the common label mutation keeps its
@@ -1914,9 +1927,8 @@ async fn gate_retirement_label(
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
-    require_owner_or_admin(server, auth, caller, claim.agent_id.as_uuid())
-        .await
-        .map(|_| ())
+    let grant = require_owner_or_admin(server, auth, caller, claim.agent_id.as_uuid()).await?;
+    Ok(Some(grant))
 }
 
 pub async fn update_labels(
@@ -1944,9 +1956,27 @@ pub async fn update_labels(
     let caller = server.write_identity(auth, viewer).await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "update_labels").await?;
-    // The gate reads on the SAME stamped transaction; a refusal drops `tx`, which
-    // rolls back, so nothing is written.
-    gate_retirement_label(
+    // OWNERSHIP OF THE WHOLE MUTATION on the authenticated transport, exactly as
+    // `patch_claim` and the HTTP twin (`PATCH /api/v1/claims/:id/labels`,
+    // `require_owner_or_admin`) require. Batch H-b review, measured on config A:
+    // with only the retirement label gated here, a teammate that is a writer of
+    // the team group owning a colleague's claim relabelled it through
+    // `update_labels` (D1 gave its stamp that reach) while `patch_claim` with
+    // the identical labels refused it. On stdio free labels stay ungated, the
+    // batch H-b bar (stdio changes only for #374); the retirement label is
+    // gated on every transport below. The read is on the SAME stamped
+    // transaction; a refusal drops `tx`, which rolls back, so nothing is
+    // written.
+    let grant = if auth.is_some() {
+        let target = ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(id))
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
+        Some(require_owner_or_admin(server, auth, caller, target.agent_id.as_uuid()).await?)
+    } else {
+        None
+    };
+    let retirement_grant = gate_retirement_label(
         server,
         &mut tx,
         viewer,
@@ -1958,7 +1988,11 @@ pub async fn update_labels(
     )
     .await?;
     let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;
-    let admin_path = crate::tools::admin_write::takes_admin_path(auth, viewer, owner_group);
+    let admin_path = crate::tools::admin_write::takes_admin_path(
+        grant.or(retirement_grant),
+        viewer,
+        owner_group,
+    );
     let labels = if admin_path {
         crate::tools::admin_write::admin_patch(
             &mut tx,
@@ -2045,14 +2079,16 @@ pub async fn patch_claim(
     // there stays ungated (batch H-b left stdio unchanged except for the
     // retirement label, which `gate_retirement_label` below now gates on every
     // transport, #374).
-    if auth.is_some() {
-        require_owner_or_admin(server, auth, caller, target.agent_id.as_uuid()).await?;
-    }
+    let grant = if auth.is_some() {
+        Some(require_owner_or_admin(server, auth, caller, target.agent_id.as_uuid()).await?)
+    } else {
+        None
+    };
 
     // Same gate as `update_labels`: `patch_claim` also accepts
     // `add_labels`/`remove_labels`, so leaving it ungated would just move the
     // bypass one tool over (issue #374).
-    gate_retirement_label(
+    let retirement_grant = gate_retirement_label(
         server,
         &mut tx,
         viewer,
@@ -2064,7 +2100,11 @@ pub async fn patch_claim(
     )
     .await?;
     let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;
-    let admin_path = crate::tools::admin_write::takes_admin_path(auth, viewer, owner_group);
+    let admin_path = crate::tools::admin_write::takes_admin_path(
+        grant.or(retirement_grant),
+        viewer,
+        owner_group,
+    );
     let (after_labels, after_props, after_trace) = if admin_path {
         let w = crate::tools::admin_write::admin_patch(
             &mut tx,

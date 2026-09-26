@@ -5,9 +5,15 @@
 //!
 //! Exactly when BOTH hold:
 //!
-//! 1. the request carries a token with `claims:admin` — the only grant in
-//!    [`crate::tools::claims::require_owner_or_admin`] that brings no write
-//!    authority of its own; and
+//! 1. the ownership gate ([`crate::tools::claims::require_owner_or_admin`])
+//!    ADMITTED the caller through its `claims:admin` arm — the only grant that
+//!    brings no write authority of its own. Keyed on the grant the gate
+//!    returned, never on the token's scope: the first revision keyed on the
+//!    scope, so `update_labels` (whose free labels ran no ownership gate at
+//!    all) sent a free-label write into the definer for any admin-scoped token
+//!    (batch H-b review: on the `--allow-unauthenticated-http` listener, whose
+//!    injected context carries `claims:admin` with a nil client, a foreign free
+//!    label was refused `ADM02`, contradicting migration 111 section 2); and
 //! 2. the claim's owning group is NOT in the caller's own writable set, so the
 //!    caller's own stamp (D1) could not write the row.
 //!
@@ -36,13 +42,15 @@ use epigraph_db::{AdminClaimAction, AdminClaimWrite, AdminToken, ClaimRepository
 use crate::errors::{internal_error, invalid_params, McpError};
 
 /// Whether this write must take the audited admin path; see the module doc.
+/// `grant` is what the ownership gate returned for THIS write (`None` when no
+/// gate ran, e.g. a stdio free-label write), never the token's scope.
 #[must_use]
 pub(crate) fn takes_admin_path(
-    auth: Option<&epigraph_auth::AuthContext>,
+    grant: Option<crate::tools::claims::OwnershipGrant>,
     caller_viewer: &epigraph_db::visibility::Viewer,
     owner_group: uuid::Uuid,
 ) -> bool {
-    auth.is_some_and(|a| a.has_scope("claims:admin"))
+    grant == Some(crate::tools::claims::OwnershipGrant::Admin)
         && !caller_viewer.writable_groups().contains(&owner_group)
 }
 

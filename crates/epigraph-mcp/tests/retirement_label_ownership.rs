@@ -14,16 +14,18 @@
 //!   principal neither owns nor has `claims:admin` for is refused, and nothing
 //!   is written;
 //! * `claims:admin` still passes;
-//! * every OTHER label is still ungated for a foreign principal — the gate is
-//!   scoped to the one label with retirement semantics, because cross-agent
-//!   taxonomy maintenance is legitimate and high-volume;
-//! * with `auth = None` (stdio) the same ownership rule applies since batch
-//!   H-b (#374's stdio half): the author, or an agent linked to the author's
-//!   operator (#503), or a per-process random signer (undecidable, allowed).
-//!   A declared stdio signer that shares no operator with the author is
-//!   refused. The old carve-out existed because a model-bumped fleet agent
-//!   could not reach its predecessor's items; #503's operator arms are what
-//!   reach them now.
+//! * over HTTP every OTHER label now needs ownership too (batch H-b review):
+//!   `update_labels` gates the whole mutation, as `patch_claim` and
+//!   `PATCH /api/v1/claims/:id/labels` already did, so a foreign principal's
+//!   free label is refused; on stdio free labels stay ungated, the scope
+//!   control for cross-agent taxonomy maintenance;
+//! * with `auth = None` (stdio) the retirement label takes the ownership rule
+//!   since batch H-b (#374's stdio half): the author, or an agent linked to
+//!   the author's operator (#503), or a per-process random signer
+//!   (undecidable, allowed). A declared stdio signer that shares no operator
+//!   with the author is refused. The old
+//!   carve-out existed because a model-bumped fleet agent could not reach its
+//!   predecessor's items; #503's operator arms are what reach them now.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -230,32 +232,60 @@ async fn update_labels_admin_scope_passes_the_retirement_authz_gate(pool: PgPool
     assert!(labels.contains(&"resolved".to_string()), "{labels:?}");
 }
 
-/// Scope control. This is the behaviour a blanket `require_owner_or_admin`
-/// would have broken, and it is exactly the 161-claim relabel the reporter
-/// describes as legitimate. Passes before and after the change by design.
+/// Batch H-b review (authority-attack, medium), measured on config A: MCP
+/// `update_labels` ran no ownership check for any label but `resolved`, while
+/// `patch_claim` with the identical labels and HTTP `PATCH /labels` did. With
+/// D1 a team writer's stamp reaches a colleague's team-owned claim, so the
+/// teammate relabelled it (`labels={wontfix}`) where `patch_claim` refused. The
+/// whole mutation is now gated on the authenticated transport. This arm PASSED
+/// by design before the change (it was the "ungated" scope control) and now
+/// pins the refusal; the stdio scope control below keeps the other half.
 #[sqlx::test(migrations = "../../migrations")]
-async fn update_labels_leaves_non_retirement_labels_ungated_for_a_foreign_principal(pool: PgPool) {
+async fn update_labels_gates_every_label_for_a_foreign_principal_over_http(pool: PgPool) {
     let claim =
         seed_claim_with_labels(&pool, "cross-agent taxonomy maintenance", &["backlog"]).await;
-    // Scoped: these tools now write on author-stamped transactions, and a
-    // server with no `ScopedPool` refuses them by name rather than writing on
-    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
-    // UPDATE with 42501.
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let (_caller, caller_auth, caller_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
 
-    epigraph_mcp::tools::claims::update_labels(
+    let err = epigraph_mcp::tools::claims::update_labels(
         &server,
         &caller_viewer,
         UpdateLabelsParams {
             claim_id: claim.to_string(),
-            add: vec!["telemetry".into()],
+            add: vec!["wontfix".into()],
             remove: vec!["backlog".into()],
         },
         Some(&caller_auth),
     )
     .await
-    .expect("free-form label maintenance must remain ungated");
+    .expect_err("over HTTP a free label on another agent's claim needs ownership too");
+    assert!(err.message.contains("is owned by agent"), "{}", err.message);
+    let labels = labels_of(&pool, claim).await;
+    assert_eq!(labels, vec!["backlog".to_string()], "nothing written");
+}
+
+/// Scope control, the half that stays: on stdio every label but `resolved` is
+/// still ungated (the batch H-b bar freezes stdio free labels), which is the
+/// cross-agent taxonomy maintenance the reporter described as legitimate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_labels_leaves_non_retirement_labels_ungated_on_stdio(pool: PgPool) {
+    let claim =
+        seed_claim_with_labels(&pool, "cross-agent taxonomy maintenance", &["backlog"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    epigraph_mcp::tools::claims::update_labels(
+        &server,
+        &viewer,
+        UpdateLabelsParams {
+            claim_id: claim.to_string(),
+            add: vec!["telemetry".into()],
+            remove: vec!["backlog".into()],
+        },
+        None,
+    )
+    .await
+    .expect("free-form label maintenance stays ungated on stdio");
 
     let labels = labels_of(&pool, claim).await;
     assert!(labels.contains(&"telemetry".to_string()), "{labels:?}");
