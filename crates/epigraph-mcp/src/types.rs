@@ -139,7 +139,7 @@ pub struct SubmitClaimParams {
     pub labels: Vec<String>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -147,10 +147,19 @@ pub struct SubmitClaimParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryClaimsParams {
-    #[schemars(description = "Minimum balanced truth value (0.0-1.0)")]
+    #[schemars(
+        description = "Minimum belief score (0.0-1.0, default 0.0). The score is the claim's \
+                       Dempster-Shafer pignistic probability when it has DS state, else its \
+                       truth_value — the same score recall's min_truth gates on — and each result \
+                       reports it as belief_score."
+    )]
     pub min_truth: Option<f64>,
 
-    #[schemars(description = "Maximum balanced truth value (0.0-1.0)")]
+    #[schemars(
+        description = "Maximum belief score (0.0-1.0, default 1.0), on the same score as \
+                       min_truth. A claim refuted by epistemic evidence has a low belief score even \
+                       when its authored truth_value is still high, so max_truth=0.4 finds it."
+    )]
     pub max_truth: Option<f64>,
 
     #[schemars(description = "Maximum number of results (default 20)")]
@@ -467,7 +476,7 @@ pub struct MemorizeParams {
     pub tags: Option<Vec<String>>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -1018,7 +1027,13 @@ pub struct SubmitDsEvidenceParams {
     #[schemars(description = "UUID of the frame of discernment")]
     pub frame_id: String,
 
-    #[schemars(description = "0-based index of the hypothesis this claim represents in the frame")]
+    #[schemars(
+        description = "0-based index of the hypothesis this claim represents in the frame. It is \
+                       stored on the claim's frame assignment and decides which hypothesis the \
+                       returned belief (and every later framed or cached belief read) is about. \
+                       An index outside the frame's hypotheses is stored as given, but every \
+                       reader treats it as 0, and the response's warnings say so."
+    )]
     pub hypothesis_index: i32,
 
     // `with` pins the advertised schema to `{"type":"object",
@@ -1045,17 +1060,25 @@ pub struct SubmitDsEvidenceParams {
     )]
     pub reliability: Option<f64>,
 
+    // DEPRECATED in the description, deliberately NOT `#[deprecated]`: the
+    // attribute would fire on ds.rs's own reads and fail `-D warnings`, and an
+    // agent reads the description, not the attribute. Backlog 82dcff9d (G5):
+    // honouring a per-call method would re-introduce the second, divergent
+    // combine that backlog 2bffdfdc removed, which needs a design decision.
     #[schemars(
-        description = "Combination method label: Dempster (default), Conjunctive, YagerOpen, \
-                       YagerClosed, DuboisPrade, Inagaki. Validated, stored on the BBA and echoed \
-                       as method_used, but it does NOT change the returned belief: the claim's \
-                       belief is always recomputed by the shared adaptive combine."
+        description = "DEPRECATED: accepted and stored, no effect on belief. Combination method \
+                       label: Dempster (default), Conjunctive, YagerOpen, YagerClosed, DuboisPrade, \
+                       Inagaki. It is validated (an unknown name is refused), stored on the BBA and \
+                       echoed as method_used, but the claim's belief is always recomputed by the \
+                       shared adaptive combine that recompute_beliefs uses, whatever this says. Any \
+                       value other than Dempster adds an entry to the response's warnings."
     )]
     pub combination_method: Option<String>,
 
     #[schemars(
-        description = "Inagaki gamma parameter. Currently has no effect: it is neither stored nor \
-                       used by the belief recompute."
+        description = "DEPRECATED: accepted, NOT stored, no effect on belief. Inagaki gamma \
+                       parameter; the belief recompute never reads it. Sending any value adds an \
+                       entry to the response's warnings."
     )]
     pub gamma: Option<f64>,
 
@@ -1075,7 +1098,10 @@ pub struct SubmitDsEvidenceParams {
                        [evidence_type_weights]) instead of the caller-supplied `reliability` float. \
                        When omitted (default), behavior is unchanged: the raw `reliability` float is \
                        applied and the BBA is stored with evidence_type=NULL, matching every \
-                       pre-existing caller byte-for-byte."
+                       pre-existing caller byte-for-byte. A tag outside the calibration vocabulary \
+                       (and not in the frame's evidence_type_weights override) is still stored, but \
+                       is combined at the 0.5 unknown-type reliability and returned in the \
+                       response's unknown_keys and warnings."
     )]
     #[serde(default)]
     pub evidence_type: Option<String>,
@@ -1175,9 +1201,18 @@ pub struct ClaimResponse {
     pub is_current: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
+    /// The scalar a truth range was compared against (GitHub #395): the
+    /// Dempster-Shafer pignistic probability when the claim carries a DS cache,
+    /// else `truth_value` — the same score `recall`'s `min_truth` gates on.
+    /// Set by `query_claims`, whose `min_truth`/`max_truth` filter on it;
+    /// omitted by tools that apply no truth range. `belief_score !=
+    /// truth_value` means epistemic evidence has moved the claim away from its
+    /// authored value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belief_score: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SubmitClaimResponse {
     pub claim_id: String,
     pub truth_value: f64,
@@ -1191,6 +1226,52 @@ pub struct SubmitClaimResponse {
     pub pignistic_prob: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_id: Option<String>,
+    /// Present ONLY when this call created nothing new because the claim
+    /// already existed. Absent on a fresh insert. See [`Deduplicated`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deduplicated: Option<Deduplicated>,
+}
+
+/// Which dedup path answered a write with an EXISTING claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupBy {
+    /// Byte-identical content already stored by this server's agent
+    /// (`UNIQUE (content_hash, agent_id)`).
+    ContentHash,
+    /// The write-side semantic novelty gate found an existing current claim
+    /// within `novelty_threshold` cosine distance. That claim may belong to
+    /// ANOTHER agent, and nothing from this call was written.
+    NoveltyGate,
+}
+
+/// The `deduplicated` block on a `submit_claim` / `memorize` /
+/// `batch_submit_claims` response (backlog a3e63a12).
+///
+/// Before this block a dedup hit was byte-for-byte indistinguishable from a
+/// fresh insert, so a caller could not tell what had become of its inputs. The
+/// two lists are MEASURED per path from the code that runs on it, not assumed:
+/// `tools::claims::dedup_block` and `tools::memory::memorize_dedup_block` decide
+/// them. Only inputs the caller actually supplied are listed (an absent
+/// `source_url`, `reasoning` or `novelty_threshold`, or empty `labels`/`tags`,
+/// appear in neither list). On `batch_submit_claims`, an entry's omitted
+/// `methodology` or `confidence` is filled from the batch defaults and is
+/// likewise in neither list (`tools::batch::SuppliedByEntry`), although the
+/// content-hash path still records the default on the trace it writes.
+///
+/// On EVERY dedup hit the existing claim's belief and truth_value are left
+/// unchanged: this call's confidence and evidence are never combined into the
+/// existing claim's belief, whichever list names them.
+#[derive(Debug, Clone, Serialize)]
+pub struct Deduplicated {
+    pub by: DedupBy,
+    /// The claim this call was answered with (always equal to `claim_id`).
+    pub existing_claim_id: String,
+    /// Inputs of this call that WERE recorded against the existing claim, e.g.
+    /// labels merged in, or a new evidence row and reasoning trace linked to it.
+    pub inputs_applied: Vec<&'static str>,
+    /// Inputs of this call that were written nowhere.
+    pub inputs_discarded: Vec<&'static str>,
 }
 
 /// Outcome of the content-integrity half of MCP `verify_claim`.
@@ -1360,6 +1441,10 @@ pub struct MemorizeResponse {
     pub plausibility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
+    /// Present ONLY when this call created nothing new because the memory
+    /// already existed. Absent on a fresh insert. See [`Deduplicated`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deduplicated: Option<Deduplicated>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2013,7 +2098,15 @@ pub struct CheckAlreadyIngestedParams {
     )]
     pub doi: String,
     #[schemars(
-        description = "Pipeline version. Omit to use the current hierarchical extraction pipeline."
+        description = "Pipeline version stamp, matched EXACTLY when given (e.g. \
+                       'hierarchical_extraction_v2:ch3' to check one chapter of a chunked ingest; \
+                       each chunk writes its own stamp). Omit to match the current hierarchical \
+                       extraction pipeline's whole family: the whole-document stamp \
+                       'hierarchical_extraction_v2' AND every per-chapter \
+                       'hierarchical_extraction_v2:ch{n}' stamp. A default-mode \
+                       already_ingested=true means AT LEAST ONE stamp in the family exists, not \
+                       that every chapter landed; matched_pipeline_versions lists which were \
+                       found."
     )]
     pub pipeline_version: Option<String>,
 }
@@ -2024,7 +2117,17 @@ pub struct CheckAlreadyIngestedResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paper_id: Option<String>,
     pub doi: String,
+    /// The stamp requested, or the base stamp when the caller omitted it.
     pub pipeline_version: String,
+    /// The `processed_by` stamps actually found: the one exact stamp for an
+    /// explicit `pipeline_version`, or every stamp in the base family
+    /// (`base` and `base:ch{n}`, sorted) when it was omitted. Empty when not
+    /// ingested (backlog 02653c4a). Each chunk of a chunked ingest writes its
+    /// own stamp, so in default mode this is the list of chunks that landed,
+    /// and `already_ingested` is `true` as soon as it holds ONE entry. A
+    /// document chunk-ingested by an older server may list only its first
+    /// chunk.
+    pub matched_pipeline_versions: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2114,6 +2217,10 @@ pub struct NeighborhoodEdge {
 #[derive(Debug, Serialize)]
 pub struct NeighborhoodResponse {
     pub node_id: String,
+    /// The node's entity type(s) as recorded on the edges this caller can see
+    /// ('claim', 'paper', 'workflow', 'agent', ...). Normally one; empty when
+    /// the node has no visible edges.
+    pub node_types: Vec<String>,
     pub edge_count: usize,
     pub edges: Vec<NeighborhoodEdge>,
 }
@@ -2175,6 +2282,19 @@ pub struct DsEvidenceResponse {
     pub mass_on_missing: f64,
     pub bba_count: i64,
     pub method_used: String,
+    /// Human-readable notes about inputs that were ACCEPTED but do not do what
+    /// their name suggests (e.g. a non-default `combination_method` or any
+    /// `gamma`, neither of which changes the returned belief). Omitted when
+    /// empty. Never a refusal: the evidence was stored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// The supplied `evidence_type`, when the belief recompute cannot resolve
+    /// it to a calibrated weight (not a calibration key or alias, and not in
+    /// the frame's own override), so the BBA was combined at the 0.5
+    /// unknown-type reliability. A WARNING, not a refusal: the BBA was stored.
+    /// A matching sentence is in `warnings`. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unknown_keys: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2411,25 +2531,120 @@ pub struct BatchSubmitClaimsParams {
     pub claims: Vec<BatchClaimEntry>,
 }
 
+/// One entry of `batch_submit_claims`: every field `submit_claim` accepts
+/// (backlog 73657204).
+///
+/// This used to carry five of `SubmitClaimParams`'s nine fields, and the batch
+/// tool hard-coded the other four — `methodology: "inductive_generalization"`
+/// (which sets the trust modifier), `source_url: None`, `reasoning: None`,
+/// `novelty_threshold: None` — so a batch submission could not say how a claim
+/// was derived or where its evidence came from.
+///
+/// # Why the two structs cannot drift again
+///
+/// They are kept separate only because two fields are REQUIRED on
+/// `submit_claim` and optional here (`methodology`, `confidence`), which a
+/// flattened shared struct cannot express. Drift is closed in both directions
+/// at compile time by `From<BatchClaimEntry> for SubmitClaimParams`: it
+/// destructures this struct exhaustively with no `..` (a field added here is a
+/// hard error, E0027, until the pattern binds it, and a bound field that is not
+/// passed through is an unused variable, which `-D warnings` refuses) and builds
+/// `SubmitClaimParams` with a full struct literal (a field added there and
+/// missing here is a missing-field error). The schema-level ratchet
+/// `tests/batch_submit_claims_parity.rs` additionally pins that this entry's
+/// advertised properties are a superset of `submit_claim`'s.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BatchClaimEntry {
     #[schemars(description = "The claim content")]
     pub content: String,
 
-    #[schemars(description = "Evidence text")]
+    #[schemars(
+        description = "How the claim was derived; the same vocabulary as submit_claim's \
+                       methodology (direct_observation, instrumental, statistical_analysis, \
+                       deductive_logic, inductive_generalization, ...). Optional: when omitted \
+                       the entry is submitted as inductive_generalization, which is what every \
+                       batch entry used before this field existed. An unknown value refuses \
+                       THIS entry only (reported in results/error_details) and writes nothing \
+                       for it; the other entries still land."
+    )]
+    #[serde(default)]
+    pub methodology: Option<String>,
+
+    #[schemars(description = "Evidence text. Stored permanently for human audit.")]
     pub evidence_data: String,
 
-    #[schemars(description = "Evidence type: empirical, statistical, logical, testimonial")]
+    #[schemars(
+        description = "Evidence type: empirical, statistical, logical, testimonial, circumstantial"
+    )]
     pub evidence_type: String,
 
-    #[schemars(description = "Confidence 0.0-1.0")]
+    #[schemars(description = "Confidence 0.0-1.0 (default 0.5)")]
     pub confidence: Option<f64>,
+
+    #[schemars(
+        description = "Source URL, DOI, or reference for the evidence, as in submit_claim. \
+                       Optional but strongly recommended."
+    )]
+    #[serde(default)]
+    pub source_url: Option<String>,
+
+    #[schemars(
+        description = "Why the evidence supports this claim, as in submit_claim. Stored on the \
+                       entry's reasoning trace."
+    )]
+    #[serde(default)]
+    pub reasoning: Option<String>,
 
     #[schemars(
         description = "Optional labels to attach to the new claim (e.g. ['backlog','bug'])"
     )]
     #[serde(default)]
     pub labels: Vec<String>,
+
+    #[schemars(
+        description = "Semantic novelty gate threshold for this entry, exactly as submit_claim's \
+                       novelty_threshold (default 0.05; 0.0 always inserts)."
+    )]
+    #[serde(default)]
+    pub novelty_threshold: Option<f64>,
+}
+
+/// The methodology a batch entry gets when it names none — the value every
+/// batch entry was hard-coded to before [`BatchClaimEntry::methodology`]
+/// existed, so an existing caller's submissions are unchanged.
+pub const BATCH_DEFAULT_METHODOLOGY: &str = "inductive_generalization";
+
+/// The confidence a batch entry gets when it names none (unchanged).
+pub const BATCH_DEFAULT_CONFIDENCE: f64 = 0.5;
+
+impl From<BatchClaimEntry> for SubmitClaimParams {
+    fn from(entry: BatchClaimEntry) -> Self {
+        // EXHAUSTIVE on both sides, deliberately: no `..` in the pattern and
+        // none in the literal. See `BatchClaimEntry`'s doc for why that is the
+        // drift guard.
+        let BatchClaimEntry {
+            content,
+            methodology,
+            evidence_data,
+            evidence_type,
+            confidence,
+            source_url,
+            reasoning,
+            labels,
+            novelty_threshold,
+        } = entry;
+        Self {
+            content,
+            methodology: methodology.unwrap_or_else(|| BATCH_DEFAULT_METHODOLOGY.to_string()),
+            evidence_data,
+            evidence_type,
+            confidence: confidence.unwrap_or(BATCH_DEFAULT_CONFIDENCE),
+            source_url,
+            reasoning,
+            labels,
+            novelty_threshold,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2626,7 +2841,7 @@ pub struct SetSourceReliabilityParams {
     pub perspective_id: String,
 
     #[schemars(
-        description = "Map of evidence-type tag -> reliability alpha in [0,1] (e.g. {\"western_clinical\":0.95,\"ayurvedic_classical\":0.15}). This is the frame-function lens read by scoped_belief. An empty map clears the override."
+        description = "Map of evidence-type tag -> reliability alpha in [0,1] (e.g. {\"empirical\":0.95,\"testimonial\":0.3}). This is the frame-function lens read by scoped_belief. It is looked up with each BBA's evidence_type LOWERCASED and strict-key, so keys must be lowercase evidence-type vocabulary (calibration.toml [evidence_type_weights] keys or [evidence_type_aliases]). Any other key is still stored but is reported back in unknown_keys and warnings, because it matches no BBA the ingest and edge paths write. An empty map clears the override."
     )]
     pub source_reliability: std::collections::HashMap<String, f64>,
 }

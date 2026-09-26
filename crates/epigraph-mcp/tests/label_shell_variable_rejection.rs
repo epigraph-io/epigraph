@@ -186,6 +186,10 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
             claims: vec![
                 epigraph_mcp::types::BatchClaimEntry {
                     content: good.into(),
+                    methodology: None,
+                    source_url: None,
+                    reasoning: None,
+                    novelty_threshold: None,
                     evidence_data: "ev".into(),
                     evidence_type: "logical".into(),
                     confidence: Some(0.6),
@@ -193,6 +197,10 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                 },
                 epigraph_mcp::types::BatchClaimEntry {
                     content: bad.into(),
+                    methodology: None,
+                    source_url: None,
+                    reasoning: None,
+                    novelty_threshold: None,
                     evidence_data: "ev".into(),
                     evidence_type: "logical".into(),
                     confidence: Some(0.6),

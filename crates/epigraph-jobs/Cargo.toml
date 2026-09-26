@@ -24,6 +24,10 @@ hex = { workspace = true }  # Hex encoding for signatures
 petgraph = { workspace = true }
 rand = { workspace = true }  # used by Louvain to break ties between equal-modularity moves
 sqlx = { workspace = true }  # PostgreSQL persistence for job queue
+url = "2"  # WHATWG URL parsing for the webhook egress guard (already in graph via reqwest)
+# The one sanctioned webhook HTTP client (`egress::pinned_client`, `PinnedHttpClient`).
+# Same spec as epigraph-api's, so it adds a dependency edge and no new TLS stack.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
@@ -33,6 +37,10 @@ proptest = { workspace = true }
 default = []
 # Enable integration tests that require a live PostgreSQL database
 integration = []
+# Exposes `egress::EgressGuard::exempt_socket_for_tests`, which lets a test
+# guard deliver to one exact local listener. Enable ONLY from
+# [dev-dependencies]: a release build must not contain it.
+test-support = []
 
 [lints]
 workspace = true

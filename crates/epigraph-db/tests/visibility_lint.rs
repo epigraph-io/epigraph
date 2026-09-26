@@ -1200,6 +1200,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "create_processed_by_stamp_if_absent_conn",
+        "WRITE. The paper -processed_by-> agent pipeline stamp on the ingest's own transaction, \
+         deduplicated on the stamp (properties->>'pipeline') so each chunk of a chunked ingest \
+         records its own edge. Its dedup probe on edges is the same VISIBILITY-EXEMPT write-path \
+         read as create_if_not_exists_conn (it must see an existing stamp whoever asks, or a \
+         re-run writes a duplicate); the INSERT goes through EdgeRepository::create and is \
+         authorised by edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "edge.rs",
         "create_symmetric_if_absent_oriented_conn",
         "WRITE. `create_symmetric_if_absent_oriented` on a caller's connection so `link_epistemic` \
          writes the edge on the same author-stamped transaction as the belief wiring keyed on its \

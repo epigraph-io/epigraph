@@ -16,6 +16,25 @@ pub struct ClaimRepository;
 /// Postgres error) rather than a cap. Enforced at compile time.
 const _: () = assert!(ClaimRepository::MAX_AGENT_CLAIMS > 0);
 
+/// **The belief score** a truth gate compares against, as one SQL expression
+/// over an unaliased `claims` row: the Dempster-Shafer pignistic probability
+/// when a DS write has populated the cache, else the independently authored
+/// `truth_value`.
+///
+/// ONE spelling, shared by every reader that gates or projects on belief
+/// (backlog 14b98adc, GitHub #395): [`ClaimRepository::effective_belief_batch`]
+/// — which `recall`'s BetP-gated `min_truth`, `traverse` and the other
+/// `min_truth` call sites use — and [`ClaimRepository::list_by_belief_range`],
+/// which `query_claims` filters AND projects on. Two copies of this CASE are how
+/// `query_claims(max_truth=0.4)` came to disagree with `recall(min_truth=…)`
+/// about the same refuted claim.
+///
+/// The `(belief, plausibility)` both-present guard is deliberate; see
+/// `effective_belief_batch`. `truth_value` is `NOT NULL`, so the value never is.
+pub(crate) const EFFECTIVE_BELIEF_SCORE_SQL: &str =
+    "(CASE WHEN belief IS NOT NULL AND plausibility IS NOT NULL \
+     THEN COALESCE(pignistic_prob, belief) ELSE truth_value END)::float8";
+
 /// **The embedded population**, as one SQL predicate over `claims`: the rows
 /// CLAUDE.md's embedding invariant says should carry a vector.
 ///
@@ -1255,12 +1274,15 @@ impl ClaimRepository {
         if claim_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        // `concat`, not `format!`: the marker stays a plain literal, so the
+        // marker scanners in `tests/visibility_lint.rs` read it as written.
         let sql = viewer.splice(
-            "SELECT id, \
-             (CASE WHEN belief IS NOT NULL AND plausibility IS NOT NULL \
-                   THEN COALESCE(pignistic_prob, belief) \
-                   ELSE truth_value END)::float8 AS score \
-             FROM claims WHERE id = ANY($1) /* {VISIBILITY:claims} */",
+            &[
+                "SELECT id, ",
+                EFFECTIVE_BELIEF_SCORE_SQL,
+                " AS score FROM claims WHERE id = ANY($1) /* {VISIBILITY:claims} */",
+            ]
+            .concat(),
             2,
         );
         let mut q = sqlx::query_as::<_, (Uuid, f64)>(&sql).bind(claim_ids);
@@ -3032,7 +3054,7 @@ impl ClaimRepository {
 
     /// Maximum number of claims returned by [`get_by_agent`](Self::get_by_agent) in a single
     /// call. Prevents loading an arbitrarily large `Vec<Claim>` into heap for agents with many
-    /// claims. Callers that need pagination should use `list_by_truth_range` with explicit
+    /// claims. Callers that need pagination should use `list_by_belief_range` with explicit
     /// offset/limit.
     pub const MAX_AGENT_CLAIMS: i64 = 500;
 
@@ -3740,7 +3762,7 @@ impl ClaimRepository {
     ///
     /// All predicates run before `LIMIT`/`OFFSET`, so a matching claim is
     /// reachable regardless of how recently it was created — the property
-    /// [`Self::list_by_truth_range`] established for `truth_value` and this
+    /// [`Self::list_by_belief_range`] established (then for `truth_value`, now for the belief score) and this
     /// method generalises to the rest of the `GET /api/v1/claims` filter set.
     ///
     /// The returned `Claim`s are post-fixed with the row's `is_current` and
@@ -3846,10 +3868,29 @@ impl ClaimRepository {
         Ok(claims)
     }
 
-    /// List claims whose `truth_value` falls within `[min_truth, max_truth]`,
-    /// most-recent first. The range filter is applied in SQL **before**
-    /// `LIMIT`, so matching claims are reachable regardless of how recently
-    /// they were created.
+    /// List claims whose **belief score** falls within `[min_belief,
+    /// max_belief]`, most-recent first, each paired with that score. The range
+    /// filter is applied in SQL **before** `LIMIT`, so matching claims are
+    /// reachable regardless of how recently they were created.
+    ///
+    /// # The score, not `truth_value` (GitHub #395, G10)
+    ///
+    /// This was `list_by_truth_range` and filtered `truth_value >= $1 AND
+    /// truth_value <= $2`. No DS write path refreshes `truth_value`, so a claim
+    /// refuted by epistemic edges (BetP 0.18) kept its stale authored value
+    /// (0.78) and never entered a `query_claims(max_truth=0.4)` assessment
+    /// queue, while `recall(min_truth=…)`, which gates on BetP, excluded it. It
+    /// now filters AND returns [`EFFECTIVE_BELIEF_SCORE_SQL`], the one spelling
+    /// `effective_belief_batch` uses, so the two tools cannot disagree about the
+    /// same row again. It was renamed because a function named "truth range"
+    /// that filters something else is the next caller's trap.
+    ///
+    /// # Deterministic paging
+    ///
+    /// `ORDER BY created_at DESC, id`. It was `created_at DESC` alone while the
+    /// function exposes `offset`, so two claims sharing a `created_at` (a batch
+    /// insert, one transaction's `now()`) could swap places between pages —
+    /// repeating one and skipping the other.
     ///
     /// This exists because the obvious `list()` + post-query filter can only
     /// ever inspect the first `limit` most-recent rows — a matching claim
@@ -3867,15 +3908,15 @@ impl ClaimRepository {
     ///
     /// `is_current` occupies `$3`, so the viewer's group bind is `$6`, not the
     /// `$5` the pre-`a85ee585` shape used.
-    pub async fn list_by_truth_range<'e, E: sqlx::PgExecutor<'e>>(
+    pub async fn list_by_belief_range<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
-        min_truth: f64,
-        max_truth: f64,
+        min_belief: f64,
+        max_belief: f64,
         is_current: Option<bool>,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<Claim>, DbError> {
+    ) -> Result<Vec<(Claim, f64)>, DbError> {
         // Inline row type, NOT the shared `ClaimRow`: adding these columns to
         // `ClaimRow` would break every other `query_as::<_, ClaimRow>` whose
         // SELECT omits them, and at runtime rather than at compile time.
@@ -3890,24 +3931,36 @@ impl ClaimRepository {
             updated_at: chrono::DateTime<chrono::Utc>,
             is_current: bool,
             supersedes: Option<Uuid>,
+            belief_score: f64,
         }
 
+        // The score is computed once in the inner SELECT and both filtered and
+        // returned from there. `concat`, not `format!`, so the visibility marker
+        // stays a plain literal for `tests/visibility_lint.rs`'s scanners.
         let sql = viewer.splice(
-            r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
-                   COALESCE(is_current, true) AS is_current, supersedes
-            FROM claims
-            WHERE truth_value >= $1 AND truth_value <= $2
-              AND ($3::bool IS NULL OR COALESCE(is_current, true) = $3)
-              /* {VISIBILITY:claims} */
-            ORDER BY created_at DESC
+            &[
+                r#"
+            SELECT * FROM (
+                SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                       COALESCE(is_current, true) AS is_current, supersedes,
+                       "#,
+                EFFECTIVE_BELIEF_SCORE_SQL,
+                r#" AS belief_score
+                FROM claims
+                WHERE ($3::bool IS NULL OR COALESCE(is_current, true) = $3)
+                  /* {VISIBILITY:claims} */
+            ) scored
+            WHERE belief_score >= $1 AND belief_score <= $2
+            ORDER BY created_at DESC, id
             LIMIT $4 OFFSET $5
             "#,
+            ]
+            .concat(),
             6,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
-            .bind(min_truth)
-            .bind(max_truth)
+            .bind(min_belief)
+            .bind(max_belief)
             .bind(is_current)
             .bind(limit)
             .bind(offset);
@@ -3930,7 +3983,7 @@ impl ClaimRepository {
             );
             claim.is_current = row.is_current;
             claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
-            claims.push(claim);
+            claims.push((claim, row.belief_score));
         }
         Ok(claims)
     }
@@ -4183,7 +4236,7 @@ impl ClaimRepository {
     ///
     /// Deliberately does **NOT** filter on `is_current`. Whether superseded
     /// rows reach this helper is the *caller's* decision — `query_claims`
-    /// passes `is_current` through to [`Self::list_by_truth_range`] and may
+    /// passes `is_current` through to [`Self::list_by_belief_range`] and may
     /// legitimately ask for superseded rows — and the single-claim label
     /// source this mirrors (`get_labels` → `SELECT labels FROM claims WHERE
     /// id = $1`) has no `is_current` clause either. Filtering here would

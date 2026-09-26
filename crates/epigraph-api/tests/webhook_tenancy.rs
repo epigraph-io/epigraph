@@ -78,6 +78,16 @@ fn unreachable_sub(agent_id: Option<Uuid>) -> WebhookSubscription {
     }
 }
 
+/// The delivery egress guard for these tests: a stub resolver that answers
+/// nothing. Every target here is the literal `127.0.0.1:1`, which the guard
+/// refuses before resolving, so no DNS is involved and an attempted delivery
+/// still yields a result entry — the discriminator these tests count.
+fn no_dns_egress() -> epigraph_jobs::egress::EgressGuard {
+    epigraph_jobs::egress::EgressGuard::with_resolver(std::sync::Arc::new(
+        epigraph_jobs::egress::StubResolver::new(),
+    ))
+}
+
 fn store_of(subs: &[WebhookSubscription]) -> WebhookStore {
     let map: HashMap<Uuid, WebhookSubscription> = subs.iter().cloned().map(|s| (s.id, s)).collect();
     Arc::new(tokio::sync::RwLock::new(map))
@@ -122,7 +132,7 @@ async fn a_group_a_subscription_never_receives_a_group_b_claim_event() {
     let store = store_of(&[sub_a.clone(), sub_b.clone()]);
 
     let results = deliver_event(
-        &reqwest::Client::new(),
+        &no_dns_egress(),
         &pool,
         &store,
         &claim_submitted(claim_b, agent_b),
@@ -163,7 +173,7 @@ async fn a_public_claim_event_reaches_every_active_subscriber() {
     let store = store_of(&[sub_a.clone(), sub_b.clone()]);
 
     let results = deliver_event(
-        &reqwest::Client::new(),
+        &no_dns_egress(),
         &pool,
         &store,
         &claim_submitted(public_claim, agent_b),
@@ -217,14 +227,7 @@ async fn an_event_naming_no_claim_is_still_delivered() {
         role: epigraph_core::domain::AgentRole::Analyst,
     };
 
-    let results = deliver_event(
-        &reqwest::Client::new(),
-        &pool,
-        &store,
-        &event,
-        &fast_config(),
-    )
-    .await;
+    let results = deliver_event(&no_dns_egress(), &pool, &store, &event, &fast_config()).await;
 
     assert_eq!(
         results.len(),
@@ -260,14 +263,7 @@ async fn a_subscription_with_no_principal_is_never_delivered_to() {
             role: epigraph_core::domain::AgentRole::Analyst,
         },
     ] {
-        let results = deliver_event(
-            &reqwest::Client::new(),
-            &pool,
-            &store,
-            &event,
-            &fast_config(),
-        )
-        .await;
+        let results = deliver_event(&no_dns_egress(), &pool, &store, &event, &fast_config()).await;
         let attempted: Vec<Uuid> = results.iter().map(|r| r.subscription_id).collect();
         assert!(
             !attempted.contains(&orphan.id),
@@ -347,14 +343,7 @@ async fn a_subscription_whose_agent_row_is_gone_is_never_delivered_to() {
             "an event naming no claim",
         ),
     ] {
-        let results = deliver_event(
-            &reqwest::Client::new(),
-            &pool,
-            &store,
-            &event,
-            &fast_config(),
-        )
-        .await;
+        let results = deliver_event(&no_dns_egress(), &pool, &store, &event, &fast_config()).await;
         let attempted: Vec<Uuid> = results.iter().map(|r| r.subscription_id).collect();
         assert!(
             !attempted.contains(&gone_sub.id),
@@ -401,7 +390,7 @@ async fn a_subscription_whose_principal_is_operated_is_never_delivered_to() {
     let store = store_of(&[operated_sub.clone(), operator_sub.clone()]);
 
     let before: Vec<Uuid> = deliver_event(
-        &reqwest::Client::new(),
+        &no_dns_egress(),
         &pool,
         &store,
         &claim_submitted(public_claim, operator),
@@ -425,7 +414,7 @@ async fn a_subscription_whose_principal_is_operated_is_never_delivered_to() {
     drop(conn);
 
     let after: Vec<Uuid> = deliver_event(
-        &reqwest::Client::new(),
+        &no_dns_egress(),
         &pool,
         &store,
         &claim_submitted(private_claim, operator),
@@ -460,7 +449,7 @@ async fn the_event_type_filter_still_applies_under_the_tenancy_filter() {
     let store = store_of(&[wants_truth_updated.clone(), wants_everything.clone()]);
 
     let results = deliver_event(
-        &reqwest::Client::new(),
+        &no_dns_egress(),
         &pool,
         &store,
         &claim_submitted(public_claim, agent_a),

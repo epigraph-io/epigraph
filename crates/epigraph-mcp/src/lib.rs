@@ -10,6 +10,7 @@ pub mod maintenance;
 pub mod operator;
 pub mod scope_map;
 pub mod server;
+pub mod session_status;
 pub mod tools;
 pub mod types;
 pub mod write_identity;

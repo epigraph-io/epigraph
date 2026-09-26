@@ -820,7 +820,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             StreamableHttpServerConfig::default(),
         );
 
-        let router = axum::Router::new().nest_service("/mcp", service);
+        // Innermost layer: rewrite rmcp 0.15's session-error statuses to the MCP
+        // spec's (unknown/ended session 401/500 -> 404, no-session non-initialize
+        // 422 -> 400). A 401 on an unknown session made OAuth clients discard a
+        // valid token after every restart instead of re-initializing. It wraps
+        // the rmcp service ONLY: the auth and Host/Origin layers below are added
+        // outside it, so their own 401/403s never pass through the rewrite.
+        // See `epigraph_mcp::session_status`.
+        let router = epigraph_mcp::session_status::nest_mcp_service(service);
 
         let router = if let Some(secret) = cli.jwt_secret.as_deref() {
             use epigraph_auth::JwtConfig;
