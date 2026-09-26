@@ -729,6 +729,40 @@ pub fn effective_source_strength_with_perspective(
     (base * locality).clamp(0.0, 1.0)
 }
 
+/// Relationship-vocab strings the `auto_wire_ds_for_edge` write path may emit
+/// as a BBA's `evidence_type` before they are added to
+/// `calibration.evidence_type_aliases`. Part of the known vocabulary.
+const RELATIONSHIP_VOCAB_ALLOWLIST: &[&str] = &[
+    "supports",
+    "corroborates",
+    "refutes",
+    "supersedes",
+    "derived_support",
+    "derived_refute",
+    "derived_supersession",
+];
+
+/// The evidence-type vocabulary check: is `key` a canonical key in
+/// `calibration.evidence_type_weights`, an alias in
+/// `calibration.evidence_type_aliases`, or one of the relationship-vocab
+/// strings the edge auto-wire emits?
+///
+/// Case-insensitive, like the calibration accessors it delegates to. NOTE that
+/// the reliability OVERRIDE maps that consume such keys (a frame's
+/// `evidence_type_weights`, a perspective's `source_reliability`) are looked up
+/// STRICT-KEY against the BBA's lowercased `evidence_type`, so a known key
+/// spelled with capitals is still one those maps can never match; callers that
+/// validate an override map must check the spelling as well.
+///
+/// A key outside this vocabulary is not rejected anywhere: an unknown
+/// `evidence_type` on a BBA with no stored `source_strength` falls through
+/// [`effective_source_strength`]'s chain to the 0.5 unknown-type weight.
+#[must_use]
+pub fn is_known_evidence_type_key(key: &str, calibration: &CalibrationConfig) -> bool {
+    calibration.evidence_type_weight_present(key)
+        || RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.to_lowercase().as_str())
+}
+
 /// Phase 4 (issue #197) Q8: warn on per-frame evidence-type override
 /// keys that aren't in calibration's known vocabulary.
 ///
@@ -738,28 +772,18 @@ pub fn effective_source_strength_with_perspective(
 /// emit before they're added to `evidence_type_aliases`. Operators may
 /// legitimately register weights for future evidence types not yet in
 /// calibration.toml; this is a log signal for typos, not a hard reject.
+///
+/// The vocabulary test itself is [`is_known_evidence_type_key`], public so the
+/// MCP write surfaces that accept these keys can return the same verdict to
+/// the caller as a warning instead of only logging it (backlog 86ee2d30).
 fn warn_on_unknown_evidence_type_keys(
     frame_id: Uuid,
     map: &HashMap<String, f64>,
     calibration: &CalibrationConfig,
 ) {
-    const RELATIONSHIP_VOCAB_ALLOWLIST: &[&str] = &[
-        "supports",
-        "corroborates",
-        "refutes",
-        "supersedes",
-        "derived_support",
-        "derived_refute",
-        "derived_supersession",
-    ];
     for key in map.keys() {
-        // Map keys are already lowercased by the repo accessor; calibration
-        // accessors also lowercase internally. evidence_type_weight_present
-        // covers both canonical-key and alias resolution in one call.
-        if calibration.evidence_type_weight_present(key) {
-            continue;
-        }
-        if RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.as_str()) {
+        // Map keys are already lowercased by the repo accessor.
+        if is_known_evidence_type_key(key, calibration) {
             continue;
         }
         tracing::warn!(
@@ -769,6 +793,38 @@ fn warn_on_unknown_evidence_type_keys(
              possibly a typo (entry is still applied at Tier 1 strict-key)"
         );
     }
+}
+
+/// Which hypothesis of a frame a claim's belief there is ABOUT, from its stored
+/// `claim_frames.hypothesis_index`: the stored index when it names one of the
+/// frame's `hypothesis_count` hypotheses, otherwise 0.
+///
+/// THE shared rule for every reader of a (claim, frame) BBA set (backlog
+/// 45cbaef4, G6): the cache writer ([`compute_combined_belief`]) and the three
+/// framed readers in `belief_query` (`get_belief`, `get_perspective_belief`,
+/// `get_perspective_belief_batch`). They used to disagree on exactly the rows
+/// this function exists for. The writer clamped as here; the readers did
+/// `unwrap_or(0) as usize`, so a NEGATIVE index wrapped to `usize::MAX` and an
+/// index past the end addressed no hypothesis at all — Bel = Pl = BetP = 0 on
+/// the framed read, beside a cached belief about hypothesis 0.
+///
+/// Why 0 and not "no hypothesis", measured against the frame's semantics: a
+/// frame is an ordered list of mutually exclusive hypotheses addressed by
+/// 0-based index, so an index outside `[0, hypothesis_count)` names nothing.
+/// Reporting Bel = Pl = 0 for it would state "this claim is certainly false"
+/// about a claim whose only defect is a bad pointer — a confident answer
+/// nothing supports. 0 is instead the value every path already uses when the
+/// pointer is ABSENT (no assignment row, or a NULL column), and it is TRUE on
+/// the canonical binary frame, where almost every claim lives. A bad pointer is
+/// treated like a missing one. The column is `integer` with no CHECK
+/// (migration 001), so such rows can exist; `submit_ds_evidence` now warns
+/// when it is asked to store one.
+#[must_use]
+pub fn resolve_hypothesis_index(stored: Option<i32>, hypothesis_count: usize) -> usize {
+    stored
+        .and_then(|i| usize::try_from(i).ok())
+        .filter(|i| *i < hypothesis_count)
+        .unwrap_or(0)
 }
 
 /// Pure compute half of the combine pipeline: load every BBA on (claim,
@@ -881,16 +937,15 @@ async fn compute_combined_belief(
     // cache writer agree with it, so a `recompute_beliefs` can no longer
     // overwrite an axis claim's cache with a belief about index 0.
     //
-    // Missing assignment or NULL index ⇒ 0, matching the read side's
-    // `unwrap_or(0)`.
-    let hypothesis_index =
+    // Resolved by `resolve_hypothesis_index`, the ONE rule every reader of a
+    // BBA shares (backlog 45cbaef4): see its doc for why.
+    let hypothesis_index = resolve_hypothesis_index(
         FrameRepository::get_claim_assignment(&mut *conn, viewer, claim_id, frame_id)
             .await
             .map_err(|e| format!("get_claim_assignment: {e}"))?
-            .and_then(|a| a.hypothesis_index)
-            .and_then(|i| usize::try_from(i).ok())
-            .filter(|i| *i < frame.hypothesis_count())
-            .unwrap_or(0);
+            .and_then(|a| a.hypothesis_index),
+        frame.hypothesis_count(),
+    );
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
     let bel = measures::belief(&combined, &target);

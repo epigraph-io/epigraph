@@ -451,12 +451,18 @@ fn frame_to_response(row: epigraph_db::FrameRow) -> FrameResponse {
 #[cfg(feature = "db")]
 pub(crate) fn compute_hypothesis_belief(
     combined: &epigraph_ds::MassFunction,
-    _ds_frame: &epigraph_ds::FrameOfDiscernment,
+    ds_frame: &epigraph_ds::FrameOfDiscernment,
     hypothesis_index: Option<i32>,
 ) -> (f64, f64, f64, f64) {
     use epigraph_ds::{measures, FocalElement};
 
-    let h_idx = hypothesis_index.map(|i| i as usize).unwrap_or(0);
+    // The shared rule (backlog 45cbaef4): a negative or out-of-range stored
+    // index reads as 0, exactly as the cache writer resolves it. This used to
+    // be `i as usize`, which wrapped a negative index to `usize::MAX`.
+    let h_idx = epigraph_engine::edge_factor::resolve_hypothesis_index(
+        hypothesis_index,
+        ds_frame.hypothesis_count(),
+    );
     let supported = FocalElement::positive(std::collections::BTreeSet::from([h_idx]));
     let bel = measures::belief(combined, &supported);
     let pl = measures::plausibility(combined, &supported);
@@ -2747,6 +2753,35 @@ pub async fn frame_ancestry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backlog 45cbaef4 (G6): the HTTP belief routes resolve a stored index the
+    /// same way the cache writer does. `i as usize` used to wrap -1 to
+    /// `usize::MAX`, a hypothesis no frame has, and report Bel = Pl = 0.
+    #[cfg(feature = "db")]
+    #[test]
+    fn compute_hypothesis_belief_reads_a_bad_stored_index_as_hypothesis_zero() {
+        let frame = epigraph_ds::FrameOfDiscernment::new(
+            "g6".to_string(),
+            vec!["low".to_string(), "mid".to_string(), "high".to_string()],
+        )
+        .unwrap();
+        let mf = epigraph_ds::MassFunction::from_json_masses(
+            frame.clone(),
+            &serde_json::json!({"0": 0.5, "2": 0.2, "0,1,2": 0.3}),
+        )
+        .unwrap();
+        let at_zero = compute_hypothesis_belief(&mf, &frame, Some(0));
+        assert!((at_zero.0 - 0.5).abs() < 1e-12);
+        for bad in [Some(-1), Some(3), Some(i32::MAX), None] {
+            assert_eq!(
+                compute_hypothesis_belief(&mf, &frame, bad),
+                at_zero,
+                "{bad:?} must read as hypothesis 0"
+            );
+        }
+        let at_two = compute_hypothesis_belief(&mf, &frame, Some(2));
+        assert!((at_two.0 - 0.2).abs() < 1e-12, "in range is honoured");
+    }
 
     #[test]
     fn kl_divergence_identical_distributions_is_zero() {

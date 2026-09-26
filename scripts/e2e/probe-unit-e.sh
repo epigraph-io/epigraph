@@ -268,6 +268,26 @@ q "SELECT '   spine_claims='||(SELECT count(*) FROM claims WHERE 'doi:$DOI4' = A
         ||' authored='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.target_id WHERE p.doi='$DOI4' AND e.relationship='authored')"
 
 echo
+echo "=== G8: a CHUNKED spine ingest (chapter 1, then 3, then 3 again) stamps each chunk once ==="
+# Both processed_by writers used to dedup on (paper, agent, processed_by), so
+# chapter 3's stamp was never written and check_already_ingested(':ch3') read
+# false for an ingested chapter. Expect stamps=[..:ch1, ..:ch3], ch3=true,
+# ch2=false, and 2 edges after the re-run.
+DOI6="10.9999/unit-e-chunked-$LABEL"
+for CH in 1 3 3; do
+  DOC6='{"source":{"title":"Unit E chunked book ch'"$CH"'","doi":"'"$DOI6"'","source_type":"Textbook","authors":[],"metadata":{"chapter_index":'"$CH"'}},"thesis":"Unit E chunked thesis ch'"$CH"'","thesis_derivation":"TopDown","sections":[{"title":"Chunk section","paragraphs":[{"text":"The unit E chunk paragraph of chapter '"$CH"'","atoms":[],"generality":[],"confidence":0.8}]}],"relationships":[]}'
+  tool ingest_document_spine "{\"extraction\":$DOC6}" | grep -oE '"isError":(true|false)' | head -1 | sed "s/^/   ch$CH /"
+done
+for PV in "" "hierarchical_extraction_v2:ch3" "hierarchical_extraction_v2:ch2"; do
+  if [ -z "$PV" ]; then ARGS="{\"doi\":\"$DOI6\"}"; NAME=default; else ARGS="{\"doi\":\"$DOI6\",\"pipeline_version\":\"$PV\"}"; NAME="${PV##*:}"; fi
+  R=$(tool check_already_ingested "$ARGS")
+  echo "   check($NAME): $(echo "$R" | grep -oE 'already_ingested\\": (true|false)' | head -1) $(echo "$R" | grep -oE 'matched_pipeline_versions\\": \[[^]]*\]' | head -1)"
+done
+q "SELECT '   stamps='||COALESCE(string_agg(e.properties->>'pipeline', ',' ORDER BY e.properties->>'pipeline'),'none')
+        ||' processed_by='||count(*)
+   FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$DOI6' AND e.relationship='processed_by'"
+
+echo
 echo "=== E1 PREFLIGHT: a detached ingest the author cannot write must be refused SYNCHRONOUSLY ==="
 # ingest_document runs detached, so a refusal inside the task reaches no caller.
 # With the server agent's memberships revoked, the synchronous preflight must

@@ -8,7 +8,7 @@
 //! check — whose distinctive failure mode was a *mispairing*: the access
 //! decision landing on the wrong claim's content. PR-14 deleted that second
 //! pass; the filtering is now a `Viewer` predicate inside
-//! `ClaimRepository::list_by_truth_range`, which cannot mispair because there
+//! `ClaimRepository::list_by_belief_range`, which cannot mispair because there
 //! is no separate decision to pair. **This test is kept anyway, and it is not
 //! vacuous**: it is now the assertion that the SET is filtered per row rather
 //! than all-or-nothing, which is the failure mode a single-claim test cannot
@@ -55,7 +55,7 @@ async fn query_claims_hides_only_the_private_claim_per_id(pool: PgPool) {
     let public_content = format!("test claim {}", public_id.as_uuid());
 
     // Private claim owned by `private_owner`. Truth 0.20 — a distinct truth
-    // value so `list_by_truth_range`'s ordering is deterministic and the two
+    // value so `list_by_belief_range`'s ordering is deterministic and the two
     // rows are unambiguous.
     let private_id = seed_claim(&pool, private_owner, 0.20).await;
     common::seed_private_tenancy(&pool, private_id.as_uuid(), private_owner).await;

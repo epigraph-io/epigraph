@@ -334,6 +334,76 @@ impl EdgeRepository {
         ))
     }
 
+    /// Write the `paper -processed_by-> agent` pipeline stamp for `pipeline`,
+    /// unless that exact stamp is already on the paper for that agent. Returns
+    /// `true` when a new edge was inserted.
+    ///
+    /// The stamp is part of the dedup key. [`Self::create_if_not_exists_conn`]
+    /// dedups on `(source_id, target_id, relationship)` only. When the ingest
+    /// tools used it, a chunked ingest's second chapter (`...:ch3` after
+    /// `...:ch1`) found the first chapter's edge and wrote nothing. The paper
+    /// then carried one stamp however many chapters landed, so
+    /// `check_already_ingested(pipeline_version = "...:ch3")` answered false for
+    /// an ingested chapter (G8 review, backlog 02653c4a). With the stamp in the
+    /// key, each chunk writes its own edge and a re-run of the same chunk
+    /// writes none. No unique index constrains the triple (migrations 017, 018
+    /// and 053 dropped it), so parallel `processed_by` edges are legal.
+    ///
+    /// Takes the caller's connection so the stamp commits in the same
+    /// transaction as the walk that earned it. `begin()` opens a SAVEPOINT
+    /// inside that transaction, keeping the probe and the INSERT atomic, as in
+    /// [`Self::create_if_not_exists_conn`].
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database operation fails.
+    #[instrument(skip(conn))]
+    pub async fn create_processed_by_stamp_if_absent_conn(
+        conn: &mut sqlx::PgConnection,
+        paper_id: Uuid,
+        agent_id: Uuid,
+        pipeline: &str,
+        tool: &str,
+    ) -> Result<bool, DbError> {
+        use sqlx::Acquire;
+        let mut tx = conn.begin().await?;
+
+        let existing = sqlx::query_scalar::<_, Uuid>(
+            "-- VISIBILITY-EXEMPT: dedup probe inside a WRITE path, for the reason \
+             given on `create_if_not_exists_conn`: it must see an existing stamp \
+             whoever is asking, or every re-run writes a duplicate.\n\
+             SELECT id FROM edges \
+             WHERE source_id = $1 AND source_type = 'paper' \
+               AND target_id = $2 AND relationship = 'processed_by' \
+               AND properties ->> 'pipeline' = $3 \
+             LIMIT 1",
+        )
+        .bind(paper_id)
+        .bind(agent_id)
+        .bind(pipeline)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if existing.is_some() {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        Self::create(
+            &mut *tx,
+            paper_id,
+            "paper",
+            agent_id,
+            "agent",
+            "processed_by",
+            Some(serde_json::json!({ "pipeline": pipeline, "tool": tool })),
+            None,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Insert a `relationship` edge between `a` and `b` (both `claim`-typed),
     /// skipping the insert when an edge with the same relationship already
     /// connects the two in EITHER direction.
@@ -684,6 +754,47 @@ impl EdgeRepository {
                 valid_to: row.valid_to,
             })
             .collect())
+    }
+
+    /// The entity types node `node_id` carries as an edge endpoint, from the
+    /// edges this viewer can see: every distinct `source_type` of an edge
+    /// leaving it and `target_type` of an edge entering it, sorted.
+    ///
+    /// Backlog cdd8d097 / aedde855 (G9). [`Self::get_by_source`] and
+    /// [`Self::get_by_target`] key on `(id, type)`, and the graph tools passed
+    /// the literal `"claim"`, so a paper, workflow or agent node returned no
+    /// edges at all. The edges table is the one place every endpoint type is
+    /// recorded, whatever table backs it (`entity_types` is operator-extensible),
+    /// so the node's real type is read from there rather than probed table by
+    /// table. Normally one type; more than one only if two tables share a UUID,
+    /// and then the caller reads each.
+    ///
+    /// Filtered by the co-owner-aware edge predicate, so it reveals a type only
+    /// through an edge the viewer could already read.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn endpoint_types<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        node_id: Uuid,
+    ) -> Result<Vec<String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT t FROM ( \
+                 SELECT e.source_type AS t FROM edges e \
+                 WHERE e.source_id = $1 /* {EDGE_VISIBILITY:e} */ \
+                 UNION \
+                 SELECT e.target_type AS t FROM edges e \
+                 WHERE e.target_id = $1 /* {EDGE_VISIBILITY:e} */ \
+             ) types ORDER BY t",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql).bind(node_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// List the claim→claim edges leaving `source_id` that can carry an

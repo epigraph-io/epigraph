@@ -102,6 +102,16 @@ pub async fn memorize(
                         "novelty gate: nearest claim {existing_id} vanished before read-back"
                     ))
                 })?;
+                let deduplicated = memorize_dedup_block(
+                    DedupBy::NoveltyGate,
+                    existing_id,
+                    &MemorizeInputs {
+                        confidence_supplied: params.confidence.is_some(),
+                        tags_supplied: !tags.is_empty(),
+                        novelty_threshold_supplied: params.novelty_threshold.is_some(),
+                        provenance_written: false,
+                    },
+                );
                 return success_json(&MemorizeResponse {
                     claim_id: existing_id.to_string(),
                     truth_value: existing.truth_value.value(),
@@ -110,6 +120,7 @@ pub async fn memorize(
                     belief: None,
                     plausibility: None,
                     pignistic_prob: None,
+                    deduplicated: Some(deduplicated),
                 });
             }
             pending_embedding = Some(pgvec);
@@ -300,6 +311,19 @@ pub async fn memorize(
         claim.truth_value.value()
     };
 
+    let deduplicated = (!was_created).then(|| {
+        memorize_dedup_block(
+            DedupBy::ContentHash,
+            claim_uuid,
+            &MemorizeInputs {
+                confidence_supplied: params.confidence.is_some(),
+                tags_supplied: !tags.is_empty(),
+                novelty_threshold_supplied: params.novelty_threshold.is_some(),
+                provenance_written: needs_provenance,
+            },
+        )
+    });
+
     success_json(&MemorizeResponse {
         claim_id: claim_uuid.to_string(),
         truth_value: final_truth,
@@ -308,7 +332,75 @@ pub async fn memorize(
         belief: ds.as_ref().map(|d| d.belief),
         plausibility: ds.as_ref().map(|d| d.plausibility),
         pignistic_prob: ds.as_ref().map(|d| d.pignistic_prob),
+        deduplicated,
     })
+}
+
+/// What [`memorize_dedup_block`] needs to know about one `memorize` call.
+struct MemorizeInputs {
+    confidence_supplied: bool,
+    tags_supplied: bool,
+    novelty_threshold_supplied: bool,
+    /// Whether this call wrote an Evidence + ReasoningTrace (it does on a
+    /// dedup hit only when the existing claim had no trace — the orphan repair).
+    provenance_written: bool,
+}
+
+/// The `deduplicated` block for a `memorize` answered with an existing claim
+/// (backlog a3e63a12). Measured from `memorize` above, and deliberately NOT
+/// shared with `submit_claim`'s, because the two paths keep different inputs:
+///
+/// * [`DedupBy::NoveltyGate`] — returns before any transaction: the memory's
+///   wording, tags and confidence are written nowhere.
+/// * [`DedupBy::ContentHash`] — `update_labels_conn` UNIONS the tags in
+///   (applied). Unlike `submit_claim`, `memorize` writes an Evidence +
+///   ReasoningTrace on a dedup hit ONLY when the existing claim has no trace, so
+///   `confidence` is applied (recorded on that trace) in that case and written
+///   nowhere otherwise. The DS auto-wire never runs on a hit, so the belief is
+///   unchanged either way. `novelty_threshold` is never consulted on an exact
+///   resubmit.
+///
+/// Only supplied inputs are listed; on a novelty-gate hit `novelty_threshold`
+/// decided the hit and is listed in neither.
+fn memorize_dedup_block(
+    by: DedupBy,
+    existing_claim_id: uuid::Uuid,
+    i: &MemorizeInputs,
+) -> Deduplicated {
+    let mut applied: Vec<&'static str> = Vec::new();
+    let mut discarded: Vec<&'static str> = Vec::new();
+    match by {
+        DedupBy::NoveltyGate => {
+            discarded.push("content");
+            if i.confidence_supplied {
+                discarded.push("confidence");
+            }
+            if i.tags_supplied {
+                discarded.push("tags");
+            }
+        }
+        DedupBy::ContentHash => {
+            if i.tags_supplied {
+                applied.push("tags");
+            }
+            if i.confidence_supplied {
+                if i.provenance_written {
+                    applied.push("confidence");
+                } else {
+                    discarded.push("confidence");
+                }
+            }
+            if i.novelty_threshold_supplied {
+                discarded.push("novelty_threshold");
+            }
+        }
+    }
+    Deduplicated {
+        by,
+        existing_claim_id: existing_claim_id.to_string(),
+        inputs_applied: applied,
+        inputs_discarded: discarded,
+    }
 }
 
 /// Parse the optional `agent_id` recall scope filter. A present-but-invalid
@@ -1060,6 +1152,43 @@ pub mod __test_only {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The novelty-gate arm is unreachable through `EpiGraphMcpFull` in a test
+    /// process (see `tests/novelty_gate_test.rs`); its list is pinned here. The
+    /// content-hash arm is measured end-to-end in `tests/dedup_response_signal.rs`.
+    #[test]
+    fn a_memorize_novelty_gate_hit_discards_content_tags_and_confidence() {
+        let d = memorize_dedup_block(
+            DedupBy::NoveltyGate,
+            uuid::Uuid::nil(),
+            &MemorizeInputs {
+                confidence_supplied: true,
+                tags_supplied: true,
+                novelty_threshold_supplied: true,
+                provenance_written: false,
+            },
+        );
+        assert!(d.inputs_applied.is_empty(), "{d:?}");
+        assert_eq!(d.inputs_discarded, vec!["content", "confidence", "tags"]);
+    }
+
+    /// On a content-hash hit `memorize` records the confidence only when it
+    /// repaired an orphan (wrote a trace); otherwise it goes nowhere.
+    #[test]
+    fn a_memorize_content_hash_hit_applies_confidence_only_when_it_wrote_a_trace() {
+        let inputs = |provenance_written| MemorizeInputs {
+            confidence_supplied: true,
+            tags_supplied: true,
+            novelty_threshold_supplied: false,
+            provenance_written,
+        };
+        let repaired = memorize_dedup_block(DedupBy::ContentHash, uuid::Uuid::nil(), &inputs(true));
+        assert_eq!(repaired.inputs_applied, vec!["tags", "confidence"]);
+        assert!(repaired.inputs_discarded.is_empty());
+        let plain = memorize_dedup_block(DedupBy::ContentHash, uuid::Uuid::nil(), &inputs(false));
+        assert_eq!(plain.inputs_applied, vec!["tags"]);
+        assert_eq!(plain.inputs_discarded, vec!["confidence"]);
+    }
 
     #[test]
     fn parse_agent_filter_none_or_blank_is_unscoped() {

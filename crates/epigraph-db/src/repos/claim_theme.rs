@@ -24,7 +24,7 @@ pub struct ClaimThemeRow {
 /// adding `member_count` / `centroid_dim` to `ClaimThemeRow` would make every
 /// existing `query_as::<_, ClaimThemeRow>` whose SELECT omits them fail when
 /// executed, not when compiled — the same hazard documented on `ClaimRow` in
-/// `claim.rs::list_by_truth_range`.
+/// `claim.rs::list_by_belief_range`.
 ///
 /// ## `member_count` vs `stored_claim_count`
 ///

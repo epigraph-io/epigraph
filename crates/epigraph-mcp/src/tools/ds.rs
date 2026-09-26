@@ -117,6 +117,12 @@ pub async fn submit_ds_evidence(
         .unwrap_or(CombinationMethod::Dempster);
     let method_name = format!("{method:?}");
 
+    // Backlog 82dcff9d (G5): both parameters are deprecated — accepted, and
+    // `combination_method` stored, but neither reaches the belief (see the
+    // recompute below). A caller who sends a non-default value believes it
+    // does something, so the response says it did not.
+    let mut warnings = deprecated_parameter_warnings(method, params.gamma);
+
     // Get frame from DB
     let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
         .await
@@ -125,6 +131,31 @@ pub async fn submit_ds_evidence(
 
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;
+
+    // Backlog 45cbaef4 (G6): an index that names none of the frame's
+    // hypotheses is stored as given (the column is an unconstrained integer, and
+    // refusing would change a call that used to succeed), but every belief
+    // reader resolves it to 0 through `edge_factor::resolve_hypothesis_index`.
+    // Say so rather than let the caller believe it addressed that hypothesis.
+    let resolved_index = epigraph_engine::edge_factor::resolve_hypothesis_index(
+        Some(params.hypothesis_index),
+        frame.hypothesis_count(),
+    );
+    if usize::try_from(params.hypothesis_index).ok() != Some(resolved_index) {
+        warnings.push(format!(
+            "hypothesis_index={} names none of this frame's {} hypotheses (valid: 0..={}); it \
+             was stored as given, but every belief read, including the belief returned here, \
+             is about hypothesis 0 ({:?}).",
+            params.hypothesis_index,
+            frame.hypothesis_count(),
+            frame.hypothesis_count().saturating_sub(1),
+            frame_row
+                .hypotheses
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ));
+    }
 
     // Parse the mass function. Reliability handling forks on whether the
     // caller opted into calibrated per-source-class discounting:
@@ -155,6 +186,25 @@ pub async fn submit_ds_evidence(
     //   parameter that couldn't affect anything.
     let mut mass_fn = parse_masses_json(&frame, &params.masses)?;
     let calibrated_evidence_type = params.evidence_type.as_deref().filter(|s| !s.is_empty());
+
+    // Backlog 86ee2d30 (G12): an `evidence_type` outside the vocabulary the
+    // recompute resolves is ACCEPTED and silently combined at the 0.5
+    // unknown-type weight (`effective_source_strength`'s last tier: this path
+    // stores no `source_strength`). Report it, never refuse it — the vocabulary
+    // is operator-extensible and a new key may be deliberate.
+    let unknown_keys = match calibrated_evidence_type {
+        Some(et) if !evidence_type_resolves(server, frame_id, et).await => {
+            warnings.push(format!(
+                "evidence_type={et:?} is not in the calibration vocabulary \
+                 (calibration.toml [evidence_type_weights] keys or [evidence_type_aliases]) and \
+                 has no entry in this frame's evidence_type_weights override, so this BBA is \
+                 combined at the 0.5 unknown-type reliability. Known keys: {}.",
+                known_evidence_type_keys().join(", ")
+            ));
+            vec![et.to_string()]
+        }
+        _ => Vec::new(),
+    };
     let stored_locality_tag = if calibrated_evidence_type.is_some() {
         params.locality_tag.as_deref().unwrap_or("unknown")
     } else {
@@ -282,11 +332,18 @@ pub async fn submit_ds_evidence(
     // same BBA rows, two different answers. Delegating here makes the two
     // tools compute identically by construction.
     //
-    // `params.combination_method`, `params.gamma`, and `params.hypothesis_index`
-    // no longer influence the stored/returned belief: the shared recompute
-    // path always resolves method adaptively (via `combine_multiple`) and
-    // targets hypothesis index 0 (the canonical binary_truth convention).
-    // This is the accepted consequence of unification, not a follow-up bug.
+    // `params.combination_method` and `params.gamma` do not influence the
+    // stored/returned belief: the shared recompute always resolves the method
+    // adaptively (via `combine_multiple`). This is the accepted consequence of
+    // unification; both are deprecated and warned about (backlog 82dcff9d).
+    //
+    // `params.hypothesis_index` DOES: it is stored in `claim_frames` just above,
+    // and the recompute's `edge_factor::resolve_hypothesis_index` reads it back,
+    // as every framed belief read does (backlog 45cbaef4). A value outside the
+    // frame is stored as given but read as 0 by all of them; see the warning
+    // pushed where the frame is loaded. (This comment used to say the recompute
+    // always targets index 0. It has not since the cache writer started reading
+    // the stored index.)
     //
     // IT RUNS INSIDE THE SAME TRANSACTION, and the commit moved below it. Its
     // `UPDATE claims SET belief/plausibility/pignistic_prob` is where
@@ -386,7 +443,78 @@ pub async fn submit_ds_evidence(
         mass_on_missing,
         bba_count: bba_count as i64,
         method_used: method_name,
+        warnings,
+        unknown_keys,
     })
+}
+
+/// The calibration the belief recompute itself uses — same loader, same
+/// fallback as `edge_factor::compute_combined_belief` — so a vocabulary
+/// verdict here agrees with what the combine will actually do.
+fn recompute_calibration() -> epigraph_engine::calibration::CalibrationConfig {
+    epigraph_engine::calibration::CalibrationConfig::from_workspace_root().unwrap_or_else(|_| {
+        epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
+    })
+}
+
+/// Every evidence-type key the calibration resolves (canonical keys and
+/// aliases), sorted — what a caller told its key is unknown needs to see.
+pub(crate) fn known_evidence_type_keys() -> Vec<String> {
+    let c = recompute_calibration();
+    let mut keys: Vec<String> = c
+        .evidence_type_weights
+        .keys()
+        .chain(c.evidence_type_aliases.keys())
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Would the recompute resolve `evidence_type` to a real weight for a BBA on
+/// `frame_id` rather than the 0.5 unknown-type fallback? True when it is in the
+/// engine's vocabulary ([`epigraph_engine::edge_factor::is_known_evidence_type_key`])
+/// or the frame's own strict-key `evidence_type_weights` override names it
+/// (Tier 1 of `effective_source_strength`).
+///
+/// The override read is `VISIBILITY-EXEMPT` at the repo; it is spent here only
+/// on a frame this caller already read through its viewer, and only as a
+/// yes/no about the caller's own key. A failed read counts as "no override",
+/// matching the recompute's own `.ok().flatten()`.
+async fn evidence_type_resolves(server: &EpiGraphMcpFull, frame_id: uuid::Uuid, et: &str) -> bool {
+    if epigraph_engine::edge_factor::is_known_evidence_type_key(et, &recompute_calibration()) {
+        return true;
+    }
+    FrameRepository::get_per_frame_evidence_type_weights(&server.pool, frame_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|m| m.contains_key(&et.to_lowercase()))
+}
+
+/// The `warnings` a `submit_ds_evidence` call earns by sending a deprecated
+/// parameter a non-default value (backlog 82dcff9d, G5).
+///
+/// Dempster is the default and is what an omitted `combination_method` parses
+/// to, so it earns nothing; `gamma` has no default at all, so ANY value does.
+fn deprecated_parameter_warnings(method: CombinationMethod, gamma: Option<f64>) -> Vec<String> {
+    let mut out = Vec::new();
+    if !matches!(method, CombinationMethod::Dempster) {
+        out.push(format!(
+            "combination_method={method:?} is deprecated: it was stored on the BBA and is \
+             echoed as method_used, but it did not change the returned belief. The claim's \
+             belief is always recomputed by the shared adaptive combine (the one \
+             recompute_beliefs uses)."
+        ));
+    }
+    if let Some(g) = gamma {
+        out.push(format!(
+            "gamma={g} is deprecated: it was neither stored nor used, and did not change the \
+             returned belief."
+        ));
+    }
+    out
 }
 
 pub async fn get_belief(

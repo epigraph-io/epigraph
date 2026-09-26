@@ -774,7 +774,7 @@ impl EpiGraphMcpFull {
     // ── Claims (11 tools) ──
 
     #[tool(
-        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its evidence, reasoning trace, verb-edges and its Dempster-Shafer belief (BBA, frame assignment, cached belief and derived truth_value) commit together; if the belief cannot be wired the call fails and nothing is written, so a retry is safe. Only the embedding is best-effort after commit (embedded=false)."
+        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its evidence, reasoning trace, verb-edges and its Dempster-Shafer belief (BBA, frame assignment, cached belief and derived truth_value) commit together; if the belief cannot be wired the call fails and nothing is written, so a retry is safe. Only the embedding is best-effort after commit (embedded=false). If the claim already existed the response carries a deduplicated block {by: 'content_hash' | 'novelty_gate', existing_claim_id, inputs_applied, inputs_discarded}; it is absent on a fresh insert. content_hash (this agent already stored byte-identical content): labels are merged and a new evidence row and reasoning trace are recorded, but the existing belief and truth_value do not change. novelty_gate (a near-identical current claim exists, possibly another agent's): nothing from this call is written."
     )]
     async fn submit_claim(
         &self,
@@ -788,7 +788,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Query epistemic claims by truth value threshold. Returns claims with their truth values and epistemic status."
+        description = "Query epistemic claims by belief-score range (min_truth / max_truth), newest first. The score is the claim's Dempster-Shafer pignistic probability when it has DS state, else its authored truth_value: the same score recall's min_truth gates on, so a claim refuted by epistemic edges is found by max_truth even while its stale truth_value is high. Each result carries truth_value (the authored value, unchanged) and belief_score (what the range compared). Current claims only unless is_current=false. Returns claims with their labels and retirement state."
     )]
     async fn query_claims(
         &self,
@@ -1054,7 +1054,7 @@ impl EpiGraphMcpFull {
     // ── Memory (2 tools) ──
 
     #[tool(
-        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its tags, evidence, trace and Dempster-Shafer belief commit together; if the belief cannot be wired the call fails and nothing is written. Only the embedding is best-effort after commit."
+        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its tags, evidence, trace and Dempster-Shafer belief commit together; if the belief cannot be wired the call fails and nothing is written. Only the embedding is best-effort after commit. If the memory already existed the response carries a deduplicated block {by, existing_claim_id, inputs_applied, inputs_discarded}; it is absent on a fresh insert. content_hash: tags are merged, confidence is recorded only if the existing memory had no reasoning trace, and the belief does not change. novelty_gate: nothing from this call is written."
     )]
     async fn memorize(
         &self,
@@ -1124,7 +1124,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Check whether a paper has been ingested (has a processed_by edge). Returns {already_ingested, paper_id?, doi, pipeline_version}. Useful as a quick pre-flight read before calling ingest_document_spine. Note: with node-level dedup, already_ingested=true means the spine was previously run — it does NOT mean all atoms are present. Use ingest_document_spine to discover which paragraphs are new. The edge persists, so it cannot confirm a background ingest_document / ingest_document_inline of a document that was ingested or spine-ingested before; use query_paper's claim_count for that. Read-only."
+        description = "Check whether a paper has been ingested (has a processed_by edge). Returns {already_ingested, paper_id?, doi, pipeline_version, matched_pipeline_versions}. Each ingest writes one processed_by stamp per pipeline version: 'hierarchical_extraction_v2' for a whole document, and 'hierarchical_extraction_v2:ch{n}' for EACH chunk of a chunked ingest (source.metadata.chapter_index = n). With pipeline_version omitted it matches the whole-document stamp AND every ':ch{n}' stamp, and matched_pipeline_versions lists the stamps found; already_ingested=true then means AT LEAST ONE of them exists, not that every chapter was ingested, so do not skip a whole chunked document on it: compare matched_pipeline_versions with the chapters you expect, or pass an exact pipeline_version (e.g. 'hierarchical_extraction_v2:ch3') to check one chunk. A chunked document ingested by an older server may carry only its first chunk's stamp, so false for a later chunk is not proof that chunk is missing: re-running ingest_document_spine with that chunk's extraction is safe, lists its already-present paragraphs in paragraphs_deduped and only the missing ones in new_paragraph_paths, and writes the chunk's stamp (query_paper's claim_count is paper-wide and cannot answer for one chunk). Useful as a quick pre-flight read before calling ingest_document_spine. Note: with node-level dedup, already_ingested=true means the spine was previously run — it does NOT mean all atoms are present. Use ingest_document_spine to discover which paragraphs are new. The edge persists, so it cannot confirm a background ingest_document / ingest_document_inline of a document that was ingested or spine-ingested before; use query_paper's claim_count for that. Read-only."
     )]
     async fn check_already_ingested(
         &self,
@@ -1487,7 +1487,7 @@ impl EpiGraphMcpFull {
     // ── Graph (2 tools) ──
 
     #[tool(
-        description = "Get the immediate graph neighborhood of any node — all connected edges with optional relationship and direction filters."
+        description = "Get the immediate graph neighborhood of any node (a claim, paper, workflow, agent, or any other entity type) — all connected edges you can see, with optional relationship and direction filters. The node's type is read from its visible edges and returned as node_types; edges are read under each of those types, so a paper's asserts edges or a workflow's executes edges are returned, not only a claim's."
     )]
     async fn get_neighborhood(
         &self,
@@ -1500,7 +1500,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Multi-hop graph walk from a starting node. BFS traversal with optional relationship filter and truth threshold."
+        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label and truth_value), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only."
     )]
     async fn traverse(
         &self,
@@ -1565,7 +1565,7 @@ impl EpiGraphMcpFull {
     // ── Batch / Staging / Stats (3 tools) ──
 
     #[tool(
-        description = "Submit multiple claims in a single batch (max 100). Each entry needs content, evidence_data, evidence_type, and optional confidence. Entries are submitted one at a time, exactly as submit_claim, and reported individually (submitted, errors, error_details); a refused entry writes nothing. If an operator has revoked this server's agent's personal-group membership, every entry is refused that way. The membership is never restored; restoring it is an operator action."
+        description = "Submit multiple claims in a single batch (max 100). Each entry accepts every submit_claim field: content, evidence_data and evidence_type are required; methodology, confidence, source_url, reasoning, labels and novelty_threshold are optional. An entry with no methodology is submitted as inductive_generalization and one with no confidence at 0.5, as before these fields existed. Entries are submitted one at a time, exactly as submit_claim, each on its own transaction. The response keeps submitted (a count), errors (a count) and error_details, and adds results: one object per entry in input order, either {index, status: 'ok', ...} carrying that entry's full submit_claim response (claim_id, truth_value, content_hash, embedded, and belief, plausibility, pignistic_prob, frame_id when a belief was wired, and the deduplicated block when the entry matched an existing claim, as submit_claim documents), or {index, status: 'error', error}. An entry that repeats an earlier entry of the same batch, or an existing claim, is reported with deduplicated rather than as a new insert; its inputs_applied / inputs_discarded name only fields the entry supplied, so an omitted (defaulted) methodology or confidence appears in neither. A refused entry (an unknown methodology or evidence_type, a bad label, a refused write) writes nothing, and the other entries still land. If an operator has revoked this server's agent's personal-group membership, every entry is refused that way. The membership is never restored; restoring it is an operator action."
     )]
     async fn batch_submit_claims(
         &self,
@@ -1615,7 +1615,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override."
+        description = "Set a perspective's source-reliability map (evidence-type tag -> alpha in [0,1]) — the frame-function lens read by scoped_belief / get_perspective_belief, so two observers weight the same evidence differently. An empty map clears the override. Keys are matched against each BBA's evidence_type lowercased and strict-key: a key that is not lowercase, or not in the evidence-type vocabulary, is still stored but is returned in unknown_keys (with one sentence per key in warnings). A key that is not lowercase never applies. A lowercase key outside the vocabulary matches no BBA any ingest or edge path writes, but it DOES weight BBAs submitted through submit_ds_evidence with that same unrecognised evidence_type, which that tool accepts (it reports them in its own unknown_keys). Both fields are omitted when every key is known. Unknown keys are a warning, never a refusal."
     )]
     async fn set_source_reliability(
         &self,
@@ -1670,7 +1670,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group this server's agent cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief."
+        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group this server's agent cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief: both are DEPRECATED, and sending a combination_method other than Dempster, or any gamma, adds an entry to the response's warnings array (omitted when empty). An evidence_type the recompute cannot resolve to a calibrated weight (not a calibration.toml [evidence_type_weights] key or [evidence_type_aliases] alias, nor in the frame's own evidence_type_weights override) is accepted and combined at the 0.5 unknown-type reliability, and is returned in unknown_keys with an explanatory entry in warnings: a warning, never a refusal."
     )]
     async fn submit_ds_evidence(
         &self,
