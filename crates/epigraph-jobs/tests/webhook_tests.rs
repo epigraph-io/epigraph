@@ -702,6 +702,49 @@ async fn test_ssrf_name_resolving_internal_is_blocked() {
     }
 }
 
+/// A name that does not resolve is a TRANSIENT failure, not an SSRF verdict:
+/// the handler must return the retryable `ProcessingFailed` (a resolver blip
+/// clears on its own) and must not reach the client — nothing was vetted, so
+/// nothing may be dialled. Mapping it to the non-retryable `PermanentFailure`
+/// would silently drop the notification after one lookup failure.
+#[tokio::test]
+async fn test_unresolvable_name_is_retryable_and_never_dialled() {
+    let http_client = Arc::new(MockHttpClient::new());
+    let webhook_repo = Arc::new(MockWebhookRepository::new());
+    let webhook_id = Uuid::new_v4();
+    webhook_repo.add_webhook(WebhookConfig {
+        id: webhook_id,
+        url: "https://nxdomain.example/hook".to_string(),
+        secret: None,
+        enabled: true,
+        retry_count: 3,
+        timeout_seconds: 5,
+    });
+    // An empty stub: every lookup fails like NXDOMAIN.
+    let handler =
+        create_test_handler_with_resolver(http_client.clone(), webhook_repo, StubResolver::new());
+    let job = EpiGraphJob::WebhookNotification {
+        webhook_id,
+        payload: json!({"event": "test"}),
+    }
+    .into_job()
+    .unwrap();
+
+    let result = handler.handle(&job).await;
+
+    match &result {
+        Err(e @ JobError::ProcessingFailed { .. }) => {
+            assert!(e.should_retry(), "a resolution failure must be retried");
+        }
+        other => panic!("an unresolvable name must be ProcessingFailed, got {other:?}"),
+    }
+    assert_eq!(
+        http_client.get_call_count(),
+        0,
+        "nothing was vetted, so the client must not be called"
+    );
+}
+
 /// The client receives the vetted addresses to pin — the single resolution
 /// the guard judged — not just a URL it would resolve again.
 #[tokio::test]
