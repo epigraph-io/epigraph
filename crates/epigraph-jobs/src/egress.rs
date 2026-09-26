@@ -565,6 +565,83 @@ impl EgressGuard {
     }
 }
 
+// =============================================================================
+// THE PINNED CLIENT — the one way a vetted target is dialled
+// =============================================================================
+//
+// Every webhook send in the workspace builds its HTTP client here: the API's
+// delivery dispatcher (`epigraph_api::routes::webhooks`) and this crate's
+// `PinnedHttpClient`. One construction site, so the properties below cannot be
+// held by one caller and forgotten by another.
+
+/// The base HTTP client configuration for webhook delivery.
+///
+/// Callers must not build a delivery client any other way: an ad-hoc
+/// `reqwest::Client::new()` silently reinstates the defaults this refuses.
+///
+/// * `Policy::none()`: the guard only ever vets the registered URL, so with
+///   reqwest's default policy (follow up to 10 hops) a registered public
+///   endpoint could answer `307 Location: http://169.254.169.254/…` and the
+///   signed payload would reach a host the guard had just refused. A webhook
+///   receiver has no legitimate reason to redirect.
+/// * `no_proxy()`: reqwest honours `HTTP(S)_PROXY` by default, and a proxy
+///   resolves the target name ITSELF — which would bypass the pinned addresses
+///   entirely and let the proxy reach whatever the name rebinds to. Webhook
+///   delivery therefore always connects directly.
+pub fn delivery_client_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+}
+
+/// A DNS resolver that resolves nothing.
+///
+/// Installed as the pinned client's fallback so that a name reqwest does NOT
+/// find in the pinned overrides — a spelling mismatch, a future reqwest change
+/// in how the override key is formed — fails the request instead of silently
+/// falling through to system DNS, which is exactly the unvetted resolution
+/// pinning exists to prevent. Fail closed.
+#[derive(Debug)]
+struct RefuseUnpinnedNames;
+
+impl reqwest::dns::Resolve for RefuseUnpinnedNames {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let name = name.as_str().to_string();
+        Box::pin(async move {
+            Err(format!(
+                "webhook delivery refused to resolve {name}: only the vetted, pinned \
+                 addresses may be dialled"
+            )
+            .into())
+        })
+    }
+}
+
+/// The client one delivery sends with: [`delivery_client_builder`], pinned to
+/// the vetted addresses of `target`.
+///
+/// For a name, `resolve_to_addrs(domain, vetted)` makes the connector use
+/// exactly the addresses the guard judged, and a fallback resolver that
+/// refuses every name makes any other lookup fail. An IP-literal URL is
+/// dialled directly (reqwest does not resolve literals) and was itself the
+/// vetted address. Send to [`VettedTarget::url`], unchanged.
+///
+/// # Errors
+///
+/// A reqwest build failure (TLS backend initialisation). Nothing is sent.
+pub fn pinned_client(
+    target: &VettedTarget,
+    timeout: std::time::Duration,
+) -> reqwest::Result<reqwest::Client> {
+    let mut builder =
+        delivery_client_builder(timeout).dns_resolver(std::sync::Arc::new(RefuseUnpinnedNames));
+    if let Some(domain) = target.domain() {
+        builder = builder.resolve_to_addrs(domain, target.addrs());
+    }
+    builder.build()
+}
+
 /// Name the reason `addr` must not be dialled, or `None` if it is a globally
 /// reachable unicast address.
 ///
@@ -906,6 +983,41 @@ mod tests {
         // URL-only verdicts echo caller input and keep their full text.
         let literal = parse_and_classify("http://127.0.0.1/x").expect_err("literal");
         assert_eq!(literal.public_message(), literal.to_string());
+    }
+
+    /// The pinned client fails CLOSED: a name that is not the pinned one is not
+    /// handed to system DNS. Without `RefuseUnpinnedNames`, reqwest falls back
+    /// to its default resolver for any name missing from the overrides. No
+    /// connection is attempted: the failure is at resolution.
+    #[tokio::test]
+    async fn pinned_client_refuses_to_resolve_other_names() {
+        let (guard, _) =
+            stub_guard(StubResolver::new().with("pinned.example", [ip("93.184.216.34")]));
+        let target = guard
+            .vet("http://pinned.example/hook")
+            .await
+            .expect("public name vets");
+        let client = pinned_client(&target, std::time::Duration::from_secs(2))
+            .expect("pinned client builds");
+
+        let err = client
+            .post("http://unpinned.example/hook")
+            .send()
+            .await
+            .expect_err("an unpinned name must not resolve");
+        let chain = {
+            let mut msgs = vec![err.to_string()];
+            let mut src = std::error::Error::source(&err);
+            while let Some(e) = src {
+                msgs.push(e.to_string());
+                src = e.source();
+            }
+            msgs.join(" | ")
+        };
+        assert!(
+            chain.contains("only the vetted, pinned addresses may be dialled"),
+            "the failure must be the fail-closed resolver, not a DNS lookup: {chain}"
+        );
     }
 
     /// Literals and reserved names are refused BEFORE the resolver is asked.

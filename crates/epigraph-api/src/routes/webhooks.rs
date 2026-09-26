@@ -1319,75 +1319,18 @@ async fn deliver_to_subscription(
     }
 }
 
-/// Build the base HTTP client configuration the dispatcher delivers with.
+/// The dispatcher's HTTP client construction lives in `epigraph_jobs::egress`,
+/// shared with `epigraph_jobs::PinnedHttpClient`, so the API and the jobs crate
+/// build every webhook client from ONE place and cannot drift apart on the
+/// no-redirect / no-proxy / pinned-resolution / fail-closed properties.
 ///
-/// Single construction site on purpose: the SSRF guard is a property of the
-/// client as much as of the egress check, so an ad-hoc `reqwest::Client::new()`
-/// on the delivery path would silently reinstate the defaults this refuses.
-/// [`pinned_client`] builds every delivery client from here.
-///
-/// * `Policy::none()`: the egress check only ever vets the registered URL, so
-///   with reqwest's default policy (follow up to 10 hops) a registered public
-///   endpoint could answer `307 Location: http://169.254.169.254/…` and the
-///   signed payload would reach a host the guard had just refused. A webhook
-///   receiver has no legitimate reason to redirect.
-/// * `no_proxy()`: reqwest honours `HTTP(S)_PROXY` by default, and a proxy
-///   resolves the target name ITSELF — which would bypass the pinned addresses
-///   entirely and let the proxy reach whatever the name rebinds to. Webhook
-///   delivery therefore always connects directly.
-pub fn dispatcher_client_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-}
-
-/// A DNS resolver that resolves nothing.
-///
-/// Installed as the pinned client's fallback so that a name reqwest does NOT
-/// find in the pinned overrides — a spelling mismatch, a future reqwest change
-/// in how the override key is formed — fails the request instead of silently
-/// falling through to system DNS, which is exactly the unvetted resolution
-/// pinning exists to prevent. Fail closed.
-#[derive(Debug)]
-struct RefuseUnpinnedNames;
-
-impl reqwest::dns::Resolve for RefuseUnpinnedNames {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let name = name.as_str().to_string();
-        Box::pin(async move {
-            Err(format!(
-                "webhook delivery refused to resolve {name}: only the vetted, pinned \
-                 addresses may be dialled"
-            )
-            .into())
-        })
-    }
-}
-
-/// The client one delivery sends with: [`dispatcher_client_builder`], pinned to
-/// the vetted addresses of `target`.
-///
-/// For a name, `resolve_to_addrs(domain, vetted)` makes the connector use
-/// exactly the addresses the guard judged, and [`RefuseUnpinnedNames`] makes
-/// every other lookup fail. An IP-literal URL is dialled directly (reqwest
-/// does not resolve literals) and was itself the vetted address.
-///
-/// # Errors
-///
-/// A reqwest build failure (TLS backend initialisation). The caller treats it
-/// as a failed delivery; nothing is sent.
-pub fn pinned_client(
-    target: &epigraph_jobs::egress::VettedTarget,
-    timeout: std::time::Duration,
-) -> reqwest::Result<reqwest::Client> {
-    let mut builder =
-        dispatcher_client_builder(timeout).dns_resolver(std::sync::Arc::new(RefuseUnpinnedNames));
-    if let Some(domain) = target.domain() {
-        builder = builder.resolve_to_addrs(domain, target.addrs());
-    }
-    builder.build()
-}
+/// * [`dispatcher_client_builder`] (`egress::delivery_client_builder`): no
+///   redirects, no proxy.
+/// * [`pinned_client`]: that builder, pinned to a `VettedTarget`'s addresses,
+///   with a fallback resolver that refuses every other name.
+pub use epigraph_jobs::egress::{
+    delivery_client_builder as dispatcher_client_builder, pinned_client,
+};
 
 /// Start the webhook dispatcher background task
 ///
@@ -2281,6 +2224,78 @@ mod tests {
             stub.calls(host),
             2,
             "one failed lookup, one vetted lookup, and no lookup after that"
+        );
+    }
+
+    // ---- epigraph_jobs::PinnedHttpClient, driven from here because reaching a
+    // loopback listener needs `exempt_socket_for_tests`, which only a crate
+    // that enables `epigraph-jobs/test-support` as a dev-dependency has. ----
+
+    /// The jobs crate's sanctioned client reaches the VETTED address for a name
+    /// that system DNS has never heard of (RFC 2606 `.example`): it can only
+    /// have connected through the pinned override, not by resolving again.
+    #[tokio::test]
+    async fn test_jobs_pinned_http_client_dials_the_vetted_address() {
+        use epigraph_jobs::HttpClient as _;
+        let (addr, hits, task) = counting_listener("127.0.0.1:0", OK_200).await;
+        let host = "jobs-pinned.example";
+        let egress =
+            stub_egress(StubResolver::new().with(host, [addr.ip()])).exempt_socket_for_tests(addr);
+        let target = egress
+            .vet(&format!("http://{host}:{}/hook", addr.port()))
+            .await
+            .expect("exempt listener vets");
+
+        let response = epigraph_jobs::PinnedHttpClient::new(std::time::Duration::from_secs(2))
+            .post(&target, std::collections::HashMap::new(), "{}")
+            .await
+            .expect("pinned delivery succeeds");
+        task.abort();
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The jobs crate's sanctioned client does not follow a redirect: the 3xx
+    /// comes back as the response and the hop target is never dialled.
+    #[tokio::test]
+    async fn test_jobs_pinned_http_client_does_not_follow_redirects() {
+        use epigraph_jobs::HttpClient as _;
+        let (hop_addr, hop_hits, hop_task) = counting_listener("127.0.0.1:0", OK_200).await;
+        let redirect: &'static [u8] = Box::leak(
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{hop_addr}/latest/meta-data/\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        );
+        let (entry_addr, entry_hits, entry_task) = counting_listener("127.0.0.1:0", redirect).await;
+        let host = "jobs-entry.example";
+        let egress = stub_egress(StubResolver::new().with(host, [entry_addr.ip()]))
+            .exempt_socket_for_tests(entry_addr);
+        let target = egress
+            .vet(&format!("http://{host}:{}/hook", entry_addr.port()))
+            .await
+            .expect("exempt listener vets");
+
+        let response = epigraph_jobs::PinnedHttpClient::new(std::time::Duration::from_secs(2))
+            .post(&target, std::collections::HashMap::new(), "{}")
+            .await
+            .expect("the entry answers");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        entry_task.abort();
+        hop_task.abort();
+
+        assert_eq!(
+            response.status_code, 307,
+            "the 3xx is returned, not followed"
+        );
+        assert_eq!(entry_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            hop_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target must never be dialled"
         );
     }
 

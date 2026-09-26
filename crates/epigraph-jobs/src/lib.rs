@@ -2182,6 +2182,11 @@ pub enum HttpError {
 ///
 /// Resolving the name again is DNS rebinding: a hostile server answers the
 /// guard with a public address and the client with an internal one.
+///
+/// **Production code should use [`PinnedHttpClient`]**, which meets the
+/// contract by construction (it builds from [`egress::pinned_client`], the same
+/// function the API's delivery dispatcher uses). The trait stays open so tests
+/// can inject mocks; a new production implementation is a review red flag.
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     /// Send an HTTP POST request to a vetted target.
@@ -2199,6 +2204,73 @@ pub trait HttpClient: Send + Sync {
         headers: std::collections::HashMap<String, String>,
         body: &str,
     ) -> Result<HttpResponse, HttpError>;
+}
+
+/// The sanctioned production [`HttpClient`].
+///
+/// Each `post` builds its client with [`egress::pinned_client`], so it
+/// connects only to [`egress::VettedTarget::addrs`] (a fallback resolver
+/// refuses every other name, so a missed override fails closed rather than
+/// reaching system DNS), sends to [`egress::VettedTarget::url`] unchanged,
+/// follows no redirect and uses no proxy. It is the same construction the
+/// API's webhook dispatcher delivers with, so the two paths cannot drift.
+///
+/// A 3xx is returned to the caller as a response, never followed.
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedHttpClient {
+    timeout: Duration,
+}
+
+impl PinnedHttpClient {
+    /// A client whose requests time out after `timeout`.
+    #[must_use]
+    pub const fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Default for PinnedHttpClient {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(30))
+    }
+}
+
+#[async_trait]
+impl HttpClient for PinnedHttpClient {
+    async fn post(
+        &self,
+        target: &egress::VettedTarget,
+        headers: std::collections::HashMap<String, String>,
+        body: &str,
+    ) -> Result<HttpResponse, HttpError> {
+        let client = egress::pinned_client(target, self.timeout).map_err(|e| {
+            HttpError::ConnectionFailed {
+                reason: format!("could not build pinned HTTP client: {e}"),
+            }
+        })?;
+        let mut request = client.post(target.url().clone()).body(body.to_string());
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request.send().await.map_err(|e| {
+            if e.is_timeout() {
+                HttpError::Timeout {
+                    duration: self.timeout,
+                }
+            } else if e.is_connect() {
+                HttpError::ConnectionFailed {
+                    reason: e.to_string(),
+                }
+            } else {
+                HttpError::TransientFailure {
+                    message: e.to_string(),
+                }
+            }
+        })?;
+        let status_code = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Ok(HttpResponse { status_code, body })
+    }
 }
 
 /// Trait for webhook configuration repository.

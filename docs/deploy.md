@@ -1254,8 +1254,12 @@ are still refused.
 
 ### Scope
 
-`epigraph-jobs` has no production `HttpClient` implementation in this
-repository; its handler vets the target and passes the resulting
-`VettedTarget` to `HttpClient::post`, whose documented contract is to dial
-only `addrs()`, never resolve again, and follow no redirects or proxies. Any
-implementation added later must honour that contract.
+`epigraph-jobs` now ships the one sanctioned production `HttpClient`,
+`PinnedHttpClient`. It builds each request's client with
+`epigraph_jobs::egress::pinned_client`, the same function the API's delivery
+dispatcher uses, so both paths dial only the vetted addresses, never resolve
+the name again (a fallback resolver refuses every other name), and follow no
+redirects or proxies. Nothing in this repository wires
+`ConfigurableWebhookHandler` into a runner yet; when something does, it should
+pass `PinnedHttpClient`. The `HttpClient` trait stays open for test mocks, so a
+second production implementation is a review red flag, not a compile error.

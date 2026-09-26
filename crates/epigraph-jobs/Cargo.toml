@@ -25,6 +25,9 @@ petgraph = { workspace = true }
 rand = { workspace = true }  # used by Louvain to break ties between equal-modularity moves
 sqlx = { workspace = true }  # PostgreSQL persistence for job queue
 url = "2"  # WHATWG URL parsing for the webhook egress guard (already in graph via reqwest)
+# The one sanctioned webhook HTTP client (`egress::pinned_client`, `PinnedHttpClient`).
+# Same spec as epigraph-api's, so it adds a dependency edge and no new TLS stack.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
