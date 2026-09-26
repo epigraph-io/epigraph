@@ -1473,7 +1473,7 @@ pub(crate) enum OwnershipGrant {
 ///
 /// `allow_actor` is `false` on the HTTP transport: there only `caller ==
 /// author_op(target)` (the operator itself) is admitted, never the actor arm.
-async fn operator_arm_allows(
+pub(crate) async fn operator_arm_allows(
     server: &EpiGraphMcpFull,
     caller: uuid::Uuid,
     target: uuid::Uuid,

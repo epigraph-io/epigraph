@@ -1060,6 +1060,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          projects back only the row this statement just inserted; `create_strict` delegates to it.",
     ),
     (
+        "workflow.rs",
+        "ingest_anchors",
+        "READ of `workflows` only: three `find_root_by_canonical` / `head_by_canonical` lookups \
+         by `canonical_name` (batch H-b review, H3's lineage-takeover fix). `workflows` has no \
+         row security and no policy, as `find_root_by_canonical` records, so there is nothing \
+         for a viewer to filter; the ingest entry points call it on the plan walk's own \
+         transaction to decide which existing rows need the caller's authority.",
+    ),
+    (
         "claim.rs",
         "admin_patch_claim_conn",
         "WRITE through migration 111's SECURITY DEFINER `epigraph_admin_patch_claim` (batch H-b, \
@@ -1848,6 +1857,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ of `workflows` by `canonical_name` (latest generation). `workflows` has no row \
          security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
          viewer to filter; batch H-b's H3 check resolves the workflow a step op names with it.",
+    ),
+    (
+        "security_event.rs",
+        "admin_grant_is_live",
+        "READ of `oauth_clients` by primary key (batch H-b review: the workflow admin arm's \
+         re-check, migration 111's ADM02 predicate). `oauth_clients` deliberately carries no row \
+         security and no policy (077 section 9: the token mint must update it), so there is \
+         nothing for a viewer to filter; the one row it reads is the caller's own token client.",
     ),
     (
         "workflow.rs",

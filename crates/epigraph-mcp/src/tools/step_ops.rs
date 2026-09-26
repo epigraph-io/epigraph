@@ -68,7 +68,8 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
 
 /// The caller's authority over the head of `canonical_name` (batch H-b, H3;
 /// see `tools::workflow_authority`). An unknown name is left to the executor,
-/// which reports it as not found.
+/// which reports it as not found. Returns the head and the grant, so an admin
+/// write can be audited on the same transaction once it has been made.
 async fn require_authority_over(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
@@ -76,20 +77,18 @@ async fn require_authority_over(
     caller: crate::write_identity::WriteIdentity,
     canonical_name: &str,
     tool_name: &'static str,
-) -> Result<(), McpError> {
-    if let Some(head) =
-        epigraph_db::WorkflowRepository::head_by_canonical(&mut *conn, canonical_name)
-            .await
-            .map_err(|e| {
-                internal_error(format!("{tool_name}: could not resolve the workflow: {e}"))
-            })?
-    {
-        crate::tools::workflow_authority::require_workflow_authority(
-            server, conn, auth, caller, head, tool_name,
-        )
-        .await?;
-    }
-    Ok(())
+) -> Result<Option<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)>, McpError> {
+    let Some(head) = epigraph_db::WorkflowRepository::head_by_canonical(&mut *conn, canonical_name)
+        .await
+        .map_err(|e| internal_error(format!("{tool_name}: could not resolve the workflow: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let grant = crate::tools::workflow_authority::require_workflow_authority(
+        server, conn, auth, caller, head, tool_name,
+    )
+    .await?;
+    Ok(Some((head, grant)))
 }
 
 /// Append or middle-insert a step under an existing workflow.
@@ -121,7 +120,7 @@ pub async fn add_step(
         crate::claim_helper::begin_system_ingest_stamped_tx(server, "add_step").await?;
     // H3 (batch H-b): the CALLER's authority over the workflow, before the
     // system-stamped write. The stamp stays the system agent's.
-    require_authority_over(
+    let authority = require_authority_over(
         server,
         &mut tx,
         auth,
@@ -138,6 +137,24 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
+    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
+        crate::tools::workflow_authority::audit_admin_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            "add_step",
+            head,
+            grant.owner,
+            serde_json::json!({
+                "canonical_name": params.canonical_name,
+                "step_claim_id": r.step_claim_id,
+                "step_lineage_id": r.step_lineage_id,
+                "step_index": r.step_index,
+                "already_present": r.already_present,
+            }),
+        )
+        .await?;
+    }
     tx.commit()
         .await
         .map_err(|e| internal_error(format!("add_step: could not commit: {e}")))?;
@@ -181,7 +198,7 @@ pub async fn delete_step(
     let (_system_agent_id, mut tx) =
         crate::claim_helper::begin_system_ingest_stamped_tx(server, "delete_step").await?;
     // H3 (batch H-b); see `add_step`.
-    require_authority_over(
+    let authority = require_authority_over(
         server,
         &mut tx,
         auth,
@@ -193,6 +210,23 @@ pub async fn delete_step(
     let r = epigraph_ingest_executor::delete_step(&mut tx, &params.canonical_name, lineage)
         .await
         .map_err(map_step_err)?;
+    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
+        crate::tools::workflow_authority::audit_admin_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            "delete_step",
+            head,
+            grant.owner,
+            serde_json::json!({
+                "canonical_name": params.canonical_name,
+                "step_claim_id": r.step_claim_id,
+                "step_lineage_id": r.step_lineage_id,
+                "truth_value_after": r.truth_value,
+            }),
+        )
+        .await?;
+    }
     tx.commit()
         .await
         .map_err(|e| internal_error(format!("delete_step: could not commit: {e}")))?;

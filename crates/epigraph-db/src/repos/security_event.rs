@@ -118,6 +118,38 @@ impl SecurityEventRepository {
         Ok(row)
     }
 
+    /// Whether `client_id` (a token's `sub`) is an ACTIVE `oauth_clients` row
+    /// that GRANTS `claims:admin` and is bound to `agent_id`: the exact
+    /// predicate migration 111's `epigraph_admin_patch_claim` re-checks
+    /// (`ADM02`), for admin writes that do not go through that definer.
+    ///
+    /// Batch H-b review: the workflow step ops accepted `claims:admin` from the
+    /// token's SCOPE alone, so a token whose client record grants nothing (or
+    /// whose client was de-scoped after the mint) kept cross-owner workflow
+    /// mutation while the same token was refused on `update_labels`.
+    /// `oauth_clients` has no row security (077 section 9 keeps it policy-free
+    /// so the token mint can update it), so the application login reads it
+    /// directly; nothing here needs a viewer.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the SELECT fails.
+    pub async fn admin_grant_is_live<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        client_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM oauth_clients c \
+                             WHERE c.id = $1 AND c.agent_id = $2 AND c.status = 'active' \
+                               AND 'claims:admin' = ANY (c.granted_scopes))",
+        )
+        .bind(client_id)
+        .bind(agent_id)
+        .fetch_one(executor)
+        .await?;
+        Ok(live)
+    }
+
     /// Query security events matching optional filter criteria.
     ///
     /// Results are ordered by `created_at DESC` (most recent first).

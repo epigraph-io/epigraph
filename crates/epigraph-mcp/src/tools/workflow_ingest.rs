@@ -86,48 +86,57 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let (_system_agent_id, mut tx) =
         crate::claim_helper::begin_system_ingest_stamped_tx(server, "workflow_ingest").await?;
 
-    // A VARIANT (a new generation of an existing lineage) needs authority over
-    // its parent, and inherits the parent's submitter. A variant of a workflow
-    // with no record inherits no record.
-    let parent = match extraction.source.parent_canonical_name.as_deref() {
-        Some(pcn) => epigraph_db::WorkflowRepository::head_by_canonical(&mut *tx, pcn)
-            .await
-            .map_err(internal_error)?,
-        None => None,
-    };
-    let parent_owner = match parent {
-        Some(parent_id) => {
-            crate::tools::workflow_authority::require_workflow_authority(
+    // WHICH EXISTING ROWS THIS INGEST TOUCHES (batch H-b, H3 review): the exact
+    // row (a re-ingest, which the executor short-circuits), the head of the
+    // lineage `canonical_name` already names (a new generation of it, parent
+    // or no parent), and exactly the row the executor links as `parent_id`.
+    let anchors = epigraph_db::WorkflowRepository::ingest_anchors(
+        &mut tx,
+        &extraction.source.canonical_name,
+        extraction.source.generation as i32,
+        extraction.source.parent_canonical_name.as_deref(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let creating = anchors.existing.is_none();
+    // `inherited`: `Some(x)` = the new row inherits submitter `x` (possibly no
+    // record); `None` = a brand-new lineage, whose submitter is the caller.
+    let mut inherited: Option<Option<uuid::Uuid>> = None;
+    let mut admin_write = false;
+    if creating {
+        let mut checked: Vec<uuid::Uuid> = Vec::with_capacity(2);
+        for anchor in [anchors.lineage_head, anchors.linked_parent]
+            .into_iter()
+            .flatten()
+        {
+            if checked.contains(&anchor) {
+                continue;
+            }
+            checked.push(anchor);
+            let grant = crate::tools::workflow_authority::require_workflow_authority(
                 server,
                 &mut tx,
                 auth,
                 caller,
-                parent_id,
+                anchor,
                 "workflow_ingest",
             )
-            .await?
+            .await?;
+            admin_write |= grant.admin;
+            // The lineage head is checked first, so a new generation of an
+            // existing name inherits ITS submitter; a new name forked from a
+            // parent inherits the parent's.
+            inherited.get_or_insert(grant.owner);
         }
-        None => None,
-    };
-    let creating = epigraph_db::WorkflowRepository::find_root_by_canonical(
-        &mut *tx,
-        &extraction.source.canonical_name,
-        extraction.source.generation as i32,
-    )
-    .await
-    .map_err(internal_error)?
-    .is_none();
+    }
 
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, extraction)
         .await
         .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
     // Recorded only when THIS call created the row: a re-ingest of an existing
     // (possibly pre-H-b, unrecorded) workflow must not make its caller the owner.
+    let submitter = inherited.unwrap_or(Some(caller.agent_id()));
     if creating {
-        let submitter = match (parent, parent_owner) {
-            (Some(_), inherited) => inherited,
-            (None, _) => Some(caller.agent_id()),
-        };
         if let Some(submitter) = submitter {
             epigraph_db::WorkflowRepository::record_submitter(
                 &mut *tx,
@@ -137,6 +146,25 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
             .await
             .map_err(internal_error)?;
         }
+    }
+    if admin_write {
+        crate::tools::workflow_authority::audit_admin_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            "workflow_ingest",
+            result.workflow_id,
+            submitter,
+            serde_json::json!({
+                "canonical_name": extraction.source.canonical_name,
+                "generation": extraction.source.generation,
+                "parent_canonical_name": extraction.source.parent_canonical_name,
+                "lineage_head_before": anchors.lineage_head,
+                "linked_parent": anchors.linked_parent,
+                "claims_ingested": result.claims_ingested,
+            }),
+        )
+        .await?;
     }
     tx.commit()
         .await

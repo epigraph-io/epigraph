@@ -131,6 +131,17 @@ pub struct ScoredHierarchicalWorkflowRow {
     pub similarity: f64,
 }
 
+/// What [`WorkflowRepository::ingest_anchors`] found; see its doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IngestAnchors {
+    /// The exact `(canonical_name, generation)` row, if it already exists.
+    pub existing: Option<Uuid>,
+    /// The latest generation already stored under `canonical_name`.
+    pub lineage_head: Option<Uuid>,
+    /// The row the executor will link as `parent_id`, if any.
+    pub linked_parent: Option<Uuid>,
+}
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -253,6 +264,47 @@ impl WorkflowRepository {
         .fetch_optional(executor)
         .await?;
         Ok(row.map(|(id,)| id))
+    }
+
+    /// The existing rows an ingest of `(canonical_name, generation)` with
+    /// `parent_canonical_name` would touch or link (batch H-b, H3 review):
+    ///
+    /// * `existing` — the exact `(canonical_name, generation)` row. When it is
+    ///   present the ingest is a re-ingest: since the plan walk became one
+    ///   transaction a recorded row always has its `executes` edges, so the
+    ///   executor short-circuits and writes nothing.
+    /// * `lineage_head` — the latest generation already stored under
+    ///   `canonical_name`. A NEW generation of a name that already has rows is a
+    ///   generation of THAT lineage, whether or not the caller names a parent;
+    ///   without this, a caller could ingest `generation + 1` with no parent,
+    ///   record itself as submitter and then pass every head-keyed authority
+    ///   check (the takeover the review measured).
+    /// * `linked_parent` — exactly the row the executor links as `parent_id`
+    ///   (`find_root_by_canonical(parent, generation - 1)`, the same saturating
+    ///   arithmetic), so authority is checked against the row actually linked,
+    ///   not a different generation of the parent's name.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if a query fails.
+    pub async fn ingest_anchors(
+        conn: &mut sqlx::PgConnection,
+        canonical_name: &str,
+        generation: i32,
+        parent_canonical_name: Option<&str>,
+    ) -> Result<IngestAnchors, sqlx::Error> {
+        let existing = Self::find_root_by_canonical(&mut *conn, canonical_name, generation).await?;
+        let lineage_head = Self::head_by_canonical(&mut *conn, canonical_name).await?;
+        let linked_parent = match parent_canonical_name {
+            Some(pcn) => {
+                Self::find_root_by_canonical(&mut *conn, pcn, generation.saturating_sub(1)).await?
+            }
+            None => None,
+        };
+        Ok(IngestAnchors {
+            existing,
+            lineage_head,
+            linked_parent,
+        })
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.

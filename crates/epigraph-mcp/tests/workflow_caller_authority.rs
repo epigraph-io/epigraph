@@ -155,7 +155,11 @@ async fn a_stranger_cannot_add_or_delete_steps_on_a_submitted_workflow(pool: PgP
     )
     .await
     .expect_err("a stranger must not add a step to another caller's workflow");
-    assert!(err.message.contains("cannot retire it"), "{}", err.message);
+    assert!(
+        err.message.contains("was submitted by agent"),
+        "{}",
+        err.message
+    );
     assert_eq!(steps(&pool, "h3-owned").await, before, "nothing written");
 
     let lineage: Uuid = sqlx::query_scalar(
@@ -408,4 +412,230 @@ async fn stdio_is_unchanged_but_a_stdio_ingest_is_still_owned(pool: PgPool) {
     )
     .await
     .expect_err("an HTTP stranger must not add to a stdio agent's workflow");
+}
+
+async fn generation_rows(pool: &PgPool, canonical: &str) -> Vec<(i32, Option<String>)> {
+    sqlx::query_as(
+        "SELECT generation, metadata->>'epigraph_submitted_by' FROM workflows \
+          WHERE canonical_name = $1 ORDER BY generation",
+    )
+    .bind(canonical)
+    .fetch_all(pool)
+    .await
+    .expect("generations")
+}
+
+async fn workflow_admin_audits(pool: &PgPool, admin: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'workflows.admin_write' AND agent_id = $1",
+    )
+    .bind(admin)
+    .fetch_one(pool)
+    .await
+    .expect("count audit rows")
+}
+
+/// Batch H-b review (authority-attack, high), reproduced on the real binary:
+/// ingesting `generation + 1` of another agent's lineage with NO
+/// `parent_canonical_name` needed no authority and recorded the ATTACKER as
+/// submitter, after which every head-keyed check admitted the attacker and
+/// refused the real submitter. A new generation of an existing name is a
+/// generation of that lineage, parent or no parent, and a gap generation is no
+/// exception.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_new_generation_cannot_take_a_lineage_over_without_naming_a_parent(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (_attacker, attacker_token, attacker_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    tools::workflow_ingest::ingest_workflow(
+        &server,
+        &owner_viewer,
+        IngestWorkflowParams {
+            extraction: extraction("h3-lineage", serde_json::json!({})),
+        },
+        Some(&owner_token),
+    )
+    .await
+    .expect("the owner ingests generation 0");
+
+    for generation in [1_u32, 5] {
+        let mut hijack = extraction("h3-lineage", serde_json::json!({}));
+        hijack.source.generation = generation;
+        hijack.phases[0].summary = format!("the attacker's generation {generation}");
+        let err = tools::workflow_ingest::ingest_workflow(
+            &server,
+            &attacker_viewer,
+            IngestWorkflowParams { extraction: hijack },
+            Some(&attacker_token),
+        )
+        .await
+        .expect_err("a stranger must not add a generation to another agent's lineage");
+        assert!(
+            err.message.contains("was submitted by agent"),
+            "a workflow-specific refusal, not the claim gate's: {}",
+            err.message
+        );
+    }
+    assert_eq!(
+        generation_rows(&pool, "h3-lineage").await,
+        vec![(0, Some(owner.to_string()))],
+        "nothing written: no attacker generation, no attacker submitter"
+    );
+    // The real submitter keeps its lineage.
+    tools::step_ops::add_step(
+        &server,
+        &owner_viewer,
+        add("h3-lineage", "the owner's step after the attempt"),
+        Some(&owner_token),
+    )
+    .await
+    .expect("the submitter still mutates its own lineage");
+
+    // CALIBRATION: the owner's own parentless new generation is admitted and
+    // INHERITS the lineage's submitter.
+    let mut next = extraction("h3-lineage", serde_json::json!({}));
+    next.source.generation = 1;
+    next.phases[0].summary = "the owner's generation 1".to_string();
+    tools::workflow_ingest::ingest_workflow(
+        &server,
+        &owner_viewer,
+        IngestWorkflowParams { extraction: next },
+        Some(&owner_token),
+    )
+    .await
+    .expect("the submitter adds a generation to its own lineage");
+    assert_eq!(
+        generation_rows(&pool, "h3-lineage").await,
+        vec![(0, Some(owner.to_string())), (1, Some(owner.to_string()))]
+    );
+}
+
+/// A variant is checked against EXACTLY the row the executor links as
+/// `parent_id` (`parent_canonical_name` at `generation - 1`), and a brand-new
+/// name forked from someone else's workflow needs authority over that parent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_fork_under_a_new_name_needs_authority_over_the_linked_parent(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (stranger, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    tools::workflow_ingest::ingest_workflow(
+        &server,
+        &owner_viewer,
+        IngestWorkflowParams {
+            extraction: extraction("h3-fork-parent", serde_json::json!({})),
+        },
+        Some(&owner_token),
+    )
+    .await
+    .expect("ingest the parent");
+    let mut fork = extraction("h3-fork-child", serde_json::json!({}));
+    fork.source.generation = 1;
+    fork.source.parent_canonical_name = Some("h3-fork-parent".to_string());
+    tools::workflow_ingest::ingest_workflow(
+        &server,
+        &stranger_viewer,
+        IngestWorkflowParams {
+            extraction: fork.clone(),
+        },
+        Some(&stranger_token),
+    )
+    .await
+    .expect_err("a variant linked to another agent's workflow needs authority over it");
+    assert!(generation_rows(&pool, "h3-fork-child").await.is_empty());
+
+    // Naming a parent generation that does not exist links nothing, so it is a
+    // brand-new lineage of the stranger's own.
+    fork.source.generation = 7;
+    tools::workflow_ingest::ingest_workflow(
+        &server,
+        &stranger_viewer,
+        IngestWorkflowParams { extraction: fork },
+        Some(&stranger_token),
+    )
+    .await
+    .expect("no linked parent: the stranger's own new lineage");
+    assert_eq!(
+        generation_rows(&pool, "h3-fork-child").await,
+        vec![(7, Some(stranger.to_string()))]
+    );
+}
+
+/// Batch H-b review (authority-attack, high): the admin arm admitted on the
+/// token's SCOPE alone, and the write ran on the system stamp, so a token whose
+/// client record grants nothing kept cross-owner workflow mutation and no
+/// audit row was written. Now the client record is re-checked and an admitted
+/// write records `workflows.admin_write` on its own transaction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_workflow_admin_write_is_audited_and_a_grantless_admin_is_refused(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    tools::workflow_ingest::ingest_workflow(
+        &server,
+        &owner_viewer,
+        IngestWorkflowParams {
+            extraction: extraction("h3-admin", serde_json::json!({})),
+        },
+        Some(&owner_token),
+    )
+    .await
+    .expect("ingest");
+    let before = steps(&pool, "h3-admin").await;
+
+    // A claims:admin token whose `sub` is no granting client record.
+    let (grantless, admin_viewer) = common::server_admin(&server).await;
+    let admin = grantless.agent_id.expect("admin agent");
+    let err = tools::step_ops::add_step(
+        &server,
+        &admin_viewer,
+        add("h3-admin", "a grantless admin's step"),
+        Some(&grantless),
+    )
+    .await
+    .expect_err("claims:admin in the token alone is not the audited admin path");
+    assert!(err.message.contains("ADM02"), "{}", err.message);
+    assert_eq!(steps(&pool, "h3-admin").await, before, "nothing written");
+    assert_eq!(workflow_admin_audits(&pool, admin).await, 0);
+
+    // The same agent with a live grant on its client record: admitted, audited.
+    let (granted, _) = common::server_admin(&server).await;
+    seed_admin_grant(&pool, &granted).await;
+    tools::step_ops::add_step(
+        &server,
+        &admin_viewer,
+        add("h3-admin", "an audited admin's step"),
+        Some(&granted),
+    )
+    .await
+    .expect("a live claims:admin grant adds a step");
+    assert_eq!(steps(&pool, "h3-admin").await, before + 1);
+    assert_eq!(workflow_admin_audits(&pool, admin).await, 1);
+    let (workflow, submitter, client): (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT details->>'workflow_id', details->>'submitter', details->>'client_id' \
+               FROM security_events WHERE event_type = 'workflows.admin_write' AND agent_id = $1",
+        )
+        .bind(admin)
+        .fetch_one(&pool)
+        .await
+        .expect("audit row");
+    let head: Uuid =
+        sqlx::query_scalar("SELECT id FROM workflows WHERE canonical_name = 'h3-admin'")
+            .fetch_one(&pool)
+            .await
+            .expect("workflow id");
+    assert_eq!(workflow, Some(head.to_string()));
+    assert_eq!(submitter, Some(owner.to_string()));
+    assert_eq!(client, Some(granted.client_id.to_string()));
+
+    // The submitter's own write is not an admin write and records nothing.
+    tools::step_ops::add_step(
+        &server,
+        &owner_viewer,
+        add("h3-admin", "the owner's step"),
+        Some(&owner_token),
+    )
+    .await
+    .expect("the submitter");
+    assert_eq!(workflow_admin_audits(&pool, owner).await, 0);
 }
