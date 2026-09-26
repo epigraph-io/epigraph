@@ -54,8 +54,16 @@ pub const ALLOWED_SCHEMES: &[&str] = &["http", "https"];
 
 /// Why a webhook target was refused.
 ///
-/// Every message repeats back only what the caller supplied (or an address it
-/// resolved to), so it is safe to return to the registering client.
+/// # `Display` is for LOGS; [`Self::public_message`] is for callers
+///
+/// The `Display` text is the full diagnosis. For a NAME it can include what
+/// the server's resolver answered (the internal address, its range) or the
+/// resolver's own error text, and none of that was supplied by the caller.
+/// Returning it to a registering client would tell that client what the
+/// server's resolver maps a name to: an internal-DNS enumeration oracle.
+///
+/// Anything returned across a trust boundary must use
+/// [`Self::public_message`], which repeats back only what the caller supplied.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EgressDenied {
     /// The string is not an absolute URL.
@@ -106,6 +114,35 @@ pub enum EgressDenied {
 }
 
 impl EgressDenied {
+    /// The refusal as it may be shown to the caller who supplied the URL.
+    ///
+    /// Variants judged from the URL alone ([`Self::Unparseable`],
+    /// [`Self::Scheme`], [`Self::NoHost`], [`Self::InternalAddress`],
+    /// [`Self::ReservedName`]) only echo caller input, so they keep their
+    /// `Display` text.
+    ///
+    /// [`Self::ResolvesInternal`] and [`Self::Unresolvable`] are verdicts about
+    /// the SERVER's resolver, so they share ONE message naming only the host.
+    /// It must be the same message for both, and it avoids the word "resolve":
+    /// if "is internal" and "does not exist" read differently, a caller can
+    /// still tell whether an internal-only name exists, even without an
+    /// address in the text. What remains observable is 201 versus 400 and the
+    /// time a lookup takes; those cannot be removed without dropping the
+    /// registration-time check, and are accepted.
+    #[must_use]
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::ResolvesInternal { host, .. } | Self::Unresolvable { host, .. } => {
+                format!("Webhook URL host {host} is not an acceptable public destination")
+            }
+            Self::Unparseable(_)
+            | Self::Scheme(_)
+            | Self::NoHost
+            | Self::InternalAddress { .. }
+            | Self::ReservedName(_) => self.to_string(),
+        }
+    }
+
     /// The refused destination, for logs and `JobError::SsrfBlocked`, or `None`
     /// when the refusal is not about an internal destination (a bad shape, or
     /// a name that did not resolve).
@@ -813,6 +850,53 @@ mod tests {
                 other => panic!("{raw} must be Unresolvable, got {other:?}"),
             }
         }
+    }
+
+    /// The caller-facing text of a resolution verdict carries nothing the
+    /// caller did not supply: no resolved address, no range name, no resolver
+    /// error — and "internal" and "does not exist" read identically, so the
+    /// text cannot distinguish an internal-only name from a missing one.
+    #[tokio::test]
+    async fn public_message_of_a_resolution_verdict_names_only_the_host() {
+        let (guard, _) = stub_guard(
+            StubResolver::new()
+                .with("loopback-alias.example", [ip("127.0.0.1")])
+                .with("private-alias.example", [ip("10.0.0.9")]),
+        );
+        let mut texts = Vec::new();
+        for name in [
+            "loopback-alias.example",
+            "private-alias.example",
+            "nxdomain.example",
+        ] {
+            let denied = guard
+                .vet(&format!("https://{name}/hook"))
+                .await
+                .expect_err("refused");
+            let text = denied.public_message();
+            for leak in [
+                "127.0.0.1",
+                "10.0.0.9",
+                "loopback",
+                "private",
+                "resolve",
+                "stub resolver",
+            ] {
+                assert!(
+                    !text.replace(name, "<host>").contains(leak),
+                    "{name}: caller-facing text leaks {leak:?}: {text}"
+                );
+            }
+            texts.push(text.replace(name, "<host>"));
+        }
+        assert!(
+            texts.windows(2).all(|w| w[0] == w[1]),
+            "every resolution verdict must read the same: {texts:?}"
+        );
+
+        // URL-only verdicts echo caller input and keep their full text.
+        let literal = parse_and_classify("http://127.0.0.1/x").expect_err("literal");
+        assert_eq!(literal.public_message(), literal.to_string());
     }
 
     /// Literals and reserved names are refused BEFORE the resolver is asked.

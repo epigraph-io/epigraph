@@ -1177,16 +1177,28 @@ visible to webhook owners or operators.
 `POST /api/v1/webhooks` resolves a host **name** once, via the operating
 system's resolver, bounded to 5 seconds. It returns **400** when:
 
-* **any** address in the answer is internal (see §3), with the refused
-  address named in the message. A round-robin answer with one internal member
-  is refused as a whole, because a client may try any member;
-* the name **does not resolve**, returns no addresses, or times out ("could
-  not be resolved"). Nothing can be vetted, so nothing is stored. This
-  includes a *transient* resolver failure: the registering client should
-  retry, and an operator seeing a burst of these should check the API host's
-  resolver before suspecting the caller.
+* **any** address in the answer is internal (see §3). A round-robin answer
+  with one internal member is refused as a whole, because a client may try
+  any member;
+* the name **does not resolve**, returns no addresses, or times out. Nothing
+  can be vetted, so nothing is stored. This includes a *transient* resolver
+  failure, and the registering client should retry.
 
-IP-literal URLs are judged as before, without resolution.
+Both cases return the **same** body, naming only the host ("Webhook URL host
+`<host>` is not an acceptable public destination"). The resolved address, its
+range and the resolver's error text are the server's resolver's answer, not
+anything the caller supplied, so they are not returned: echoing them would let
+any `webhooks:write` holder learn what internal-only names resolve to. They are
+logged at WARN as `Refusing webhook registration: target host failed egress
+vetting`, with the caller's `agent_id`. **Operators:** because a transient
+resolver failure now looks like any other refusal to the caller, a burst of
+these 400s is diagnosed from that log line, and the API host's resolver should
+be checked before the caller is suspected. What a caller can still observe is
+201 versus 400 and how long the lookup took; those cannot be removed without
+dropping the registration-time check, and are accepted.
+
+IP-literal URLs are judged as before, without resolution, and their refusal
+still names the literal (it is the caller's own input).
 
 ### 2. BREAKING for existing rows — every delivery re-vets, so grandfathered internal targets stop receiving
 

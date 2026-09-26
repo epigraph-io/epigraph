@@ -182,11 +182,19 @@ async fn whitespace_does_not_separate_the_judged_url_from_the_stored_one() {
 /// pinned was the hole. It is inverted, not deleted, so the boundary move is
 /// recorded where the old one was:
 ///
-/// * a public name whose record points at loopback → 400, naming the address;
+/// * a public name whose record points at loopback → 400;
 /// * one pointing at the metadata address → 400;
 /// * one with a round-robin answer containing ONE internal member → 400;
 /// * one that does not resolve at all → 400 (nothing can be vetted);
 /// * the control: one resolving only to a public address → 201.
+///
+/// # The 400 body must not say what the name resolved to
+///
+/// The resolved address is the SERVER's resolver's answer, not caller input:
+/// echoing it (or its range, or the resolver's error text) makes registration
+/// an internal-DNS enumeration oracle. So every refusal below must name the
+/// host and nothing the resolver said, and "internal" and "does not resolve"
+/// must read identically. The full verdict is logged server-side at WARN.
 ///
 /// The stub stands in for DNS; the names are RFC 2606 `.example`, so nothing
 /// here would resolve for real anyway.
@@ -218,11 +226,18 @@ async fn a_hostname_is_resolved_and_refused_if_any_answer_is_internal() {
     .await;
     let token = writer_token().await;
 
-    for (target, needle) in [
-        ("http://loopback-alias.example/hook", "127.0.0.1"),
-        ("http://metadata-alias.example/hook", "169.254.169.254"),
-        ("https://mixed.example/hook", "10.0.0.9"),
-        ("https://nxdomain.example/hook", "could not be resolved"),
+    let mut bodies = Vec::new();
+    for (target, host) in [
+        (
+            "http://loopback-alias.example/hook",
+            "loopback-alias.example",
+        ),
+        (
+            "http://metadata-alias.example/hook",
+            "metadata-alias.example",
+        ),
+        ("https://mixed.example/hook", "mixed.example"),
+        ("https://nxdomain.example/hook", "nxdomain.example"),
     ] {
         let resp = register(addr, &token, target).await;
         let status = resp.status();
@@ -232,10 +247,30 @@ async fn a_hostname_is_resolved_and_refused_if_any_answer_is_internal() {
             "{target} must be refused at registration: {body}"
         );
         assert!(
-            body.contains(needle),
-            "{target}: the refusal must say why ({needle}): {body}"
+            body.contains(host),
+            "{target}: the refusal must name the caller's host: {body}"
         );
+        let rest = body.replace(host, "<host>");
+        for leak in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.9",
+            "loopback",
+            "link-local",
+            "private",
+            "resolve",
+        ] {
+            assert!(
+                !rest.contains(leak),
+                "{target}: the 400 body discloses the resolver's answer ({leak:?}): {body}"
+            );
+        }
+        bodies.push(rest);
     }
+    assert!(
+        bodies.windows(2).all(|w| w[0] == w[1]),
+        "internal and nonexistent names must be refused with the same body: {bodies:?}"
+    );
 
     let resp = register(addr, &token, "http://consumer.public.example/hook").await;
     assert_eq!(

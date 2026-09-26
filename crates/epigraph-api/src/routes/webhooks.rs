@@ -330,12 +330,25 @@ pub async fn register_webhook(
     //     DNS lookup. Nothing is pinned here — registration never dials — and
     //     delivery re-vets every send, so this is the early, caller-visible
     //     verdict rather than the only one.
+    //
+    //     THE 400 BODY IS `public_message()`, NOT `to_string()`. The full
+    //     verdict can name what the SERVER's resolver answered for a name
+    //     (an internal address and its range) or the resolver's error text;
+    //     echoing that would let any `webhooks:write` holder map internal DNS.
+    //     The full verdict goes to the server log instead.
     state
         .webhook_egress
         .vet(registration.url.trim())
         .await
-        .map_err(|denied| ApiError::BadRequest {
-            message: denied.to_string(),
+        .map_err(|denied| {
+            tracing::warn!(
+                agent_id = %agent_id,
+                denied = %denied,
+                "Refusing webhook registration: target host failed egress vetting"
+            );
+            ApiError::BadRequest {
+                message: denied.public_message(),
+            }
         })?;
 
     // 4. Create the subscription
@@ -3285,5 +3298,85 @@ mod ssrf_registration_tests {
                 "{url} must not be stored"
             );
         }
+    }
+
+    /// A registration refusal about a NAME must not tell the caller what the
+    /// server's resolver answered for it.
+    ///
+    /// Before this, the 400 body for a name that resolved internally named the
+    /// resolved address and its range, and a name that did not resolve got a
+    /// different message carrying the resolver's error text — so a
+    /// `webhooks:write` holder could learn what internal-only names resolve to,
+    /// and which exist. Now both get the same host-only message.
+    ///
+    /// The fixture carries an `agent_id`, so the handler reaches the resolution
+    /// step (3b); it refuses there, before any query, so the lazy pool never
+    /// connects.
+    #[tokio::test]
+    async fn register_webhook_refusal_does_not_disclose_the_resolver_answer() {
+        use epigraph_jobs::egress::{EgressGuard, StubResolver};
+        let stub = StubResolver::new()
+            .with("loopback-alias.example", ["127.0.0.1".parse().unwrap()])
+            .with(
+                "metadata-alias.example",
+                ["169.254.169.254".parse().unwrap()],
+            )
+            .with(
+                "mixed.example",
+                [
+                    "93.184.216.34".parse().unwrap(),
+                    "10.0.0.9".parse().unwrap(),
+                ],
+            );
+        let state =
+            test_state().with_webhook_egress(EgressGuard::with_resolver(std::sync::Arc::new(stub)));
+        let mut auth = webhooks_write_auth();
+        auth.agent_id = Some(Uuid::new_v4());
+
+        let mut normalised = Vec::new();
+        for host in [
+            "loopback-alias.example",
+            "metadata-alias.example",
+            "mixed.example",
+            "nxdomain.example",
+        ] {
+            let result = register_webhook(
+                State(state.clone()),
+                RequireScopeWebhooksWrite(auth.clone()),
+                Json(registration(&format!("https://{host}/hook"))),
+            )
+            .await;
+            let message = match result {
+                Err(ApiError::BadRequest { message }) => message,
+                Err(other) => panic!("{host}: expected 400, got {other:?}"),
+                Ok(_) => panic!("{host}: must not be registrable"),
+            };
+            assert!(
+                message.contains(host),
+                "{host}: the refusal must still name the caller's host: {message}"
+            );
+            let rest = message.replace(host, "<host>");
+            for leak in [
+                "127.0.0.1",
+                "169.254.169.254",
+                "10.0.0.9",
+                "loopback",
+                "link-local",
+                "private",
+                "resolve",
+                "stub resolver",
+            ] {
+                assert!(
+                    !rest.contains(leak),
+                    "{host}: the 400 body discloses {leak:?}: {message}"
+                );
+            }
+            normalised.push(rest);
+        }
+        assert!(
+            normalised.windows(2).all(|w| w[0] == w[1]),
+            "internal and nonexistent names must be refused with the same text: {normalised:?}"
+        );
+        assert!(state.webhook_store.read().await.is_empty());
     }
 }
