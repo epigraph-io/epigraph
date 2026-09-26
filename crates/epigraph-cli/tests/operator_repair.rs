@@ -618,3 +618,127 @@ async fn strip_label_refuses_a_label_the_write_path_accepts(pool: PgPool) {
     assert!(!mf.exists());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Rewrite one strip-label manifest: `edit` sees each parsed line and may
+/// change it in place.
+fn tamper(src: &Path, dst: &Path, edit: impl Fn(&mut serde_json::Value)) {
+    let text = std::fs::read_to_string(src).expect("read manifest");
+    let out: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut v: serde_json::Value = serde_json::from_str(l).expect("manifest line");
+            edit(&mut v);
+            v.to_string()
+        })
+        .collect();
+    std::fs::write(dst, out.join("\n") + "\n").expect("write tampered manifest");
+}
+
+/// `strip-label-reverse` writes each recorded `before` back verbatim, so it
+/// must refuse a manifest whose records are not a strip of its header label:
+/// otherwise an edited `before` makes it write any label array at all, gated
+/// labels included, while reporting success. Three tamperings, one per
+/// consistency condition, each refused WHOLE (exit 1, nothing restored, not
+/// even the untampered claim), and the untampered manifest still reverses.
+#[sqlx::test(migrations = "../../migrations")]
+async fn strip_label_reverse_refuses_a_manifest_that_is_not_a_strip_of_its_label(pool: PgPool) {
+    let fx = label_fixture(&pool).await;
+    let dir = scratch_dir();
+    let mf = dir.join("strip.jsonl");
+    let r = run_op(
+        &pool,
+        &[
+            "strip-label",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let once = fx.once.to_string();
+    let is_once = |v: &serde_json::Value| v["claim_id"].as_str() == Some(once.as_str());
+
+    // (b) a `before` that does not carry the label: restoring values the
+    // strip never saw.
+    let no_label = dir.join("no-label.jsonl");
+    tamper(&mf, &no_label, |v| {
+        if is_once(v) && v.get("before").is_some() {
+            v["before"] = serde_json::json!(["b", "resolved", "totally-new"]);
+        }
+    });
+    // (c) a `before` that carries the label AND an extra value, so the
+    // recorded `after` is not it without the label.
+    let extra = dir.join("extra.jsonl");
+    tamper(&mf, &extra, |v| {
+        if is_once(v) && v.get("before").is_some() {
+            v["before"] = serde_json::json!([BAD_LABEL, "b", "b", "resolved"]);
+        }
+    });
+    // (a) a header label the write path accepts, which strip-label never
+    // strips.
+    let header = dir.join("header.jsonl");
+    tamper(&mf, &header, |v| {
+        if v.get("manifest").is_some() {
+            v["label"] = serde_json::json!("b");
+        }
+    });
+
+    for (what, p) in [
+        ("before lacks the label", &no_label),
+        ("after is not before without the label", &extra),
+        ("header names an accepted label", &header),
+    ] {
+        let rr = run_op(
+            &pool,
+            &[
+                "strip-label-reverse",
+                "--manifest",
+                p.to_str().unwrap(),
+                "--apply",
+            ],
+        )
+        .await;
+        assert_eq!(
+            rr.code,
+            1,
+            "{what}: a manifest that is not a strip of its header label must be refused\n{}",
+            rr.show()
+        );
+        assert!(rr.stderr.contains("refusing"), "{what}\n{}", rr.show());
+        assert_eq!(
+            labels_of(&pool, fx.once).await,
+            owned(&["b", "b"]),
+            "{what}: the tampered claim must not be written"
+        );
+        assert_eq!(
+            labels_of(&pool, fx.both).await,
+            owned(&["zeta", "alpha", "mu"]),
+            "{what}: the manifest is refused whole, so the untampered claim is not restored \
+             either"
+        );
+    }
+
+    let rr = run_op(
+        &pool,
+        &[
+            "strip-label-reverse",
+            "--manifest",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(
+        rr.code,
+        0,
+        "the untampered manifest still reverses\n{}",
+        rr.show()
+    );
+    assert_eq!(
+        labels_of(&pool, fx.once).await,
+        owned(&[BAD_LABEL, "b", "b"])
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

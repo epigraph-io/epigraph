@@ -410,7 +410,45 @@ fn read_manifest(path: &Path) -> anyhow::Result<Read> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("{}: header has no label", path.display()))?
         .to_string();
+    check_is_a_strip_of(&label, &claims)
+        .with_context(|| format!("{}: refusing the whole manifest", path.display()))?;
     Ok(Read { label, claims })
+}
+
+/// A manifest is only reversible if it records a strip of its OWN header
+/// label: the label is one the write-path validator rejects (the only kind
+/// `run` strips), every `before` carries it, and every written `after` is
+/// exactly `before` without it. `reverse` writes `before` back verbatim, so
+/// without this an edited `before` would let it write any label array at all,
+/// including labels whose writes are gated elsewhere, under a tool whose
+/// contract is to restore one rejected value. Checked for every record before
+/// the transaction opens, so a manifest that fails is refused whole.
+fn check_is_a_strip_of(
+    label: &str,
+    claims: &BTreeMap<Uuid, (Vec<String>, Option<Vec<String>>)>,
+) -> anyhow::Result<()> {
+    refuse_valid_label(label)?;
+    for (id, (before, after)) in claims {
+        if !before.iter().any(|l| l == label) {
+            bail!(
+                "claim {id}: recorded labels {} do not carry {label:?}, so they are not the \
+                 prior state of a strip of that label",
+                json!(before)
+            );
+        }
+        if let Some(after) = after {
+            let want = without(before, label);
+            if *after != want {
+                bail!(
+                    "claim {id}: recorded post-strip labels {} are not {} (the recorded prior \
+                     labels without {label:?})",
+                    json!(after),
+                    json!(want)
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Restore every claim a strip-label manifest wrote to its recorded labels.
