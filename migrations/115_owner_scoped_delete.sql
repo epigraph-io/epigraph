@@ -222,13 +222,34 @@
 -- backfill and operator re-own paths all run as the maintenance role. No
 -- application path re-owns one of these rows.
 --
+-- ===================================================================
+-- 8. THE GROUP-KEYED SEALED-CONTENT TABLES
+-- ===================================================================
+--
+-- The same shape outside tier A: `claim_encryption`, `evidence_encryption`,
+-- `edge_encryption`, `claim_version_encryption` and `group_key_epochs` carry
+-- a `group_id` instead of the tenancy columns, and their 077 policies are FOR
+-- ALL with USING = the READ set (`epigraph_session_groups()`) and WITH CHECK =
+-- the writable set. So a `reader` member of a group could DELETE the group's
+-- ciphertext rows, and a sealed row has no plaintext to restore from. Each
+-- gets a RESTRICTIVE, FOR DELETE policy `<table>_delete_writer`: the row's
+-- group must be in the session's WRITABLE set (on `group_key_epochs` also the
+-- group's creator, which that table's 077 policy admits for provisioning).
+-- The application's own deletes on these tables are the privatization /
+-- unseal paths, which run as the maintenance role and are unchanged. `groups`
+-- keeps its delete-blocking trigger, and `group_memberships` grants the
+-- application no DELETE. `owner_scoped_delete.rs`'s catalog ratchet fails
+-- when a table whose permissive DELETE-covering policy admits on the read
+-- set has no restrictive DELETE policy and is not on its short allow-list.
+--
 -- DEPLOY ORDER: apply 115 BEFORE any binary built with it serves: the repo
 -- layer calls `epigraph_cascade_delete_edge_bbas` for every non-privileged
 -- cascade. A binary built without 115 against a database at 115 runs its old
 -- plain statements, which the policies then scope to owned rows.
 --
--- Undo: DROP the 24 `<table>_delete_owner` policies and the 21
--- `<table>_owner_immutable` triggers; point the three
+-- Undo: DROP the 24 `<table>_delete_owner` policies, the five
+-- `<table>_delete_writer` policies and the 21 `<table>_owner_immutable`
+-- triggers; point the three
 -- `<node>_cascade_edges` triggers back at `cascade_delete_edges('<type>')`;
 -- restore 114's body of `epigraph_dedup_move_bbas`; DROP the four new
 -- functions; REVOKE DELETE ON mass_functions, edges FROM epigraph_maintenance.
@@ -556,6 +577,41 @@ CREATE TRIGGER edges_owner_immutable BEFORE UPDATE OF owner_group_id, co_owner_g
     WHEN (OLD.owner_group_id IS DISTINCT FROM NEW.owner_group_id
           OR OLD.co_owner_group_id IS DISTINCT FROM NEW.co_owner_group_id)
     EXECUTE FUNCTION public.epigraph_owner_immutable_guard();
+
+-- ===================================================================
+-- 8. RESTRICTIVE DELETE ON THE GROUP-KEYED SEALED-CONTENT TABLES
+-- ===================================================================
+DO $$
+DECLARE t text;
+        sealed text[] := ARRAY['claim_encryption','evidence_encryption','edge_encryption',
+                               'claim_version_encryption'];
+BEGIN
+    FOREACH t IN ARRAY sealed LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_class c
+                         JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = 'public' AND c.relname = t
+                          AND c.relkind IN ('r', 'p')) THEN
+            CONTINUE;
+        END IF;
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_delete_writer', t);
+        EXECUTE format($f$
+            CREATE POLICY %I ON public.%I AS RESTRICTIVE FOR DELETE TO PUBLIC
+                USING (
+                    (SELECT public.epigraph_bypass())
+                    OR (SELECT public.epigraph_definer_bypass())
+                    OR group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]))
+        $f$, t || '_delete_writer', t);
+    END LOOP;
+END $$;
+
+DROP POLICY IF EXISTS group_key_epochs_delete_writer ON public.group_key_epochs;
+CREATE POLICY group_key_epochs_delete_writer ON public.group_key_epochs
+    AS RESTRICTIVE FOR DELETE TO PUBLIC
+    USING (
+        (SELECT public.epigraph_bypass())
+        OR (SELECT public.epigraph_definer_bypass())
+        OR group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[])
+        OR public.epigraph_is_group_creator(group_id));
 
 -- ===================================================================
 -- 6. OWNERSHIP AND GRANTS

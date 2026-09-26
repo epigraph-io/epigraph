@@ -1369,6 +1369,128 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     }
 }
 
+/// The broader ratchet (115 section 8): outside tier A too, no table the
+/// application may DELETE from lets its READ set license a delete. Every table
+/// whose permissive DELETE-covering policy admits on `epigraph_session_groups()`
+/// must carry a restrictive DELETE policy, unless it is on the allow-list with
+/// the reason it is safe.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_app_deletable_table_admits_delete_on_the_read_set(pool: PgPool) {
+    // `groups`: `groups_block_delete` refuses every row delete (asserted below).
+    const ALLOWED: &[&str] = &["groups"];
+    let open: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT c.relname::text \
+           FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+           JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'public' AND c.relrowsecurity \
+            AND p.polpermissive AND p.polcmd IN ('*', 'd') \
+            AND pg_get_expr(p.polqual, p.polrelid) LIKE '%epigraph_session_groups()%' \
+            AND has_table_privilege('epigraph_app', c.oid, 'DELETE') \
+            AND NOT EXISTS (SELECT 1 FROM pg_policy r WHERE r.polrelid = c.oid \
+                             AND r.polcmd = 'd' AND NOT r.polpermissive) \
+          ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("catalog");
+    let unexplained: Vec<&String> = open
+        .iter()
+        .filter(|t| !ALLOWED.contains(&t.as_str()))
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "these tables let a READ-only member delete: {unexplained:?}"
+    );
+    let blocked: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = 'public.groups'::regclass \
+                         AND tgname = 'groups_block_delete' AND tgenabled <> 'D')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("groups trigger");
+    assert!(
+        blocked,
+        "the `groups` allow-list entry relies on groups_block_delete"
+    );
+}
+
+/// Section 8's behaviour: a `reader` of W's group reads the group's sealed
+/// claim row and a key epoch and deletes neither; W, a writer of the group,
+/// deletes both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reader_cannot_delete_its_groups_sealed_rows(pool: PgPool) {
+    let (w, g) = fixture::seed_agent_with_group(&pool, "writer-w").await;
+    let (r, _) = fixture::seed_agent_with_group(&pool, "reader-r").await;
+    add_reader(&pool, g, r).await;
+    let sealed = fixture::seed_group_claim(&pool, w, g, "a sealed claim").await;
+    // One active epoch per group (`group_key_epochs_one_active`).
+    for (epoch, status) in [(0_i32, "active"), (1, "retired")] {
+        sqlx::query("INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, $2, $3)")
+            .bind(g)
+            .bind(epoch)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("seed key epoch");
+    }
+    sqlx::query(
+        "INSERT INTO claim_encryption (claim_id, group_id, epoch, privacy_tier, \
+                                       encrypted_content) \
+         VALUES ($1, $2, 0, 'fully_private', '\\x00'::bytea)",
+    )
+    .bind(sealed)
+    .bind(g)
+    .execute(&pool)
+    .await
+    .expect("seed the sealed row");
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let delete_sealed = "DELETE FROM claim_encryption WHERE claim_id = $1";
+    let delete_epoch = "DELETE FROM group_key_epochs WHERE group_id = $1 AND epoch = 1";
+    let p = pool.clone();
+    let (seen, by_reader, by_writer) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, r).await;
+            let seen: i64 = sqlx::query_scalar(
+                "SELECT (SELECT count(*) FROM claim_encryption WHERE claim_id = $1) \
+                      + (SELECT count(*) FROM group_key_epochs WHERE group_id = $2 AND epoch = 1)",
+            )
+            .bind(sealed)
+            .bind(g)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read as R");
+            let mut by_reader = Vec::new();
+            for (sql, id) in [(delete_sealed, sealed), (delete_epoch, g)] {
+                by_reader.push(
+                    sqlx::query(sql)
+                        .bind(id)
+                        .execute(&mut *conn)
+                        .await
+                        .expect("reader delete")
+                        .rows_affected(),
+                );
+            }
+            stamp(&mut conn, &p, w).await;
+            let mut by_writer = Vec::new();
+            for (sql, id) in [(delete_sealed, sealed), (delete_epoch, g)] {
+                by_writer.push(
+                    sqlx::query(sql)
+                        .bind(id)
+                        .execute(&mut *conn)
+                        .await
+                        .expect("writer delete")
+                        .rows_affected(),
+                );
+            }
+            (conn, (seen, by_reader, by_writer))
+        })
+        .await;
+    assert_eq!(seen, 2, "calibration: the reader reads both rows");
+    assert_eq!(by_reader, vec![0, 0], "a reader deletes neither");
+    assert_eq!(by_writer, vec![1, 1], "the group's writer deletes both");
+}
+
 /// The four functions are definers owned by the maintenance role, not
 /// executable by PUBLIC; the two a statement names are executable by the app;
 /// the three tier-A node triggers run the definer body.
