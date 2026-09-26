@@ -449,3 +449,61 @@ async fn an_edge_the_caller_cannot_read_is_not_patched_or_retracted(pool: PgPool
         "calibration: the member's retraction must land"
     );
 }
+
+/// Batch H-b review (authority-attack, medium), measured on config A: an
+/// unrelated `claims:write` caller retired another agent's WORLD-OWNED edge
+/// (both endpoints public) with `patch_edge {valid_to: 2020-01-01}`, while
+/// `delete_edge` is admin-gated. Over HTTP the patch now requires ownership of
+/// the edge's SOURCE claim (its author, the author's operator, or
+/// `claims:admin`). Load-bearing, verified by reverting: without
+/// `require_edge_ownership` the stranger's patch lands and this fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stranger_cannot_patch_another_agents_edge_over_http(pool: PgPool) {
+    let server = common::build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (author, author_token, author_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
+    let (_stranger, stranger_token, stranger_viewer) =
+        common::seed_caller(&pool, &["claims:write"]).await;
+    let source = seed_claim(&pool, "the author's public source", 0.6).await;
+    let target = seed_claim(&pool, "the author's public target", 0.6).await;
+    sqlx::query("UPDATE claims SET agent_id = $1 WHERE id = ANY($2)")
+        .bind(author)
+        .bind(vec![source, target])
+        .execute(&pool)
+        .await
+        .expect("author both endpoints");
+    let edge = seed_edge(
+        &pool,
+        source,
+        target,
+        "decomposes_to",
+        serde_json::json!({}),
+    )
+    .await;
+    let retire = |id: Uuid| PatchEdgeParams {
+        edge_id: id.to_string(),
+        valid_to: Some("2020-01-01T00:00:00Z".to_string()),
+        properties: None,
+    };
+
+    let err = do_patch_edge(
+        &server,
+        &stranger_viewer,
+        retire(edge),
+        Some(&stranger_token),
+    )
+    .await
+    .expect_err("a stranger must not retire another agent's edge over HTTP");
+    assert!(
+        err.message.contains("is asserted by claim"),
+        "{}",
+        err.message
+    );
+    let (_, valid_to) = read_edge(&pool, edge).await.expect("edge row");
+    assert!(valid_to.is_none(), "nothing written");
+
+    do_patch_edge(&server, &author_viewer, retire(edge), Some(&author_token))
+        .await
+        .expect("the source claim's author retires its own edge");
+    let (_, valid_to) = read_edge(&pool, edge).await.expect("edge row");
+    assert!(valid_to.is_some());
+}

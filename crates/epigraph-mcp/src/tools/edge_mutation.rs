@@ -143,6 +143,66 @@ async fn require_visible_edge(
     }
 }
 
+/// OWNERSHIP of the edge on the authenticated transport (batch H-b review).
+///
+/// `patch_edge` needed only `claims:write` and checked no ownership, so a
+/// caller could set `valid_to` in the past on another agent's WORLD-OWNED edge
+/// (both endpoints public), which retires it — measured on config A: an
+/// unrelated attacker's `patch_edge {valid_to: 2020-01-01}` landed on the
+/// victim's `decomposes_to` edge, while `delete_edge` (and
+/// `retire_match_candidate`, the same retraction by `valid_to`) is gated on
+/// `claims:admin`. An edge is asserted by its SOURCE claim's author (the
+/// attribution `retraction_cascade` and the edge-write path use), so over HTTP
+/// the patch requires what `patch_claim` requires of that claim: its author,
+/// the author's operator, or `claims:admin`. An edge whose source is not a
+/// claim has no author to own it and needs `claims:admin`. stdio is unchanged
+/// (the batch H-b bar), as `patch_claim`'s whole-patch check is HTTP-only.
+async fn require_edge_ownership(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
+    edge_id: uuid::Uuid,
+) -> Result<(), McpError> {
+    let Some(token) = auth else {
+        return Ok(());
+    };
+    let (source_type, source_id) = EdgeRepository::source_of(&mut *conn, viewer, edge_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("edge {edge_id} not found")))?;
+    let author = if source_type == "claim" {
+        epigraph_db::ClaimRepository::get_agent_id(&mut *conn, viewer, source_id)
+            .await
+            .map_err(internal_error)?
+    } else {
+        None
+    };
+    match author {
+        Some(author) => {
+            crate::tools::claims::require_owner_or_admin(server, auth, caller, author)
+                .await
+                .map_err(|e| {
+                    invalid_params(format!(
+                        "edge {edge_id} is asserted by claim {source_id}, whose author is agent \
+                         {author}; patching it over HTTP requires that author, its operator, or \
+                         claims:admin ({}). Nothing was written.",
+                        e.message
+                    ))
+                })?;
+        }
+        None if token.has_scope("claims:admin") => {}
+        None => {
+            return Err(invalid_params(format!(
+                "edge {edge_id}'s source is a {source_type} ({source_id}), not a claim you can \
+                 own; patching it over HTTP requires claims:admin. Nothing was written."
+            )))
+        }
+    }
+    Ok(())
+}
+
 /// Core logic factored out so integration tests can call it directly without
 /// round-tripping through the rmcp dispatch layer (mirrors
 /// `do_link_epistemic`).
@@ -192,6 +252,7 @@ pub async fn do_patch_edge(
     let actor_id = actor.agent_id();
     let mut tx = crate::claim_helper::begin_author_stamped_tx(server, actor, "patch_edge").await?;
     require_visible_edge(&mut tx, viewer, edge_id).await?;
+    require_edge_ownership(server, &mut tx, viewer, auth, actor, edge_id).await?;
     let updated = EdgeRepository::update_valid_to_and_properties(
         &mut *tx,
         edge_id,
