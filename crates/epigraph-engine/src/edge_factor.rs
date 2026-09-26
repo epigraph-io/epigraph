@@ -795,6 +795,38 @@ fn warn_on_unknown_evidence_type_keys(
     }
 }
 
+/// Which hypothesis of a frame a claim's belief there is ABOUT, from its stored
+/// `claim_frames.hypothesis_index`: the stored index when it names one of the
+/// frame's `hypothesis_count` hypotheses, otherwise 0.
+///
+/// THE shared rule for every reader of a (claim, frame) BBA set (backlog
+/// 45cbaef4, G6): the cache writer ([`compute_combined_belief`]) and the three
+/// framed readers in `belief_query` (`get_belief`, `get_perspective_belief`,
+/// `get_perspective_belief_batch`). They used to disagree on exactly the rows
+/// this function exists for. The writer clamped as here; the readers did
+/// `unwrap_or(0) as usize`, so a NEGATIVE index wrapped to `usize::MAX` and an
+/// index past the end addressed no hypothesis at all — Bel = Pl = BetP = 0 on
+/// the framed read, beside a cached belief about hypothesis 0.
+///
+/// Why 0 and not "no hypothesis", measured against the frame's semantics: a
+/// frame is an ordered list of mutually exclusive hypotheses addressed by
+/// 0-based index, so an index outside `[0, hypothesis_count)` names nothing.
+/// Reporting Bel = Pl = 0 for it would state "this claim is certainly false"
+/// about a claim whose only defect is a bad pointer — a confident answer
+/// nothing supports. 0 is instead the value every path already uses when the
+/// pointer is ABSENT (no assignment row, or a NULL column), and it is TRUE on
+/// the canonical binary frame, where almost every claim lives. A bad pointer is
+/// treated like a missing one. The column is `integer` with no CHECK
+/// (migration 001), so such rows can exist; `submit_ds_evidence` now warns
+/// when it is asked to store one.
+#[must_use]
+pub fn resolve_hypothesis_index(stored: Option<i32>, hypothesis_count: usize) -> usize {
+    stored
+        .and_then(|i| usize::try_from(i).ok())
+        .filter(|i| *i < hypothesis_count)
+        .unwrap_or(0)
+}
+
 /// Pure compute half of the combine pipeline: load every BBA on (claim,
 /// frame), discount + combine, and derive the resulting Bel/Pl/BetP/
 /// conflict/missing scalars (plus the CDST classification label on the
@@ -905,16 +937,15 @@ async fn compute_combined_belief(
     // cache writer agree with it, so a `recompute_beliefs` can no longer
     // overwrite an axis claim's cache with a belief about index 0.
     //
-    // Missing assignment or NULL index ⇒ 0, matching the read side's
-    // `unwrap_or(0)`.
-    let hypothesis_index =
+    // Resolved by `resolve_hypothesis_index`, the ONE rule every reader of a
+    // BBA shares (backlog 45cbaef4): see its doc for why.
+    let hypothesis_index = resolve_hypothesis_index(
         FrameRepository::get_claim_assignment(&mut *conn, viewer, claim_id, frame_id)
             .await
             .map_err(|e| format!("get_claim_assignment: {e}"))?
-            .and_then(|a| a.hypothesis_index)
-            .and_then(|i| usize::try_from(i).ok())
-            .filter(|i| *i < frame.hypothesis_count())
-            .unwrap_or(0);
+            .and_then(|a| a.hypothesis_index),
+        frame.hypothesis_count(),
+    );
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
     let bel = measures::belief(&combined, &target);

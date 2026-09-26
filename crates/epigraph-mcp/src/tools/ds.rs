@@ -132,6 +132,31 @@ pub async fn submit_ds_evidence(
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;
 
+    // Backlog 45cbaef4 (G6): an index that names none of the frame's
+    // hypotheses is stored as given (the column is an unconstrained integer, and
+    // refusing would change a call that used to succeed), but every belief
+    // reader resolves it to 0 through `edge_factor::resolve_hypothesis_index`.
+    // Say so rather than let the caller believe it addressed that hypothesis.
+    let resolved_index = epigraph_engine::edge_factor::resolve_hypothesis_index(
+        Some(params.hypothesis_index),
+        frame.hypothesis_count(),
+    );
+    if usize::try_from(params.hypothesis_index).ok() != Some(resolved_index) {
+        warnings.push(format!(
+            "hypothesis_index={} names none of this frame's {} hypotheses (valid: 0..={}); it \
+             was stored as given, but every belief read, including the belief returned here, \
+             is about hypothesis 0 ({:?}).",
+            params.hypothesis_index,
+            frame.hypothesis_count(),
+            frame.hypothesis_count().saturating_sub(1),
+            frame_row
+                .hypotheses
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ));
+    }
+
     // Parse the mass function. Reliability handling forks on whether the
     // caller opted into calibrated per-source-class discounting:
     //
@@ -307,11 +332,18 @@ pub async fn submit_ds_evidence(
     // same BBA rows, two different answers. Delegating here makes the two
     // tools compute identically by construction.
     //
-    // `params.combination_method`, `params.gamma`, and `params.hypothesis_index`
-    // no longer influence the stored/returned belief: the shared recompute
-    // path always resolves method adaptively (via `combine_multiple`) and
-    // targets hypothesis index 0 (the canonical binary_truth convention).
-    // This is the accepted consequence of unification, not a follow-up bug.
+    // `params.combination_method` and `params.gamma` do not influence the
+    // stored/returned belief: the shared recompute always resolves the method
+    // adaptively (via `combine_multiple`). This is the accepted consequence of
+    // unification; both are deprecated and warned about (backlog 82dcff9d).
+    //
+    // `params.hypothesis_index` DOES: it is stored in `claim_frames` just above,
+    // and the recompute's `edge_factor::resolve_hypothesis_index` reads it back,
+    // as every framed belief read does (backlog 45cbaef4). A value outside the
+    // frame is stored as given but read as 0 by all of them; see the warning
+    // pushed where the frame is loaded. (This comment used to say the recompute
+    // always targets index 0. It has not since the cache writer started reading
+    // the stored index.)
     //
     // IT RUNS INSIDE THE SAME TRANSACTION, and the commit moved below it. Its
     // `UPDATE claims SET belief/plausibility/pignistic_prob` is where

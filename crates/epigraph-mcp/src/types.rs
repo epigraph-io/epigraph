@@ -1018,7 +1018,13 @@ pub struct SubmitDsEvidenceParams {
     #[schemars(description = "UUID of the frame of discernment")]
     pub frame_id: String,
 
-    #[schemars(description = "0-based index of the hypothesis this claim represents in the frame")]
+    #[schemars(
+        description = "0-based index of the hypothesis this claim represents in the frame. It is \
+                       stored on the claim's frame assignment and decides which hypothesis the \
+                       returned belief (and every later framed or cached belief read) is about. \
+                       An index outside the frame's hypotheses is stored as given, but every \
+                       reader treats it as 0, and the response's warnings say so."
+    )]
     pub hypothesis_index: i32,
 
     // `with` pins the advertised schema to `{"type":"object",
