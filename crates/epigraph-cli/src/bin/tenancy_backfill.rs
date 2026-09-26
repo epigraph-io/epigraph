@@ -1039,6 +1039,20 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_operates_agents", 107),
     ("epigraph_link_operator", 107),
     ("epigraph_link_retired_agent", 107),
+    // 114, writer-owned derived rows. All fail CLOSED under a non-member owner:
+    // `epigraph_writer_group` reads no operator link and no personal group
+    // (the attach trigger then leaves the row to 074 and 077 refuses it, as
+    // before 114), and the aggregate definers' `claims` / `claim_frames` /
+    // `security_events` writes are refused by the tenancy policies. The stake is
+    // a non-owner's attachment silently refused again, which a green pre-flight
+    // must not hide.
+    ("epigraph_writer_group", 114),
+    ("epigraph_foreign_aggregate_target", 114),
+    ("epigraph_foreign_aggregate_audit", 114),
+    ("epigraph_foreign_claim_frame", 114),
+    ("epigraph_foreign_belief_cache", 114),
+    ("epigraph_foreign_claim_classification", 114),
+    ("epigraph_foreign_belief_clear", 114),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

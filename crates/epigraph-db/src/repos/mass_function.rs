@@ -499,6 +499,17 @@ impl MassFunctionRepository {
     ///
     /// Returns the number of rows cleared: 0 or 1.
     ///
+    /// # A non-owner on a public claim (migration 114)
+    ///
+    /// These cache columns live on the CLAIM row, which a non-owner cannot
+    /// write. When the session is not privileged, can read the claim, the claim
+    /// is public and its owner is not writable
+    /// ([`crate::repos::foreign_attach`]), the SAME statement writes through
+    /// migration 114's audited `epigraph_foreign_*` definer instead: it touches
+    /// only the DS cache (never `truth_value`, `labels` or `content`) and writes
+    /// a `claims.foreign_aggregate_write` audit event. Every other session runs
+    /// the UPDATE below exactly as before.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor))]
@@ -506,22 +517,34 @@ impl MassFunctionRepository {
         executor: E,
         claim_id: Uuid,
     ) -> Result<u64, DbError> {
-        let result = sqlx::query(
+        let sql = format!(
             r#"
-            UPDATE claims
-            SET belief = NULL, plausibility = NULL, mass_on_empty = NULL,
-                pignistic_prob = NULL, mass_on_missing = NULL,
-                classification = NULL, updated_at = NOW()
-            WHERE id = $1
-              AND (belief IS NOT NULL OR plausibility IS NOT NULL
-                   OR pignistic_prob IS NOT NULL OR classification IS NOT NULL)
+            WITH acc AS (SELECT {foreign} AS foreign_public),
+            own AS (
+                UPDATE claims
+                SET belief = NULL, plausibility = NULL, mass_on_empty = NULL,
+                    pignistic_prob = NULL, mass_on_missing = NULL,
+                    classification = NULL, updated_at = NOW()
+                WHERE id = $1
+                  AND NOT (SELECT foreign_public FROM acc)
+                  AND (belief IS NOT NULL OR plausibility IS NOT NULL
+                       OR pignistic_prob IS NOT NULL OR classification IS NOT NULL)
+                RETURNING 1
+            )
+            SELECT CASE WHEN acc.foreign_public
+                        THEN public.epigraph_foreign_belief_clear($1)::bigint
+                        ELSE (SELECT count(*) FROM own)
+                   END
+              FROM acc
             "#,
-        )
-        .bind(claim_id)
-        .execute(executor)
-        .await?;
+            foreign = crate::repos::foreign_attach::foreign_public_claim("$1"),
+        );
+        let cleared: i64 = sqlx::query_scalar(&sql)
+            .bind(claim_id)
+            .fetch_one(executor)
+            .await?;
 
-        Ok(result.rows_affected())
+        Ok(u64::try_from(cleared).unwrap_or(0))
     }
 
     /// Update a claim's belief, plausibility, and pignistic probability columns
@@ -532,6 +555,17 @@ impl MassFunctionRepository {
     /// drift accumulated upstream cannot trip the
     /// `claims_{belief,plausibility,mass_on_empty,mass_on_missing,pignistic_prob}_bounds`
     /// CHECK constraints.
+    ///
+    /// # A non-owner on a public claim (migration 114)
+    ///
+    /// These cache columns live on the CLAIM row, which a non-owner cannot
+    /// write. When the session is not privileged, can read the claim, the claim
+    /// is public and its owner is not writable
+    /// ([`crate::repos::foreign_attach`]), the SAME statement writes through
+    /// migration 114's audited `epigraph_foreign_*` definer instead: it touches
+    /// only the DS cache (never `truth_value`, `labels` or `content`) and writes
+    /// a `claims.foreign_aggregate_write` audit event. Every other session runs
+    /// the UPDATE below exactly as before.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -554,24 +588,35 @@ impl MassFunctionRepository {
                 cached.mass_on_missing,
             );
 
-        sqlx::query(
+        let sql = format!(
             r#"
-            UPDATE claims
-            SET belief = $1, plausibility = $2, mass_on_empty = $3,
-                pignistic_prob = $4, mass_on_missing = $5, belief_frame_id = $7,
-                updated_at = NOW()
-            WHERE id = $6
+            WITH acc AS (SELECT {foreign} AS foreign_public),
+            own AS (
+                UPDATE claims
+                SET belief = $1, plausibility = $2, mass_on_empty = $3,
+                    pignistic_prob = $4, mass_on_missing = $5, belief_frame_id = $7,
+                    updated_at = NOW()
+                WHERE id = $6
+                  AND NOT (SELECT foreign_public FROM acc)
+                RETURNING 1
+            )
+            SELECT CASE WHEN acc.foreign_public
+                        THEN public.epigraph_foreign_belief_cache($6, $1, $2, $3, $4, $5, $7)
+                   END
+              FROM acc
             "#,
-        )
-        .bind(belief)
-        .bind(plausibility)
-        .bind(mass_on_empty)
-        .bind(pignistic_prob)
-        .bind(mass_on_missing)
-        .bind(claim_id)
-        .bind(cached.belief_frame_id)
-        .execute(executor)
-        .await?;
+            foreign = crate::repos::foreign_attach::foreign_public_claim("$6"),
+        );
+        sqlx::query(&sql)
+            .bind(belief)
+            .bind(plausibility)
+            .bind(mass_on_empty)
+            .bind(pignistic_prob)
+            .bind(mass_on_missing)
+            .bind(claim_id)
+            .bind(cached.belief_frame_id)
+            .execute(executor)
+            .await?;
 
         Ok(())
     }
@@ -588,6 +633,17 @@ impl MassFunctionRepository {
     /// The extra UPDATE lands on the recompute (maintenance) path, not an
     /// online read path.
     ///
+    /// # A non-owner on a public claim (migration 114)
+    ///
+    /// These cache columns live on the CLAIM row, which a non-owner cannot
+    /// write. When the session is not privileged, can read the claim, the claim
+    /// is public and its owner is not writable
+    /// ([`crate::repos::foreign_attach`]), the SAME statement writes through
+    /// migration 114's audited `epigraph_foreign_*` definer instead: it touches
+    /// only the DS cache (never `truth_value`, `labels` or `content`) and writes
+    /// a `claims.foreign_aggregate_write` audit event. Every other session runs
+    /// the UPDATE below exactly as before.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor))]
@@ -596,7 +652,22 @@ impl MassFunctionRepository {
         claim_id: Uuid,
         classification: &str,
     ) -> Result<(), DbError> {
-        sqlx::query("UPDATE claims SET classification = $1, updated_at = NOW() WHERE id = $2")
+        let sql = format!(
+            r#"
+            WITH acc AS (SELECT {foreign} AS foreign_public),
+            own AS (
+                UPDATE claims SET classification = $1, updated_at = NOW()
+                WHERE id = $2 AND NOT (SELECT foreign_public FROM acc)
+                RETURNING 1
+            )
+            SELECT CASE WHEN acc.foreign_public
+                        THEN public.epigraph_foreign_claim_classification($2, $1)
+                   END
+              FROM acc
+            "#,
+            foreign = crate::repos::foreign_attach::foreign_public_claim("$2"),
+        );
+        sqlx::query(&sql)
             .bind(classification)
             .bind(claim_id)
             .execute(executor)
