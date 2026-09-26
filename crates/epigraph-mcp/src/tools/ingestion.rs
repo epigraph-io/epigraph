@@ -398,10 +398,11 @@ pub async fn paper_already_ingested(
 /// actually save extraction cost on re-runs, callers must invoke this tool
 /// first and skip their own LLM call when `already_ingested` is true.
 ///
-/// Defaults to [`PIPELINE_VERSION_BASE`] (the whole-document stamp) when the
-/// caller omits `pipeline_version`, mirroring the gate that runs for a paper
-/// ingested whole; per-chapter chunked ingests carry a `:ch{n}` suffix and
-/// must pass the exact stamp to gate a single chunk.
+/// When the caller omits `pipeline_version`, matches the whole
+/// [`PIPELINE_VERSION_BASE`] family — the whole-document stamp and every
+/// per-chapter `:ch{n}` stamp [`effective_pipeline_version`] writes — and
+/// reports which stamps were found. An explicit `pipeline_version` is matched
+/// exactly, which is how a caller gates a single chunk.
 pub async fn check_already_ingested(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -418,16 +419,47 @@ pub async fn check_already_ingested(
             params.doi
         )));
     }
-    let pipeline = params
-        .pipeline_version
-        .unwrap_or_else(|| PIPELINE_VERSION_BASE.to_string());
-    let paper_id = paper_already_ingested(&server.pool, viewer, &params.doi, &pipeline).await?;
+    // An explicit `pipeline_version` is matched EXACTLY — that is how a caller
+    // gates one chunk (`...:ch3`). An omitted one used to default to the bare
+    // base stamp, which a chunked ingest never writes (it stamps `base:ch{n}`
+    // via `effective_pipeline_version`), so a textbook ingested chapter by
+    // chapter read as never ingested (backlog 02653c4a, G8). The default now
+    // matches the whole family the ingest tools actually write: the base stamp
+    // and every `base:ch{n}`. The ingest-side gate (`paper_already_ingested`)
+    // is untouched and stays exact.
+    let (pipeline, paper_id, matched) = match params.pipeline_version {
+        Some(exact) => {
+            let paper_id =
+                paper_already_ingested(&server.pool, viewer, &params.doi, &exact).await?;
+            let matched = paper_id.map(|_| vec![exact.clone()]).unwrap_or_default();
+            (exact, paper_id, matched)
+        }
+        None => {
+            let paper = PaperRepository::find_by_doi(&server.pool, &params.doi)
+                .await
+                .map_err(internal_error)?;
+            let matched = match &paper {
+                Some(p) => PaperRepository::processed_by_pipelines_in_family(
+                    &server.pool,
+                    viewer,
+                    p.id,
+                    PIPELINE_VERSION_BASE,
+                )
+                .await
+                .map_err(internal_error)?,
+                None => Vec::new(),
+            };
+            let paper_id = paper.filter(|_| !matched.is_empty()).map(|p| p.id);
+            (PIPELINE_VERSION_BASE.to_string(), paper_id, matched)
+        }
+    };
 
     success_json(&CheckAlreadyIngestedResponse {
         already_ingested: paper_id.is_some(),
         paper_id: paper_id.map(|id| id.to_string()),
         doi: params.doi,
         pipeline_version: pipeline,
+        matched_pipeline_versions: matched,
     })
 }
 

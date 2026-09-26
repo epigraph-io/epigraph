@@ -1124,7 +1124,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Check whether a paper has been ingested (has a processed_by edge). Returns {already_ingested, paper_id?, doi, pipeline_version}. Useful as a quick pre-flight read before calling ingest_document_spine. Note: with node-level dedup, already_ingested=true means the spine was previously run — it does NOT mean all atoms are present. Use ingest_document_spine to discover which paragraphs are new. The edge persists, so it cannot confirm a background ingest_document / ingest_document_inline of a document that was ingested or spine-ingested before; use query_paper's claim_count for that. Read-only."
+        description = "Check whether a paper has been ingested (has a processed_by edge). Returns {already_ingested, paper_id?, doi, pipeline_version, matched_pipeline_versions}. With pipeline_version omitted it matches the current pipeline's whole-document stamp AND every per-chapter ':ch{n}' stamp a chunked ingest writes, so a document ingested chapter by chapter reads as ingested, and matched_pipeline_versions says which stamps exist; pass an exact pipeline_version (e.g. 'hierarchical_extraction_v2:ch3') to check one chunk. Useful as a quick pre-flight read before calling ingest_document_spine. Note: with node-level dedup, already_ingested=true means the spine was previously run — it does NOT mean all atoms are present. Use ingest_document_spine to discover which paragraphs are new. The edge persists, so it cannot confirm a background ingest_document / ingest_document_inline of a document that was ingested or spine-ingested before; use query_paper's claim_count for that. Read-only."
     )]
     async fn check_already_ingested(
         &self,

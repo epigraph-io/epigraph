@@ -2087,7 +2087,13 @@ pub struct CheckAlreadyIngestedParams {
     )]
     pub doi: String,
     #[schemars(
-        description = "Pipeline version. Omit to use the current hierarchical extraction pipeline."
+        description = "Pipeline version stamp, matched EXACTLY when given (e.g. \
+                       'hierarchical_extraction_v2:ch3' to check one chapter of a chunked ingest). \
+                       Omit to match the current hierarchical extraction pipeline's whole family: \
+                       the whole-document stamp 'hierarchical_extraction_v2' AND every per-chapter \
+                       'hierarchical_extraction_v2:ch{n}' stamp a chunked ingest writes, so a \
+                       document ingested chapter by chapter reads as ingested. \
+                       matched_pipeline_versions lists which stamps were found."
     )]
     pub pipeline_version: Option<String>,
 }
@@ -2098,7 +2104,13 @@ pub struct CheckAlreadyIngestedResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paper_id: Option<String>,
     pub doi: String,
+    /// The stamp requested, or the base stamp when the caller omitted it.
     pub pipeline_version: String,
+    /// The `processed_by` stamps actually found: the one exact stamp for an
+    /// explicit `pipeline_version`, or every stamp in the base family
+    /// (`base` and `base:ch{n}`, sorted) when it was omitted. Empty when not
+    /// ingested (backlog 02653c4a).
+    pub matched_pipeline_versions: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

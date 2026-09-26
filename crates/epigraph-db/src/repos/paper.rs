@@ -121,6 +121,54 @@ impl PaperRepository {
         Ok(row.is_some())
     }
 
+    /// Every pipeline stamp in the `base` FAMILY that a visible `processed_by`
+    /// edge from `paper_id` carries: `base` itself and each chunked
+    /// `base:ch{n}` stamp, sorted.
+    ///
+    /// Backlog 02653c4a (G8). The ingest tools stamp `processed_by` with
+    /// `ingestion.rs::effective_pipeline_version`, which appends `:ch{n}` for a
+    /// chunked (per-chapter) ingest. A pre-flight that asks only for the bare
+    /// `base` stamp therefore reported `already_ingested: false` for a document
+    /// ingested chapter by chapter. This is the read that answers "has ANY
+    /// ingest of this document at this pipeline landed, and which?".
+    ///
+    /// Deliberately NOT a replacement for [`Self::has_processed_by_edge`]: the
+    /// ingest gates must stay exact-stamp, or chapter 1's edge would block
+    /// chapter 2, which is the regression the `:ch{n}` suffix exists to prevent.
+    ///
+    /// `starts_with`, not `LIKE`: the stamp contains `_`, a `LIKE` wildcard.
+    /// Edge visibility is the co-owner-aware `EDGE_VISIBILITY` predicate.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn processed_by_pipelines_in_family<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+        base: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT DISTINCT e.properties ->> 'pipeline' AS pipeline \
+             FROM edges e \
+             WHERE e.source_id = $1 \
+               AND e.source_type = 'paper' \
+               AND e.relationship = 'processed_by' \
+               AND (e.properties ->> 'pipeline' = $2 \
+                    OR starts_with(e.properties ->> 'pipeline', $2 || ':ch')) \
+               /* {EDGE_VISIBILITY:e} */ \
+             ORDER BY 1",
+            3,
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql)
+            .bind(paper_id)
+            .bind(base);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// Count the claims this paper asserts (`paper -asserts-> claim` edges).
     ///
     /// This alone under-counts a partially-ingested paper: `do_ingest_document`
