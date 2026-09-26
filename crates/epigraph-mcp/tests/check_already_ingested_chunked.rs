@@ -146,3 +146,63 @@ async fn the_default_still_sees_a_whole_document_ingest_and_not_a_missing_one(po
     );
     assert_eq!(whole["pipeline_version"], "hierarchical_extraction_v2");
 }
+
+/// G8 review: the second chunk of a chunked ingest must record its OWN stamp.
+///
+/// Both `processed_by` writers deduplicated on the `(paper, agent,
+/// processed_by)` triple, so chapter 3's stamp was never written once chapter
+/// 1's existed. The paper then read `[":ch1"]` for ever, and an explicit
+/// `:ch3` check answered false for an ingested chapter. This drives two real
+/// chapters through `do_ingest_document` and asserts both stamps exist, that a
+/// re-run of a chapter adds no duplicate, and that an un-ingested chapter
+/// still reads false.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_chunk_of_a_chunked_ingest_records_its_own_stamp(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let doi = "10.1234/g8-two-chapters";
+
+    for chapter in [1, 3, 3] {
+        do_ingest_document(&server, &viewer, &document(doi, Some(chapter)))
+            .await
+            .unwrap_or_else(|e| panic!("chapter {chapter} ingest: {e:?}"));
+    }
+
+    let default = check(&server, &viewer, doi, None).await;
+    assert_eq!(default["already_ingested"], true, "{default}");
+    assert_eq!(
+        default["matched_pipeline_versions"],
+        serde_json::json!([
+            "hierarchical_extraction_v2:ch1",
+            "hierarchical_extraction_v2:ch3"
+        ]),
+        "each chunk must write its own stamp: {default}"
+    );
+
+    for (stamp, expected) in [
+        ("hierarchical_extraction_v2:ch1", true),
+        ("hierarchical_extraction_v2:ch3", true),
+        ("hierarchical_extraction_v2:ch2", false),
+    ] {
+        let got = check(&server, &viewer, doi, Some(stamp)).await;
+        assert_eq!(got["already_ingested"], expected, "{stamp}: {got}");
+    }
+
+    // The re-run of chapter 3 wrote no second edge: one edge per stamp.
+    let stamps: Vec<String> = sqlx::query_scalar(
+        "SELECT e.properties ->> 'pipeline' FROM edges e JOIN papers p ON p.id = e.source_id \
+         WHERE p.doi = $1 AND e.relationship = 'processed_by' ORDER BY 1",
+    )
+    .bind(doi)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stamps,
+        vec![
+            "hierarchical_extraction_v2:ch1".to_string(),
+            "hierarchical_extraction_v2:ch3".to_string()
+        ],
+        "one processed_by edge per stamp"
+    );
+}

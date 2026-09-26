@@ -132,9 +132,12 @@ impl PaperRepository {
     /// ingested chapter by chapter. This is the read that answers "has ANY
     /// ingest of this document at this pipeline landed, and which?".
     ///
-    /// Deliberately NOT a replacement for [`Self::has_processed_by_edge`]: the
-    /// ingest gates must stay exact-stamp, or chapter 1's edge would block
-    /// chapter 2, which is the regression the `:ch{n}` suffix exists to prevent.
+    /// Deliberately NOT a replacement for [`Self::has_processed_by_edge`]: an
+    /// exact-stamp check is how a caller asks about ONE chunk, and a family
+    /// match would let chapter 1's stamp answer for chapter 2. Each chunk
+    /// writes its own stamp
+    /// ([`crate::EdgeRepository::create_processed_by_stamp_if_absent_conn`]),
+    /// so both reads see every chunk that landed.
     ///
     /// `starts_with`, not `LIKE`: the stamp contains `_`, a `LIKE` wildcard.
     /// Edge visibility is the co-owner-aware `EDGE_VISIBILITY` predicate.

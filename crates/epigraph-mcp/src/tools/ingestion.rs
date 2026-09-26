@@ -129,15 +129,17 @@ pub async fn structure_source(
 
 const PIPELINE_VERSION_BASE: &str = "hierarchical_extraction_v2";
 
-/// Pipeline version stamp used by the `processed_by` edge and the version gate.
+/// Pipeline version stamp written on the paper's `processed_by` edge and read
+/// by `check_already_ingested`.
 ///
-/// For documents ingested whole (papers), this is just `PIPELINE_VERSION_BASE`
-/// so re-ingesting the same paper short-circuits as before. For chunked
-/// ingests where many `DocumentExtraction`s share one paper row (e.g. a
-/// textbook ingested chapter-by-chapter), `source.metadata.chapter_index` is
-/// appended so each chunk is gated independently — without it, the first
-/// chunk's `processed_by` edge would block every subsequent chunk for the
-/// same paper.
+/// For documents ingested whole (papers), this is just `PIPELINE_VERSION_BASE`.
+/// For chunked ingests where many `DocumentExtraction`s share one paper row
+/// (e.g. a textbook ingested chapter-by-chapter), `source.metadata.chapter_index`
+/// is appended (`...:ch{n}`), and
+/// `EdgeRepository::create_processed_by_stamp_if_absent_conn` keys its dedup on
+/// the stamp, so each chunk records its own `processed_by` edge and
+/// `check_already_ingested` can answer for one chunk. The ingest tools do not
+/// short-circuit on the stamp: node-level dedup makes a re-run safe.
 fn effective_pipeline_version(extraction: &DocumentExtraction) -> String {
     extraction
         .source
@@ -401,8 +403,11 @@ pub async fn paper_already_ingested(
 /// When the caller omits `pipeline_version`, matches the whole
 /// [`PIPELINE_VERSION_BASE`] family — the whole-document stamp and every
 /// per-chapter `:ch{n}` stamp [`effective_pipeline_version`] writes — and
-/// reports which stamps were found. An explicit `pipeline_version` is matched
-/// exactly, which is how a caller gates a single chunk.
+/// reports which stamps were found. A default-mode `true` therefore means AT
+/// LEAST ONE stamp in the family exists, not that every chunk landed. An
+/// explicit `pipeline_version` is matched exactly, which is how a caller gates
+/// a single chunk: each chunk writes its own stamp
+/// (`EdgeRepository::create_processed_by_stamp_if_absent_conn`).
 pub async fn check_already_ingested(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -425,8 +430,9 @@ pub async fn check_already_ingested(
     // via `effective_pipeline_version`), so a textbook ingested chapter by
     // chapter read as never ingested (backlog 02653c4a, G8). The default now
     // matches the whole family the ingest tools actually write: the base stamp
-    // and every `base:ch{n}`. The ingest-side gate (`paper_already_ingested`)
-    // is untouched and stays exact.
+    // and every `base:ch{n}`. The explicit arm stays exact, and it is reliable
+    // for every chunk only because each chunk now writes its own stamp (G8
+    // review: the triple-keyed writer kept only the first chunk's).
     let (pipeline, paper_id, matched) = match params.pipeline_version {
         Some(exact) => {
             let paper_id =
@@ -1124,26 +1130,23 @@ pub async fn do_ingest_document(
     }
 
     // ── 5b. Mark paper as processed by this pipeline — INSIDE the walk ──
-    // Idempotent: first ingest stamps the edge; re-runs (full paper after
-    // abstract, or ingest_document_spine + ingest_document_inline) are safe.
+    // Idempotent PER STAMP: the first ingest at a given `pipeline_version`
+    // stamps the edge and re-runs at that version (full paper after abstract,
+    // or ingest_document_spine + ingest_document_inline) write none, while each
+    // chunk of a chunked ingest (`...:ch{n}`) writes its own. Deduplicating on
+    // the (paper, agent, processed_by) triple alone kept only the FIRST chunk's
+    // stamp (G8 review).
     //
     // In the same transaction as the claims on purpose: `processed_by` is what
     // `check_already_ingested` reports, and this path runs DETACHED, so that
     // edge is the caller's only way to learn whether the queued ingest landed.
     // Written with the walk, it exists if and only if the walk committed.
-    let (_row, _was_created) = EdgeRepository::create_if_not_exists_conn(
+    EdgeRepository::create_processed_by_stamp_if_absent_conn(
         &mut tx,
         paper_id,
-        "paper",
         agent_id,
-        "agent",
-        "processed_by",
-        Some(serde_json::json!({
-            "pipeline": pipeline_version,
-            "tool": "ingest_document",
-        })),
-        None,
-        None,
+        &pipeline_version,
+        "ingest_document",
     )
     .await
     .map_err(internal_error)?;
@@ -1924,20 +1927,13 @@ pub async fn do_ingest_document_spine(
         .map_err(internal_error)?;
     }
 
-    // ── 5. processed_by edge (idempotent; first spine call stamps the pipeline) ──
-    let (_row, _) = EdgeRepository::create_if_not_exists_conn(
+    // ── 5. processed_by edge (idempotent per pipeline stamp; each :ch{n} chunk gets its own) ──
+    EdgeRepository::create_processed_by_stamp_if_absent_conn(
         &mut tx,
         paper_id,
-        "paper",
         agent_id,
-        "agent",
-        "processed_by",
-        Some(serde_json::json!({
-            "pipeline": pipeline_version,
-            "tool": "ingest_document_spine",
-        })),
-        None,
-        None,
+        &pipeline_version,
+        "ingest_document_spine",
     )
     .await
     .map_err(internal_error)?;
