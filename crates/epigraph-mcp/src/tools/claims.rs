@@ -167,6 +167,79 @@ pub(crate) async fn submit_claim_response(
     finish_submission(server, viewer, sub, written, "submit_claim").await
 }
 
+/// The `deduplicated` block for a `submit_claim` answered with an existing
+/// claim (backlog a3e63a12). Each list is what the path in question ACTUALLY
+/// does with the input, read off the code below, not what one might expect:
+///
+/// * [`DedupBy::NoveltyGate`] — `prepare_submission` returns before any
+///   transaction opens. Nothing of this call is written: not its wording, not
+///   its labels, not an evidence row, not a trace.
+/// * [`DedupBy::ContentHash`] — `write_submission` still runs in full on the
+///   existing claim: `update_labels_conn` UNIONS the labels in; a new Evidence
+///   row (evidence_data, evidence_type, and source_url serialized into the
+///   evidence type) and a new ReasoningTrace (methodology, reasoning,
+///   confidence) are written and linked by DERIVED_FROM / HAS_TRACE edges. The
+///   trace becomes the claim's canonical trace only if it had none. The DS
+///   auto-wire is skipped (`was_created` is false), so none of it moves the
+///   existing belief. `novelty_threshold` is never consulted: the exact-content
+///   pre-check skips the gate. `source_url` is written nowhere for `empirical`
+///   evidence, whose evidence type has no URL slot (`parse_evidence_type`) —
+///   true of a fresh insert as well.
+///
+/// Only supplied inputs are listed; see `types::Deduplicated`. On a
+/// novelty-gate hit `novelty_threshold` is the input that DECIDED the hit, so
+/// it is listed in neither.
+fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams) -> Deduplicated {
+    let mut applied: Vec<&'static str> = Vec::new();
+    let mut discarded: Vec<&'static str> = Vec::new();
+    let url_has_a_slot = !params.evidence_type.eq_ignore_ascii_case("empirical");
+    match by {
+        DedupBy::NoveltyGate => {
+            discarded.extend(["content", "methodology", "evidence_data", "evidence_type"]);
+            discarded.push("confidence");
+            if params.source_url.is_some() {
+                discarded.push("source_url");
+            }
+            if params.reasoning.is_some() {
+                discarded.push("reasoning");
+            }
+            if !params.labels.is_empty() {
+                discarded.push("labels");
+            }
+        }
+        DedupBy::ContentHash => {
+            applied.extend([
+                "methodology",
+                "evidence_data",
+                "evidence_type",
+                "confidence",
+            ]);
+            if params.source_url.is_some() {
+                if url_has_a_slot {
+                    applied.push("source_url");
+                } else {
+                    discarded.push("source_url");
+                }
+            }
+            if params.reasoning.is_some() {
+                applied.push("reasoning");
+            }
+            if !params.labels.is_empty() {
+                applied.push("labels");
+            }
+            if params.novelty_threshold.is_some() {
+                discarded.push("novelty_threshold");
+            }
+        }
+    }
+    Deduplicated {
+        by,
+        existing_claim_id: existing_claim_id.to_string(),
+        inputs_applied: applied,
+        inputs_discarded: discarded,
+    }
+}
+
 /// What [`prepare_submission`] decided.
 enum PreparedSubmission {
     /// The novelty gate matched an existing claim: this is the response, and
@@ -331,6 +404,9 @@ async fn prepare_submission(
                         plausibility: None,
                         pignistic_prob: None,
                         frame_id: None,
+                        // The caller is TOLD this is not an insert, and that
+                        // every input it sent was dropped (backlog a3e63a12).
+                        deduplicated: Some(dedup_block(DedupBy::NoveltyGate, existing_id, &params)),
                     },
                 )));
             }
@@ -679,6 +755,11 @@ async fn finish_submission(
         plausibility: ds.as_ref().map(|d| d.plausibility),
         pignistic_prob: ds.as_ref().map(|d| d.pignistic_prob),
         frame_id: ds.as_ref().map(|d| d.frame_id.to_string()),
+        // `was_created` from the idempotent create, not the read-only
+        // pre-check: it is what decided whether DS ran, and it also covers a
+        // concurrent writer landing the same content between the two.
+        deduplicated: (!was_created)
+            .then(|| dedup_block(DedupBy::ContentHash, claim_uuid, &params)),
     })
 }
 
@@ -2025,6 +2106,71 @@ pub async fn query_undecomposed_claims(
         .collect();
 
     success_json(&results)
+}
+
+#[cfg(test)]
+mod dedup_block_tests {
+    //! The novelty-gate arm of `dedup_block` cannot be reached through
+    //! `EpiGraphMcpFull` in a test process (its embedder hard-codes OpenAI; see
+    //! `tests/novelty_gate_test.rs`), so its list is pinned here. The
+    //! content-hash arm is additionally measured end-to-end in
+    //! `tests/dedup_response_signal.rs`.
+    use super::dedup_block;
+    use crate::types::{DedupBy, SubmitClaimParams};
+
+    fn params() -> SubmitClaimParams {
+        SubmitClaimParams {
+            content: "c".into(),
+            methodology: "direct_observation".into(),
+            evidence_data: "e".into(),
+            evidence_type: "logical".into(),
+            confidence: 0.5,
+            source_url: Some("u".into()),
+            reasoning: Some("r".into()),
+            labels: vec!["l".into()],
+            novelty_threshold: Some(0.1),
+        }
+    }
+
+    #[test]
+    fn a_novelty_gate_hit_discards_every_supplied_input() {
+        let d = dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &params());
+        assert!(d.inputs_applied.is_empty(), "{d:?}");
+        for want in [
+            "content",
+            "methodology",
+            "evidence_data",
+            "evidence_type",
+            "confidence",
+            "source_url",
+            "reasoning",
+            "labels",
+        ] {
+            assert!(d.inputs_discarded.contains(&want), "{want}: {d:?}");
+        }
+        assert!(
+            !d.inputs_discarded.contains(&"novelty_threshold"),
+            "the threshold decided the hit; it was not discarded: {d:?}"
+        );
+    }
+
+    #[test]
+    fn unsupplied_inputs_are_listed_nowhere() {
+        let mut p = params();
+        p.source_url = None;
+        p.reasoning = None;
+        p.labels.clear();
+        p.novelty_threshold = None;
+        for by in [DedupBy::NoveltyGate, DedupBy::ContentHash] {
+            let d = dedup_block(by, uuid::Uuid::nil(), &p);
+            for absent in ["source_url", "reasoning", "labels", "novelty_threshold"] {
+                assert!(
+                    !d.inputs_applied.contains(&absent) && !d.inputs_discarded.contains(&absent),
+                    "{absent} listed for {by:?}: {d:?}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

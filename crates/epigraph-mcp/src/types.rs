@@ -139,7 +139,7 @@ pub struct SubmitClaimParams {
     pub labels: Vec<String>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -467,7 +467,7 @@ pub struct MemorizeParams {
     pub tags: Option<Vec<String>>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -1191,6 +1191,49 @@ pub struct SubmitClaimResponse {
     pub pignistic_prob: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_id: Option<String>,
+    /// Present ONLY when this call created nothing new because the claim
+    /// already existed. Absent on a fresh insert. See [`Deduplicated`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deduplicated: Option<Deduplicated>,
+}
+
+/// Which dedup path answered a write with an EXISTING claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupBy {
+    /// Byte-identical content already stored by this server's agent
+    /// (`UNIQUE (content_hash, agent_id)`).
+    ContentHash,
+    /// The write-side semantic novelty gate found an existing current claim
+    /// within `novelty_threshold` cosine distance. That claim may belong to
+    /// ANOTHER agent, and nothing from this call was written.
+    NoveltyGate,
+}
+
+/// The `deduplicated` block on a `submit_claim` / `memorize` /
+/// `batch_submit_claims` response (backlog a3e63a12).
+///
+/// Before this block a dedup hit was byte-for-byte indistinguishable from a
+/// fresh insert, so a caller could not tell what had become of its inputs. The
+/// two lists are MEASURED per path from the code that runs on it, not assumed:
+/// `tools::claims::dedup_block` and `tools::memory::memorize_dedup_block` decide
+/// them. Only inputs the caller actually supplied are listed (an absent
+/// `source_url`, `reasoning` or `novelty_threshold`, or empty `labels`/`tags`,
+/// appear in neither list).
+///
+/// On EVERY dedup hit the existing claim's belief and truth_value are left
+/// unchanged: this call's confidence and evidence are never combined into the
+/// existing claim's belief, whichever list names them.
+#[derive(Debug, Clone, Serialize)]
+pub struct Deduplicated {
+    pub by: DedupBy,
+    /// The claim this call was answered with (always equal to `claim_id`).
+    pub existing_claim_id: String,
+    /// Inputs of this call that WERE recorded against the existing claim, e.g.
+    /// labels merged in, or a new evidence row and reasoning trace linked to it.
+    pub inputs_applied: Vec<&'static str>,
+    /// Inputs of this call that were written nowhere.
+    pub inputs_discarded: Vec<&'static str>,
 }
 
 /// Outcome of the content-integrity half of MCP `verify_claim`.
@@ -1352,6 +1395,10 @@ pub struct MemorizeResponse {
     pub plausibility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
+    /// Present ONLY when this call created nothing new because the memory
+    /// already existed. Absent on a fresh insert. See [`Deduplicated`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deduplicated: Option<Deduplicated>,
 }
 
 #[derive(Debug, Serialize)]
