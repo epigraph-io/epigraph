@@ -471,6 +471,49 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// see them. Read them as a first review, not as a regression — and read the
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // Batch R2: `epigraph-operator reown-seed` (backlog 0512ca33) and
+    // `strip-label` / `strip-label-reverse` (backlog f6310444). Every caller is
+    // the operator CLI on its maintenance DSN (`epigraph_cli::operator::connect`
+    // refuses any other session); none is reachable from a request, and none
+    // returns a row to anyone but the operator running the repair.
+    (
+        "operator_repair.rs",
+        "claim_ids_owned_by_conn",
+        "MAINTENANCE READ of claims ids by owning group (the seed group), corpus-wide by \
+         construction: a repair must find every row the escape hatch stamped, and a filtered \
+         read would silently skip them. Operator CLI only.",
+    ),
+    (
+        "operator_repair.rs",
+        "count_owned_by_per_table_conn",
+        "MAINTENANCE COUNT per tier-A table of rows one group owns (the seed group); returns \
+         counts only, for the repair's scope report. Operator CLI only.",
+    ),
+    (
+        "operator_repair.rs",
+        "claims_with_label_conn",
+        "MAINTENANCE READ (optionally FOR UPDATE) of claims carrying one label value the write \
+         path refuses; corpus-wide by construction, part of the strip-label mutation. Operator \
+         CLI only.",
+    ),
+    (
+        "operator_repair.rs",
+        "labels_for_update_conn",
+        "MAINTENANCE READ ... FOR UPDATE of the labels of claims named in a strip-label \
+         manifest, part of the reversal's compare-and-swap. Operator CLI only.",
+    ),
+    (
+        "operator_repair.rs",
+        "strip_label_conn",
+        "WRITE. array_remove of one refused label value from named claims; registered in \
+         write_gate_lint.rs::UNGATED_REPO_WRITES too. Operator CLI only.",
+    ),
+    (
+        "operator_repair.rs",
+        "restore_labels_conn",
+        "WRITE. Compare-and-swap of one claim's whole labels array back to its recorded prior \
+         value; registered in write_gate_lint.rs::UNGATED_REPO_WRITES too. Operator CLI only.",
+    ),
     (
         "claim.rs",
         "supersede_conn",

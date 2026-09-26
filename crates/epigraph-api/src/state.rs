@@ -598,6 +598,10 @@ pub struct RlsPosture {
     /// `crates/epigraph-api`.
     pub has_bypassrls: bool,
     /// Can this connection take migration 074's `epigraph_seed` escape hatch?
+    /// Asked as the triggers ask it at the database's migration level
+    /// (`epigraph_db::repos::seed_posture::SESSION_IS_SEED_SQL`): since
+    /// migration 113 an explicit grant, which a superuser does NOT hold by
+    /// implication.
     /// `D-PR16-seed-membership-refusal-downgraded` assigns arming this to PR-17
     /// and notes it is a SEVENTH refusal, not one of the six the plan lists.
     pub is_seed_member: bool,
@@ -1615,20 +1619,16 @@ impl AppState {
     /// Returns `DbError::QueryFailed` if the catalog cannot be read at all.
     #[cfg(feature = "db")]
     pub async fn probe_rls_posture(&self) -> Result<RlsPosture, epigraph_db::DbError> {
-        let (current_user, is_superuser, has_bypassrls, is_seed_member, forced, protected): (
-            String,
-            bool,
-            bool,
-            bool,
-            i64,
-            i64,
-        ) = sqlx::query_as(
+        // The seed column asks what the `*_require_tenancy` triggers ask AT
+        // THIS DATABASE'S MIGRATION LEVEL: since 113 an explicit grant, not
+        // `pg_has_role`, which every superuser satisfies. See
+        // `epigraph_db::repos::seed_posture` for why it is an expression.
+        let sql = format!(
             "SELECT current_user::text, \
                     COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = session_user), false), \
                     COALESCE((SELECT rolbypassrls FROM pg_roles WHERE rolname = session_user), \
                              false), \
-                    EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_seed') \
-                      AND pg_has_role(session_user, 'epigraph_seed', 'MEMBER'), \
+                    {seed}, \
                     (SELECT count(*) FROM pg_class c \
                        JOIN pg_namespace n ON n.oid = c.relnamespace \
                       WHERE n.nspname = 'public' AND c.relname = ANY($1) \
@@ -1637,10 +1637,19 @@ impl AppState {
                        JOIN pg_namespace n ON n.oid = c.relnamespace \
                       WHERE n.nspname = 'public' AND c.relname = ANY($1) \
                         AND c.relkind IN ('r','p'))",
-        )
-        .bind(FORCE_PROTECTED_SET)
-        .fetch_one(&self.db_pool)
-        .await?;
+            seed = epigraph_db::repos::seed_posture::SESSION_IS_SEED_SQL,
+        );
+        let (current_user, is_superuser, has_bypassrls, is_seed_member, forced, protected): (
+            String,
+            bool,
+            bool,
+            bool,
+            i64,
+            i64,
+        ) = sqlx::query_as(&sql)
+            .bind(FORCE_PROTECTED_SET)
+            .fetch_one(&self.db_pool)
+            .await?;
 
         // Below 078 there is no canary. `to_regclass` returns NULL rather than
         // raising, so this is one statement either way.
@@ -1782,19 +1791,37 @@ impl AppState {
     /// the boot log of every environment, so week 11d's flip is a change whose
     /// blast radius is already known rather than discovered on the day.
     ///
+    /// # Since migration 113
+    ///
+    /// The "`rolsuper` satisfies it for free" above describes 074's trigger
+    /// question. 113 made the hatch require an explicit grant, so the probe
+    /// now asks what the triggers ask at the database's migration level
+    /// (`epigraph_db::repos::seed_posture`), and a superuser without the grant
+    /// gets its own warning saying what its undeclared writes do instead.
+    ///
     /// # Errors
     /// Returns the underlying `DbError` if the catalog probe itself fails. The
     /// posture findings are logged, not returned.
     #[cfg(feature = "db")]
     pub async fn warn_on_privileged_connection(&self) -> Result<(), epigraph_db::DbError> {
-        let (current_user, is_seed_member, is_super): (String, bool, bool) = sqlx::query_as(
-            "SELECT current_user::text, \
-                    EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_seed') \
-                      AND pg_has_role(session_user, 'epigraph_seed', 'MEMBER'), \
-                    (SELECT rolsuper FROM pg_roles WHERE rolname = session_user)",
-        )
-        .fetch_one(&self.db_pool)
-        .await?;
+        // See `epigraph_db::repos::seed_posture`: the seed column is the
+        // question the triggers ask at this migration level, and the last
+        // column says which question that is (113's explicit grant, or 074's
+        // `pg_has_role`, which every superuser satisfies).
+        let sql = format!(
+            "SELECT current_user::text, {seed}, \
+                    COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = session_user), \
+                             false), \
+                    {explicit}",
+            seed = epigraph_db::repos::seed_posture::SESSION_IS_SEED_SQL,
+            explicit = epigraph_db::repos::seed_posture::SEED_FUNCTION_EXISTS_SQL,
+        );
+        let (current_user, is_seed_member, is_super, explicit_seed_question): (
+            String,
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(&sql).fetch_one(&self.db_pool).await?;
 
         if current_user != "epigraph_app" {
             tracing::warn!(
@@ -1813,6 +1840,18 @@ impl AppState {
                  '00000000-0000-0000-0000-00000000dead'. \
                  Arming this as a refusal is D-PR16-seed-membership-refusal-downgraded, \
                  owned by PR-17."
+            );
+        } else if is_super && explicit_seed_question {
+            // Migration 113: a superuser is no longer a seed by implication, so
+            // the message above would be false for it. Say what does happen.
+            tracing::warn!(
+                current_user = %current_user,
+                "connected as a SUPERUSER that holds no grant of epigraph_seed. Since migration \
+                 113 this connection does NOT take the seed escape hatch: an undeclared claim \
+                 takes its author's own declaration (the acting operator's or the author's \
+                 personal group, 'public'), and an undeclared root row, or a claim-derived row \
+                 with no parent claim, raises 23502. A superuser still bypasses every \
+                 row-level security policy; move this service onto epigraph_app."
             );
         }
         Ok(())
