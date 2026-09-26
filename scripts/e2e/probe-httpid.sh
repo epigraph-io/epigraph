@@ -14,8 +14,10 @@
 #             (resolve_backlog_item, update_labels +resolved)
 #   unauth    the --allow-unauthenticated-http listener (a principal-less
 #             caller: every request gets the injected context naming the
-#             listener's own signer): the same three writes, a read, and the
-#             principal-less caller's attempt to retire the human's item
+#             listener's own signer): the same three writes, a claims:admin
+#             tool, a read, and the principal-less caller's attempt to retire
+#             the human's item; then, on a binary that has it, the same with
+#             --allow-unauthenticated-writes (batch HTTP-id's opt-in)
 #   retired   a FORMER shared signer: a listener key that served two principals
 #             (so it carries OPERATED_BY auth-lineage edges to both), then
 #             link-retired to the human through migration 107's
@@ -98,6 +100,8 @@ start_server() {
               --agent-key "$key" --listen "unix:$SOCK" >> "$LOG" 2>&1 & ;;
     unauth) env -u MAINTENANCE_DATABASE_URL -u EPIGRAPH_JWT_SECRET DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
               --agent-key "$key" --listen "unix:$SOCK" --allow-unauthenticated-http >> "$LOG" 2>&1 & ;;
+    unauthw) env -u MAINTENANCE_DATABASE_URL -u EPIGRAPH_JWT_SECRET DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
+              --agent-key "$key" --listen "unix:$SOCK" --allow-unauthenticated-http --allow-unauthenticated-writes >> "$LOG" 2>&1 & ;;
   esac
   PID=$!
   for _ in $(seq 1 40); do
@@ -233,13 +237,13 @@ if want oauth; then
 fi
 
 # ── unauth ───────────────────────────────────────────────────────────────────
-if want unauth; then
-  echo
-  echo "=== unauth: a PRINCIPAL-LESS caller on --allow-unauthenticated-http ==="
-  start_server unauth "$E2E_AGENT_KEY" || { echo "FAIL: unauth listener"; tail -20 "$LOG"; exit 1; }
+unauth_arm() {  # $1 = unauth | unauthw
+  start_server "$1" "$E2E_AGENT_KEY" || { echo "FAIL: unauth listener"; tail -20 "$LOG"; exit 1; }
   CL_BEFORE=$(q "SELECT count(*) FROM claims WHERE agent_id='$SIG'")
-  writes unauth "$HUMAN_ITEM"
+  writes "$1" "$HUMAN_ITEM"
   echo "   claims authored by SIGNER: $CL_BEFORE->$(q "SELECT count(*) FROM claims WHERE agent_id='$SIG'")"
+  R=$(tool sweep_semantic_duplicates '{"dry_run":true}')
+  echo "   sweep_semantic_duplicates (a claims:admin tool): $(verdict "$R")"
   R=$(tool query_claims '{"limit":1}')
   echo "   query_claims (a read): $(verdict "$R")"
   if [ -n "$HUMAN_ITEM" ]; then
@@ -249,6 +253,17 @@ if want unauth; then
     echo "   resolve_backlog_item on the HUMAN's item: $(verdict "$R") | labelled=$(q "SELECT count(*) FROM claims WHERE id='$HUMAN_ITEM' AND 'resolved'=ANY(labels)") resolutions=$(q "SELECT count(*) FROM claims WHERE content LIKE 'Resolves $HUMAN_ITEM:%'")"
   fi
   stop_server
+}
+if want unauth; then
+  echo
+  echo "=== unauth: a PRINCIPAL-LESS caller on --allow-unauthenticated-http (the default) ==="
+  unauth_arm unauth
+  if "$BIN" --help 2>/dev/null | grep -q -- --allow-unauthenticated-writes; then
+    echo "--- the same listener with --allow-unauthenticated-writes (expect: writes authored by the unlinked SIGNER; the human's item still refused)"
+    unauth_arm unauthw
+  else
+    echo "   (this binary has no --allow-unauthenticated-writes: every write above ran on the pre-HTTP-id listener)"
+  fi
 fi
 
 # ── retired ──────────────────────────────────────────────────────────────────
