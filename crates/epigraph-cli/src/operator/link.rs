@@ -6,6 +6,12 @@
 //! savepoint per id, and rolls everything back, so what it prints is what the
 //! function did rather than a re-derivation of what it would do.
 //!
+//! With `--attest-shared-signer`, each id goes through migration 116's
+//! `epigraph_link_retired_shared_signer` instead: the retire of a FORMER shared
+//! HTTP signer, admitted only when every principal its auth-lineage names
+//! (other than the operator) is attested. Its refusals are 107's retire's plus
+//! that one, and this module still adds none.
+//!
 //! # Two refusals are about the OPERATOR, not the id
 //!
 //! The function resolves the operator's personal group through migration 105's
@@ -149,6 +155,26 @@ fn classify(operator: Uuid, e: &DbError) -> LinkStatus {
     }
 }
 
+/// One retire: 107's `epigraph_link_retired_agent`, or, with `attested`,
+/// migration 116's `epigraph_link_retired_shared_signer` for a FORMER shared
+/// HTTP signer (batch HTTP-id). 116 keeps every refusal of 107's retire and
+/// replaces only the agent-side shared-signer refusal with "every lineage
+/// principal other than the operator is attested", so its outcomes are read
+/// exactly as 107's are.
+async fn retire_one(
+    conn: &mut PgConnection,
+    agent: Uuid,
+    operator: Uuid,
+    attested: Option<&[Uuid]>,
+) -> Result<RetiredLinkOutcome, DbError> {
+    match attested {
+        Some(principals) => {
+            AgentRepository::link_retired_shared_signer(conn, agent, operator, principals).await
+        }
+        None => AgentRepository::link_retired_agent(conn, agent, operator).await,
+    }
+}
+
 /// After pushing id `i`'s status: when it was an operator refusal, report every
 /// later id as not attempted and return `true` (stop).
 fn stop_after(out: &mut Vec<(Uuid, LinkStatus)>, agents: &[Uuid], i: usize) -> bool {
@@ -168,18 +194,23 @@ fn stop_after(out: &mut Vec<(Uuid, LinkStatus)>, agents: &[Uuid], i: usize) -> b
 /// that is rolled back. Either way an operator refusal (`RVK01` / `RVK02`)
 /// stops the run (see the module doc).
 ///
+/// With `attested` (`--attest-shared-signer`), each id goes through migration
+/// 116's attested retire of a FORMER shared HTTP signer instead of 107's
+/// retire; see [`retire_one`].
+///
 /// # Errors
 /// A database error on the dry run's transaction or savepoint statements.
 pub async fn run(
     conn: &mut PgConnection,
     agents: &[Uuid],
     operator: Uuid,
+    attested: Option<&[Uuid]>,
     apply: bool,
 ) -> anyhow::Result<Vec<(Uuid, LinkStatus)>> {
     let mut out = Vec::with_capacity(agents.len());
     if apply {
         for (i, &agent) in agents.iter().enumerate() {
-            let status = match AgentRepository::link_retired_agent(conn, agent, operator).await {
+            let status = match retire_one(conn, agent, operator, attested).await {
                 Ok(o) => LinkStatus::Linked(o),
                 Err(e) => classify(operator, &e),
             };
@@ -195,7 +226,7 @@ pub async fn run(
         sqlx::query("SAVEPOINT link_retired_one")
             .execute(&mut *tx)
             .await?;
-        let status = match AgentRepository::link_retired_agent(&mut tx, agent, operator).await {
+        let status = match retire_one(&mut tx, agent, operator, attested).await {
             Ok(o) => {
                 sqlx::query("RELEASE SAVEPOINT link_retired_one")
                     .execute(&mut *tx)
