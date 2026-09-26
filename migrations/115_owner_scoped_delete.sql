@@ -140,6 +140,27 @@
 -- with the cause, the edge ids, the per-arm counts and the owners of the
 -- removed rows.
 --
+-- Two properties of these arms, stated so nobody reads more into them:
+--   * `source_writer` is a STANDING capability of the source's writer, not one
+--     scoped to a cascade event: it does not require that the edge was just
+--     re-sourced, nor that the row sits on the edge's target. The writer of S
+--     may invalidate edge-keyed BBAs of any edge sourced at S at any time: the
+--     definer is executable by the application role, and the application
+--     itself calls it only from the three cascade paths, over edges they
+--     select. That matches the attribution rule (the edge-factor BBA is the
+--     source author's assertion), not a cascade binding.
+--   * `p_cause` is CALLER-ASSERTED. It is checked against a three-value list
+--     and recorded in the audit row, but nothing verifies that the named event
+--     happened; read the audit's `cause` as what the caller said, and its
+--     `arms` as what licensed each row.
+-- The whole-call refusal is fail-closed on purpose, and it has a cost: a
+-- readable BBA on the same edge that no arm admits (for instance one a third
+-- party stored under that edge's perspective, attributed to another agent)
+-- makes the legitimate actor's call refuse too, and the stale rows it meant to
+-- invalidate stay combined until a privileged recompute. Skipping the
+-- unadmitted rows per edge was rejected: it would make "some of this edge's
+-- BBAs were not yours" indistinguishable from "done".
+--
 -- WHY NOT "deleted in this transaction": the retraction cascade runs AFTER the
 -- supersede / dedup transaction committed (it is best-effort by design, see
 -- the module doc), so there is no transaction to bind to; every arm above is a
