@@ -939,19 +939,6 @@ pub async fn report_workflow_outcome(
         .await;
     }
 
-    let claim = ClaimRepository::get_by_id(
-        &server.pool,
-        viewer,
-        epigraph_core::ClaimId::from_uuid(workflow_id),
-    )
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| {
-        invalid_params(format!(
-            "workflow {workflow_id} not found in `workflows` or `claims` tables"
-        ))
-    })?;
-
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let pub_key = server.signer.public_key();
@@ -1044,6 +1031,40 @@ pub async fn report_workflow_outcome(
         crate::claim_helper::begin_author_stamped_tx(server, agent_id, "report_workflow_outcome")
             .await?;
 
+    // ── MIGRATION 114: A NON-OWNER REPORTING ON A PUBLIC WORKFLOW CLAIM ──
+    //
+    // Most legacy flat workflow claims are public and owned by a group no
+    // reporting agent can write (the world group). As in
+    // `tools::claims::update_with_evidence`: the outcome evidence and its BBA
+    // are the caller's own rows (the `<table>_attach_writer` trigger owns them
+    // by the caller's group, public), the DS cache is refreshed through the
+    // audited definer path inside `update_claim_belief`, and the claim ROW is
+    // not written -- its `truth_value` stays its owner's (`truth_written =
+    // false`). Asked on THIS stamped transaction, so "can read" and "can write"
+    // are the session's own answers.
+    //
+    // The claim itself is read on the same stamped transaction through the
+    // caller's viewer (not on `server.pool`, an unstamped application
+    // connection in production that sees no group-private row), so a caller's
+    // OWN group-private workflow claim is found, and an unreadable one answers
+    // exactly as a missing one.
+    let claim = ClaimRepository::get_by_id(
+        &mut *tx,
+        viewer,
+        epigraph_core::ClaimId::from_uuid(workflow_id),
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| {
+        invalid_params(format!(
+            "workflow {workflow_id} not found in `workflows` or `claims` tables"
+        ))
+    })?;
+    let foreign_claim =
+        epigraph_db::repos::foreign_attach::is_foreign_public_claim(&mut tx, workflow_id)
+            .await
+            .map_err(internal_error)?;
+
     EvidenceRepository::create(&mut *tx, &evidence)
         .await
         .map_err(internal_error)?;
@@ -1078,8 +1099,16 @@ pub async fn report_workflow_outcome(
     // registered as a residual in
     // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` with that reason.
     // After the DS wiring necessarily, because the value comes from it.
-    let after = TruthValue::clamped(ds.pignistic_prob);
-    {
+    //
+    // MIGRATION 114: skipped for a public workflow claim this caller does not
+    // own (see `foreign_claim` above); `truth_after` then reports the
+    // unchanged value.
+    let after = if foreign_claim {
+        claim.truth_value
+    } else {
+        TruthValue::clamped(ds.pignistic_prob)
+    };
+    if !foreign_claim {
         ClaimRepository::update_truth_value_conn(
             &mut tx,
             epigraph_core::ClaimId::from_uuid(workflow_id),
@@ -1087,8 +1116,8 @@ pub async fn report_workflow_outcome(
         )
         .await
         .map_err(internal_error)?;
-        tx.commit().await.map_err(internal_error)?;
     }
+    tx.commit().await.map_err(internal_error)?;
 
     // Update use counts in workflow JSON
     let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
@@ -1171,12 +1200,21 @@ pub async fn report_workflow_outcome(
         evidence_id: evidence.id.as_uuid().to_string(),
         truth_before: before,
         truth_after: after.value(),
+        truth_written: !foreign_claim,
+        cache_written: ds.cache_written,
         total_uses: use_count,
         success_rate: if use_count > 0 {
             success_count as f64 / use_count as f64
         } else {
             0.0
         },
+        warning: (!ds.cache_written).then(|| {
+            format!(
+                "workflow claim {workflow_id}'s cached belief was NOT updated: it is carried on \
+                 another frame (or on an older cache with no recorded frame), which a non-owner \
+                 does not re-point. The outcome evidence and its BBA are stored."
+            )
+        }),
     })
 }
 

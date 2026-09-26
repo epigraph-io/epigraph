@@ -1067,11 +1067,6 @@ pub async fn update_with_evidence(
     // on the strength of a submission the caller was told had failed.
     epigraph_db::reject_unexpanded_labels(&params.labels).map_err(db_caller_error)?;
 
-    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(claim_id))
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
-
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let pub_key = server.signer.public_key();
@@ -1129,6 +1124,18 @@ pub async fn update_with_evidence(
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
             .await?;
+
+    // Read the claim through the caller's viewer on THIS stamped transaction,
+    // before anything is written, as `submit_ds_evidence` does. Not on
+    // `server.pool`: that is an unstamped application connection in
+    // production, which RLS lets see no group-private row whatever the viewer
+    // says, so an agent adding evidence to its OWN group-private claim was told
+    // "not found". An unreadable private claim and a nonexistent id still give
+    // the same answer.
+    let claim = ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(claim_id))
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
     // ── MIGRATION 114: A NON-OWNER ATTACHING TO A PUBLIC CLAIM ──────────
     //
@@ -1301,12 +1308,30 @@ pub async fn update_with_evidence(
     // pignistic-to-pignistic; when the claim had no prior DS state the column is
     // NULL, so fall back to the truth_value the fresh BBA combined against.
     let pre_belief = pre_pignistic.unwrap_or(before);
-    let warning = (params.supports && ds.pignistic_prob < pre_belief).then(|| {
-        "Supporting evidence decreased belief — the new evidence has high \
-         ignorance mass relative to the prior; this is mathematically correct \
-         DS combination, not a bug."
-            .to_string()
-    });
+    let mut warnings: Vec<String> = Vec::new();
+    if params.supports && ds.pignistic_prob < pre_belief {
+        warnings.push(
+            "Supporting evidence decreased belief — the new evidence has high \
+             ignorance mass relative to the prior; this is mathematically correct \
+             DS combination, not a bug."
+                .to_string(),
+        );
+    }
+    // Migration 114: a non-owner refreshes a claim's cached belief only on the
+    // frame the cache already carries, and seeds one only on `binary_truth`
+    // when the claim has no cache at all. When that refused the write, the
+    // belief / plausibility / pignistic_prob below are THIS call's combination
+    // and the claim's cache still holds its previous values: say so.
+    if !ds.cache_written {
+        warnings.push(format!(
+            "claim {claim_id}'s cached belief was NOT updated: it is carried on another frame \
+             (or on an older cache with no recorded frame), which a non-owner does not \
+             re-point. Your evidence and its BBA are stored; belief, plausibility and \
+             pignistic_prob in this response are this call's combination on binary_truth, \
+             not the claim's cached values."
+        ));
+    }
+    let warning = (!warnings.is_empty()).then(|| warnings.join(" "));
 
     // `belief_wired` / `bba_stored` / `ds_wire_error` are #497's response fields,
     // kept because clients may already read them. Under D2 a success response is
@@ -1328,6 +1353,7 @@ pub async fn update_with_evidence(
         evidence_id: evidence.id.as_uuid().to_string(),
         belief_wired: true,
         bba_stored: true,
+        cache_written: ds.cache_written,
         ds_wire_error: None,
         belief: Some(ds.belief),
         plausibility: Some(ds.plausibility),

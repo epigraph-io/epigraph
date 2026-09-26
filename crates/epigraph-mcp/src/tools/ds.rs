@@ -317,9 +317,10 @@ pub async fn submit_ds_evidence(
         warnings.push(format!(
             "claim {claim_id} is a public claim this caller does not own: this BBA is stored, \
              owned by the caller's group and public. The claim's frame assignment keeps the \
-             hypothesis_index its owner set, and the claim's cached belief (the belief \
-             returned here) is refreshed only when it already carries this frame or carries \
-             none; a non-owner never re-points it to another frame."
+             hypothesis_index its owner set (a missing binary_truth assignment can only be \
+             created at index 0), and the claim's cached belief (the belief returned here) is \
+             refreshed only when it already carries this frame, or seeded on binary_truth when \
+             the claim has no cache at all; a non-owner never re-points it to another frame."
         ));
     }
 
