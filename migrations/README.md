@@ -561,12 +561,17 @@ Current reservation:
   `epigraph_cascade_delete_edge_bbas` is redefined (CREATE OR REPLACE) to its
   owner arm only; 115's `retracted_edge` and `source_writer` arms are gone.
   `epigraph_dedup_move_bbas` is revoked from `epigraph_app`.
-  `epigraph_maintenance` gains DELETE on `factors` and `bp_messages`. The
-  application splits supersede, dedup and match-candidate retirement into the
-  caller's act (its own stamped transaction) and a repair that runs on the
-  maintenance connection (`epigraph_engine::admin_cascade`), audited as
-  `cascade.admin_applied`, or recorded as `cascade.deferred` when the process
-  has no configured maintenance DSN. Behaviour in
+  `epigraph_maintenance` gains DELETE on `factors` and `bp_messages`. A
+  BEFORE UPDATE trigger `edges_repoint_unsign` clears an edge's signature
+  columns when a non-privileged session changes its endpoints. The
+  application splits supersede, dedup, consolidation and match-candidate
+  retirement into the caller's act (its own stamped transaction) and a repair
+  that runs on the maintenance connection (`epigraph_engine::admin_cascade`),
+  committed together with its `cascade.admin_applied` row, or recorded as
+  `cascade.deferred` (in the act's transaction) when the process has no usable
+  maintenance DSN; `replay_deferred_cascades` replays those. 115's source-writer
+  DELETE arm on `edges` is unchanged and recorded in the header as a pending
+  decision. Behaviour in
   `epigraph-db/tests/owner_scoped_update.rs`, `owner_scoped_delete.rs` and
   `epigraph-mcp/tests/writer_owned_attach_app_role.rs` (arms as `epigraph_app`).
   **Deploy order: apply 117 BEFORE any binary built with it serves, and set the

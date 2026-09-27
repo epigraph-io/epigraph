@@ -391,7 +391,10 @@ that for a non-privileged session:
 
 * **DELETE is owner-scoped (115)** on every tier-A table: the row's owner (on
   `edges`, the owner or co-owner, or for an edge between two public claims the
-  writer of its source) must be in the session's writable set.
+  writer of its source) must be in the session's writable set. That last
+  source-writer arm is a non-owner DELETE; whether it survives the rule that a
+  non-privileged DELETE is owner-scoped is an open operator decision (the
+  workflow step rewire depends on it).
 * **UPDATE of an edge or of an instance-wide registry row is owner-scoped
   (117).** `edges` (owner or co-owner) and `frames`, `contexts`, `perspectives`,
   `communities` (owner): both the row as it was and the row as it will be,
@@ -400,20 +403,40 @@ that for a non-privileged session:
   by any application session; its retraction, relabelling or re-pointing is a
   privileged act. The other tier-A tables already refuse a non-owner's UPDATE
   through their writable-set WITH CHECK and 115's owner-immutability guard.
+  A re-point by a non-privileged session (the owner, or a co-owner moving the
+  edge off the owner's endpoint) clears the edge's `signature`, `signer_id` and
+  `content_hash`: the signed content named the old endpoints.
 
-**The retraction cascade is an administrative act (117).** A supersede, a dedup
-or a match-candidate retirement is the caller's act, written with the caller's
-authority on its own stamped transaction. What follows it -- re-pointing and
-retracting other writers' edges, moving and invalidating their edge-keyed BBAs,
-re-deriving belief -- runs on the server's maintenance connection
-(`epigraph_engine::admin_cascade`) and writes one `security_events` row
-(`cascade.admin_applied`) naming the caller, the cause and what it touched. That
-connection exists only when `MAINTENANCE_DATABASE_URL` is configured to a login
-that bypasses row security; it is never derived from `DATABASE_URL`. Without it
-the act still commits and the cascade is reported (`"cascade": {"status":
-"deferred"}`) and recorded (`cascade.deferred`); every repair re-verifies the
-act and is idempotent, so a deferred cascade is replayed by running it later on
-a maintenance connection.
+**The retraction cascade is an administrative act (117).** A supersede, a dedup,
+a consolidation or a match-candidate retirement is the caller's act, written with
+the caller's authority on its own stamped transaction. What follows it --
+re-pointing and retracting other writers' edges, moving and invalidating their
+edge-keyed BBAs, re-deriving belief -- runs on the server's maintenance
+connection (`epigraph_engine::admin_cascade`). Each repair commits in ONE
+transaction with its `security_events` row (`cascade.admin_applied`) naming the
+caller, the cause and what it touched; a failed repair rolls back and is
+recorded as `cascade.admin_failed`; the belief re-derivation that follows writes
+`cascade.belief_rederived`. That connection exists only when
+`MAINTENANCE_DATABASE_URL` is configured to a login that bypasses row security;
+it is never derived from `DATABASE_URL`, and a request path acquires it before
+the act commits. Without it the act still commits and the cascade is reported
+(`"cascade": {"status": "deferred"}`) and recorded (`cascade.deferred`) in the
+act's own transaction.
+
+What the caller is told is filtered to what it may read: `cascade.touched` is
+counts only, and the belief report keeps only claims the caller's viewer can
+read. The ids live in the audit rows.
+
+Two rules keep the administrative repair from carrying a decision the caller
+could not make: a dedup onto a non-public canonical requires write authority
+over the canonical (the repair would move the duplicate's derived rows into the
+canonical's group), and a duplicate bound FALSE on `binary_truth` does not hand
+that binding to a canonical the caller cannot write.
+
+Every repair re-verifies the committed act and is idempotent, so the
+`replay_deferred_cascades` CLI, run on the maintenance DSN (it refuses the
+fallback to `DATABASE_URL`), replays every deferred or failed cascade with no
+later `cascade.admin_applied` row, naming the original caller and the deferral.
 
 ### The kill switch
 
