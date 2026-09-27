@@ -4291,6 +4291,39 @@ impl ClaimRepository {
         Ok(q.fetch_all(executor).await?.into_iter().collect())
     }
 
+    /// The subset of `ids` that are claims `viewer` may read.
+    ///
+    /// The positive twin of [`Self::hidden_claim_ids`], over the same definer
+    /// (`epigraph_claim_tenancy_by_ids`), so it answers the same on any
+    /// connection: a caller's RLS-filtered session, or the privileged
+    /// maintenance connection a request path's administrative cascade runs on.
+    /// Every id that is not a claim the viewer can read -- a hidden claim, a
+    /// missing one, an edge id -- is absent. That makes it the filter for what
+    /// an administrative act may report back to the caller that triggered it
+    /// (migration 117): an id outside this set is not the caller's to learn.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn visible_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashSet<uuid::Uuid>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let sql = viewer.splice(
+            "SELECT c.id FROM public.epigraph_claim_tenancy_by_ids($1) c \
+              WHERE true /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, uuid::Uuid>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
+    }
+
     /// Fetch `labels` for a batch of claim ids in one round-trip.
     ///
     /// Batch companion to [`Self::get_labels`], used by MCP `query_claims` to

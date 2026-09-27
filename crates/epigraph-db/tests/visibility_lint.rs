@@ -1177,6 +1177,27 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "consolidate_act_conn",
+        "WRITE. The consolidation's act (lock the sources, insert the merged claim, retire the \
+         sources, insert the `supersedes` edges) on the caller's stamped transaction; authorised \
+         by claims_tenancy's / edges_tenancy's WITH CHECK. Its reads are the sources' FOR UPDATE \
+         lock, the membership check and the idempotency probe, all of rows it is about to write.",
+    ),
+    (
+        "claim.rs",
+        "migrate_consolidated_edges_conn",
+        "WRITE, privileged only (refuses otherwise). Re-points the retired sources' live edges \
+         onto the merged claim on the maintenance connection; its read verifies the committed \
+         act.",
+    ),
+    (
+        "claim.rs",
+        "migrate_consolidated_edges",
+        "WRITE. The consolidation's edge-migration statements, unchecked; called only after the \
+         caller established the privilege and the committed merge.",
+    ),
+    (
+        "claim.rs",
         "mark_duplicate_act_conn",
         "WRITE. The dedup's act (mark the duplicate) on the caller's stamped transaction; \
          authorised by claims_tenancy's WITH CHECK. Its reads are the two claims' existence / \
@@ -1465,6 +1486,14 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     // ── Batch W10 (migration 117): the administrative cascade's audit row.
+    (
+        "admin_cascade.rs",
+        "pending_replays",
+        "READ of `security_events` for the operator's replay of deferred administrative cascades \
+         (migration 117). Runs on the maintenance connection only (an application session cannot \
+         read other principals' audit rows); it returns audit rows, not tenant content, so there \
+         is no viewer predicate to splice.",
+    ),
     (
         "admin_cascade.rs",
         "record",
