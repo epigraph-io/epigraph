@@ -299,7 +299,30 @@ async fn post_decide(
     token: &str,
     verdict: &str,
 ) -> axum::http::Response<Body> {
-    let state = AppState::with_db(pool, ApiConfig::default());
+    // Through a `ScopedPool`, as `bin/server.rs` builds it: since migration 118
+    // `retire` runs on the maintenance connection and fails closed without one.
+    // The test database has one DSN, so the maintenance pool is the same
+    // (superuser) pool.
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("current_database()");
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let prefix = base
+        .split_once('?')
+        .map_or(base.as_str(), |(a, _)| a)
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .expect("DATABASE_URL must carry a database path")
+        .0
+        .to_string();
+    let scoped = epigraph_db::ScopedPool::connect(
+        &format!("{prefix}/{db}"),
+        epigraph_db::SessionGucMode::Session,
+    )
+    .await
+    .expect("ScopedPool::connect");
+    let state = AppState::with_scoped_pool(scoped, ApiConfig::default());
     create_router(state)
         .oneshot(
             Request::builder()

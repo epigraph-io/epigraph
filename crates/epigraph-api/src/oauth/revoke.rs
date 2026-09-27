@@ -40,11 +40,15 @@ pub async fn revoke_endpoint(
                             message: e.to_string(),
                         })?
                 {
-                    RefreshTokenRepository::revoke(&state.db_pool, stored.id)
-                        .await
-                        .map_err(|e| ApiError::InternalError {
-                            message: e.to_string(),
-                        })?;
+                    RefreshTokenRepository::revoke(
+                        &state.db_pool,
+                        stored.id,
+                        epigraph_db::repos::refresh_token::RefreshRevokeReason::Revoked,
+                    )
+                    .await
+                    .map_err(|e| ApiError::InternalError {
+                        message: e.to_string(),
+                    })?;
                 }
             }
         }

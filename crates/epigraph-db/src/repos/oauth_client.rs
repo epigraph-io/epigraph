@@ -121,16 +121,15 @@ impl OAuthClientRepository {
         id: Uuid,
         agent_id: Uuid,
     ) -> Result<bool, DbError> {
-        let result = sqlx::query(
-            "UPDATE oauth_clients SET agent_id = $2, updated_at = now() \
-             WHERE id = $1 AND agent_id IS NULL",
-        )
-        .bind(id)
-        .bind(agent_id)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| DbError::QueryFailed { source: e })?;
-        Ok(result.rows_affected() > 0)
+        // Migration 118: `epigraph_oauth_client_link_agent` runs the same
+        // write-once UPDATE as a SECURITY DEFINER (and refuses an agent that
+        // does not exist); the application role holds no UPDATE here.
+        sqlx::query_scalar("SELECT public.epigraph_oauth_client_link_agent($1, $2)")
+            .bind(id)
+            .bind(agent_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| DbError::QueryFailed { source: e })
     }
 
     /// Look up a client by `client_name` (status-agnostic), oldest first.
@@ -259,15 +258,16 @@ impl OAuthClientRepository {
         granted_scopes: &[String],
         approved_by: Uuid,
     ) -> Result<(), DbError> {
-        sqlx::query(
-            r#"UPDATE oauth_clients SET granted_scopes = $2, status = 'active', created_by = $3, updated_at = now() WHERE id = $1"#,
-        )
-        .bind(id)
-        .bind(granted_scopes)
-        .bind(approved_by)
-        .execute(pool)
-        .await
-        .map_err(|e| DbError::QueryFailed { source: e })?;
+        // Migration 118: the same UPDATE, in `epigraph_oauth_client_approve`
+        // (a SECURITY DEFINER that also writes an `oauth.client_approved`
+        // security event); the application role holds no UPDATE here.
+        sqlx::query("SELECT public.epigraph_oauth_client_approve($1, $2, $3)")
+            .bind(id)
+            .bind(granted_scopes)
+            .bind(approved_by)
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::QueryFailed { source: e })?;
         Ok(())
     }
 

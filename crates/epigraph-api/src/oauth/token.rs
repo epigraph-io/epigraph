@@ -626,14 +626,21 @@ async fn handle_client_credentials(
     ))
 }
 
-/// Revoke a refresh token (rotation, or a deliberate burn on a denied refresh).
+/// Burn a refresh token on a DENIED refresh (migration 118's revoke definer,
+/// reason `denied`). Rotation does not come through here: it is the atomic
+/// [`RefreshTokenRepository::rotate`](epigraph_db::repos::refresh_token::RefreshTokenRepository::rotate).
 #[cfg(feature = "db")]
 async fn burn_refresh_token(state: &AppState, id: uuid::Uuid) -> Result<(), ApiError> {
-    epigraph_db::repos::refresh_token::RefreshTokenRepository::revoke(&state.db_pool, id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })
+    epigraph_db::repos::refresh_token::RefreshTokenRepository::revoke(
+        &state.db_pool,
+        id,
+        epigraph_db::repos::refresh_token::RefreshRevokeReason::Denied,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| ApiError::InternalError {
+        message: e.to_string(),
+    })
 }
 
 #[cfg(feature = "db")]
@@ -642,7 +649,9 @@ async fn handle_refresh_token(
     req: &TokenRequest,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
     use epigraph_db::repos::oauth_client::OAuthClientRepository;
-    use epigraph_db::repos::refresh_token::RefreshTokenRepository;
+    use epigraph_db::repos::refresh_token::{
+        RefreshCheck, RefreshRotateOutcome, RefreshTokenRepository,
+    };
 
     let refresh_token_str = req.refresh_token.as_deref().ok_or(ApiError::BadRequest {
         message: "refresh_token required".to_string(),
@@ -653,14 +662,23 @@ async fn handle_refresh_token(
     })?;
     let hash = blake3::hash(&raw);
 
-    let stored = RefreshTokenRepository::get_valid(&state.db_pool, hash.as_bytes())
+    // Migration 118: the first read goes through the check definer, which
+    // treats a token already spent by ROTATION as reuse and revokes its whole
+    // family (OAuth 2.0 Security BCP) before answering. Reuse and an unknown or
+    // expired token get the same 401: the response must not tell a replayer
+    // which one it hit.
+    let stored = match RefreshTokenRepository::check(&state.db_pool, hash.as_bytes())
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
-        })?
-        .ok_or(ApiError::Unauthorized {
-            reason: "Invalid or expired refresh token".to_string(),
-        })?;
+        })? {
+        RefreshCheck::Valid { id, client_id } => StoredRefresh { id, client_id },
+        RefreshCheck::Reuse => {
+            tracing::warn!("refresh token reuse: its rotation family has been revoked");
+            return Err(invalid_refresh());
+        }
+        RefreshCheck::Invalid => return Err(invalid_refresh()),
+    };
 
     // WHEN THE OLD TOKEN IS BURNED (rotation). A DENIAL burns it on purpose --
     // a suspended client, an identity no longer allowlisted, an operated agent
@@ -747,9 +765,10 @@ async fn handle_refresh_token(
         Err(unanswered) => return Err(unanswered),
     };
 
-    // Rotation: the refresh is going ahead, so the old token is spent.
-    burn_refresh_token(state, stored.id).await?;
-
+    // Everything that can fail to ANSWER (the checks above, the signing below)
+    // runs before the old token is spent, so an outage never burns a chain.
+    // The access token is signed first and simply dropped if the rotation
+    // below does not happen.
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(
@@ -764,30 +783,44 @@ async fn handle_refresh_token(
             message: format!("JWT signing failed: {e}"),
         })?;
 
-    // New refresh token
+    // Rotation, ATOMIC (migration 118): one definer call claims the presented
+    // token (`UPDATE ... WHERE revoked_at IS NULL AND expires_at > now()
+    // RETURNING`) and inserts its successor in the same family. Of concurrent
+    // refreshes presenting one token exactly one gets here with `Rotated`; the
+    // others found it spent, which is reuse and revoked the family.
     let new_refresh = {
         use rand::Rng;
         let raw: [u8; 32] = rand::thread_rng().gen();
         let token_str = hex::encode(raw);
-        let hash = blake3::hash(&raw);
+        let new_hash = blake3::hash(&raw);
         let refresh_ttl = match client.client_type.as_str() {
             "agent" => Duration::hours(24),
             "human" => Duration::days(30),
             "service" => Duration::days(90),
             _ => Duration::hours(24),
         };
-        RefreshTokenRepository::create(
+        match RefreshTokenRepository::rotate(
             &state.db_pool,
             hash.as_bytes(),
-            client.id,
+            new_hash.as_bytes(),
             &effective_scopes,
             Utc::now() + refresh_ttl,
         )
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
-        })?;
-        token_str
+        })? {
+            RefreshRotateOutcome::Rotated { .. } => token_str,
+            RefreshRotateOutcome::Reuse => {
+                tracing::warn!(
+                    client_id = %client.client_id,
+                    "refresh token presented again while its rotation was in flight: \
+                     treated as reuse, family revoked"
+                );
+                return Err(invalid_refresh());
+            }
+            RefreshRotateOutcome::Invalid => return Err(invalid_refresh()),
+        }
     };
 
     Ok((
@@ -800,6 +833,22 @@ async fn handle_refresh_token(
             scope: effective_scopes.join(" "),
         }),
     ))
+}
+
+/// The presented refresh token row the grant proceeds with.
+#[cfg(feature = "db")]
+struct StoredRefresh {
+    id: uuid::Uuid,
+    client_id: uuid::Uuid,
+}
+
+/// One 401 for every refresh that cannot proceed (unknown, expired, revoked,
+/// reused): the response does not distinguish them.
+#[cfg(feature = "db")]
+fn invalid_refresh() -> ApiError {
+    ApiError::Unauthorized {
+        reason: "Invalid or expired refresh token".to_string(),
+    }
 }
 
 #[cfg(feature = "db")]

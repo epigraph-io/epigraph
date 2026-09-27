@@ -25,7 +25,7 @@ use uuid::Uuid;
 ///
 /// Uses primitive types to avoid importing `epigraph-api` types and creating
 /// a circular dependency. The API layer converts this to `AgentKey`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AgentKeyRow {
     pub id: Uuid,
     pub agent_id: Uuid,
@@ -247,46 +247,33 @@ impl AgentKeyRepository {
         revocation_reason: Option<&str>,
         revoked_by: Option<Uuid>,
     ) -> Result<AgentKeyRow, DbError> {
-        let row = sqlx::query!(
-            r#"
-            UPDATE agent_keys
-            SET status            = $2,
-                revocation_reason = COALESCE($3, revocation_reason),
-                revoked_by        = COALESCE($4, revoked_by)
-            WHERE id = $1
-            RETURNING
-                id, agent_id, public_key, key_type, status,
-                valid_from, valid_until, revocation_reason, revoked_by, created_at
-            "#,
-            key_id,
-            status,
-            revocation_reason,
-            revoked_by,
+        // Migration 118: `epigraph_agent_key_set_status` is a SECURITY DEFINER
+        // that admits only active -> rotated and (not revoked) -> revoked, and
+        // changes no column but status / revocation_reason / revoked_by. The
+        // application role holds no UPDATE on `agent_keys`.
+        let row = sqlx::query_as::<_, AgentKeyRow>(
+            "SELECT id, agent_id, public_key, key_type, status, valid_from, valid_until, \
+                    revocation_reason, revoked_by, created_at \
+             FROM public.epigraph_agent_key_set_status($1, $2, $3, $4)",
         )
+        .bind(key_id)
+        .bind(status)
+        .bind(revocation_reason)
+        .bind(revoked_by)
         .fetch_optional(pool)
         .await?;
 
-        match row {
-            Some(r) => Ok(AgentKeyRow {
-                id: r.id,
-                agent_id: r.agent_id,
-                public_key: r.public_key,
-                key_type: r.key_type,
-                status: r.status,
-                valid_from: r.valid_from,
-                valid_until: r.valid_until,
-                revocation_reason: r.revocation_reason,
-                revoked_by: r.revoked_by,
-                created_at: r.created_at,
-            }),
-            None => Err(DbError::NotFound {
-                entity: "AgentKey".to_string(),
-                id: key_id,
-            }),
-        }
+        row.ok_or_else(|| DbError::NotFound {
+            entity: "AgentKey".to_string(),
+            id: key_id,
+        })
     }
 
     /// Full update of a key row.
+    ///
+    /// A direct UPDATE of every mutable column. Since migration 118 the
+    /// application role holds no UPDATE on `agent_keys`, so this runs only on a
+    /// privileged connection; the request path uses [`Self::update_status`].
     ///
     /// Replaces all mutable fields. Used by `KeyManager::rotate_key` and
     /// `KeyManager::revoke_key` after in-memory state changes.

@@ -301,6 +301,30 @@ pub struct DecideCandidateRequest {
     pub verdict: String,
 }
 
+/// The retirement, on the MAINTENANCE connection (migration 118).
+///
+/// `stale` is an administrative state: `match_candidates_stale_guard` refuses
+/// the flip on a non-privileged session, and the retirement's cascade deletes
+/// the matcher edge's derived rows, which are not the caller's. The route's
+/// `claims:admin` scope is what authorizes it; the connection is what the
+/// database checks. Fail-closed: a state without a `ScopedPool`, or a
+/// maintenance DSN that is not privileged, gets an error, never the
+/// application pool.
+#[cfg(feature = "db")]
+async fn retire_on_maintenance(
+    state: &AppState,
+    id: Uuid,
+    decided_by: Option<Uuid>,
+) -> Result<epigraph_db::repos::match_candidate::RetirementOutcome, ApiError> {
+    let mut session = state
+        .maintenance_viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("retirement needs the maintenance connection: {e}"),
+        })?;
+    map_sqlx(epigraph_db::MatchCandidateRepo::retire_conn(session.conn(), id, decided_by).await)
+}
+
 #[cfg(feature = "db")]
 pub async fn decide_candidate(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -382,12 +406,7 @@ pub async fn decide_candidate(
 
     match req.verdict.as_str() {
         "retire" => {
-            let outcome =
-                repo.retire(id, decided_by)
-                    .await
-                    .map_err(|e| ApiError::DatabaseError {
-                        message: e.to_string(),
-                    })?;
+            let outcome = retire_on_maintenance(&state, id, decided_by).await?;
 
             // Deliberately NOT followed by `recompute_claim_belief_binary`.
             // That entry point recombines `mass_functions`, and a matcher

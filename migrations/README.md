@@ -447,9 +447,39 @@ Current reservation:
   ref and no open PR carries a `110`. **Applied to a throwaway database only,
   NOT to any deployed database.**
 
-- **111+**: public next
+- **111–117**: claimed by open pull requests at the time `118` was written
+  (111/112 and 116 batch H-b / HTTP-id, 113 batch R2, 114 W-own, 115 W9, 117
+  W10). Not allocated by this file.
+- **118**: public `app_role_table_lockdown` (batch W11). The application role
+  no longer holds UPDATE/DELETE on credential and ledger tables. REVOKEs
+  INSERT/UPDATE/DELETE/TRUNCATE from `epigraph_app` on `_sqlx_migrations` and the
+  four tenancy bookkeeping tables (and INSERT/UPDATE/DELETE on
+  `_sqlx_migrations` from `epigraph_maintenance`); REVOKEs UPDATE/DELETE on
+  `refresh_tokens`, `oauth_authorization_codes`, `oauth_authorize_sessions`,
+  `oauth_clients` and `agent_keys`, after moving every request-path UPDATE/DELETE
+  on them into a SECURITY DEFINER owned by `epigraph_maintenance` (refresh
+  check / atomic rotate / revoke / revoke-client, code consume, session
+  to-consent / take, client lock-for-link / write-once link / audited approve,
+  agent-key set-status with no un-revoke). `refresh_tokens` gains nullable
+  `family_id` and `revoked_reason`; presenting a token spent by rotation revokes
+  its family and writes an `oauth.refresh_token_reuse` security event.
+  `agents`: table UPDATE/DELETE revoked, UPDATE granted back on the profile
+  columns only. `match_candidates`: DELETE revoked and the
+  `match_candidates_stale_guard` trigger refuses the transition to `stale` on a
+  non-privileged session, so retirement runs on the maintenance connection.
+  The remaining tables without row security that the application role may
+  update or delete are an explicit, justified allowlist in
+  `epigraph-db/tests/app_role_table_lockdown.rs`. **Ordering:** it uses no
+  object 111–117 create, replaces no function they create, and none of them
+  grants table privileges, so 118-then-111..117 (sqlx applies a lower pending
+  version after a higher applied one) and 111..118 in order end in the same
+  catalog (measured). After 118 is applied, a binary that does not embed it is
+  refused by the head check unless `--allow-db-ahead`, so every open branch must
+  merge `main` (with 118) before it deploys. **Undo:** the GRANTs are listed at
+  the end of the file. **Applied to a throwaway database only.**
+- **119+**: public next
 
-Next public migration **outside both reserved tenancy ranges** must be `111` or
+Next public migration **outside both reserved tenancy ranges** must be `119` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

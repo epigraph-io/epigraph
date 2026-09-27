@@ -113,10 +113,10 @@ impl AuthorizeSessionRepository {
         resolved_oauth_client_id: Uuid,
         granted_scopes: &[String],
     ) -> Result<Option<AuthorizeSessionRow>, DbError> {
+        // Migration 118: the UPDATE runs in `epigraph_oauth_session_to_consent`
+        // (a SECURITY DEFINER wrapping the same statement).
         let row = sqlx::query_as::<_, SessionTuple>(&format!(
-            "UPDATE oauth_authorize_sessions \
-             SET state = $2, resolved_oauth_client_id = $3, granted_scopes = $4 \
-             WHERE state = $1 AND expires_at > now() RETURNING {SESSION_COLS}"
+            "SELECT {SESSION_COLS} FROM public.epigraph_oauth_session_to_consent($1, $2, $3, $4)"
         ))
         .bind(from_state)
         .bind(to_state)
@@ -131,11 +131,13 @@ impl AuthorizeSessionRepository {
     /// Fetch + delete (single-use) by state, only if unexpired. The consent POST handler
     /// uses this to consume the consent ticket atomically before minting a code.
     pub async fn take(pool: &PgPool, state: &str) -> Result<Option<AuthorizeSessionRow>, DbError> {
+        // Migration 118: the single-use DELETE runs in `epigraph_oauth_session_take`.
         let row = sqlx::query_as::<_, SessionTuple>(&format!(
-            "DELETE FROM oauth_authorize_sessions WHERE state = $1 AND expires_at > now() RETURNING {SESSION_COLS}"
+            "SELECT {SESSION_COLS} FROM public.epigraph_oauth_session_take($1)"
         ))
         .bind(state)
-        .fetch_optional(pool).await
+        .fetch_optional(pool)
+        .await
         .map_err(|e| DbError::QueryFailed { source: e })?;
         Ok(row.map(to_row))
     }

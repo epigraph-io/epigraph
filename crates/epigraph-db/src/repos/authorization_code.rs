@@ -68,11 +68,12 @@ impl AuthorizationCodeRepository {
                 DateTime<Utc>,
             ),
         >(
-            r#"UPDATE oauth_authorization_codes
-               SET used_at = now()
-               WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now()
-               RETURNING client_id, oauth_client_id, redirect_uri, code_challenge,
-                         scopes, used_at, expires_at"#,
+            // Migration 118: the single-use UPDATE runs in a SECURITY DEFINER
+            // (`epigraph_oauth_code_consume`, the same statement); the
+            // application role no longer holds UPDATE on this table.
+            r#"SELECT client_id, oauth_client_id, redirect_uri, code_challenge,
+                      scopes, used_at, expires_at
+               FROM public.epigraph_oauth_code_consume($1)"#,
         )
         .bind(code_hash)
         .fetch_optional(pool)

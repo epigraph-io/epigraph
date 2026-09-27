@@ -1072,6 +1072,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          and membership decisions made under the old identity.",
     ),
     (
+        "match_candidate.rs",
+        "retire_conn",
+        "ADMINISTRATIVE WRITE on the maintenance connection (migration 118). The body is the old \
+         `retire`'s, moved behind a connection parameter so the HTTP route can run it on the \
+         maintenance session: `match_candidates` carries no tenancy, and the flip to `stale` is \
+         refused on any non-privileged session by `match_candidates_stale_guard`, so the \
+         connection, not a viewer, is the control. The route's `claims:admin` scope authorizes it.",
+    ),
+    (
         "privatization.rs",
         "create_previewed_plan",
         "WRITE of one `privatization_plans` row in the `previewed` state. `privatization_plans` \

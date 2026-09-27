@@ -159,7 +159,10 @@ pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};
 pub use pattern_template::{PatternTemplateRepository, PatternTemplateRow};
 pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORIZER_ID};
-pub use refresh_token::{RefreshTokenRepository, RefreshTokenRow};
+pub use refresh_token::{
+    RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
+    RefreshTokenRow,
+};
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
 pub use span::{SpanRepository, SpanRow};
 pub use task::{TaskRepository, TaskRow};
