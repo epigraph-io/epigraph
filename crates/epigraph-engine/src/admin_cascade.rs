@@ -2,11 +2,13 @@
 //!
 //! # The rule
 //!
-//! A supersede, a dedup or a match-candidate retirement is two things:
+//! A supersede, a dedup, a consolidation or a match-candidate retirement is
+//! two things:
 //!
 //! * the CALLER's act -- retire its claim and insert the replacement, mark its
-//!   duplicate, flip the candidate to `stale` -- which runs with the caller's
-//!   own write authority on its own stamped transaction, exactly as before; and
+//!   duplicate, merge its sources, flip the candidate to `stale` -- which runs
+//!   with the caller's own write authority on its own stamped transaction,
+//!   exactly as before; and
 //! * the CASCADE that follows -- re-pointing and retracting edges other writers
 //!   asserted, moving, dropping and invalidating their edge-keyed BBAs, and
 //!   re-deriving belief downstream -- which touches rows the caller does not
@@ -14,22 +16,42 @@
 //!   privileged maintenance connection, with that connection's bypass viewer,
 //!   never with the caller's stamp.
 //!
-//! Every function here takes that maintenance connection. The request paths
-//! (MCP `supersede_claim` / `mark_duplicate` / `retire_match_candidate`, and the
-//! matching HTTP routes) commit the act first, then acquire the connection and
-//! call one of the `apply_after_*` functions. Each writes ONE `security_events`
-//! row ([`epigraph_db::repos::admin_cascade::EVENT_APPLIED`]) naming the
-//! triggering principal ([`CascadeTrigger`]), the cause, and what it touched.
+//! Every `apply_after_*` function here takes that maintenance connection. The
+//! request paths (MCP `supersede_claim` / `mark_duplicate` /
+//! `consolidate_claims` / `retire_match_candidate`, and the matching HTTP
+//! routes) acquire it BEFORE committing the act, commit the act, then call one
+//! of the `apply_after_*` functions.
+//!
+//! # The audit trail
+//!
+//! * The repair and its [`EVENT_APPLIED`] row commit in ONE transaction on the
+//!   maintenance connection, so an applied cross-owner repair never exists
+//!   without the row naming the triggering principal ([`CascadeTrigger`]), the
+//!   cause and what it touched (counts and ids).
+//! * A repair that fails rolls back and writes [`EVENT_FAILED`].
+//! * The belief re-derivation that follows is best-effort (per claim) and
+//!   writes its own [`EVENT_BELIEF`] row naming the applied row.
+//!
+//! # What the CALLER is told
+//!
+//! The caller triggered the cascade but cannot read every row it touched: an
+//! edge between another group's private claim and the caller's public one is
+//! re-pointed with the rest. So the result a tool or route returns is filtered
+//! to the caller's view: `cascade.touched` carries COUNTS only, the belief
+//! report keeps only claim ids the caller's viewer can read (and drops any
+//! error text naming anything else), and a failure's reason is generic. The
+//! ids live in the audit rows, which only a privileged session reads.
 //!
 //! # No maintenance connection: deferred, never skipped
 //!
 //! A server without an explicitly configured maintenance DSN cannot run the
 //! cascade. It still commits the caller's act, reports the cascade as
-//! [`CascadeState::Deferred`] with a reason, and writes a
-//! [`epigraph_db::repos::admin_cascade::EVENT_DEFERRED`] row through
-//! [`record_deferral`]. Every repair below re-verifies the committed act and is
-//! idempotent, so an operator replays a deferred cascade by running the same
-//! `apply_after_*` call on a maintenance connection later.
+//! [`CascadeState::Deferred`] with a reason, and writes an [`EVENT_DEFERRED`]
+//! row through [`record_deferral`] IN THE ACT'S OWN TRANSACTION, so the act and
+//! its deferral commit together. Every repair re-verifies the committed act
+//! and is idempotent, so [`replay_deferred`] runs the same `apply_after_*` call
+//! on a maintenance connection later (`replay_deferred_cascades`, a CLI on the
+//! operator's maintenance DSN).
 //!
 //! # Best-effort, like the belief cascade
 //!
@@ -37,11 +59,16 @@
 //! reported in the returned [`CascadeStatus`] (and in the audit row), never as
 //! an `Err` that would tell the caller a committed write failed.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use epigraph_db::repos::admin_cascade::{self as audit, EVENT_APPLIED, EVENT_DEFERRED};
+use epigraph_db::repos::admin_cascade::{
+    self as audit, EVENT_APPLIED, EVENT_BELIEF, EVENT_DEFERRED, EVENT_FAILED,
+};
 use epigraph_db::repos::match_candidate::RetirementOutcome;
+use epigraph_db::visibility::Viewer;
 use epigraph_db::{ClaimRepository, DbError, MatchCandidateRepo};
 
 use crate::retraction_cascade::{cascade_after_dedup, cascade_after_supersede, CascadeReport};
@@ -55,13 +82,15 @@ pub const REASON_NOT_CONFIGURED: &str =
      replay";
 
 /// What triggered an administrative cascade.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CascadeCause {
     /// A claim was superseded by its author.
     Supersede,
     /// A claim was marked a duplicate of a canonical claim.
     Dedup,
+    /// Two or more claims were consolidated into one merged claim.
+    Consolidate,
     /// A promoted match candidate was retired.
     MatchRetire,
 }
@@ -73,7 +102,20 @@ impl CascadeCause {
         match self {
             Self::Supersede => "supersede",
             Self::Dedup => "dedup",
+            Self::Consolidate => "consolidate",
             Self::MatchRetire => "match_retire",
+        }
+    }
+
+    /// The inverse of [`Self::as_str`].
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "supersede" => Some(Self::Supersede),
+            "dedup" => Some(Self::Dedup),
+            "consolidate" => Some(Self::Consolidate),
+            "match_retire" => Some(Self::MatchRetire),
+            _ => None,
         }
     }
 }
@@ -89,6 +131,15 @@ pub struct OauthPrincipal {
     pub agent_id: Option<Uuid>,
 }
 
+/// Where a replayed cascade came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayOrigin {
+    /// The `cascade.deferred` / `cascade.admin_failed` row being replayed.
+    pub deferred_event_id: Uuid,
+    /// Who ran the replay (the operator-supplied label of the replay run).
+    pub replayed_by: String,
+}
+
 /// Who triggered a cascade, and on what.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CascadeTrigger {
@@ -99,24 +150,88 @@ pub struct CascadeTrigger {
     pub agent_id: Option<Uuid>,
     /// The OAuth principal behind the request, where present.
     pub oauth: Option<OauthPrincipal>,
-    /// The retired claim (supersede), the duplicate (dedup), or the candidate
-    /// (match retirement).
+    /// The retired claim (supersede), the duplicate (dedup), the merged claim
+    /// (consolidate), or the candidate (match retirement).
     pub subject_id: Uuid,
     /// The replacement (supersede) or the canonical claim (dedup).
     pub object_id: Option<Uuid>,
+    /// The retired sources of a consolidation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<Uuid>,
+    /// Set when this run replays a deferred or failed cascade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_of: Option<ReplayOrigin>,
 }
 
 impl CascadeTrigger {
+    /// A trigger for a caller's act (not a replay, no consolidation sources).
+    #[must_use]
+    pub fn new(
+        cause: CascadeCause,
+        agent_id: Option<Uuid>,
+        oauth: Option<OauthPrincipal>,
+        subject_id: Uuid,
+        object_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            cause,
+            agent_id,
+            oauth,
+            subject_id,
+            object_id,
+            sources: Vec::new(),
+            replay_of: None,
+        }
+    }
+
     fn audit_details(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut trigger = serde_json::json!({
+            "agent_id": self.agent_id,
+            "oauth": self.oauth,
+            "subject_id": self.subject_id,
+            "object_id": self.object_id,
+        });
+        if !self.sources.is_empty() {
+            trigger["sources"] = serde_json::json!(self.sources);
+        }
+        let mut details = serde_json::json!({
             "cause": self.cause.as_str(),
-            "trigger": {
-                "agent_id": self.agent_id,
-                "oauth": self.oauth,
-                "subject_id": self.subject_id,
-                "object_id": self.object_id,
-            },
+            "trigger": trigger,
             "migration": 117,
+        });
+        if let Some(r) = &self.replay_of {
+            details["replay_of"] = serde_json::json!(r);
+        }
+        details
+    }
+
+    /// Rebuild the trigger an audit row recorded (for the replay). `None` when
+    /// the row does not carry a well-formed trigger.
+    #[must_use]
+    pub fn from_audit(details: &serde_json::Value) -> Option<Self> {
+        let cause = CascadeCause::parse(details.get("cause")?.as_str()?)?;
+        let t = details.get("trigger")?;
+        let uuid = |v: Option<&serde_json::Value>| -> Option<Uuid> {
+            v.and_then(serde_json::Value::as_str)
+                .and_then(|s| s.parse().ok())
+        };
+        let subject_id = uuid(t.get("subject_id"))?;
+        let sources = match t.get("sources") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => serde_json::from_value(v.clone()).ok()?,
+        };
+        let oauth = match t.get("oauth") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => serde_json::from_value(v.clone()).ok(),
+        };
+        Some(Self {
+            cause,
+            agent_id: uuid(t.get("agent_id")),
+            oauth,
+            subject_id,
+            object_id: uuid(t.get("object_id")),
+            sources,
+            replay_of: None,
         })
     }
 }
@@ -125,18 +240,22 @@ impl CascadeTrigger {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CascadeState {
-    /// It ran on the maintenance connection (`touched` says what it did; any
-    /// per-row failures are in the belief cascade's `errors`).
+    /// The repair ran on the maintenance connection and committed with its
+    /// audit row (`touched` counts what it did; per-claim belief failures are
+    /// in the belief report's `errors`).
     Applied,
     /// It did not run: no maintenance connection. The act committed.
     #[default]
     Deferred,
-    /// It started on the maintenance connection and its repair step failed.
-    /// The act committed; the repair is idempotent and can be replayed.
+    /// It started on the maintenance connection and its repair failed and
+    /// rolled back. The act committed; the repair is idempotent and replayable.
     Failed,
 }
 
 /// The `cascade` object a tool or route returns next to the caller's result.
+///
+/// This is the CALLER's copy: `touched` carries counts only and `reason` names
+/// no row. The full record is the audit row `audit_event_id` names.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CascadeStatus {
@@ -146,42 +265,31 @@ pub struct CascadeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// The `security_events` row recording it; `None` only when writing that
-    /// row itself failed (and then `audit_error` says why).
+    /// row itself failed (and then `audit_error` says so).
     pub audit_event_id: Option<Uuid>,
-    /// Why the audit row could not be written, when it could not.
+    /// The `security_events` row recording the belief re-derivation that
+    /// followed an applied repair, when it could be written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belief_audit_event_id: Option<Uuid>,
+    /// Set when an audit row could not be written.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_error: Option<String>,
-    /// What an applied cascade touched: counts and ids.
+    /// What an applied cascade touched, as COUNTS (the ids are in the audit
+    /// row).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub touched: Option<serde_json::Value>,
 }
 
-impl CascadeStatus {
-    /// A deferral whose audit row could not be written, for a caller that has
-    /// already committed the act and can only report.
-    #[must_use]
-    pub fn deferred_unaudited(reason: &str, audit_error: impl std::fmt::Display) -> Self {
-        Self {
-            status: CascadeState::Deferred,
-            reason: Some(reason.to_string()),
-            audit_event_id: None,
-            audit_error: Some(audit_error.to_string()),
-            touched: None,
-        }
-    }
-}
-
 /// Record that `trigger`'s cascade was deferred, on `executor`.
 ///
-/// A request path calls this on the CALLER's session -- inside the act's own
-/// transaction when it already knows no maintenance connection is configured,
-/// so the act and its audit row commit together -- which is why the row's
-/// `agent_id` must be the session principal (077's `security_events_append`).
+/// A request path calls this on the CALLER's session, inside the act's own
+/// transaction, so the act and its audit row commit together (or neither
+/// does); that is why the row's `agent_id` must be the session principal
+/// (077's `security_events_append`). The reason is the server's own text and
+/// names no row.
 ///
 /// # Errors
-/// The INSERT's error. A caller inside the act's transaction propagates it
-/// (nothing commits); one after the commit reports
-/// [`CascadeStatus::deferred_unaudited`].
+/// The INSERT's error; the caller propagates it, and nothing commits.
 pub async fn record_deferral<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     trigger: &CascadeTrigger,
@@ -201,67 +309,131 @@ pub async fn record_deferral<'e, E: sqlx::PgExecutor<'e>>(
         status: CascadeState::Deferred,
         reason: Some(reason.to_string()),
         audit_event_id: Some(id),
-        audit_error: None,
-        touched: None,
+        ..CascadeStatus::default()
     })
 }
 
-/// Append the applied/failed audit row on the maintenance connection and
-/// build the status. An audit failure is reported, never raised.
-async fn finish(
-    admin: &mut sqlx::PgConnection,
-    trigger: &CascadeTrigger,
-    state: CascadeState,
-    reason: Option<String>,
-    touched: serde_json::Value,
-    success: bool,
-) -> CascadeStatus {
-    let mut details = trigger.audit_details();
-    details["outcome"] = serde_json::to_value(state).unwrap_or(serde_json::Value::Null);
-    details["touched"] = touched.clone();
-    if let Some(r) = &reason {
-        details["reason"] = serde_json::Value::String(r.clone());
+/// Replace every array in `v` by its length, recursively: the caller's copy of
+/// what a cascade touched.
+fn counts_only(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Array(a) => serde_json::json!(a.len()),
+        serde_json::Value::Object(o) => {
+            serde_json::Value::Object(o.iter().map(|(k, v)| (k.clone(), counts_only(v))).collect())
+        }
+        other => other.clone(),
     }
-    let (audit_event_id, audit_error) = match audit::record(
-        &mut *admin,
-        EVENT_APPLIED,
-        trigger.agent_id,
-        success,
-        &details,
-    )
-    .await
-    {
-        Ok(id) => (Some(id), None),
+}
+
+/// Every UUID spelled inside `s`.
+fn uuids_in(s: &str) -> Vec<Uuid> {
+    s.split(|c: char| !(c.is_ascii_hexdigit() || c == '-'))
+        .filter(|t| t.len() == 36)
+        .filter_map(|t| t.parse().ok())
+        .collect()
+}
+
+/// Filter a belief report to what `caller` may read: claim ids outside its
+/// view are dropped, and an error that names anything but a claim it can read
+/// is replaced by a generic line. A bypass caller (a replay, a maintenance
+/// job) gets the report unchanged. If the filter itself cannot run, the
+/// caller gets no ids at all.
+pub async fn report_for_caller(
+    conn: &mut sqlx::PgConnection,
+    caller: &Viewer,
+    report: &CascadeReport,
+) -> CascadeReport {
+    if caller.is_bypass() {
+        return report.clone();
+    }
+    let mut ids: Vec<Uuid> = report
+        .targets
+        .iter()
+        .chain(&report.recomputed)
+        .chain(&report.unbacked)
+        .copied()
+        .collect();
+    for e in &report.errors {
+        ids.extend(uuids_in(e));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let visible = match ClaimRepository::visible_claim_ids(&mut *conn, caller, &ids).await {
+        Ok(v) => v,
         Err(e) => {
-            tracing::error!(
+            tracing::warn!(
                 target: "tenancy.admin_cascade",
-                cause = trigger.cause.as_str(),
-                subject = %trigger.subject_id,
                 error = %e,
-                "administrative cascade ran but its audit row could not be written"
+                "the cascade report could not be filtered to the caller's view; withholding it"
             );
-            (None, Some(e.to_string()))
+            return CascadeReport {
+                invalidated_bbas: report.invalidated_bbas,
+                errors: vec![
+                    "the cascade report could not be filtered to the caller's view; the \
+                     details are in the audit row"
+                        .to_string(),
+                ],
+                ..CascadeReport::default()
+            };
         }
     };
-    CascadeStatus {
-        status: state,
-        reason,
-        audit_event_id,
-        audit_error,
-        touched: Some(touched),
+    let keep = |v: &[Uuid]| {
+        v.iter()
+            .copied()
+            .filter(|id| visible.contains(id))
+            .collect()
+    };
+    CascadeReport {
+        targets: keep(&report.targets),
+        invalidated_bbas: report.invalidated_bbas,
+        recomputed: keep(&report.recomputed),
+        unbacked: keep(&report.unbacked),
+        errors: report
+            .errors
+            .iter()
+            .map(|e| {
+                if uuids_in(e).iter().all(|id| visible.contains(id)) {
+                    e.clone()
+                } else {
+                    "a cascade step failed on a row outside the caller's view; the details are \
+                     in the audit row"
+                        .to_string()
+                }
+            })
+            .collect(),
     }
 }
 
-fn report_json(report: &CascadeReport) -> serde_json::Value {
-    serde_json::json!({
-        "invalidated_bbas": report.invalidated_bbas,
-        "targets": report.targets,
-        "recomputed": report.recomputed,
-        "unbacked": report.unbacked,
-        "errors": report.errors,
-    })
+/// Filter a retirement outcome to what `caller` may read: endpoints and
+/// retracted edges between claims outside its view are dropped.
+pub async fn retirement_for_caller(
+    conn: &mut sqlx::PgConnection,
+    caller: &Viewer,
+    outcome: &RetirementOutcome,
+) -> RetirementOutcome {
+    if caller.is_bypass() {
+        return outcome.clone();
+    }
+    let mut ids: Vec<Uuid> = outcome.affected_claims.clone();
+    for e in &outcome.retracted_edges {
+        ids.push(e.source_id);
+        ids.push(e.target_id);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let visible = ClaimRepository::visible_claim_ids(&mut *conn, caller, &ids)
+        .await
+        .unwrap_or_default();
+    let mut out = outcome.clone();
+    out.affected_claims.retain(|id| visible.contains(id));
+    out.retracted_edges
+        .retain(|e| visible.contains(&e.source_id) && visible.contains(&e.target_id));
+    out
 }
 
+/// Record a repair that failed (and rolled back), on the maintenance
+/// connection, and build the caller's status: the reason it gets is generic,
+/// the audit row carries the error.
 async fn failed(
     admin: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
@@ -275,71 +447,215 @@ async fn failed(
         subject = %trigger.subject_id,
         "{reason}"
     );
-    finish(
-        admin,
-        trigger,
-        CascadeState::Failed,
-        Some(reason),
-        serde_json::json!({}),
-        false,
+    let mut details = trigger.audit_details();
+    details["outcome"] = serde_json::json!("failed");
+    details["reason"] = serde_json::Value::String(reason);
+    let (audit_event_id, audit_error) =
+        match audit::record(&mut *admin, EVENT_FAILED, trigger.agent_id, false, &details).await {
+            Ok(id) => (Some(id), None),
+            Err(e) => {
+                tracing::error!(
+                    target: "tenancy.admin_cascade",
+                    cause = trigger.cause.as_str(),
+                    subject = %trigger.subject_id,
+                    error = %e,
+                    "administrative cascade failed and its audit row could not be written"
+                );
+                (
+                    None,
+                    Some("the audit row could not be written; see the server log".to_string()),
+                )
+            }
+        };
+    CascadeStatus {
+        status: CascadeState::Failed,
+        reason: Some(format!(
+            "{step} failed on the maintenance connection; the caller's act committed, the \
+             repair rolled back and is replayable"
+        )),
+        audit_event_id,
+        audit_error,
+        ..CascadeStatus::default()
+    }
+}
+
+/// Run `repair` and write its [`EVENT_APPLIED`] row in ONE transaction on the
+/// maintenance connection. Returns the repair's outcome and the row's id, or
+/// the error text (the transaction rolled back; nothing of the repair or the
+/// row committed).
+macro_rules! repair_with_audit {
+    ($admin:expr, $trigger:expr, |$tx:ident| $repair:expr, |$out:ident| $touched:expr) => {{
+        let res: Result<_, String> = async {
+            let mut $tx = sqlx::Acquire::begin(&mut *$admin)
+                .await
+                .map_err(|e| e.to_string())?;
+            let $out = $repair.await.map_err(|e| e.to_string())?;
+            let mut details = $trigger.audit_details();
+            details["outcome"] = serde_json::json!("applied");
+            details["touched"] = $touched;
+            let id = audit::record(&mut *$tx, EVENT_APPLIED, $trigger.agent_id, true, &details)
+                .await
+                .map_err(|e| format!("the audit row could not be written: {e}"))?;
+            $tx.commit().await.map_err(|e| e.to_string())?;
+            Ok(($out, id, details["touched"].clone()))
+        }
+        .await;
+        res
+    }};
+}
+
+/// The belief audit row's id, or why it could not be written.
+type BeliefAudit = (Option<Uuid>, Option<String>);
+
+/// Write the belief re-derivation's row after the applied repair (best-effort).
+async fn record_belief(
+    admin: &mut sqlx::PgConnection,
+    trigger: &CascadeTrigger,
+    applied_event_id: Uuid,
+    report: &CascadeReport,
+) -> BeliefAudit {
+    let mut details = trigger.audit_details();
+    details["applied_event_id"] = serde_json::json!(applied_event_id);
+    details["belief"] = serde_json::json!({
+        "invalidated_bbas": report.invalidated_bbas,
+        "targets": report.targets,
+        "recomputed": report.recomputed,
+        "unbacked": report.unbacked,
+        "errors": report.errors,
+    });
+    match audit::record(
+        &mut *admin,
+        EVENT_BELIEF,
+        trigger.agent_id,
+        report.errors.is_empty(),
+        &details,
     )
     .await
+    {
+        Ok(id) => (Some(id), None),
+        Err(e) => {
+            tracing::error!(
+                target: "tenancy.admin_cascade",
+                cause = trigger.cause.as_str(),
+                subject = %trigger.subject_id,
+                error = %e,
+                "belief re-derivation ran but its audit row could not be written"
+            );
+            (
+                None,
+                Some("the belief audit row could not be written; see the server log".to_string()),
+            )
+        }
+    }
+}
+
+fn belief_counts(report: &CascadeReport) -> serde_json::Value {
+    serde_json::json!({
+        "invalidated_bbas": report.invalidated_bbas,
+        "targets": report.targets.len(),
+        "recomputed": report.recomputed.len(),
+        "unbacked": report.unbacked.len(),
+        "errors": report.errors.len(),
+    })
+}
+
+/// The applied status, the caller's copy.
+fn applied(
+    applied_event_id: Uuid,
+    touched: &serde_json::Value,
+    belief: Option<(&CascadeReport, BeliefAudit)>,
+) -> CascadeStatus {
+    let mut counts = counts_only(touched);
+    let (belief_audit_event_id, audit_error) = match belief {
+        Some((report, (id, err))) => {
+            counts["belief"] = belief_counts(report);
+            (id, err)
+        }
+        None => (None, None),
+    };
+    CascadeStatus {
+        status: CascadeState::Applied,
+        reason: None,
+        audit_event_id: Some(applied_event_id),
+        belief_audit_event_id,
+        audit_error,
+        touched: Some(counts),
+    }
 }
 
 /// The supersede cascade: migrate the retired claim's edges onto the
-/// replacement, then invalidate and re-derive the BBAs frozen from its
-/// interval ([`cascade_after_supersede`]).
+/// replacement (with its audit row, atomically), then invalidate and re-derive
+/// the BBAs frozen from its interval ([`cascade_after_supersede`]).
 ///
-/// `admin` must be the maintenance connection and `viewer` its bypass viewer
-/// (`MaintenanceSession::split`): the cascade walks downstream claims of any
-/// owner, and a caller's viewer would hide other groups' rows from it.
+/// `admin` must be the maintenance connection and `admin_viewer` its bypass
+/// viewer (`MaintenanceSession::split`): the cascade walks downstream claims of
+/// any owner, and a caller's viewer would hide other groups' rows from it.
+/// `caller` is the triggering caller's viewer; the returned status and report
+/// are filtered to it (see the module docs).
 pub async fn apply_after_supersede(
     admin: &mut sqlx::PgConnection,
-    viewer: &epigraph_db::visibility::Viewer,
+    admin_viewer: &Viewer,
+    caller: &Viewer,
     trigger: &CascadeTrigger,
     old_id: Uuid,
     new_id: Uuid,
 ) -> (CascadeStatus, CascadeReport) {
-    let migration =
-        match ClaimRepository::migrate_superseded_edges_conn(&mut *admin, old_id, new_id).await {
-            Ok(m) => m,
-            Err(e) => {
-                return (
-                    failed(admin, trigger, "the supersede edge migration", e).await,
-                    CascadeReport::default(),
-                )
-            }
-        };
-    let report = cascade_after_supersede(&mut *admin, viewer, new_id).await;
-    let touched = serde_json::json!({
-        "edges_retargeted": migration.retargeted,
-        "edges_resourced": migration.resourced,
-        "belief": report_json(&report),
-    });
-    let ok = report.errors.is_empty();
-    let status = finish(admin, trigger, CascadeState::Applied, None, touched, ok).await;
-    (status, report)
+    let repaired = repair_with_audit!(
+        admin,
+        trigger,
+        |tx| ClaimRepository::migrate_superseded_edges_conn(&mut tx, old_id, new_id),
+        |m| serde_json::json!({
+            "edges_retargeted": m.retargeted,
+            "edges_resourced": m.resourced,
+        })
+    );
+    let (_, applied_id, touched) = match repaired {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                failed(admin, trigger, "the supersede edge migration", e).await,
+                CascadeReport::default(),
+            )
+        }
+    };
+    let report = cascade_after_supersede(&mut *admin, admin_viewer, new_id).await;
+    let belief = record_belief(admin, trigger, applied_id, &report).await;
+    let status = applied(applied_id, &touched, Some((&report, belief)));
+    (status, report_for_caller(admin, caller, &report).await)
 }
 
 /// The dedup cascade: repair the edge and derived-record layers
-/// ([`ClaimRepository::repair_marked_duplicate_conn`]), then recompute and
-/// re-derive ([`cascade_after_dedup`]). `admin` / `viewer` as for
-/// [`apply_after_supersede`].
+/// ([`ClaimRepository::repair_marked_duplicate_conn`], with its audit row,
+/// atomically), then recompute and re-derive ([`cascade_after_dedup`]).
+/// `admin` / `admin_viewer` / `caller` as for [`apply_after_supersede`].
 pub async fn apply_after_dedup(
     admin: &mut sqlx::PgConnection,
-    viewer: &epigraph_db::visibility::Viewer,
+    admin_viewer: &Viewer,
+    caller: &Viewer,
     trigger: &CascadeTrigger,
     dup_id: Uuid,
     canonical_id: Uuid,
 ) -> (CascadeStatus, CascadeReport) {
     use epigraph_core::ClaimId;
-    let repair = match ClaimRepository::repair_marked_duplicate_conn(
-        &mut *admin,
-        ClaimId::from_uuid(dup_id),
-        ClaimId::from_uuid(canonical_id),
-    )
-    .await
-    {
+    let repaired = repair_with_audit!(
+        admin,
+        trigger,
+        |tx| ClaimRepository::repair_marked_duplicate_conn(
+            &mut tx,
+            ClaimId::from_uuid(dup_id),
+            ClaimId::from_uuid(canonical_id),
+        ),
+        |r| serde_json::json!({
+            "edges_retracted": r.retracted_edges,
+            "edges_retargeted": r.retargeted_edges,
+            "edges_resourced": r.resourced_edges.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            "bbas_deleted_with_retracted_edges": r.deleted_bbas,
+            "bbas_moved": r.moved_bbas,
+            "duplicate_copies_dropped": r.dropped_duplicate_copies,
+            "false_bindings_not_copied": r.skipped_false_bindings,
+        })
+    );
+    let (repair, applied_id, touched) = match repaired {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -348,46 +664,258 @@ pub async fn apply_after_dedup(
             )
         }
     };
-    let report = cascade_after_dedup(&mut *admin, viewer, canonical_id, &repair).await;
-    let touched = serde_json::json!({
-        "edges_retracted": repair.retracted_edges,
-        "edges_retargeted": repair.retargeted_edges,
-        "edges_resourced": repair.resourced_edges.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-        "bbas_deleted_with_retracted_edges": repair.deleted_bbas,
-        "bbas_moved": repair.moved_bbas,
-        "duplicate_copies_dropped": repair.dropped_duplicate_copies,
-        "false_bindings_not_copied": repair.skipped_false_bindings,
-        "belief": report_json(&report),
-    });
-    let ok = report.errors.is_empty();
-    let status = finish(admin, trigger, CascadeState::Applied, None, touched, ok).await;
-    (status, report)
+    let report = cascade_after_dedup(&mut *admin, admin_viewer, canonical_id, &repair).await;
+    let belief = record_belief(admin, trigger, applied_id, &report).await;
+    let status = applied(applied_id, &touched, Some((&report, belief)));
+    (status, report_for_caller(admin, caller, &report).await)
+}
+
+/// The consolidation cascade: migrate the retired sources' live edges onto
+/// the merged claim and retract the redundant copies
+/// ([`ClaimRepository::migrate_consolidated_edges_conn`], with its audit row,
+/// atomically). `trigger.subject_id` is the merged claim and
+/// `trigger.sources` the retired sources. No belief cascade follows, as none
+/// did before the split.
+pub async fn apply_after_consolidate(
+    admin: &mut sqlx::PgConnection,
+    trigger: &CascadeTrigger,
+) -> CascadeStatus {
+    let merged_id = trigger.subject_id;
+    let sources = trigger.sources.clone();
+    let repaired = repair_with_audit!(
+        admin,
+        trigger,
+        |tx| ClaimRepository::migrate_consolidated_edges_conn(&mut tx, merged_id, &sources),
+        |m| serde_json::json!({
+            "edges_migrated": m.migrated,
+            "edges_retracted": m.retracted,
+        })
+    );
+    match repaired {
+        Ok((_, applied_id, touched)) => applied(applied_id, &touched, None),
+        Err(e) => failed(admin, trigger, "the consolidation edge migration", e).await,
+    }
 }
 
 /// The match-candidate retirement cascade: retract the candidate's matcher
 /// edges and remove their derived rows
-/// ([`MatchCandidateRepo::retract_candidate_edges_conn`]).
+/// ([`MatchCandidateRepo::retract_candidate_edges_conn`], with its audit row,
+/// atomically). The returned outcome is filtered to `caller`.
 pub async fn apply_after_match_retire(
     admin: &mut sqlx::PgConnection,
+    caller: &Viewer,
     trigger: &CascadeTrigger,
     candidate_id: Uuid,
 ) -> (CascadeStatus, Option<RetirementOutcome>) {
-    match MatchCandidateRepo::retract_candidate_edges_conn(&mut *admin, candidate_id).await {
-        Ok(outcome) => {
-            let touched = serde_json::json!({
-                "edges_retracted": outcome.retracted_edges.iter().map(|e| e.edge_id).collect::<Vec<_>>(),
-                "edges_retracted_now": outcome.edges_retracted,
-                "factors_deleted": outcome.factors_deleted,
-                "bp_messages_deleted": outcome.bp_messages_deleted,
-                "bbas_invalidated": outcome.bbas_invalidated,
-                "affected_claims": outcome.affected_claims,
-            });
-            let status = finish(admin, trigger, CascadeState::Applied, None, touched, true).await;
+    let repaired = repair_with_audit!(
+        admin,
+        trigger,
+        |tx| MatchCandidateRepo::retract_candidate_edges_conn(&mut tx, candidate_id),
+        |o| serde_json::json!({
+            "edges_retracted": o.retracted_edges.iter().map(|e| e.edge_id).collect::<Vec<_>>(),
+            "edges_retracted_now": o.edges_retracted,
+            "factors_deleted": o.factors_deleted,
+            "bp_messages_deleted": o.bp_messages_deleted,
+            "bbas_invalidated": o.bbas_invalidated,
+            "affected_claims": o.affected_claims,
+        })
+    );
+    match repaired {
+        Ok((outcome, applied_id, touched)) => {
+            let status = applied(applied_id, &touched, None);
+            let outcome = retirement_for_caller(admin, caller, &outcome).await;
             (status, Some(outcome))
         }
         Err(e) => (
             failed(admin, trigger, "the match-candidate retirement cascade", e).await,
             None,
         ),
+    }
+}
+
+/// One replayed cascade.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayItem {
+    /// The deferred (or failed) row replayed.
+    pub deferred_event_id: Uuid,
+    /// Its cause, when the row carried one.
+    pub cause: Option<CascadeCause>,
+    /// Its subject, when the row carried one.
+    pub subject_id: Option<Uuid>,
+    /// What the replay did.
+    pub status: CascadeStatus,
+}
+
+/// What [`replay_deferred`] did.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReplayReport {
+    /// Rows still pending when the run started (up to the limit).
+    pub pending: usize,
+    /// Cascades applied by this run.
+    pub applied: usize,
+    /// Cascades whose repair failed again (still pending).
+    pub failed: usize,
+    /// Rows whose trigger could not be read (left pending, reported).
+    pub unreadable: usize,
+    /// One entry per row considered.
+    pub items: Vec<ReplayItem>,
+}
+
+/// Replay every deferred or failed administrative cascade that has no later
+/// [`EVENT_APPLIED`] row for the same cause and subject, oldest first, up to
+/// `limit` rows. Runs on the maintenance connection with its bypass viewer.
+///
+/// Each replay runs the same `apply_after_*` call the request path would have,
+/// with the trigger the deferral recorded (so the applied row still names the
+/// original caller) plus `replay_of` naming the deferral and `replayed_by`.
+/// Every repair re-verifies the committed act, so a deferral whose act was
+/// since undone fails loudly instead of repairing, and is left pending.
+///
+/// # Errors
+/// Only the pending-row query's error; each cascade's own failure is reported
+/// in its [`ReplayItem`].
+pub async fn replay_deferred(
+    admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
+    replayed_by: &str,
+    limit: i64,
+) -> Result<ReplayReport, DbError> {
+    let rows = audit::pending_replays(&mut *admin, limit).await?;
+    let mut report = ReplayReport {
+        pending: rows.len(),
+        ..ReplayReport::default()
+    };
+    let mut seen: HashSet<(CascadeCause, Uuid)> = HashSet::new();
+    for (event_id, details) in rows {
+        let Some(mut trigger) = CascadeTrigger::from_audit(&details) else {
+            report.unreadable += 1;
+            report.items.push(ReplayItem {
+                deferred_event_id: event_id,
+                cause: None,
+                subject_id: None,
+                status: CascadeStatus {
+                    status: CascadeState::Deferred,
+                    reason: Some("the deferral row carries no readable trigger".to_string()),
+                    audit_event_id: Some(event_id),
+                    ..CascadeStatus::default()
+                },
+            });
+            continue;
+        };
+        if !seen.insert((trigger.cause, trigger.subject_id)) {
+            continue;
+        }
+        trigger.replay_of = Some(ReplayOrigin {
+            deferred_event_id: event_id,
+            replayed_by: replayed_by.to_string(),
+        });
+        let subject = trigger.subject_id;
+        let status = match (trigger.cause, trigger.object_id) {
+            (CascadeCause::Supersede, Some(new_id)) => {
+                apply_after_supersede(admin, admin_viewer, admin_viewer, &trigger, subject, new_id)
+                    .await
+                    .0
+            }
+            (CascadeCause::Dedup, Some(canonical)) => {
+                apply_after_dedup(
+                    admin,
+                    admin_viewer,
+                    admin_viewer,
+                    &trigger,
+                    subject,
+                    canonical,
+                )
+                .await
+                .0
+            }
+            (CascadeCause::Consolidate, _) => apply_after_consolidate(admin, &trigger).await,
+            (CascadeCause::MatchRetire, _) => {
+                apply_after_match_retire(admin, admin_viewer, &trigger, subject)
+                    .await
+                    .0
+            }
+            (CascadeCause::Supersede | CascadeCause::Dedup, None) => {
+                report.unreadable += 1;
+                report.items.push(ReplayItem {
+                    deferred_event_id: event_id,
+                    cause: Some(trigger.cause),
+                    subject_id: Some(subject),
+                    status: CascadeStatus {
+                        status: CascadeState::Deferred,
+                        reason: Some("the deferral row names no object claim".to_string()),
+                        audit_event_id: Some(event_id),
+                        ..CascadeStatus::default()
+                    },
+                });
+                continue;
+            }
+        };
+        match status.status {
+            CascadeState::Applied => report.applied += 1,
+            _ => report.failed += 1,
+        }
+        report.items.push(ReplayItem {
+            deferred_event_id: event_id,
+            cause: Some(trigger.cause),
+            subject_id: Some(subject),
+            status,
+        });
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_only_replaces_every_array_by_its_length() {
+        let v = serde_json::json!({
+            "edges_retargeted": [Uuid::nil(), Uuid::nil()],
+            "bbas_moved": 3,
+            "belief": {"targets": [Uuid::nil()], "errors": []},
+        });
+        assert_eq!(
+            counts_only(&v),
+            serde_json::json!({
+                "edges_retargeted": 2,
+                "bbas_moved": 3,
+                "belief": {"targets": 1, "errors": 0},
+            })
+        );
+    }
+
+    #[test]
+    fn uuids_in_finds_every_spelled_uuid() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let found = uuids_in(&format!("target {a}: failed (edge {b}); code 42501"));
+        assert_eq!(found, vec![a, b]);
+        assert!(uuids_in("no ids here, just 42501").is_empty());
+    }
+
+    #[test]
+    fn a_trigger_round_trips_through_its_audit_row() {
+        let mut t = CascadeTrigger::new(
+            CascadeCause::Consolidate,
+            Some(Uuid::new_v4()),
+            Some(OauthPrincipal {
+                client_id: Some(Uuid::new_v4()),
+                owner_id: None,
+                agent_id: None,
+            }),
+            Uuid::new_v4(),
+            None,
+        );
+        t.sources = vec![Uuid::new_v4(), Uuid::new_v4()];
+        assert_eq!(CascadeTrigger::from_audit(&t.audit_details()), Some(t));
+        for c in [
+            CascadeCause::Supersede,
+            CascadeCause::Dedup,
+            CascadeCause::Consolidate,
+            CascadeCause::MatchRetire,
+        ] {
+            assert_eq!(CascadeCause::parse(c.as_str()), Some(c));
+        }
     }
 }
