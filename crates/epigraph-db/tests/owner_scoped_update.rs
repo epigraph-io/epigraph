@@ -519,3 +519,63 @@ async fn no_other_table_restamps_its_owner_on_update(pool: PgPool) {
         "a BEFORE UPDATE trigger that restamps an owner appeared or moved"
     );
 }
+
+/// The restrictive WITH CHECK where 077's permissive one would admit: an edge
+/// W's group owns with `visibility = 'public'` between two public claims. W
+/// may update it, but re-pointing its source at another public claim makes the
+/// restamp stamp it `('public', world)` -- a row nobody owns, which 077's world
+/// arm admits and 117's WITH CHECK refuses. W cannot hand its edge to nobody.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_owner_cannot_hand_its_edge_to_nobody_by_repointing_it(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, g) = fixture::seed_agent_with_group(&pool, "owner-w").await;
+    let a = fixture::seed_public_claim(&pool, author, "public claim A").await;
+    let b = fixture::seed_public_claim(&pool, author, "public claim B").await;
+    let c = fixture::seed_public_claim(&pool, author, "public claim C").await;
+    let edge = fixture::seed_edge_owned_by(&pool, a, b, "public", g).await;
+    let before = edge_row(&pool, edge).await;
+    assert_eq!(
+        (before.2, before.3),
+        (g, None),
+        "fixture shape: W's group owns it"
+    );
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (relabel, repoint) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        let relabel = update(
+            &mut conn,
+            "UPDATE edges SET properties = properties || jsonb_build_object('by', $2::text) \
+             WHERE id = $1",
+            edge,
+            w,
+        )
+        .await;
+        let repoint = update(
+            &mut conn,
+            "UPDATE edges SET source_id = $2 WHERE id = $1",
+            edge,
+            c,
+        )
+        .await;
+        (conn, (relabel, repoint))
+    })
+    .await;
+    assert_eq!(
+        relabel,
+        Ok(1),
+        "calibration: the owner updates its edge in place"
+    );
+    assert_eq!(
+        repoint,
+        Err("42501".to_string()),
+        "a re-point whose restamp leaves the edge world-owned is refused"
+    );
+    let after = edge_row(&pool, edge).await;
+    assert_eq!(
+        (after.0, after.2),
+        (a, g),
+        "the edge kept its source and owner"
+    );
+}
