@@ -63,8 +63,13 @@
 -- WHAT THIS DOES NOT CHANGE: 077's INSERT arm (a new edge between two public
 -- endpoints still arrives world-owned, and is still admitted), and 115's
 -- `edges_delete_owner`, whose source-writer arm still lets the writer of a
--- world edge's SOURCE delete it. That leaves one stated asymmetry: such a
--- writer may DELETE its world edge but may not retract or re-point it. The
+-- world edge's SOURCE delete it. That arm is a non-owner DELETE, and whether
+-- it survives the rule that a non-privileged DELETE is owner/co-owner scoped
+-- is an OPEN operator decision, not settled here: the workflow step rewire
+-- (`workflow_steps.rs`) deletes world `step_follows` edges through it on the
+-- application role, and removing it would move every world-edge delete onto
+-- the administrative connection. Until that decision, such a writer may
+-- DELETE a world edge from its source but may not retract or re-point it. The
 -- retraction, the property patch and the re-point of an edge nobody owns are
 -- privileged operations after this file.
 --
