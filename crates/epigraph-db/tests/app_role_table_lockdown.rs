@@ -31,6 +31,9 @@
 //!   `the_app_role_cannot_make_a_match_candidate_stale`.
 //! * table-level UPDATE on `agents` kept: fails
 //!   `agents_identity_columns_are_not_app_updatable`.
+//! * the maintenance role's DELETE on the derived rows withheld: fails
+//!   `the_app_role_cannot_make_a_match_candidate_stale` (42501 on
+//!   `bp_messages` during the maintenance-role retirement).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -344,6 +347,7 @@ async fn agents_identity_columns_are_not_app_updatable(pool: PgPool) {
         "agent_type",
         "role",
         "state",
+        "metadata",
     ] {
         let r = sqlx::query(&format!("UPDATE agents SET {col} = {col} WHERE id = $1"))
             .bind(agent)
@@ -364,7 +368,7 @@ async fn agents_identity_columns_are_not_app_updatable(pool: PgPool) {
     // The profile columns the live paths write still work, on the own row.
     let n = sqlx::query(
         "UPDATE agents SET display_name = 'w11', labels = '{a}', properties = properties, \
-                metadata = metadata, orcid = NULL, ror_id = NULL, updated_at = now() \
+                orcid = NULL, ror_id = NULL, updated_at = now() \
           WHERE id = $1",
     )
     .bind(agent)
@@ -1014,4 +1018,55 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
     .await
     .expect("matcher re-touch of a stale row on the application role");
     assert_eq!(status_of(&pool, id).await, "stale");
+}
+
+/// The derived BP tables stay writable by the application role (they are on the
+/// allowlist): factor insert, BP-message upsert (INSERT ... ON CONFLICT DO
+/// UPDATE, which needs UPDATE) and the clear before a propagation run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn factor_and_bp_message_writes_still_work_on_the_app_role(pool: PgPool) {
+    use epigraph_db::FactorRepository;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "w11-bp").await;
+    let a = fixture::seed_public_claim(&pool, agent, &format!("w11 bp a {}", Uuid::new_v4())).await;
+    let b = fixture::seed_public_claim(&pool, agent, &format!("w11 bp b {}", Uuid::new_v4())).await;
+    let app = app_pool(&pool, 2).await;
+
+    let factor = FactorRepository::insert(
+        &app,
+        "evidential_support",
+        &[a, b],
+        &serde_json::json!({"strength": 0.7}),
+        Some("w11 app-role factor"),
+        None,
+    )
+    .await
+    .expect("factor insert on the application role");
+    for iteration in [1, 2] {
+        FactorRepository::upsert_bp_message(
+            &app,
+            factor,
+            a,
+            "factor_to_var",
+            &serde_json::json!([0.6, 0.4]),
+            iteration,
+        )
+        .await
+        .expect("bp message upsert on the application role");
+    }
+    let iteration: i32 = sqlx::query_scalar(
+        "SELECT iteration FROM bp_messages WHERE factor_id = $1 AND variable_id = $2",
+    )
+    .bind(factor)
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        iteration, 2,
+        "the second upsert took the ON CONFLICT DO UPDATE arm"
+    );
+    let cleared = FactorRepository::clear_bp_messages(&app)
+        .await
+        .expect("clear on the application role");
+    assert!(cleared >= 1);
 }

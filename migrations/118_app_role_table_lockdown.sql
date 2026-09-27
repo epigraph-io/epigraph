@@ -426,16 +426,18 @@ END $$;
 -- ===================================================================
 -- 077's row policies already confine an application UPDATE to the session's
 -- own agent and admit no DELETE. What they do not confine is the COLUMN: a
--- session could rewrite its own `public_key` or `key_kind`. The live
+-- session could rewrite its own `public_key` or `key_kind` (or its own
+-- `role`, `state`, or the reputation kept in `metadata`). The live
 -- application writes are `AgentRepository::update` (display_name, labels,
--- orcid, ror_id), `set_llm_properties` (properties) and the reputation job
--- (metadata), each with updated_at. A column GRANT is only additive, so the
--- table-level UPDATE goes first.
+-- orcid, ror_id) and `set_llm_properties` (properties), each with
+-- updated_at; the reputation writer of `metadata` has no application-role
+-- caller. A column GRANT is only additive, so the table-level UPDATE goes
+-- first.
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'REVOKE UPDATE, DELETE, TRUNCATE ON public.agents FROM epigraph_app';
-        EXECUTE 'GRANT UPDATE (display_name, labels, orcid, ror_id, properties, metadata, '
-                'updated_at) ON public.agents TO epigraph_app';
+        EXECUTE 'GRANT UPDATE (display_name, labels, orcid, ror_id, properties, updated_at) '
+                'ON public.agents TO epigraph_app';
     END IF;
 END $$;
 
