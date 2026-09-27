@@ -264,9 +264,27 @@
 -- maintenance role). A WITH CHECK cannot see the OLD row, so this has to be a
 -- trigger. `UPDATE OF` fires only when the statement's SET list names the
 -- column, so the tenancy triggers that restamp an owner from the row's parent
--- or endpoints (074, 070/072) are unaffected, and the propagation, privatization,
--- backfill and operator re-own paths all run as the maintenance role. No
--- application path re-owns one of these rows.
+-- or endpoints (074, 070/072) are unaffected. The propagation, privatization,
+-- backfill and operator re-own paths are privileged sessions (a maintenance
+-- DSN login, or a maintenance-owned definer body); the application's own
+-- statements cannot re-own one of these rows.
+--
+-- WHAT THE GUARD DOES NOT BIND: a re-own issued by a maintenance-owned
+-- DEFINER on behalf of a non-privileged statement. Inside such a body
+-- `current_user` is the maintenance role, so the guard admits it, by design
+-- (it is what lets arm (d) propagate a claim's tenancy). Two definers restamp
+-- an owner in response to an ordinary application write, and each is a
+-- re-own vector unless something else bounds it:
+--   * 089's fragment stamp, fired by an INSERT into
+--     `harvester_claim_provenance`. It would move a sentinel-owned fragment
+--     into the citing claim's group, whoever wrote the fragment and whoever
+--     else cites it, after which that group's writer could DELETE it and the
+--     FK cascade would take every other claim's provenance row with it.
+--     Section 9 closes it: the stamp now runs only for a session that could
+--     itself have written a sentinel-owned fragment.
+--   * 070/072's edge tenancy, fired by an UPDATE that re-points an edge's
+--     endpoints. It stays a recorded residual of the same class (the UPDATE
+--     side of 077 on `edges`, section 0), not closed here.
 --
 -- ===================================================================
 -- 8. THE GROUP-KEYED SEALED-CONTENT TABLES
@@ -288,6 +306,52 @@
 -- when a table whose permissive DELETE-covering policy admits on the read
 -- set has no restrictive DELETE policy and is not on its short allow-list.
 --
+-- ===================================================================
+-- 9. THE 089 FRAGMENT STAMP, GATED ON THE SESSION
+-- ===================================================================
+--
+-- 089's `epigraph_inherit_fragment_tenancy_stmt` (AFTER INSERT on
+-- `harvester_claim_provenance`) moves a fragment owned by a sentinel (world or
+-- seed) into the citing claim's `(owner_group_id, visibility)`. It is a
+-- maintenance-owned definer, so section 7's guard admits it (see there), and
+-- it did not ask who wrote the fragment or who else cites it. So a session
+-- that can write nothing but its own group could cite a world-owned fragment
+-- from one of its own claims, own the fragment, and DELETE it as that group's
+-- writer; the FK cascade then removes every other claim's provenance row for
+-- it. Measured at head on a throwaway database, for a fragment already cited
+-- by another author's claim and for an uncited one alike.
+--
+-- The body is redefined here (CREATE OR REPLACE, same signature, so the owner
+-- and the ACL 089 set are preserved; 089 is not edited) with one addition: it
+-- stamps only when `epigraph_bypass()` holds, i.e. for a session whose
+-- `session_user` is a maintenance member or a superuser. `session_user`,
+-- because inside this definer `current_user` is always the maintenance role:
+-- `epigraph_definer_bypass()` and `epigraph_session_is_privileged_writer()`
+-- are both true there, which is the gap itself.
+--
+-- WHY THIS GATE AND NOT ANOTHER.
+--   * A sentinel-owned fragment can be WRITTEN only by such a session: 074
+--     raises 23502 on an undeclared insert from any other session, and
+--     `harvester_fragments_tenancy`'s WITH CHECK admits a sentinel owner only
+--     through its bypass disjuncts. Measured: a non-bypassing session that is
+--     a member of `epigraph_app` AND `epigraph_seed` has its seed-stamped
+--     fragment refused by that WITH CHECK. So the gate turns the stamp off
+--     exactly for the sessions that could never have written the rows it
+--     stamps; 089's own case (a harvester writes the fragment, then the
+--     provenance that links it) is unchanged, and no seed disjunct is needed.
+--   * "First citation only" (skip a fragment another claim already cites)
+--     was rejected: it still lets a session claim, then delete, an uncited
+--     world-owned fragment, which is the removal of a public row nobody owns
+--     that this file exists to stop.
+--   * "The cited claim must be writable by the session" was rejected: it is
+--     the tightening F-089-F records as an operator decision, and it would
+--     change the privileged harvester's behaviour too.
+--   * Nothing becomes more readable: a fragment the gate leaves unstamped was
+--     already public, and stays exactly as readable as it was. A privileged
+--     backfill or arm (d)'s propagation still stamps it.
+-- `owner_scoped_delete.rs::a_provenance_insert_does_not_hand_a_session_a_world_fragment`
+-- is the app-role pin, with a superuser arm showing the stamp still runs.
+--
 -- DEPLOY ORDER: apply 115 BEFORE any binary built with it serves: the repo
 -- layer calls `epigraph_cascade_delete_edge_bbas` for every non-privileged
 -- cascade. A binary built without 115 against a database at 115 runs its old
@@ -297,7 +361,9 @@
 -- `<table>_delete_writer` policies and the 21 `<table>_owner_immutable`
 -- triggers; point the three
 -- `<node>_cascade_edges` triggers back at `cascade_delete_edges('<type>')`;
--- restore 114's body of `epigraph_dedup_move_bbas`; DROP the four new
+-- restore 114's body of `epigraph_dedup_move_bbas` and 089's body of
+-- `epigraph_inherit_fragment_tenancy_stmt` (CREATE OR REPLACE, never DROP:
+-- a DROP resets the ACL to PUBLIC-executable); DROP the four new
 -- functions; REVOKE DELETE ON mass_functions, edges FROM epigraph_maintenance.
 -- Checked before claiming: no `origin/*` ref carries a `115`.
 
@@ -660,6 +726,36 @@ CREATE POLICY group_key_epochs_delete_writer ON public.group_key_epochs
         OR public.epigraph_is_group_creator(group_id));
 
 -- ===================================================================
+-- 9. THE 089 FRAGMENT STAMP, GATED ON THE SESSION
+-- ===================================================================
+-- 089's body; the only change is the `epigraph_bypass()` gate. See section 9
+-- of the header.
+CREATE OR REPLACE FUNCTION public.epigraph_inherit_fragment_tenancy_stmt() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+    -- `session_user`, not `current_user`: inside this definer the latter is
+    -- the maintenance owner. Only a session that could itself write a
+    -- sentinel-owned fragment stamps one.
+    IF NOT public.epigraph_bypass() THEN
+        RETURN NULL;
+    END IF;
+    UPDATE public.harvester_fragments f
+       SET owner_group_id = c.owner_group_id,
+           visibility     = c.visibility
+      FROM newprov n
+      JOIN public.claims c ON c.id = n.claim_id
+     WHERE f.id = n.fragment_id
+       AND f.owner_group_id IN (
+             '00000000-0000-0000-0000-000000000000'::uuid,
+             '00000000-0000-0000-0000-00000000dead'::uuid)
+       AND c.owner_group_id <> '00000000-0000-0000-0000-000000000000'::uuid
+       AND (f.owner_group_id, f.visibility)
+           IS DISTINCT FROM (c.owner_group_id, c.visibility);
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_inherit_fragment_tenancy_stmt() FROM PUBLIC;
+
+-- ===================================================================
 -- 6. OWNERSHIP AND GRANTS
 -- ===================================================================
 DO $$ BEGIN
@@ -673,6 +769,8 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_cascade_delete_node_edges() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_owner_immutable_guard() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_inherit_fragment_tenancy_stmt() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT DELETE ON public.mass_functions, public.edges TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_session_writes_node(uuid, text) '

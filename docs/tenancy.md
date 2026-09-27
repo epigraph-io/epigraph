@@ -112,6 +112,15 @@ the `#[sqlx::test]` harness — plus everything already on disk. **Declare both
 columns at the fragment's own insert site.** 089 is a backstop for the rows that
 predate a declaration, not a default to lean on.
 
+**Since migration 115 the stamp also runs only for a privileged session**
+(`epigraph_bypass()`: a maintenance-member or superuser `session_user`). A
+provenance INSERT from any other session leaves a sentinel-owned fragment
+exactly as it was. Such a session cannot write a sentinel-owned fragment in the
+first place (the `WITH CHECK` above), so the only fragments it could have
+stamped were somebody else's, and owning one would have let it DELETE the
+fragment and, through the FK cascade, every other claim's provenance row for
+it. The unstamped fragment was already public and stays so.
+
 One consequence worth knowing before you rely on it: a still-unstamped fragment
 cited by **both** a public claim and a group-private one becomes group-private the
 moment the private link is inserted, and so leaves the public claim's provenance.

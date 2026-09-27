@@ -1301,6 +1301,138 @@ async fn a_non_privileged_session_cannot_reown_a_row_and_then_delete_it(pool: Pg
     assert_eq!(n, 1, "a privileged session re-owns as before");
 }
 
+async fn insert_harvester_source(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO harvester_sources (id, content_hash, modality) VALUES ($1, $2, 'text')",
+    )
+    .bind(id)
+    .bind(id.as_bytes().to_vec())
+    .execute(pool)
+    .await
+    .expect("seed harvester source");
+    id
+}
+
+/// A fragment declared `('public', owner)`, written on the superuser pool (the
+/// only kind of session that may name a sentinel owner).
+async fn insert_public_fragment(pool: &PgPool, source: Uuid, owner: Uuid, text: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO harvester_fragments \
+             (id, source_id, content_hash, content_text, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, $4, 'public', $5)",
+    )
+    .bind(id)
+    .bind(source)
+    .bind(id.as_bytes().to_vec())
+    .bind(text)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("seed a sentinel-owned fragment");
+    id
+}
+
+async fn fragment_tenancy(pool: &PgPool, id: Uuid) -> (Uuid, String) {
+    sqlx::query_as("SELECT owner_group_id, visibility::text FROM harvester_fragments WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("read fragment {id}: {e}"))
+}
+
+/// Section 9: an INSERT cannot do what section 7 forbids an UPDATE to do.
+///
+/// 089's fragment stamp is a maintenance-owned definer, so section 7's guard
+/// admits the re-own it performs. Before section 9 a bystander T, writable only
+/// on its own group, cited three sentinel-owned fragments from its own claims
+/// (one already cited by another author's world claim, one uncited, one on the
+/// seed sentinel cited from T's PRIVATE claim), came to own all three, deleted
+/// them, and the FK cascade removed the other author's provenance row. Now each
+/// provenance INSERT succeeds (calibration: the write itself is not refused),
+/// every fragment keeps its sentinel tenancy, T's DELETE removes nothing, and the
+/// other author's provenance survives. The same INSERT on the superuser pool
+/// still stamps, so the gate is scoped to the session and 089 is not off.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_provenance_insert_does_not_hand_a_session_a_world_fragment(pool: PgPool) {
+    const SEED: Uuid = Uuid::from_u128(0xdead);
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (t, t_group) = fixture::seed_agent_with_group(&pool, "bystander-t").await;
+    let world_claim = fixture::seed_public_claim(&pool, author, "another author's claim").await;
+    let t_public = seed_public_claim_owned_by(&pool, t, t_group, "t's public claim").await;
+    let t_private = fixture::seed_group_claim(&pool, t, t_group, "t's private claim").await;
+    let source = insert_harvester_source(&pool).await;
+    let cited = insert_public_fragment(&pool, source, WORLD, "cited by another author").await;
+    let uncited = insert_public_fragment(&pool, source, WORLD, "cited by nobody").await;
+    let seeded = insert_public_fragment(&pool, source, SEED, "seed-sentinel fragment").await;
+    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
+        .bind(world_claim)
+        .bind(cited)
+        .execute(&pool)
+        .await
+        .expect("the other author's provenance row");
+    assert_app_role_does_not_bypass(&pool).await;
+    let frags = [cited, uncited, seeded];
+
+    let p = pool.clone();
+    let (linked, deleted) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, t).await;
+        let mut linked = 0;
+        for (claim, frag) in [(t_public, cited), (t_public, uncited), (t_private, seeded)] {
+            linked += sqlx::query(
+                "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
+            )
+            .bind(claim)
+            .bind(frag)
+            .execute(&mut *conn)
+            .await
+            .expect("T links a fragment to its own claim")
+            .rows_affected();
+        }
+        let deleted = sqlx::query("DELETE FROM harvester_fragments WHERE id = ANY($1)")
+            .bind(&frags[..])
+            .execute(&mut *conn)
+            .await
+            .expect("T's DELETE")
+            .rows_affected();
+        (conn, (linked, deleted))
+    })
+    .await;
+
+    assert_eq!(linked, 3, "calibration: each provenance INSERT landed");
+    for (frag, owner) in [(cited, WORLD), (uncited, WORLD), (seeded, SEED)] {
+        assert_eq!(
+            fragment_tenancy(&pool, frag).await,
+            (owner, "public".to_string()),
+            "fragment {frag}: a non-privileged provenance INSERT leaves its tenancy alone"
+        );
+    }
+    assert_eq!(deleted, 0, "T owns none of the fragments, so deletes none");
+    let others: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM harvester_claim_provenance WHERE claim_id = $1 AND fragment_id = $2",
+    )
+    .bind(world_claim)
+    .bind(cited)
+    .fetch_one(&pool)
+    .await
+    .expect("read provenance");
+    assert_eq!(others, 1, "the other author's provenance row survived");
+
+    // Privileged: the identical INSERT still stamps (089's own case).
+    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
+        .bind(t_private)
+        .bind(uncited)
+        .execute(&pool)
+        .await
+        .expect("superuser link");
+    assert_eq!(
+        fragment_tenancy(&pool, uncited).await,
+        (t_group, "group".to_string()),
+        "a privileged session's provenance INSERT still stamps the fragment"
+    );
+}
+
 // ===========================================================================
 // 4. The catalog.
 // ===========================================================================
@@ -1658,8 +1790,8 @@ fn no_application_path_deletes_a_non_tier_a_edge_node() {
     );
 }
 
-/// The four functions are definers owned by the maintenance role, not
-/// executable by PUBLIC; the two a statement names are executable by the app;
+/// The five definers 115 installs or redefines are owned by the maintenance role, not
+/// executable by PUBLIC; the three a statement names are executable by the app;
 /// the three tier-A node triggers run the definer body.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_115_functions_are_maintenance_owned_definers(pool: PgPool) {
@@ -1668,6 +1800,8 @@ async fn the_115_functions_are_maintenance_owned_definers(pool: PgPool) {
         ("epigraph_cascade_delete_edge_bbas(uuid[], text)", true),
         ("epigraph_dedup_move_bbas(uuid, uuid, uuid[])", true),
         ("epigraph_cascade_delete_node_edges()", false),
+        // Redefined by 115 (section 9); CREATE OR REPLACE kept 089's owner and ACL.
+        ("epigraph_inherit_fragment_tenancy_stmt()", false),
     ] {
         let (secdef, owner, public_exec, app): (bool, String, bool, bool) = sqlx::query_as(
             "SELECT p.prosecdef, pg_get_userbyid(p.proowner)::text, \
