@@ -543,11 +543,12 @@ async fn main() {
         // enabled only for a configured DSN whose login bypasses row security;
         // otherwise every such cascade is reported deferred, with a
         // `security_events` row, and the caller's act still commits.
-        let admin_cascade = maintenance_source == epigraph_db::MaintenanceDsnSource::Configured
-            && epigraph_db::probe_maintenance_privilege(maintenance_pool.inner())
+        let admin_cascade = epigraph_api::state::admin_cascade_enabled(
+            maintenance_source,
+            epigraph_db::probe_maintenance_privilege(maintenance_pool.inner())
                 .await
-                .map(|p| p.bypass)
-                .unwrap_or(false);
+                .is_ok_and(|p| p.bypass),
+        );
         if admin_cascade {
             tracing::info!(
                 target: "tenancy.admin_cascade",

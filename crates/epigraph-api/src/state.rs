@@ -2333,3 +2333,45 @@ mod rls_verdict_tests {
         );
     }
 }
+
+/// Whether `bin/server.rs` enables the ADMINISTRATIVE CASCADE (migration 117):
+/// only for a maintenance DSN that was CONFIGURED through
+/// `MAINTENANCE_DATABASE_URL` (never the documented fallback to
+/// `DATABASE_URL`, which would derive an administrative act from the
+/// application DSN) AND whose login the boot probe found bypassing row
+/// security. Anything else defers every cascade (recorded) and still commits
+/// the caller's act.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn admin_cascade_enabled(source: epigraph_db::MaintenanceDsnSource, bypass: bool) -> bool {
+    source == epigraph_db::MaintenanceDsnSource::Configured && bypass
+}
+
+#[cfg(all(test, feature = "db"))]
+mod admin_cascade_gate_tests {
+    use super::admin_cascade_enabled;
+    use epigraph_db::MaintenanceDsnSource;
+
+    /// The fallback-with-bypass case is the one that matters: a server whose
+    /// APPLICATION DSN is a superuser must not run the cross-owner cascade just
+    /// because nobody set `MAINTENANCE_DATABASE_URL`.
+    #[test]
+    fn only_a_configured_bypassing_dsn_enables_the_administrative_cascade() {
+        assert!(admin_cascade_enabled(
+            MaintenanceDsnSource::Configured,
+            true
+        ));
+        assert!(
+            !admin_cascade_enabled(MaintenanceDsnSource::FellBackToApplicationDsn, true),
+            "the application DSN derived an administrative act"
+        );
+        assert!(
+            !admin_cascade_enabled(MaintenanceDsnSource::Configured, false),
+            "a configured login that cannot bypass row security would re-point nothing"
+        );
+        assert!(!admin_cascade_enabled(
+            MaintenanceDsnSource::FellBackToApplicationDsn,
+            false
+        ));
+    }
+}
