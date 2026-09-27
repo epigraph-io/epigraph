@@ -7,6 +7,14 @@
 //! and moves the three cascades that remove other writers' edge-keyed BBAs
 //! behind an audited definer.
 //!
+//! Migration 117 then made those cascades an ADMINISTRATIVE act: the definer
+//! keeps only its owner arm (a non-privileged call over another writer's row
+//! is refused, CD02), and the dedup repair, the supersede edge migration and
+//! the match-candidate retirement cascade run on the maintenance connection,
+//! which each of them now requires. The cascade arms below assert exactly that
+//! split: refused for every non-privileged session, landing on
+//! `epigraph_maintenance`.
+//!
 //! # Why every arm runs as `epigraph_app`
 //!
 //! `#[sqlx::test]` connects as the superuser `epigraph`, for whom every policy

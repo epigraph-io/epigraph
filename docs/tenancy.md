@@ -383,6 +383,38 @@ split: while `DATABASE_URL` still names the owning superuser, **all three
 migrations are observably inert**. The risk lives in deploy step 11d, not in
 the schema change.
 
+### DELETE and UPDATE of a row you do not own (115, 117)
+
+077's policies are FOR ALL with the READ predicate as their USING, so for DELETE
+and UPDATE they admitted what a session could read. Two later migrations narrow
+that for a non-privileged session:
+
+* **DELETE is owner-scoped (115)** on every tier-A table: the row's owner (on
+  `edges`, the owner or co-owner, or for an edge between two public claims the
+  writer of its source) must be in the session's writable set.
+* **UPDATE of an edge or of an instance-wide registry row is owner-scoped
+  (117).** `edges` (owner or co-owner) and `frames`, `contexts`, `perspectives`,
+  `communities` (owner): both the row as it was and the row as it will be,
+  after `edges_tenancy` has restamped a re-pointed edge. A row nobody owns (an
+  edge between two public claims, a shared frame) is therefore not updatable
+  by any application session; its retraction, relabelling or re-pointing is a
+  privileged act. The other tier-A tables already refuse a non-owner's UPDATE
+  through their writable-set WITH CHECK and 115's owner-immutability guard.
+
+**The retraction cascade is an administrative act (117).** A supersede, a dedup
+or a match-candidate retirement is the caller's act, written with the caller's
+authority on its own stamped transaction. What follows it -- re-pointing and
+retracting other writers' edges, moving and invalidating their edge-keyed BBAs,
+re-deriving belief -- runs on the server's maintenance connection
+(`epigraph_engine::admin_cascade`) and writes one `security_events` row
+(`cascade.admin_applied`) naming the caller, the cause and what it touched. That
+connection exists only when `MAINTENANCE_DATABASE_URL` is configured to a login
+that bypasses row security; it is never derived from `DATABASE_URL`. Without it
+the act still commits and the cascade is reported (`"cascade": {"status":
+"deferred"}`) and recorded (`cascade.deferred`); every repair re-verifies the
+act and is idempotent, so a deferred cascade is replayed by running it later on
+a maintenance connection.
+
 ### The kill switch
 
 `ALTER TABLE … NO FORCE ROW LEVEL SECURITY`, scripted at

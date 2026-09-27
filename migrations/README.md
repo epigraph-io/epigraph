@@ -545,9 +545,38 @@ Current reservation:
   the file's header. **Applied to throwaway databases only (5433, with 113 and
   114), NOT to any deployed database.**
 
-- **116+**: public next
+- **116**: claimed by another open branch (not present on this one); a database
+  at 117 without it applies it later in version order.
 
-Next public migration **outside both reserved tenancy ranges** must be `116` or
+- **117**: public `admin_cascade_owner_scoped_update` (batch W10) — UPDATE of
+  an edge, or of an instance-wide registry row, is owner-scoped, and the
+  retraction cascade is an administrative act. One RESTRICTIVE, FOR UPDATE
+  policy `<table>_update_owner` on `edges` (owner or co-owner in the writable
+  set) and on `frames`, `contexts`, `perspectives`, `communities` (owner),
+  USING and WITH CHECK both, plus the bypass arms: 077's world WITH CHECK arm no
+  longer lets any session retract, relabel or re-point a row nobody owns, and
+  070/072's endpoint restamp can no longer be driven by a non-owner. The set is
+  the catalog's (world-admitting UPDATE WITH CHECK, or a BEFORE UPDATE owner
+  restamp), pinned by `owner_scoped_update.rs`'s two ratchets.
+  `epigraph_cascade_delete_edge_bbas` is redefined (CREATE OR REPLACE) to its
+  owner arm only; 115's `retracted_edge` and `source_writer` arms are gone.
+  `epigraph_dedup_move_bbas` is revoked from `epigraph_app`.
+  `epigraph_maintenance` gains DELETE on `factors` and `bp_messages`. The
+  application splits supersede, dedup and match-candidate retirement into the
+  caller's act (its own stamped transaction) and a repair that runs on the
+  maintenance connection (`epigraph_engine::admin_cascade`), audited as
+  `cascade.admin_applied`, or recorded as `cascade.deferred` when the process
+  has no configured maintenance DSN. Behaviour in
+  `epigraph-db/tests/owner_scoped_update.rs`, `owner_scoped_delete.rs` and
+  `epigraph-mcp/tests/writer_owned_attach_app_role.rs` (arms as `epigraph_app`).
+  **Deploy order: apply 117 BEFORE any binary built with it serves, and set the
+  maintenance DSN on each server process first.** Undo is in the file's header.
+  **Applied to throwaway databases only (5433, with 113, 114 and 115), NOT to
+  any deployed database.**
+
+- **118+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `118` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
