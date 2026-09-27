@@ -251,6 +251,14 @@ async fn a_principal_less_caller_writes_nothing_by_default(pool: PgPool) {
 /// human's backlog item stays open and no resolution is written. With the
 /// opt-in the context carries `claims:admin`, and the audited admin path
 /// refuses it because no client record names an admin to audit.
+///
+/// A REGRESSION PIN, not a test of this batch's change: the refusal it
+/// observes is the ownership / ADM02 path that already refused at the batch
+/// H-b tip (disabling `write_identity`'s principal-less refusal leaves it
+/// passing), and the victim is unrelated to the signer. The shape this batch
+/// is about, a principal-less caller on a listener whose signer is linked
+/// (retired) to the human, needs `call_tool`'s linked-signer gate in the path:
+/// `operator_http_signer_runtime_guard.rs::*_on_a_retired_linked_signer_*`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_principal_less_caller_cannot_retire_a_humans_item(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
