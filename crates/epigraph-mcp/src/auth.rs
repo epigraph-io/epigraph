@@ -179,9 +179,14 @@ pub fn unauthorized(resource_metadata_url: Option<&str>, error: &str) -> Respons
 /// that identity to a human afterwards is what migration 107 section 9
 /// refuses. So the default is [`Self::Refused`]: the injected context carries
 /// only the `:read` scopes, the per-tool scope gate refuses every write tool
-/// before dispatch (the maintenance tools included), and
-/// `EpiGraphMcpFull::write_identity` refuses a principal-less context without
-/// a write scope as a second, independent layer. Reads are unchanged. A caller
+/// before dispatch (the maintenance tools included), and, for the
+/// AUTHOR-STAMPED writes only, `EpiGraphMcpFull::write_identity` refuses a
+/// principal-less context without a write scope as a second layer. Write and
+/// admin tools that never resolve an author (`stage_claims`, `create_frame`,
+/// `report_hierarchical_outcome`, `theme_cluster`, and the `claims:admin`
+/// maintenance tools) have the scope gate as their ONLY refusal, so a
+/// `SCOPE_MAP` entry that put one of them on a `:read` scope would open it
+/// here. Reads are unchanged. A caller
 /// that needs to write uses an authenticated (`--jwt-secret`) listener, where
 /// its writes are authored by its own agent.
 ///

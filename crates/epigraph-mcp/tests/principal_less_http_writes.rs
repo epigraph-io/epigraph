@@ -7,8 +7,10 @@
 //! owns. These arms pin both halves at the tool-function layer, which is BELOW
 //! the per-tool scope gate: `tests/http_auth_test.rs` pins that the gate refuses
 //! the principal-less listener's write tools; here the tool functions are
-//! driven directly, so what is exercised is the second, independent layer in
-//! `EpiGraphMcpFull::write_identity`.
+//! driven directly, so what is exercised is the second layer in
+//! `EpiGraphMcpFull::write_identity`. That layer covers the AUTHOR-STAMPED
+//! writes only (the tools that resolve an author through it); write tools that
+//! never do are refused by the scope gate alone.
 //!
 //! Superuser harness (BYPASSRLS): what is visible is WHO the rows name and
 //! whether rows were written at all, not a `42501`. The RLS half is the probe's.

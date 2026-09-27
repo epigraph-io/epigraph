@@ -121,8 +121,10 @@ pub(crate) fn no_agent_principal_refusal() -> McpError {
 /// injected context, `auth::is_principal_less`) without a write scope has no
 /// author that belongs to a human, so it writes nothing (batch HTTP-id; see
 /// `auth::UnauthenticatedWrites`). The per-tool scope gate refuses the same
-/// calls first; this is the second, independent layer, keyed on the resolver
-/// every author-stamped transaction goes through.
+/// calls first; this is a second layer for the AUTHOR-STAMPED writes only,
+/// keyed on the resolver every author-stamped transaction goes through. A
+/// write tool that never calls `write_identity` is covered by the scope gate
+/// alone (see `auth::UnauthenticatedWrites`).
 pub(crate) fn principal_less_write_refusal() -> McpError {
     McpError::invalid_request(
         "this listener serves callers with no authenticated principal, and such a caller \
