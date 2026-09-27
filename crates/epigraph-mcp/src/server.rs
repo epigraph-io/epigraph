@@ -1946,7 +1946,12 @@ impl EpiGraphMcpFull {
     #[tool(
         description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
     )]
-    async fn retire_match_candidate(
+    // `pub` so `tests/matching_tools_smoke.rs` can drive this dispatch body,
+    // not just the tool function under it: the maintenance-connection choice
+    // below is wiring no other test reaches. It exposes nothing new: the tool
+    // function it calls is already `pub`, and the `claims:admin` gate is
+    // `call_tool`'s, not this method's.
+    pub async fn retire_match_candidate(
         &self,
         Parameters(params): Parameters<RetireMatchCandidateParams>,
     ) -> Result<CallToolResult, McpError> {
