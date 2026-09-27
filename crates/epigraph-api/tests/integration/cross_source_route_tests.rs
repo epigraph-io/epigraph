@@ -854,3 +854,165 @@ async fn retire_without_an_admin_connection_defers_the_cascade(pool: PgPool) {
         ("cascade.deferred", "match_retire")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Migration 117 on the APPLICATION ROLE (W10 revision). Every other test in
+// this file runs its act on the superuser harness pool, which bypasses row
+// security, so an administrative cascade that ran on the caller's connection
+// (or drew its session from the application pool) would pass them all. Here
+// the ScopedPool is downgraded to `epigraph_app` and the maintenance pool to
+// `epigraph_maintenance`, the two logins `bin/server.rs` pairs.
+// ---------------------------------------------------------------------------
+
+#[path = "../viewer_fixture.rs"]
+mod viewer_fixture;
+
+/// A state whose stamped transactions run as `epigraph_app` and whose
+/// maintenance pool (when `admin`) runs as `epigraph_maintenance`.
+async fn app_role_state(pool: &PgPool, admin: bool) -> AppState {
+    let url = database_url_of(pool);
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let who: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(scoped.inner())
+        .await
+        .expect("current_user");
+    assert_eq!(
+        who, "epigraph_app",
+        "CALIBRATION: the act runs as the app role"
+    );
+    let scoped = if admin {
+        let maint = viewer_fixture::downgraded_pool(pool, "epigraph_maintenance").await;
+        scoped.with_maintenance_pool(maint)
+    } else {
+        scoped
+    };
+    AppState::with_scoped_pool(scoped, ApiConfig::default()).with_admin_cascade(admin)
+}
+
+/// A public claim owned by `group`, authored by `agent`.
+async fn public_claim_owned_by(pool: &PgPool, agent: Uuid, group: Uuid, tag: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let content = format!("w10 app-role {tag} {id}");
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, sha256($2::bytea), 0.5, $3, true, 'public', $4)",
+    )
+    .bind(id)
+    .bind(&content)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed a public claim owned by a group");
+    id
+}
+
+async fn post_supersede_on(
+    state: AppState,
+    claim: Uuid,
+    token: &str,
+) -> (StatusCode, serde_json::Value) {
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/claims/{claim}/supersede"))
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "content": format!("the corrected {claim}"),
+                        "truth_value": 0.6,
+                        "reason": "w10 app-role supersede",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }));
+    (status, json)
+}
+
+/// The supersede route on the application role, by a caller that is NOT an
+/// admin (`claims:write`, the claim's own writer). The act lands on the
+/// caller's `epigraph_app` session; ANOTHER writer's edge into the retired
+/// claim -- which that session cannot update -- is re-pointed onto the
+/// replacement by the maintenance pool; the audit row names the caller's agent
+/// and OAuth client; the response carries counts, not ids. Without the
+/// maintenance pool the act still lands, the edge stays, and the deferral row
+/// names the caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_route_on_the_app_role_runs_the_cascade_on_the_maintenance_pool(pool: PgPool) {
+    let (w, w_group) = viewer_fixture::seed_agent_with_group(&pool, "w10-writer-w").await;
+    let (x, x_group) = viewer_fixture::seed_agent_with_group(&pool, "w10-writer-x").await;
+    let token = decide_bearer_token(w, Some(w), "agent");
+
+    for admin in [true, false] {
+        let old = public_claim_owned_by(&pool, w, w_group, "W's claim").await;
+        let xc = public_claim_owned_by(&pool, x, x_group, "X's citing claim").await;
+        let into_old = viewer_fixture::seed_edge(&pool, xc, old).await;
+
+        let (status, json) =
+            post_supersede_on(app_role_state(&pool, admin).await, old, &token).await;
+        assert!(
+            status == StatusCode::OK || status == StatusCode::CREATED,
+            "the owner's supersede lands on the app role (admin={admin}): {status} {json}"
+        );
+        let new_id: Uuid = json["new_claim_id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("new id");
+        let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+            .bind(into_old)
+            .fetch_one(&pool)
+            .await
+            .expect("X's edge");
+        let event: Uuid = json["cascade"]["audit_event_id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("the cascade names its audit row");
+        let (et, who, client): (String, Option<Uuid>, Option<String>) = sqlx::query_as(
+            "SELECT event_type::text, agent_id, details#>>'{trigger,oauth,client_id}' \
+               FROM security_events WHERE id = $1",
+        )
+        .bind(event)
+        .fetch_one(&pool)
+        .await
+        .expect("audit row");
+        assert_eq!(
+            who,
+            Some(w),
+            "the audit row's agent_id is the caller (admin={admin})"
+        );
+        assert_eq!(client, Some(w.to_string()), "and its OAuth client");
+        if admin {
+            assert_eq!(json["cascade"]["status"], "applied", "{json}");
+            assert_eq!(et, "cascade.admin_applied");
+            assert_eq!(
+                target, new_id,
+                "X's edge was re-pointed by the maintenance pool"
+            );
+            assert_eq!(
+                json["cascade"]["touched"]["edges_retargeted"],
+                serde_json::json!(1),
+                "the caller is told a COUNT, not the ids: {json}"
+            );
+        } else {
+            assert_eq!(json["cascade"]["status"], "deferred", "{json}");
+            assert_eq!(et, "cascade.deferred");
+            assert_eq!(target, old, "the deferred cascade moved nothing");
+        }
+    }
+}
