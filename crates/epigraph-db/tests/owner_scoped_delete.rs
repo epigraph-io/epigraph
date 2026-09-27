@@ -2691,14 +2691,41 @@ async fn cascade_row(
     .expect("cascade audit row")
 }
 
-/// The replay's window counts CASCADES, not rows. A cascade whose replay keeps
-/// failing (its act was undone, say) writes one `cascade.admin_failed` row per
-/// attempt; those rows are history and never pending themselves, and two
-/// deferrals of the same cascade are one entry. So at a small limit a newer
-/// deferral is still selected; an applied cascade is not; a request path's own
-/// failed repair is.
+/// Append a cascade row whose subject is spelled as given (the harness is
+/// privileged, so 117 admits it).
+async fn cascade_row_spelled(pool: &PgPool, event_type: &str, cause: &str, subject: &str) -> Uuid {
+    epigraph_db::repos::admin_cascade::record(
+        pool,
+        match event_type {
+            "deferred" => epigraph_db::repos::admin_cascade::EVENT_DEFERRED,
+            _ => epigraph_db::repos::admin_cascade::EVENT_APPLIED,
+        },
+        None,
+        false,
+        &serde_json::json!({
+            "cause": cause,
+            "trigger": {"agent_id": null, "oauth": null, "subject_id": subject, "object_id": null},
+            "migration": 117,
+        }),
+    )
+    .await
+    .expect("cascade audit row")
+}
+
+fn pending_ids(rows: &[epigraph_db::repos::admin_cascade::PendingReplay]) -> Vec<Uuid> {
+    rows.iter().map(|r| r.event_id).collect()
+}
+
+/// The replay's window holds one entry per CASCADE, fewest failed repairs
+/// first: a cascade that keeps failing (its act was undone, say) writes one
+/// `cascade.admin_failed` row per attempt, moves behind every cascade that has
+/// failed less, and at `max_failures` leaves the window for the stuck list,
+/// where an operator retires it. So neither one such cascade nor many can hold
+/// a newer deferral out of the window. An applied or retired cascade is not
+/// pending; a request path's own failed repair is.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_replay_window_holds_one_entry_per_pending_cascade(pool: PgPool) {
+async fn the_replay_window_puts_fewer_failures_first_and_holds_stuck_cascades_out(pool: PgPool) {
+    use epigraph_db::repos::admin_cascade as ac;
     let stuck = Uuid::new_v4();
     let d_stuck = cascade_row(&pool, "deferred", "supersede", stuck, None).await;
     cascade_row(&pool, "deferred", "supersede", stuck, None).await;
@@ -2712,24 +2739,76 @@ async fn the_replay_window_holds_one_entry_per_pending_cascade(pool: PgPool) {
     let failed_at_request = Uuid::new_v4();
     let f_req = cascade_row(&pool, "failed", "match_retire", failed_at_request, None).await;
 
-    let two = epigraph_db::repos::admin_cascade::pending_replays(&pool, 2)
-        .await
-        .expect("pending");
-    let ids: Vec<Uuid> = two.iter().map(|(id, _)| *id).collect();
+    let two = ac::pending_replays(&pool, 2, 5).await.expect("pending");
     assert_eq!(
-        ids,
-        vec![d_stuck, d_fresh],
-        "the stuck cascade takes ONE slot (its oldest deferral), so the fresh one is selected"
+        pending_ids(&two),
+        vec![d_fresh, f_req],
+        "the twice-failed cascade, though oldest, goes behind the fresh deferral and the \
+         once-failed one"
     );
-    let all = epigraph_db::repos::admin_cascade::pending_replays(&pool, 50)
-        .await
-        .expect("pending");
-    let ids: Vec<Uuid> = all.iter().map(|(id, _)| *id).collect();
     assert_eq!(
-        ids,
-        vec![d_stuck, d_fresh, f_req],
-        "the applied cascade is not pending; a request path's failed repair is"
+        two.iter().map(|r| r.failures).collect::<Vec<_>>(),
+        vec![0, 1]
     );
+    let all = ac::pending_replays(&pool, 50, 5).await.expect("pending");
+    assert_eq!(
+        pending_ids(&all),
+        vec![d_fresh, f_req, d_stuck],
+        "one entry per cascade (its oldest pending row); the applied cascade is not pending"
+    );
+    assert!(ac::stuck_replays(&pool, 5).await.expect("stuck").is_empty());
+
+    // At max_failures = 2 the twice-failed cascade leaves the window for the
+    // stuck list.
+    let capped = ac::pending_replays(&pool, 50, 2).await.expect("pending");
+    assert_eq!(pending_ids(&capped), vec![d_fresh, f_req]);
+    let held = ac::stuck_replays(&pool, 2).await.expect("stuck");
+    assert_eq!(pending_ids(&held), vec![d_stuck]);
+    assert_eq!(held[0].failures, 2);
+
+    // The operator retires it: it is neither pending nor stuck any more.
+    ac::retire_pending(&pool, d_stuck, "w10-test", "its act was undone")
+        .await
+        .expect("retire");
+    assert_eq!(
+        pending_ids(&ac::pending_replays(&pool, 50, 5).await.expect("pending")),
+        vec![d_fresh, f_req]
+    );
+    assert!(ac::stuck_replays(&pool, 2).await.expect("stuck").is_empty());
+    // Retiring a row that is not a pending cascade row is NotFound.
+    let e = ac::retire_pending(&pool, Uuid::new_v4(), "w10-test", "none")
+        .await
+        .expect_err("no such row");
+    assert!(matches!(e, epigraph_db::DbError::NotFound { .. }), "{e}");
+
+    // A later deferral of the retired cascade is pending again.
+    let again = cascade_row(&pool, "deferred", "supersede", stuck, None).await;
+    assert!(
+        pending_ids(&ac::pending_replays(&pool, 50, 5).await.expect("pending")).contains(&again)
+    );
+}
+
+/// The replay parses a subject as a UUID, which accepts upper case, the
+/// hyphen-less simple form and a `urn:uuid:` prefix; the window compares the
+/// subject in the same terms, so a cascade whose applied row spells its
+/// subject differently from its deferral is answered, not replayed forever.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_replay_window_matches_a_subject_in_any_uuid_spelling(pool: PgPool) {
+    use epigraph_db::repos::admin_cascade as ac;
+    let a = Uuid::new_v4();
+    cascade_row_spelled(&pool, "deferred", "dedup", &a.to_string().to_uppercase()).await;
+    cascade_row_spelled(&pool, "applied", "dedup", &a.simple().to_string()).await;
+    let b = Uuid::new_v4();
+    cascade_row_spelled(&pool, "deferred", "supersede", &b.urn().to_string()).await;
+    cascade_row_spelled(&pool, "applied", "supersede", &b.to_string()).await;
+    let open = Uuid::new_v4();
+    let d_open = cascade_row_spelled(&pool, "deferred", "supersede", &open.to_string()).await;
+    // A malformed subject stays pending (the replay reports it unreadable)
+    // without aborting the window.
+    let d_bad = cascade_row_spelled(&pool, "deferred", "supersede", "not a uuid").await;
+
+    let rows = ac::pending_replays(&pool, 50, 5).await.expect("pending");
+    assert_eq!(pending_ids(&rows), vec![d_open, d_bad]);
 }
 
 /// 117 section 6(a): an application session writes NO `cascade.*` row itself,
@@ -3036,15 +3115,15 @@ async fn a_deferral_names_only_the_recording_sessions_own_act(pool: PgPool) {
     assert_eq!(details["cause"], "supersede");
 
     // The replay's view of V: only A's deferral, naming A's successor.
-    let pending = ac::pending_replays(&pool, 50).await.expect("pending");
+    let pending = ac::pending_replays(&pool, 50, 5).await.expect("pending");
     let for_v: Vec<_> = pending
         .iter()
-        .filter(|(_, d)| d["trigger"]["subject_id"] == serde_json::json!(v))
+        .filter(|p| p.details["trigger"]["subject_id"] == serde_json::json!(v))
         .collect();
     assert_eq!(for_v.len(), 1, "{pending:?}");
-    assert_eq!(for_v[0].0, genuine);
-    let object: Uuid =
-        serde_json::from_value(for_v[0].1["trigger"]["object_id"].clone()).expect("object id");
+    assert_eq!(for_v[0].event_id, genuine);
+    let object: Uuid = serde_json::from_value(for_v[0].details["trigger"]["object_id"].clone())
+        .expect("object id");
     assert_eq!(object, gs);
     // What the replay then runs: X's edge lands on A's successor, not on R's
     // claim.

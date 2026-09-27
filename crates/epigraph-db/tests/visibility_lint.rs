@@ -1509,6 +1509,20 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          audit-row write whose control is the definer's own (attribution to the session \
          principal, the act must be the session's). Returns the new row's id, no tenant content.",
     ),
+    (
+        "admin_cascade.rs",
+        "retire_pending",
+        "INSERT INTO `security_events` of a `cascade.retired` row copied from a pending cascade \
+         row, on the maintenance connection only (117 refuses a `cascade.*` row from any other \
+         session). Returns the new id, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "stuck_replays",
+        "READ of `security_events` for the operator's replay, the complement of \
+         `pending_replays` (the cascades held out after repeated failures). Maintenance \
+         connection only; audit rows, not tenant content.",
+    ),
     // ── Batch H-a: writes whose executor widened so a route or the theme
     // clusterer can put them in ONE transaction. Same argument as
     // `trace.rs::create` below: the control on a write is the table's

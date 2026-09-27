@@ -766,10 +766,29 @@ pub struct ReplayItem {
     pub status: CascadeStatus,
 }
 
+/// A pending cascade held out of the replay window because its repair has
+/// failed `max_failures` times: an operator reads why and retires it
+/// (`replay_deferred_cascades --retire`).
+#[derive(Debug, Clone, Serialize)]
+pub struct StuckItem {
+    /// Its oldest pending deferred (or failed) row: the id to retire.
+    pub deferred_event_id: Uuid,
+    /// Its cause, when the row carried one.
+    pub cause: Option<CascadeCause>,
+    /// Its subject, when the row carried one.
+    pub subject_id: Option<Uuid>,
+    /// How many times its repair has failed since it was deferred.
+    pub failures: i64,
+}
+
+/// The default of [`replay_deferred`]'s `max_failures`: a cascade whose
+/// repair has failed this many times leaves the window for an operator.
+pub const DEFAULT_MAX_FAILURES: i64 = 5;
+
 /// What [`replay_deferred`] did.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ReplayReport {
-    /// Rows still pending when the run started (up to the limit).
+    /// Cascades in this run's window (up to the limit).
     pub pending: usize,
     /// Cascades applied by this run.
     pub applied: usize,
@@ -779,11 +798,20 @@ pub struct ReplayReport {
     pub unreadable: usize,
     /// One entry per row considered.
     pub items: Vec<ReplayItem>,
+    /// Cascades held out of the window (failed `max_failures` times or more),
+    /// after this run.
+    pub stuck: Vec<StuckItem>,
 }
 
-/// Replay every deferred or failed administrative cascade that has no later
-/// [`EVENT_APPLIED`] row for the same cause and subject, oldest first, up to
-/// `limit` rows. Runs on the maintenance connection with its bypass viewer.
+/// Replay the pending administrative cascades
+/// ([`epigraph_db::repos::admin_cascade::pending_replays`]: one per cause and
+/// subject, fewest failures first, then oldest), up to `limit` cascades, and
+/// report the ones held back after `max_failures` failed repairs. Runs on the
+/// maintenance connection with its bypass viewer.
+///
+/// Every row it reads was written by 117's deferral definer (which checked the
+/// act was the recorded principal's own) or by a privileged session: a
+/// non-privileged session cannot write a `cascade.*` row.
 ///
 /// Each replay runs the same `apply_after_*` call the request path would have,
 /// with the trigger the deferral recorded (so the applied row still names the
@@ -799,14 +827,18 @@ pub async fn replay_deferred(
     admin_viewer: &Viewer,
     replayed_by: &str,
     limit: i64,
+    max_failures: i64,
 ) -> Result<ReplayReport, DbError> {
-    let rows = audit::pending_replays(&mut *admin, limit).await?;
+    let rows = audit::pending_replays(&mut *admin, limit, max_failures).await?;
     let mut report = ReplayReport {
         pending: rows.len(),
         ..ReplayReport::default()
     };
     let mut seen: HashSet<(CascadeCause, Uuid)> = HashSet::new();
-    for (event_id, details) in rows {
+    for audit::PendingReplay {
+        event_id, details, ..
+    } in rows
+    {
         let Some(mut trigger) = CascadeTrigger::from_audit(&details) else {
             report.unreadable += 1;
             report.items.push(ReplayItem {
@@ -881,6 +913,19 @@ pub async fn replay_deferred(
             status,
         });
     }
+    report.stuck = audit::stuck_replays(&mut *admin, max_failures)
+        .await?
+        .into_iter()
+        .map(|p| {
+            let trigger = CascadeTrigger::from_audit(&p.details);
+            StuckItem {
+                deferred_event_id: p.event_id,
+                cause: trigger.as_ref().map(|t| t.cause),
+                subject_id: trigger.as_ref().map(|t| t.subject_id),
+                failures: p.failures,
+            }
+        })
+        .collect();
     Ok(report)
 }
 

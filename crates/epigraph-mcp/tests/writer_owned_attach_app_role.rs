@@ -1274,6 +1274,7 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
     let (x, x_group) = fixture::seed_agent_with_group(&pool, "writer-x2").await;
     let xc = public_claim_of(&pool, x, x_group, "X's claim").await;
     let into_s1 = edge_between(&pool, xc, s1).await;
+    let auth = non_admin_owner(agent);
 
     let sup = first_text(
         &epigraph_mcp::tools::supersede::supersede_claim(
@@ -1285,7 +1286,7 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
                 truth_value: 0.6,
                 reason: "a correction".to_string(),
             },
-            Some(&non_admin_owner(agent)),
+            Some(&auth),
         )
         .await
         .expect("supersede act"),
@@ -1299,7 +1300,7 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
                 canonical_id: df.canonical.to_string(),
                 reason: None,
             },
-            Some(&non_admin_owner(agent)),
+            Some(&auth),
         )
         .await
         .expect("dedup act"),
@@ -1309,7 +1310,7 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
             &server,
             &viewer,
             consolidate_params(&[s1, s2], "my merged claim"),
-            Some(&non_admin_owner(agent)),
+            Some(&auth),
         )
         .await
         .expect("consolidate act"),
@@ -1321,6 +1322,59 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
     }
     let new_id = parse_uuid_field(&sup, "new_claim_id");
     let merged = parse_uuid_field(&cons, "merged_claim_id");
+
+    // Each deferral was written by 117's definer, not by this code: it reads
+    // back through `from_audit` as exactly the trigger the tool built, and the
+    // database attributed it to the session principal.
+    use epigraph_engine::admin_cascade::{CascadeCause, CascadeTrigger, OauthPrincipal};
+    let oauth = Some(OauthPrincipal {
+        client_id: Some(auth.client_id),
+        owner_id: Some(agent),
+        agent_id: None,
+    });
+    let expected = [
+        CascadeTrigger::new(
+            CascadeCause::Supersede,
+            Some(agent),
+            oauth.clone(),
+            sf.old,
+            Some(new_id),
+        ),
+        CascadeTrigger::new(
+            CascadeCause::Dedup,
+            Some(agent),
+            oauth.clone(),
+            df.dup,
+            Some(df.canonical),
+        ),
+        CascadeTrigger {
+            sources: vec![s1, s2],
+            ..CascadeTrigger::new(
+                CascadeCause::Consolidate,
+                Some(agent),
+                oauth.clone(),
+                merged,
+                None,
+            )
+        },
+    ];
+    for (id, want) in deferrals.iter().zip(expected) {
+        let (who, details): (Option<Uuid>, serde_json::Value) = sqlx::query_as(
+            "SELECT agent_id, details FROM security_events \
+              WHERE id = $1 AND event_type = 'cascade.deferred'",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("the deferral row");
+        assert_eq!(who, Some(agent));
+        assert_eq!(details["recorded_by"], "epigraph_record_cascade_deferral");
+        assert_eq!(
+            CascadeTrigger::from_audit(&details),
+            Some(want),
+            "{details}"
+        );
+    }
     let target = |e: Uuid| {
         let pool = pool.clone();
         async move {
@@ -1345,10 +1399,15 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
         .await
         .expect("maintenance session");
     let (conn, admin_viewer) = session.split();
-    let report =
-        epigraph_engine::admin_cascade::replay_deferred(conn, admin_viewer, "w10-test", 50)
-            .await
-            .expect("replay");
+    let report = epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        admin_viewer,
+        "w10-test",
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("replay");
     assert_eq!(
         (
             report.pending,
@@ -1400,9 +1459,15 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
     }
 
     let (conn, admin_viewer) = session.split();
-    let again = epigraph_engine::admin_cascade::replay_deferred(conn, admin_viewer, "w10-test", 50)
-        .await
-        .expect("second replay");
+    let again = epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        admin_viewer,
+        "w10-test",
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("second replay");
     assert_eq!((again.pending, again.applied), (0, 0), "{again:?}");
 }
 

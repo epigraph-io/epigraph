@@ -24,6 +24,9 @@
 //! * [`EVENT_FAILED`]: the repair started on the maintenance connection and
 //!   failed; nothing of it committed. Replayable like a deferral.
 //! * [`EVENT_BELIEF`]: the belief re-derivation after an applied repair.
+//! * [`EVENT_RETIRED`]: an operator retired a pending cascade that will not
+//!   replay ([`retire_pending`]); it answers the pending rows like an applied
+//!   one.
 //!
 //! The [`EVENT_APPLIED`] row is written INSIDE the repair's transaction, so an
 //! applied cross-owner repair never exists without its audit row.
@@ -51,6 +54,11 @@ pub const EVENT_FAILED: &str = "cascade.admin_failed";
 /// committed (the belief cascade is best-effort and runs per claim), and
 /// names that row in `details.applied_event_id`.
 pub const EVENT_BELIEF: &str = "cascade.belief_rederived";
+
+/// `security_events.event_type` of a pending cascade an operator retired
+/// instead of replaying (its act was undone, say, so its repair can never
+/// verify). Written on the maintenance connection only.
+pub const EVENT_RETIRED: &str = "cascade.retired";
 
 /// Record a deferred cascade on the CALLER's session, through 117's
 /// `epigraph_record_cascade_deferral` definer, and return the row's id.
@@ -122,50 +130,179 @@ pub async fn record<'e, E: sqlx::PgExecutor<'e>>(
     Ok(id)
 }
 
-/// The deferred or failed cascades still to replay, oldest first, ONE row per
-/// (cause, subject) -- its oldest [`EVENT_DEFERRED`] / [`EVENT_FAILED`] row --
-/// up to `limit` cascades, for every cascade with no [`EVENT_APPLIED`] row for
-/// the same cause and subject written at or after that row. Returns
-/// `(event id, details)`.
+/// The pending cascades, keyed and counted: one row per (cause, subject) --
+/// its oldest [`EVENT_DEFERRED`] / [`EVENT_FAILED`] row with no
+/// [`EVENT_APPLIED`] or [`EVENT_RETIRED`] row for the same cause and subject at
+/// or after it -- with the number of [`EVENT_FAILED`] rows written for that
+/// cascade since. Binds: `$1` deferred, `$2` failed, `$3` applied, `$4`
+/// retired.
 ///
-/// One row per cascade, so a cascade that keeps failing (a replay that fails
-/// again writes one more [`EVENT_FAILED`] row each run) occupies one slot of
-/// `limit` however many runs it has failed, and cannot crowd newer deferrals
-/// out of the window.
+/// The subject is compared NORMALISED (lower case, hex digits only, a
+/// `urn:uuid:` prefix dropped): the replay parses it as a UUID, which accepts
+/// every such spelling, so a textual comparison would leave a cascade whose
+/// rows spell the subject differently pending forever. The normaliser is total,
+/// so a malformed row cannot abort the window the way a `::uuid` cast would.
+const PENDING_CTE: &str = "\
+    WITH ev AS ( \
+        SELECT e.id, e.event_type, e.details, e.created_at, \
+               e.details->>'cause' AS cause, \
+               regexp_replace(lower(e.details->'trigger'->>'subject_id'), \
+                              '^urn:uuid:|[^0-9a-f]', '', 'g') AS subj \
+          FROM security_events e \
+         WHERE e.event_type IN ($1, $2, $3, $4)), \
+    pend AS ( \
+        SELECT DISTINCT ON (d.cause, d.subj) d.id, d.details, d.created_at, d.cause, d.subj \
+          FROM ev d \
+         WHERE d.event_type IN ($1, $2) \
+           AND NOT EXISTS (SELECT 1 FROM ev a \
+                            WHERE a.event_type IN ($3, $4) \
+                              AND a.cause IS NOT DISTINCT FROM d.cause \
+                              AND a.subj IS NOT DISTINCT FROM d.subj \
+                              AND a.created_at >= d.created_at) \
+         ORDER BY d.cause, d.subj, d.created_at, d.id), \
+    counted AS ( \
+        SELECT p.id, p.details, p.created_at, \
+               (SELECT count(*) FROM ev f \
+                 WHERE f.event_type = $2 \
+                   AND f.cause IS NOT DISTINCT FROM p.cause \
+                   AND f.subj IS NOT DISTINCT FROM p.subj \
+                   AND f.created_at >= p.created_at) AS failures \
+          FROM pend p) ";
+
+/// One pending cascade: the row to replay, its details, and how many times
+/// its repair has failed since it was deferred.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingReplay {
+    /// The oldest pending `cascade.deferred` / `cascade.admin_failed` row.
+    pub event_id: Uuid,
+    /// That row's `details` (the trigger the replay rebuilds).
+    pub details: serde_json::Value,
+    /// `cascade.admin_failed` rows written for this cascade since that row.
+    pub failures: i64,
+}
+
+/// The pending cascades to replay now: those that have failed fewer than
+/// `max_failures` times, FEWEST FAILURES FIRST and then oldest first, up to
+/// `limit` cascades.
 ///
-/// Runs on the maintenance connection (the replay's): `security_events` is
-/// append-only for application sessions, which cannot read other principals'
-/// rows.
+/// One entry per (cause, subject), and a cascade that keeps failing moves
+/// behind every cascade that has failed less, then leaves the window at
+/// `max_failures` ([`stuck_replays`] lists it for an operator, who retires it
+/// with [`retire_pending`]). So neither one cascade nor many that can never
+/// verify hold newer deferrals out of the window.
+///
+/// Runs on the maintenance connection (the replay's): application sessions
+/// cannot read other principals' rows.
 ///
 /// # Errors
 /// `DbError::QueryFailed` on a failed query.
 pub async fn pending_replays<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     limit: i64,
-) -> Result<Vec<(Uuid, serde_json::Value)>, DbError> {
-    let rows: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
-        "SELECT p.id, p.details FROM ( \
-             SELECT DISTINCT ON (d.details->>'cause', d.details->'trigger'->>'subject_id') \
-                    d.id, d.details, d.created_at \
-               FROM security_events d \
-              WHERE d.event_type IN ($1, $2) \
-                AND NOT EXISTS ( \
-                    SELECT 1 FROM security_events a \
-                     WHERE a.event_type = $3 \
-                       AND a.details->>'cause' = d.details->>'cause' \
-                       AND a.details->'trigger'->>'subject_id' = \
-                           d.details->'trigger'->>'subject_id' \
-                       AND a.created_at >= d.created_at) \
-              ORDER BY d.details->>'cause', d.details->'trigger'->>'subject_id', \
-                       d.created_at, d.id) p \
-          ORDER BY p.created_at, p.id \
-          LIMIT $4",
+    max_failures: i64,
+) -> Result<Vec<PendingReplay>, DbError> {
+    let sql = format!(
+        "{PENDING_CTE} SELECT id, details, failures FROM counted \
+          WHERE failures < $5 ORDER BY failures, created_at, id LIMIT $6"
+    );
+    let rows: Vec<(Uuid, serde_json::Value, i64)> = sqlx::query_as(&sql)
+        .bind(EVENT_DEFERRED)
+        .bind(EVENT_FAILED)
+        .bind(EVENT_APPLIED)
+        .bind(EVENT_RETIRED)
+        .bind(max_failures)
+        .bind(limit)
+        .fetch_all(executor)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(event_id, details, failures)| PendingReplay {
+            event_id,
+            details,
+            failures,
+        })
+        .collect())
+}
+
+/// The pending cascades held out of the replay window: those that have failed
+/// `max_failures` times or more, oldest first. An operator reads why (the
+/// failed rows' `details.reason`) and retires each with [`retire_pending`].
+///
+/// # Errors
+/// `DbError::QueryFailed` on a failed query.
+pub async fn stuck_replays<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    max_failures: i64,
+) -> Result<Vec<PendingReplay>, DbError> {
+    let sql = format!(
+        "{PENDING_CTE} SELECT id, details, failures FROM counted \
+          WHERE failures >= $5 ORDER BY created_at, id"
+    );
+    let rows: Vec<(Uuid, serde_json::Value, i64)> = sqlx::query_as(&sql)
+        .bind(EVENT_DEFERRED)
+        .bind(EVENT_FAILED)
+        .bind(EVENT_APPLIED)
+        .bind(EVENT_RETIRED)
+        .bind(max_failures)
+        .fetch_all(executor)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(event_id, details, failures)| PendingReplay {
+            event_id,
+            details,
+            failures,
+        })
+        .collect())
+}
+
+/// Retire the pending cascade that the `cascade.deferred` /
+/// `cascade.admin_failed` row `event_id` belongs to, without replaying it: an
+/// [`EVENT_RETIRED`] row carrying that row's cause and trigger, the operator's
+/// label and reason. The cascade then leaves the pending set like an applied
+/// one; a later deferral of the same (cause, subject) is pending again.
+/// Returns the new row's id.
+///
+/// Maintenance connection only: 117 refuses a `cascade.*` row from any other
+/// session.
+///
+/// # Errors
+/// `DbError::NotFound` when `event_id` is not a deferred or failed cascade
+/// row; `DbError::QueryFailed` on a failed or refused statement.
+pub async fn retire_pending<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    event_id: Uuid,
+    retired_by: &str,
+    reason: &str,
+) -> Result<Uuid, DbError> {
+    let id = Uuid::new_v4();
+    let done = sqlx::query(
+        "INSERT INTO security_events (id, event_type, agent_id, success, details) \
+         SELECT $1, $2, NULL, true, \
+                jsonb_build_object('cause', d.details->'cause', \
+                                   'trigger', d.details->'trigger', \
+                                   'migration', 117, \
+                                   'outcome', 'retired_by_operator', \
+                                   'retired_event_id', d.id, \
+                                   'retired_by', $4::text, \
+                                   'reason', $5::text) \
+           FROM security_events d \
+          WHERE d.id = $3 AND d.event_type IN ($6, $7)",
     )
+    .bind(id)
+    .bind(EVENT_RETIRED)
+    .bind(event_id)
+    .bind(retired_by)
+    .bind(reason)
     .bind(EVENT_DEFERRED)
     .bind(EVENT_FAILED)
-    .bind(EVENT_APPLIED)
-    .bind(limit)
-    .fetch_all(executor)
+    .execute(executor)
     .await?;
-    Ok(rows)
+    if done.rows_affected() == 0 {
+        return Err(DbError::NotFound {
+            entity: "pending cascade row".to_string(),
+            id: event_id,
+        });
+    }
+    Ok(id)
 }

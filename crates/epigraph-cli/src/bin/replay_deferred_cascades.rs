@@ -11,12 +11,22 @@
 //! unset -- still commits the caller's act and records the cascade as a
 //! `cascade.deferred` `security_events` row in the act's own transaction. This
 //! binary finds every deferred or failed cascade with no later
-//! `cascade.admin_applied` row for the same cause and subject and runs the same
-//! repair the request path would have (`epigraph_engine::admin_cascade::
-//! replay_deferred`). Each repair re-verifies the committed act and is
+//! `cascade.admin_applied` (or `cascade.retired`) row for the same cause and
+//! subject and runs the same repair the request path would have
+//! (`epigraph_engine::admin_cascade::replay_deferred`), fewest failed attempts
+//! first, then oldest. Each repair re-verifies the committed act and is
 //! idempotent, so a replay of an already-repaired or undone act changes nothing
 //! it should not; every applied replay writes its own audit row naming the
 //! original caller, the deferral it replays and `--replayed-by`.
+//!
+//! # Stuck cascades
+//!
+//! A cascade whose repair has failed `--max-failures` times (its act was
+//! undone, say, so it can never verify) leaves the window and is listed under
+//! `stuck` in the report; the run then exits non-zero (status 2) until an
+//! operator reads why and retires it: `--retire <event id> --reason <text>`
+//! writes a `cascade.retired` row, which answers that cascade's pending rows,
+//! and runs no replay.
 //!
 //! # Authority
 //!
@@ -42,9 +52,23 @@ struct Cli {
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
-    /// Maximum deferral rows to consider this run.
+    /// Maximum cascades to replay this run.
     #[arg(long, default_value_t = 200)]
     limit: i64,
+
+    /// A cascade whose repair has failed this many times is held out of the
+    /// window and reported as stuck.
+    #[arg(long, default_value_t = epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES)]
+    max_failures: i64,
+
+    /// Retire the pending cascade this deferred (or failed) row belongs to
+    /// instead of replaying anything (repeatable). Requires --reason.
+    #[arg(long = "retire", value_name = "EVENT_ID")]
+    retire: Vec<uuid::Uuid>,
+
+    /// Why the cascades named by --retire are retired; recorded in each row.
+    #[arg(long, requires = "retire")]
+    reason: Option<String>,
 
     /// Who is running the replay; recorded in every applied row's `replay_of`.
     #[arg(long, default_value = "replay_deferred_cascades")]
@@ -79,10 +103,42 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("the maintenance connection cannot bypass row security")?;
     let (conn, viewer) = session.split();
-    let report =
-        epigraph_engine::admin_cascade::replay_deferred(conn, viewer, &cli.replayed_by, cli.limit)
+
+    if !cli.retire.is_empty() {
+        let reason = cli
+            .reason
+            .as_deref()
+            .filter(|r| !r.trim().is_empty())
+            .ok_or_else(|| anyhow!("--retire needs a non-empty --reason"))?;
+        let mut retired = Vec::new();
+        for event_id in &cli.retire {
+            let id = epigraph_db::repos::admin_cascade::retire_pending(
+                &mut *conn,
+                *event_id,
+                &cli.replayed_by,
+                reason,
+            )
             .await
-            .context("list the pending deferrals")?;
+            .with_context(|| format!("retire the pending cascade of row {event_id}"))?;
+            retired.push(serde_json::json!({"retired_event_id": event_id, "audit_event_id": id}));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "retired": retired }))
+                .context("serialize the retire report")?
+        );
+        return Ok(());
+    }
+
+    let report = epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        viewer,
+        &cli.replayed_by,
+        cli.limit,
+        cli.max_failures,
+    )
+    .await
+    .context("list the pending deferrals")?;
     println!(
         "{}",
         serde_json::to_string_pretty(&report).context("serialize the replay report")?
@@ -93,6 +149,15 @@ async fn main() -> anyhow::Result<()> {
             report.failed,
             report.unreadable
         );
+    }
+    if !report.stuck.is_empty() {
+        eprintln!(
+            "{} cascade(s) failed {} times or more and are held out of the replay; read why and \
+             retire each with --retire <deferred_event_id> --reason <text>",
+            report.stuck.len(),
+            cli.max_failures
+        );
+        std::process::exit(2);
     }
     Ok(())
 }
