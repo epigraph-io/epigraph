@@ -426,34 +426,21 @@ pub async fn supersede_claim(
         }
     }
 
-    // The administrative cascade's trigger, and -- when this process has no
-    // administrative connection -- its deferral, recorded in the act's own
-    // transaction under the principal it is stamped with, so the supersession
-    // and its audit row commit together.
+    // The administrative cascade's trigger, and its administrative session,
+    // acquired BEFORE the act commits. With none (not configured, or not
+    // usable) the deferral is recorded in the act's own transaction under the
+    // principal it is stamped with, so the supersession and its audit row
+    // commit together.
     #[cfg(feature = "db")]
-    let trigger = epigraph_engine::admin_cascade::CascadeTrigger {
-        cause: epigraph_engine::admin_cascade::CascadeCause::Supersede,
-        agent_id: viewer.principal(),
-        oauth: Some(oauth_principal(&auth)),
-        subject_id: claim_id,
-        object_id: Some(new_uuid),
-    };
+    let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
+        epigraph_engine::admin_cascade::CascadeCause::Supersede,
+        viewer.principal(),
+        Some(oauth_principal(&auth)),
+        claim_id,
+        Some(new_uuid),
+    );
     #[cfg(feature = "db")]
-    let deferred = if state.admin_cascade {
-        None
-    } else {
-        Some(
-            epigraph_engine::admin_cascade::record_deferral(
-                &mut *tx,
-                &trigger,
-                epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED,
-            )
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to record the deferred cascade: {e}"),
-            })?,
-        )
-    };
+    let (mut session, deferred) = admin_session_or_deferral(&state, &mut tx, &trigger).await?;
 
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the supersession: {e}"),
@@ -478,25 +465,20 @@ pub async fn supersede_claim(
     // caller. Best-effort: the act has committed, so a cascade failure must
     // not turn a successful write into a reported error (the retry would hit
     // "already been superseded").
-    let (cascade, belief_cascade) = match deferred {
-        Some(status) => (status, Default::default()),
-        None => match state.admin_cascade_session().await {
-            Ok(mut session) => {
-                let (conn, admin_viewer) = session.split();
-                epigraph_engine::admin_cascade::apply_after_supersede(
-                    conn,
-                    admin_viewer,
-                    &trigger,
-                    claim_id,
-                    new_uuid,
-                )
-                .await
-            }
-            Err(reason) => (
-                record_deferral_after_commit(&state, &viewer, &trigger, &reason).await,
-                Default::default(),
-            ),
-        },
+    let (cascade, belief_cascade) = match (session.as_mut(), deferred) {
+        (Some(session), _) => {
+            let (conn, admin_viewer) = session.split();
+            epigraph_engine::admin_cascade::apply_after_supersede(
+                conn,
+                admin_viewer,
+                &viewer,
+                &trigger,
+                claim_id,
+                new_uuid,
+            )
+            .await
+        }
+        (None, status) => (status, Default::default()),
     };
 
     // 10. Trigger belief propagation for downstream factors (fire-and-forget).
@@ -566,28 +548,37 @@ pub(crate) fn oauth_principal(
     }
 }
 
-/// Record a deferral AFTER the act committed (the administrative connection
-/// was configured but could not be used), on a transaction stamped with the
-/// caller's viewer so `security_events_append` admits the row. Best-effort: a
-/// failure is reported in the response, never raised.
+/// Acquire the administrative (maintenance) session BEFORE the caller's act
+/// commits. When there is none -- not configured, or not usable -- record the
+/// deferral inside the act's own transaction `tx` (stamped with the caller's
+/// viewer, so `security_events_append` admits the row) and return that status:
+/// the act and its audit row then commit together.
+///
+/// # Errors
+/// The deferral INSERT's error, as a database error: nothing commits.
 #[cfg(feature = "db")]
-pub(crate) async fn record_deferral_after_commit(
-    state: &AppState,
-    viewer: &epigraph_db::visibility::Viewer,
+pub(crate) async fn admin_session_or_deferral<'s>(
+    state: &'s AppState,
+    tx: &mut sqlx::PgConnection,
     trigger: &epigraph_engine::admin_cascade::CascadeTrigger,
-    reason: &str,
-) -> epigraph_engine::admin_cascade::CascadeStatus {
-    use epigraph_engine::admin_cascade::{record_deferral, CascadeStatus};
-    let mut tx = match state.write_as(viewer, "admin_cascade_deferral").await {
-        Ok(tx) => tx,
-        Err(e) => return CascadeStatus::deferred_unaudited(reason, format!("{e:?}")),
-    };
-    match record_deferral(&mut *tx, trigger, reason).await {
-        Ok(status) => match tx.commit().await {
-            Ok(()) => status,
-            Err(e) => CascadeStatus::deferred_unaudited(reason, e),
-        },
-        Err(e) => CascadeStatus::deferred_unaudited(reason, e),
+) -> Result<
+    (
+        Option<epigraph_db::MaintenanceSession<'s>>,
+        epigraph_engine::admin_cascade::CascadeStatus,
+    ),
+    ApiError,
+> {
+    match state.admin_cascade_session().await {
+        Ok(session) => Ok((Some(session), Default::default())),
+        Err(reason) => {
+            let status =
+                epigraph_engine::admin_cascade::record_deferral(&mut *tx, trigger, &reason)
+                    .await
+                    .map_err(|e| ApiError::DatabaseError {
+                        message: format!("Failed to record the deferred cascade: {e}"),
+                    })?;
+            Ok((None, status))
+        }
     }
 }
 
@@ -698,28 +689,14 @@ pub async fn mark_duplicate(
             message: other.to_string(),
         },
     })?;
-    let trigger = epigraph_engine::admin_cascade::CascadeTrigger {
-        cause: epigraph_engine::admin_cascade::CascadeCause::Dedup,
-        agent_id: viewer.principal(),
-        oauth: Some(oauth_principal(&auth)),
-        subject_id: dup_id,
-        object_id: Some(req.canonical_id),
-    };
-    let deferred = if state.admin_cascade {
-        None
-    } else {
-        Some(
-            epigraph_engine::admin_cascade::record_deferral(
-                &mut *tx,
-                &trigger,
-                epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED,
-            )
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to record the deferred cascade: {e}"),
-            })?,
-        )
-    };
+    let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
+        epigraph_engine::admin_cascade::CascadeCause::Dedup,
+        viewer.principal(),
+        Some(oauth_principal(&auth)),
+        dup_id,
+        Some(req.canonical_id),
+    );
+    let (mut session, deferred) = admin_session_or_deferral(&state, &mut tx, &trigger).await?;
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the dedup: {e}"),
     })?;
@@ -729,25 +706,20 @@ pub async fn mark_duplicate(
     // BBAs, re-point every other edge onto the canonical, move the BBAs that
     // follow them, and rebuild the affected beliefs (backlog 20e9ed83).
     // Best-effort and audited; see the supersede handler.
-    let (cascade, belief_cascade) = match deferred {
-        Some(status) => (status, Default::default()),
-        None => match state.admin_cascade_session().await {
-            Ok(mut session) => {
-                let (conn, admin_viewer) = session.split();
-                epigraph_engine::admin_cascade::apply_after_dedup(
-                    conn,
-                    admin_viewer,
-                    &trigger,
-                    dup_id,
-                    req.canonical_id,
-                )
-                .await
-            }
-            Err(reason) => (
-                record_deferral_after_commit(&state, &viewer, &trigger, &reason).await,
-                Default::default(),
-            ),
-        },
+    let (cascade, belief_cascade) = match (session.as_mut(), deferred) {
+        (Some(session), _) => {
+            let (conn, admin_viewer) = session.split();
+            epigraph_engine::admin_cascade::apply_after_dedup(
+                conn,
+                admin_viewer,
+                &viewer,
+                &trigger,
+                dup_id,
+                req.canonical_id,
+            )
+            .await
+        }
+        (None, status) => (status, Default::default()),
     };
 
     // Provenance: best-effort (.ok() swallow). content_hash is zero-bytes for mark_duplicate.

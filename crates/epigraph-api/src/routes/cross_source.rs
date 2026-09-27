@@ -387,54 +387,37 @@ pub async fn decide_candidate(
             // transaction stamped with the CALLER's viewer. `match_candidates`
             // carries no tenancy and this verdict requires `claims:admin`; the
             // stamp is what attributes a deferral row to the session principal,
-            // which `security_events_append` requires. When this process has no
-            // administrative connection the deferral commits with the act.
-            let trigger = CascadeTrigger {
-                cause: CascadeCause::MatchRetire,
-                agent_id: viewer.principal(),
-                oauth: Some(crate::routes::versioning::oauth_principal(&auth)),
-                subject_id: id,
-                object_id: None,
-            };
+            // which `security_events_append` requires. The administrative
+            // session is acquired before the act commits; without one the
+            // deferral commits with the act.
+            let trigger = CascadeTrigger::new(
+                CascadeCause::MatchRetire,
+                viewer.principal(),
+                Some(crate::routes::versioning::oauth_principal(&auth)),
+                id,
+                None,
+            );
             let db_err = |e: String| ApiError::DatabaseError { message: e };
             let mut tx = state.write_as(&viewer, "decide_candidate.retire").await?;
             let previous_status =
                 epigraph_db::MatchCandidateRepo::mark_retired_conn(&mut tx, id, decided_by)
                     .await
                     .map_err(|e| db_err(e.to_string()))?;
-            let deferred = if state.admin_cascade {
-                None
-            } else {
-                Some(
-                    admin_cascade::record_deferral(
-                        &mut *tx,
-                        &trigger,
-                        admin_cascade::REASON_NOT_CONFIGURED,
-                    )
-                    .await
-                    .map_err(|e| db_err(e.to_string()))?,
-                )
-            };
+            let (mut session, deferred) =
+                crate::routes::versioning::admin_session_or_deferral(&state, &mut tx, &trigger)
+                    .await?;
             tx.commit().await.map_err(|e| db_err(e.to_string()))?;
 
             // THE CASCADE, with administrative authority on the maintenance
             // connection: retract the matcher edge (owned by nobody when both
             // claims are public) and delete its factors, bp_messages and
             // edge-keyed BBAs. Audited in `security_events`.
-            let (cascade, outcome) = match deferred {
-                Some(status) => (status, None),
-                None => match state.admin_cascade_session().await {
-                    Ok(mut session) => {
-                        admin_cascade::apply_after_match_retire(session.conn(), &trigger, id).await
-                    }
-                    Err(reason) => (
-                        crate::routes::versioning::record_deferral_after_commit(
-                            &state, &viewer, &trigger, &reason,
-                        )
-                        .await,
-                        None,
-                    ),
-                },
+            let (cascade, outcome) = match (session.as_mut(), deferred) {
+                (Some(session), _) => {
+                    admin_cascade::apply_after_match_retire(session.conn(), &viewer, &trigger, id)
+                        .await
+                }
+                (None, status) => (status, None),
             };
             let outcome =
                 outcome.unwrap_or(epigraph_db::repos::match_candidate::RetirementOutcome {
