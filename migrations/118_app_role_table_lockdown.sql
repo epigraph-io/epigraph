@@ -36,7 +36,8 @@
 --      `stale` (INSERT or UPDATE) on a non-privileged session. Retirement is an
 --      administrative act and runs on the maintenance connection;
 --   6. append-only tables (provenance_log among them) lose UPDATE/DELETE, and
---      tables with no writer lose every write.
+--      tables with no writer lose every write;
+--   7. `oauth.` security events become writable by the definers only.
 --
 -- Refresh-token families. `family_id` (nullable; NULL reads as the row's own
 -- id, so rows inserted by an older binary during the deploy are their own
@@ -605,6 +606,24 @@ DO $$ BEGIN
     END IF;
 END $$;
 
+-- ===================================================================
+-- 7. AUDIT ROWS 118's DEFINERS WRITE ARE THEIRS ALONE
+-- ===================================================================
+-- `oauth.client_approved`, `oauth.refresh_token_reuse` and
+-- `oauth.refresh_token_grace` are written by the definers above. The
+-- application role keeps INSERT on `security_events` (077: an actor must never
+-- be able to suppress its own audit record), so without this an application
+-- session could forge one. Same shape as 117's `cascade.` arm. `left()`, not
+-- LIKE: the application's own provisioning events are `oauth_...`, and `_` is
+-- a LIKE wildcard.
+DROP POLICY IF EXISTS security_events_oauth_privileged ON public.security_events;
+CREATE POLICY security_events_oauth_privileged ON public.security_events
+    AS RESTRICTIVE FOR INSERT TO PUBLIC
+    WITH CHECK (
+        left(event_type, 6) <> 'oauth.'
+        OR (SELECT public.epigraph_bypass())
+        OR (SELECT public.epigraph_definer_bypass()));
+
 -- UNDO (restores the prior privileges; re-opens what this file closes):
 --   GRANT INSERT, UPDATE, DELETE ON public._sqlx_migrations, public.tenancy_backfill_progress,
 --     public.tenancy_exempt, public.tenancy_transcription_log,
@@ -625,6 +644,7 @@ END $$;
 --     public.authorizers, public.entity_merge_candidates, public.experiment_entities,
 --     public.harvester_audit_reports, public.harvester_enriched_concepts,
 --     public.harvester_sources, public.source_artifacts TO epigraph_app;
+--   DROP POLICY IF EXISTS security_events_oauth_privileged ON public.security_events;
 --   REVOKE DELETE ON public.factors, public.bp_messages, public.mass_functions
 --     FROM epigraph_maintenance;   (only where 115 / 117 are NOT applied: they
 --     grant the same privileges and need them)

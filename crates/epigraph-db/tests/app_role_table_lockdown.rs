@@ -1394,3 +1394,39 @@ async fn append_only_tables_keep_insert_and_cascades_still_clear_them(pool: PgPo
     .unwrap();
     assert_eq!(left, 0, "the cascade cleared the children");
 }
+
+/// Migration 118 section 7: an application session cannot write an `oauth.`
+/// audit event (only the definers can), while its own `oauth_...` provisioning
+/// events and unrelated events still land.
+#[sqlx::test(migrations = "../../migrations")]
+async fn oauth_audit_events_are_written_only_by_the_definers(pool: PgPool) {
+    let app = app_pool(&pool, 2).await;
+    for forged in [
+        "oauth.client_approved",
+        "oauth.refresh_token_reuse",
+        "oauth.refresh_token_grace",
+    ] {
+        let r = sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ($1, NULL, true, '{}'::jsonb)",
+        )
+        .bind(forged)
+        .execute(&app)
+        .await;
+        assert_eq!(sqlstate(r).as_deref(), Some("42501"), "forged {forged}");
+    }
+    for own in [
+        "oauth_provision_denied",
+        "oauth_human_provisioned",
+        "rate_limited",
+    ] {
+        sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ($1, NULL, false, '{}'::jsonb)",
+        )
+        .bind(own)
+        .execute(&app)
+        .await
+        .unwrap_or_else(|e| panic!("{own} on the application role: {e}"));
+    }
+}
