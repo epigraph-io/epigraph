@@ -579,3 +579,107 @@ async fn an_owner_cannot_hand_its_edge_to_nobody_by_repointing_it(pool: PgPool) 
         "the edge kept its source and owner"
     );
 }
+
+/// `(signature IS NOT NULL, signer_id, content_hash IS NOT NULL)` of an edge.
+async fn signed(pool: &PgPool, id: Uuid) -> (bool, Option<Uuid>, bool) {
+    sqlx::query_as(
+        "SELECT signature IS NOT NULL, signer_id, content_hash IS NOT NULL \
+           FROM edges WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("edge signature columns")
+}
+
+/// Sign `edge` as `signer` (the harness is privileged, so this is not a re-point).
+async fn sign(pool: &PgPool, edge: Uuid, signer: Uuid) {
+    sqlx::query(
+        "UPDATE edges SET signature = decode(repeat('ab', 64), 'hex'), signer_id = $2, \
+                          content_hash = decode(repeat('cd', 32), 'hex') \
+          WHERE id = $1",
+    )
+    .bind(edge)
+    .bind(signer)
+    .execute(pool)
+    .await
+    .expect("sign the edge");
+}
+
+/// A re-point keeps the edge id but changes what was signed. So when a
+/// NON-privileged session changes an edge's endpoints -- here the co-owner, who
+/// may re-point the owner's edge off the owner's endpoint -- the edge comes out
+/// UNSIGNED instead of carrying the owner's signature over endpoints it never
+/// signed. The owner's in-place relabel keeps the signature (no endpoint
+/// changed), and a privileged re-point (the administrative cascade's shape)
+/// keeps it too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_privileged_repoint_unsigns_the_edge_and_a_privileged_one_does_not(pool: PgPool) {
+    let (w, g1) = fixture::seed_agent_with_group(&pool, "owner-w").await;
+    let (c, g2) = fixture::seed_agent_with_group(&pool, "co-owner-c").await;
+    add_reader(&pool, g1, c).await;
+    let w1 = fixture::seed_group_claim(&pool, w, g1, "W's private claim 1").await;
+    let w2 = fixture::seed_group_claim(&pool, w, g1, "W's private claim 2").await;
+    let cc = fixture::seed_group_claim(&pool, c, g2, "C's private claim").await;
+    let public = fixture::seed_public_claim(&pool, w, "a public claim").await;
+    let public2 = fixture::seed_public_claim(&pool, w, "another public claim").await;
+    let co_owned = fixture::seed_edge(&pool, w1, cc).await;
+    let owned = fixture::seed_edge(&pool, w1, w2).await;
+    let by_admin = fixture::seed_edge(&pool, w1, cc).await;
+    for e in [co_owned, owned, by_admin] {
+        sign(&pool, e, w).await;
+        assert_eq!(
+            signed(&pool, e).await,
+            (true, Some(w), true),
+            "fixture: signed by W"
+        );
+    }
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (by_c, by_w) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, c).await;
+        let by_c = update(
+            &mut conn,
+            "UPDATE edges SET source_id = $2 WHERE id = $1",
+            co_owned,
+            public,
+        )
+        .await;
+        stamp(&mut conn, &p, w).await;
+        let by_w = update(
+            &mut conn,
+            "UPDATE edges SET properties = properties || jsonb_build_object('by', $2::text) \
+             WHERE id = $1",
+            owned,
+            w,
+        )
+        .await;
+        (conn, (by_c, by_w))
+    })
+    .await;
+    assert_eq!(by_c, Ok(1), "the co-owner's re-point is admitted (D2)");
+    assert_eq!(
+        signed(&pool, co_owned).await,
+        (false, None, false),
+        "and leaves an UNSIGNED edge, not one attributed to W over endpoints W never signed"
+    );
+    assert_eq!(by_w, Ok(1), "the owner's in-place relabel lands");
+    assert_eq!(
+        signed(&pool, owned).await,
+        (true, Some(w), true),
+        "no endpoint changed, so the signature stays"
+    );
+
+    sqlx::query("UPDATE edges SET source_id = $2 WHERE id = $1")
+        .bind(by_admin)
+        .bind(public2)
+        .execute(&pool)
+        .await
+        .expect("a privileged re-point");
+    assert_eq!(
+        signed(&pool, by_admin).await,
+        (true, Some(w), true),
+        "a privileged re-point (the administrative cascade) keeps the attribution"
+    );
+}

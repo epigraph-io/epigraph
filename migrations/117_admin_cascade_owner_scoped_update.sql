@@ -76,7 +76,11 @@
 -- passes both WITH CHECKs. That is an edit by a party that could already
 -- DELETE the edge (115), so it is admitted, as rule (1) above says.
 -- `owner_scoped_update.rs::the_owner_and_the_co_owner_still_update_their_edges`
--- pins both halves.
+-- pins both halves. A re-point must not keep the ORIGINAL writer's signature,
+-- though: the signed content named the old endpoints, so an edge re-pointed
+-- in place would carry an attribution its signer never made. Section 5 clears
+-- `signature`, `signer_id` and `content_hash` whenever a non-privileged
+-- session changes an edge's endpoints.
 --
 -- ===================================================================
 -- 2. THE CASCADE, ON THE MAINTENANCE CONNECTION
@@ -130,7 +134,8 @@
 -- reported in the cascade's errors, as they were for an unstamped session
 -- under 115.
 --
--- Undo: DROP the five `<table>_update_owner` policies; restore 115's body of
+-- Undo: DROP the five `<table>_update_owner` policies; DROP TRIGGER
+-- `edges_repoint_unsign` and its function; restore 115's body of
 -- `epigraph_cascade_delete_edge_bbas` with CREATE OR REPLACE (never DROP: a
 -- DROP resets the ACL); GRANT EXECUTE ON `epigraph_dedup_move_bbas(uuid, uuid,
 -- uuid[])` TO epigraph_app. Checked before claiming: no `origin/*` ref carries
@@ -276,3 +281,36 @@ DO $$ BEGIN
         EXECUTE 'GRANT DELETE ON public.factors, public.bp_messages TO epigraph_maintenance';
     END IF;
 END $$;
+
+-- ===================================================================
+-- 5. A NON-PRIVILEGED RE-POINT UNSIGNS THE EDGE
+-- ===================================================================
+-- An edge's `signature` / `signer_id` / `content_hash` attest the edge as its
+-- signer wrote it, endpoints included. The owner and the co-owner may re-point
+-- an edge (section 1a), but the re-pointed edge is no longer what was signed,
+-- so a non-privileged session that changes an endpoint leaves an unsigned edge
+-- rather than one that keeps another writer's attribution. A privileged
+-- session (the administrative cascade that migrates a superseded or duplicate
+-- claim's edges, a backfill) keeps the columns: it records where an
+-- assertion moved, and the audit row says so.
+CREATE OR REPLACE FUNCTION public.epigraph_edges_repoint_unsign()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF (NEW.source_id, NEW.source_type, NEW.target_id, NEW.target_type)
+           IS DISTINCT FROM (OLD.source_id, OLD.source_type, OLD.target_id, OLD.target_type)
+       AND (OLD.signature IS NOT NULL OR OLD.signer_id IS NOT NULL
+            OR OLD.content_hash IS NOT NULL)
+       AND NOT public.epigraph_session_is_privileged_writer() THEN
+        NEW.signature := NULL;
+        NEW.signer_id := NULL;
+        NEW.content_hash := NULL;
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS edges_repoint_unsign ON public.edges;
+CREATE TRIGGER edges_repoint_unsign
+    BEFORE UPDATE OF source_id, source_type, target_id, target_type ON public.edges
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_edges_repoint_unsign();
