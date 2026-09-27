@@ -155,6 +155,13 @@ name = "retire_match_candidates"
 path = "src/bin/retire_match_candidates.rs"
 required-features = ["db"]
 
+# Migration 117 (batch W10): replay deferred administrative cascades on the
+# maintenance connection.
+[[bin]]
+name = "replay_deferred_cascades"
+path = "src/bin/replay_deferred_cascades.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every
