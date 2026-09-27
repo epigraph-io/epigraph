@@ -44,12 +44,13 @@ impl EdgeBbaCascade {
 ///
 /// * a PRIVILEGED session (superuser, BYPASSRLS, a maintenance member) runs the
 ///   plain `DELETE` it always ran;
-/// * any other session calls migration 115's
-///   `epigraph_cascade_delete_edge_bbas`, which deletes only rows it can admit
-///   (the session's own; a retracted edge's; an edge whose source claim, or a
-///   retired duplicate of it, the session writes), refuses the whole call with
-///   `CD02` (42501) when a readable row is admitted by none of those, and
-///   appends one `security_events` row per call that deleted anything.
+/// * any other session calls `epigraph_cascade_delete_edge_bbas` (115, reduced
+///   to its owner arm by migration 117), which deletes only the session's OWN
+///   rows (owner group in its writable set), refuses the whole call with
+///   `CD02` (42501) when a readable row is not the session's, and appends one
+///   `security_events` row per call that deleted anything. Another writer's
+///   rows are removed only by the administrative cascade on the maintenance
+///   connection (`epigraph_engine::admin_cascade`).
 ///
 /// `sqlx::Result` rather than `DbError` so the match-candidate repository,
 /// which speaks `sqlx::Result`, calls it unchanged.
