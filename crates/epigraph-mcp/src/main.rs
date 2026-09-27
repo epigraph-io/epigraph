@@ -249,14 +249,7 @@ fn select_signer(
 
     // (3) explicit 32-byte key, no LLM identity.
     if let Some(key_hex) = agent_key {
-        let bytes = (0..key_hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-            .map_err(|e| format!("invalid agent-key hex: {e}"))?;
-        let key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "agent-key must be exactly 32 bytes (64 hex chars)".to_string())?;
+        let key = parse_agent_key(key_hex)?;
         let signer = AgentSigner::from_bytes(&key).map_err(|e| format!("agent-key: {e}"))?;
         return Ok(SelectedSigner {
             signer,
@@ -271,6 +264,43 @@ fn select_signer(
         llm_identity: None,
         identity_declared: false,
     })
+}
+
+/// Parse an `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` value into its 32 bytes.
+///
+/// Surrounding whitespace is trimmed first: a value read from an environment
+/// file or a shell export can carry a trailing space, CR or newline. What is
+/// left must be exactly 64 ASCII hex characters. Every other input is a named
+/// error, never a panic (the old byte-pair slicing panicked on an odd length
+/// or a multi-byte character) and never the `generate()` fallback, because the
+/// operator asked for one specific key. No error message echoes any part of
+/// the value: it is a secret, and `main` prints the error.
+fn parse_agent_key(raw: &str) -> Result<[u8; 32], String> {
+    const EXPECTED: &str = "expected exactly 64 hex chars (32 bytes); the value is not shown";
+    let key_hex = raw.trim();
+    if !key_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid agent-key: it contains a non-hex character; {EXPECTED}"
+        ));
+    }
+    if key_hex.len() % 2 != 0 {
+        return Err(format!(
+            "invalid agent-key: odd number of hex chars ({}); {EXPECTED}",
+            key_hex.len()
+        ));
+    }
+    if key_hex.len() != 64 {
+        return Err(format!(
+            "agent-key must be exactly 32 bytes: got {} hex chars; {EXPECTED}",
+            key_hex.len()
+        ));
+    }
+    let mut key = [0u8; 32];
+    // Cannot fail after the checks above; map the error to a fixed string
+    // anyway, because `FromHexError`'s Display names the offending character.
+    hex::decode_to_slice(key_hex, &mut key)
+        .map_err(|_| format!("invalid agent-key hex; {EXPECTED}"))?;
+    Ok(key)
 }
 
 /// Validate the `(--listen, --jwt-secret, --allow-unauthenticated-http)`
@@ -1295,5 +1325,88 @@ mod signer_selection_tests {
     #[test]
     fn malformed_agent_key_is_an_error() {
         assert!(select_signer(None, None, None, Some("zz")).is_err());
+    }
+
+    /// A key read from an env file or a shell export can carry surrounding
+    /// whitespace (a trailing space, CR or newline). It is trimmed, and the
+    /// signer is the SAME one the clean key gives: not merely `Ok`, which a
+    /// silent `generate()` would also be.
+    #[test]
+    fn agent_key_with_surrounding_whitespace_is_the_same_signer() {
+        let clean = select_signer(None, None, None, Some(KEY_HEX))
+            .unwrap()
+            .signer
+            .public_key();
+        for padded in [
+            format!("{KEY_HEX} "),
+            format!("{KEY_HEX}\r"),
+            format!("{KEY_HEX}\n"),
+            format!("{KEY_HEX}\r\n"),
+            format!(" \t{KEY_HEX}"),
+        ] {
+            let selected = select_signer(None, None, None, Some(&padded))
+                .unwrap_or_else(|e| panic!("{padded:?} must parse after trimming: {e}"));
+            assert_eq!(
+                selected.signer.public_key(),
+                clean,
+                "{padded:?} must give the clean key's signer"
+            );
+            assert!(selected.identity_declared);
+        }
+    }
+
+    /// Inputs the old byte-pair slicing PANICKED on (odd length, a multi-byte
+    /// character inside 64 bytes), plus the other malformed shapes, are each a
+    /// clean `Err`: no panic, and never the `generate()` fallback. A value that
+    /// trims to empty fails closed too.
+    #[test]
+    fn malformed_agent_key_values_are_errors_not_panics_or_fallbacks() {
+        let odd = &KEY_HEX[..63];
+        let multibyte = format!("{}\u{e9}", &KEY_HEX[..62]); // 64 bytes, 63 chars
+        assert_eq!(multibyte.len(), 64);
+        let internal_space = format!("{} {}", &KEY_HEX[..32], &KEY_HEX[33..]);
+        let short = &KEY_HEX[..62];
+        let long = format!("{KEY_HEX}01");
+        for bad in [
+            odd,
+            multibyte.as_str(),
+            internal_space.as_str(),
+            short,
+            long.as_str(),
+            "",
+            "   ",
+            "\r\n",
+        ] {
+            let outcome = std::panic::catch_unwind(|| select_signer(None, None, None, Some(bad)));
+            let result = outcome.unwrap_or_else(|_| panic!("{bad:?} must not panic"));
+            assert!(result.is_err(), "{bad:?} must be refused, not generate()d");
+        }
+    }
+
+    /// No error message echoes any part of the key: it is a secret, and `main`
+    /// prints the error. A non-hex LAST char, an odd length and a wrong length
+    /// are each checked for a 16-char run of the value.
+    #[test]
+    fn agent_key_errors_never_echo_the_value() {
+        let secret = "0123456789abcdef".repeat(4);
+        let non_hex = format!("{}g", &secret[..63]);
+        let odd = secret[..63].to_string();
+        let wrong_len = secret[..62].to_string();
+        for bad in [non_hex, odd, wrong_len] {
+            let Err(msg) = select_signer(None, None, None, Some(&bad)) else {
+                panic!("{bad:?} must be refused");
+            };
+            for window in bad.as_bytes().windows(16) {
+                let run = std::str::from_utf8(window).unwrap();
+                assert!(
+                    !msg.contains(run),
+                    "the error must not echo the key (found {run:?}): {msg}"
+                );
+            }
+            assert!(
+                !msg.contains("'g'"),
+                "the error must not name the bad char: {msg}"
+            );
+        }
     }
 }
