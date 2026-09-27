@@ -2401,3 +2401,138 @@ async fn a_reader_cannot_dedup_onto_its_groups_private_claim(pool: PgPool) {
     );
     by_writer.expect("the group's writer dedups onto its own group's claim");
 }
+
+/// `(target_id, source_id)` of an edge.
+async fn endpoints(pool: &PgPool, edge: Uuid) -> (Uuid, Uuid) {
+    sqlx::query_as("SELECT target_id, source_id FROM edges WHERE id = $1")
+        .bind(edge)
+        .fetch_one(pool)
+        .await
+        .expect("edge endpoints")
+}
+
+/// `consolidate_claims` after migration 117: the combined one-transaction form
+/// refuses the application role; the ACT (merged claim, retired sources,
+/// `supersedes` edges) lands there; the edge migration refuses it, refuses a
+/// merged id the sources do not record, and lands on the maintenance
+/// connection, moving another writer's edges and retracting the redundant
+/// copies; a second run is a no-op.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_is_an_act_plus_a_maintenance_edge_migration(pool: PgPool) {
+    let (w, w_group) = fixture::seed_agent_with_group(&pool, "merger-w").await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    let s1 = seed_public_claim_owned_by(&pool, w, w_group, "W's source 1").await;
+    let s2 = seed_public_claim_owned_by(&pool, w, w_group, "W's source 2").await;
+    let xc = seed_public_claim_owned_by(&pool, x, x_group, "X's claim").await;
+    let x_into_s1 = fixture::seed_edge(&pool, xc, s1).await;
+    let x_into_s2 = fixture::seed_edge(&pool, xc, s2).await;
+    let s2_out = fixture::seed_edge(&pool, s2, xc).await;
+    let interior = fixture::seed_edge(&pool, s1, s2).await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (combined, act, on_app) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        let combined = epigraph_db::ClaimRepository::consolidate_conn(
+            &mut conn,
+            &[s1, s2],
+            "W's merged claim (combined)",
+            0.7,
+            epigraph_db::ConsolidateMode::Merge,
+            "merge",
+            w,
+        )
+        .await;
+        let act = epigraph_db::ClaimRepository::consolidate_act_conn(
+            &mut conn,
+            &[s1, s2],
+            "W's merged claim",
+            0.7,
+            epigraph_db::ConsolidateMode::Merge,
+            "merge",
+            w,
+        )
+        .await;
+        let merged = act.as_ref().map(|r| r.merged_id).unwrap_or_default();
+        let on_app = epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+            &mut conn,
+            merged,
+            &[s1, s2],
+        )
+        .await;
+        (conn, (combined, act, on_app))
+    })
+    .await;
+    let e = combined.expect_err("the combined form refuses the application role");
+    assert!(e.to_string().contains("privileged"), "{e}");
+    let act = act.expect("W's consolidation act lands on the app role");
+    assert!(!act.already_existed);
+    assert_eq!((act.edges_migrated, act.edges_deduped), (0, 0));
+    let merged = act.merged_id;
+    let e = on_app.expect_err("the edge migration is not the application role's");
+    assert!(e.to_string().contains("privileged"), "{e}");
+    for e in [x_into_s1, x_into_s2, s2_out, interior] {
+        let open: bool = sqlx::query_scalar("SELECT valid_to IS NULL FROM edges WHERE id = $1")
+            .bind(e)
+            .fetch_one(&pool)
+            .await
+            .expect("edge");
+        assert!(open, "the act touched no edge");
+    }
+    assert_eq!(endpoints(&pool, x_into_s1).await.0, s1);
+
+    let (wrong, m, again) =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let wrong = epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+                &mut conn,
+                xc,
+                &[s1, s2],
+            )
+            .await;
+            let m = epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+                &mut conn,
+                merged,
+                &[s1, s2],
+            )
+            .await;
+            let again = epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+                &mut conn,
+                merged,
+                &[s1, s2],
+            )
+            .await;
+            (conn, (wrong, m, again))
+        })
+        .await;
+    let e = wrong.expect_err("a merged id the sources do not record");
+    assert!(e.to_string().contains("does not replace"), "{e}");
+    let m = m.expect("the maintenance connection migrates the edges");
+    assert_eq!(
+        m.migrated.len(),
+        2,
+        "one of X's edges and s2's outgoing edge: {m:?}"
+    );
+    assert!(m.migrated.contains(&s2_out), "{m:?}");
+    assert_eq!(
+        m.retracted.len(),
+        2,
+        "the interior edge and X's redundant copy: {m:?}"
+    );
+    assert!(m.retracted.contains(&interior), "{m:?}");
+    let kept = if m.migrated.contains(&x_into_s1) {
+        x_into_s1
+    } else {
+        x_into_s2
+    };
+    assert_eq!(
+        endpoints(&pool, kept).await.0,
+        merged,
+        "X's edge now targets the merged claim"
+    );
+    assert_eq!(endpoints(&pool, s2_out).await.1, merged);
+    let again = again.expect("a replay is harmless");
+    assert!(
+        again.migrated.is_empty() && again.retracted.is_empty(),
+        "the migration is idempotent: {again:?}"
+    );
+}

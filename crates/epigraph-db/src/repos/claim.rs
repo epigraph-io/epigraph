@@ -8489,10 +8489,73 @@ impl ClaimRepository {
     /// (migration 105) returns a live group without writing and refuses a
     /// revoked one, so the answer no longer depends on the stamp.
     ///
+    /// # Migration 117: a PRIVILEGED session only
+    ///
+    /// The edge migration re-points and retracts edges whatever their owner (an
+    /// edge into a source is its SOURCE's writer's assertion). Since 117 a
+    /// non-privileged session's UPDATE of an edge it does not own matches no
+    /// row, so on such a session this would merge and silently leave other
+    /// writers' edges on the retired sources. It therefore refuses a
+    /// non-privileged session outright. A request path runs
+    /// [`Self::consolidate_act_conn`] on the caller's stamped transaction and
+    /// [`Self::migrate_consolidated_edges_conn`] on the maintenance connection
+    /// (`epigraph_engine::admin_cascade`).
+    ///
+    /// # Errors
+    /// As [`Self::consolidate`], plus `DbError::InvalidData` on a
+    /// non-privileged session.
+    pub async fn consolidate_conn(
+        conn: &mut sqlx::PgConnection,
+        source_ids: &[Uuid],
+        merged_content: &str,
+        merged_truth: f64,
+        mode: ConsolidateMode,
+        reason: &str,
+        acting_agent_id: Uuid,
+    ) -> Result<ConsolidateResult, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "consolidate_conn (its edge migration re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let mut result = Self::consolidate_act_conn(
+            &mut tx,
+            source_ids,
+            merged_content,
+            merged_truth,
+            mode,
+            reason,
+            acting_agent_id,
+        )
+        .await?;
+        if !result.already_existed {
+            let m = migrate_consolidated_edges(&mut tx, result.merged_id, source_ids).await?;
+            result.edges_migrated = m.migrated.len() as u64;
+            result.edges_deduped = m.retracted.len() as u64;
+        }
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// The consolidation's own act, and nothing else: validate and lock the
+    /// sources, insert the merged claim, retire every source (`supersedes =
+    /// merged`) and insert the `supersedes` edges merged → source.
+    ///
+    /// Every row it writes is one the consolidating caller authors or must be
+    /// able to write (the merged claim, its own sources, the edges between
+    /// them), so it runs on the CALLER's stamped transaction and the database
+    /// decides write authority. It does NOT migrate the sources' other edges:
+    /// those belong to whoever asserted them, and moving them is the
+    /// administrative cascade's job
+    /// ([`Self::migrate_consolidated_edges_conn`], migration 117). The
+    /// returned counts of migrated and deduped edges are therefore zero.
+    ///
     /// # Errors
     /// As [`Self::consolidate`].
     #[allow(clippy::too_many_lines)]
-    pub async fn consolidate_conn(
+    pub async fn consolidate_act_conn(
         conn: &mut sqlx::PgConnection,
         source_ids: &[Uuid],
         merged_content: &str,
@@ -8762,117 +8825,6 @@ impl ClaimRepository {
         .fetch_one(&mut *tx)
         .await?;
 
-        // ── Edge migration ──
-        //
-        // Collect every non-supersedes edge touching a source, dropping those
-        // interior to the merge (both endpoints inside the source set) — those
-        // would collapse to merged→merged self-loops.
-        let candidates = sqlx::query!(
-            r#"
-            -- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-            SELECT id, source_id, target_id, source_type, target_type,
-                   relationship, created_at
-            FROM edges
-            WHERE relationship != 'supersedes'
-              AND ( (source_id = ANY($1) AND source_type = 'claim')
-                 OR (target_id = ANY($1) AND target_type = 'claim') )
-            ORDER BY created_at, id
-            "#,
-            source_ids,
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-
-        let src_set: &std::collections::HashSet<Uuid> = &unique;
-        let mut to_delete: Vec<Uuid> = Vec::new();
-        let mut survivors: Vec<Uuid> = Vec::new();
-        let mut seen: std::collections::HashSet<(Uuid, String, String, i8)> =
-            std::collections::HashSet::new();
-
-        for e in &candidates {
-            let src_in = e.source_type == "claim" && src_set.contains(&e.source_id);
-            let tgt_in = e.target_type == "claim" && src_set.contains(&e.target_id);
-
-            if src_in && tgt_in {
-                // Interior to the merge: would become merged→merged.
-                to_delete.push(e.id);
-                continue;
-            }
-            // AUTHORED is allowed to accumulate (migration 017) — migrate, never dedupe.
-            if e.relationship == "AUTHORED" {
-                survivors.push(e.id);
-                continue;
-            }
-
-            let (other, other_type) = if src_in {
-                (e.target_id, e.target_type.clone())
-            } else {
-                (e.source_id, e.source_type.clone())
-            };
-            // alternative_of's unique index is keyed on (LEAST, GREATEST) and
-            // is therefore direction-agnostic; every other relationship
-            // duplicates per-direction.
-            let direction = if e.relationship == "alternative_of" {
-                0
-            } else if src_in {
-                1
-            } else {
-                -1
-            };
-            let key = (other, other_type, e.relationship.clone(), direction);
-            if seen.insert(key) {
-                survivors.push(e.id);
-            } else {
-                // Earliest edge already claimed this slot (ORDER BY created_at, id).
-                to_delete.push(e.id);
-            }
-        }
-
-        let mut edges_deduped = 0_u64;
-        if !to_delete.is_empty() {
-            // `survivors` keeps the earliest edge per slot and `to_delete` holds only
-            // the redundant later copies, so retracting them leaves the assertion in
-            // force on the survivor. Retraction rather than deletion keeps the
-            // duplicates auditable — you can still see that the graph once carried
-            // two copies and when the redundancy was resolved.
-            edges_deduped = sqlx::query!(
-                "UPDATE edges SET valid_to = now() WHERE id = ANY($1) AND valid_to IS NULL",
-                &to_delete[..]
-            )
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        }
-
-        let mut edges_migrated = 0_u64;
-        if !survivors.is_empty() {
-            edges_migrated += sqlx::query!(
-                r#"
-                UPDATE edges SET source_id = $1
-                WHERE id = ANY($2) AND source_type = 'claim' AND source_id = ANY($3)
-                "#,
-                merged_id,
-                &survivors[..],
-                source_ids,
-            )
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-
-            edges_migrated += sqlx::query!(
-                r#"
-                UPDATE edges SET target_id = $1
-                WHERE id = ANY($2) AND target_type = 'claim' AND target_id = ANY($3)
-                "#,
-                merged_id,
-                &survivors[..],
-                source_ids,
-            )
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        }
-
         // Retire sources. One statement: chk_deprecated_no_embedding (migration
         // 052) is a per-statement CHECK, so is_current=false and both
         // embedding=NULL / embedding_3072=NULL must land together.
@@ -8913,11 +8865,192 @@ impl ClaimRepository {
         Ok(ConsolidateResult {
             merged_id,
             superseded: source_ids.to_vec(),
-            edges_migrated,
-            edges_deduped,
+            edges_migrated: 0,
+            edges_deduped: 0,
             already_existed: false,
         })
     }
+
+    /// The consolidation's edge migration, as the administrative cascade runs it
+    /// after the caller's [`Self::consolidate_act_conn`] committed (migration
+    /// 117): re-point every live edge on a retired source onto the merged
+    /// claim, and retract the redundant copies the merge creates.
+    ///
+    /// Re-verifies the committed act first (every source is retired with
+    /// `supersedes = merged_id`), so it acts only on a merge that happened, and
+    /// it is idempotent: it considers LIVE edges only (`valid_to IS NULL`), and
+    /// a second run finds none left on the sources. That makes it the replay
+    /// of a deferred cascade too. Runs in its own transaction (a SAVEPOINT when
+    /// the connection is already in one).
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` on a non-privileged session, or when the claims
+    /// do not record `merged_id` replacing every retired source;
+    /// `DbError::QueryFailed` on any failed statement.
+    pub async fn migrate_consolidated_edges_conn(
+        conn: &mut sqlx::PgConnection,
+        merged_id: Uuid,
+        source_ids: &[Uuid],
+    ) -> Result<ConsolidateEdgeMigration, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "migrate_consolidated_edges_conn (it re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let merged: Vec<(Uuid, Option<Uuid>, bool)> = sqlx::query_as(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read verifies the act the mutation follows.
+            SELECT id, supersedes, COALESCE(is_current, true)
+              FROM claims WHERE id = ANY($1) FOR UPDATE"#,
+        )
+        .bind(source_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
+        let verified = !source_ids.is_empty()
+            && unique.len() == source_ids.len()
+            && merged.len() == source_ids.len()
+            && merged
+                .iter()
+                .all(|(_, sup, current)| *sup == Some(merged_id) && !*current);
+        if !verified {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "claim {merged_id} does not replace every retired source of this \
+                     consolidation; refusing to migrate their edges"
+                ),
+            });
+        }
+        let migration = migrate_consolidated_edges(&mut tx, merged_id, source_ids).await?;
+        tx.commit().await?;
+        Ok(migration)
+    }
+}
+
+/// What [`ClaimRepository::migrate_consolidated_edges_conn`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsolidateEdgeMigration {
+    /// Live edges re-pointed from a retired source onto the merged claim.
+    pub migrated: Vec<Uuid>,
+    /// Live edges retracted: interior to the merge (both endpoints were
+    /// sources) or a redundant later copy of a surviving edge.
+    pub retracted: Vec<Uuid>,
+}
+
+/// The consolidation's edge migration, unchecked: the callers
+/// ([`ClaimRepository::consolidate_conn`],
+/// [`ClaimRepository::migrate_consolidated_edges_conn`]) establish the
+/// privilege and the committed act first.
+async fn migrate_consolidated_edges(
+    tx: &mut sqlx::PgConnection,
+    merged_id: Uuid,
+    source_ids: &[Uuid],
+) -> Result<ConsolidateEdgeMigration, DbError> {
+    let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
+    // Collect every LIVE non-supersedes edge touching a source, dropping those
+    // interior to the merge (both endpoints inside the source set) — those
+    // would collapse to merged→merged self-loops. A retracted edge stays where
+    // it is: it is history, and leaving it makes a second run a no-op.
+    let candidates: Vec<(Uuid, Uuid, Uuid, String, String, String)> = sqlx::query_as(
+        r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+        SELECT id, source_id, target_id, source_type, target_type, relationship
+        FROM edges
+        WHERE relationship != 'supersedes'
+          AND valid_to IS NULL
+          AND ( (source_id = ANY($1) AND source_type = 'claim')
+             OR (target_id = ANY($1) AND target_type = 'claim') )
+        ORDER BY created_at, id"#,
+    )
+    .bind(source_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut to_delete: Vec<Uuid> = Vec::new();
+    let mut survivors: Vec<Uuid> = Vec::new();
+    let mut seen: std::collections::HashSet<(Uuid, String, String, i8)> =
+        std::collections::HashSet::new();
+
+    for (id, source_id, target_id, source_type, target_type, relationship) in &candidates {
+        let src_in = source_type == "claim" && unique.contains(source_id);
+        let tgt_in = target_type == "claim" && unique.contains(target_id);
+
+        if src_in && tgt_in {
+            // Interior to the merge: would become merged→merged.
+            to_delete.push(*id);
+            continue;
+        }
+        // AUTHORED is allowed to accumulate (migration 017) — migrate, never dedupe.
+        if relationship == "AUTHORED" {
+            survivors.push(*id);
+            continue;
+        }
+
+        let (other, other_type) = if src_in {
+            (*target_id, target_type.clone())
+        } else {
+            (*source_id, source_type.clone())
+        };
+        // alternative_of's unique index is keyed on (LEAST, GREATEST) and
+        // is therefore direction-agnostic; every other relationship
+        // duplicates per-direction.
+        let direction = if relationship == "alternative_of" {
+            0
+        } else if src_in {
+            1
+        } else {
+            -1
+        };
+        let key = (other, other_type, relationship.clone(), direction);
+        if seen.insert(key) {
+            survivors.push(*id);
+        } else {
+            // Earliest edge already claimed this slot (ORDER BY created_at, id).
+            to_delete.push(*id);
+        }
+    }
+
+    let mut out = ConsolidateEdgeMigration::default();
+    if !to_delete.is_empty() {
+        // `survivors` keeps the earliest edge per slot and `to_delete` holds only
+        // the redundant later copies, so retracting them leaves the assertion in
+        // force on the survivor. Retraction rather than deletion keeps the
+        // duplicates auditable — you can still see that the graph once carried
+        // two copies and when the redundancy was resolved.
+        out.retracted = sqlx::query_scalar(
+            "UPDATE edges SET valid_to = now() WHERE id = ANY($1) AND valid_to IS NULL \
+             RETURNING id",
+        )
+        .bind(&to_delete[..])
+        .fetch_all(&mut *tx)
+        .await?;
+    }
+
+    if !survivors.is_empty() {
+        let resourced: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE edges SET source_id = $1 \
+             WHERE id = ANY($2) AND source_type = 'claim' AND source_id = ANY($3) \
+             RETURNING id",
+        )
+        .bind(merged_id)
+        .bind(&survivors[..])
+        .bind(source_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        let retargeted: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE edges SET target_id = $1 \
+             WHERE id = ANY($2) AND target_type = 'claim' AND target_id = ANY($3) \
+             RETURNING id",
+        )
+        .bind(merged_id)
+        .bind(&survivors[..])
+        .bind(source_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        out.migrated = resourced;
+        out.migrated.extend(retargeted);
+    }
+    Ok(out)
 }
 
 /// One grounded neighbour of a query vector, as
