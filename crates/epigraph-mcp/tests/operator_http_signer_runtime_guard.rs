@@ -405,8 +405,11 @@ async fn principal_less_caller_on_a_retired_signer_cannot_retire_the_humans_item
     )
     .await;
     assert!(
-        before.contains("data:") && !before.contains(REFUSAL) && !before.contains("Forbidden"),
-        "CALIBRATION: an unlinked signer's read must be served:\n{before}"
+        before.contains("data:")
+            && before.contains("the human's open item")
+            && !before.contains(REFUSAL)
+            && !before.contains("Forbidden"),
+        "CALIBRATION: an unlinked signer's read must be served, claim content included:\n{before}"
     );
 
     // The signer is RETIRED-linked to the human who owns the item.
@@ -420,6 +423,29 @@ async fn principal_less_caller_on_a_retired_signer_cannot_retire_the_humans_item
         .await
         .expect("retired link to the human");
     drop(conn);
+
+    // A READ, which the scope gate admits on BOTH listener kinds, so this is
+    // the call that reaches `refuse_linked_http_signer` on the default
+    // (read-only) listener too. The signer is still that listener's READ
+    // principal: a group membership that predates the retire would widen what
+    // its callers read, so the linked-signer gate must refuse reads as well,
+    // naming the human, and must not serve the claim.
+    let read_after_link = call_named(
+        &client,
+        &url,
+        &session,
+        10,
+        "get_claim",
+        serde_json::json!({"claim_id": item.to_string()}),
+    )
+    .await;
+    assert!(
+        read_after_link.contains(REFUSAL)
+            && read_after_link.contains(&human.to_string())
+            && !read_after_link.contains("the human's open item"),
+        "a principal-less READ on a signer retired-linked to a human must be refused by the \
+         linked-signer gate, naming the link, and must not serve the claim:\n{read_after_link}"
+    );
 
     let calls = [
         (
@@ -437,7 +463,9 @@ async fn principal_less_caller_on_a_retired_signer_cannot_retire_the_humans_item
         let body = call_named(&client, &url, &session, 3 + i as u32, tool, args).await;
         match writes {
             // Refused first by the scope gate, which runs BEFORE the linked
-            // signer gate: this arm does not reach `refuse_linked_http_signer`.
+            // signer gate: these WRITE tools do not reach
+            // `refuse_linked_http_signer` on this listener (the `get_claim`
+            // read above does).
             UnauthenticatedWrites::Refused => assert!(
                 body.contains("requires scope 'claims:write'")
                     && body.contains("no authenticated principal"),
@@ -469,6 +497,7 @@ async fn principal_less_caller_on_a_retired_signer_cannot_retire_the_humans_item
 }
 
 /// Default (read-only) principal-less listener on a retired-linked signer:
+/// a read reaches the linked-signer gate and is refused, naming the human;
 /// both write tools are refused (at the scope gate) and nothing is written.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_principal_less_caller_on_a_retired_linked_signer_cannot_retire_the_humans_item(
