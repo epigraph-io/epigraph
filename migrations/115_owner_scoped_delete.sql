@@ -300,7 +300,17 @@
 -- group must be in the session's WRITABLE set (on `group_key_epochs` also the
 -- group's creator, which that table's 077 policy admits for provisioning).
 -- The application's own deletes on these tables are the privatization /
--- unseal paths, which run as the maintenance role and are unchanged. `groups`
+-- unseal paths. They run on the privatization job's maintenance-DSN
+-- connection (`ScopedPool::unscoped_for_maintenance`), whose login must pass
+-- `assert_maintenance_privilege`; `epigraph_bypass()` admits that session, so
+-- they are unchanged. They do NOT run as the NOLOGIN `epigraph_maintenance`
+-- role itself, which holds no DELETE on these tables (070 granted it SELECT /
+-- INSERT / UPDATE only). The DELETE works on a login that holds the privilege
+-- on its own (a superuser does); a non-superuser maintenance login needs that
+-- grant before it can unseal, and only such a login, holding it, reaches the
+-- `epigraph_bypass()` disjunct below.
+-- `owner_scoped_delete.rs::a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exactly`
+-- pins the refusal for a member without it. `groups`
 -- keeps its delete-blocking trigger, and `group_memberships` grants the
 -- application no DELETE. `owner_scoped_delete.rs`'s catalog ratchet fails
 -- when a table whose permissive DELETE-covering policy admits on the read

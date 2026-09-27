@@ -1748,7 +1748,25 @@ async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exact
         steps.push(("meet after restore", n));
 
         tx.commit().await.expect("commit");
-        (conn, (sup, bypassrls, bypass, steps))
+
+        // 115 section 8: the unseal's ciphertext DELETE is NOT something this
+        // role can run. It holds no DELETE grant on the sealed-content tables,
+        // so the unseal works only on a maintenance DSN whose login has one (a
+        // superuser today). Outside the transaction, so the refusal aborts
+        // nothing above.
+        let unseal = sqlx::query(
+            "DELETE FROM public.claim_encryption WHERE claim_id = ANY($1) AND group_id = $2",
+        )
+        .bind(&[c1][..])
+        .bind(p_group)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| match e.as_database_error() {
+            Some(d) => format!("{} {}", d.code().unwrap_or_default(), d.message()),
+            None => e.to_string(),
+        });
+        (conn, (sup, bypassrls, bypass, steps, unseal))
     })
     .await;
     sqlx::query(&format!("DROP ROLE {role}"))
@@ -1756,7 +1774,12 @@ async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exact
         .await
         .expect("drop the probe role");
 
-    let (sup, bypassrls, bypass, steps) = steps;
+    let (sup, bypassrls, bypass, steps, unseal) = steps;
+    assert_eq!(
+        unseal,
+        Err("42501 permission denied for table claim_encryption".to_string()),
+        "the NOLOGIN maintenance role cannot run the unseal's ciphertext DELETE"
+    );
     assert!(
         !sup && !bypassrls && bypass,
         "calibration: a member session, neither superuser nor BYPASSRLS \
