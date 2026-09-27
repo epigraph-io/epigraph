@@ -37,6 +37,10 @@
 //! * the rotation's `service` cap cut from 90 days to 24 hours, or its `ELSE`
 //!   (agent) cap lengthened to 30 days: fails
 //!   `rotation_caps_each_client_types_successor_at_its_refresh_ttl`.
+//! * table-level INSERT re-granted on two writer-less tables, or column-level
+//!   INSERT on one: fails `no_rowless_table_is_app_writable_unless_allowlisted`
+//!   and `append_only_tables_keep_insert_and_cascades_still_clear_them`; a
+//!   column-level UPDATE re-grant fails the ratchet.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -120,6 +124,23 @@ const CLOSED: &[&str] = &[
     "tenancy_exempt",
     "tenancy_transcription_log",
     "tenancy_undeclared_writes",
+];
+
+/// Migration 118 section 6's writer-less tables: nothing in any repository that
+/// shares the database writes them, so the application role holds no write at
+/// all on them, INSERT included. The ratchet checks INSERT and UPDATE with
+/// `has_any_column_privilege`, so a column-level re-grant fails it as well as a
+/// table-level one.
+const NO_WRITE: &[&str] = &[
+    "agent_capabilities",
+    "authorization_votes",
+    "authorizers",
+    "entity_merge_candidates",
+    "experiment_entities",
+    "harvester_audit_reports",
+    "harvester_enriched_concepts",
+    "harvester_sources",
+    "source_artifacts",
 ];
 
 /// A pool whose connections are `SET SESSION AUTHORIZATION <role>` (a
@@ -239,6 +260,30 @@ async fn no_rowless_table_is_app_writable_unless_allowlisted(pool: PgPool) {
         "these allowlist entries no longer violate (RLS enabled or privilege revoked): \
          {stale:?}. Remove them so the list only shrinks."
     );
+
+    // The writer-less tables: no write of any kind, whether or not the table
+    // has row security, and whether the grant is table- or column-level.
+    for t in NO_WRITE {
+        assert!(
+            !ALLOWLIST.iter().any(|(a, _)| a == t),
+            "{t} has no writer and cannot be allowlisted"
+        );
+        let writable: Vec<String> = sqlx::query_scalar(
+            "SELECT p FROM unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) AS p \
+              WHERE CASE WHEN p IN ('INSERT', 'UPDATE') \
+                         THEN has_any_column_privilege('epigraph_app', $1::regclass, p) \
+                         ELSE has_table_privilege('epigraph_app', $1::regclass, p) END",
+        )
+        .bind(format!("public.{t}"))
+        .fetch_all(&pool)
+        .await
+        .expect("privilege read");
+        assert!(
+            writable.is_empty(),
+            "{t} has no writer, but epigraph_app holds {writable:?} on it (table- or \
+             column-level). Revoke it, or name the writer and move the table out of NO_WRITE."
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1437,11 +1482,7 @@ async fn append_only_tables_keep_insert_and_cascades_still_clear_them(pool: PgPo
         let r = sqlx::query(&format!("DELETE FROM {t}")).execute(&app).await;
         assert_eq!(sqlstate(r).as_deref(), Some("42501"), "DELETE {t}");
     }
-    for t in [
-        "agent_capabilities",
-        "source_artifacts",
-        "harvester_sources",
-    ] {
+    for t in NO_WRITE {
         let r = sqlx::query(&format!("INSERT INTO {t} DEFAULT VALUES"))
             .execute(&app)
             .await;
