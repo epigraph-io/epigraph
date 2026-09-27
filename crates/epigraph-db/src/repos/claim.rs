@@ -6582,10 +6582,22 @@ impl ClaimRepository {
     /// repair from diverging when the caller can see the edge that would move
     /// it.
     ///
+    /// And it keeps 114's attach rule for the canonical (FA04: a non-owner may
+    /// attach only to a PUBLIC claim). The repair moves the duplicate's
+    /// edge-keyed BBAs and copies its frame bindings onto the canonical with
+    /// administrative authority, and on a non-public canonical those rows take
+    /// the canonical's owner: a session that may only READ that canonical would
+    /// be writing into its group through the repair. So a non-privileged
+    /// session may dedup onto a non-public canonical only when it writes that
+    /// canonical. The refusal is unconditional (it does not ask whether there
+    /// is anything to move), because the caller cannot see every edge the
+    /// repair will move.
+    ///
     /// # Errors
     /// `DbError::NotFound` for a missing canonical or duplicate,
     /// `DbError::QueryFailed` for a duplicate already superseded, for
-    /// `dup == canonical`, for the FA07 refusal and for any refused statement.
+    /// `dup == canonical`, for the FA04 and FA07 refusals and for any refused
+    /// statement.
     pub async fn mark_duplicate_act_conn(
         conn: &mut sqlx::PgConnection,
         dup: ClaimId,
@@ -6596,6 +6608,27 @@ impl ClaimRepository {
         let canon_uuid: Uuid = canonical.into();
         let mut tx = conn.begin().await?;
         mark_duplicate_act(&mut tx, dup_uuid, canon_uuid).await?;
+        let foreign_private_canonical: bool = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+            SELECT NOT public.epigraph_session_is_privileged_writer()
+               AND c.visibility::text <> 'public'
+               AND NOT public.epigraph_session_writes_node(c.id, 'claim')
+              FROM claims c WHERE c.id = $1"#,
+        )
+        .bind(canon_uuid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if foreign_private_canonical {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "FA04: canonical {canon_uuid} is not public and this session cannot write \
+                     it; a dedup would move the duplicate's derived rows into its owner's \
+                     group, and a non-owner may attach only to a PUBLIC claim; nothing was \
+                     written"
+                )),
+            });
+        }
         let false_binding: bool = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
             SELECT NOT public.epigraph_session_is_privileged_writer()

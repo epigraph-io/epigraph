@@ -2346,3 +2346,58 @@ async fn the_115_functions_are_maintenance_owned_definers(pool: PgPool) {
         assert_eq!(func, "epigraph_cascade_delete_node_edges", "{table}");
     }
 }
+
+// ===========================================================================
+// W10 revision: each administrative repair is bound to a committed act of the
+// caller's, runs only on a privileged session, and a reader cannot dedup into
+// its group's private claim through the repair.
+// ===========================================================================
+
+/// A READER of a group may not dedup its own claim onto that group's
+/// non-public claim (FA04 at the act): the administrative repair would move
+/// the duplicate's derived rows into the group as the group's own. Nothing is
+/// written. The group's writer may.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reader_cannot_dedup_onto_its_groups_private_claim(pool: PgPool) {
+    let (a, g) = fixture::seed_agent_with_group(&pool, "group-writer-a").await;
+    let (r, r_group) = fixture::seed_agent_with_group(&pool, "reader-r").await;
+    add_reader(&pool, g, r).await;
+    let k = fixture::seed_group_claim(&pool, a, g, "G's private canonical").await;
+    let d = seed_public_claim_owned_by(&pool, r, r_group, "R's duplicate").await;
+    let d2 = seed_public_claim_owned_by(&pool, a, g, "A's duplicate").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (by_reader, by_writer) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, r).await;
+        let by_reader = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(d),
+            epigraph_core::ClaimId::from_uuid(k),
+        )
+        .await;
+        stamp(&mut conn, &p, a).await;
+        let by_writer = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(d2),
+            epigraph_core::ClaimId::from_uuid(k),
+        )
+        .await;
+        (conn, (by_reader, by_writer))
+    })
+    .await;
+    let e = by_reader.expect_err("a reader's dedup onto the group's private claim is refused");
+    assert!(e.to_string().contains("FA04"), "{e}");
+    let (current, sup): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+            .bind(d)
+            .fetch_one(&pool)
+            .await
+            .expect("d");
+    assert_eq!(
+        (current, sup),
+        (true, None),
+        "the refused act wrote nothing"
+    );
+    by_writer.expect("the group's writer dedups onto its own group's claim");
+}
