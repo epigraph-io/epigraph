@@ -1141,6 +1141,29 @@ async fn seed_candidate(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
     (id, lo, hi)
 }
 
+/// The stale guard's refusal: SQLSTATE 42501 AND its own `MC01` tag.
+///
+/// Verified to fail: with `REVOKE EXECUTE ON FUNCTION epigraph_definer_bypass()
+/// FROM epigraph_app` appended to 118 (restored afterwards), the app-role
+/// statements still fail with 42501, but from the helper, not the guard, and
+/// this assertion names the difference.
+fn assert_mc01(e: &sqlx::Error, what: &str) {
+    let d = e
+        .as_database_error()
+        .unwrap_or_else(|| panic!("{what}: not a database error: {e}"));
+    assert_eq!(
+        d.code().as_deref(),
+        Some("42501"),
+        "{what}: {}",
+        d.message()
+    );
+    assert!(
+        d.message().contains("MC01"),
+        "{what}: refused, but not by the stale guard: {}",
+        d.message()
+    );
+}
+
 async fn status_of(pool: &PgPool, id: Uuid) -> String {
     sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
         .bind(id)
@@ -1173,32 +1196,25 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
         .expect("decide on the application role");
     assert_eq!(status_of(&pool, id).await, "promoted");
 
-    // Retirement does not, by any route.
+    // Retirement does not, by any route, and each refusal is the stale
+    // guard's own (MC01), not some other 42501 on the way (a lost EXECUTE on a
+    // privilege helper, a missing table grant in the cascade).
     let e = repo
         .retire(id, None)
         .await
         .expect_err("retire on the application role");
-    assert_eq!(
-        e.as_database_error().and_then(|d| d.code()).as_deref(),
-        Some("42501")
-    );
+    assert_mc01(&e, "retire");
     let e = repo
         .set_status(id, "stale", None)
         .await
         .expect_err("set_status stale");
-    assert_eq!(
-        e.as_database_error().and_then(|d| d.code()).as_deref(),
-        Some("42501")
-    );
-    let raw = sqlx::query("UPDATE match_candidates SET status = 'stale' WHERE id = $1")
+    assert_mc01(&e, "set_status stale");
+    let e = sqlx::query("UPDATE match_candidates SET status = 'stale' WHERE id = $1")
         .bind(id)
         .execute(&app)
-        .await;
-    assert_eq!(
-        sqlstate(raw).as_deref(),
-        Some("42501"),
-        "raw UPDATE to stale"
-    );
+        .await
+        .expect_err("raw UPDATE to stale");
+    assert_mc01(&e, "raw UPDATE to stale");
     let (agent, _) = fixture::seed_agent_with_group(&pool, "w11-match-ins").await;
     let c = fixture::seed_public_claim(&pool, agent, &format!("w11 c {}", Uuid::new_v4())).await;
     let d = fixture::seed_public_claim(&pool, agent, &format!("w11 d {}", Uuid::new_v4())).await;
@@ -1215,15 +1231,7 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
             None,
         )
         .await;
-    assert_eq!(
-        ins.err()
-            .and_then(|e| e
-                .as_database_error()
-                .and_then(|d| d.code().map(|c| c.to_string())))
-            .as_deref(),
-        Some("42501"),
-        "INSERT as stale"
-    );
+    assert_mc01(&ins.expect_err("INSERT as stale"), "INSERT as stale");
     let del = sqlx::query("DELETE FROM match_candidates WHERE id = $1")
         .bind(id)
         .execute(&app)
