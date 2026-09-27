@@ -467,10 +467,15 @@ Current reservation:
   concurrent refresh) it is refused and the family stays live. The rotation
   derives the successor's scopes from the client and caps its expiry at the
   client type's TTL, and the application role no longer reads `token_hash`.
-  `agents`: table UPDATE/DELETE revoked, UPDATE granted back on the profile
-  columns only. `match_candidates`: DELETE revoked and the
-  `match_candidates_stale_guard` trigger refuses the transition to `stale` on a
-  non-privileged session, so retirement runs on the maintenance connection.
+  `agents`: table UPDATE/DELETE revoked, UPDATE granted back on the columns the
+  live paths write, and `agents_competence_guard` refuses a change to
+  `properties.competence_scopes` on a non-privileged session.
+  `match_candidates`: DELETE revoked and the `match_candidates_stale_guard`
+  trigger refuses the transition to `stale` on a non-privileged session, so
+  retirement (HTTP and MCP) runs on the maintenance connection. Append-only
+  tables (`provenance_log` among them) lose application UPDATE/DELETE, tables
+  with no writer lose every application write, and a restrictive policy lets
+  only the definers write `oauth.` security events.
   The remaining tables without row security that the application role may
   update or delete are an explicit, justified allowlist in
   `epigraph-db/tests/app_role_table_lockdown.rs`. **Ordering:** it uses no
