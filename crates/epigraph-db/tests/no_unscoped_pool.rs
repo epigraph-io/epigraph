@@ -513,7 +513,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/revoke.rs",
-        2,
+        1,
         "Pre-authentication. RFC 7009 revocation authenticates the token being revoked rather than \
          a session principal, and is reachable on the anonymous OAuth router.",
     ),
