@@ -162,7 +162,7 @@ impl PerspectiveRepository {
         map: &std::collections::HashMap<String, f64>,
     ) -> Result<(), DbError> {
         let value = serde_json::to_value(map).unwrap_or(serde_json::Value::Null);
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
             UPDATE perspectives
             SET properties = jsonb_set(
@@ -179,6 +179,15 @@ impl PerspectiveRepository {
         .bind(value)
         .execute(pool)
         .await?;
+        // Migration 117: UPDATE of a registry row is owner-scoped, so a world
+        // perspective (nobody's) matches no row for a non-privileged session.
+        // Report that, and a missing perspective, instead of a silent success.
+        if updated.rows_affected() == 0 {
+            return Err(DbError::NotFound {
+                entity: "Perspective (or not updatable by this session)".to_string(),
+                id,
+            });
+        }
         Ok(())
     }
 

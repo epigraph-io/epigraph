@@ -4,6 +4,7 @@
 //! following the repository pattern to abstract database access.
 
 pub mod activity;
+pub mod admin_cascade;
 pub mod agent;
 pub mod agent_key;
 pub mod alternative_set;
@@ -83,8 +84,8 @@ pub use claim::{
     ClaimSortOrder, ConsolidateMode, ConsolidateResult, DedupRepair, EvolveStepResult,
     FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit, LabelQuery,
     LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
-    SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
-    EXPANSION_RELATIONSHIPS,
+    SortDirection, SupersedeEdgeMigration, SweepCandidate, CONSOLIDATE_MAX_SOURCES,
+    CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,

@@ -153,13 +153,17 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     ("challenge.rs::update_state", "caller-supplied id"),
     ("claim.rs::batch_update_truth_values", "caller-supplied ids"),
     ("claim.rs::evolve_step", "caller-supplied id"),
-    (
-        "claim.rs::mark_duplicate_with_repair_conn",
-        "caller-supplied ids (the body moved here from `mark_duplicate_with_repair`, which now delegates; not a new write)",
-    ),
+
     ("claim.rs::merge_properties", "caller-supplied id"),
     ("claim.rs::patch_claim_atomic_conn", "caller-supplied id"),
-    ("claim.rs::supersede_conn", "caller-supplied id"),
+    (
+        "claim.rs::supersede_act_conn",
+        "caller-supplied id (the act half of `supersede_conn`, split by batch W10; not a new write)",
+    ),
+    (
+        "claim.rs::migrate_superseded_edges",
+        "caller-supplied ids, privileged session only (the edge half of `supersede_conn`, split by batch W10; not a new write)",
+    ),
     ("claim.rs::update_trace_id_conn", "caller-supplied id"),
     ("claim.rs::update_truth_value_conn", "caller-supplied id"),
     ("edge.rs::retract", "caller-supplied id"),
@@ -223,7 +227,10 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
         "evidence.rs::store_embedding",
         "embedding backfill, corpus-wide",
     ),
-    ("match_candidate.rs::retire", "dedup sweep, corpus-wide"),
+    (
+        "match_candidate.rs::retract_candidate_edges",
+        "dedup sweep, corpus-wide; privileged session only (the cascade half of `retire`, split by batch W10; not a new write)",
+    ),
     // ── privatization: selection must be unfiltered to be correct ───────────
     // Filtering these would silently skip the rows they exist to find, which is
     // the argument `SystemReason::PrivatizationSelection` already records. They

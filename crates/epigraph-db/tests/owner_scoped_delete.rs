@@ -519,12 +519,15 @@ async fn a_world_owned_edge_is_deletable_by_its_sources_writer_only(pool: PgPool
 // 3. The three cascades, for their legitimate actor.
 // ===========================================================================
 
-/// The dedup's retracted collision edge. W marks its duplicate D of a WORLD
-/// canonical C. D -> T collides with C -> T, so the dedup retracts D -> T and
-/// drops its edge-keyed BBA -- which lives on T and is X's writer-owned row. It
-/// lands for W through the definer, and is audited once with W as the actor.
+/// The dedup's retracted collision edge (migration 117). W marks its duplicate
+/// D of a WORLD canonical C. D -> T collides with C -> T, so the repair
+/// retracts D -> T and drops its edge-keyed BBA -- which lives on T and is X's
+/// writer-owned row. W's ACT lands on the application role; the REPAIR does
+/// not (it refuses a non-privileged session, and leaves every row as it was),
+/// and lands on the maintenance connection, where it is idempotent. The
+/// definer is never entered, so it writes no definer audit row.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_dedup_drops_another_writers_bba_of_a_retracted_collision_edge(pool: PgPool) {
+async fn the_dedup_repair_is_the_maintenance_connections_and_drops_the_collision_bba(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (w, w_group) = fixture::seed_agent_with_group(&pool, "dedup-w").await;
     let (x, x_group) = fixture::seed_agent_with_group(&pool, "writer-x").await;
@@ -538,22 +541,52 @@ async fn the_dedup_drops_another_writers_bba_of_a_retracted_collision_edge(pool:
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
-    let (bba, repair) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+    let (bba, act, repair_by_w) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, x).await;
         let bba = store_bba(&mut conn, third, bt, w, Some(dup_edge)).await;
         stamp(&mut conn, &p, w).await;
-        let repair = epigraph_db::ClaimRepository::mark_duplicate_with_repair_conn(
+        let act = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
             &mut conn,
             epigraph_core::ClaimId::from_uuid(dup),
             epigraph_core::ClaimId::from_uuid(canonical),
         )
         .await;
-        (conn, (bba, repair))
+        let repair_by_w = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await;
+        (conn, (bba, act, repair_by_w))
     })
     .await;
-    // `bba` is already gone, so the fixture shape is asserted on the audit's
-    // owner list below rather than on the row.
-    let repair = repair.expect("the dedup lands for the duplicate's writer");
+    act.expect("the duplicate's writer marks its own duplicate on the app role");
+    let e = repair_by_w.expect_err("the repair is not the duplicate writer's to run");
+    assert!(e.to_string().contains("privileged"), "{e}");
+    assert_eq!(
+        writer_owned(&pool, "mass_functions", bba).await,
+        (x_group, true),
+        "fixture shape: X's writer-owned row, untouched by the refused repair"
+    );
+    let open: bool = sqlx::query_scalar("SELECT valid_to IS NULL FROM edges WHERE id = $1")
+        .bind(dup_edge)
+        .fetch_one(&pool)
+        .await
+        .expect("dup edge");
+    assert!(open, "the refused repair retracted nothing");
+
+    let repair = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("the maintenance connection repairs the dedup");
+    assert_eq!(repair.retracted_edges, vec![dup_edge]);
     assert_eq!(
         repair.deleted_bbas, 1,
         "the retracted edge's BBA was dropped"
@@ -565,43 +598,37 @@ async fn the_dedup_drops_another_writers_bba_of_a_retracted_collision_edge(pool:
             .fetch_one(&pool)
             .await
             .expect("dup edge");
-    assert!(
-        retracted,
-        "fixture shape: the collision edge was retracted, not deleted"
-    );
-    let audit = cascade_audit(&pool).await;
-    assert_eq!(audit.len(), 1, "{audit:?}");
-    assert_eq!(
-        audit[0].0,
-        Some(w),
-        "attributed to the deduplicating writer"
-    );
-    assert_eq!(audit[0].1, "dedup_retracted_edge");
-    assert_eq!(audit[0].2, 1);
-    assert_eq!(audit[0].3["retracted_edge"], 1, "{:?}", audit[0].3);
-    let owners: serde_json::Value = sqlx::query_scalar(
-        "SELECT details->'owner_group_ids' FROM security_events \
-          WHERE event_type = 'derived.cascade_bba_delete'",
-    )
-    .fetch_one(&pool)
+    assert!(retracted, "the collision edge was retracted, not deleted");
+
+    let again = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await;
+        (conn, r)
+    })
     .await
-    .expect("owners");
-    assert_eq!(
-        owners,
-        serde_json::json!([x_group]),
-        "fixture shape: the dropped BBA was X's writer-owned row, not W's"
+    .expect("a replay of the repair is harmless");
+    assert!(
+        again.retracted_edges.is_empty() && again.deleted_bbas == 0,
+        "the repair is idempotent: {again:?}"
+    );
+    assert!(
+        cascade_audit(&pool).await.is_empty(),
+        "a privileged session never enters the definer"
     );
 }
 
-/// The supersede-shaped retraction cascade. W writes Y (the replacement), and
-/// Y -> T's edge-keyed BBA on the world claim T is X's writer-owned row
-/// attributed to W. W invalidates it (arm `source_writer`); a bystander and an
-/// unstamped session are REFUSED with an error (CD02), not a silent 0, so the
-/// cascade reports it instead of skipping the edge as BBA-free.
+/// The supersede-shaped retraction cascade after migration 117. W writes Y (the
+/// replacement), and Y -> T's edge-keyed BBA on the world claim T is X's
+/// writer-owned row attributed to W. 115's `source_writer` arm let W remove
+/// it; that arm is gone. W, a bystander and an unstamped session are all
+/// REFUSED with an error (CD02), not a silent 0, and the row survives. The
+/// maintenance connection removes it with the plain statement.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_retraction_cascade_invalidates_for_the_sources_writer_and_refuses_others(
-    pool: PgPool,
-) {
+async fn the_retraction_cascade_refuses_every_non_owner_and_lands_on_maintenance(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (w, w_group) = fixture::seed_agent_with_group(&pool, "superseder-w").await;
     let (x, _) = fixture::seed_agent_with_group(&pool, "wirer-x").await;
@@ -631,30 +658,41 @@ async fn the_retraction_cascade_invalidates_for_the_sources_writer_and_refuses_o
     for (who, r) in [
         ("a bystander", by_z),
         ("an unstamped session", by_unstamped),
+        (
+            "the source's writer (115's source_writer arm is gone)",
+            by_w,
+        ),
     ] {
         let e = r.expect_err(&format!("{who} is refused"));
         assert!(e.to_string().contains("CD02"), "{who}: {e}");
     }
-    assert_eq!(by_w.expect("the source's writer invalidates"), 1);
-    assert!(!exists(&pool, "mass_functions", bba).await);
-    let audit = cascade_audit(&pool).await;
-    assert_eq!(
-        audit.len(),
-        1,
-        "only the admitted call is audited: {audit:?}"
+    assert!(
+        exists(&pool, "mass_functions", bba).await,
+        "nothing was deleted"
     );
-    assert_eq!(audit[0].0, Some(w));
-    assert_eq!(audit[0].1, "retraction_cascade");
-    assert_eq!(audit[0].3["source_writer"], 1, "{:?}", audit[0].3);
+    assert!(
+        cascade_audit(&pool).await.is_empty(),
+        "no refused call is audited"
+    );
+
+    let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        (conn, n)
+    })
+    .await
+    .expect("the maintenance connection invalidates");
+    assert_eq!(n, 1);
+    assert!(!exists(&pool, "mass_functions", bba).await);
 }
 
-/// The dedup cascade's phase 2. W's duplicate D had an outgoing edge D -> T;
-/// the dedup re-sources it at the WORLD canonical C, which W cannot write. Its
-/// BBA on T (X's writer-owned row, frozen from D and attributed to D's author
-/// W) is invalidated by W through the "retired duplicate of the source" arm. A
-/// bystander is refused.
+/// The dedup cascade's phase 2 after migration 117. W's duplicate D had an
+/// outgoing edge D -> T; the repair (on the maintenance connection) re-sources
+/// it at the WORLD canonical C. Its BBA on T -- X's writer-owned row, frozen
+/// from D and attributed to D's author W -- was invalidatable by W through 115's
+/// "retired duplicate of the source" arm. That arm is gone: W and a bystander
+/// are both refused (CD02), and the maintenance connection invalidates it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_dedup_cascade_invalidates_a_resourced_edge_for_the_duplicates_writer(pool: PgPool) {
+async fn the_resourced_edges_bba_is_the_maintenance_connections_to_invalidate(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (w, w_group) = fixture::seed_agent_with_group(&pool, "dedup-w").await;
     let (x, _) = fixture::seed_agent_with_group(&pool, "wirer-x").await;
@@ -668,25 +706,31 @@ async fn the_dedup_cascade_invalidates_a_resourced_edge_for_the_duplicates_write
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
-    let (bba, repair, by_z, by_w) =
-        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-            stamp(&mut conn, &p, x).await;
-            let bba = store_bba(&mut conn, target, bt, w, Some(edge)).await;
-            stamp(&mut conn, &p, w).await;
-            let repair = epigraph_db::ClaimRepository::mark_duplicate_with_repair_conn(
-                &mut conn,
-                epigraph_core::ClaimId::from_uuid(dup),
-                epigraph_core::ClaimId::from_uuid(canonical),
-            )
-            .await;
-            stamp(&mut conn, &p, z).await;
-            let by_z = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
-            stamp(&mut conn, &p, w).await;
-            let by_w = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
-            (conn, (bba, repair, by_z, by_w))
-        })
+    let bba = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, x).await;
+        let bba = store_bba(&mut conn, target, bt, w, Some(edge)).await;
+        stamp(&mut conn, &p, w).await;
+        epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("W's act");
+        (conn, bba)
+    })
+    .await;
+    let repair = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
         .await;
-    let repair = repair.expect("the dedup lands");
+        (conn, r)
+    })
+    .await
+    .expect("the maintenance connection repairs");
     assert_eq!(
         repair
             .resourced_edges
@@ -696,21 +740,44 @@ async fn the_dedup_cascade_invalidates_a_resourced_edge_for_the_duplicates_write
         vec![edge],
         "fixture shape: the edge was re-sourced at the canonical"
     );
-    let e = by_z.expect_err("a bystander is refused");
-    assert!(e.to_string().contains("CD02"), "{e}");
-    assert_eq!(by_w.expect("the duplicate's writer invalidates"), 1);
+
+    let p = pool.clone();
+    let (by_z, by_w) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, z).await;
+        let by_z = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        stamp(&mut conn, &p, w).await;
+        let by_w = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        (conn, (by_z, by_w))
+    })
+    .await;
+    for (who, r) in [("a bystander", by_z), ("the duplicate's writer", by_w)] {
+        let e = r.expect_err(&format!("{who} is refused"));
+        assert!(e.to_string().contains("CD02"), "{who}: {e}");
+    }
+    assert!(exists(&pool, "mass_functions", bba).await);
+
+    let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        (conn, n)
+    })
+    .await
+    .expect("maintenance invalidates");
+    assert_eq!(n, 1);
     assert!(!exists(&pool, "mass_functions", bba).await);
-    let audit = cascade_audit(&pool).await;
-    assert_eq!(audit.len(), 1, "{audit:?}");
-    assert_eq!(audit[0].3["source_writer"], 1, "{:?}", audit[0].3);
+    assert!(
+        cascade_audit(&pool).await.is_empty(),
+        "{:?}",
+        cascade_audit(&pool).await
+    );
 }
 
 /// The dedup's key collision with SOMEBODY ELSE's canonical-side row. W's
 /// duplicate D carries a BBA keyed by edge S -> D; the WORLD canonical C already
 /// carries X's writer-owned row with the same (frame, source agent,
-/// perspective) key. The owner-scoped pre-delete cannot remove X's row, so the
-/// dedup move keeps the canonical's row and drops the duplicate's copy instead
-/// of tripping the unique index; the drop is counted in the move's audit row.
+/// perspective) key. The repair (on the maintenance connection, migration 117)
+/// keeps the canonical's row and drops the duplicate's copy instead of
+/// tripping the unique index, and counts the drop. The move definer 114 added
+/// is no longer the application's to call.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_dedup_collision_with_another_writers_row_keeps_the_canonicals(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
@@ -725,24 +792,59 @@ async fn a_dedup_collision_with_another_writers_row_keeps_the_canonicals(pool: P
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
-    let (x_row, w_row, repair) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        stamp(&mut conn, &p, x).await;
-        let x_row = store_bba(&mut conn, canonical, bt, author, Some(edge)).await;
-        stamp(&mut conn, &p, w).await;
-        let w_row = store_bba(&mut conn, dup, bt, author, Some(edge)).await;
-        let repair = epigraph_db::ClaimRepository::mark_duplicate_with_repair_conn(
+    let (x_row, w_row, direct_move) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, x).await;
+            let x_row = store_bba(&mut conn, canonical, bt, author, Some(edge)).await;
+            stamp(&mut conn, &p, w).await;
+            let w_row = store_bba(&mut conn, dup, bt, author, Some(edge)).await;
+            epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+                &mut conn,
+                epigraph_core::ClaimId::from_uuid(dup),
+                epigraph_core::ClaimId::from_uuid(canonical),
+            )
+            .await
+            .expect("W's act");
+            let direct_move = sqlx::query_scalar::<_, i64>(
+                "SELECT public.epigraph_dedup_move_bbas($1, $2, ARRAY[$3]::uuid[])",
+            )
+            .bind(dup)
+            .bind(canonical)
+            .bind(edge)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| {
+                e.as_database_error()
+                    .and_then(|d| d.code())
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+            });
+            (conn, (x_row, w_row, direct_move))
+        })
+        .await;
+    assert_eq!(
+        direct_move,
+        Err("42501".to_string()),
+        "117 revoked the dedup move definer from the application role"
+    );
+    let repair = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
             &mut conn,
             epigraph_core::ClaimId::from_uuid(dup),
             epigraph_core::ClaimId::from_uuid(canonical),
         )
         .await;
-        (conn, (x_row, w_row, repair))
+        (conn, r)
     })
-    .await;
-    let repair = repair.expect("the dedup lands instead of tripping the unique index");
+    .await
+    .expect("the repair lands instead of tripping the unique index");
     assert_eq!(
         repair.moved_bbas, 0,
         "the colliding copy was dropped, not moved"
+    );
+    assert_eq!(
+        repair.dropped_duplicate_copies, 1,
+        "and the drop is counted"
     );
     assert!(
         exists(&pool, "mass_functions", x_row).await,
@@ -756,23 +858,15 @@ async fn a_dedup_collision_with_another_writers_row_keeps_the_canonicals(pool: P
         !exists(&pool, "mass_functions", w_row).await,
         "the duplicate's copy is gone"
     );
-    let dropped: Option<i64> = sqlx::query_scalar(
-        "SELECT (details->'after'->>'dropped_duplicate_copies')::bigint FROM security_events \
-          WHERE event_type = 'claims.foreign_aggregate_write' \
-            AND details->>'action' = 'dedup_bba_move' AND details->>'claim_id' = $1::text",
-    )
-    .bind(canonical)
-    .fetch_optional(&pool)
-    .await
-    .expect("move audit");
-    assert_eq!(dropped, Some(1), "the drop is in the move's audit row");
 }
 
-/// Match-candidate retirement runs on an UNSTAMPED connection. It retracts the
-/// promoted matcher edge and then drops the edge's BBA -- X's writer-owned row
-/// -- through the definer's retracted-edge arm, audited with no principal.
+/// Match-candidate retirement after migration 117: the ACT (flip to `stale`)
+/// lands on an unstamped application session; the CASCADE (retract the
+/// promoted matcher edge, drop its BBA -- X's writer-owned row) refuses that
+/// session, refuses to run before the act, and lands on the maintenance
+/// connection. The one-transaction `retire` refuses the application role.
 #[sqlx::test(migrations = "../../migrations")]
-async fn match_candidate_retirement_drops_the_retracted_edges_bba_unstamped(pool: PgPool) {
+async fn match_candidate_retirement_is_an_act_plus_a_maintenance_cascade(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (x, _) = fixture::seed_agent_with_group(&pool, "wirer-x").await;
     let c1 = fixture::seed_public_claim(&pool, author, "match side one").await;
@@ -820,22 +914,59 @@ async fn match_candidate_retirement_drops_the_retracted_edges_bba_unstamped(pool
         "fixture shape: X's writer-owned row"
     );
 
-    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
-    let outcome = MatchCandidateRepo::new(app)
-        .retire(cand.id, None)
+    let cascade = |pool: PgPool, role: &'static str| async move {
+        fixture::as_role(&pool, role, |mut conn| async move {
+            let r = MatchCandidateRepo::retract_candidate_edges_conn(&mut conn, cand.id).await;
+            (conn, r)
+        })
         .await
-        .expect("retirement lands on an unstamped app session");
+    };
+    let early = cascade(pool.clone(), "epigraph_maintenance").await;
+    assert!(
+        early
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("not stale")),
+        "the cascade runs only after the act: {early:?}"
+    );
+
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let whole = MatchCandidateRepo::new(app.clone())
+        .retire(cand.id, None)
+        .await;
+    assert!(
+        whole
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("privileged")),
+        "the one-transaction retire is not the application role's: {whole:?}"
+    );
+    let previous = MatchCandidateRepo::new(app)
+        .mark_retired(cand.id, None)
+        .await
+        .expect("the act lands on an unstamped app session");
+    assert_eq!(previous, "promoted");
+    let by_app = cascade(pool.clone(), "epigraph_app").await;
+    assert!(
+        by_app
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("privileged")),
+        "{by_app:?}"
+    );
+    assert!(exists(&pool, "mass_functions", bba).await);
+
+    let outcome = cascade(pool.clone(), "epigraph_maintenance")
+        .await
+        .expect("the maintenance connection retracts");
     assert_eq!(outcome.edges_retracted, 1);
     assert_eq!(outcome.bbas_invalidated, 1);
     assert!(!exists(&pool, "mass_functions", bba).await);
-    let audit = cascade_audit(&pool).await;
-    assert_eq!(audit.len(), 1, "{audit:?}");
-    assert_eq!(
-        audit[0].0, None,
-        "no principal on the retirement connection"
+    let again = cascade(pool.clone(), "epigraph_maintenance")
+        .await
+        .expect("a replay is harmless");
+    assert_eq!((again.edges_retracted, again.bbas_invalidated), (0, 0));
+    assert!(
+        cascade_audit(&pool).await.is_empty(),
+        "no definer, no definer audit"
     );
-    assert_eq!(audit[0].1, "match_candidate_retire");
-    assert_eq!(audit[0].3["retracted_edge"], 1, "{:?}", audit[0].3);
 }
 
 /// Maintenance and the superuser are unchanged: both remove another writer's
@@ -1018,21 +1149,20 @@ async fn a_reader_of_a_group_deletes_none_of_its_rows(pool: PgPool) {
     }
 }
 
-/// The "retired duplicate of the source" arm needs all three of its
-/// conditions. W writes d1, which supersedes S1 but is still CURRENT, and d2,
-/// which is retired and supersedes S2 but was authored by W while the BBA on
-/// S2's edge is attributed to X. W is refused (CD02) on both edges. Once d1 is
-/// retired, the same call on S1's edge lands: the refusal was the
-/// `NOT is_current` condition, not the fixture.
+/// 115's "retired duplicate of the source" arm is gone (migration 117). W
+/// writes d1, which supersedes S1 and is RETIRED, authored by W, and the BBA
+/// on S1's edge is attributed to W -- every condition the old arm checked. W
+/// is still refused (CD02), as it is for d2's edge (another author's BBA). The
+/// maintenance connection removes both.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_retired_duplicate_arm_needs_a_retired_duplicate_by_the_same_author(pool: PgPool) {
+async fn no_retired_duplicate_licenses_another_writers_bba_any_more(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (w, wg) = fixture::seed_agent_with_group(&pool, "dedup-w").await;
     let (x, _) = fixture::seed_agent_with_group(&pool, "writer-x").await;
     let s1 = fixture::seed_public_claim(&pool, author, "world source one").await;
     let s2 = fixture::seed_public_claim(&pool, author, "world source two").await;
     let target = fixture::seed_public_claim(&pool, author, "world target").await;
-    let d1 = seed_claim_row(&pool, w, wg, Some(s1), true, "current dup of S1").await;
+    let _d1 = seed_claim_row(&pool, w, wg, Some(s1), false, "retired dup of S1").await;
     let _d2 = seed_claim_row(&pool, w, wg, Some(s2), false, "retired dup of S2").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let e1 = fixture::seed_edge(&pool, s1, target).await;
@@ -1046,7 +1176,7 @@ async fn the_retired_duplicate_arm_needs_a_retired_duplicate_by_the_same_author(
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
-    let (current_dup, other_author) =
+    let (same_author, other_author) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             stamp(&mut conn, &p, w).await;
             let a = MassFunctionRepository::delete_for_perspective(&mut *conn, e1).await;
@@ -1055,82 +1185,67 @@ async fn the_retired_duplicate_arm_needs_a_retired_duplicate_by_the_same_author(
         })
         .await;
     assert!(
-        is_cd02(&current_dup),
-        "a CURRENT claim superseding S is not a retired duplicate: {current_dup:?}"
+        is_cd02(&same_author),
+        "a retired duplicate by the BBA's own author no longer licenses it: {same_author:?}"
     );
-    assert!(
-        is_cd02(&other_author),
-        "a retired duplicate by another author does not license X's row: {other_author:?}"
-    );
+    assert!(is_cd02(&other_author), "{other_author:?}");
     assert!(exists(&pool, "mass_functions", b1).await);
     assert!(exists(&pool, "mass_functions", b2).await);
 
-    // Calibration: retire d1, and the same call lands through the arm.
-    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
-        .bind(d1)
-        .execute(&pool)
-        .await
-        .expect("retire d1");
-    let p = pool.clone();
-    let retired = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        stamp(&mut conn, &p, w).await;
-        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, e1).await;
-        (conn, n)
+    let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let a = MassFunctionRepository::delete_for_perspective(&mut *conn, e1).await;
+        let b = MassFunctionRepository::delete_for_perspective(&mut *conn, e2).await;
+        (conn, (a, b))
     })
     .await;
-    assert_eq!(retired.expect("the retired duplicate's author"), 1);
-    assert!(!exists(&pool, "mass_functions", b1).await);
-    let audit = cascade_audit(&pool).await;
-    assert_eq!(audit.len(), 1, "{audit:?}");
-    assert_eq!(audit[0].3["source_writer"], 1, "{:?}", audit[0].3);
+    assert_eq!((n.0.expect("e1"), n.1.expect("e2")), (1, 1));
+    assert!(cascade_audit(&pool).await.is_empty());
 }
 
-/// The cascade definer only ever considers rows the SESSION can read. On a
-/// retracted edge a bystander Z removes the public BBA through the
-/// retracted-edge arm, and leaves the private BBA of group H keyed on the same
-/// edge alone, exactly as the invoker statement always did.
+/// The cascade definer only ever considers rows the SESSION can read. Z owns a
+/// writer-owned BBA on a world claim, keyed on an edge that also keys group
+/// H's PRIVATE BBA. Z's call removes its own row and leaves H's alone -- the
+/// private row is neither deleted nor counted as a refusal, exactly as the
+/// invoker statement always left it -- and it is audited once with the owner
+/// arm.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_cascade_never_touches_a_row_the_session_cannot_read(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (h, hg) = fixture::seed_agent_with_group(&pool, "private-h").await;
-    let (z, _) = fixture::seed_agent_with_group(&pool, "bystander-z").await;
+    let (z, zg) = fixture::seed_agent_with_group(&pool, "writer-z").await;
     let source = fixture::seed_public_claim(&pool, author, "world source").await;
     let target = fixture::seed_public_claim(&pool, author, "world target").await;
     let h_claim = fixture::seed_group_claim(&pool, h, hg, "H's private claim").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, source, target).await;
     seed_perspective(&pool, edge).await;
-    let public_bba = store_bba_privileged(&pool, target, bt, author, edge).await;
     let private_bba = store_bba_privileged(&pool, h_claim, bt, author, edge).await;
     assert_eq!(
         writer_owned(&pool, "mass_functions", private_bba).await.0,
         hg,
         "fixture shape: H's private row"
     );
-    sqlx::query("UPDATE edges SET valid_to = now() - interval '1 minute' WHERE id = $1")
-        .bind(edge)
-        .execute(&pool)
-        .await
-        .expect("retract the edge");
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
-    let n = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+    let (z_bba, n) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, z).await;
+        let z_bba = store_bba(&mut conn, target, bt, author, Some(edge)).await;
         let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
-        (conn, n)
+        (conn, (z_bba, n))
     })
     .await;
-    assert_eq!(
-        n.expect("the retracted-edge arm"),
-        1,
-        "only the readable row"
-    );
-    assert!(!exists(&pool, "mass_functions", public_bba).await);
+    assert_eq!(n.expect("the owner arm"), 1, "only Z's own readable row");
+    assert!(!exists(&pool, "mass_functions", z_bba).await);
     assert!(
         exists(&pool, "mass_functions", private_bba).await,
         "a row Z cannot read is not Z's to cascade-delete"
     );
+    let audit = cascade_audit(&pool).await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0].0, Some(z));
+    assert_eq!(audit[0].3["owner"], 1, "{:?}", audit[0].3);
+    let _ = zg;
 }
 
 /// The CO-owner of an edge deletes it. C's own group is the co-owner of an
@@ -1268,9 +1383,17 @@ async fn a_non_privileged_session_cannot_reown_a_row_and_then_delete_it(pool: Pg
 
     assert_eq!(seen, 4, "calibration: Z reads all four world-owned rows");
     for (table, set, reown, deleted) in &outcomes {
+        // `frames` and `edges` carry 117's restrictive UPDATE policy: a row the
+        // session does not own is invisible to its UPDATE, so the re-own
+        // matches nothing before the guard is reached. The other two are
+        // refused by 115's guard.
+        let want = if matches!(*table, "frames" | "edges") {
+            Ok(0)
+        } else {
+            Err("42501 owner guard".to_string())
+        };
         assert_eq!(
-            reown,
-            &Err("42501 owner guard".to_string()),
+            reown, &want,
             "{table} SET {set}: a non-privileged re-own is refused"
         );
         assert_eq!(*deleted, 0, "{table}: the follow-up DELETE removes nothing");
@@ -2178,7 +2301,9 @@ async fn the_115_functions_are_maintenance_owned_definers(pool: PgPool) {
     for (f, app_exec) in [
         ("epigraph_session_writes_node(uuid, text)", true),
         ("epigraph_cascade_delete_edge_bbas(uuid[], text)", true),
-        ("epigraph_dedup_move_bbas(uuid, uuid, uuid[])", true),
+        // 117 revoked it from the application role: the dedup move is part of
+        // the administrative repair now.
+        ("epigraph_dedup_move_bbas(uuid, uuid, uuid[])", false),
         ("epigraph_cascade_delete_node_edges()", false),
         // Redefined by 115 (section 9); CREATE OR REPLACE kept 089's owner and ACL.
         ("epigraph_inherit_fragment_tenancy_stmt()", false),

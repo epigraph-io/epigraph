@@ -1218,12 +1218,15 @@ async fn seed_perspective(pool: &PgPool, id: Uuid) {
         .expect("seed edge perspective");
 }
 
-/// W4(b). A writer marks its own claim a duplicate of a WORLD-owned canonical.
-/// The edge-keyed BBAs on the duplicate -- its own and ANOTHER writer's -- move
-/// with their edges and come out writer-owned (so neither is re-stamped to the
-/// world by a later insert), the canonical gets its binary_truth assignment
-/// through the audited definer, and a duplicate bound to FALSE cannot pass
-/// that binding to a canonical it does not own.
+/// W4(b), after migration 117. A writer marks its own claim a duplicate of a
+/// WORLD-owned canonical: the ACT lands on the application role. The REPAIR --
+/// the administrative cascade, on the maintenance connection -- moves the
+/// edge-keyed BBAs on the duplicate (its own and ANOTHER writer's) with their
+/// edges, and they come out writer-owned (so neither is re-stamped to the world
+/// by a later insert); the canonical gets its binary_truth assignment as its
+/// own row. A duplicate bound to FALSE still cannot pass that binding to a
+/// canonical its writer does not own: the act refuses it (FA07), and the
+/// repair would not copy it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_onto_a_world_canonical_moves_every_writers_bba(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
@@ -1245,7 +1248,7 @@ async fn mark_duplicate_onto_a_world_canonical_moves_every_writers_bba(pool: PgP
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
-    let (x_bba, w_bba, repair, refused) =
+    let (x_bba, w_bba, act, refused) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             let m = serde_json::json!({"0": 0.6, "0,1": 0.4});
             stamp(&mut conn, &p, x).await;
@@ -1261,19 +1264,19 @@ async fn mark_duplicate_onto_a_world_canonical_moves_every_writers_bba(pool: PgP
             store_bba(&mut conn, dup_false, bt, w, Some(ef), m)
                 .await
                 .expect("W's BBA on the FALSE-bound dup");
-            let repair = epigraph_db::ClaimRepository::mark_duplicate_with_repair_conn(
+            let act = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
                 &mut conn,
                 epigraph_core::ClaimId::from_uuid(dup),
                 epigraph_core::ClaimId::from_uuid(canonical),
             )
             .await;
-            let refused = epigraph_db::ClaimRepository::mark_duplicate_with_repair_conn(
+            let refused = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
                 &mut conn,
                 epigraph_core::ClaimId::from_uuid(dup_false),
                 epigraph_core::ClaimId::from_uuid(canonical2),
             )
             .await;
-            (conn, (x_bba, w_bba, repair, refused))
+            (conn, (x_bba, w_bba, act, refused))
         })
         .await;
     let x_bba = x_bba.expect("X attaches to W's public claim");
@@ -1282,7 +1285,19 @@ async fn mark_duplicate_onto_a_world_canonical_moves_every_writers_bba(pool: PgP
         tenancy(&pool, "mass_functions", x_bba).await,
         (x_group, "public".into(), true)
     );
-    let repair = repair.expect("the dedup onto a world canonical lands on the app role");
+    act.expect("the dedup's act onto a world canonical lands on the app role");
+
+    let repair = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("the administrative repair lands on the maintenance connection");
     assert_eq!(repair.moved_bbas, 2);
 
     for (id, group, what) in [(x_bba, x_group, "X's"), (w_bba, w_group, "W's")] {
@@ -1311,24 +1326,7 @@ async fn mark_duplicate_onto_a_world_canonical_moves_every_writers_bba(pool: PgP
     .fetch_one(&pool)
     .await
     .expect("canonical assignment");
-    assert_eq!(
-        (owner, idx),
-        (WORLD, Some(0)),
-        "claim-owned, created via the definer"
-    );
-    let actions: Vec<String> = audit_events(&pool, canonical)
-        .await
-        .into_iter()
-        .map(|(_, a)| a)
-        .collect();
-    assert!(
-        actions.contains(&"claim_frame_attach".to_string()),
-        "{actions:?}"
-    );
-    assert!(
-        actions.contains(&"dedup_bba_move".to_string()),
-        "{actions:?}"
-    );
+    assert_eq!((owner, idx), (WORLD, Some(0)), "claim-owned, at TRUE");
 
     let e = refused.expect_err("a FALSE binding cannot pass to a world canonical");
     assert!(e.to_string().contains("FA07"), "{e}");
@@ -1338,6 +1336,41 @@ async fn mark_duplicate_onto_a_world_canonical_moves_every_writers_bba(pool: PgP
         .await
         .expect("dup_false");
     assert!(still_current, "the refused dedup wrote nothing");
+
+    // And the administrative repair would not have copied it either: mark the
+    // FALSE-bound dup on the harness connection (as a privileged act would)
+    // and repair it on the maintenance connection.
+    sqlx::query("UPDATE claims SET supersedes = $2, is_current = false, embedding = NULL, embedding_3072 = NULL WHERE id = $1")
+        .bind(dup_false)
+        .bind(canonical2)
+        .execute(&pool)
+        .await
+        .expect("privileged act");
+    let r2 = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup_false),
+            epigraph_core::ClaimId::from_uuid(canonical2),
+        )
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("repair");
+    assert_eq!(r2.skipped_false_bindings, 1, "{r2:?}");
+    let bound: Option<i64> = sqlx::query_scalar(
+        "SELECT count(*) FROM claim_frames WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(canonical2)
+    .bind(bt)
+    .fetch_optional(&pool)
+    .await
+    .expect("canonical2 frames");
+    assert_eq!(
+        bound,
+        Some(0),
+        "the FALSE binding was not handed to the world canonical"
+    );
 }
 
 /// W5. After the claim's owner privatizes it, what a writer had attached is

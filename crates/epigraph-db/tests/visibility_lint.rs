@@ -1150,6 +1150,92 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `update_labels_conn`: authorised by claims_tenancy's WITH CHECK on the stamped \
          connection, not by a read predicate.",
     ),
+    // ── Batch W10 (migration 117): the retraction cascade split into the
+    // caller's ACT (on its own stamped transaction; authorised by the table's
+    // WITH CHECK against that stamp) and the ADMINISTRATIVE repair (on the
+    // privileged maintenance connection, which each refuses to run without).
+    // Their reads are existence / lock / verification probes of the rows they
+    // are about to mutate; none is a disclosure to a caller.
+    (
+        "claim.rs",
+        "supersede_act_conn",
+        "WRITE. The supersession's act (retire, insert the replacement and the `supersedes` \
+         edge) on the caller's stamped transaction; authorised by claims_tenancy's / \
+         edges_tenancy's WITH CHECK. Its one read is the old claim's lock probe.",
+    ),
+    (
+        "claim.rs",
+        "migrate_superseded_edges_conn",
+        "WRITE, privileged only (refuses otherwise). Re-points the retired claim's edges onto the \
+         replacement on the maintenance connection; its read verifies the committed act.",
+    ),
+    (
+        "claim.rs",
+        "migrate_superseded_edges",
+        "WRITE. The two edge-migration statements, unchecked; called only after the caller \
+         established the privilege and the supersession.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_act_conn",
+        "WRITE. The dedup's act (mark the duplicate) on the caller's stamped transaction; \
+         authorised by claims_tenancy's WITH CHECK. Its reads are the two claims' existence / \
+         lock probes and the FA07 binding probe, which projects only a boolean.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_act",
+        "WRITE. The act's checks and single claims UPDATE; the caller owns the stamped \
+         transaction, and claims_tenancy's WITH CHECK authorises it.",
+    ),
+    (
+        "claim.rs",
+        "repair_marked_duplicate_conn",
+        "WRITE, privileged only (refuses otherwise). The dedup's repair on the maintenance \
+         connection; its read verifies the committed act.",
+    ),
+    (
+        "claim.rs",
+        "repair_marked_duplicate",
+        "WRITE. The dedup repair's statements, unchecked; called only after the caller \
+         established the privilege and the act.",
+    ),
+    (
+        "claim.rs",
+        "require_privileged_session",
+        "Reads no table and filters nothing: it asks the session one boolean, \
+         `epigraph_session_is_privileged_writer()`, before a privileged-only write.",
+    ),
+    (
+        "match_candidate.rs",
+        "mark_retired_conn",
+        "WRITE. The retirement's act on `match_candidates`, which carries no tenancy columns; the \
+         callers gate it on claims:admin.",
+    ),
+    (
+        "match_candidate.rs",
+        "mark_retired_on",
+        "WRITE. `mark_retired_conn`'s body: lock and flip one `match_candidates` row, a table \
+         with no tenancy columns to filter on.",
+    ),
+    (
+        "match_candidate.rs",
+        "retract_candidate_edges_conn",
+        "WRITE, privileged only (refuses otherwise). The retirement's cascade on the maintenance \
+         connection; its read verifies the committed act.",
+    ),
+    (
+        "match_candidate.rs",
+        "retract_candidate_edges",
+        "WRITE. The cascade's statements, unchecked; called only on a privileged session, \
+         after its caller verified the privilege.",
+    ),
+    (
+        "match_candidate.rs",
+        "require_privileged",
+        "Reads no table and filters nothing: it asks the session one boolean, \
+         `epigraph_session_is_privileged_writer()`, before a privileged-only write.",
+    ),
     (
         "claim.rs",
         "mark_duplicate_with_repair_conn",
@@ -1378,6 +1464,14 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── Batch W10 (migration 117): the administrative cascade's audit row.
+    (
+        "admin_cascade.rs",
+        "record",
+        "INSERT INTO `security_events` (append-only; 077's security_events_append admits a row \
+         attributed to the session principal, or any row on the maintenance connection). Reads \
+         nothing back: the id is minted client-side.",
+    ),
     // ── Batch H-a: writes whose executor widened so a route or the theme
     // clusterer can put them in ONE transaction. Same argument as
     // `trace.rs::create` below: the control on a write is the table's
