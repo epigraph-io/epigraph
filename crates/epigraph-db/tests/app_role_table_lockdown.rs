@@ -34,6 +34,9 @@
 //! * the maintenance role's DELETE on the derived rows withheld: fails
 //!   `the_app_role_cannot_make_a_match_candidate_stale` (42501 on
 //!   `bp_messages` during the maintenance-role retirement).
+//! * the rotation's `service` cap cut from 90 days to 24 hours, or its `ELSE`
+//!   (agent) cap lengthened to 30 days: fails
+//!   `rotation_caps_each_client_types_successor_at_its_refresh_ttl`.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -635,6 +638,80 @@ async fn rotation_caps_expiry_and_derives_scopes_and_token_hash_is_unreadable(po
             .await
             .unwrap();
     assert_eq!(reason.as_deref(), Some("revoked"));
+}
+
+/// The rotation's expiry cap is the client type's refresh TTL, row by row: the
+/// same table as `oauth/token.rs::handle_refresh_token`'s `refresh_ttl` (agent
+/// 24 h, human 30 d, service 90 d). A 100-year successor must land in a
+/// two-sided band around each TTL, so a shortened cap fails as well as a
+/// lengthened one. `oauth_clients_client_type_check` admits only these three
+/// types, so the definer's `ELSE` arm is reached by `agent` alone, and the
+/// agent row is what pins it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotation_caps_each_client_types_successor_at_its_refresh_ttl(pool: PgPool) {
+    let human = seed_client(&pool, "active").await;
+    let insert = |client_type: &'static str, owner: Option<Uuid>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                     granted_scopes, status, owner_id, legal_entity_name, legal_contact_email) \
+                 VALUES ($1, 'w11 ttl', $2, '{claims:read}', '{claims:read}', 'active', $3, \
+                         'W11 Ltd', 'w11@example.invalid') RETURNING id",
+            )
+            .bind(format!("w11_{}", Uuid::new_v4().simple()))
+            .bind(client_type)
+            .bind(owner)
+            .fetch_one(&pool)
+            .await
+            .expect("seed client")
+        }
+    };
+    let agent = insert("agent", Some(human)).await;
+    let service = insert("service", None).await;
+
+    let app = app_pool(&pool, 2).await;
+    let century = chrono::Utc::now() + chrono::Duration::days(36_500);
+    for (client, client_type, ttl) in [
+        (agent, "agent", "24 hours"),
+        (human, "human", "30 days"),
+        (service, "service", "90 days"),
+    ] {
+        let t0 = h(&format!("ttl0-{client_type}"));
+        RefreshTokenRepository::create(
+            &app,
+            &t0,
+            client,
+            &["claims:read".to_string()],
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+        let t1 = h(&format!("ttl1-{client_type}"));
+        assert!(
+            matches!(
+                RefreshTokenRepository::rotate(&app, &t0, &t1, century)
+                    .await
+                    .unwrap(),
+                RefreshRotateOutcome::Rotated { .. }
+            ),
+            "{client_type} rotation"
+        );
+        let in_band: bool = sqlx::query_scalar(
+            "SELECT expires_at BETWEEN now() + $2::interval - interval '1 minute' \
+                                   AND now() + $2::interval + interval '1 minute' \
+               FROM refresh_tokens WHERE token_hash = $1",
+        )
+        .bind(&t1)
+        .bind(ttl)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            in_band,
+            "a 100-year {client_type} successor is capped at exactly {ttl}"
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
