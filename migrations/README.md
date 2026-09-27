@@ -458,11 +458,15 @@ Current reservation:
   `refresh_tokens`, `oauth_authorization_codes`, `oauth_authorize_sessions`,
   `oauth_clients` and `agent_keys`, after moving every request-path UPDATE/DELETE
   on them into a SECURITY DEFINER owned by `epigraph_maintenance` (refresh
-  check / atomic rotate / revoke / revoke-client, code consume, session
-  to-consent / take, client lock-for-link / write-once link / audited approve,
-  agent-key set-status with no un-revoke). `refresh_tokens` gains nullable
-  `family_id` and `revoked_reason`; presenting a token spent by rotation revokes
-  its family and writes an `oauth.refresh_token_reuse` security event.
+  check / atomic rotate / revoke / revoke-by-hash / revoke-client, code consume,
+  session to-consent / take, client lock-for-link / write-once link / audited
+  approve, agent-key set-status with no un-revoke). `refresh_tokens` gains
+  nullable `family_id` and `revoked_reason`; presenting a token spent by
+  rotation more than 30 seconds earlier revokes its family and writes an
+  `oauth.refresh_token_reuse` security event, while inside those 30 seconds (a
+  concurrent refresh) it is refused and the family stays live. The rotation
+  derives the successor's scopes from the client and caps its expiry at the
+  client type's TTL, and the application role no longer reads `token_hash`.
   `agents`: table UPDATE/DELETE revoked, UPDATE granted back on the profile
   columns only. `match_candidates`: DELETE revoked and the
   `match_candidates_stale_guard` trigger refuses the transition to `stale` on a

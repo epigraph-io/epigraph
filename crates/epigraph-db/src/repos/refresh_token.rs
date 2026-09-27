@@ -25,7 +25,12 @@ pub struct RefreshTokenRepository;
 pub enum RefreshCheck {
     /// Live and unexpired.
     Valid { id: Uuid, client_id: Uuid },
-    /// Already spent by rotation: its family has been revoked.
+    /// Spent by its own rotation less than 30 seconds ago: a benign
+    /// concurrent refresh. Refused like [`Self::Invalid`], and the family
+    /// stays live (migration 118's grace window).
+    Grace,
+    /// Spent by rotation longer ago than the grace window: its family has been
+    /// revoked.
     Reuse,
     /// Unknown, expired, or revoked for another reason.
     Invalid,
@@ -36,7 +41,11 @@ pub enum RefreshCheck {
 pub enum RefreshRotateOutcome {
     /// The presented token was claimed; `id` is its successor.
     Rotated { id: Uuid },
-    /// The presented token had already been rotated: reuse, family revoked.
+    /// The presented token was rotated less than 30 seconds ago (the loser of
+    /// a concurrent refresh): refused, family left live.
+    Grace,
+    /// The presented token had been rotated before the grace window: reuse,
+    /// family revoked.
     Reuse,
     /// The presented token was not live (expired, or revoked otherwise).
     Invalid,
@@ -86,6 +95,10 @@ impl RefreshTokenRepository {
         Ok(row.0)
     }
 
+    /// Read a live row by hash, `token_hash` included. Since migration 118 the
+    /// application role cannot read `token_hash`, so this runs only on a
+    /// privileged connection; no request path calls it (the refresh grant uses
+    /// [`Self::check`], `/oauth/revoke` uses [`Self::revoke_by_hash`]).
     #[instrument(skip(pool, token_hash))]
     pub async fn get_valid(
         pool: &PgPool,
@@ -103,7 +116,9 @@ impl RefreshTokenRepository {
 
     /// The refresh grant's first read (migration 118,
     /// `epigraph_refresh_token_check`). [`RefreshCheck::Valid`] has no side
-    /// effect. A token that was spent by ROTATION is reuse (OAuth 2.0 Security
+    /// effect. A token that was spent by ROTATION less than 30 seconds ago is
+    /// [`RefreshCheck::Grace`] (a benign concurrent refresh; nothing revoked).
+    /// Spent by rotation longer ago than that, it is reuse (OAuth 2.0 Security
     /// BCP): the definer revokes every live token of its family and writes a
     /// `security_events` row before answering [`RefreshCheck::Reuse`].
     /// Anything else (unknown, expired, revoked for another reason) is
@@ -119,6 +134,7 @@ impl RefreshTokenRepository {
         .map_err(|e| DbError::QueryFailed { source: e })?;
         Ok(match (outcome.as_str(), id, client_id) {
             ("valid", Some(id), Some(client_id)) => RefreshCheck::Valid { id, client_id },
+            ("grace", _, _) => RefreshCheck::Grace,
             ("reuse", _, _) => RefreshCheck::Reuse,
             _ => RefreshCheck::Invalid,
         })
@@ -128,30 +144,33 @@ impl RefreshTokenRepository {
     /// claim the presented token with one `UPDATE ... WHERE revoked_at IS NULL
     /// AND expires_at > now()` and insert its successor in the same family, for
     /// the same client. Of any number of concurrent calls presenting one token,
-    /// exactly one gets [`RefreshRotateOutcome::Rotated`]; the others find it spent by
-    /// rotation, which is reuse and revokes the family (the winner's new token
-    /// included: the server cannot tell which presenter is the legitimate one,
-    /// and the BCP's rule is to end the chain).
+    /// exactly one gets [`RefreshRotateOutcome::Rotated`]; the others find it
+    /// spent by a rotation inside the grace window and get
+    /// [`RefreshRotateOutcome::Grace`], and the winner's successor stays live.
+    ///
+    /// The successor's scopes are the client's current `granted_scopes` and its
+    /// expiry is `expires_at` capped at the client type's refresh TTL, both
+    /// decided inside the definer: a caller can shorten a chain, never widen or
+    /// lengthen it.
     #[instrument(skip(pool, old_hash, new_hash))]
     pub async fn rotate(
         pool: &PgPool,
         old_hash: &[u8],
         new_hash: &[u8],
-        scopes: &[String],
         expires_at: DateTime<Utc>,
     ) -> Result<RefreshRotateOutcome, DbError> {
         let (outcome, id): (String, Option<Uuid>) = sqlx::query_as(
-            "SELECT outcome, token_id FROM public.epigraph_refresh_token_rotate($1, $2, $3, $4)",
+            "SELECT outcome, token_id FROM public.epigraph_refresh_token_rotate($1, $2, $3)",
         )
         .bind(old_hash)
         .bind(new_hash)
         .bind(expires_at)
-        .bind(scopes)
         .fetch_one(pool)
         .await
         .map_err(|e| DbError::QueryFailed { source: e })?;
         Ok(match (outcome.as_str(), id) {
             ("rotated", Some(id)) => RefreshRotateOutcome::Rotated { id },
+            ("grace", _) => RefreshRotateOutcome::Grace,
             ("reuse", _) => RefreshRotateOutcome::Reuse,
             _ => RefreshRotateOutcome::Invalid,
         })
@@ -168,6 +187,19 @@ impl RefreshTokenRepository {
         sqlx::query_scalar("SELECT public.epigraph_refresh_token_revoke($1, $2)")
             .bind(id)
             .bind(reason.as_str())
+            .fetch_one(pool)
+            .await
+            .map_err(|e| DbError::QueryFailed { source: e })
+    }
+
+    /// RFC 7009 revocation by the presented token (`/oauth/revoke`), through
+    /// migration 118's definer: the application role cannot read `token_hash`,
+    /// so the lookup by hash happens inside it. Returns whether a live row was
+    /// revoked; an unknown or already revoked token is `false`, not an error.
+    #[instrument(skip(pool, token_hash))]
+    pub async fn revoke_by_hash(pool: &PgPool, token_hash: &[u8]) -> Result<bool, DbError> {
+        sqlx::query_scalar("SELECT public.epigraph_refresh_token_revoke_by_hash($1)")
+            .bind(token_hash)
             .fetch_one(pool)
             .await
             .map_err(|e| DbError::QueryFailed { source: e })

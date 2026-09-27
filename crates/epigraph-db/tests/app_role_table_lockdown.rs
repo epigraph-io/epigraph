@@ -432,6 +432,227 @@ async fn reuse_events(pool: &PgPool, client: Uuid) -> i64 {
     .unwrap()
 }
 
+/// Move a rotated token's `revoked_at` `secs` seconds into the past (on the
+/// superuser pool), so a test can stand on either side of the grace window
+/// without sleeping.
+async fn backdate_rotation(pool: &PgPool, token_hash: &[u8], secs: i32) {
+    let n = sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now() - make_interval(secs => $2) \
+          WHERE token_hash = $1 AND revoked_reason = 'rotated'",
+    )
+    .bind(token_hash)
+    .bind(f64::from(secs))
+    .execute(pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(n, 1, "backdate a rotated token");
+}
+
+async fn grace_events(pool: &PgPool, client: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'oauth.refresh_token_grace' \
+            AND details->>'client_id' = $1::text",
+    )
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The grace window's boundary, on both definers. A token re-presented 29 s
+/// after its own rotation is refused and its family stays live; at 31 s it is
+/// reuse and the family is revoked. (The 1 s case is the chain test above and
+/// the concurrent race below.)
+///
+/// Verified to fail, each mutant of `epigraph_refresh_token_on_reuse` applied
+/// alone and restored: the window at 0 s (fails the 29 s arm), at 3600 s
+/// (fails the 31 s arm), `>` turned into `<` (fails the 29 s arm), and the
+/// time predicate removed (fails the 31 s arm).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_grace_window_is_thirty_seconds_from_the_tokens_own_rotation(pool: PgPool) {
+    let client = seed_client(&pool, "active").await;
+    let app = app_pool(&pool, 2).await;
+    let scopes = vec!["claims:read".to_string()];
+    let exp = chrono::Utc::now() + chrono::Duration::hours(1);
+
+    for via_rotate in [false, true] {
+        // 29 s: grace. The successor stays live, no reuse event.
+        let (a0, a1) = (h("a0"), h("a1"));
+        RefreshTokenRepository::create(&app, &a0, client, &scopes, exp)
+            .await
+            .unwrap();
+        assert!(matches!(
+            RefreshTokenRepository::rotate(&app, &a0, &a1, exp)
+                .await
+                .unwrap(),
+            RefreshRotateOutcome::Rotated { .. }
+        ));
+        backdate_rotation(&pool, &a0, 29).await;
+        let before = grace_events(&pool, client).await;
+        let reuse_at_start = reuse_events(&pool, client).await;
+        if via_rotate {
+            assert_eq!(
+                RefreshTokenRepository::rotate(&app, &a0, &h("a2"), exp)
+                    .await
+                    .unwrap(),
+                RefreshRotateOutcome::Grace,
+                "29 s after rotation, via rotate"
+            );
+        } else {
+            assert_eq!(
+                RefreshTokenRepository::check(&app, &a0).await.unwrap(),
+                RefreshCheck::Grace,
+                "29 s after rotation, via check"
+            );
+        }
+        assert_eq!(
+            live_in_family(&pool, &a1).await,
+            1,
+            "grace keeps the family"
+        );
+        assert_eq!(
+            reuse_events(&pool, client).await,
+            reuse_at_start,
+            "grace writes no reuse event"
+        );
+        assert_eq!(grace_events(&pool, client).await, before + 1);
+
+        // 31 s: reuse. The family is revoked and the event written.
+        let (b0, b1) = (h("b0"), h("b1"));
+        RefreshTokenRepository::create(&app, &b0, client, &scopes, exp)
+            .await
+            .unwrap();
+        assert!(matches!(
+            RefreshTokenRepository::rotate(&app, &b0, &b1, exp)
+                .await
+                .unwrap(),
+            RefreshRotateOutcome::Rotated { .. }
+        ));
+        backdate_rotation(&pool, &b0, 31).await;
+        let reuse_before = reuse_events(&pool, client).await;
+        if via_rotate {
+            assert_eq!(
+                RefreshTokenRepository::rotate(&app, &b0, &h("b2"), exp)
+                    .await
+                    .unwrap(),
+                RefreshRotateOutcome::Reuse,
+                "31 s after rotation, via rotate"
+            );
+        } else {
+            assert_eq!(
+                RefreshTokenRepository::check(&app, &b0).await.unwrap(),
+                RefreshCheck::Reuse,
+                "31 s after rotation, via check"
+            );
+        }
+        assert_eq!(
+            live_in_family(&pool, &b1).await,
+            0,
+            "reuse revokes the family"
+        );
+        assert_eq!(reuse_events(&pool, client).await, reuse_before + 1);
+        // The family revoked above stays revoked.
+        assert_eq!(
+            RefreshTokenRepository::check(&app, &b1).await.unwrap(),
+            RefreshCheck::Invalid
+        );
+    }
+}
+
+/// The rotation derives the successor's authority from the client, not from
+/// the caller, and the application role cannot read the hashes that name a
+/// chain.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotation_caps_expiry_and_derives_scopes_and_token_hash_is_unreadable(pool: PgPool) {
+    let client = seed_client(&pool, "active").await; // human, granted {claims:read}
+    let app = app_pool(&pool, 2).await;
+    let wide = vec!["claims:read".to_string(), "claims:admin".to_string()];
+    let t0 = h("cap0");
+    RefreshTokenRepository::create(
+        &app,
+        &t0,
+        client,
+        &wide,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    let t1 = h("cap1");
+    let century = chrono::Utc::now() + chrono::Duration::days(36_500);
+    assert!(matches!(
+        RefreshTokenRepository::rotate(&app, &t0, &t1, century)
+            .await
+            .unwrap(),
+        RefreshRotateOutcome::Rotated { .. }
+    ));
+    let (scopes, capped): (Vec<String>, bool) = sqlx::query_as(
+        "SELECT scopes, expires_at <= now() + interval '30 days' + interval '1 minute' \
+           FROM refresh_tokens WHERE token_hash = $1",
+    )
+    .bind(&t1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(capped, "a 100-year successor is capped at the human TTL");
+    assert_eq!(
+        scopes,
+        vec!["claims:read"],
+        "the successor carries the client's granted scopes, not the caller's"
+    );
+    // A shorter expiry than the TTL is kept (the caller may shorten).
+    let t2 = h("cap2");
+    let soon = chrono::Utc::now() + chrono::Duration::minutes(10);
+    RefreshTokenRepository::rotate(&app, &t1, &t2, soon)
+        .await
+        .unwrap();
+    let short: bool = sqlx::query_scalar(
+        "SELECT expires_at <= now() + interval '11 minutes' FROM refresh_tokens \
+          WHERE token_hash = $1",
+    )
+    .bind(&t2)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(short, "a caller-shortened expiry is kept");
+
+    // token_hash is not readable on the application role; the rest is.
+    let r = sqlx::query("SELECT token_hash FROM refresh_tokens")
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "SELECT token_hash");
+    let r = sqlx::query("SELECT * FROM refresh_tokens")
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "SELECT *");
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(id) FROM refresh_tokens WHERE client_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(client)
+    .fetch_one(&app)
+    .await
+    .expect("the other columns stay readable");
+    assert_eq!(n, 1);
+
+    // /oauth/revoke goes by hash through the definer; idempotent.
+    assert!(RefreshTokenRepository::revoke_by_hash(&app, &t2)
+        .await
+        .unwrap());
+    assert!(!RefreshTokenRepository::revoke_by_hash(&app, &t2)
+        .await
+        .unwrap());
+    assert!(!RefreshTokenRepository::revoke_by_hash(&app, &h("unknown"))
+        .await
+        .unwrap());
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT revoked_reason FROM refresh_tokens WHERE token_hash = $1")
+            .bind(&t2)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reason.as_deref(), Some("revoked"));
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_rotation_chains_a_family_and_reuse_revokes_it(pool: PgPool) {
     let client = seed_client(&pool, "active").await;
@@ -458,14 +679,14 @@ async fn refresh_rotation_chains_a_family_and_reuse_revokes_it(pool: PgPool) {
 
     let t1 = h("t1");
     assert!(matches!(
-        RefreshTokenRepository::rotate(&app, &t0, &t1, &scopes, exp)
+        RefreshTokenRepository::rotate(&app, &t0, &t1, exp)
             .await
             .unwrap(),
         RefreshRotateOutcome::Rotated { .. }
     ));
     let t2 = h("t2");
     assert!(matches!(
-        RefreshTokenRepository::rotate(&app, &t1, &t2, &scopes, exp)
+        RefreshTokenRepository::rotate(&app, &t1, &t2, exp)
             .await
             .unwrap(),
         RefreshRotateOutcome::Rotated { .. }
@@ -498,8 +719,23 @@ async fn refresh_rotation_chains_a_family_and_reuse_revokes_it(pool: PgPool) {
     .unwrap();
     assert_eq!(families, 1, "rotation keeps one family");
 
-    // Presenting the spent t0 again is reuse: the live t2 dies with it, and a
-    // security event records it.
+    // Presented again straight after its own rotation, t0 is inside the grace
+    // window: refused, nothing revoked, no reuse event.
+    assert_eq!(
+        RefreshTokenRepository::check(&app, &t0).await.unwrap(),
+        RefreshCheck::Grace
+    );
+    assert_eq!(
+        live_in_family(&pool, &t2).await,
+        1,
+        "grace leaves the family live"
+    );
+    assert_eq!(reuse_events(&pool, client).await, 0);
+
+    // Past the window, presenting the spent t0 again is reuse: the live t2
+    // dies with it, and a security event records it.
+    backdate_rotation(&pool, &t0, 31).await;
+    backdate_rotation(&pool, &t1, 31).await;
     assert_eq!(
         RefreshTokenRepository::check(&app, &t0).await.unwrap(),
         RefreshCheck::Reuse
@@ -513,7 +749,7 @@ async fn refresh_rotation_chains_a_family_and_reuse_revokes_it(pool: PgPool) {
     // The same through rotate (a replay straight at the rotation).
     let t3 = h("t3");
     assert_eq!(
-        RefreshTokenRepository::rotate(&app, &t1, &t3, &scopes, exp)
+        RefreshTokenRepository::rotate(&app, &t1, &t3, exp)
             .await
             .unwrap(),
         RefreshRotateOutcome::Reuse
@@ -559,7 +795,7 @@ async fn a_denied_revoked_or_expired_token_is_invalid_not_reuse(pool: PgPool) {
             RefreshCheck::Invalid
         );
         assert_eq!(
-            RefreshTokenRepository::rotate(&app, &t, &h("n"), &scopes, exp)
+            RefreshTokenRepository::rotate(&app, &t, &h("n"), exp)
                 .await
                 .unwrap(),
             RefreshRotateOutcome::Invalid
@@ -632,11 +868,11 @@ async fn concurrent_rotations_of_one_token_admit_exactly_one(pool: PgPool) {
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
     let mut handles = Vec::new();
     for i in 0..N {
-        let (app, t0, scopes, barrier) = (app.clone(), t0.clone(), scopes.clone(), barrier.clone());
+        let (app, t0, barrier) = (app.clone(), t0.clone(), barrier.clone());
         handles.push(tokio::spawn(async move {
             let next = h(&format!("next{i}"));
             barrier.wait().await;
-            RefreshTokenRepository::rotate(&app, &t0, &next, &scopes, exp)
+            RefreshTokenRepository::rotate(&app, &t0, &next, exp)
                 .await
                 .expect("rotate")
         }));
@@ -656,12 +892,14 @@ async fn concurrent_rotations_of_one_token_admit_exactly_one(pool: PgPool) {
     assert_eq!(
         outcomes
             .iter()
-            .filter(|o| **o == RefreshRotateOutcome::Reuse)
+            .filter(|o| **o == RefreshRotateOutcome::Grace)
             .count(),
         N - 1,
-        "every other presenter found it spent by rotation: {outcomes:?}"
+        "every other presenter found it spent by a rotation inside the grace window: \
+         {outcomes:?}"
     );
-    // Strict reuse detection: the winner's successor is revoked with the family.
+    // A benign race does not end the chain: the winner's successor stays live
+    // and no reuse event is written.
     let minted: i64 =
         sqlx::query_scalar("SELECT count(*) FROM refresh_tokens WHERE client_id = $1")
             .bind(client)
@@ -676,10 +914,8 @@ async fn concurrent_rotations_of_one_token_admit_exactly_one(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(
-        live, 0,
-        "reuse ends the chain, the winner's successor included"
-    );
+    assert_eq!(live, 1, "the winner's successor survives the race");
+    assert_eq!(reuse_events(&pool, client).await, 0, "a race is not reuse");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

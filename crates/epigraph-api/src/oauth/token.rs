@@ -662,17 +662,26 @@ async fn handle_refresh_token(
     })?;
     let hash = blake3::hash(&raw);
 
-    // Migration 118: the first read goes through the check definer, which
-    // treats a token already spent by ROTATION as reuse and revokes its whole
-    // family (OAuth 2.0 Security BCP) before answering. Reuse and an unknown or
-    // expired token get the same 401: the response must not tell a replayer
-    // which one it hit.
+    // Migration 118: the first read goes through the check definer. A token
+    // spent by its own ROTATION less than 30 seconds ago is `Grace` (the loser
+    // of a benign concurrent refresh: refused, family left live); spent longer
+    // ago than that, it is reuse and the definer revokes its whole family
+    // (OAuth 2.0 Security BCP) before answering. Grace, reuse and an unknown or
+    // expired token all get the same 401: the response must not tell a
+    // replayer which one it hit.
     let stored = match RefreshTokenRepository::check(&state.db_pool, hash.as_bytes())
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
         })? {
         RefreshCheck::Valid { id, client_id } => StoredRefresh { id, client_id },
+        RefreshCheck::Grace => {
+            tracing::info!(
+                "refresh token presented again inside its rotation's grace window: \
+                 refused, family left live"
+            );
+            return Err(invalid_refresh());
+        }
         RefreshCheck::Reuse => {
             tracing::warn!("refresh token reuse: its rotation family has been revoked");
             return Err(invalid_refresh());
@@ -787,7 +796,10 @@ async fn handle_refresh_token(
     // token (`UPDATE ... WHERE revoked_at IS NULL AND expires_at > now()
     // RETURNING`) and inserts its successor in the same family. Of concurrent
     // refreshes presenting one token exactly one gets here with `Rotated`; the
-    // others found it spent, which is reuse and revoked the family.
+    // others find it spent inside the grace window and get a 401 while the
+    // winner's successor stays live. The definer derives the successor's scopes
+    // (the client's `granted_scopes`, which `effective_scopes` already is) and
+    // caps its expiry at the same TTL table as below.
     let new_refresh = {
         use rand::Rng;
         let raw: [u8; 32] = rand::thread_rng().gen();
@@ -803,7 +815,6 @@ async fn handle_refresh_token(
             &state.db_pool,
             hash.as_bytes(),
             new_hash.as_bytes(),
-            &effective_scopes,
             Utc::now() + refresh_ttl,
         )
         .await
@@ -811,11 +822,18 @@ async fn handle_refresh_token(
             message: e.to_string(),
         })? {
             RefreshRotateOutcome::Rotated { .. } => token_str,
+            RefreshRotateOutcome::Grace => {
+                tracing::info!(
+                    client_id = %client.client_id,
+                    "refresh token presented again while its rotation was in flight: \
+                     refused inside the grace window, family left live"
+                );
+                return Err(invalid_refresh());
+            }
             RefreshRotateOutcome::Reuse => {
                 tracing::warn!(
                     client_id = %client.client_id,
-                    "refresh token presented again while its rotation was in flight: \
-                     treated as reuse, family revoked"
+                    "refresh token reuse at rotation: family revoked"
                 );
                 return Err(invalid_refresh());
             }
@@ -843,7 +861,8 @@ struct StoredRefresh {
 }
 
 /// One 401 for every refresh that cannot proceed (unknown, expired, revoked,
-/// reused): the response does not distinguish them.
+/// reused, or refused inside the grace window): the response does not
+/// distinguish them.
 #[cfg(feature = "db")]
 fn invalid_refresh() -> ApiError {
     ApiError::Unauthorized {

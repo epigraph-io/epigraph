@@ -155,6 +155,23 @@ async fn live_tokens(pool: &PgPool, client: Uuid) -> i64 {
     .unwrap()
 }
 
+/// Move a rotated refresh token's `revoked_at` `secs` seconds into the past on
+/// the superuser pool, to stand past the grace window without sleeping.
+async fn backdate_rotation(pool: &PgPool, token: &str, secs: i32) {
+    let hash = blake3::hash(&hex::decode(token).expect("hex refresh token"));
+    let n = sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now() - make_interval(secs => $2) \
+          WHERE token_hash = $1 AND revoked_reason = 'rotated'",
+    )
+    .bind(hash.as_bytes().as_slice())
+    .bind(f64::from(secs))
+    .execute(pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(n, 1, "backdate a rotated token");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn authorization_code_then_refresh_chain_on_the_app_role(pool: PgPool) {
     let (client_id, client, code) = seed_code(&pool).await;
@@ -192,7 +209,30 @@ async fn authorization_code_then_refresh_chain_on_the_app_role(pool: PgPool) {
     let r2 = body["refresh_token"].as_str().unwrap().to_string();
     assert_eq!(live_tokens(&pool, client).await, 1);
 
-    // Replaying a rotated token: 401, and the live r2 dies with its family.
+    // Re-presenting a token straight after its own rotation is inside the
+    // grace window: 401, and the chain survives (r2 still refreshes).
+    let (status, _) = post_token(app.clone(), refresh_grant(&r1)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "re-presented inside the window"
+    );
+    assert_eq!(
+        live_tokens(&pool, client).await,
+        1,
+        "grace leaves the family live"
+    );
+    let (status, body) = post_token(app.clone(), refresh_grant(&r2)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "r2 survives a grace refusal: {body}"
+    );
+    let r3 = body["refresh_token"].as_str().unwrap().to_string();
+
+    // Past the window, replaying a rotated token is reuse: 401, and the live r3
+    // dies with its family.
+    backdate_rotation(&pool, &r0, 31).await;
     let (status, _) = post_token(app.clone(), refresh_grant(&r0)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "replayed token");
     assert_eq!(
@@ -200,11 +240,11 @@ async fn authorization_code_then_refresh_chain_on_the_app_role(pool: PgPool) {
         0,
         "reuse revoked the family"
     );
-    let (status, _) = post_token(app.clone(), refresh_grant(&r2)).await;
+    let (status, _) = post_token(app.clone(), refresh_grant(&r3)).await;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
-        "r2 was revoked with its family"
+        "r3 was revoked with its family"
     );
     let events: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM security_events WHERE event_type = 'oauth.refresh_token_reuse' \
@@ -232,12 +272,17 @@ async fn concurrent_refreshes_with_one_token_admit_exactly_one(pool: PgPool) {
         let (app, r0, barrier) = (app.clone(), r0.clone(), barrier.clone());
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            post_token(app, refresh_grant(&r0)).await.0
+            post_token(app, refresh_grant(&r0)).await
         }));
     }
     let mut statuses = Vec::new();
+    let mut winner = None;
     for h in handles {
-        statuses.push(h.await.unwrap());
+        let (status, body) = h.await.unwrap();
+        if status == StatusCode::OK {
+            winner = body["refresh_token"].as_str().map(str::to_string);
+        }
+        statuses.push(status);
     }
     let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
     assert_eq!(ok, 1, "exactly one refresh may succeed: {statuses:?}");
@@ -254,6 +299,30 @@ async fn concurrent_refreshes_with_one_token_admit_exactly_one(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(minted, 2, "one successor, not one per request");
+
+    // The race's losers were inside the grace window: the winner is not logged
+    // out. Its successor is live and refreshes.
+    assert_eq!(
+        live_tokens(&pool, client).await,
+        1,
+        "the winner's successor is live"
+    );
+    let winner = winner.expect("the winning response carries a refresh token");
+    let (status, body) = post_token(app.clone(), refresh_grant(&winner)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the winner refreshes after the race: {body}"
+    );
+    let reuse: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'oauth.refresh_token_reuse' \
+            AND details->>'client_id' = $1::text",
+    )
+    .bind(client)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reuse, 0, "a benign race is not reuse");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

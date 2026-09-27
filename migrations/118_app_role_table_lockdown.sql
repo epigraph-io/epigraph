@@ -18,8 +18,9 @@
 --   3. moves every UPDATE/DELETE the request path runs on a credential table
 --      into a SECURITY DEFINER owned by `epigraph_maintenance`, then revokes
 --      UPDATE and DELETE on those tables from `epigraph_app`:
---        refresh_tokens            check (reuse detection), rotate (atomic),
---                                  revoke, revoke-for-client
+--        refresh_tokens            check (reuse detection), rotate (atomic;
+--                                  successor scopes and expiry derived),
+--                                  revoke, revoke-by-hash, revoke-for-client
 --        oauth_authorization_codes consume (single use)
 --        oauth_authorize_sessions  to-consent, take (single use)
 --        oauth_clients             lock-for-link, link-agent (write-once),
@@ -39,10 +40,22 @@
 -- id, so rows inserted by an older binary during the deploy are their own
 -- family) links a rotated token to its successor; `revoked_reason` records why
 -- a row was revoked. Presenting a token whose revocation reason is `rotated`
--- is reuse (OAuth 2.0 Security BCP, refresh token rotation): every live token
--- of its family is revoked and a `security_events` row is written. The
--- definers RETURN an outcome and never RAISE on that path, because a RAISE
--- would roll the family revocation back with it.
+-- more than 30 seconds after that rotation is reuse (OAuth 2.0 Security BCP,
+-- refresh token rotation): every live token of its family is revoked and a
+-- `security_events` row is written. Inside those 30 seconds it is a benign
+-- concurrent refresh (the GRACE WINDOW): refused with the same answer, and
+-- the family, the race winner's successor included, stays live. The definers
+-- RETURN an outcome and never RAISE on that path, because a RAISE would roll
+-- the family revocation back with it. The application role no longer reads
+-- `token_hash`, so no application session can name another client's chain
+-- to these definers.
+--
+-- INSERT is not narrowed here, and on these tables INSERT carries authority
+-- of its own: a client row inserted with a chosen `agent_id`, status and
+-- scopes, an authorization code inserted for a chosen client, and an agent key
+-- inserted for a chosen agent can each be redeemed or used as that principal.
+-- Moving those inserts behind definers that derive the security-relevant
+-- columns from checked state is a named follow-up.
 --
 -- ORDERING. This file uses no object created by 111-117 and replaces no
 -- function any of them creates, and none of them grants table privileges to
@@ -122,6 +135,16 @@ CREATE INDEX IF NOT EXISTS refresh_tokens_live_family_idx
 
 -- Reuse handling, shared by check and rotate. Not granted to the application:
 -- it is reached only through the two definers below.
+--
+-- GRACE WINDOW. A token presented again within 30 seconds of its OWN rotation
+-- is a benign race (two tabs, connectors or processes refreshing with one
+-- token and no lock), not a replay: the answer is `grace`, which the token
+-- endpoint turns into the same 401 as `invalid`, and the family stays live, so
+-- the race's winner keeps the successor it was handed. Presented later than
+-- that, it is reuse and the family is revoked (strict BCP). The window is
+-- measured on the database clock against the row's own `revoked_at`, never
+-- against anything the caller supplies. `grace` issues nothing: a replayer
+-- inside the window gets a 401 and learns nothing a 401 does not already say.
 CREATE OR REPLACE FUNCTION public.epigraph_refresh_token_on_reuse(p_hash bytea)
 RETURNS text
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
@@ -131,14 +154,22 @@ DECLARE
     v_client uuid;
     v_family uuid;
     v_reason text;
+    v_revoked_at timestamptz;
     v_n bigint;
 BEGIN
-    SELECT t.id, t.client_id, COALESCE(t.family_id, t.id), t.revoked_reason
-      INTO v_id, v_client, v_family, v_reason
+    SELECT t.id, t.client_id, COALESCE(t.family_id, t.id), t.revoked_reason, t.revoked_at
+      INTO v_id, v_client, v_family, v_reason, v_revoked_at
       FROM public.refresh_tokens t
      WHERE t.token_hash = p_hash;
     IF NOT FOUND OR v_reason IS DISTINCT FROM 'rotated' THEN
         RETURN 'invalid';
+    END IF;
+    IF v_revoked_at > now() - interval '30 seconds' THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('oauth.refresh_token_grace', NULL, false,
+                jsonb_build_object('client_id', v_client, 'family_id', v_family,
+                                   'presented_token_id', v_id, 'migration', 118));
+        RETURN 'grace';
     END IF;
     UPDATE public.refresh_tokens
        SET revoked_at = now(), revoked_reason = 'reuse'
@@ -154,7 +185,8 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_refresh_token_on_reuse(bytea) FROM PUBLIC;
 
 -- The refresh grant's first read. `valid` has no side effect; a token revoked
--- by rotation is reuse and revokes its family; anything else is `invalid`.
+-- by rotation is `grace` inside the window and reuse (family revoked) after
+-- it; anything else is `invalid`.
 CREATE OR REPLACE FUNCTION public.epigraph_refresh_token_check(p_hash bytea)
 RETURNS TABLE (outcome text, token_id uuid, client_id uuid)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
@@ -175,15 +207,24 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_refresh_token_check(bytea) FROM PUBLI
 -- number of concurrent callers presenting it exactly one gets the row) and
 -- insert its successor in the same family, for the same client. 0 rows
 -- claimed is not an error: the token was spent, revoked or expired, and a
--- token spent by rotation is reuse.
+-- token spent by rotation is `grace` or reuse (above).
+--
+-- The successor's authority is DERIVED here, not taken from the caller: its
+-- scopes are the client's current `granted_scopes` (what the refresh grant
+-- mints access tokens from anyway), and its expiry is capped at the client
+-- type's refresh TTL (agent 24 h, human 30 d, service 90 d, anything else
+-- 24 h; the same table as `oauth/token.rs`). The caller may shorten the
+-- expiry, never lengthen it.
 CREATE OR REPLACE FUNCTION public.epigraph_refresh_token_rotate(
-    p_old_hash bytea, p_new_hash bytea, p_new_expires_at timestamptz, p_scopes text[])
+    p_old_hash bytea, p_new_hash bytea, p_new_expires_at timestamptz)
 RETURNS TABLE (outcome text, token_id uuid)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, public AS $$
 DECLARE
     v_client uuid;
     v_family uuid;
+    v_scopes text[];
+    v_ttl interval;
     v_new uuid;
 BEGIN
     IF p_new_hash IS NULL OR p_new_expires_at IS NULL OR p_new_expires_at <= now() THEN
@@ -198,12 +239,22 @@ BEGIN
         RETURN QUERY SELECT public.epigraph_refresh_token_on_reuse(p_old_hash), NULL::uuid;
         RETURN;
     END IF;
+    SELECT COALESCE(c.granted_scopes, ARRAY[]::text[]),
+           CASE c.client_type
+               WHEN 'human' THEN interval '30 days'
+               WHEN 'service' THEN interval '90 days'
+               ELSE interval '24 hours'
+           END
+      INTO v_scopes, v_ttl
+      FROM public.oauth_clients c
+     WHERE c.id = v_client;
     INSERT INTO public.refresh_tokens (token_hash, client_id, scopes, expires_at, family_id)
-    VALUES (p_new_hash, v_client, COALESCE(p_scopes, ARRAY[]::text[]), p_new_expires_at, v_family)
+    VALUES (p_new_hash, v_client, COALESCE(v_scopes, ARRAY[]::text[]),
+            LEAST(p_new_expires_at, now() + COALESCE(v_ttl, interval '24 hours')), v_family)
     RETURNING id INTO v_new;
     RETURN QUERY SELECT 'rotated'::text, v_new;
 END $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz, text[])
+REVOKE EXECUTE ON FUNCTION public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz)
     FROM PUBLIC;
 
 -- A deliberate revocation of one live token (a denied refresh, /revoke).
@@ -223,6 +274,22 @@ BEGIN
     RETURN FOUND;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_refresh_token_revoke(uuid, text) FROM PUBLIC;
+
+-- RFC 7009 revocation by the token itself (`/oauth/revoke`). The application
+-- role cannot read `token_hash` (section 3e), so the lookup by hash happens
+-- here. Idempotent: an unknown or already revoked token is `false`, and the
+-- endpoint answers 200 either way.
+CREATE OR REPLACE FUNCTION public.epigraph_refresh_token_revoke_by_hash(p_hash bytea)
+RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, public AS $$
+BEGIN
+    UPDATE public.refresh_tokens
+       SET revoked_at = now(), revoked_reason = 'revoked'
+     WHERE token_hash = p_hash AND revoked_at IS NULL AND expires_at > now();
+    RETURN FOUND;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_refresh_token_revoke_by_hash(bytea) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION public.epigraph_refresh_token_revoke_client(p_client_id uuid)
 RETURNS bigint
@@ -385,8 +452,9 @@ BEGIN
         FOREACH f IN ARRAY ARRAY[
             'public.epigraph_refresh_token_on_reuse(bytea)',
             'public.epigraph_refresh_token_check(bytea)',
-            'public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz, text[])',
+            'public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz)',
             'public.epigraph_refresh_token_revoke(uuid, text)',
+            'public.epigraph_refresh_token_revoke_by_hash(bytea)',
             'public.epigraph_refresh_token_revoke_client(uuid)',
             'public.epigraph_oauth_code_consume(bytea)',
             'public.epigraph_oauth_session_to_consent(text, text, uuid, text[])',
@@ -402,8 +470,9 @@ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         FOREACH f IN ARRAY ARRAY[
             'public.epigraph_refresh_token_check(bytea)',
-            'public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz, text[])',
+            'public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz)',
             'public.epigraph_refresh_token_revoke(uuid, text)',
+            'public.epigraph_refresh_token_revoke_by_hash(bytea)',
             'public.epigraph_refresh_token_revoke_client(uuid)',
             'public.epigraph_oauth_code_consume(bytea)',
             'public.epigraph_oauth_session_to_consent(text, text, uuid, text[])',
@@ -418,6 +487,15 @@ BEGIN
         EXECUTE 'REVOKE UPDATE, DELETE, TRUNCATE ON public.refresh_tokens, '
                 'public.oauth_authorization_codes, public.oauth_authorize_sessions, '
                 'public.oauth_clients, public.agent_keys FROM epigraph_app';
+        -- `token_hash` is the bearer secret's image: with it, the check, rotate
+        -- and revoke definers act on another client's chain. No application
+        -- path reads it (every lookup by hash is a definer above), so the
+        -- application role reads every column but that one. A column GRANT is
+        -- only additive, so the table-level SELECT goes first; `id` stays
+        -- readable because the mint's `INSERT ... RETURNING id` needs it.
+        EXECUTE 'REVOKE SELECT ON public.refresh_tokens FROM epigraph_app';
+        EXECUTE 'GRANT SELECT (id, client_id, scopes, expires_at, revoked_at, created_at, '
+                'family_id, revoked_reason) ON public.refresh_tokens TO epigraph_app';
     END IF;
 END $$;
 

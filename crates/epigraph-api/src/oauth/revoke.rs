@@ -32,24 +32,14 @@ pub async fn revoke_endpoint(
             #[cfg(feature = "db")]
             {
                 use epigraph_db::repos::refresh_token::RefreshTokenRepository;
-                // Revoke if it exists; if not, that's fine (idempotent per RFC 7009)
-                if let Some(stored) =
-                    RefreshTokenRepository::get_valid(&state.db_pool, hash.as_bytes())
-                        .await
-                        .map_err(|e| ApiError::InternalError {
-                            message: e.to_string(),
-                        })?
-                {
-                    RefreshTokenRepository::revoke(
-                        &state.db_pool,
-                        stored.id,
-                        epigraph_db::repos::refresh_token::RefreshRevokeReason::Revoked,
-                    )
+                // Revoke if it exists; if not, that's fine (idempotent per RFC
+                // 7009). One definer call (migration 118): the application role
+                // cannot read `token_hash`, so the lookup by hash is inside it.
+                RefreshTokenRepository::revoke_by_hash(&state.db_pool, hash.as_bytes())
                     .await
                     .map_err(|e| ApiError::InternalError {
                         message: e.to_string(),
                     })?;
-                }
             }
         }
         "access_token" => {
