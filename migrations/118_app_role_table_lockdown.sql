@@ -617,9 +617,10 @@ END $$;
 -- `oauth.refresh_token_grace` are written by the definers above. The
 -- application role keeps INSERT on `security_events` (077: an actor must never
 -- be able to suppress its own audit record), so without this an application
--- session could forge one. Same shape as 117's `cascade.` arm. `left()`, not
--- LIKE: the application's own provisioning events are `oauth_...`, and `_` is
--- a LIKE wildcard.
+-- session could forge one. Same shape as 117's `cascade.` arm.
+-- `left(event_type, 6) <> 'oauth.'` is an exact, case-sensitive prefix test:
+-- the application's own provisioning events are `oauth_...` and do not match
+-- it, so they still land.
 DROP POLICY IF EXISTS security_events_oauth_privileged ON public.security_events;
 CREATE POLICY security_events_oauth_privileged ON public.security_events
     AS RESTRICTIVE FOR INSERT TO PUBLIC
