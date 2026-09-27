@@ -312,6 +312,7 @@ pub async fn decide_match_candidate(
 /// materializations that regenerate from live edges.
 pub async fn retire_match_candidate(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: RetireMatchCandidateParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
@@ -335,44 +336,27 @@ pub async fn retire_match_candidate(
         MatchCandidateRepo::mark_retired_conn(&mut tx, candidate_id, Some(acting_agent))
             .await
             .map_err(internal_error)?;
-    let trigger = CascadeTrigger {
-        cause: CascadeCause::MatchRetire,
-        agent_id: Some(acting_agent),
-        oauth: crate::tools::supersede::oauth_principal(auth),
-        subject_id: candidate_id,
-        object_id: None,
-    };
-    let deferred = if crate::maintenance::admin_cascade_configured(server) {
-        None
-    } else {
-        Some(
-            admin_cascade::record_deferral(
-                &mut *tx,
-                &trigger,
-                admin_cascade::REASON_NOT_CONFIGURED,
-            )
-            .await
-            .map_err(internal_error)?,
-        )
-    };
+    let trigger = CascadeTrigger::new(
+        CascadeCause::MatchRetire,
+        Some(acting_agent),
+        crate::tools::supersede::oauth_principal(auth),
+        candidate_id,
+        None,
+    );
+    let (mut session, deferred) =
+        crate::tools::supersede::admin_session_or_deferral(server, &mut tx, &trigger).await?;
     tx.commit().await.map_err(internal_error)?;
 
     // THE CASCADE, with administrative authority on the maintenance
     // connection: retract the matcher edge (a promoted edge between two public
-    // claims is owned by nobody) and delete its derived rows. Audited.
-    let (cascade, retirement) = match deferred {
-        Some(status) => (status, None),
-        None => match crate::maintenance::admin_cascade_session(server).await {
-            Ok(mut session) => {
-                admin_cascade::apply_after_match_retire(session.conn(), &trigger, candidate_id)
-                    .await
-            }
-            Err(reason) => (
-                crate::tools::supersede::record_deferral_after_commit(server, &trigger, &reason)
-                    .await,
-                None,
-            ),
-        },
+    // claims is owned by nobody) and delete its derived rows. Audited
+    // atomically; what comes back is filtered to the caller's viewer.
+    let (cascade, retirement) = match (session.as_mut(), deferred) {
+        (Some(session), _) => {
+            admin_cascade::apply_after_match_retire(session.conn(), viewer, &trigger, candidate_id)
+                .await
+        }
+        (None, status) => (status, None),
     };
     let retirement = retirement.map(|mut r| {
         r.previous_status.clone_from(&previous_status);

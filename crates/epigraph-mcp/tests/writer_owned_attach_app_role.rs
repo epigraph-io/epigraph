@@ -114,6 +114,16 @@ async fn claim_row(pool: &PgPool, claim: Uuid) -> (Uuid, f64, Vec<String>, Optio
 }
 
 async fn binary_truth(pool: &PgPool) -> Uuid {
+    // Get-or-create: `frames.name` is UNIQUE, and a test that builds two
+    // fixtures asks for the frame twice.
+    let existing: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM frames WHERE name = 'binary_truth'")
+            .fetch_optional(pool)
+            .await
+            .expect("read binary_truth");
+    if let Some(id) = existing {
+        return id;
+    }
     epigraph_db::FrameRepository::create(
         pool,
         "binary_truth",
@@ -1052,4 +1062,403 @@ async fn supersede_without_an_admin_connection_commits_the_act_and_defers(pool: 
         ("cascade.deferred", Some(agent), "supersede")
     );
     assert!(reason.contains("MAINTENANCE_DATABASE_URL"), "{reason}");
+}
+
+// ===========================================================================
+// W10 revision: what the caller is told, consolidation, and the replay.
+// ===========================================================================
+
+/// The ids a JSON body spells.
+fn mentions(body: &serde_json::Value, id: Uuid) -> bool {
+    body.to_string().contains(&id.to_string())
+}
+
+/// The supersede cascade re-points EVERY writer's edge on the retired claim,
+/// including edges between another group's PRIVATE claims and the caller's
+/// public one, and re-derives the private downstream claim. The caller cannot
+/// read those rows, so the tool result names none of them: `cascade.touched`
+/// is counts, and the belief report keeps only claims the caller can read
+/// (the world claim T is still reported). The audit rows keep every id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_supersede_result_names_no_row_the_caller_cannot_read(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let f = supersede_fixture(&pool, agent, group).await;
+    let t: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(f.outgoing)
+        .fetch_one(&pool)
+        .await
+        .expect("T");
+    let (h, h_group) = fixture::seed_agent_with_group(&pool, "private-group-h").await;
+    let hp1 = fixture::seed_group_claim(&pool, h, h_group, "H's private citing claim").await;
+    let hp2 = fixture::seed_group_claim(&pool, h, h_group, "H's private downstream claim").await;
+    let into_old = edge_between(&pool, hp1, f.old).await;
+    let out_of_old = edge_between(&pool, f.old, hp2).await;
+    let bt = binary_truth(&pool).await;
+    harness_edge_bba(&pool, hp2, bt, h, out_of_old).await;
+    // A cached belief on both downstream claims, so the belief cascade reports
+    // each one (as unbacked: its only BBA is invalidated).
+    sqlx::query(
+        "UPDATE claims SET belief = 0.8, plausibility = 0.9, pignistic_prob = 0.85 \
+          WHERE id = ANY($1)",
+    )
+    .bind(vec![t, hp2])
+    .execute(&pool)
+    .await
+    .expect("plant cached beliefs");
+    let visible = epigraph_db::ClaimRepository::visible_claim_ids(&pool, &viewer, &[hp1, hp2, t])
+        .await
+        .expect("visible ids");
+    assert_eq!(
+        visible,
+        std::iter::once(t).collect(),
+        "fixture: the caller reads T and neither of H's private claims"
+    );
+
+    let r = epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &viewer,
+        epigraph_mcp::types::SupersedeClaimParams {
+            claim_id: f.old.to_string(),
+            content: "my claim, corrected".to_string(),
+            truth_value: 0.6,
+            reason: "a correction".to_string(),
+        },
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("the owner's supersede lands on the app role");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    let new_id = parse_uuid_field(&body, "new_claim_id");
+    let (moved_in, moved_out): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT (SELECT target_id FROM edges WHERE id = $1), \
+                (SELECT source_id FROM edges WHERE id = $2)",
+    )
+    .bind(into_old)
+    .bind(out_of_old)
+    .fetch_one(&pool)
+    .await
+    .expect("edges");
+    assert_eq!(
+        (moved_in, moved_out),
+        (new_id, new_id),
+        "calibration: the cascade DID touch the private rows"
+    );
+    for (id, what) in [
+        (hp1, "H's private claim"),
+        (hp2, "H's private downstream claim"),
+        (into_old, "the private edge into the retired claim"),
+        (out_of_old, "the private edge out of it"),
+        (f.incoming, "another writer's edge id"),
+    ] {
+        assert!(
+            !mentions(&body, id),
+            "the result names {what} ({id}): {body}"
+        );
+    }
+    assert!(
+        body["cascade"]["touched"]["edges_retargeted"].is_u64(),
+        "touched carries counts: {body}"
+    );
+    assert_eq!(
+        body["cascade"]["touched"]["edges_retargeted"],
+        serde_json::json!(2),
+        "{body}"
+    );
+    assert!(
+        body["belief_cascade"]["targets"]
+            .as_array()
+            .is_some_and(|a| a.contains(&serde_json::json!(t))),
+        "a downstream claim the caller CAN read is still reported: {body}"
+    );
+
+    let event = parse_uuid_field(&body["cascade"], "audit_event_id");
+    let touched: serde_json::Value =
+        sqlx::query_scalar("SELECT details->'touched' FROM security_events WHERE id = $1")
+            .bind(event)
+            .fetch_one(&pool)
+            .await
+            .expect("applied row");
+    assert!(
+        mentions(&touched, into_old) && mentions(&touched, out_of_old),
+        "the audit row keeps the ids: {touched}"
+    );
+    let belief_event = parse_uuid_field(&body["cascade"], "belief_audit_event_id");
+    let belief: serde_json::Value =
+        sqlx::query_scalar("SELECT details->'belief' FROM security_events WHERE id = $1")
+            .bind(belief_event)
+            .fetch_one(&pool)
+            .await
+            .expect("belief row");
+    assert!(
+        mentions(&belief, hp2),
+        "the belief audit row keeps it: {belief}"
+    );
+}
+
+fn consolidate_params(ids: &[Uuid], content: &str) -> epigraph_mcp::types::ConsolidateClaimsParams {
+    epigraph_mcp::types::ConsolidateClaimsParams {
+        source_claim_ids: ids.iter().map(ToString::to_string).collect(),
+        merged_content: content.to_string(),
+        mode: "merge".to_string(),
+        reason: "w10 consolidation".to_string(),
+        confidence: Some(0.7),
+    }
+}
+
+/// `consolidate_claims` on the APPLICATION ROLE by a `claims:write` caller:
+/// the merge is its act; another writer's edges on the retired sources (world
+/// edges no app session can update) move onto the merged claim through the
+/// maintenance connection, audited under the caller. Before 117's split this
+/// reported success with zero edges migrated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_tool_on_the_app_role_runs_its_edge_migration_with_admin_authority(
+    pool: PgPool,
+) {
+    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let s1 = public_claim_of(&pool, agent, group, "my source one").await;
+    let s2 = public_claim_of(&pool, agent, group, "my source two").await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    let xc = public_claim_of(&pool, x, x_group, "X's claim").await;
+    let into_s1 = edge_between(&pool, xc, s1).await;
+    let out_of_s2 = edge_between(&pool, s2, xc).await;
+
+    let r = epigraph_mcp::tools::consolidate::consolidate_claims(
+        &server,
+        &viewer,
+        consolidate_params(&[s1, s2], "my merged claim"),
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("the owner's consolidation lands on the app role");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    assert_eq!(body["edges_migrated"], serde_json::json!(2), "{body}");
+    let merged = parse_uuid_field(&body, "merged_claim_id");
+    let (t, s): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT (SELECT target_id FROM edges WHERE id = $1), \
+                (SELECT source_id FROM edges WHERE id = $2)",
+    )
+    .bind(into_s1)
+    .bind(out_of_s2)
+    .fetch_one(&pool)
+    .await
+    .expect("edges");
+    assert_eq!((t, s), (merged, merged), "both edges follow the merge");
+    let event = parse_uuid_field(&body["cascade"], "audit_event_id");
+    let (et, who, cause): (String, Option<Uuid>, String) = sqlx::query_as(
+        "SELECT event_type::text, agent_id, details->>'cause' FROM security_events WHERE id = $1",
+    )
+    .bind(event)
+    .fetch_one(&pool)
+    .await
+    .expect("audit row");
+    assert_eq!(
+        (et.as_str(), who, cause.as_str()),
+        ("cascade.admin_applied", Some(agent), "consolidate")
+    );
+}
+
+/// A server with NO administrative connection (a stdio agent's shape) defers
+/// every cascade and records it in the act's transaction. The operator's
+/// replay (`replay_deferred`, on a maintenance connection) then applies each
+/// one, names the original caller and the deferral it replays, and a second
+/// run finds nothing pending.
+#[sqlx::test(migrations = "../../migrations")]
+async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    let sf = supersede_fixture(&pool, agent, group).await;
+    let df = dedup_fixture(&pool, agent, group).await;
+    let s1 = public_claim_of(&pool, agent, group, "my source one").await;
+    let s2 = public_claim_of(&pool, agent, group, "my source two").await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "writer-x2").await;
+    let xc = public_claim_of(&pool, x, x_group, "X's claim").await;
+    let into_s1 = edge_between(&pool, xc, s1).await;
+
+    let sup = first_text(
+        &epigraph_mcp::tools::supersede::supersede_claim(
+            &server,
+            &viewer,
+            epigraph_mcp::types::SupersedeClaimParams {
+                claim_id: sf.old.to_string(),
+                content: "my claim, corrected".to_string(),
+                truth_value: 0.6,
+                reason: "a correction".to_string(),
+            },
+            Some(&non_admin_owner(agent)),
+        )
+        .await
+        .expect("supersede act"),
+    );
+    let dedup = first_text(
+        &epigraph_mcp::tools::supersede::mark_duplicate(
+            &server,
+            &viewer,
+            epigraph_mcp::types::MarkDuplicateParams {
+                claim_id: df.dup.to_string(),
+                canonical_id: df.canonical.to_string(),
+                reason: None,
+            },
+            Some(&non_admin_owner(agent)),
+        )
+        .await
+        .expect("dedup act"),
+    );
+    let cons = first_text(
+        &epigraph_mcp::tools::consolidate::consolidate_claims(
+            &server,
+            &viewer,
+            consolidate_params(&[s1, s2], "my merged claim"),
+            Some(&non_admin_owner(agent)),
+        )
+        .await
+        .expect("consolidate act"),
+    );
+    let mut deferrals = Vec::new();
+    for b in [&sup, &dedup, &cons] {
+        assert_eq!(b["cascade"]["status"], "deferred", "{b}");
+        deferrals.push(parse_uuid_field(&b["cascade"], "audit_event_id"));
+    }
+    let new_id = parse_uuid_field(&sup, "new_claim_id");
+    let merged = parse_uuid_field(&cons, "merged_claim_id");
+    let target = |e: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>("SELECT target_id FROM edges WHERE id = $1")
+                .bind(e)
+                .fetch_one(&pool)
+                .await
+                .expect("edge target")
+        }
+    };
+    assert_eq!(target(sf.incoming).await, sf.old, "deferred: nothing moved");
+
+    let url = fixture::database_url_for(&pool).await;
+    let maintenance = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("ScopedPool")
+            .with_maintenance_pool(maintenance);
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, admin_viewer) = session.split();
+    let report =
+        epigraph_engine::admin_cascade::replay_deferred(conn, admin_viewer, "w10-test", 50)
+            .await
+            .expect("replay");
+    assert_eq!(
+        (
+            report.pending,
+            report.applied,
+            report.failed,
+            report.unreadable
+        ),
+        (3, 3, 0, 0),
+        "{report:?}"
+    );
+    assert_eq!(
+        target(sf.incoming).await,
+        new_id,
+        "the supersede cascade replayed"
+    );
+    assert_eq!(
+        target(df.other_writers_edge).await,
+        df.canonical,
+        "the dedup cascade replayed"
+    );
+    assert_eq!(
+        target(into_s1).await,
+        merged,
+        "the consolidation cascade replayed"
+    );
+
+    let replays: Vec<(Option<Uuid>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT agent_id, details#>>'{replay_of,deferred_event_id}', \
+                details#>>'{replay_of,replayed_by}' \
+           FROM security_events WHERE event_type = 'cascade.admin_applied' ORDER BY created_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("applied rows");
+    assert_eq!(replays.len(), 3, "{replays:?}");
+    for (who, of, by) in &replays {
+        assert_eq!(
+            *who,
+            Some(agent),
+            "the replay still names the original caller"
+        );
+        assert!(
+            of.as_deref()
+                .and_then(|s| s.parse::<Uuid>().ok())
+                .is_some_and(|d| deferrals.contains(&d)),
+            "and the deferral it replays: {of:?}"
+        );
+        assert_eq!(by.as_deref(), Some("w10-test"));
+    }
+
+    let (conn, admin_viewer) = session.split();
+    let again = epigraph_engine::admin_cascade::replay_deferred(conn, admin_viewer, "w10-test", 50)
+        .await
+        .expect("second replay");
+    assert_eq!((again.pending, again.applied), (0, 0), "{again:?}");
+}
+
+/// The repair and its audit row commit together or not at all. With the
+/// maintenance role unable to append to `security_events`, the supersede's act
+/// still commits, but the cascade reports `failed`: another writer's edge is
+/// NOT re-pointed (the repair rolled back with its refused audit row), so no
+/// cross-owner change exists without the row naming its caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_applied_repair_never_commits_without_its_audit_row(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let f = supersede_fixture(&pool, agent, group).await;
+    sqlx::query("REVOKE INSERT ON security_events FROM epigraph_maintenance")
+        .execute(&pool)
+        .await
+        .expect("revoke the maintenance role's audit append");
+
+    let r = epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &viewer,
+        epigraph_mcp::types::SupersedeClaimParams {
+            claim_id: f.old.to_string(),
+            content: "my claim, corrected".to_string(),
+            truth_value: 0.6,
+            reason: "a correction".to_string(),
+        },
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("the act still commits");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "failed", "{body}");
+    assert!(
+        body["cascade"]["audit_error"].is_string(),
+        "and says its audit row could not be written: {body}"
+    );
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(f.old)
+        .fetch_one(&pool)
+        .await
+        .expect("old");
+    assert!(!current, "the caller's act committed");
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(f.incoming)
+        .fetch_one(&pool)
+        .await
+        .expect("X's edge");
+    assert_eq!(
+        target, f.old,
+        "the repair rolled back with its refused audit row: nothing moved unaudited"
+    );
+    let applied: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'cascade.admin_applied'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(applied, 0);
 }

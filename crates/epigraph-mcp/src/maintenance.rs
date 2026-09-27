@@ -185,10 +185,6 @@ pub(crate) async fn maintenance_viewer(
 /// all: a privileged maintenance pool is attached, which `main` does only for an
 /// explicitly configured `MAINTENANCE_DATABASE_URL` whose role bypasses RLS
 /// ([`may_attach_maintenance_pool`]). Never the application DSN.
-///
-/// A request path asks this BEFORE committing the caller's act, so that a
-/// server that cannot run the cascade records the deferral in the act's own
-/// transaction.
 #[must_use]
 pub(crate) fn admin_cascade_configured(server: &EpiGraphMcpFull) -> bool {
     server
@@ -198,8 +194,10 @@ pub(crate) fn admin_cascade_configured(server: &EpiGraphMcpFull) -> bool {
 }
 
 /// The maintenance session the administrative cascade that follows a
-/// supersede, a dedup or a match-candidate retirement runs on (migration 117,
-/// batch W10).
+/// supersede, a dedup, a consolidation or a match-candidate retirement runs on
+/// (migration 117, batch W10). A request path acquires it BEFORE committing the
+/// caller's act, so a server that cannot run the cascade records the deferral
+/// in the act's own transaction.
 ///
 /// # Why a request path may reach the bypass here
 ///

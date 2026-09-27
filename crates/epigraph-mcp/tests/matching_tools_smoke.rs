@@ -603,6 +603,7 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
 
     let out = tools::matching::retire_match_candidate(
         &server,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
@@ -673,6 +674,7 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
     let read_only = build_server(pool.clone(), true).await;
     tools::matching::retire_match_candidate(
         &read_only,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
@@ -795,6 +797,7 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
     .expect("promote");
     tools::matching::retire_match_candidate(
         &server,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
@@ -1035,6 +1038,7 @@ async fn retire_without_an_admin_connection_commits_the_act_and_defers_the_casca
 
     let out = tools::matching::retire_match_candidate(
         &server,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },

@@ -70,29 +70,18 @@ pub async fn supersede_claim(
     .await
     .map_err(internal_error)?;
 
-    let trigger = CascadeTrigger {
-        cause: CascadeCause::Supersede,
-        agent_id: Some(author),
-        oauth: oauth_principal(auth),
-        subject_id: old_id,
-        object_id: Some(new_id),
-    };
-    // No administrative connection: the deferral is recorded in the act's own
-    // transaction, attributed to the principal it is stamped with, so the act
-    // and its audit row commit together (or neither does).
-    let deferred = if crate::maintenance::admin_cascade_configured(server) {
-        None
-    } else {
-        Some(
-            admin_cascade::record_deferral(
-                &mut *tx,
-                &trigger,
-                admin_cascade::REASON_NOT_CONFIGURED,
-            )
-            .await
-            .map_err(internal_error)?,
-        )
-    };
+    let trigger = CascadeTrigger::new(
+        CascadeCause::Supersede,
+        Some(author),
+        oauth_principal(auth),
+        old_id,
+        Some(new_id),
+    );
+    // The administrative connection is acquired BEFORE the act commits. With
+    // none (not configured, or unusable), the deferral is recorded in the act's
+    // own transaction, attributed to the principal it is stamped with, so the
+    // act and its audit row commit together (or neither does).
+    let (mut session, deferred) = admin_session_or_deferral(server, &mut tx, &trigger).await?;
     tx.commit().await.map_err(internal_error)?;
 
     // THE CASCADE (backlog 20e9ed83; migration 117): migrate the retired
@@ -100,23 +89,17 @@ pub async fn supersede_claim(
     // supporters froze from ITS interval and re-derive them. It runs with
     // ADMINISTRATIVE authority, on the server's maintenance connection and its
     // bypass viewer, because the edges and BBAs it rewrites belong to other
-    // writers; it writes one `security_events` row naming this caller.
+    // writers; the repair and its `security_events` row naming this caller
+    // commit together. What comes back is filtered to the CALLER's viewer.
     // Best-effort by construction: the act has committed, and failing the call
     // here would hand the caller an error for a write that succeeded (the retry
-    // then hits "already been superseded"). Reported, so a caller reading a
-    // downstream claim straight after this call can see what was repaired.
-    let (cascade, belief_cascade) = match deferred {
-        Some(status) => (status, CascadeReport::default()),
-        None => match crate::maintenance::admin_cascade_session(server).await {
-            Ok(mut session) => {
-                let (conn, v) = session.split();
-                admin_cascade::apply_after_supersede(conn, v, &trigger, old_id, new_id).await
-            }
-            Err(reason) => (
-                record_deferral_after_commit(server, &trigger, &reason).await,
-                CascadeReport::default(),
-            ),
-        },
+    // then hits "already been superseded").
+    let (cascade, belief_cascade) = match (session.as_mut(), deferred) {
+        (Some(session), _) => {
+            let (conn, v) = session.split();
+            admin_cascade::apply_after_supersede(conn, v, viewer, &trigger, old_id, new_id).await
+        }
+        (None, status) => (status, CascadeReport::default()),
     };
 
     Ok(CallToolResult::success(vec![Content::text(
@@ -131,31 +114,26 @@ pub async fn supersede_claim(
     )]))
 }
 
-/// Record a deferral AFTER the act committed (the administrative connection was
-/// configured but could not be used). Best-effort: the act has committed, so a
-/// failure to write the row is reported in the result rather than raised.
-pub(crate) async fn record_deferral_after_commit(
-    server: &EpiGraphMcpFull,
+/// Acquire the administrative (maintenance) session BEFORE the caller's act
+/// commits. When there is none -- not configured, or not usable -- record the
+/// deferral inside the act's own transaction `tx`, so the act and its audit row
+/// commit together, and return that status.
+///
+/// # Errors
+/// The deferral INSERT's error: the caller propagates it and nothing commits.
+pub(crate) async fn admin_session_or_deferral<'s>(
+    server: &'s EpiGraphMcpFull,
+    tx: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
-    reason: &str,
-) -> CascadeStatus {
-    let author = match trigger.agent_id {
-        Some(a) => a,
-        None => {
-            return CascadeStatus::deferred_unaudited(reason, "no principal to attribute it to")
+) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
+    match crate::maintenance::admin_cascade_session(server).await {
+        Ok(session) => Ok((Some(session), CascadeStatus::default())),
+        Err(reason) => {
+            let status = admin_cascade::record_deferral(&mut *tx, trigger, &reason)
+                .await
+                .map_err(internal_error)?;
+            Ok((None, status))
         }
-    };
-    match crate::claim_helper::begin_author_stamped_tx(server, author, "admin_cascade_deferral")
-        .await
-    {
-        Ok(mut tx) => match admin_cascade::record_deferral(&mut *tx, trigger, reason).await {
-            Ok(status) => match tx.commit().await {
-                Ok(()) => status,
-                Err(e) => CascadeStatus::deferred_unaudited(reason, e),
-            },
-            Err(e) => CascadeStatus::deferred_unaudited(reason, e),
-        },
-        Err(e) => CascadeStatus::deferred_unaudited(reason, e.message),
     }
 }
 
@@ -194,46 +172,28 @@ pub async fn mark_duplicate(
         .await
         .map_err(internal_error)?;
 
-    let trigger = CascadeTrigger {
-        cause: CascadeCause::Dedup,
-        agent_id: Some(author),
-        oauth: oauth_principal(auth),
-        subject_id: dup,
-        object_id: Some(canon),
-    };
-    let deferred = if crate::maintenance::admin_cascade_configured(server) {
-        None
-    } else {
-        Some(
-            admin_cascade::record_deferral(
-                &mut *tx,
-                &trigger,
-                admin_cascade::REASON_NOT_CONFIGURED,
-            )
-            .await
-            .map_err(internal_error)?,
-        )
-    };
+    let trigger = CascadeTrigger::new(
+        CascadeCause::Dedup,
+        Some(author),
+        oauth_principal(auth),
+        dup,
+        Some(canon),
+    );
+    let (mut session, deferred) = admin_session_or_deferral(server, &mut tx, &trigger).await?;
     tx.commit().await.map_err(internal_error)?;
 
     // THE CASCADE (migration 117), with administrative authority on the
     // maintenance connection: retract the duplicate's colliding edges and drop
     // their BBAs, re-point every other edge onto the canonical, move the BBAs
-    // that follow them, and re-derive what changed. Same best-effort contract
-    // as supersede: the act's own failure is an error, the cascade's is
-    // reported.
-    let (cascade, belief_cascade) = match deferred {
-        Some(status) => (status, CascadeReport::default()),
-        None => match crate::maintenance::admin_cascade_session(server).await {
-            Ok(mut session) => {
-                let (conn, v) = session.split();
-                admin_cascade::apply_after_dedup(conn, v, &trigger, dup, canon).await
-            }
-            Err(reason) => (
-                record_deferral_after_commit(server, &trigger, &reason).await,
-                CascadeReport::default(),
-            ),
-        },
+    // that follow them, and re-derive what changed. Same contract as
+    // supersede: audited atomically, filtered to the caller, best-effort (the
+    // act's own failure is an error, the cascade's is reported).
+    let (cascade, belief_cascade) = match (session.as_mut(), deferred) {
+        (Some(session), _) => {
+            let (conn, v) = session.split();
+            admin_cascade::apply_after_dedup(conn, v, viewer, &trigger, dup, canon).await
+        }
+        (None, status) => (status, CascadeReport::default()),
     };
 
     Ok(CallToolResult::success(vec![Content::text(

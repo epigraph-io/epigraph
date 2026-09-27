@@ -989,9 +989,13 @@ impl EpiGraphMcpFull {
     #[tool(
         description = "Consolidate 2..=20 near-duplicate claims into ONE caller-synthesized \
                        claim. Each source is retired with a forwarding pointer to the merged \
-                       claim, its edges migrated (cross-source duplicates collapsed so \
-                       Dempster-Shafer mass is not double-counted), and lineage recorded as \
-                       supersedes edges plus properties.merge. The caller supplies \
+                       claim and lineage recorded as supersedes edges plus properties.merge. \
+                       The sources' live edges are then migrated onto the merged claim \
+                       (cross-source duplicates retracted so Dempster-Shafer mass is not \
+                       double-counted) by the server's administrative cascade on its \
+                       maintenance connection, audited; the result's `cascade` says applied, \
+                       deferred (no maintenance connection: the merge committed and the edge \
+                       migration is recorded for replay) or failed. The caller supplies \
                        merged_content; the server never calls an LLM. ALL-OR-NOTHING: on any \
                        error no merged claim is written and no source is retired, so retrying \
                        a failed call is safe. A source owned by a group this server's agent \
@@ -1010,7 +1014,7 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::consolidate::consolidate_claims(self, viewer, params).await
+        tools::consolidate::consolidate_claims(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1952,7 +1956,8 @@ impl EpiGraphMcpFull {
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
-        tools::matching::retire_match_candidate(self, params, auth).await
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::matching::retire_match_candidate(self, viewer, params, auth).await
     }
 
     // ── Meta (1 tool) ──
