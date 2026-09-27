@@ -2353,55 +2353,6 @@ async fn the_115_functions_are_maintenance_owned_definers(pool: PgPool) {
 // its group's private claim through the repair.
 // ===========================================================================
 
-/// A READER of a group may not dedup its own claim onto that group's
-/// non-public claim (FA04 at the act): the administrative repair would move
-/// the duplicate's derived rows into the group as the group's own. Nothing is
-/// written. The group's writer may.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_reader_cannot_dedup_onto_its_groups_private_claim(pool: PgPool) {
-    let (a, g) = fixture::seed_agent_with_group(&pool, "group-writer-a").await;
-    let (r, r_group) = fixture::seed_agent_with_group(&pool, "reader-r").await;
-    add_reader(&pool, g, r).await;
-    let k = fixture::seed_group_claim(&pool, a, g, "G's private canonical").await;
-    let d = seed_public_claim_owned_by(&pool, r, r_group, "R's duplicate").await;
-    let d2 = seed_public_claim_owned_by(&pool, a, g, "A's duplicate").await;
-    assert_app_role_does_not_bypass(&pool).await;
-
-    let p = pool.clone();
-    let (by_reader, by_writer) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        stamp(&mut conn, &p, r).await;
-        let by_reader = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
-            &mut conn,
-            epigraph_core::ClaimId::from_uuid(d),
-            epigraph_core::ClaimId::from_uuid(k),
-        )
-        .await;
-        stamp(&mut conn, &p, a).await;
-        let by_writer = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
-            &mut conn,
-            epigraph_core::ClaimId::from_uuid(d2),
-            epigraph_core::ClaimId::from_uuid(k),
-        )
-        .await;
-        (conn, (by_reader, by_writer))
-    })
-    .await;
-    let e = by_reader.expect_err("a reader's dedup onto the group's private claim is refused");
-    assert!(e.to_string().contains("FA04"), "{e}");
-    let (current, sup): (bool, Option<Uuid>) =
-        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
-            .bind(d)
-            .fetch_one(&pool)
-            .await
-            .expect("d");
-    assert_eq!(
-        (current, sup),
-        (true, None),
-        "the refused act wrote nothing"
-    );
-    by_writer.expect("the group's writer dedups onto its own group's claim");
-}
-
 /// `(target_id, source_id)` of an edge.
 async fn endpoints(pool: &PgPool, edge: Uuid) -> (Uuid, Uuid) {
     sqlx::query_as("SELECT target_id, source_id FROM edges WHERE id = $1")
@@ -2409,6 +2360,129 @@ async fn endpoints(pool: &PgPool, edge: Uuid) -> (Uuid, Uuid) {
         .fetch_one(pool)
         .await
         .expect("edge endpoints")
+}
+
+/// The supersede and dedup repairs refuse, with nothing changed, every call
+/// that is not the repair of a committed act: before the act, with a pair the
+/// claims do not record, and (the supersede migration) on the application role
+/// after the act. Only the matching pair on the maintenance connection moves
+/// the other writer's edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, w_group) = fixture::seed_agent_with_group(&pool, "writer-w").await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    let old = seed_public_claim_owned_by(&pool, w, w_group, "W's claim to supersede").await;
+    let dup = seed_public_claim_owned_by(&pool, w, w_group, "W's duplicate").await;
+    let decoy = seed_public_claim_owned_by(&pool, w, w_group, "W's unrelated claim").await;
+    let canonical = fixture::seed_public_claim(&pool, author, "a world canonical").await;
+    let xc = seed_public_claim_owned_by(&pool, x, x_group, "X's citing claim").await;
+    let into_old = fixture::seed_edge(&pool, xc, old).await;
+    let into_dup = fixture::seed_edge(&pool, xc, dup).await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    // Before any act: both repairs refuse on the maintenance connection.
+    let (sup_pre, dup_pre) =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let a =
+                epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, decoy)
+                    .await;
+            let b = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
+                &mut conn,
+                epigraph_core::ClaimId::from_uuid(dup),
+                epigraph_core::ClaimId::from_uuid(canonical),
+            )
+            .await;
+            (conn, (a, b))
+        })
+        .await;
+    let e = sup_pre.expect_err("no supersession happened: the migration refuses");
+    assert!(e.to_string().contains("does not supersede"), "{e}");
+    let e = dup_pre.expect_err("no dedup happened: the repair refuses");
+    assert!(e.to_string().contains("not a retired duplicate"), "{e}");
+    assert_eq!(endpoints(&pool, into_old).await.0, old, "nothing moved");
+    assert_eq!(endpoints(&pool, into_dup).await.0, dup, "nothing moved");
+
+    // W's two acts, on the application role.
+    let p = pool.clone();
+    let (new_id, on_app) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        use sqlx::Acquire;
+        stamp(&mut conn, &p, w).await;
+        let new_id = {
+            let mut tx = conn.begin().await.expect("begin");
+            let (n, _) = epigraph_db::ClaimRepository::supersede_act_conn(
+                &mut tx,
+                epigraph_core::ClaimId::from_uuid(old),
+                "W's corrected claim",
+                epigraph_core::TruthValue::clamped(0.6),
+                "a correction",
+            )
+            .await
+            .expect("W supersedes its own claim on the app role");
+            tx.commit().await.expect("commit the act");
+            n
+        };
+        epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("W marks its own duplicate on the app role");
+        // The supersede migration on W's own application session, AFTER the act.
+        let on_app =
+            epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, new_id)
+                .await;
+        (conn, (new_id, on_app))
+    })
+    .await;
+    let e = on_app.expect_err("the supersede migration is not the application role's to run");
+    assert!(e.to_string().contains("privileged"), "{e}");
+    assert_eq!(endpoints(&pool, into_old).await.0, old, "nothing moved");
+
+    // After the acts, a mismatched pair still refuses.
+    let (sup_bad, dup_bad) =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let a =
+                epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, decoy)
+                    .await;
+            let b = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
+                &mut conn,
+                epigraph_core::ClaimId::from_uuid(dup),
+                epigraph_core::ClaimId::from_uuid(decoy),
+            )
+            .await;
+            (conn, (a, b))
+        })
+        .await;
+    assert!(sup_bad.is_err(), "a replacement the claims do not record");
+    assert!(dup_bad.is_err(), "a canonical the claims do not record");
+    assert_eq!(endpoints(&pool, into_old).await.0, old, "nothing moved");
+    assert_eq!(endpoints(&pool, into_dup).await.0, dup, "nothing moved");
+
+    // The matching pairs, on the maintenance connection, repair.
+    let (sup_ok, dup_ok) = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let a = epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, new_id)
+            .await;
+        let b = epigraph_db::ClaimRepository::repair_marked_duplicate_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await;
+        (conn, (a, b))
+    })
+    .await;
+    assert_eq!(
+        sup_ok.expect("the supersession's own migration").retargeted,
+        vec![into_old]
+    );
+    assert_eq!(
+        dup_ok.expect("the dedup's own repair").retargeted_edges,
+        vec![into_dup]
+    );
+    assert_eq!(endpoints(&pool, into_old).await.0, new_id);
+    assert_eq!(endpoints(&pool, into_dup).await.0, canonical);
 }
 
 /// `consolidate_claims` after migration 117: the combined one-transaction form
@@ -2535,4 +2609,53 @@ async fn consolidate_is_an_act_plus_a_maintenance_edge_migration(pool: PgPool) {
         again.migrated.is_empty() && again.retracted.is_empty(),
         "the migration is idempotent: {again:?}"
     );
+}
+
+/// A READER of a group may not dedup its own claim onto that group's
+/// non-public claim (FA04 at the act): the administrative repair would move
+/// the duplicate's derived rows into the group as the group's own. Nothing is
+/// written. The group's writer may.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reader_cannot_dedup_onto_its_groups_private_claim(pool: PgPool) {
+    let (a, g) = fixture::seed_agent_with_group(&pool, "group-writer-a").await;
+    let (r, r_group) = fixture::seed_agent_with_group(&pool, "reader-r").await;
+    add_reader(&pool, g, r).await;
+    let k = fixture::seed_group_claim(&pool, a, g, "G's private canonical").await;
+    let d = seed_public_claim_owned_by(&pool, r, r_group, "R's duplicate").await;
+    let d2 = seed_public_claim_owned_by(&pool, a, g, "A's duplicate").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (by_reader, by_writer) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, r).await;
+        let by_reader = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(d),
+            epigraph_core::ClaimId::from_uuid(k),
+        )
+        .await;
+        stamp(&mut conn, &p, a).await;
+        let by_writer = epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(d2),
+            epigraph_core::ClaimId::from_uuid(k),
+        )
+        .await;
+        (conn, (by_reader, by_writer))
+    })
+    .await;
+    let e = by_reader.expect_err("a reader's dedup onto the group's private claim is refused");
+    assert!(e.to_string().contains("FA04"), "{e}");
+    let (current, sup): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+            .bind(d)
+            .fetch_one(&pool)
+            .await
+            .expect("d");
+    assert_eq!(
+        (current, sup),
+        (true, None),
+        "the refused act wrote nothing"
+    );
+    by_writer.expect("the group's writer dedups onto its own group's claim");
 }
