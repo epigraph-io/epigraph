@@ -569,7 +569,16 @@ Current reservation:
   that runs on the maintenance connection (`epigraph_engine::admin_cascade`),
   committed together with its `cascade.admin_applied` row, or recorded as
   `cascade.deferred` (in the act's transaction) when the process has no usable
-  maintenance DSN; `replay_deferred_cascades` replays those. 115's source-writer
+  maintenance DSN; `replay_deferred_cascades` replays those (fewest failed
+  attempts first; a cascade that keeps failing is held out as stuck until an
+  operator retires it with a `cascade.retired` row). The rows the replay acts
+  on are the server's: a RESTRICTIVE INSERT policy
+  `security_events_cascade_privileged` refuses any `cascade.*` row from a
+  non-privileged session, a deferral is written only by the definer
+  `epigraph_record_cascade_deferral` (attributed to the session principal,
+  and only for an act the session made), and trigger `claims_supersedes_guard`
+  refuses a non-privileged UPDATE pointing `claims.supersedes` at a claim that
+  is neither public nor written by the session. 115's source-writer
   DELETE arm on `edges` is unchanged and recorded in the header as a pending
   decision. Behaviour in
   `epigraph-db/tests/owner_scoped_update.rs`, `owner_scoped_delete.rs` and

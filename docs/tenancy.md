@@ -436,7 +436,23 @@ that binding to a canonical the caller cannot write.
 Every repair re-verifies the committed act and is idempotent, so the
 `replay_deferred_cascades` CLI, run on the maintenance DSN (it refuses the
 fallback to `DATABASE_URL`), replays every deferred or failed cascade with no
-later `cascade.admin_applied` row, naming the original caller and the deferral.
+later `cascade.admin_applied` (or `cascade.retired`) row, naming the original
+caller and the deferral. The window takes cascades with fewer failed attempts
+first; one that has failed `--max-failures` times (default 5) is held out and
+reported as stuck (the CLI exits 2) until an operator retires it with
+`--retire <event id> --reason <text>`.
+
+The replay acts on `security_events` rows, so 117 makes those rows the
+server's: a non-privileged session cannot write any `cascade.*` row itself (a
+RESTRICTIVE INSERT policy), and a request path records its deferral through the
+definer `epigraph_record_cascade_deferral`, which attributes the row to the
+session principal and admits it only for an act that session made (write
+authority over the retired claim and its successor for a supersede; over the
+duplicate, onto a canonical that is public or written by the session, for a
+dedup; over every source for a consolidation; a `stale` candidate for a
+match-candidate retirement, whose table has no tenancy). A non-privileged
+UPDATE may point `claims.supersedes` only at a claim that is public or written
+by the session.
 
 ### The kill switch
 
