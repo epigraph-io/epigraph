@@ -19,7 +19,10 @@
 //! count; dropping the NULL-element refusal fails
 //! `a_null_in_the_attested_set_refuses_and_writes_nothing` (the NULL-safe filter
 //! alone refuses with 55000, not 22004, and with only the refusal reverted AND
-//! the filter written the old way, `ARRAY[NULL]` links).
+//! the filter written the old way, `ARRAY[NULL]` links); dropping the self-loop
+//! exclusion fails
+//! `a_self_loop_on_a_schema_without_the_constraint_is_not_a_lineage_principal`
+//! (the signer then has to attest itself).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -58,10 +61,11 @@ async fn lineage_edge(pool: &PgPool, signer: Uuid, principal: Uuid) {
 
 /// A former shared signer: lineage to the operator and to one more principal.
 ///
-/// A deployed database can also carry the signer's SELF-loop (the
-/// principal-less listener's injected principal IS the signer), written before
-/// `edges_no_self_loop` existed; a database migrated from empty refuses one, so
-/// it is not seeded here. The function excludes it either way.
+/// A database whose `edges` predates `edges_no_self_loop` can also carry the
+/// signer's SELF-loop (the principal-less listener's injected principal IS the
+/// signer); a database migrated from 001 refuses one, so it is not seeded here.
+/// `a_self_loop_on_a_schema_without_the_constraint_is_not_a_lineage_principal`
+/// covers that shape.
 async fn former_signer(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
     let signer = seed_agent(pool).await;
     let operator = seed_agent(pool).await;
@@ -359,4 +363,33 @@ async fn a_null_in_the_attested_set_refuses_and_writes_nothing(pool: PgPool) {
             "{label}: no audit"
         );
     }
+}
+
+/// On a schema WITHOUT `edges_no_self_loop` (one whose `edges` predates it), the
+/// principal-less listener's lineage attempt leaves a `signer -> signer`
+/// OPERATED_BY self-loop. 116 excludes it from the lineage set, so the operator
+/// attests only the OTHER principals, and the audit row's lineage omits the
+/// signer. (Dropping the exclusion would refuse, naming the signer.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_self_loop_on_a_schema_without_the_constraint_is_not_a_lineage_principal(pool: PgPool) {
+    sqlx::query("ALTER TABLE edges DROP CONSTRAINT edges_no_self_loop")
+        .execute(&pool)
+        .await
+        .expect("model the older schema (this throwaway database only)");
+    let (signer, operator, other) = former_signer(&pool).await;
+    lineage_edge(&pool, signer, signer).await;
+
+    let ok = retire_shared(&pool, signer, operator, vec![other])
+        .await
+        .expect("the self-loop is not a principal to attest");
+    assert!(ok.link_created && ok.link_retired);
+    let audits = audits_of(&pool, signer).await;
+    assert_eq!(audits.len(), 1);
+    let mut lineage = vec![operator, other];
+    lineage.sort();
+    assert_eq!(
+        uuids(&audits[0]["lineage_targets"]),
+        lineage,
+        "the signer's self-loop is not in the lineage it was checked against"
+    );
 }

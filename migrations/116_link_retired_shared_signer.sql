@@ -32,10 +32,10 @@
 -- `epigraph_link_retired_shared_signer(agent, operator, attested uuid[])`:
 -- every distinct OPERATED_BY lineage target of `agent`, other than `agent`
 -- itself (the principal-less listener writes a self-loop: its injected
--- principal IS the signer) and other than `operator`, must appear in
--- `attested`. An unattested target refuses the call (55000) and names it. A
--- NULL element in `attested` refuses the call (22004), so it cannot count as
--- attesting anyone.
+-- principal IS the signer; a schema migrated from 001 refuses one, an older
+-- one may hold it) and other than `operator`, must appear in `attested`. An
+-- unattested target refuses the call (55000) and names it. A NULL element in
+-- `attested` refuses the call (22004), so it cannot count as attesting anyone.
 --
 -- That check is a SANITY CHECK, not proof:
 --   * lineage edges exist only since `record_auth_lineage` shipped; callers
