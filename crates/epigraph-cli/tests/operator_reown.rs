@@ -3160,3 +3160,59 @@ async fn link_retired_attest_shared_signer_retires_a_former_shared_signer(pool: 
     .unwrap();
     assert_eq!(memberships, 0, "a retired link creates no membership");
 }
+
+/// `--attest-shared-signer` names the principals of ONE former signer, so an
+/// agents file with more than one id is refused before any call: otherwise the
+/// same attested set would be recorded for every signer in the file. Nothing
+/// is written, for either id, even with `--apply`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_retired_attest_shared_signer_refuses_a_multi_id_agents_file(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let (principal, _) = fixture::seed_agent_with_group(&pool, "attested-principal").await;
+    let mut signers = Vec::new();
+    for name in ["former-signer-a", "former-signer-b"] {
+        let (signer, _) = fixture::seed_agent_with_group(&pool, name).await;
+        for target in [fx.operator, principal] {
+            sqlx::query(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+                 VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+            )
+            .bind(signer)
+            .bind(target)
+            .execute(&pool)
+            .await
+            .expect("auth-lineage edge");
+        }
+        signers.push(signer);
+    }
+    let agents = dir.join("agents.txt");
+    std::fs::write(&agents, format!("{}\n{}\n", signers[0], signers[1])).unwrap();
+    let r = run_op(
+        &pool,
+        &[
+            "link-retired",
+            "--agents-file",
+            agents.to_str().unwrap(),
+            "--operator",
+            &fx.operator.to_string(),
+            "--attest-shared-signer",
+            &principal.to_string(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_ne!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stderr.contains("ONE former shared signer") && r.stderr.contains("2 agent ids"),
+        "{}",
+        r.show()
+    );
+    let links: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM operator_links WHERE agent_id = ANY($1)")
+            .bind(&signers)
+            .fetch_one(&pool)
+            .await
+            .expect("links");
+    assert_eq!(links, 0, "refused before any retire call");
+}

@@ -54,7 +54,7 @@ enum Command {
         /// OPERATED_BY auth-lineage names and whose every write through them
         /// the operator attests is its own (comma-separated; may be empty).
         /// Without this flag each id goes through 107's retire, which refuses
-        /// a shared signer.
+        /// a shared signer. With it, `--agents-file` must list exactly one id.
         #[arg(long, value_delimiter = ',', num_args = 0..)]
         attest_shared_signer: Option<Vec<Uuid>>,
         /// Perform the calls. Without it, every call runs in a transaction that
@@ -163,6 +163,17 @@ async fn main_inner() -> anyhow::Result<i32> {
             let agents = operator::read_ids_file(&agents_file)?;
             if agents.is_empty() {
                 anyhow::bail!("no agent ids in {}", agents_file.display());
+            }
+            // An attestation covers ONE former signer: the principals it names
+            // are the ones THAT signer carried. Applied to several ids, one set
+            // would be recorded as attested for every signer in the file.
+            if attest_shared_signer.is_some() && agents.len() > 1 {
+                anyhow::bail!(
+                    "--attest-shared-signer attests the principals of ONE former shared signer, \
+                     but {} lists {} agent ids; run it once per signer with a one-id file",
+                    agents_file.display(),
+                    agents.len()
+                );
             }
             println!(
                 "link-retired: operator={op} agents={} mode={}{}",
