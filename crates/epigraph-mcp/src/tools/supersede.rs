@@ -5,6 +5,19 @@ use crate::server::EpiGraphMcpFull;
 use crate::types::{MarkDuplicateParams, SupersedeClaimParams};
 use epigraph_core::{ClaimId, TruthValue};
 use epigraph_db::ClaimRepository;
+use epigraph_engine::admin_cascade::{
+    self, CascadeCause, CascadeStatus, CascadeTrigger, OauthPrincipal,
+};
+use epigraph_engine::retraction_cascade::CascadeReport;
+
+/// The OAuth principal behind an authenticated call, for the cascade's audit row.
+pub(crate) fn oauth_principal(auth: Option<&epigraph_auth::AuthContext>) -> Option<OauthPrincipal> {
+    auth.map(|a| OauthPrincipal {
+        client_id: Some(a.client_id),
+        owner_id: a.owner_id,
+        agent_id: a.agent_id,
+    })
+}
 
 pub async fn supersede_claim(
     server: &EpiGraphMcpFull,
@@ -14,9 +27,10 @@ pub async fn supersede_claim(
 ) -> Result<CallToolResult, McpError> {
     let old = parse_uuid(&params.claim_id)?;
     let old_claim_id = ClaimId::from_uuid(old);
+    let author = server.agent_id().await?;
 
     // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT, for the gate read
-    // and the supersession, the same construction as `patch_claim` and
+    // and the supersession's own act, the same construction as `patch_claim` and
     // `update_labels`.
     //
     // This was `get_by_id(&server.pool, ..)` then `supersede(&server.pool, ..)`:
@@ -29,12 +43,8 @@ pub async fn supersede_claim(
     // supersede under ITS OWN stamp rather than the server agent's is the
     // authenticated-MCP stamping question recorded as an R3 blocker in
     // scripts/e2e/README.md, not this conversion's.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(
-        server,
-        server.agent_id().await?,
-        "supersede_claim",
-    )
-    .await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, author, "supersede_claim").await?;
 
     // Per-resource ownership check: only the claim's author or a
     // claims:admin token holder may supersede it. The read is the CALLER's,
@@ -45,8 +55,12 @@ pub async fn supersede_claim(
         .ok_or_else(|| invalid_params(format!("claim {} not found", old)))?;
     crate::tools::claims::require_owner_or_admin(server, auth, existing.agent_id.as_uuid()).await?;
 
+    // THE ACT (migration 117): retire the claim, insert the replacement and the
+    // `supersedes` edge. It does NOT migrate the old claim's other edges: an
+    // incoming edge is its source writer's assertion, and re-pointing another
+    // writer's edge is the administrative cascade's job below.
     let truth = TruthValue::clamped(params.truth_value);
-    let (new_id, old_id) = ClaimRepository::supersede_conn(
+    let (new_id, old_id) = ClaimRepository::supersede_act_conn(
         &mut tx,
         old_claim_id,
         &params.content,
@@ -55,50 +69,94 @@ pub async fn supersede_claim(
     )
     .await
     .map_err(internal_error)?;
+
+    let trigger = CascadeTrigger {
+        cause: CascadeCause::Supersede,
+        agent_id: Some(author),
+        oauth: oauth_principal(auth),
+        subject_id: old_id,
+        object_id: Some(new_id),
+    };
+    // No administrative connection: the deferral is recorded in the act's own
+    // transaction, attributed to the principal it is stamped with, so the act
+    // and its audit row commit together (or neither does).
+    let deferred = if crate::maintenance::admin_cascade_configured(server) {
+        None
+    } else {
+        Some(
+            admin_cascade::record_deferral(
+                &mut *tx,
+                &trigger,
+                admin_cascade::REASON_NOT_CONFIGURED,
+            )
+            .await
+            .map_err(internal_error)?,
+        )
+    };
     tx.commit().await.map_err(internal_error)?;
 
-    // Retraction cascade (backlog 20e9ed83): the supporters this claim was
-    // feeding hold BBAs frozen from ITS interval at wire time, so without an
-    // explicit invalidation pass they keep believing a retracted claim
-    // forever. Best-effort by construction — the supersede transaction has
-    // already committed, and failing the call here would hand the caller an
-    // error for a write that succeeded (the retry then hits "already been
-    // superseded"). Enumerated from the REPLACEMENT id: supersede re-points
-    // outgoing edges onto it inside the transaction.
-    //
-    // Reported rather than silent so a caller reading a downstream claim
-    // straight after this call can see exactly what was repaired.
-    //
-    // STILL UNSTAMPED, and named rather than quietly converted. The cascade walks
-    // DOWNSTREAM claims, whose owner groups are arbitrary — it re-derives belief on
-    // whatever supported the retracted claim — so there is no single viewer whose
-    // writable set covers its target population, and stamping it from
-    // `server.agent_id()` would convert "refused for some rows" into "refused for
-    // some rows while looking converted". Which authority a retraction cascade
-    // carries across group boundaries is a tenancy-model decision, not a
-    // mechanical conversion; `crates/epigraph-mcp/tests/residual_unstamped_writes.rs`
-    // keeps both cascade sites in the residual register. The acquire below is a
-    // mechanical consequence of the engine signature change: it moves the whole
-    // cascade onto ONE connection instead of a checkout per statement, which is a
-    // coherence improvement and NOT a tenancy stamp.
-    let mut cascade_conn = server.pool.acquire().await.map_err(internal_error)?;
-    let cascade = epigraph_engine::retraction_cascade::cascade_after_supersede(
-        &mut cascade_conn,
-        viewer,
-        new_id,
-    )
-    .await;
-    drop(cascade_conn);
+    // THE CASCADE (backlog 20e9ed83; migration 117): migrate the retired
+    // claim's edges onto the replacement, then invalidate the BBAs its
+    // supporters froze from ITS interval and re-derive them. It runs with
+    // ADMINISTRATIVE authority, on the server's maintenance connection and its
+    // bypass viewer, because the edges and BBAs it rewrites belong to other
+    // writers; it writes one `security_events` row naming this caller.
+    // Best-effort by construction: the act has committed, and failing the call
+    // here would hand the caller an error for a write that succeeded (the retry
+    // then hits "already been superseded"). Reported, so a caller reading a
+    // downstream claim straight after this call can see what was repaired.
+    let (cascade, belief_cascade) = match deferred {
+        Some(status) => (status, CascadeReport::default()),
+        None => match crate::maintenance::admin_cascade_session(server).await {
+            Ok(mut session) => {
+                let (conn, v) = session.split();
+                admin_cascade::apply_after_supersede(conn, v, &trigger, old_id, new_id).await
+            }
+            Err(reason) => (
+                record_deferral_after_commit(server, &trigger, &reason).await,
+                CascadeReport::default(),
+            ),
+        },
+    };
 
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "new_claim_id": new_id,
             "superseded_claim_id": old_id,
             "reason": params.reason,
-            "belief_cascade": cascade,
+            "cascade": cascade,
+            "belief_cascade": belief_cascade,
         }))
         .map_err(internal_error)?,
     )]))
+}
+
+/// Record a deferral AFTER the act committed (the administrative connection was
+/// configured but could not be used). Best-effort: the act has committed, so a
+/// failure to write the row is reported in the result rather than raised.
+pub(crate) async fn record_deferral_after_commit(
+    server: &EpiGraphMcpFull,
+    trigger: &CascadeTrigger,
+    reason: &str,
+) -> CascadeStatus {
+    let author = match trigger.agent_id {
+        Some(a) => a,
+        None => {
+            return CascadeStatus::deferred_unaudited(reason, "no principal to attribute it to")
+        }
+    };
+    match crate::claim_helper::begin_author_stamped_tx(server, author, "admin_cascade_deferral")
+        .await
+    {
+        Ok(mut tx) => match admin_cascade::record_deferral(&mut *tx, trigger, reason).await {
+            Ok(status) => match tx.commit().await {
+                Ok(()) => status,
+                Err(e) => CascadeStatus::deferred_unaudited(reason, e),
+            },
+            Err(e) => CascadeStatus::deferred_unaudited(reason, e),
+        },
+        Err(e) => CascadeStatus::deferred_unaudited(reason, e.message),
+    }
 }
 
 pub async fn mark_duplicate(
@@ -110,63 +168,72 @@ pub async fn mark_duplicate(
     let dup = parse_uuid(&params.claim_id)?;
     let canon = parse_uuid(&params.canonical_id)?;
     let dup_claim_id = ClaimId::from_uuid(dup);
+    let author = server.agent_id().await?;
+
+    // THE ACT, on ONE transaction STAMPED FROM THE MCP SERVER'S OWN AGENT, the
+    // same authority `supersede_claim` above writes with: the ownership read,
+    // then marking the duplicate. On an unstamped connection the duplicate's
+    // `claims` row is refused by `claims_tenancy` on the application role, so
+    // the tool could not dedup even the server agent's own claim. A duplicate
+    // in a group the stamp cannot write is refused and nothing commits.
+    // `begin_as` stamps a transaction in either GUC mode, so there is no
+    // transaction-mode-pooler fallback any more.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, author, "mark_duplicate").await?;
 
     // Per-resource ownership check: only the duplicate claim's author or a
     // claims:admin token holder may mark it as a duplicate.
-    let dup_claim = ClaimRepository::get_by_id(&server.pool, viewer, dup_claim_id)
+    let dup_claim = ClaimRepository::get_by_id(&mut *tx, viewer, dup_claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {} not found", dup)))?;
     crate::tools::claims::require_owner_or_admin(server, auth, dup_claim.agent_id.as_uuid())
         .await?;
 
-    // Dedup repairs the derived-record layer inside its own transaction
-    // (orphaned + stranded edge-factor BBAs) and hands back what still has to
-    // be re-derived through the DS pipeline. Same best-effort contract as
-    // supersede: the dedup's own failure is an error, the cascade's is not.
-    //
-    // STAMPED FROM THE MCP SERVER'S OWN AGENT when the pool can carry a
-    // session stamp, the same authority `supersede_claim` above writes with.
-    // On an unstamped connection the dedup's first write (the duplicate's
-    // `claims` row) is refused by `claims_tenancy` on the application role, so
-    // the tool could not dedup even the server agent's own claim. The stamp is
-    // on a CONNECTION, not a transaction: the dedup opens its own transaction,
-    // and the cascade that follows is best-effort per statement, which one
-    // enclosing transaction would turn into all-or-nothing. Rows the stamp
-    // cannot write (another group's) are refused and reported in the cascade's
-    // `errors`, never silently skipped (migration 115's CD02).
-    //
-    // Behind a transaction-mode pooler a session stamp does not survive, so
-    // that deployment keeps the unstamped connection it always used.
-    let session_mode = server
-        .scoped
-        .as_ref()
-        .is_some_and(|s| s.mode() == epigraph_db::SessionGucMode::Session);
-    let cascade = if session_mode {
-        let mut cascade_conn = crate::claim_helper::acquire_author_stamped_conn(
-            server,
-            server.agent_id().await?,
-            "mark_duplicate",
-        )
-        .await?;
-        epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-            &mut cascade_conn,
-            viewer,
-            dup_claim_id.into(),
-            canon,
-        )
+    ClaimRepository::mark_duplicate_act_conn(&mut tx, dup_claim_id, ClaimId::from_uuid(canon))
         .await
-        .map_err(internal_error)?
+        .map_err(internal_error)?;
+
+    let trigger = CascadeTrigger {
+        cause: CascadeCause::Dedup,
+        agent_id: Some(author),
+        oauth: oauth_principal(auth),
+        subject_id: dup,
+        object_id: Some(canon),
+    };
+    let deferred = if crate::maintenance::admin_cascade_configured(server) {
+        None
     } else {
-        let mut cascade_conn = server.pool.acquire().await.map_err(internal_error)?;
-        epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-            &mut cascade_conn,
-            viewer,
-            dup_claim_id.into(),
-            canon,
+        Some(
+            admin_cascade::record_deferral(
+                &mut *tx,
+                &trigger,
+                admin_cascade::REASON_NOT_CONFIGURED,
+            )
+            .await
+            .map_err(internal_error)?,
         )
-        .await
-        .map_err(internal_error)?
+    };
+    tx.commit().await.map_err(internal_error)?;
+
+    // THE CASCADE (migration 117), with administrative authority on the
+    // maintenance connection: retract the duplicate's colliding edges and drop
+    // their BBAs, re-point every other edge onto the canonical, move the BBAs
+    // that follow them, and re-derive what changed. Same best-effort contract
+    // as supersede: the act's own failure is an error, the cascade's is
+    // reported.
+    let (cascade, belief_cascade) = match deferred {
+        Some(status) => (status, CascadeReport::default()),
+        None => match crate::maintenance::admin_cascade_session(server).await {
+            Ok(mut session) => {
+                let (conn, v) = session.split();
+                admin_cascade::apply_after_dedup(conn, v, &trigger, dup, canon).await
+            }
+            Err(reason) => (
+                record_deferral_after_commit(server, &trigger, &reason).await,
+                CascadeReport::default(),
+            ),
+        },
     };
 
     Ok(CallToolResult::success(vec![Content::text(
@@ -174,7 +241,8 @@ pub async fn mark_duplicate(
             "duplicate_id": dup,
             "canonical_id": canon,
             "mode": "mark_duplicate",
-            "belief_cascade": cascade,
+            "cascade": cascade,
+            "belief_cascade": belief_cascade,
         }))
         .map_err(internal_error)?,
     )]))

@@ -10,7 +10,12 @@ async fn mark_duplicate_marks_dup_only(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let canonical = seed_claim(&pool, "canonical", 0.5).await;
     let dup = seed_claim(&pool, "duplicate", 0.5).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
     let auth = admin_auth();
 
     epigraph_mcp::tools::supersede::mark_duplicate(

@@ -567,66 +567,199 @@ async fn submit_ds_evidence_on_a_writer_frame_reports_an_unwritten_cache(pool: P
     );
 }
 
-/// W14, closed: the mark_duplicate TOOL dedups on a connection stamped from the
-/// server agent (the authority `supersede_claim` writes with), so on the
-/// application role the agent's own duplicate of a WORLD canonical lands. It
-/// was refused at its first write while the tool ran on the unstamped pool.
+/// Migration 117 (batch W10), the dedup on the APPLICATION ROLE, driven through
+/// the real tool by a caller that is NOT an admin: the duplicate's own writer
+/// (a `claims:write` token whose owner is the server agent).
 ///
-/// The duplicate's outgoing edge collides with the canonical's, so the dedup
-/// retracts it and drops its edge-keyed BBA -- a row owned by a memberless
-/// group, which the agent does not own. Migration 115 makes DELETE owner-scoped, so that drop lands only
-/// through the audited cascade definer: the `security_events` row names the
-/// server agent and the `retracted_edge` arm.
+/// The ACT -- marking the agent's own duplicate of a WORLD canonical -- runs on
+/// the transaction stamped from the server agent. The CASCADE runs on the
+/// server's maintenance connection and reaches rows the agent does not own:
+/// the duplicate's outgoing edge collides with the canonical's, so it is
+/// retracted and its edge-keyed BBA (owned by a memberless group) dropped; and
+/// ANOTHER writer's edge into the duplicate is re-pointed onto the canonical.
+/// One `security_events` row names the caller -- the stamped agent, and the
+/// OAuth owner -- the cause and what it touched.
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(pool: PgPool) {
-    let (server, agent, group, viewer) = app_role_server(&pool).await;
-    let dup = Uuid::new_v4();
-    let hash: Vec<u8> = dup.as_bytes().iter().copied().cycle().take(32).collect();
+    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let f = dedup_fixture(&pool, agent, group).await;
+
+    let r = epigraph_mcp::tools::supersede::mark_duplicate(
+        &server,
+        &viewer,
+        epigraph_mcp::types::MarkDuplicateParams {
+            claim_id: f.dup.to_string(),
+            canonical_id: f.canonical.to_string(),
+            reason: None,
+        },
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("the stamped dedup lands on the app role");
+    let body = first_text(&r);
+    assert_eq!(body["mode"], "mark_duplicate", "{body}");
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    let (current, supersedes): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+            .bind(f.dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup");
+    assert!(!current, "the duplicate is retired");
+    assert_eq!(supersedes, Some(f.canonical));
+    let gone: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM mass_functions WHERE id = $1)")
+            .bind(f.bba)
+            .fetch_one(&pool)
+            .await
+            .expect("bba");
+    assert!(
+        gone,
+        "the retracted collision edge's BBA, which the agent does not own, was dropped"
+    );
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(f.other_writers_edge)
+        .fetch_one(&pool)
+        .await
+        .expect("other writer's edge");
+    assert_eq!(
+        target, f.canonical,
+        "another writer's edge into the duplicate now points at the canonical"
+    );
+
+    let event_id: Uuid = body["cascade"]["audit_event_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("the applied cascade carries its audit row id");
+    let (et, who, details): (String, Option<Uuid>, serde_json::Value) = sqlx::query_as(
+        "SELECT event_type::text, agent_id, details FROM security_events WHERE id = $1",
+    )
+    .bind(event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the cascade's audit row");
+    assert_eq!(et, "cascade.admin_applied");
+    assert_eq!(who, Some(agent), "attributed to the caller's stamped agent");
+    assert_eq!(details["cause"], "dedup");
+    assert_eq!(
+        details["trigger"]["oauth"]["owner_id"],
+        serde_json::json!(agent),
+        "and to the OAuth principal behind the call: {details}"
+    );
+    assert_eq!(
+        details["touched"]["edges_retracted"],
+        serde_json::json!([f.dup_edge]),
+        "{details}"
+    );
+    assert!(
+        details["touched"]["edges_retargeted"]
+            .as_array()
+            .is_some_and(|a| a.contains(&serde_json::json!(f.other_writers_edge))),
+        "{details}"
+    );
+    let definer_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'derived.cascade_bba_delete'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("definer audit");
+    assert_eq!(
+        definer_rows, 0,
+        "the cascade never took the non-privileged definer path"
+    );
+}
+
+// ===========================================================================
+// Migration 117 (batch W10): the retraction cascade is an administrative act.
+// ===========================================================================
+
+/// [`app_role_server`] whose `ScopedPool` also carries a MAINTENANCE pool: a
+/// second downgraded pool whose sessions are `epigraph_maintenance`, the shape
+/// `main` attaches for an explicitly configured `MAINTENANCE_DATABASE_URL`.
+async fn app_role_server_with_admin(pool: &PgPool) -> (EpiGraphMcpFull, Uuid, Uuid, Viewer) {
+    let url = fixture::database_url_for(pool).await;
+    let maintenance = fixture::downgraded_pool(pool, "epigraph_maintenance").await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool")
+            .with_maintenance_pool(maintenance);
+    let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let server = build_scoped_test_server(plain, scoped);
+    let agent = server.server_agent_id().await.expect("server agent");
+    let group = personal_group_of(pool, agent).await;
+    let viewer = Viewer::resolve(pool, agent).await.expect("viewer");
+    (server, agent, group, viewer)
+}
+
+/// A caller that is NOT an admin: a `claims:write` token issued to `owner`.
+fn non_admin_owner(owner: Uuid) -> epigraph_auth::AuthContext {
+    epigraph_auth::AuthContext {
+        client_id: Uuid::new_v4(),
+        agent_id: None,
+        owner_id: Some(owner),
+        client_type: epigraph_auth::ClientType::Service,
+        scopes: vec!["claims:write".to_string()],
+        jti: Uuid::new_v4(),
+    }
+}
+
+/// A public claim owned by `group`, authored by `agent`.
+async fn public_claim_of(pool: &PgPool, agent: Uuid, group: Uuid, content: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
                              visibility, owner_group_id) \
-         VALUES ($1, 'my duplicate', $2, 0.5, $3, true, 'public', $4)",
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
     )
-    .bind(dup)
+    .bind(id)
+    .bind(content)
     .bind(&hash)
     .bind(agent)
     .bind(group)
-    .execute(&pool)
+    .execute(pool)
     .await
-    .expect("a public duplicate owned by the agent's group");
-    let canonical = seed_claim(&pool, "a world canonical", 0.5).await;
-    let third = seed_claim(&pool, "a world third claim", 0.5).await;
-    let bt = binary_truth(&pool).await;
-    let mut edges = Vec::new();
-    for source in [dup, canonical] {
-        let e = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, \
-                                relationship) VALUES ($1, $2, 'claim', $3, 'claim', 'supports')",
-        )
-        .bind(e)
-        .bind(source)
-        .bind(third)
-        .execute(&pool)
-        .await
-        .expect("edge");
-        edges.push(e);
-    }
-    let dup_edge = edges[0];
+    .expect("a public claim owned by a group");
+    id
+}
+
+async fn edge_between(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
+    let e = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, 'claim', $3, 'claim', 'supports')",
+    )
+    .bind(e)
+    .bind(source)
+    .bind(target)
+    .execute(pool)
+    .await
+    .expect("edge");
     sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
-        .bind(dup_edge)
-        .bind(format!("edge {dup_edge}"))
-        .execute(&pool)
+        .bind(e)
+        .bind(format!("edge {e}"))
+        .execute(pool)
         .await
         .expect("edge perspective");
-    // Written by the (privileged) harness: claim-owned, i.e. owned by the
-    // memberless group the seeded claim landed in.
-    let bba = epigraph_db::MassFunctionRepository::store_with_perspective(
-        &pool,
-        third,
-        bt,
-        Some(agent),
-        Some(dup_edge),
+    e
+}
+
+/// An edge-keyed BBA written by the (privileged) harness: claim-owned, i.e.
+/// owned by whatever group the target claim is -- never the agent's.
+async fn harness_edge_bba(
+    pool: &PgPool,
+    target: Uuid,
+    frame: Uuid,
+    source_agent: Uuid,
+    edge: Uuid,
+) -> Uuid {
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        pool,
+        target,
+        frame,
+        Some(source_agent),
+        Some(edge),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("test"),
@@ -636,55 +769,287 @@ async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(
         None,
     )
     .await
-    .expect("world-owned edge BBA");
-    let bba_owner = tenancy(&pool, "mass_functions", bba).await.0;
-    assert_eq!(bba_owner, memberless_owner(&pool, third).await);
+    .expect("edge BBA")
+}
+
+struct DedupFixture {
+    dup: Uuid,
+    canonical: Uuid,
+    dup_edge: Uuid,
+    bba: Uuid,
+    other_writers_edge: Uuid,
+}
+
+/// The agent's public duplicate of a WORLD canonical. `dup -> third` collides
+/// with `canonical -> third` and carries a BBA the agent does not own; another
+/// writer X's public claim points INTO the duplicate.
+async fn dedup_fixture(pool: &PgPool, agent: Uuid, group: Uuid) -> DedupFixture {
+    let dup = public_claim_of(pool, agent, group, "my duplicate").await;
+    let canonical = seed_claim(pool, "a world canonical", 0.5).await;
+    let third = seed_claim(pool, "a world third claim", 0.5).await;
+    let (x, x_group) = fixture::seed_agent_with_group(pool, "writer-x").await;
+    let xc = public_claim_of(pool, x, x_group, "X's claim about the duplicate").await;
+    let bt = binary_truth(pool).await;
+    let dup_edge = edge_between(pool, dup, third).await;
+    let _canon_edge = edge_between(pool, canonical, third).await;
+    let other_writers_edge = edge_between(pool, xc, dup).await;
+    let bba = harness_edge_bba(pool, third, bt, agent, dup_edge).await;
+    let bba_owner = tenancy(pool, "mass_functions", bba).await.0;
+    assert_eq!(bba_owner, memberless_owner(pool, third).await);
+    DedupFixture {
+        dup,
+        canonical,
+        dup_edge,
+        bba,
+        other_writers_edge,
+    }
+}
+
+/// The same dedup on a server with NO administrative connection: the act
+/// commits (the duplicate is retired), the cascade is reported deferred with
+/// a `security_events` row naming the caller, and nothing the agent does not
+/// own was touched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_without_an_admin_connection_commits_the_act_and_defers(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    let f = dedup_fixture(&pool, agent, group).await;
 
     let r = epigraph_mcp::tools::supersede::mark_duplicate(
         &server,
         &viewer,
         epigraph_mcp::types::MarkDuplicateParams {
-            claim_id: dup.to_string(),
-            canonical_id: canonical.to_string(),
+            claim_id: f.dup.to_string(),
+            canonical_id: f.canonical.to_string(),
             reason: None,
         },
-        None,
+        Some(&non_admin_owner(agent)),
     )
     .await
-    .expect("the stamped dedup lands on the app role");
+    .expect("the act commits");
     let body = first_text(&r);
-    assert_eq!(body["mode"], "mark_duplicate", "{body}");
-    let (current, supersedes): (bool, Option<Uuid>) =
-        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
-            .bind(dup)
-            .fetch_one(&pool)
-            .await
-            .expect("dup");
-    assert!(!current, "the duplicate is retired");
-    assert_eq!(supersedes, Some(canonical));
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(f.dup)
+        .fetch_one(&pool)
+        .await
+        .expect("dup");
+    assert!(!current, "the act committed");
+    let (bba_left, still_on_dup): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM mass_functions WHERE id = $1), \
+                (SELECT target_id = $3 FROM edges WHERE id = $2)",
+    )
+    .bind(f.bba)
+    .bind(f.other_writers_edge)
+    .bind(f.dup)
+    .fetch_one(&pool)
+    .await
+    .expect("state");
+    assert!(
+        bba_left && still_on_dup,
+        "the deferred cascade touched nothing"
+    );
+    let event_id: Uuid = body["cascade"]["audit_event_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("the deferral carries its audit row id");
+    let (et, who, cause): (String, Option<Uuid>, String) = sqlx::query_as(
+        "SELECT event_type::text, agent_id, details->>'cause' FROM security_events WHERE id = $1",
+    )
+    .bind(event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the deferral row");
+    assert_eq!(
+        (et.as_str(), who, cause.as_str()),
+        ("cascade.deferred", Some(agent), "dedup")
+    );
+}
+
+struct SupersedeFixture {
+    old: Uuid,
+    incoming: Uuid,
+    outgoing: Uuid,
+    bba: Uuid,
+}
+
+/// The agent's own public claim S; another writer X's public claim points INTO
+/// it; S supports a WORLD claim T, whose edge-keyed BBA (frozen from S's
+/// interval, owned by T's memberless group) the agent does not own.
+async fn supersede_fixture(pool: &PgPool, agent: Uuid, group: Uuid) -> SupersedeFixture {
+    let old = public_claim_of(pool, agent, group, "my claim, about to be corrected").await;
+    let (x, x_group) = fixture::seed_agent_with_group(pool, "writer-x").await;
+    let xc = public_claim_of(pool, x, x_group, "X's claim that cites mine").await;
+    let t = seed_claim(pool, "a world claim my claim supports", 0.5).await;
+    let bt = binary_truth(pool).await;
+    let incoming = edge_between(pool, xc, old).await;
+    let outgoing = edge_between(pool, old, t).await;
+    let bba = harness_edge_bba(pool, t, bt, agent, outgoing).await;
+    assert_eq!(
+        tenancy(pool, "mass_functions", bba).await.0,
+        memberless_owner(pool, t).await
+    );
+    SupersedeFixture {
+        old,
+        incoming,
+        outgoing,
+        bba,
+    }
+}
+
+/// Migration 117, the supersede on the APPLICATION ROLE by a caller that is not
+/// an admin (the claim's own writer). The act -- retire the claim, insert the
+/// replacement -- runs on the stamped transaction; the cascade runs on the
+/// maintenance connection: ANOTHER writer's incoming edge and the claim's
+/// outgoing edge move onto the replacement, and the BBA frozen from the old
+/// claim's interval (a row the agent does not own) is invalidated. One
+/// `security_events` row names the caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_tool_on_the_app_role_runs_its_cascade_with_admin_authority(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let f = supersede_fixture(&pool, agent, group).await;
+
+    let r = epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &viewer,
+        epigraph_mcp::types::SupersedeClaimParams {
+            claim_id: f.old.to_string(),
+            content: "my claim, corrected".to_string(),
+            truth_value: 0.6,
+            reason: "a correction".to_string(),
+        },
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("the owner's supersede lands on the app role");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    let new_id: Uuid = body["new_claim_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("new id");
+    let (inc_target, out_source): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT (SELECT target_id FROM edges WHERE id = $1), \
+                (SELECT source_id FROM edges WHERE id = $2)",
+    )
+    .bind(f.incoming)
+    .bind(f.outgoing)
+    .fetch_one(&pool)
+    .await
+    .expect("edges");
+    assert_eq!(
+        (inc_target, out_source),
+        (new_id, new_id),
+        "another writer's edge and the claim's own edge moved onto the replacement"
+    );
     let gone: bool =
         sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM mass_functions WHERE id = $1)")
-            .bind(bba)
+            .bind(f.bba)
             .fetch_one(&pool)
             .await
             .expect("bba");
     assert!(
         gone,
-        "the retracted collision edge's BBA, which the agent does not own, was dropped"
+        "the BBA frozen from the retired claim was invalidated"
     );
-    let audit: Vec<(Option<Uuid>, String, serde_json::Value)> = sqlx::query_as(
-        "SELECT agent_id, details->>'cause', details->'arms' FROM security_events \
-          WHERE event_type = 'derived.cascade_bba_delete'",
+    assert!(
+        body["belief_cascade"]["invalidated_bbas"].as_u64() >= Some(1),
+        "{body}"
+    );
+
+    let event_id: Uuid = body["cascade"]["audit_event_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("audit row id");
+    let (et, who, details): (String, Option<Uuid>, serde_json::Value) = sqlx::query_as(
+        "SELECT event_type::text, agent_id, details FROM security_events WHERE id = $1",
     )
-    .fetch_all(&pool)
+    .bind(event_id)
+    .fetch_one(&pool)
     .await
-    .expect("audit");
-    assert_eq!(audit.len(), 1, "{audit:?}");
+    .expect("the cascade's audit row");
+    assert_eq!(et, "cascade.admin_applied");
+    assert_eq!(who, Some(agent));
+    assert_eq!(details["cause"], "supersede");
+    assert_eq!(details["trigger"]["subject_id"], serde_json::json!(f.old));
+    assert_eq!(details["trigger"]["object_id"], serde_json::json!(new_id));
     assert_eq!(
-        audit[0].0,
-        Some(agent),
-        "attributed to the stamped server agent"
+        details["trigger"]["oauth"]["owner_id"],
+        serde_json::json!(agent)
     );
-    assert_eq!(audit[0].1, "dedup_retracted_edge");
-    assert_eq!(audit[0].2["retracted_edge"], 1, "{:?}", audit[0].2);
+    assert_eq!(
+        details["touched"]["edges_retargeted"],
+        serde_json::json!([f.incoming]),
+        "{details}"
+    );
+}
+
+/// The same supersede with NO administrative connection: the act commits (the
+/// claim is retired, its replacement exists), the edges stay where they were,
+/// the BBA is untouched, and the deferral is recorded under the caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_without_an_admin_connection_commits_the_act_and_defers(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    let f = supersede_fixture(&pool, agent, group).await;
+
+    let r = epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &viewer,
+        epigraph_mcp::types::SupersedeClaimParams {
+            claim_id: f.old.to_string(),
+            content: "my claim, corrected".to_string(),
+            truth_value: 0.6,
+            reason: "a correction".to_string(),
+        },
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("the act commits");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let new_id: Uuid = body["new_claim_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("new id");
+    let (old_current, new_sup): (bool, Option<Uuid>) = sqlx::query_as(
+        "SELECT (SELECT is_current FROM claims WHERE id = $1), \
+                (SELECT supersedes FROM claims WHERE id = $2)",
+    )
+    .bind(f.old)
+    .bind(new_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claims");
+    assert_eq!(
+        (old_current, new_sup),
+        (false, Some(f.old)),
+        "the act committed"
+    );
+    let (inc_target, bba_left): (Uuid, bool) = sqlx::query_as(
+        "SELECT (SELECT target_id FROM edges WHERE id = $1), \
+                EXISTS (SELECT 1 FROM mass_functions WHERE id = $2)",
+    )
+    .bind(f.incoming)
+    .bind(f.bba)
+    .fetch_one(&pool)
+    .await
+    .expect("state");
+    assert_eq!(inc_target, f.old, "the deferred cascade moved no edge");
+    assert!(bba_left, "and invalidated nothing");
+    let event_id: Uuid = body["cascade"]["audit_event_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("the deferral carries its audit row id");
+    let (et, who, cause, reason): (String, Option<Uuid>, String, String) = sqlx::query_as(
+        "SELECT event_type::text, agent_id, details->>'cause', details->>'reason' \
+           FROM security_events WHERE id = $1",
+    )
+    .bind(event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the deferral row");
+    assert_eq!(
+        (et.as_str(), who, cause.as_str()),
+        ("cascade.deferred", Some(agent), "supersede")
+    );
+    assert!(reason.contains("MAINTENANCE_DATABASE_URL"), "{reason}");
 }

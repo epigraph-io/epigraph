@@ -1944,13 +1944,15 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
+        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. The flip is the caller's act; the edge retraction and derived-row deletes run as the server's administrative cascade on its maintenance connection and are audited (the result's `cascade` says applied, deferred or failed). Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
     )]
     async fn retire_match_candidate(
         &self,
         Parameters(params): Parameters<RetireMatchCandidateParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::matching::retire_match_candidate(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        tools::matching::retire_match_candidate(self, params, auth).await
     }
 
     // ── Meta (1 tool) ──

@@ -181,6 +181,57 @@ pub(crate) async fn maintenance_viewer(
     Ok(session)
 }
 
+/// Whether this server can run the ADMINISTRATIVE CASCADE (migration 117) at
+/// all: a privileged maintenance pool is attached, which `main` does only for an
+/// explicitly configured `MAINTENANCE_DATABASE_URL` whose role bypasses RLS
+/// ([`may_attach_maintenance_pool`]). Never the application DSN.
+///
+/// A request path asks this BEFORE committing the caller's act, so that a
+/// server that cannot run the cascade records the deferral in the act's own
+/// transaction.
+#[must_use]
+pub(crate) fn admin_cascade_configured(server: &EpiGraphMcpFull) -> bool {
+    server
+        .scoped
+        .as_ref()
+        .is_some_and(epigraph_db::ScopedPool::has_maintenance_pool)
+}
+
+/// The maintenance session the administrative cascade that follows a
+/// supersede, a dedup or a match-candidate retirement runs on (migration 117,
+/// batch W10).
+///
+/// # Why a request path may reach the bypass here
+///
+/// Not to read content on the caller's behalf, which is the abuse this module's
+/// header names. The caller's own act has already committed on its own stamped
+/// transaction; what remains is re-pointing and invalidating rows OTHER writers
+/// own, which the operator decided is an administrative function (it runs
+/// with the server's authority, not the caller's, and writes a
+/// `security_events` row naming the caller). The session comes from the same
+/// mint and the same two refusals as [`maintenance_viewer`], with
+/// `SystemReason::BeliefRecomputation`: the cascade is belief invalidation and
+/// re-derivation, and the reason set only shrinks.
+///
+/// # Errors
+/// A human-readable reason the cascade is deferred.
+pub(crate) async fn admin_cascade_session(
+    server: &EpiGraphMcpFull,
+) -> Result<MaintenanceSession<'_>, String> {
+    if !admin_cascade_configured(server) {
+        return Err(epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED.to_string());
+    }
+    maintenance_viewer(server, SystemReason::BeliefRecomputation)
+        .await
+        .map_err(|e| {
+            format!(
+                "the administrative (maintenance) connection could not be used, so the \
+                 cascade is deferred: {}",
+                e.message
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

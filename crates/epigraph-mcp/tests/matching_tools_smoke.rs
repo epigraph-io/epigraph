@@ -18,10 +18,31 @@ use sqlx::types::Json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// A server whose ScopedPool carries a privileged maintenance pool (the
+/// harness superuser pool), so the retirement's administrative cascade
+/// (migration 117) runs, as it does on a server configured with
+/// `MAINTENANCE_DATABASE_URL`.
 async fn build_server(pool: PgPool, read_only: bool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool)
+        .await
+        .with_maintenance_pool(pool.clone());
+    build_server_with(pool, read_only, scoped)
+}
+
+/// A server with NO maintenance pool: its cascades defer.
+async fn build_server_without_admin(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool).await;
+    build_server_with(pool, false, scoped)
+}
+
+fn build_server_with(
+    pool: PgPool,
+    read_only: bool,
+    scoped: epigraph_db::ScopedPool,
+) -> EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&[0x19u8; 32]).expect("signer");
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, read_only)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, read_only).with_scoped_pool(scoped)
 }
 
 async fn insert_claim(pool: &PgPool, agent: Uuid) -> Uuid {
@@ -585,11 +606,14 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
+        None,
     )
     .await
     .expect("retire");
     let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
     assert_eq!(body["candidate"]["status"], "stale");
+    assert_eq!(body["previous_status"], "promoted");
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
     assert_eq!(body["retirement"]["previous_status"], "promoted");
     assert_eq!(body["retirement"]["edges_retracted"], 1);
     assert_eq!(body["retirement"]["factors_deleted"], 1);
@@ -652,6 +676,7 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
+        None,
     )
     .await
     .expect_err("retire must be refused in read-only mode");
@@ -773,6 +798,7 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
+        None,
     )
     .await
     .expect("retire");
@@ -982,5 +1008,63 @@ async fn find_cross_source_matches_omits_sweep_coverage_for_an_invisible_claim(p
         json["candidates"],
         serde_json::json!([]),
         "the pre-existing non-leaking shape is preserved: {json}"
+    );
+}
+
+/// Migration 117: with NO administrative connection the retirement's act still
+/// commits (the candidate is `stale`), the cascade is reported deferred -- the
+/// matcher edge stays in force -- and a `security_events` row records the
+/// deferral under the acting agent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_without_an_admin_connection_commits_the_act_and_defers_the_cascade(pool: PgPool) {
+    let server = build_server_without_admin(pool.clone()).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    tools::matching::decide_match_candidate(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect("promote");
+
+    let out = tools::matching::retire_match_candidate(
+        &server,
+        RetireMatchCandidateParams {
+            candidate_id: cand.to_string(),
+        },
+        None,
+    )
+    .await
+    .expect("the act commits");
+    let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
+    assert_eq!(body["candidate"]["status"], "stale");
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let event = body["cascade"]["audit_event_id"]
+        .as_str()
+        .expect("a deferral carries its audit row id")
+        .to_string();
+    assert_eq!(
+        edge_relationships(&pool, a, b).await,
+        vec!["CORROBORATES".to_string()],
+        "the deferred cascade retracted nothing"
+    );
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let (et, who, cause): (String, Option<Uuid>, String) = sqlx::query_as(
+        "SELECT event_type::text, agent_id, details->>'cause' FROM security_events \
+          WHERE id = $1::uuid",
+    )
+    .bind(&event)
+    .fetch_one(&pool)
+    .await
+    .expect("the deferral row");
+    assert_eq!(
+        (et.as_str(), who, cause.as_str()),
+        ("cascade.deferred", Some(server_agent), "match_retire")
     );
 }

@@ -190,29 +190,11 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "tools/perspectives.rs",
         "PerspectiveRepository::set_source_reliability",
         1,
-        "`set_source_reliability`. Same registry table as above; an UPDATE rather than an INSERT, \
-         and the static arm covers it for the same reason.",
-    ),
-    (
-        "tools/supersede.rs",
-        "server.pool.acquire",
-        2,
-        "`supersede_claim`'s retraction cascade, and `mark_duplicate`'s FALLBACK acquire. \
-         `mark_duplicate` now dedups and cascades on a connection stamped from the server agent \
-         (`claim_helper::acquire_author_stamped_conn`) whenever the pool carries session stamps; \
-         the acquire counted here is its transaction-mode-pooler fallback, where a session stamp \
-         cannot survive, and is the tool's pre-stamp behaviour. Migration 115 makes an unstamped \
-         cascade's delete of another group's edge-keyed BBA a reported CD02 refusal, not a \
-         silent skip. The supersede cascade is STILL \
-         UNSTAMPED, and it is a design decision rather than a missing conversion: the cascade \
-         walks DOWNSTREAM claims, whose owner groups are arbitrary, so no single viewer's \
-         writable set covers its target population and stamping it from `server.agent_id()` \
-         would refuse some rows while looking converted. Which authority a retraction cascade \
-         carries across group boundaries is a tenancy-model question, not a mechanical \
-         conversion. \
-         REGISTERED UNDER `server.pool.acquire` for the same reason as `dedup_sweep.rs` above: \
-         the engine now takes `&mut PgConnection`, so the cascade call names no pool and only \
-         the acquire is visible to this scan.",
+        "`set_source_reliability`. Same registry table as above, but an UPDATE, and migration \
+         117 makes UPDATE of a registry row owner-scoped: a WORLD perspective (every edge \
+         perspective, and every `create_perspective` row) is nobody's, so on the application \
+         role this UPDATE matches no row. The repo reports that as NotFound rather than a \
+         silent success; editing a shared perspective's reliability map is a maintenance act.",
     ),
     (
         "tools/themes.rs",

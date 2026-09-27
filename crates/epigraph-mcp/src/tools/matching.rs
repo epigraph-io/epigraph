@@ -313,19 +313,78 @@ pub async fn decide_match_candidate(
 pub async fn retire_match_candidate(
     server: &EpiGraphMcpFull,
     params: RetireMatchCandidateParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    use epigraph_engine::admin_cascade::{self, CascadeCause, CascadeTrigger};
+
     server.reject_if_read_only()?;
     let candidate_id = parse_uuid(&params.candidate_id)?;
-    let repo = MatchCandidateRepo::new(server.pool.clone());
     let acting_agent = server.agent_id().await?;
 
-    let outcome = repo
-        .retire(candidate_id, Some(acting_agent))
-        .await
-        .map_err(internal_error)?;
+    // THE ACT (migration 117): flip the candidate to `stale`, on a transaction
+    // stamped from the acting agent. `match_candidates` carries no tenancy; the
+    // stamp is there so the deferral row below, when there is one, is
+    // attributed to the session principal that `security_events_append` admits.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        acting_agent,
+        "retire_match_candidate",
+    )
+    .await?;
+    let previous_status =
+        MatchCandidateRepo::mark_retired_conn(&mut tx, candidate_id, Some(acting_agent))
+            .await
+            .map_err(internal_error)?;
+    let trigger = CascadeTrigger {
+        cause: CascadeCause::MatchRetire,
+        agent_id: Some(acting_agent),
+        oauth: crate::tools::supersede::oauth_principal(auth),
+        subject_id: candidate_id,
+        object_id: None,
+    };
+    let deferred = if crate::maintenance::admin_cascade_configured(server) {
+        None
+    } else {
+        Some(
+            admin_cascade::record_deferral(
+                &mut *tx,
+                &trigger,
+                admin_cascade::REASON_NOT_CONFIGURED,
+            )
+            .await
+            .map_err(internal_error)?,
+        )
+    };
+    tx.commit().await.map_err(internal_error)?;
+
+    // THE CASCADE, with administrative authority on the maintenance
+    // connection: retract the matcher edge (a promoted edge between two public
+    // claims is owned by nobody) and delete its derived rows. Audited.
+    let (cascade, retirement) = match deferred {
+        Some(status) => (status, None),
+        None => match crate::maintenance::admin_cascade_session(server).await {
+            Ok(mut session) => {
+                admin_cascade::apply_after_match_retire(session.conn(), &trigger, candidate_id)
+                    .await
+            }
+            Err(reason) => (
+                crate::tools::supersede::record_deferral_after_commit(server, &trigger, &reason)
+                    .await,
+                None,
+            ),
+        },
+    };
+    let retirement = retirement.map(|mut r| {
+        r.previous_status.clone_from(&previous_status);
+        r
+    });
+
+    let repo = MatchCandidateRepo::new(server.pool.clone());
     let updated = repo.get(candidate_id).await.map_err(internal_error)?;
     success_json(&serde_json::json!({
         "candidate": row_to_out(updated),
-        "retirement": outcome,
+        "previous_status": previous_status,
+        "cascade": cascade,
+        "retirement": retirement,
     }))
 }

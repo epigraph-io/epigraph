@@ -72,7 +72,12 @@ async fn supersede_reports_the_downstream_target_it_repaired(pool: PgPool) {
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
@@ -169,7 +174,12 @@ async fn sole_supporter_retraction_is_reported_as_unbacked_not_as_nothing_to_do(
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim(&pool, "sole-supported claim B", 0.5).await;
@@ -222,7 +232,12 @@ async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
@@ -276,7 +291,12 @@ async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
     let dup = seed_claim(&pool, "duplicate claim", 0.5).await;
