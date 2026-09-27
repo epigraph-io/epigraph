@@ -2659,3 +2659,75 @@ async fn a_reader_cannot_dedup_onto_its_groups_private_claim(pool: PgPool) {
     );
     by_writer.expect("the group's writer dedups onto its own group's claim");
 }
+
+/// Append a cascade audit row as the harness (privileged) and return its id.
+async fn cascade_row(
+    pool: &PgPool,
+    event_type: &str,
+    cause: &str,
+    subject: Uuid,
+    replay_of: Option<Uuid>,
+) -> Uuid {
+    let mut details = serde_json::json!({
+        "cause": cause,
+        "trigger": {"agent_id": null, "oauth": null, "subject_id": subject, "object_id": null},
+        "migration": 117,
+    });
+    if let Some(d) = replay_of {
+        details["replay_of"] = serde_json::json!({"deferred_event_id": d, "replayed_by": "t"});
+    }
+    epigraph_db::repos::admin_cascade::record(
+        pool,
+        match event_type {
+            "deferred" => epigraph_db::repos::admin_cascade::EVENT_DEFERRED,
+            "failed" => epigraph_db::repos::admin_cascade::EVENT_FAILED,
+            _ => epigraph_db::repos::admin_cascade::EVENT_APPLIED,
+        },
+        None,
+        false,
+        &details,
+    )
+    .await
+    .expect("cascade audit row")
+}
+
+/// The replay's window counts CASCADES, not rows. A cascade whose replay keeps
+/// failing (its act was undone, say) writes one `cascade.admin_failed` row per
+/// attempt; those rows are history and never pending themselves, and two
+/// deferrals of the same cascade are one entry. So at a small limit a newer
+/// deferral is still selected; an applied cascade is not; a request path's own
+/// failed repair is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_replay_window_holds_one_entry_per_pending_cascade(pool: PgPool) {
+    let stuck = Uuid::new_v4();
+    let d_stuck = cascade_row(&pool, "deferred", "supersede", stuck, None).await;
+    cascade_row(&pool, "deferred", "supersede", stuck, None).await;
+    cascade_row(&pool, "failed", "supersede", stuck, Some(d_stuck)).await;
+    cascade_row(&pool, "failed", "supersede", stuck, Some(d_stuck)).await;
+    let done = Uuid::new_v4();
+    cascade_row(&pool, "deferred", "dedup", done, None).await;
+    cascade_row(&pool, "applied", "dedup", done, None).await;
+    let fresh = Uuid::new_v4();
+    let d_fresh = cascade_row(&pool, "deferred", "dedup", fresh, None).await;
+    let failed_at_request = Uuid::new_v4();
+    let f_req = cascade_row(&pool, "failed", "match_retire", failed_at_request, None).await;
+
+    let two = epigraph_db::repos::admin_cascade::pending_replays(&pool, 2)
+        .await
+        .expect("pending");
+    let ids: Vec<Uuid> = two.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        ids,
+        vec![d_stuck, d_fresh],
+        "the stuck cascade takes ONE slot (its oldest deferral), so the fresh one is selected"
+    );
+    let all = epigraph_db::repos::admin_cascade::pending_replays(&pool, 50)
+        .await
+        .expect("pending");
+    let ids: Vec<Uuid> = all.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        ids,
+        vec![d_stuck, d_fresh, f_req],
+        "the applied cascade is not pending; a request path's failed repair is"
+    );
+}

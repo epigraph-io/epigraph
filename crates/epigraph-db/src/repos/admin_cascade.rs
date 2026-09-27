@@ -74,10 +74,16 @@ pub async fn record<'e, E: sqlx::PgExecutor<'e>>(
     Ok(id)
 }
 
-/// The deferred or failed cascades still to replay, oldest first, up to
-/// `limit`: every [`EVENT_DEFERRED`] / [`EVENT_FAILED`] row with no
-/// [`EVENT_APPLIED`] row for the same cause and subject written at or after
-/// it. Returns `(event id, details)`.
+/// The deferred or failed cascades still to replay, oldest first, ONE row per
+/// (cause, subject) -- its oldest [`EVENT_DEFERRED`] / [`EVENT_FAILED`] row --
+/// up to `limit` cascades, for every cascade with no [`EVENT_APPLIED`] row for
+/// the same cause and subject written at or after that row. Returns
+/// `(event id, details)`.
+///
+/// One row per cascade, so a cascade that keeps failing (a replay that fails
+/// again writes one more [`EVENT_FAILED`] row each run) occupies one slot of
+/// `limit` however many runs it has failed, and cannot crowd newer deferrals
+/// out of the window.
 ///
 /// Runs on the maintenance connection (the replay's): `security_events` is
 /// append-only for application sessions, which cannot read other principals'
@@ -90,15 +96,21 @@ pub async fn pending_replays<'e, E: sqlx::PgExecutor<'e>>(
     limit: i64,
 ) -> Result<Vec<(Uuid, serde_json::Value)>, DbError> {
     let rows: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
-        "SELECT d.id, d.details FROM security_events d \
-          WHERE d.event_type IN ($1, $2) \
-            AND NOT EXISTS ( \
-                SELECT 1 FROM security_events a \
-                 WHERE a.event_type = $3 \
-                   AND a.details->>'cause' = d.details->>'cause' \
-                   AND a.details->'trigger'->>'subject_id' = d.details->'trigger'->>'subject_id' \
-                   AND a.created_at >= d.created_at) \
-          ORDER BY d.created_at, d.id \
+        "SELECT p.id, p.details FROM ( \
+             SELECT DISTINCT ON (d.details->>'cause', d.details->'trigger'->>'subject_id') \
+                    d.id, d.details, d.created_at \
+               FROM security_events d \
+              WHERE d.event_type IN ($1, $2) \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM security_events a \
+                     WHERE a.event_type = $3 \
+                       AND a.details->>'cause' = d.details->>'cause' \
+                       AND a.details->'trigger'->>'subject_id' = \
+                           d.details->'trigger'->>'subject_id' \
+                       AND a.created_at >= d.created_at) \
+              ORDER BY d.details->>'cause', d.details->'trigger'->>'subject_id', \
+                       d.created_at, d.id) p \
+          ORDER BY p.created_at, p.id \
           LIMIT $4",
     )
     .bind(EVENT_DEFERRED)
