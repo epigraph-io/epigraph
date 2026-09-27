@@ -34,7 +34,9 @@
 --      apply to what is left);
 --   5. `match_candidates`: DELETE revoked; a trigger refuses the transition to
 --      `stale` (INSERT or UPDATE) on a non-privileged session. Retirement is an
---      administrative act and runs on the maintenance connection.
+--      administrative act and runs on the maintenance connection;
+--   6. append-only tables (provenance_log among them) lose UPDATE/DELETE, and
+--      tables with no writer lose every write.
 --
 -- Refresh-token families. `family_id` (nullable; NULL reads as the row's own
 -- id, so rows inserted by an older binary during the deploy are their own
@@ -567,6 +569,42 @@ DO $$ BEGIN
     END IF;
 END $$;
 
+-- ===================================================================
+-- 6. APPEND-ONLY AND WRITER-LESS TABLES
+-- ===================================================================
+-- Measured over every repository that shares this database, at their origin
+-- refs, and over every function body a fresh 001 -> 118 install carries: the
+-- only writers of these tables INSERT. None updates, deletes or truncates one.
+-- Rows removed by a foreign-key cascade (graph_cluster_runs / claim_themes ->
+-- graph_neighborhoods -> neighborhood_edges, reasoning_traces ->
+-- trace_parents) are removed by the referential action, which does not need
+-- the deleting session to hold DELETE on the child.
+--   provenance_log            a signed, append-only ledger (its rows carry
+--                             provenance_sig and authorization_chain)
+--   agent_state_history, analyses, analysis_methods, behavioral_executions,
+--   counterfactual_scenarios, gap_analyses, graph_neighborhoods,
+--   learning_events, neighborhood_edges, pattern_templates, trace_parents
+--                             append-only records and derived rows
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'REVOKE UPDATE, DELETE, TRUNCATE ON public.provenance_log, '
+                'public.agent_state_history, public.analyses, public.analysis_methods, '
+                'public.behavioral_executions, public.counterfactual_scenarios, '
+                'public.gap_analyses, public.graph_neighborhoods, public.learning_events, '
+                'public.neighborhood_edges, public.pattern_templates, public.trace_parents '
+                'FROM epigraph_app';
+        -- No writer at all: no INSERT either. `agent_capabilities` is authority
+        -- content (privileged_access, can_modify_policies), and its only
+        -- statement, `AgentRepository::update_capabilities`, has no caller: it
+        -- now needs a privileged connection.
+        EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.agent_capabilities, '
+                'public.authorization_votes, public.authorizers, '
+                'public.entity_merge_candidates, public.experiment_entities, '
+                'public.harvester_audit_reports, public.harvester_enriched_concepts, '
+                'public.harvester_sources, public.source_artifacts FROM epigraph_app';
+    END IF;
+END $$;
+
 -- UNDO (restores the prior privileges; re-opens what this file closes):
 --   GRANT INSERT, UPDATE, DELETE ON public._sqlx_migrations, public.tenancy_backfill_progress,
 --     public.tenancy_exempt, public.tenancy_transcription_log,
@@ -577,6 +615,16 @@ END $$;
 --   GRANT UPDATE, DELETE ON public.agents TO epigraph_app;
 --   GRANT DELETE ON public.match_candidates TO epigraph_app;
 --   DROP TRIGGER IF EXISTS match_candidates_stale_guard ON public.match_candidates;
+--   GRANT SELECT ON public.refresh_tokens TO epigraph_app;
+--   GRANT UPDATE, DELETE ON public.provenance_log, public.agent_state_history,
+--     public.analyses, public.analysis_methods, public.behavioral_executions,
+--     public.counterfactual_scenarios, public.gap_analyses, public.graph_neighborhoods,
+--     public.learning_events, public.neighborhood_edges, public.pattern_templates,
+--     public.trace_parents TO epigraph_app;
+--   GRANT INSERT, UPDATE, DELETE ON public.agent_capabilities, public.authorization_votes,
+--     public.authorizers, public.entity_merge_candidates, public.experiment_entities,
+--     public.harvester_audit_reports, public.harvester_enriched_concepts,
+--     public.harvester_sources, public.source_artifacts TO epigraph_app;
 --   REVOKE DELETE ON public.factors, public.bp_messages, public.mass_functions
 --     FROM epigraph_maintenance;   (only where 115 / 117 are NOT applied: they
 --     grant the same privileges and need them)

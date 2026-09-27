@@ -63,8 +63,9 @@ const OPERATIONAL: &str = "an operational record the request path writes on the 
     role through its repository; owner-scoped RLS is a follow-up";
 const REGISTRY: &str = "a shared registry the request path extends on the application role \
     (entity/method/paper/type upserts)";
-const NO_WRITER: &str = "no writer in this repository; writers outside it are unmeasured, so a \
-    revoke could break an external consumer";
+const SCRIPT_UPSERT: &str = "upserted by the clustering scripts (cluster_claims.py, \
+    evidential_clustering.py, refine_clusters.py), which connect through maintenance_dsn(): that \
+    falls back to DATABASE_URL, the application role, when MAINTENANCE_DATABASE_URL is unset";
 const MATCH: &str = "UPDATE kept for the matcher upsert and decide; 118's \
     match_candidates_stale_guard refuses the transition to stale on a non-privileged \
     session and DELETE is revoked";
@@ -73,61 +74,44 @@ const COMMUNITY: &str = "rows written by 106's community definer; removal delete
 
 const ALLOWLIST: &[(&str, &str)] = &[
     ("activities", OPERATIONAL),
-    ("agent_capabilities", OPERATIONAL),
     ("agent_spans", OPERATIONAL),
-    ("agent_state_history", OPERATIONAL),
-    ("analyses", OPERATIONAL),
-    ("analysis_methods", OPERATIONAL),
-    ("authorization_votes", NO_WRITER),
-    ("authorizers", NO_WRITER),
-    ("behavioral_executions", OPERATIONAL),
     ("bp_messages", DERIVED_BP),
     ("claim_themes", DERIVED_CLUSTER),
-    ("cluster_centroids", DERIVED_CLUSTER),
+    ("cluster_centroids", SCRIPT_UPSERT),
     ("cluster_edges", DERIVED_CLUSTER),
-    ("cluster_labels", DERIVED_CLUSTER),
+    ("cluster_labels", SCRIPT_UPSERT),
     ("community_members", COMMUNITY),
-    ("counterfactual_scenarios", OPERATIONAL),
     ("edges_staging", OPERATIONAL),
     ("entities", REGISTRY),
-    ("entity_merge_candidates", NO_WRITER),
     ("entity_types", REGISTRY),
     ("events", OPERATIONAL),
-    ("experiment_entities", NO_WRITER),
     ("experiment_results", OPERATIONAL),
     ("experiments", OPERATIONAL),
     ("factors", DERIVED_BP),
-    ("gap_analyses", OPERATIONAL),
     ("graph_cluster_runs", DERIVED_CLUSTER),
     ("graph_clusters", DERIVED_CLUSTER),
-    ("graph_neighborhoods", DERIVED_CLUSTER),
-    ("harvester_audit_reports", NO_WRITER),
-    ("harvester_enriched_concepts", NO_WRITER),
-    ("harvester_sources", NO_WRITER),
-    ("learning_events", OPERATIONAL),
     ("match_candidates", MATCH),
     ("method_capabilities", REGISTRY),
     ("methods", REGISTRY),
-    ("neighborhood_edges", DERIVED_CLUSTER),
     ("papers", REGISTRY),
-    ("pattern_templates", OPERATIONAL),
-    ("provenance_log", OPERATIONAL),
-    ("source_artifacts", NO_WRITER),
     ("tasks", OPERATIONAL),
-    ("trace_parents", OPERATIONAL),
     ("webhook_subscriptions", OPERATIONAL),
     ("workflow_executions", OPERATIONAL),
     ("workflows", OPERATIONAL),
 ];
 
-/// Credential and ledger tables: never allowlisted, and the application role
-/// must hold neither UPDATE nor DELETE on any of them.
+/// Credential, authority and ledger tables: never allowlisted, and the
+/// application role must hold neither UPDATE nor DELETE on any of them.
+/// (`provenance_log` is the signed append-only ledger; `agent_capabilities`
+/// holds `privileged_access` and `can_modify_policies`.)
 const CLOSED: &[&str] = &[
     "_sqlx_migrations",
+    "agent_capabilities",
     "agent_keys",
     "oauth_authorization_codes",
     "oauth_authorize_sessions",
     "oauth_clients",
+    "provenance_log",
     "refresh_tokens",
     "tenancy_backfill_progress",
     "tenancy_exempt",
@@ -1313,4 +1297,100 @@ async fn factor_and_bp_message_writes_still_work_on_the_app_role(pool: PgPool) {
         .await
         .expect("clear on the application role");
     assert!(cleared >= 1);
+}
+
+/// Migration 118 section 6: the append-only tables keep INSERT and lose
+/// UPDATE/DELETE, the writer-less ones lose every write, and rows removed by a
+/// foreign-key cascade from a table the application still deletes
+/// (graph_cluster_runs -> graph_neighborhoods -> neighborhood_edges) still go:
+/// the referential action does not need the session to hold DELETE on the
+/// child.
+#[sqlx::test(migrations = "../../migrations")]
+async fn append_only_tables_keep_insert_and_cascades_still_clear_them(pool: PgPool) {
+    let app = app_pool(&pool, 2).await;
+
+    let theme: Uuid =
+        sqlx::query_scalar("INSERT INTO claim_themes (label) VALUES ('w11') RETURNING id")
+            .fetch_one(&app)
+            .await
+            .expect("claim_themes insert on the application role");
+    let run = Uuid::new_v4();
+    sqlx::query("INSERT INTO graph_cluster_runs (run_id, cluster_count) VALUES ($1, 2)")
+        .bind(run)
+        .execute(&app)
+        .await
+        .expect("graph_cluster_runs insert on the application role");
+    let mut hoods = Vec::new();
+    for label in ["a", "b"] {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO graph_neighborhoods (run_id, theme_id, label, size) \
+             VALUES ($1, $2, $3, 1) RETURNING id",
+        )
+        .bind(run)
+        .bind(theme)
+        .bind(label)
+        .fetch_one(&app)
+        .await
+        .expect("graph_neighborhoods INSERT is kept");
+        hoods.push(id);
+    }
+    hoods.sort();
+    sqlx::query(
+        "INSERT INTO neighborhood_edges (run_id, neighborhood_a, neighborhood_b, weight) \
+         VALUES ($1, $2, $3, 0.5)",
+    )
+    .bind(run)
+    .bind(hoods[0])
+    .bind(hoods[1])
+    .execute(&app)
+    .await
+    .expect("neighborhood_edges INSERT is kept");
+
+    for (t, set) in [
+        ("graph_neighborhoods", "size = size"),
+        ("neighborhood_edges", "weight = weight"),
+        ("provenance_log", "id = id"),
+        ("learning_events", "id = id"),
+        ("trace_parents", "trace_id = trace_id"),
+    ] {
+        let r = sqlx::query(&format!("UPDATE {t} SET {set}"))
+            .execute(&app)
+            .await;
+        assert_eq!(sqlstate(r).as_deref(), Some("42501"), "UPDATE {t}");
+        let r = sqlx::query(&format!("DELETE FROM {t}")).execute(&app).await;
+        assert_eq!(sqlstate(r).as_deref(), Some("42501"), "DELETE {t}");
+    }
+    for t in [
+        "agent_capabilities",
+        "source_artifacts",
+        "harvester_sources",
+    ] {
+        let r = sqlx::query(&format!("INSERT INTO {t} DEFAULT VALUES"))
+            .execute(&app)
+            .await;
+        assert_eq!(
+            sqlstate(r).as_deref(),
+            Some("42501"),
+            "INSERT {t} (no writer)"
+        );
+    }
+
+    // The cascade: deleting the run (still application-deletable, derived
+    // clustering state) removes its neighborhoods and their edges.
+    let n = sqlx::query("DELETE FROM graph_cluster_runs WHERE run_id = $1")
+        .bind(run)
+        .execute(&app)
+        .await
+        .expect("a cascading delete from a parent the application still deletes")
+        .rows_affected();
+    assert_eq!(n, 1);
+    let left: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM graph_neighborhoods WHERE run_id = $1) \
+              + (SELECT count(*) FROM neighborhood_edges WHERE run_id = $1)",
+    )
+    .bind(run)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "the cascade cleared the children");
 }
