@@ -1430,3 +1430,45 @@ async fn oauth_audit_events_are_written_only_by_the_definers(pool: PgPool) {
         .unwrap_or_else(|e| panic!("{own} on the application role: {e}"));
     }
 }
+
+/// Migration 118 section 8: an agent may still record its LLM properties, but
+/// may not rewrite the competence scopes the belief route discounts it by.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_cannot_rewrite_its_own_competence_scopes(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "w11-competence").await;
+    sqlx::query(
+        "UPDATE agents SET properties = properties || '{\"competence_scopes\": [\"chemistry\"]}' \
+          WHERE id = $1",
+    )
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("a privileged connection sets the scopes");
+    let app = app_pool_as(&pool, agent).await;
+
+    for patch in [
+        "properties - 'competence_scopes'",
+        "properties || '{\"competence_scopes\": [\"everything\"]}'",
+    ] {
+        let e = sqlx::query(&format!(
+            "UPDATE agents SET properties = {patch} WHERE id = $1"
+        ))
+        .bind(agent)
+        .execute(&app)
+        .await
+        .expect_err("the agent rewrites its own competence scopes");
+        let d = e.as_database_error().expect("database error");
+        assert_eq!(d.code().as_deref(), Some("42501"));
+        assert!(d.message().contains("AG01"), "{}", d.message());
+    }
+    AgentRepository::set_llm_properties(&app, agent, "model-z", "hash-z")
+        .await
+        .expect("the LLM-property merge leaves the scopes alone and still works");
+    let scopes: serde_json::Value =
+        sqlx::query_scalar("SELECT properties -> 'competence_scopes' FROM agents WHERE id = $1")
+            .bind(agent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(scopes, serde_json::json!(["chemistry"]));
+}

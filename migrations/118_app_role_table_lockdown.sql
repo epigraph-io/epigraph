@@ -29,15 +29,19 @@
 --      INSERT stays: registration, provisioning and token minting insert on
 --      the application role, and none of them updates or deletes;
 --   4. `agents`: table-level UPDATE and DELETE are revoked and UPDATE is
---      granted back on the profile columns only, so no application session can
+--      granted back on the columns the live paths write (display_name, labels,
+--      orcid, ror_id, properties, updated_at), so no application session can
 --      change `id`, `public_key` or `key_kind` (the row policies of 077 still
---      apply to what is left);
+--      apply to what is left); `properties` is not a pure profile column, so a
+--      trigger keeps its `competence_scopes` key out of the agent's reach
+--      (section 8);
 --   5. `match_candidates`: DELETE revoked; a trigger refuses the transition to
 --      `stale` (INSERT or UPDATE) on a non-privileged session. Retirement is an
 --      administrative act and runs on the maintenance connection;
 --   6. append-only tables (provenance_log among them) lose UPDATE/DELETE, and
 --      tables with no writer lose every write;
---   7. `oauth.` security events become writable by the definers only.
+--   7. `oauth.` security events become writable by the definers only;
+--   8. `agents.properties.competence_scopes` is no longer writable by the agent.
 --
 -- Refresh-token families. `family_id` (nullable; NULL reads as the row's own
 -- id, so rows inserted by an older binary during the deploy are their own
@@ -624,6 +628,34 @@ CREATE POLICY security_events_oauth_privileged ON public.security_events
         OR (SELECT public.epigraph_bypass())
         OR (SELECT public.epigraph_definer_bypass()));
 
+-- ===================================================================
+-- 8. AGENTS: COMPETENCE SCOPES ARE NOT SELF-SERVICE
+-- ===================================================================
+-- Section 4 leaves `properties` application-updatable (on the own row, 077's
+-- policy) because `AgentRepository::set_llm_properties` merges its three keys
+-- there. But `properties->'competence_scopes'` is read by the belief route to
+-- discount evidence from an out-of-scope agent, so an agent that could rewrite
+-- it could remove its own discount. No statement in this repository writes
+-- it; a non-privileged session may not change it.
+CREATE OR REPLACE FUNCTION public.epigraph_agents_competence_guard()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF (NEW.properties -> 'competence_scopes') IS DISTINCT FROM (OLD.properties -> 'competence_scopes')
+       AND NOT public.epigraph_lockdown_privileged() THEN
+        RAISE EXCEPTION 'AG01: agents.properties.competence_scopes of agent % is set by a '
+            'privileged connection, not by the agent', NEW.id
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_agents_competence_guard() FROM PUBLIC;
+DROP TRIGGER IF EXISTS agents_competence_guard ON public.agents;
+CREATE TRIGGER agents_competence_guard
+    BEFORE UPDATE OF properties ON public.agents
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_agents_competence_guard();
+
 -- UNDO (restores the prior privileges; re-opens what this file closes):
 --   GRANT INSERT, UPDATE, DELETE ON public._sqlx_migrations, public.tenancy_backfill_progress,
 --     public.tenancy_exempt, public.tenancy_transcription_log,
@@ -645,6 +677,7 @@ CREATE POLICY security_events_oauth_privileged ON public.security_events
 --     public.harvester_audit_reports, public.harvester_enriched_concepts,
 --     public.harvester_sources, public.source_artifacts TO epigraph_app;
 --   DROP POLICY IF EXISTS security_events_oauth_privileged ON public.security_events;
+--   DROP TRIGGER IF EXISTS agents_competence_guard ON public.agents;
 --   REVOKE DELETE ON public.factors, public.bp_messages, public.mass_functions
 --     FROM epigraph_maintenance;   (only where 115 / 117 are NOT applied: they
 --     grant the same privileges and need them)
