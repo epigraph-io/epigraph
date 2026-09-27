@@ -470,9 +470,20 @@ CREATE TRIGGER match_candidates_stale_guard
     BEFORE INSERT OR UPDATE OF status ON public.match_candidates
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_match_candidates_stale_guard();
 
+-- The retirement now runs on the maintenance connection, and its cascade
+-- deletes the matcher edge's `bp_messages`, `factors` and edge-keyed
+-- `mass_functions`. 070 gave the maintenance role no DELETE, so on a
+-- maintenance login that is not a superuser the retirement stopped at its
+-- first DELETE (measured with the real server). The narrowest grant under
+-- which it runs; it is the same grant 115 (`mass_functions`) and 117
+-- (`factors`, `bp_messages`) make, so the two converge in either order.
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'REVOKE DELETE, TRUNCATE ON public.match_candidates FROM epigraph_app';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'GRANT DELETE ON public.factors, public.bp_messages, public.mass_functions '
+                'TO epigraph_maintenance';
     END IF;
 END $$;
 
@@ -486,5 +497,8 @@ END $$;
 --   GRANT UPDATE, DELETE ON public.agents TO epigraph_app;
 --   GRANT DELETE ON public.match_candidates TO epigraph_app;
 --   DROP TRIGGER IF EXISTS match_candidates_stale_guard ON public.match_candidates;
+--   REVOKE DELETE ON public.factors, public.bp_messages, public.mass_functions
+--     FROM epigraph_maintenance;   (only where 115 / 117 are NOT applied: they
+--     grant the same privileges and need them)
 -- The definers, the two refresh_tokens columns and the index may stay: the
 -- previous binaries do not call or read them.

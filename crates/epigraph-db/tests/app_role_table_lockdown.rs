@@ -132,6 +132,25 @@ const CLOSED: &[&str] = &[
     "tenancy_undeclared_writes",
 ];
 
+/// A pool whose connections are `SET SESSION AUTHORIZATION <role>` (a
+/// test-local literal).
+async fn role_pool(pool: &PgPool, role: &'static str) -> PgPool {
+    use sqlx::Executor;
+    let url = fixture::database_url_for(pool).await;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("role pool")
+}
+
 /// A pool acting as the deployed application role, with no tenancy GUCs.
 async fn app_pool(pool: &PgPool, max: u32) -> PgPool {
     use sqlx::Executor;
@@ -972,12 +991,15 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
     assert_eq!(sqlstate(del).as_deref(), Some("42501"), "DELETE");
     assert_eq!(status_of(&pool, id).await, "promoted", "nothing changed");
 
-    // A privileged session retires; the matcher's later re-touch of the now
-    // stale, decided row keeps it stale and is not refused.
-    MatchCandidateRepo::new(pool.clone())
+    // The MAINTENANCE role (not a superuser) retires, cascade included: 118
+    // grants it the DELETEs on the derived rows the cascade removes. Then the
+    // matcher's later re-touch of the now stale, decided row keeps it stale and
+    // is not refused.
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+    MatchCandidateRepo::new(maint)
         .retire(id, None)
         .await
-        .expect("privileged retire");
+        .expect("retire on the maintenance role");
     assert_eq!(status_of(&pool, id).await, "stale");
     repo.upsert(
         lo,
