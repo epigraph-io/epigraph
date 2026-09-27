@@ -1639,9 +1639,11 @@ impl AgentRepository {
     /// to the operator. The lineage check is a sanity check, not proof (edges
     /// exist only since lineage recording shipped, and are forgeable in the
     /// direction that refuses more); the attestation is the authority, and is
-    /// recorded in `security_events` (`operator.shared_signer_retired`) and on
-    /// the OPERATED_BY edge. Every other refusal is 107's retire, unchanged, and
-    /// the link is retired with no membership.
+    /// always recorded in `security_events` (`operator.shared_signer_retired`).
+    /// It is also recorded on the (agent, operator) OPERATED_BY edge, but only
+    /// when this call creates that edge (`edge_created`); a pre-existing lineage
+    /// edge is left untouched. Every other refusal is 107's retire, unchanged,
+    /// and the link is retired with no membership.
     ///
     /// Same authorization: EXECUTE-able by `epigraph_maintenance` only.
     ///

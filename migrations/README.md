@@ -511,8 +511,10 @@ Current reservation:
   refusing an agent whose OPERATED_BY auth-lineage names more than one
   principal (107 section 9), it refuses only a lineage principal, other than
   the agent itself and the operator, that is not in `attested`, and records
-  the attestation (a `security_events` row `operator.shared_signer_retired`,
-  and the OPERATED_BY edge's properties). A NULL element in `attested` refuses
+  the attestation (always a `security_events` row
+  `operator.shared_signer_retired`; also the OPERATED_BY edge's properties, but
+  only when it records that edge itself, which it does not for a signer that
+  already has the edge as lineage). A NULL element in `attested` refuses
   (22004). Every other refusal, the operator-side
   fingerprint included, is 107's; the link is retired with no membership. The
   lineage check is a sanity check (edges exist only since lineage recording

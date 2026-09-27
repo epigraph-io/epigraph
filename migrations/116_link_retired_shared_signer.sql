@@ -44,9 +44,11 @@
 --     agent-to-agent OPERATED_BY edge). A forged edge can only ADD a target,
 --     which makes this call refuse more, never less.
 -- The authority is the maintenance caller's attestation, which is why the
--- function is EXECUTE-able by `epigraph_maintenance` only and writes the
--- attested set to `security_events` (event `operator.shared_signer_retired`)
--- and onto the OPERATED_BY edge it records.
+-- function is EXECUTE-able by `epigraph_maintenance` only and ALWAYS writes the
+-- attested set to `security_events` (event `operator.shared_signer_retired`).
+-- It also writes it onto the (agent, operator) OPERATED_BY edge, but only when
+-- it records that edge itself: a former signer the operator called through
+-- already has it as lineage, and that edge is left as it is.
 --
 -- ===================================================================
 -- 3. EVERYTHING ELSE IS 107's RETIRE, UNCHANGED
