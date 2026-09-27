@@ -57,7 +57,10 @@ use std::path::{Path, PathBuf};
 ///   PR-11 removed two names, and the "(18)" this doc previously carried was a
 ///   pre-existing miscount — the base array held 17 write-group entries. The
 ///   array length is what the test asserts, so nothing was broken by it; it is
-///   corrected here rather than silently absorbed. Converting one needs write
+///   corrected here rather than silently absorbed. (Batch W10's revision
+///   removed `retire_match_candidate`, which now acquires a viewer; the array
+///   holds 10 write-group entries after it. The array, not this number, is
+///   what the test asserts.) Converting one needs write
 ///   authority —
 ///   member-with-write-role, not merely member-who-can-read. That mechanism
 ///   turned out to **already exist**: `Viewer::resolve` has split `writable`
@@ -114,7 +117,8 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     "ingest_document_spine",
     "publish_event",
     "report_hierarchical_outcome",
-    "retire_match_candidate",
+    // `retire_match_candidate` left this list in W10's revision: it acquires a
+    // viewer to filter what its administrative cascade reports to the caller.
     "set_source_reliability",
     "structure_source",
     // pure-CPU, no DB
