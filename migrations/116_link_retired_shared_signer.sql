@@ -33,7 +33,9 @@
 -- every distinct OPERATED_BY lineage target of `agent`, other than `agent`
 -- itself (the principal-less listener writes a self-loop: its injected
 -- principal IS the signer) and other than `operator`, must appear in
--- `attested`. An unattested target refuses the call (55000) and names it.
+-- `attested`. An unattested target refuses the call (55000) and names it. A
+-- NULL element in `attested` refuses the call (22004), so it cannot count as
+-- attesting anyone.
 --
 -- That check is a SANITY CHECK, not proof:
 --   * lineage edges exist only since `record_auth_lineage` shipped; callers
@@ -105,6 +107,14 @@ BEGIN
                         'principal set are all required (the set may be empty)'
             USING ERRCODE = '22004';
     END IF;
+    -- A NULL element would make `t = ANY (p_attested)` NULL for every t it does
+    -- not match, and the NOT below would then drop t from the unattested set:
+    -- an attestation of nothing would pass the check. Refuse it outright.
+    IF array_position(p_attested, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: the attested principal set '
+                        'contains a NULL; attest principals by id only'
+            USING ERRCODE = '22004';
+    END IF;
     IF p_agent = p_operator THEN
         RAISE EXCEPTION 'epigraph_link_retired_shared_signer: agent % cannot be its own operator',
                         p_agent
@@ -164,7 +174,7 @@ BEGIN
         SELECT COALESCE(array_agg(t ORDER BY t), '{}')
           INTO v_unattested
           FROM unnest(v_lineage) AS t
-         WHERE t <> p_operator AND NOT (t = ANY (p_attested));
+         WHERE t <> p_operator AND NOT COALESCE(t = ANY (p_attested), false);
         IF cardinality(v_unattested) > 0 THEN
             RAISE EXCEPTION 'epigraph_link_retired_shared_signer: agent % carried OPERATED_BY '
                             'auth-lineage to principals that were not attested: %; nothing was '

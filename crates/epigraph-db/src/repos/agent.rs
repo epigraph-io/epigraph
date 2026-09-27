@@ -1647,7 +1647,8 @@ impl AgentRepository {
     ///
     /// # Errors
     /// As [`Self::link_retired_agent`], plus `DbError::QueryFailed` (55000)
-    /// naming each unattested lineage principal; nothing is written.
+    /// naming each unattested lineage principal; nothing is written. (A NULL
+    /// element, 22004, cannot be sent through this `&[Uuid]` binding.)
     pub async fn link_retired_shared_signer(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,

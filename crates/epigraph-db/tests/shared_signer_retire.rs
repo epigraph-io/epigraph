@@ -16,7 +16,10 @@
 //! dropping the unattested-principal check makes
 //! `an_unattested_lineage_principal_refuses_and_an_attested_one_links_retired`
 //! link on the empty attestation; dropping the audit INSERT fails its audit
-//! count.
+//! count; dropping the NULL-element refusal fails
+//! `a_null_in_the_attested_set_refuses_and_writes_nothing` (the NULL-safe filter
+//! alone refuses with 55000, not 22004, and with only the refusal reverted AND
+//! the filter written the old way, `ARRAY[NULL]` links).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -313,4 +316,47 @@ async fn the_rest_of_107s_retire_still_refuses(pool: PgPool) {
     assert!(e.to_string().contains("live writer/admin"), "{e}");
     assert!(links_of(&pool, signer2).await.is_empty());
     assert!(audits_of(&pool, signer2).await.is_empty());
+}
+
+/// A NULL element in the attested set refuses (22004) and writes nothing.
+///
+/// Without that refusal, `t = ANY (ARRAY[NULL])` is NULL for an unmatched
+/// lineage principal, `NOT NULL` is NULL, and the principal would drop out of
+/// the unattested set: the call would link on an attestation of nobody. The
+/// Rust binding (`&[Uuid]`) cannot send a NULL, so this drives the function
+/// directly, as a maintenance login at a psql prompt would.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_null_in_the_attested_set_refuses_and_writes_nothing(pool: PgPool) {
+    let (signer, operator, _other) = former_signer(&pool).await;
+    let stranger = seed_agent(&pool).await;
+    for (label, attested) in [
+        ("ARRAY[NULL]", vec![None]),
+        ("ARRAY[stranger, NULL]", vec![Some(stranger), None]),
+    ] {
+        let r = as_maint(&pool, |mut conn| async move {
+            let r =
+                sqlx::query("SELECT * FROM public.epigraph_link_retired_shared_signer($1, $2, $3)")
+                    .bind(signer)
+                    .bind(operator)
+                    .bind(attested)
+                    .fetch_one(&mut *conn)
+                    .await;
+            (conn, r)
+        })
+        .await;
+        let err = r.expect_err("a NULL attestation must refuse");
+        let code = err
+            .as_database_error()
+            .and_then(|d| d.code().map(|c| c.into_owned()));
+        assert_eq!(
+            code.as_deref(),
+            Some("22004"),
+            "{label}: refused by the NULL-element check itself: {err}"
+        );
+        assert!(links_of(&pool, signer).await.is_empty(), "{label}: no link");
+        assert!(
+            audits_of(&pool, signer).await.is_empty(),
+            "{label}: no audit"
+        );
+    }
 }
