@@ -1498,8 +1498,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "admin_cascade.rs",
         "record",
         "INSERT INTO `security_events` (append-only; 077's security_events_append admits a row \
-         attributed to the session principal, or any row on the maintenance connection). Reads \
-         nothing back: the id is minted client-side.",
+         attributed to the session principal, or any row on the maintenance connection; 117 \
+         refuses a `cascade.*` row from any other session). Reads nothing back: the id is \
+         minted client-side.",
+    ),
+    (
+        "admin_cascade.rs",
+        "record_deferral",
+        "Calls 117's `epigraph_record_cascade_deferral` definer on the CALLER's session: an \
+         audit-row write whose control is the definer's own (attribution to the session \
+         principal, the act must be the session's). Returns the new row's id, no tenant content.",
     ),
     // ── Batch H-a: writes whose executor widened so a route or the theme
     // clusterer can put them in ONE transaction. Same argument as

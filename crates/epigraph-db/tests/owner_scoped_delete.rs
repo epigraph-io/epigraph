@@ -2731,3 +2731,377 @@ async fn the_replay_window_holds_one_entry_per_pending_cascade(pool: PgPool) {
         "the applied cascade is not pending; a request path's failed repair is"
     );
 }
+
+/// 117 section 6(a): an application session writes NO `cascade.*` row itself,
+/// whether unattributed, attributed to itself, or an answering applied row
+/// (which would silence a genuine deferral). Any other event type is admitted
+/// as before, so the anti-suppression rule of 077 is unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_application_session_writes_no_cascade_audit_row(pool: PgPool) {
+    let (r, _) = fixture::seed_agent_with_group(&pool, "writer-r").await;
+    assert_app_role_does_not_bypass(&pool).await;
+    let p = pool.clone();
+    let results = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, r).await;
+        let details = serde_json::json!({
+            "cause": "supersede",
+            "trigger": {"agent_id": Uuid::new_v4(), "subject_id": Uuid::new_v4(),
+                        "object_id": Uuid::new_v4()},
+        });
+        let mut out = Vec::new();
+        for (event_type, agent) in [
+            ("cascade.deferred", None),
+            ("cascade.deferred", Some(r)),
+            ("cascade.admin_applied", Some(r)),
+            ("cascade.admin_failed", None),
+            ("cascade.retired", None),
+            ("w10.test_event", None),
+        ] {
+            let res = sqlx::query(
+                "INSERT INTO security_events (event_type, agent_id, success, details, created_at) \
+                 VALUES ($1, $2, false, $3, now() - interval '10 days')",
+            )
+            .bind(event_type)
+            .bind(agent)
+            .bind(&details)
+            .execute(&mut *conn)
+            .await;
+            out.push((event_type, res.map(|d| d.rows_affected())));
+        }
+        (conn, out)
+    })
+    .await;
+    for (event_type, res) in results {
+        if event_type.starts_with("cascade.") {
+            let e = res.expect_err(event_type);
+            assert!(
+                e.to_string().contains("security_events_cascade_privileged"),
+                "{event_type}: {e}"
+            );
+        } else {
+            assert_eq!(res.expect("a non-cascade event is still admitted"), 1);
+        }
+    }
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type LIKE 'cascade.%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(n, 0, "no cascade row was written");
+}
+
+fn is_cx(r: &Result<Uuid, epigraph_db::DbError>, code: &str) -> bool {
+    matches!(r, Err(e) if e.to_string().contains(code))
+}
+
+/// 117 section 6(b): a deferral is recorded only through the definer, and only
+/// for an act the recording session made. Measured against the review's
+/// chain: a writer that points its own claim at another writer's retired
+/// public claim cannot record a supersede deferral naming it (CX03), nor
+/// attribute one to that writer (CX02); the only pending deferral for the
+/// retired claim is its author's, and the replay's migration of it moves a
+/// third writer's edge onto the author's successor. Each other cause's
+/// authority arm refuses a session that does not hold it and admits one that
+/// does.
+#[sqlx::test(migrations = "../../migrations")]
+#[allow(clippy::too_many_lines)]
+async fn a_deferral_names_only_the_recording_sessions_own_act(pool: PgPool) {
+    use epigraph_db::repos::admin_cascade as ac;
+    let (a, ga) = fixture::seed_agent_with_group(&pool, "author-a").await;
+    let (r, gr) = fixture::seed_agent_with_group(&pool, "writer-r").await;
+    let (x, gx) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    add_reader(&pool, ga, r).await;
+    let v = seed_public_claim_owned_by(&pool, a, ga, "A's claim, to be superseded").await;
+    let xc = seed_public_claim_owned_by(&pool, x, gx, "X's citing claim").await;
+    let x_edge = fixture::seed_edge(&pool, xc, v).await;
+    let n = seed_public_claim_owned_by(&pool, r, gr, "R's claim").await;
+    // Dedup fixtures, set by the privileged harness so the definer's own arm
+    // is what decides: R's duplicate of A's group-private claim K, and R's
+    // duplicate of a public claim P.
+    let k = fixture::seed_group_claim(&pool, a, ga, "A's group-private canonical").await;
+    // (074 refuses INSERTing a public successor of a group-private claim, so
+    // the privileged harness UPDATEs the column, which only 117's guard would
+    // stop and the guard exempts a privileged session.)
+    let d_private = seed_public_claim_owned_by(&pool, r, gr, "R's dup of K").await;
+    sqlx::query("UPDATE claims SET supersedes = $1, is_current = false WHERE id = $2")
+        .bind(k)
+        .bind(d_private)
+        .execute(&pool)
+        .await
+        .expect("the harness marks R's claim a duplicate of K");
+    let p_claim = seed_public_claim_owned_by(&pool, x, gx, "X's public canonical").await;
+    let d_public = seed_claim_row(&pool, r, gr, Some(p_claim), false, "R's dup of P").await;
+    // Consolidation fixture: A's merged claim and its two retired sources.
+    let merged = seed_public_claim_owned_by(&pool, a, ga, "A's merged claim").await;
+    let s1 = seed_claim_row(&pool, a, ga, Some(merged), false, "A's source 1").await;
+    let s2 = seed_claim_row(&pool, a, ga, Some(merged), false, "A's source 2").await;
+    // Match-candidate fixture.
+    let (c1, c2) = if v < xc { (v, xc) } else { (xc, v) };
+    let cand = MatchCandidateRepo::new(pool.clone())
+        .upsert(
+            c1,
+            c2,
+            0.9,
+            serde_json::json!({}),
+            "promoted",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("candidate")
+        .id;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let oauth = serde_json::json!({"client_id": Uuid::new_v4(), "owner_id": null,
+                                   "agent_id": null});
+    let p = pool.clone();
+    let o = oauth.clone();
+    let (gs, genuine, got) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        use sqlx::Acquire;
+        // A's genuine supersede, deferred in the act's own transaction.
+        stamp(&mut conn, &p, a).await;
+        let (gs, genuine) = {
+            let mut tx = conn.begin().await.expect("begin");
+            let (gs, _) = epigraph_db::ClaimRepository::supersede_act_conn(
+                &mut tx,
+                epigraph_core::ClaimId::from_uuid(v),
+                "A's corrected claim",
+                epigraph_core::TruthValue::clamped(0.6),
+                "a correction",
+            )
+            .await
+            .expect("A supersedes its own claim");
+            let id = ac::record_deferral(
+                &mut *tx,
+                "supersede",
+                Some(a),
+                v,
+                Some(gs),
+                &[],
+                Some(&o),
+                "no maintenance connection",
+            )
+            .await
+            .expect("A records its own supersede's deferral");
+            tx.commit().await.expect("commit");
+            (gs, id)
+        };
+        // A's consolidation deferral (it writes both sources) is admitted.
+        let consolidate_a = ac::record_deferral(
+            &mut *conn,
+            "consolidate",
+            Some(a),
+            merged,
+            None,
+            &[s1, s2],
+            None,
+            "t",
+        )
+        .await;
+
+        // R, a writer of its own group and a reader of A's.
+        stamp(&mut conn, &p, r).await;
+        let repoint = sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+            .bind(v)
+            .bind(n)
+            .execute(&mut *conn)
+            .await
+            .map(|d| d.rows_affected());
+        let hijack =
+            ac::record_deferral(&mut *conn, "supersede", Some(r), v, Some(n), &[], None, "t").await;
+        let misattributed =
+            ac::record_deferral(&mut *conn, "supersede", Some(a), v, Some(n), &[], None, "t").await;
+        let unattributed =
+            ac::record_deferral(&mut *conn, "supersede", None, v, Some(n), &[], None, "t").await;
+        let dedup_private = ac::record_deferral(
+            &mut *conn,
+            "dedup",
+            Some(r),
+            d_private,
+            Some(k),
+            &[],
+            None,
+            "t",
+        )
+        .await;
+        let dedup_public = ac::record_deferral(
+            &mut *conn,
+            "dedup",
+            Some(r),
+            d_public,
+            Some(p_claim),
+            &[],
+            None,
+            "t",
+        )
+        .await;
+        let consolidate_r = ac::record_deferral(
+            &mut *conn,
+            "consolidate",
+            Some(r),
+            merged,
+            None,
+            &[s1, s2],
+            None,
+            "t",
+        )
+        .await;
+        let retire_pending = ac::record_deferral(
+            &mut *conn,
+            "match_retire",
+            Some(r),
+            cand,
+            None,
+            &[],
+            None,
+            "t",
+        )
+        .await;
+        (
+            conn,
+            (
+                gs,
+                genuine,
+                (
+                    repoint,
+                    hijack,
+                    misattributed,
+                    unattributed,
+                    dedup_private,
+                    dedup_public,
+                    consolidate_r,
+                    consolidate_a,
+                    retire_pending,
+                ),
+            ),
+        )
+    })
+    .await;
+    let (
+        repoint,
+        hijack,
+        misattributed,
+        unattributed,
+        dedup_private,
+        dedup_public,
+        consolidate_r,
+        consolidate_a,
+        retire_pending,
+    ) = got;
+    assert_eq!(
+        repoint.expect("pointing its own claim at a PUBLIC claim is admitted (a dedup shape)"),
+        1
+    );
+    assert!(
+        is_cx(&hijack, "CX03"),
+        "R cannot defer a supersede of A's claim: {hijack:?}"
+    );
+    assert!(
+        is_cx(&misattributed, "CX02"),
+        "nor attribute one to A: {misattributed:?}"
+    );
+    assert!(
+        is_cx(&unattributed, "CX02"),
+        "nor record one unattributed: {unattributed:?}"
+    );
+    assert!(
+        is_cx(&dedup_private, "CX03"),
+        "FA04 in the definer: a dedup onto a private canonical R only reads: {dedup_private:?}"
+    );
+    dedup_public.expect("R's dedup of its own claim onto a PUBLIC canonical is admitted");
+    assert!(
+        is_cx(&consolidate_r, "CX03"),
+        "R cannot defer a consolidation of A's sources: {consolidate_r:?}"
+    );
+    consolidate_a.expect("A defers its own consolidation");
+    assert!(
+        is_cx(&retire_pending, "CX03"),
+        "a retirement deferral needs a stale candidate: {retire_pending:?}"
+    );
+
+    // The genuine row: attributed to A by the database, built by the definer.
+    let (agent, details): (Option<Uuid>, serde_json::Value) =
+        sqlx::query_as("SELECT agent_id, details FROM security_events WHERE id = $1")
+            .bind(genuine)
+            .fetch_one(&pool)
+            .await
+            .expect("the genuine row");
+    assert_eq!(agent, Some(a));
+    assert_eq!(
+        details["trigger"],
+        serde_json::json!({"agent_id": a, "oauth": oauth, "subject_id": v, "object_id": gs})
+    );
+    assert_eq!(details["cause"], "supersede");
+
+    // The replay's view of V: only A's deferral, naming A's successor.
+    let pending = ac::pending_replays(&pool, 50).await.expect("pending");
+    let for_v: Vec<_> = pending
+        .iter()
+        .filter(|(_, d)| d["trigger"]["subject_id"] == serde_json::json!(v))
+        .collect();
+    assert_eq!(for_v.len(), 1, "{pending:?}");
+    assert_eq!(for_v[0].0, genuine);
+    let object: Uuid =
+        serde_json::from_value(for_v[0].1["trigger"]["object_id"].clone()).expect("object id");
+    assert_eq!(object, gs);
+    // What the replay then runs: X's edge lands on A's successor, not on R's
+    // claim.
+    let moved = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let m =
+            epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, v, object).await;
+        (conn, m)
+    })
+    .await
+    .expect("the genuine migration");
+    assert_eq!(moved.retargeted, vec![x_edge]);
+    assert_eq!(endpoints(&pool, x_edge).await.0, gs);
+}
+
+/// 117 section 6(c): a non-privileged UPDATE may set `claims.supersedes` only
+/// to a claim that is public or that the session writes (FA04), so a reader
+/// cannot point its own claim at its group's private claim outside the dedup
+/// act either. Public and own-group targets, clearing the column, and a
+/// privileged session are unaffected.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_owner_cannot_point_supersedes_at_a_private_claim(pool: PgPool) {
+    let (a, g) = fixture::seed_agent_with_group(&pool, "group-writer-a").await;
+    let (r, r_group) = fixture::seed_agent_with_group(&pool, "reader-r").await;
+    add_reader(&pool, g, r).await;
+    let k = fixture::seed_group_claim(&pool, a, g, "G's private claim").await;
+    let own_private = fixture::seed_group_claim(&pool, r, r_group, "R's private claim").await;
+    let public = fixture::seed_public_claim(&pool, a, "a public claim").await;
+    let d = seed_public_claim_owned_by(&pool, r, r_group, "R's claim").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let got = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, r).await;
+        let mut out = Vec::new();
+        for target in [Some(k), Some(public), Some(own_private), None] {
+            let res = sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+                .bind(target)
+                .bind(d)
+                .execute(&mut *conn)
+                .await
+                .map(|x| x.rows_affected());
+            out.push(res);
+        }
+        (conn, out)
+    })
+    .await;
+    let e = got[0].as_ref().expect_err("R only reads K");
+    assert!(e.to_string().contains("FA04"), "{e}");
+    assert_eq!(*got[1].as_ref().expect("a public target"), 1);
+    assert_eq!(*got[2].as_ref().expect("R's own private claim"), 1);
+    assert_eq!(*got[3].as_ref().expect("clearing the column"), 1);
+
+    // The privileged harness is not held to it.
+    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+        .bind(k)
+        .bind(d)
+        .execute(&pool)
+        .await
+        .expect("a privileged session sets any supersedes");
+}

@@ -14,9 +14,13 @@
 //!   (or could not use it). The caller's act still commits, in the SAME
 //!   transaction as this row; the row is how the replay
 //!   (`epigraph_engine::admin_cascade::replay_deferred`) finds the cascades to
-//!   run. Written on the CALLER's session, so 077's `security_events_append`
-//!   admits it only when `agent_id` is the session principal (or NULL):
-//!   callers pass the principal they stamped.
+//!   run. Written on the CALLER's session through [`record_deferral`], which
+//!   calls 117's `epigraph_record_cascade_deferral` definer: the database
+//!   attributes the row to the session principal and admits it only for an
+//!   act that session made. A non-privileged session cannot INSERT any
+//!   `cascade.*` row itself (117's `security_events_cascade_privileged`), so
+//!   every row the replay reads was written by that definer or by a
+//!   privileged session.
 //! * [`EVENT_FAILED`]: the repair started on the maintenance connection and
 //!   failed; nothing of it committed. Replayable like a deferral.
 //! * [`EVENT_BELIEF`]: the belief re-derivation after an applied repair.
@@ -48,7 +52,51 @@ pub const EVENT_FAILED: &str = "cascade.admin_failed";
 /// names that row in `details.applied_event_id`.
 pub const EVENT_BELIEF: &str = "cascade.belief_rederived";
 
+/// Record a deferred cascade on the CALLER's session, through 117's
+/// `epigraph_record_cascade_deferral` definer, and return the row's id.
+///
+/// The definer builds the row itself: `agent_id` is the session principal
+/// (a different `agent_id` is refused, CX02), `created_at` is the time of the
+/// write, and the act must be one the session made -- the subject (and, for a
+/// supersede, its successor; for a consolidation, every source) written by the
+/// session, a dedup's canonical public or written by it (CX03). Call it inside
+/// the act's own transaction, after the act.
+///
+/// # Errors
+/// `DbError::QueryFailed` if the definer refuses or the call fails; nothing is
+/// recorded.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_deferral<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    cause: &str,
+    agent_id: Option<Uuid>,
+    subject_id: Uuid,
+    object_id: Option<Uuid>,
+    sources: &[Uuid],
+    oauth: Option<&serde_json::Value>,
+    reason: &str,
+) -> Result<Uuid, DbError> {
+    let id: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_record_cascade_deferral($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(cause)
+    .bind(agent_id)
+    .bind(subject_id)
+    .bind(object_id)
+    .bind(sources)
+    .bind(oauth)
+    .bind(reason)
+    .fetch_one(executor)
+    .await?;
+    Ok(id)
+}
+
 /// Append one cascade audit row and return its id.
+///
+/// On a non-privileged session 117 refuses every `cascade.*` row this writes;
+/// a request path records its deferral with [`record_deferral`] instead. The
+/// maintenance connection writes the applied, failed, belief and retired rows
+/// through this.
 ///
 /// # Errors
 /// `DbError::QueryFailed` if the INSERT is refused or fails.

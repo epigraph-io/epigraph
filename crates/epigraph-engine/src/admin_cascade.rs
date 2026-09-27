@@ -46,7 +46,8 @@
 //!
 //! A server without an explicitly configured maintenance DSN cannot run the
 //! cascade. It still commits the caller's act, reports the cascade as
-//! [`CascadeState::Deferred`] with a reason, and writes an [`EVENT_DEFERRED`]
+//! [`CascadeState::Deferred`] with a reason, and writes an
+//! [`EVENT_DEFERRED`](epigraph_db::repos::admin_cascade::EVENT_DEFERRED)
 //! row through [`record_deferral`] IN THE ACT'S OWN TRANSACTION, so the act and
 //! its deferral commit together. Every repair re-verifies the committed act
 //! and is idempotent, so [`replay_deferred`] runs the same `apply_after_*` call
@@ -64,9 +65,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use epigraph_db::repos::admin_cascade::{
-    self as audit, EVENT_APPLIED, EVENT_BELIEF, EVENT_DEFERRED, EVENT_FAILED,
-};
+use epigraph_db::repos::admin_cascade::{self as audit, EVENT_APPLIED, EVENT_BELIEF, EVENT_FAILED};
 use epigraph_db::repos::match_candidate::RetirementOutcome;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ClaimRepository, DbError, MatchCandidateRepo};
@@ -283,21 +282,42 @@ pub struct CascadeStatus {
 /// Record that `trigger`'s cascade was deferred, on `executor`.
 ///
 /// A request path calls this on the CALLER's session, inside the act's own
-/// transaction, so the act and its audit row commit together (or neither
-/// does); that is why the row's `agent_id` must be the session principal
-/// (077's `security_events_append`). The reason is the server's own text and
-/// names no row.
+/// transaction and after the act, so the act and its audit row commit
+/// together (or neither does). The row is written by 117's
+/// `epigraph_record_cascade_deferral` definer, which the replay trusts and a
+/// session cannot bypass: `trigger.agent_id` must be the session principal,
+/// and the act must be one the session made (see
+/// [`epigraph_db::repos::admin_cascade::record_deferral`]). The row it writes
+/// reads back through [`CascadeTrigger::from_audit`] as `trigger`. The reason
+/// is the server's own text and names no row.
 ///
 /// # Errors
-/// The INSERT's error; the caller propagates it, and nothing commits.
+/// The definer's refusal or the call's error; the caller propagates it, and
+/// nothing commits.
 pub async fn record_deferral<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     trigger: &CascadeTrigger,
     reason: &str,
 ) -> Result<CascadeStatus, DbError> {
-    let mut details = trigger.audit_details();
-    details["reason"] = serde_json::Value::String(reason.to_string());
-    let id = audit::record(executor, EVENT_DEFERRED, trigger.agent_id, false, &details).await?;
+    let oauth = trigger
+        .oauth
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| DbError::InvalidData {
+            reason: format!("the OAuth principal could not be encoded: {e}"),
+        })?;
+    let id = audit::record_deferral(
+        executor,
+        trigger.cause.as_str(),
+        trigger.agent_id,
+        trigger.subject_id,
+        trigger.object_id,
+        &trigger.sources,
+        oauth.as_ref(),
+        reason,
+    )
+    .await?;
     tracing::warn!(
         target: "tenancy.admin_cascade",
         cause = trigger.cause.as_str(),

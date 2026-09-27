@@ -18,6 +18,10 @@
 --       privileged maintenance connection, not with the caller's authority.
 --       So the cascade definer 115 added no longer needs, and no longer has,
 --       any arm that admits a row the session does not own.
+--   (3) The `security_events` rows that drive that cascade's replay are the
+--       server's: a non-privileged session writes no `cascade.*` row itself,
+--       and records a deferral only through a definer that checks the act is
+--       one the session made (section 6).
 --
 -- ===================================================================
 -- 1. WHY UPDATE, AND WHY THESE FIVE TABLES
@@ -143,8 +147,11 @@
 -- `edges_repoint_unsign` and its function; restore 115's body of
 -- `epigraph_cascade_delete_edge_bbas` with CREATE OR REPLACE (never DROP: a
 -- DROP resets the ACL); GRANT EXECUTE ON `epigraph_dedup_move_bbas(uuid, uuid,
--- uuid[])` TO epigraph_app. Checked before claiming: no `origin/*` ref carries
--- a `117`.
+-- uuid[])` TO epigraph_app; DROP POLICY `security_events_cascade_privileged`,
+-- DROP TRIGGER `claims_supersedes_guard` and its function, and DROP FUNCTION
+-- `epigraph_record_cascade_deferral` (new here, so a DROP resets nothing). A
+-- binary built with section 6 needs the function; roll the binary back first.
+-- Checked before claiming: no `origin/*` ref carries a `117`.
 
 SET LOCAL lock_timeout = '3s';
 
@@ -319,3 +326,206 @@ DROP TRIGGER IF EXISTS edges_repoint_unsign ON public.edges;
 CREATE TRIGGER edges_repoint_unsign
     BEFORE UPDATE OF source_id, source_type, target_id, target_type ON public.edges
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_edges_repoint_unsign();
+
+-- ===================================================================
+-- 6. THE CASCADE AUDIT ROWS ARE THE SERVER'S, NOT THE SESSION'S
+-- ===================================================================
+-- The replay (`replay_deferred_cascades`) runs a repair with administrative
+-- authority for every `cascade.deferred` / `cascade.admin_failed` row that no
+-- later `cascade.admin_applied` / `cascade.retired` row answers. So those rows
+-- are instructions to a privileged process, and 077's `security_events_append`
+-- is not a strong enough gate for them: it admits any row whose `agent_id`
+-- column is NULL or the session principal, with any `details` and any
+-- `created_at`. Three rules close that:
+--
+--   (a) A non-privileged session writes NO `cascade.*` row directly (a
+--       RESTRICTIVE INSERT policy, AND-ed with 077's permissive one). That
+--       covers the answering rows too: a `cascade.admin_applied` row would
+--       otherwise silence a genuine deferral. The privileged arms are 077's:
+--       the maintenance session, and a body running as the maintenance role.
+--       Every maintenance-owned definer that inserts into `security_events`
+--       names a fixed event type that is not `cascade.*` (114's two, 115's and
+--       section 2's `derived.cascade_bba_delete`), except the one below.
+--   (b) A deferral is written only by `epigraph_record_cascade_deferral`, a
+--       definer that derives the row from committed state and the session:
+--       `agent_id` is the session principal (a named principal that differs
+--       is refused), `created_at` is the default, `details` is built here, and
+--       the act must be one this session could have made:
+--         supersede    : the retired subject and its successor, both written by
+--                        the session (the supersede act's own authority);
+--         dedup        : the retired duplicate, written by the session, onto a
+--                        canonical that is public or written by the session
+--                        (114's attach rule, FA04, as the act checks it);
+--         consolidate  : every retired source, written by the session;
+--         match_retire : the candidate is `stale`. `match_candidates` carries
+--                        no tenancy, so the database holds no finer authority
+--                        for a retirement than the table grant; the request
+--                        paths gate it on the `claims:admin` scope.
+--       A privileged session is not held to the authority half (it may write
+--       any row under (a) anyway) but is to the state half. The OAuth part of
+--       the trigger is the server's report of the request, recorded as given;
+--       `agent_id` is the attribution the database vouches for.
+--   (c) A non-privileged UPDATE that sets `claims.supersedes` to a claim the
+--       session neither writes nor sees as public is refused (FA04). The
+--       dedup act checks this too, but an UPDATE of `supersedes` issued
+--       outside the act had no guard, and 074's check runs on INSERT only.
+--       074's other INSERT rule (a public successor of a group-private claim)
+--       is about the tenancy an INSERT inherits; an UPDATE inherits nothing,
+--       so it is not repeated here.
+DROP POLICY IF EXISTS security_events_cascade_privileged ON public.security_events;
+CREATE POLICY security_events_cascade_privileged ON public.security_events
+    AS RESTRICTIVE FOR INSERT TO PUBLIC
+    WITH CHECK (
+        left(event_type, 8) <> 'cascade.'
+        OR (SELECT public.epigraph_bypass())
+        OR (SELECT public.epigraph_definer_bypass()));
+
+CREATE OR REPLACE FUNCTION public.epigraph_record_cascade_deferral(
+    p_cause text, p_agent_id uuid, p_subject uuid, p_object uuid, p_sources uuid[],
+    p_oauth jsonb, p_reason text)
+RETURNS uuid
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, public AS $$
+DECLARE
+    -- session_user, not current_user: inside this frame current_user is the
+    -- owner (epigraph_maintenance).
+    v_priv boolean := public.epigraph_bypass()
+        OR COALESCE((SELECT r.rolsuper OR r.rolbypassrls FROM pg_catalog.pg_roles r
+                      WHERE r.rolname = session_user), false);
+    v_principal uuid := public.epigraph_principal_id();
+    v_sources uuid[] := COALESCE(p_sources, ARRAY[]::uuid[]);
+    v_agent uuid;
+    v_ok boolean;
+    v_oauth jsonb;
+    v_trigger jsonb;
+    v_id uuid := gen_random_uuid();
+BEGIN
+    IF p_cause IS NULL OR p_cause NOT IN ('supersede', 'dedup', 'consolidate', 'match_retire') THEN
+        RAISE EXCEPTION 'CX01: unknown cascade cause %; no deferral was recorded', p_cause
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_subject IS NULL
+       OR (p_cause IN ('supersede', 'dedup')) <> (p_object IS NOT NULL)
+       OR (p_cause = 'consolidate') <> (cardinality(v_sources) > 0) THEN
+        RAISE EXCEPTION 'CX01: a % deferral names a subject%; no deferral was recorded', p_cause,
+            CASE p_cause WHEN 'supersede' THEN ' and an object, and no sources'
+                         WHEN 'dedup' THEN ' and an object, and no sources'
+                         WHEN 'consolidate' THEN ' and its sources, and no object'
+                         ELSE ', and no object or sources' END
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF v_priv THEN
+        v_agent := COALESCE(p_agent_id, v_principal);
+    ELSIF v_principal IS NULL OR p_agent_id IS DISTINCT FROM v_principal THEN
+        RAISE EXCEPTION 'CX02: a deferral is attributed to the session principal, and this '
+            'session''s principal (%) is not the one named (%); no deferral was recorded',
+            v_principal, p_agent_id
+            USING ERRCODE = '42501';
+    ELSE
+        v_agent := v_principal;
+    END IF;
+
+    IF p_cause = 'supersede' THEN
+        v_ok := EXISTS (SELECT 1 FROM public.claims o JOIN public.claims n ON n.id = p_object
+                         WHERE o.id = p_subject AND NOT COALESCE(o.is_current, true)
+                           AND n.supersedes = o.id)
+            AND (v_priv OR (public.epigraph_session_writes_node(p_subject, 'claim')
+                            AND public.epigraph_session_writes_node(p_object, 'claim')));
+    ELSIF p_cause = 'dedup' THEN
+        v_ok := EXISTS (SELECT 1 FROM public.claims d
+                         WHERE d.id = p_subject AND d.supersedes = p_object
+                           AND NOT COALESCE(d.is_current, true))
+            AND (v_priv OR (public.epigraph_session_writes_node(p_subject, 'claim')
+                            AND EXISTS (SELECT 1 FROM public.claims k
+                                         WHERE k.id = p_object
+                                           AND (k.visibility::text = 'public'
+                                                OR public.epigraph_session_writes_node(k.id, 'claim')))));
+    ELSIF p_cause = 'consolidate' THEN
+        v_ok := (SELECT count(DISTINCT s) FROM unnest(v_sources) s) = cardinality(v_sources)
+            AND (SELECT count(*) FROM public.claims s
+                  WHERE s.id = ANY (v_sources) AND s.supersedes = p_subject
+                    AND NOT COALESCE(s.is_current, true)) = cardinality(v_sources)
+            AND (v_priv OR NOT EXISTS (
+                    SELECT 1 FROM unnest(v_sources) s
+                     WHERE NOT public.epigraph_session_writes_node(s, 'claim')));
+    ELSE
+        v_ok := EXISTS (SELECT 1 FROM public.match_candidates mc
+                         WHERE mc.id = p_subject AND mc.status = 'stale');
+    END IF;
+    IF NOT COALESCE(v_ok, false) THEN
+        RAISE EXCEPTION 'CX03: the % act on % is not recorded as one this session made; a '
+            'deferral names only a committed act of its own session; no deferral was recorded',
+            p_cause, p_subject
+            USING ERRCODE = '42501';
+    END IF;
+
+    IF p_oauth IS NULL OR jsonb_typeof(p_oauth) = 'null' THEN
+        v_oauth := 'null'::jsonb;
+    ELSIF jsonb_typeof(p_oauth) <> 'object'
+          OR EXISTS (SELECT 1 FROM jsonb_object_keys(p_oauth) k
+                      WHERE k NOT IN ('client_id', 'owner_id', 'agent_id')) THEN
+        RAISE EXCEPTION 'CX01: the OAuth principal must be an object of client_id, owner_id and '
+            'agent_id; no deferral was recorded'
+            USING ERRCODE = '22023';
+    ELSE
+        v_oauth := jsonb_build_object('client_id', (p_oauth->>'client_id')::uuid,
+                                      'owner_id',  (p_oauth->>'owner_id')::uuid,
+                                      'agent_id',  (p_oauth->>'agent_id')::uuid);
+    END IF;
+
+    v_trigger := jsonb_build_object('agent_id', v_agent, 'oauth', v_oauth,
+                                    'subject_id', p_subject, 'object_id', p_object);
+    IF p_cause = 'consolidate' THEN
+        v_trigger := v_trigger || jsonb_build_object('sources', to_jsonb(v_sources));
+    END IF;
+    INSERT INTO public.security_events (id, event_type, agent_id, success, details)
+    VALUES (v_id, 'cascade.deferred', v_agent, false,
+            jsonb_build_object('cause', p_cause, 'trigger', v_trigger, 'migration', 117,
+                               'reason', p_reason, 'session_user', session_user::text,
+                               'recorded_by', 'epigraph_record_cascade_deferral'));
+    RETURN v_id;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_record_cascade_deferral(
+    text, uuid, uuid, uuid, uuid[], jsonb, text) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION public.epigraph_claims_supersedes_guard()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF NEW.supersedes IS NULL OR NEW.supersedes IS NOT DISTINCT FROM OLD.supersedes
+       OR public.epigraph_session_is_privileged_writer() THEN
+        RETURN NEW;
+    END IF;
+    -- Read as the invoker: a claim the session cannot read is refused like a
+    -- private one, and the message names nothing the session could not see.
+    IF NOT EXISTS (SELECT 1 FROM public.claims k
+                    WHERE k.id = NEW.supersedes
+                      AND (k.visibility::text = 'public'
+                           OR public.epigraph_session_writes_node(k.id, 'claim'))) THEN
+        RAISE EXCEPTION 'FA04: claim % may not name % in supersedes: it is not public and this '
+            'session cannot write it; a non-owner may attach only to a PUBLIC claim; nothing was '
+            'written', NEW.id, NEW.supersedes
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS claims_supersedes_guard ON public.claims;
+CREATE TRIGGER claims_supersedes_guard
+    BEFORE UPDATE OF supersedes ON public.claims
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_claims_supersedes_guard();
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_record_cascade_deferral('
+                'text, uuid, uuid, uuid, uuid[], jsonb, text) OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_record_cascade_deferral('
+                'text, uuid, uuid, uuid, uuid[], jsonb, text) TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_record_cascade_deferral('
+                'text, uuid, uuid, uuid, uuid[], jsonb, text) TO epigraph_app';
+    END IF;
+END $$;
