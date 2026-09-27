@@ -269,22 +269,25 @@
 -- DSN login, or a maintenance-owned definer body); the application's own
 -- statements cannot re-own one of these rows.
 --
--- WHAT THE GUARD DOES NOT BIND: a re-own issued by a maintenance-owned
--- DEFINER on behalf of a non-privileged statement. Inside such a body
--- `current_user` is the maintenance role, so the guard admits it, by design
--- (it is what lets arm (d) propagate a claim's tenancy). Two definers restamp
--- an owner in response to an ordinary application write, and each is a
--- re-own vector unless something else bounds it:
---   * 089's fragment stamp, fired by an INSERT into
---     `harvester_claim_provenance`. It would move a sentinel-owned fragment
---     into the citing claim's group, whoever wrote the fragment and whoever
---     else cites it, after which that group's writer could DELETE it and the
---     FK cascade would take every other claim's provenance row with it.
---     Section 9 closes it: the stamp now runs only for a session that could
---     itself have written a sentinel-owned fragment.
---   * 070/072's edge tenancy, fired by an UPDATE that re-points an edge's
---     endpoints. It stays a recorded residual of the same class (the UPDATE
---     side of 077 on `edges`, section 0), not closed here.
+-- WHAT THE GUARD DOES NOT STOP: two re-owns that follow an ordinary
+-- application write, by two different routes.
+--   * A DEFINER that issues the re-own itself. 089's fragment stamp, fired by
+--     an INSERT into `harvester_claim_provenance`, runs `UPDATE
+--     harvester_fragments SET owner_group_id = ...` as the maintenance owner;
+--     the guard fires, sees a maintenance `current_user`, and admits it, as it
+--     must for arm (d)'s propagation. So the stamp moved a sentinel-owned
+--     fragment into the citing claim's group, whoever wrote the fragment and
+--     whoever else cites it, after which that group's writer could DELETE it
+--     and the FK cascade would take every other claim's provenance row with
+--     it. Section 9 closes it: the stamp now runs only for a session that
+--     could itself have written a sentinel-owned fragment.
+--   * A BEFORE trigger that rewrites NEW. An UPDATE that re-points an edge's
+--     endpoints names only `source_id` / `target_id` in its SET list;
+--     070/072's `edges_tenancy` (BEFORE INSERT OR UPDATE OF source_id,
+--     target_id) then recomputes the row's owner from the new endpoints, and
+--     `edges_owner_immutable` (UPDATE OF the owner columns) never fires. That
+--     is part of 077's UPDATE side on `edges` (section 0) and is not closed
+--     here.
 --
 -- ===================================================================
 -- 8. THE GROUP-KEYED SEALED-CONTENT TABLES
