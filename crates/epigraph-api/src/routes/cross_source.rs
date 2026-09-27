@@ -419,16 +419,35 @@ pub async fn decide_candidate(
                 }
                 (None, status) => (status, None),
             };
-            let outcome =
-                outcome.unwrap_or(epigraph_db::repos::match_candidate::RetirementOutcome {
-                    previous_status: String::new(),
-                    affected_claims: vec![row.claim_a, row.claim_b],
-                    edges_retracted: 0,
-                    factors_deleted: 0,
-                    bp_messages_deleted: 0,
-                    bbas_invalidated: 0,
-                    retracted_edges: Vec::new(),
-                });
+            // With no cascade (deferred), the endpoints come from the candidate
+            // row, filtered to the caller's view exactly as an applied
+            // cascade's outcome is (`admin_cascade::retirement_for_caller`).
+            let outcome = match outcome {
+                Some(o) => o,
+                None => {
+                    let endpoints = [row.claim_a, row.claim_b];
+                    let visible = match state.read_as(&viewer).await {
+                        Ok(mut read) => epigraph_db::ClaimRepository::visible_claim_ids(
+                            &mut *read, &viewer, &endpoints,
+                        )
+                        .await
+                        .unwrap_or_default(),
+                        Err(_) => std::collections::HashSet::new(),
+                    };
+                    epigraph_db::repos::match_candidate::RetirementOutcome {
+                        previous_status: String::new(),
+                        affected_claims: endpoints
+                            .into_iter()
+                            .filter(|c| visible.contains(c))
+                            .collect(),
+                        edges_retracted: 0,
+                        factors_deleted: 0,
+                        bp_messages_deleted: 0,
+                        bbas_invalidated: 0,
+                        retracted_edges: Vec::new(),
+                    }
+                }
+            };
 
             // Deliberately NOT followed by `recompute_claim_belief_binary`.
             // That entry point recombines `mass_functions`, and a matcher
