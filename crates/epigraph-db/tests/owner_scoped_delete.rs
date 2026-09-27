@@ -1434,6 +1434,363 @@ async fn a_provenance_insert_does_not_hand_a_session_a_world_fragment(pool: PgPo
 }
 
 // ===========================================================================
+// 3c. The privileged writers, on a NON-superuser maintenance member.
+// ===========================================================================
+
+/// Every row the round trip below can touch, keyed `(table, primary key)`,
+/// as `to_jsonb(row)`. `claims.updated_at` is the one column removed: 001's
+/// unconditional `claims_updated_at` trigger restamps it on every UPDATE, and
+/// the operator module documents it as the column neither `reown-claims` nor
+/// `reown-reverse` can put back.
+async fn round_trip_snapshot(
+    pool: &PgPool,
+    claims: &[Uuid],
+    edges: &[Uuid],
+    frags: &[Uuid],
+) -> Vec<(String, String, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT 'claims', id::text, to_jsonb(t) - 'updated_at' FROM claims t \
+          WHERE id = ANY($1) \
+         UNION ALL SELECT 'claim_frames', concat_ws(',', claim_id, frame_id), to_jsonb(t) \
+           FROM claim_frames t WHERE claim_id = ANY($1) \
+         UNION ALL SELECT 'claim_versions', id::text, to_jsonb(t) \
+           FROM claim_versions t WHERE claim_id = ANY($1) \
+         UNION ALL SELECT 'mass_functions', id::text, to_jsonb(t) \
+           FROM mass_functions t WHERE claim_id = ANY($1) \
+         UNION ALL SELECT 'harvester_claim_provenance', concat_ws(',', claim_id, fragment_id), \
+                          to_jsonb(t) \
+           FROM harvester_claim_provenance t WHERE claim_id = ANY($1) \
+         UNION ALL SELECT 'harvester_fragments', id::text, to_jsonb(t) \
+           FROM harvester_fragments t WHERE id = ANY($3) \
+         UNION ALL SELECT 'edges', id::text, to_jsonb(t) FROM edges t WHERE id = ANY($2) \
+         ORDER BY 1, 2",
+    )
+    .bind(claims)
+    .bind(edges)
+    .bind(frags)
+    .fetch_all(pool)
+    .await
+    .expect("round-trip snapshot")
+}
+
+/// `epigraph-cli`'s `operator::tables::write_tenancy`, verbatim but for the
+/// table-spec plumbing: the statement `reown-claims --derived keep-writer`
+/// uses to put a derived row back, and `reown-reverse` uses to write a row's
+/// recorded tenancy. `scope` is `t.claim_id = ANY($2)` for a derived table and
+/// `t.id = ANY($2)` for `edges`; on `edges` the SET list also names
+/// `co_owner_group_id`, which is what arms `edges_owner_immutable` for it.
+async fn write_tenancy_shape(
+    conn: &mut PgConnection,
+    table: &str,
+    scope: &str,
+    bind_ids: &[Uuid],
+    rows: &[(Uuid, Uuid, &str, Option<Uuid>)],
+) -> u64 {
+    let edges = table == "edges";
+    let payload: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(pk, o, v, co)| serde_json::json!({"pk": pk.to_string(), "o": o, "v": v, "co": co}))
+        .collect();
+    let (set_co, cmp_co, m_co) = if edges {
+        (
+            ", co_owner_group_id = m.co",
+            ", t.co_owner_group_id",
+            ", m.co",
+        )
+    } else {
+        ("", "", "")
+    };
+    let sql = format!(
+        "UPDATE \"{table}\" AS t SET owner_group_id = m.o, visibility = m.v{set_co} \
+           FROM jsonb_to_recordset($1::jsonb) AS m(pk text, o uuid, v text, co uuid) \
+          WHERE {scope} AND t.\"id\"::text = m.pk \
+            AND (t.owner_group_id, t.visibility::text{cmp_co}) IS DISTINCT FROM (m.o, m.v{m_co})"
+    );
+    sqlx::query(&sql)
+        .bind(serde_json::Value::Array(payload))
+        .bind(bind_ids)
+        .execute(&mut *conn)
+        .await
+        .unwrap_or_else(|e| panic!("write_tenancy shape on {table}: {e}"))
+        .rows_affected()
+}
+
+/// Section 7's guard exempts a privileged session through
+/// `epigraph_session_is_privileged_writer()`. Every other positive arm of it in
+/// this suite runs as the harness SUPERUSER, which satisfies the `rolsuper`
+/// arm before the two a real maintenance login would use are reached. Here a
+/// fresh NOLOGIN role that is only a MEMBER of `epigraph_maintenance` (not a
+/// superuser, not BYPASSRLS) runs, in one transaction, the operator's write
+/// shapes and the privatization job's:
+///
+/// * `reown-claims`: its `UPDATE claims SET owner_group_id` (the trigger
+///   carries it into `claim_frames`, `claim_versions`, `mass_functions`,
+///   `harvester_claim_provenance` and the fragment), then its keep-writer
+///   `write_tenancy` on `claim_versions`, and a `write_tenancy` that moves an
+///   edge's owner AND co-owner;
+/// * `reown-reverse`: its `UPDATE claims ... FROM jsonb_to_recordset`, and the
+///   `write_tenancy` that restores the edge's recorded tenancy;
+/// * privatization: the real `begin_batch_conn`, `restrict_claims_conn` and
+///   `recompute_boundary_meet_conn` (which re-owns both edges, one of them
+///   gaining a co-owner), then `restore_claims_conn` (which sets the
+///   declassify GUC `SET LOCAL`, hence the explicit transaction) and the meet
+///   again.
+///
+/// Each shape must land (a guard refusal would abort the transaction) and move
+/// exactly the rows expected of it. Seven of them re-own a row through the
+/// session's OWN statement (the two claims UPDATEs, the restrict, the restore,
+/// the keep-writer and edge `write_tenancy`, and the widening meet), so the
+/// exemption is exercised for each guarded table they name; the rest are
+/// carried by the definer triggers. After COMMIT every touched row is
+/// identical to its pre-image bar `claims.updated_at`.
+///
+/// The two non-superuser arms of `epigraph_session_is_privileged_writer()` (a
+/// maintenance-member `session_user`, a maintenance-member `current_user`) are
+/// BOTH true for this session, so removing either one alone leaves this test
+/// green; removing both makes every re-own here fail with the guard's 42501.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exactly(pool: PgPool) {
+    use epigraph_db::repos::privatization::PrivatizationRepository;
+
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (writer, _) = fixture::seed_agent_with_group(&pool, "writer").await;
+    let (_operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (_b, b_group) = fixture::seed_agent_with_group(&pool, "private-b").await;
+    let (_p, p_group) = fixture::seed_agent_with_group(&pool, "privatizer").await;
+    let c1 = fixture::seed_public_claim(&pool, author, "the claim that moves").await;
+    let c2 = fixture::seed_group_claim(&pool, author, b_group, "a private neighbour").await;
+    let c3 = fixture::seed_public_claim(&pool, author, "a public neighbour").await;
+    let bt = seed_frame(&pool, "binary_truth").await;
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0)",
+    )
+    .bind(c1)
+    .bind(bt)
+    .execute(&pool)
+    .await
+    .expect("claim_frames row");
+    sqlx::query(
+        "INSERT INTO claim_versions (claim_id, version_number, content, truth_value, created_by) \
+         VALUES ($1, 1, 'v1', 0.5, $2)",
+    )
+    .bind(c1)
+    .bind(writer)
+    .execute(&pool)
+    .await
+    .expect("claim_versions row");
+    let version: Uuid = sqlx::query_scalar("SELECT id FROM claim_versions WHERE claim_id = $1")
+        .bind(c1)
+        .fetch_one(&pool)
+        .await
+        .expect("version id");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        store_bba(&mut conn, c1, bt, writer, None).await;
+    }
+    let source = insert_harvester_source(&pool).await;
+    let frag = insert_public_fragment(&pool, source, WORLD, "a fragment of the claim").await;
+    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
+        .bind(c1)
+        .bind(frag)
+        .execute(&pool)
+        .await
+        .expect("provenance");
+    let e_private = fixture::seed_edge(&pool, c1, c2).await;
+    let e_public = fixture::seed_edge(&pool, c1, c3).await;
+    let (e_owner, e_co): (Uuid, Option<Uuid>) =
+        sqlx::query_as("SELECT owner_group_id, co_owner_group_id FROM edges WHERE id = $1")
+            .bind(e_private)
+            .fetch_one(&pool)
+            .await
+            .expect("edge tenancy");
+    assert_eq!(
+        (e_owner, e_co),
+        (b_group, None),
+        "calibration: the meet of a public and a private endpoint"
+    );
+    // The plan row exists only for `restore_claims_conn`'s join to its frozen
+    // pre-image. 081's plan guards (target age, co-admins, instance admin) are
+    // not under test here, so the two rows are written with triggers off, on
+    // a superuser transaction that ends before anything under test runs.
+    let plan = Uuid::new_v4();
+    {
+        let mut tx = pool.begin().await.expect("begin plan seed");
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .expect("triggers off for the plan seed");
+        sqlx::query(
+            "INSERT INTO privatization_plans (id, mode, target_group_id, selector, created_by) \
+             VALUES ($1, 'restrict', $2, '{}'::jsonb, $3)",
+        )
+        .bind(plan)
+        .bind(p_group)
+        .bind(author)
+        .execute(&mut *tx)
+        .await
+        .expect("seed a plan");
+        sqlx::query(
+            "INSERT INTO privatization_plan_items (plan_id, kind, entity_id, depth, via, \
+                 before_visibility, before_owner_group_id, before_had_embedding) \
+             SELECT $1, 'claim', id, 0, 'seed', visibility, owner_group_id, false \
+               FROM claims WHERE id = $2",
+        )
+        .bind(plan)
+        .bind(c1)
+        .execute(&mut *tx)
+        .await
+        .expect("freeze the plan item");
+        tx.commit().await.expect("commit plan seed");
+    }
+
+    let claims = [c1, c2, c3];
+    let edges = [e_private, e_public];
+    let frags = [frag];
+    let before = round_trip_snapshot(&pool, &claims, &edges, &frags).await;
+    assert_eq!(before.len(), 10, "fixture rows: {before:#?}");
+
+    let role = format!("w9_maint_member_{}", Uuid::new_v4().simple());
+    for stmt in [
+        format!("CREATE ROLE {role} NOLOGIN"),
+        format!("GRANT epigraph_maintenance TO {role}"),
+    ] {
+        sqlx::query(&stmt)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+
+    let steps = fixture::as_role(&pool, &role, |mut conn| async move {
+        let (sup, bypassrls, bypass): (bool, bool, bool) = sqlx::query_as(
+            "SELECT r.rolsuper, r.rolbypassrls, public.epigraph_bypass() \
+               FROM pg_roles r WHERE r.rolname = session_user",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("calibrate the member session");
+        let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+        let mut steps: Vec<(&str, u64)> = Vec::new();
+
+        // reown-claims (`operator::reown`), follow-claim.
+        let n = sqlx::query(
+            "UPDATE claims SET owner_group_id = $2 \
+              WHERE id = ANY($1) AND owner_group_id IS DISTINCT FROM $2",
+        )
+        .bind(&[c1][..])
+        .bind(op_group)
+        .execute(&mut *tx)
+        .await
+        .expect("reown UPDATE claims")
+        .rows_affected();
+        steps.push(("reown claims", n));
+        // keep-writer: put the version row back where it was.
+        let n = write_tenancy_shape(
+            &mut tx,
+            "claim_versions",
+            "t.claim_id = ANY($2)",
+            &[c1],
+            &[(version, WORLD, "public", None)],
+        )
+        .await;
+        steps.push(("keep-writer claim_versions", n));
+        let n = write_tenancy_shape(
+            &mut tx,
+            "edges",
+            "t.id = ANY($2)",
+            &[e_private],
+            &[(e_private, op_group, "group", Some(b_group))],
+        )
+        .await;
+        steps.push(("write_tenancy edges (owner + co-owner)", n));
+
+        // reown-reverse (`operator::reverse`).
+        let n = sqlx::query(
+            "UPDATE claims c SET owner_group_id = m.o \
+               FROM jsonb_to_recordset($1::jsonb) AS m(id uuid, o uuid) \
+              WHERE c.id = m.id AND c.owner_group_id = $2 AND c.owner_group_id <> m.o",
+        )
+        .bind(serde_json::json!([{"id": c1, "o": WORLD}]))
+        .bind(op_group)
+        .execute(&mut *tx)
+        .await
+        .expect("reverse UPDATE claims")
+        .rows_affected();
+        steps.push(("reverse claims", n));
+        let n = write_tenancy_shape(
+            &mut tx,
+            "edges",
+            "t.id = ANY($2)",
+            &[e_private],
+            &[(e_private, b_group, "group", None)],
+        )
+        .await;
+        steps.push(("reverse edges (recorded tenancy)", n));
+
+        // Privatization: apply, then revert.
+        PrivatizationRepository::begin_batch_conn(&mut tx)
+            .await
+            .expect("begin_batch_conn");
+        let moved = PrivatizationRepository::restrict_claims_conn(&mut tx, &[c1], p_group)
+            .await
+            .expect("restrict_claims_conn");
+        steps.push(("restrict", moved.len() as u64));
+        let n = PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &[c1])
+            .await
+            .expect("recompute_boundary_meet_conn (apply)");
+        steps.push(("meet after restrict", n));
+        let n = PrivatizationRepository::restore_claims_conn(&mut tx, plan, &[c1], p_group)
+            .await
+            .expect("restore_claims_conn");
+        steps.push(("restore", n));
+        let n = PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &[c1])
+            .await
+            .expect("recompute_boundary_meet_conn (revert)");
+        steps.push(("meet after restore", n));
+
+        tx.commit().await.expect("commit");
+        (conn, (sup, bypassrls, bypass, steps))
+    })
+    .await;
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&pool)
+        .await
+        .expect("drop the probe role");
+
+    let (sup, bypassrls, bypass, steps) = steps;
+    assert!(
+        !sup && !bypassrls && bypass,
+        "calibration: a member session, neither superuser nor BYPASSRLS \
+         (rolsuper {sup}, rolbypassrls {bypassrls}, epigraph_bypass {bypass})"
+    );
+    assert_eq!(
+        steps,
+        vec![
+            ("reown claims", 1),
+            ("keep-writer claim_versions", 1),
+            ("write_tenancy edges (owner + co-owner)", 1),
+            ("reverse claims", 1),
+            // 0: the reverse's claims UPDATE already re-ran the edge meet
+            // (072's propagation), so the recorded tenancy is in place; the
+            // statement is the module's no-op for a row the trigger restored.
+            ("reverse edges (recorded tenancy)", 0),
+            ("restrict", 1),
+            // 0: the restrict's propagation already narrowed both edges.
+            ("meet after restrict", 0),
+            ("restore", 1),
+            // 1: the one WIDENING (the public-public edge back to world),
+            // which 072's propagation refuses and only this statement does.
+            ("meet after restore", 1),
+        ],
+        "every shape landed; the counts are what each is expected to move"
+    );
+    let after = round_trip_snapshot(&pool, &claims, &edges, &frags).await;
+    assert_eq!(
+        after, before,
+        "every touched row is back to its pre-image (bar claims.updated_at)"
+    );
+}
+
+// ===========================================================================
 // 4. The catalog.
 // ===========================================================================
 
