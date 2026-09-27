@@ -293,13 +293,62 @@ async fn insert_pending_candidate(pool: &PgPool, a: Uuid, b: Uuid) -> Uuid {
     .unwrap()
 }
 
+/// The URL of the `#[sqlx::test]` pool's own ephemeral database.
+fn database_url_of(pool: &PgPool) -> String {
+    let db = pool
+        .connect_options()
+        .get_database()
+        .expect("the #[sqlx::test] pool names its database")
+        .to_string();
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let (authority, query) = match base.split_once('?') {
+        Some((a, q)) => (a, Some(q)),
+        None => (base.as_str(), None),
+    };
+    let prefix = authority
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .expect("DATABASE_URL must carry a database path")
+        .0;
+    match query {
+        Some(q) => format!("{prefix}/{db}?{q}"),
+        None => format!("{prefix}/{db}"),
+    }
+}
+
+/// A state built through a `ScopedPool` (the retire act runs on a
+/// viewer-stamped transaction), with the administrative cascade enabled on the
+/// harness pool when `admin` is set (migration 117).
+async fn decide_state(pool: PgPool, admin: bool) -> AppState {
+    let scoped = epigraph_db::ScopedPool::connect(
+        &database_url_of(&pool),
+        epigraph_db::SessionGucMode::Session,
+    )
+    .await
+    .expect("ScopedPool over the test database");
+    let scoped = if admin {
+        scoped.with_maintenance_pool(pool)
+    } else {
+        scoped
+    };
+    AppState::with_scoped_pool(scoped, ApiConfig::default()).with_admin_cascade(admin)
+}
+
 async fn post_decide(
     pool: PgPool,
     candidate: Uuid,
     token: &str,
     verdict: &str,
 ) -> axum::http::Response<Body> {
-    let state = AppState::with_db(pool, ApiConfig::default());
+    post_decide_on(decide_state(pool, true).await, candidate, token, verdict).await
+}
+
+async fn post_decide_on(
+    state: AppState,
+    candidate: Uuid,
+    token: &str,
+    verdict: &str,
+) -> axum::http::Response<Body> {
     create_router(state)
         .oneshot(
             Request::builder()
@@ -546,6 +595,10 @@ async fn retire_undoes_a_promotion_including_its_derived_factors(pool: PgPool) {
 
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
+        json["cascade"]["status"], "applied",
+        "migration 117: the retraction runs as the administrative cascade: {json}"
+    );
+    assert_eq!(
         json["edges_retracted"].as_i64(),
         Some(1),
         "the response must account for the retracted edge"
@@ -752,5 +805,52 @@ async fn retire_is_refused_to_a_claims_write_caller(pool: PgPool) {
     assert_eq!(
         edges, 1,
         "the promoted edge must still be in force after the refused retire"
+    );
+}
+
+/// Migration 117: with NO administrative connection the retire verdict still
+/// commits its act (the candidate is `stale`), reports the cascade deferred
+/// with its `security_events` row, and leaves the matcher edge in force.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_without_an_admin_connection_defers_the_cascade(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+    let client_id = Uuid::new_v4();
+    let token = decide_bearer_token(client_id, Some(agent), "agent");
+    let resp = post_decide(pool.clone(), candidate, &token, "promote").await;
+    assert_eq!(resp.status(), StatusCode::OK, "promote must succeed");
+
+    let token = admin_bearer_token(client_id, Some(agent), "agent");
+    let state = decide_state(pool.clone(), false).await;
+    let resp = post_decide_on(state, candidate, &token, "retire").await;
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the act commits (body: {})",
+        String::from_utf8_lossy(&body)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["cascade"]["status"], "deferred", "{json}");
+    assert_eq!(status_of(&pool, candidate).await, "stale");
+    let (edges, _, _) = matcher_edge_footprint(&pool, a, b).await;
+    assert_eq!(edges, 1, "the deferred cascade retracted nothing");
+    let event: Uuid = json["cascade"]["audit_event_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("the deferral names its audit row");
+    let (et, cause): (String, String) = sqlx::query_as(
+        "SELECT event_type::text, details->>'cause' FROM security_events WHERE id = $1",
+    )
+    .bind(event)
+    .fetch_one(&pool)
+    .await
+    .expect("deferral row");
+    assert_eq!(
+        (et.as_str(), cause.as_str()),
+        ("cascade.deferred", "match_retire")
     );
 }

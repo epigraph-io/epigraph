@@ -25,6 +25,32 @@ pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) 
     (addr, tx)
 }
 
+/// [`spawn_app`] with the administrative cascade enabled (migration 117): the
+/// retraction cascade after a supersede, a dedup or a match-candidate
+/// retirement runs on a maintenance pool, as on a server configured with
+/// `MAINTENANCE_DATABASE_URL`. Plain [`spawn_app`] has none, so it defers.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: only the cascade binaries use it"
+)]
+pub async fn spawn_app_with_admin_cascade(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) {
+    let app = epigraph_api::build_app_for_tests_with_admin_cascade(database_url)
+        .await
+        .expect("app builds for tests");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (addr, tx)
+}
+
 /// [`spawn_app`] with a caller-chosen webhook-registration egress guard, for
 /// tests that need particular DNS answers (a name that resolves to loopback,
 /// one that does not resolve). No real DNS: pass a guard over a `StubResolver`.

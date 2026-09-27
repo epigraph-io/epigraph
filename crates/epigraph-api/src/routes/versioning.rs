@@ -65,9 +65,14 @@ pub struct DedupResponse {
     pub duplicate_id: Uuid,
     pub canonical_id: Uuid,
     pub mode: &'static str,
+    /// The administrative cascade that follows the dedup (migration 117):
+    /// `status` is `applied`, `deferred` (no maintenance connection; the dedup
+    /// itself committed) or `failed`, with its `security_events` row id.
+    #[schema(value_type = Object)]
+    pub cascade: epigraph_engine::admin_cascade::CascadeStatus,
     /// What the downstream belief cascade repaired (backlog 20e9ed83).
     /// Additive and best-effort: an empty report means there was nothing
-    /// downstream, never that the dedup failed.
+    /// downstream (or the cascade was deferred), never that the dedup failed.
     #[schema(value_type = Object)]
     pub belief_cascade: epigraph_engine::retraction_cascade::CascadeReport,
 }
@@ -112,6 +117,13 @@ pub struct SupersessionResponse {
     pub version: u32,
     /// When the new claim was created
     pub created_at: DateTime<Utc>,
+    /// The administrative cascade that follows the supersession (migration
+    /// 117): `status` is `applied`, `deferred` (no maintenance connection; the
+    /// supersession itself committed) or `failed`, with its `security_events`
+    /// row id. `#[serde(default)]` so older payloads still deserialize.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub cascade: epigraph_engine::admin_cascade::CascadeStatus,
     /// What the downstream belief cascade repaired (backlog 20e9ed83).
     /// Additive and best-effort: `#[serde(default)]` so payloads written
     /// before this field existed still deserialize.
@@ -320,7 +332,12 @@ pub async fn supersede_claim(
     //    lacks the claim's owner group gets 403 with nothing written.
     let old_claim_id = ClaimId::from_uuid(claim_id);
     let mut tx = state.write_as(&viewer, "supersede_claim").await?;
-    let (new_uuid, _old_uuid) = ClaimRepository::supersede_conn(
+    //
+    //    Migration 117: this is the supersession's ACT only (retire, insert the
+    //    replacement and the `supersedes` edge). Re-pointing the old claim's
+    //    other edges belongs to whoever asserted them and runs below as the
+    //    administrative cascade.
+    let (new_uuid, _old_uuid) = ClaimRepository::supersede_act_conn(
         &mut tx,
         old_claim_id,
         &request.content,
@@ -409,6 +426,35 @@ pub async fn supersede_claim(
         }
     }
 
+    // The administrative cascade's trigger, and -- when this process has no
+    // administrative connection -- its deferral, recorded in the act's own
+    // transaction under the principal it is stamped with, so the supersession
+    // and its audit row commit together.
+    #[cfg(feature = "db")]
+    let trigger = epigraph_engine::admin_cascade::CascadeTrigger {
+        cause: epigraph_engine::admin_cascade::CascadeCause::Supersede,
+        agent_id: viewer.principal(),
+        oauth: Some(oauth_principal(&auth)),
+        subject_id: claim_id,
+        object_id: Some(new_uuid),
+    };
+    #[cfg(feature = "db")]
+    let deferred = if state.admin_cascade {
+        None
+    } else {
+        Some(
+            epigraph_engine::admin_cascade::record_deferral(
+                &mut *tx,
+                &trigger,
+                epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED,
+            )
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to record the deferred cascade: {e}"),
+            })?,
+        )
+    };
+
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the supersession: {e}"),
     })?;
@@ -423,32 +469,34 @@ pub async fn supersede_claim(
         })
         .await;
 
-    // 9b. Retraction cascade (backlog 20e9ed83): the downstream claims this
-    // one was supporting hold edge-factor BBAs frozen from ITS interval at
-    // wire time, so nothing re-derives them on its own. Enumerated from the
-    // REPLACEMENT id, because supersede re-points outgoing edges onto it
-    // inside the transaction. Best-effort: the transaction has already
-    // committed, so a cascade failure must not turn a successful write into a
-    // reported error (the retry would hit "already been superseded").
-    //
-    // STILL UNSTAMPED, and named. The cascade walks DOWNSTREAM claims whose owner
-    // groups are arbitrary, so no single viewer's writable set covers its target
-    // population; which authority a retraction cascade carries across group
-    // boundaries is a tenancy-model decision rather than a mechanical conversion.
-    // `no_unscoped_pool.rs` keeps `routes/versioning.rs` at 8 sites for this and
-    // the sibling `mark_duplicate` cascade. The acquire is mechanical: one
-    // connection instead of a checkout per statement.
-    let belief_cascade = match state.db_pool.acquire().await {
-        Ok(mut conn) => {
-            epigraph_engine::retraction_cascade::cascade_after_supersede(
-                &mut conn, &viewer, new_uuid,
-            )
-            .await
-        }
-        Err(e) => {
-            tracing::warn!("belief cascade skipped: could not acquire: {e}");
-            Default::default()
-        }
+    // 9b. The administrative cascade (backlog 20e9ed83; migration 117): migrate
+    // the retired claim's edges onto the replacement, then invalidate the
+    // edge-factor BBAs frozen from ITS interval and re-derive them. Those edges
+    // and BBAs belong to other writers, so this runs with ADMINISTRATIVE
+    // authority -- the maintenance connection and its bypass viewer, never the
+    // caller's stamp -- and writes one `security_events` row naming the
+    // caller. Best-effort: the act has committed, so a cascade failure must
+    // not turn a successful write into a reported error (the retry would hit
+    // "already been superseded").
+    let (cascade, belief_cascade) = match deferred {
+        Some(status) => (status, Default::default()),
+        None => match state.admin_cascade_session().await {
+            Ok(mut session) => {
+                let (conn, admin_viewer) = session.split();
+                epigraph_engine::admin_cascade::apply_after_supersede(
+                    conn,
+                    admin_viewer,
+                    &trigger,
+                    claim_id,
+                    new_uuid,
+                )
+                .await
+            }
+            Err(reason) => (
+                record_deferral_after_commit(&state, &viewer, &trigger, &reason).await,
+                Default::default(),
+            ),
+        },
     };
 
     // 10. Trigger belief propagation for downstream factors (fire-and-forget).
@@ -500,9 +548,47 @@ pub async fn supersede_claim(
             new_truth_value: request.truth_value,
             version: 0, // version counting now handled by DB chain walk
             created_at: now,
+            cascade,
             belief_cascade,
         }),
     ))
+}
+
+/// The OAuth principal behind an authenticated request, for the cascade audit.
+#[cfg(feature = "db")]
+pub(crate) fn oauth_principal(
+    auth: &crate::middleware::bearer::AuthContext,
+) -> epigraph_engine::admin_cascade::OauthPrincipal {
+    epigraph_engine::admin_cascade::OauthPrincipal {
+        client_id: Some(auth.client_id),
+        owner_id: auth.owner_id,
+        agent_id: auth.agent_id,
+    }
+}
+
+/// Record a deferral AFTER the act committed (the administrative connection
+/// was configured but could not be used), on a transaction stamped with the
+/// caller's viewer so `security_events_append` admits the row. Best-effort: a
+/// failure is reported in the response, never raised.
+#[cfg(feature = "db")]
+pub(crate) async fn record_deferral_after_commit(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    trigger: &epigraph_engine::admin_cascade::CascadeTrigger,
+    reason: &str,
+) -> epigraph_engine::admin_cascade::CascadeStatus {
+    use epigraph_engine::admin_cascade::{record_deferral, CascadeStatus};
+    let mut tx = match state.write_as(viewer, "admin_cascade_deferral").await {
+        Ok(tx) => tx,
+        Err(e) => return CascadeStatus::deferred_unaudited(reason, format!("{e:?}")),
+    };
+    match record_deferral(&mut *tx, trigger, reason).await {
+        Ok(status) => match tx.commit().await {
+            Ok(()) => status,
+            Err(e) => CascadeStatus::deferred_unaudited(reason, e),
+        },
+        Err(e) => CascadeStatus::deferred_unaudited(reason, e),
+    }
 }
 
 /// Supersession requires a database; without the `db` feature this reports 503.
@@ -577,25 +663,30 @@ pub async fn mark_duplicate(
         });
     }
 
-    // Dedup repairs the orphaned/stranded edge-factor BBAs inside its own
-    // transaction and then rebuilds the affected beliefs (backlog 20e9ed83).
-    // Only the dedup's own failure is an error; the cascade's is reported.
-    // Unstamped for the reason recorded on `cascade_after_supersede` above.
-    let mut cascade_conn = state
-        .db_pool
-        .acquire()
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("belief cascade: could not acquire: {e}"),
-        })?;
-    let belief_cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-        &mut cascade_conn,
-        &viewer,
-        dup_id,
-        req.canonical_id,
+    // THE ACT (migration 117), on ONE transaction stamped with the CALLER's
+    // viewer: mark the duplicate. The database decides write authority, so a
+    // caller may dedup only a claim it may write (a duplicate in a group its
+    // writable set lacks is refused with nothing written). It used to run
+    // unstamped on the raw pool, where the application role refused even the
+    // caller's own duplicate. Only the act's failure is an error.
+    let mut tx = state.write_as(&viewer, "mark_duplicate").await?;
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(dup_id),
+        ClaimId::from_uuid(req.canonical_id),
     )
     .await
     .map_err(|e| match e {
+        e if crate::errors::db_is_insufficient_privilege(&e) => {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "mark_duplicate",
+                claim = %dup_id,
+                error = %e,
+                "the database refused the dedup"
+            );
+            crate::errors::write_refused("claim")
+        }
         epigraph_db::DbError::NotFound { id, .. } => ApiError::NotFound {
             entity: "Claim".into(),
             id: id.to_string(),
@@ -607,6 +698,57 @@ pub async fn mark_duplicate(
             message: other.to_string(),
         },
     })?;
+    let trigger = epigraph_engine::admin_cascade::CascadeTrigger {
+        cause: epigraph_engine::admin_cascade::CascadeCause::Dedup,
+        agent_id: viewer.principal(),
+        oauth: Some(oauth_principal(&auth)),
+        subject_id: dup_id,
+        object_id: Some(req.canonical_id),
+    };
+    let deferred = if state.admin_cascade {
+        None
+    } else {
+        Some(
+            epigraph_engine::admin_cascade::record_deferral(
+                &mut *tx,
+                &trigger,
+                epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED,
+            )
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to record the deferred cascade: {e}"),
+            })?,
+        )
+    };
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the dedup: {e}"),
+    })?;
+
+    // THE CASCADE, with administrative authority on the maintenance connection
+    // (migration 117): retract the duplicate's colliding edges and drop their
+    // BBAs, re-point every other edge onto the canonical, move the BBAs that
+    // follow them, and rebuild the affected beliefs (backlog 20e9ed83).
+    // Best-effort and audited; see the supersede handler.
+    let (cascade, belief_cascade) = match deferred {
+        Some(status) => (status, Default::default()),
+        None => match state.admin_cascade_session().await {
+            Ok(mut session) => {
+                let (conn, admin_viewer) = session.split();
+                epigraph_engine::admin_cascade::apply_after_dedup(
+                    conn,
+                    admin_viewer,
+                    &trigger,
+                    dup_id,
+                    req.canonical_id,
+                )
+                .await
+            }
+            Err(reason) => (
+                record_deferral_after_commit(&state, &viewer, &trigger, &reason).await,
+                Default::default(),
+            ),
+        },
+    };
 
     // Provenance: best-effort (.ok() swallow). content_hash is zero-bytes for mark_duplicate.
     if let Ok(mut tx) = state.db_pool.begin().await {
@@ -637,6 +779,7 @@ pub async fn mark_duplicate(
         duplicate_id: dup_id,
         canonical_id: req.canonical_id,
         mode: "mark_duplicate",
+        cascade,
         belief_cascade,
     }))
 }

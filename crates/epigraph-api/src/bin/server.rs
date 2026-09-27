@@ -532,10 +532,43 @@ async fn main() {
         // shared, reference-counted pool whose options — including the scrub —
         // were fixed at build time. Dropping the `ScopedPool` wrapper here does
         // not drop the pool or uninstall the hook.
+        // Migration 117 (batch W10): the cascade that follows a supersede, a
+        // dedup or a match-candidate retirement re-points and invalidates rows
+        // OTHER writers own, so it runs with administrative authority on this
+        // maintenance pool. That authority must come from EXPLICIT
+        // configuration: the maintenance pool above is also attached when
+        // `MAINTENANCE_DATABASE_URL` is unset (it then falls back to
+        // `DATABASE_URL`), and a cascade on that fallback would be the
+        // application DSN deriving an administrative act. So the cascade is
+        // enabled only for a configured DSN whose login bypasses row security;
+        // otherwise every such cascade is reported deferred, with a
+        // `security_events` row, and the caller's act still commits.
+        let admin_cascade = maintenance_source == epigraph_db::MaintenanceDsnSource::Configured
+            && epigraph_db::probe_maintenance_privilege(maintenance_pool.inner())
+                .await
+                .map(|p| p.bypass)
+                .unwrap_or(false);
+        if admin_cascade {
+            tracing::info!(
+                target: "tenancy.admin_cascade",
+                "administrative cascade enabled on the configured maintenance DSN"
+            );
+        } else {
+            tracing::warn!(
+                target: "tenancy.admin_cascade",
+                dsn_source = maintenance_source.as_str(),
+                "administrative cascade DISABLED: MAINTENANCE_DATABASE_URL is not set to a login \
+                 that bypasses row security. Supersede, dedup and match-candidate retirement \
+                 still commit the caller's act; their cascades across other writers' rows are \
+                 deferred and recorded in security_events (cascade.deferred)."
+            );
+        }
+
         let scoped = scoped.with_maintenance_pool(maintenance_pool.inner().clone());
 
-        let state =
-            AppState::with_scoped_pool(scoped, config).with_embedding_service(embedding_service);
+        let state = AppState::with_scoped_pool(scoped, config)
+            .with_embedding_service(embedding_service)
+            .with_admin_cascade(admin_cascade);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the

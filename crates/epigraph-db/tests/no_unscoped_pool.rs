@@ -563,7 +563,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 274;
+const HIGH_WATER: usize = 272;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -615,6 +615,10 @@ const HIGH_WATER: usize = 274;
 /// on the converted tree. Dropping `PATCH /claims/:id/labels`' author-stamp
 /// arm removed its `Viewer::resolve(&state.db_pool, ..)`: `routes/claims.rs`
 /// 20 -> 19, `HIGH_WATER` 275 -> 274.
+/// Batch W10 (migration 117) moved `mark_duplicate`'s dedup onto a
+/// caller-stamped transaction and both cascades onto the maintenance
+/// connection: `routes/versioning.rs` 4 -> 2, `HIGH_WATER` 274 -> 272, the file
+/// keeping 2 sites, read off `the_scanner_is_not_vacuous`'s own failure.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
@@ -840,7 +844,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // viewer (F-write-authz-reads-unfiltered). Five `supersede_claim` sites and
     // two `mark_duplicate` sites remain, all write. Read off this test's
     // failure output.
-    ("routes/versioning.rs", 4),
+    //
+    // 4 -> 2 (batch W10, migration 117): `mark_duplicate`'s dedup moved onto a
+    // transaction stamped with the caller's viewer (`AppState::write_as`), and
+    // both cascades moved onto the maintenance connection
+    // (`AppState::admin_cascade_session`). What remains is `supersede_claim`'s
+    // detached factor-query spawn and `mark_duplicate`'s best-effort provenance
+    // append. Read off this test's failure output.
+    ("routes/versioning.rs", 2),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is

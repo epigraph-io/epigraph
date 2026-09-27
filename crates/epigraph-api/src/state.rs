@@ -302,6 +302,19 @@ pub struct AppState {
     /// 500 in whichever shard next converts a route reachable through it.
     #[cfg(feature = "db")]
     pub scoped: Option<epigraph_db::ScopedPool>,
+    /// Whether this process may run the ADMINISTRATIVE CASCADE (migration 117,
+    /// batch W10) that follows a supersede, a dedup or a match-candidate
+    /// retirement: re-pointing and invalidating rows other writers own, on the
+    /// maintenance connection.
+    ///
+    /// `bin/server.rs` sets it only when `MAINTENANCE_DATABASE_URL` was
+    /// CONFIGURED (not the documented fallback to `DATABASE_URL`) and the boot
+    /// probe found that login privileged, so the cascade's authority always
+    /// comes from explicit configuration and never from the application DSN.
+    /// `false` everywhere else: the caller's act still commits and the cascade
+    /// is reported as deferred, with a `security_events` row.
+    #[cfg(feature = "db")]
+    pub admin_cascade: bool,
     /// API configuration
     pub config: ApiConfig,
     /// Idempotency store for duplicate request detection
@@ -1028,6 +1041,8 @@ impl AppState {
         Self {
             db_pool,
             scoped: None,
+            #[cfg(feature = "db")]
+            admin_cascade: false,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1093,6 +1108,54 @@ impl AppState {
         let mut st = Self::with_db(db_pool, config);
         st.scoped = Some(scoped);
         st
+    }
+
+    /// Enable (or not) the administrative cascade; see [`Self::admin_cascade`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_admin_cascade(mut self, enabled: bool) -> Self {
+        self.admin_cascade = enabled;
+        self
+    }
+
+    /// The maintenance session the administrative cascade runs on (migration
+    /// 117): the privileged connection and its bypass viewer.
+    ///
+    /// Not a content read on a caller's behalf. The caller's act has already
+    /// committed on its own stamped transaction; what remains re-points and
+    /// invalidates rows OTHER writers own, which the operator decided is an
+    /// administrative function, run with the server's authority and audited in
+    /// `security_events` under the caller's name.
+    /// `SystemReason::BeliefRecomputation` is the reason: the cascade is belief
+    /// invalidation and re-derivation, and the reason set only shrinks.
+    ///
+    /// # Errors
+    /// A human-readable reason the cascade is deferred: not configured
+    /// ([`Self::admin_cascade`] is false), the lease could not be minted, or the
+    /// leased connection cannot bypass row security.
+    #[cfg(feature = "db")]
+    pub async fn admin_cascade_session(
+        &self,
+    ) -> Result<epigraph_db::MaintenanceSession<'_>, String> {
+        if !self.admin_cascade {
+            return Err(epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED.to_string());
+        }
+        let mut session = self
+            .maintenance_viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .map_err(|e| {
+                format!(
+                    "the administrative (maintenance) connection could not be acquired, so the \
+                     cascade is deferred: {e}"
+                )
+            })?;
+        session.assert_privileged().await.map_err(|e| {
+            format!(
+                "the administrative (maintenance) connection cannot bypass row security, so the \
+                 cascade is deferred: {e}"
+            )
+        })?;
+        Ok(session)
     }
 
     /// A bypass viewer plus the maintenance connection it is inseparable from.
@@ -1257,6 +1320,8 @@ impl AppState {
         Self {
             db_pool,
             scoped: None,
+            #[cfg(feature = "db")]
+            admin_cascade: false,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1323,6 +1388,8 @@ impl AppState {
         Self {
             db_pool,
             scoped: None,
+            #[cfg(feature = "db")]
+            admin_cascade: false,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,

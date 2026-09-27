@@ -382,12 +382,70 @@ pub async fn decide_candidate(
 
     match req.verdict.as_str() {
         "retire" => {
-            let outcome =
-                repo.retire(id, decided_by)
+            use epigraph_engine::admin_cascade::{self, CascadeCause, CascadeTrigger};
+            // THE ACT (migration 117): flip the candidate to `stale`, on a
+            // transaction stamped with the CALLER's viewer. `match_candidates`
+            // carries no tenancy and this verdict requires `claims:admin`; the
+            // stamp is what attributes a deferral row to the session principal,
+            // which `security_events_append` requires. When this process has no
+            // administrative connection the deferral commits with the act.
+            let trigger = CascadeTrigger {
+                cause: CascadeCause::MatchRetire,
+                agent_id: viewer.principal(),
+                oauth: Some(crate::routes::versioning::oauth_principal(&auth)),
+                subject_id: id,
+                object_id: None,
+            };
+            let db_err = |e: String| ApiError::DatabaseError { message: e };
+            let mut tx = state.write_as(&viewer, "decide_candidate.retire").await?;
+            let previous_status =
+                epigraph_db::MatchCandidateRepo::mark_retired_conn(&mut tx, id, decided_by)
                     .await
-                    .map_err(|e| ApiError::DatabaseError {
-                        message: e.to_string(),
-                    })?;
+                    .map_err(|e| db_err(e.to_string()))?;
+            let deferred = if state.admin_cascade {
+                None
+            } else {
+                Some(
+                    admin_cascade::record_deferral(
+                        &mut *tx,
+                        &trigger,
+                        admin_cascade::REASON_NOT_CONFIGURED,
+                    )
+                    .await
+                    .map_err(|e| db_err(e.to_string()))?,
+                )
+            };
+            tx.commit().await.map_err(|e| db_err(e.to_string()))?;
+
+            // THE CASCADE, with administrative authority on the maintenance
+            // connection: retract the matcher edge (owned by nobody when both
+            // claims are public) and delete its factors, bp_messages and
+            // edge-keyed BBAs. Audited in `security_events`.
+            let (cascade, outcome) = match deferred {
+                Some(status) => (status, None),
+                None => match state.admin_cascade_session().await {
+                    Ok(mut session) => {
+                        admin_cascade::apply_after_match_retire(session.conn(), &trigger, id).await
+                    }
+                    Err(reason) => (
+                        crate::routes::versioning::record_deferral_after_commit(
+                            &state, &viewer, &trigger, &reason,
+                        )
+                        .await,
+                        None,
+                    ),
+                },
+            };
+            let outcome =
+                outcome.unwrap_or(epigraph_db::repos::match_candidate::RetirementOutcome {
+                    previous_status: String::new(),
+                    affected_claims: vec![row.claim_a, row.claim_b],
+                    edges_retracted: 0,
+                    factors_deleted: 0,
+                    bp_messages_deleted: 0,
+                    bbas_invalidated: 0,
+                    retracted_edges: Vec::new(),
+                });
 
             // Deliberately NOT followed by `recompute_claim_belief_binary`.
             // That entry point recombines `mass_functions`, and a matcher
@@ -405,7 +463,8 @@ pub async fn decide_candidate(
             return Ok(Json(serde_json::json!({
                 "id": id.to_string(),
                 "status": "stale",
-                "previous_status": outcome.previous_status,
+                "previous_status": previous_status,
+                "cascade": cascade,
                 "edges_retracted": outcome.edges_retracted,
                 "factors_deleted": outcome.factors_deleted,
                 "bp_messages_deleted": outcome.bp_messages_deleted,
