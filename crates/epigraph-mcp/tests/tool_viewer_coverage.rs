@@ -114,7 +114,6 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     "ingest_document_spine",
     "publish_event",
     "report_hierarchical_outcome",
-    "retire_match_candidate",
     "set_source_reliability",
     "structure_source",
     // pure-CPU, no DB
@@ -132,9 +131,19 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
 /// `epigraph-db/tests/viewer_ratchet.rs`. Listed here so the three-way
 /// partition below is total and a tool cannot move between categories
 /// unnoticed.
+///
+/// `retire_match_candidate` joined in migration 118's batch (W11), moved from
+/// the no-viewer write group. It is not a corpus-wide job: it mints the
+/// maintenance session only when a maintenance pool is attached, spends only
+/// its CONNECTION (never the bypass viewer) on one candidate's retirement,
+/// because 118's `match_candidates_stale_guard` refuses the flip to `stale` on
+/// an application-role session, and reuses the existing
+/// `SystemReason::BeliefRecomputation` (the retirement deletes the matcher
+/// edge's derived belief rows), so the reason register does not grow.
 const EXPECTED_MAINTENANCE_TOOLS: &[&str] = &[
     "backfill_embeddings",
     "recompute_beliefs",
+    "retire_match_candidate",
     "sweep_semantic_duplicates",
 ];
 

@@ -582,6 +582,7 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
 
     let out = tools::matching::retire_match_candidate(
         &server,
+        None,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
@@ -649,6 +650,7 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
     let read_only = build_server(pool.clone(), true).await;
     tools::matching::retire_match_candidate(
         &read_only,
+        None,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
@@ -770,6 +772,7 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
     .expect("promote");
     tools::matching::retire_match_candidate(
         &server,
+        None,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
@@ -983,4 +986,77 @@ async fn find_cross_source_matches_omits_sweep_coverage_for_an_invisible_claim(p
         serde_json::json!([]),
         "the pre-existing non-leaking shape is preserved: {json}"
     );
+}
+
+/// A pool whose connections are `SET SESSION AUTHORIZATION <role>`.
+async fn role_pool(pool: &PgPool, role: &'static str) -> PgPool {
+    use sqlx::Executor;
+    let url = fixture::database_url_for(pool).await;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("role pool")
+}
+
+/// Migration 118: on an MCP server whose own pool is the APPLICATION role,
+/// `retire_match_candidate` retires only through a maintenance connection.
+/// Without one the stale guard refuses it, the error names the fix, and
+/// nothing changes; with one (the maintenance role, not a superuser) the
+/// retirement and its cascade go through.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_on_an_application_role_server_needs_the_maintenance_connection(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    tools::matching::decide_match_candidate(
+        &build_server(pool.clone(), false).await,
+        &fixture::public_viewer(&pool).await,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+    )
+    .await
+    .expect("promote");
+
+    let app = role_pool(&pool, "epigraph_app").await;
+    let server = build_server(app.clone(), false).await;
+    let params = || RetireMatchCandidateParams {
+        candidate_id: cand.to_string(),
+    };
+
+    let e = tools::matching::retire_match_candidate(&server, None, params())
+        .await
+        .expect_err("an application-role server without a maintenance connection");
+    assert!(
+        e.message.contains("MAINTENANCE_DATABASE_URL") && e.message.contains("MC01"),
+        "the refusal names the fix and the guard: {}",
+        e.message
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "promoted", "a refused retirement changes nothing");
+    assert_eq!(edge_relationships(&pool, a, b).await.len(), 1);
+
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+    let mut conn = maint.acquire().await.expect("maintenance connection");
+    let out = tools::matching::retire_match_candidate(&server, Some(&mut *conn), params())
+        .await
+        .expect("retire on the maintenance connection");
+    let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
+    assert_eq!(body["candidate"]["status"], "stale");
+    assert_eq!(body["retirement"]["edges_retracted"], 1);
+    assert!(edge_relationships(&pool, a, b).await.is_empty());
 }

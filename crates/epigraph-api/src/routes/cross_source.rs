@@ -310,6 +310,12 @@ pub struct DecideCandidateRequest {
 /// database checks. Fail-closed: a state without a `ScopedPool`, or a
 /// maintenance DSN that is not privileged, gets an error, never the
 /// application pool.
+///
+/// The reason is `SystemReason::BeliefRecomputation`: the retirement deletes
+/// the matcher edge's derived belief rows (factors, bp_messages, its BBAs).
+/// `SystemReason` is a closed register whose size may only fall
+/// (`epigraph-db/tests/viewer_ratchet.rs`), so no retirement variant is added;
+/// the MCP tool uses the same reason.
 #[cfg(feature = "db")]
 async fn retire_on_maintenance(
     state: &AppState,

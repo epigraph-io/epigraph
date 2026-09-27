@@ -310,8 +310,18 @@ pub async fn decide_match_candidate(
 /// provenance — `properties.decided_by` in particular — survives; see
 /// `MatchCandidateRepo::retire`. The derived rows ARE deleted, because they are
 /// materializations that regenerate from live edges.
+///
+/// # Migration 118: which connection
+///
+/// `maintenance` is the server's maintenance connection when one is attached
+/// (`server.rs` mints it). Without one the retirement runs on the server's
+/// pool, where `match_candidates_stale_guard` admits a privileged DSN and
+/// refuses an application-role one with `MC01`; that refusal is returned as an
+/// error naming `MAINTENANCE_DATABASE_URL`, and nothing is written (the
+/// retirement is one transaction).
 pub async fn retire_match_candidate(
     server: &EpiGraphMcpFull,
+    maintenance: Option<&mut sqlx::PgConnection>,
     params: RetireMatchCandidateParams,
 ) -> Result<CallToolResult, McpError> {
     server.reject_if_read_only()?;
@@ -319,13 +329,32 @@ pub async fn retire_match_candidate(
     let repo = MatchCandidateRepo::new(server.pool.clone());
     let acting_agent = server.agent_id().await?;
 
-    let outcome = repo
-        .retire(candidate_id, Some(acting_agent))
-        .await
-        .map_err(internal_error)?;
+    let outcome = match maintenance {
+        Some(conn) => MatchCandidateRepo::retire_conn(conn, candidate_id, Some(acting_agent)).await,
+        None => repo.retire(candidate_id, Some(acting_agent)).await,
+    }
+    .map_err(retire_error)?;
     let updated = repo.get(candidate_id).await.map_err(internal_error)?;
     success_json(&serde_json::json!({
         "candidate": row_to_out(updated),
         "retirement": outcome,
     }))
+}
+
+/// A retirement refused by migration 118's stale guard (`MC01`) is a
+/// configuration problem, not an internal fault: say which one.
+fn retire_error(e: sqlx::Error) -> McpError {
+    let refused_by_guard = e
+        .as_database_error()
+        .is_some_and(|d| d.message().contains("MC01"));
+    if refused_by_guard {
+        internal_error(format!(
+            "retire_match_candidate needs a privileged database connection: this MCP server's \
+             own connection is the application role, which may not retire a match candidate, \
+             and no maintenance connection is attached. Set MAINTENANCE_DATABASE_URL to a role \
+             that is a member of epigraph_maintenance and restart. Nothing was changed. ({e})"
+        ))
+    } else {
+        internal_error(e)
+    }
 }

@@ -1950,7 +1950,34 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<RetireMatchCandidateParams>,
     ) -> Result<CallToolResult, McpError> {
-        tools::matching::retire_match_candidate(self, params).await
+        // Migration 118: `stale` is an administrative state that
+        // `match_candidates_stale_guard` refuses on a non-privileged session,
+        // and the retirement's cascade deletes derived rows that are not the
+        // caller's. So the retirement runs on the MAINTENANCE connection
+        // whenever one is attached, as the HTTP route does. Without one it runs
+        // on the server's own pool, exactly as before 118, and the database
+        // decides: a privileged DSN retires, an application-role DSN is
+        // refused with MC01 (mapped to an error naming the fix). Refusing
+        // outright without a maintenance pool, as the three corpus-wide
+        // maintenance tools do, would take retirement away from a process on a
+        // privileged DSN that never needed one.
+        //
+        // The reason is `BeliefRecomputation`: the retirement deletes the
+        // matcher edge's derived belief rows (factors, bp_messages, its BBAs).
+        // `SystemReason` is a closed, monotone-decreasing register
+        // (`viewer_ratchet.rs`), so a dedicated retirement variant is not added.
+        let mut session = match self.scoped.as_ref() {
+            Some(scoped) if scoped.has_maintenance_pool() => Some(
+                crate::maintenance::maintenance_viewer(
+                    self,
+                    epigraph_db::visibility::SystemReason::BeliefRecomputation,
+                )
+                .await?,
+            ),
+            _ => None,
+        };
+        let conn = session.as_mut().map(epigraph_db::MaintenanceSession::conn);
+        tools::matching::retire_match_candidate(self, conn, params).await
     }
 
     // ── Meta (1 tool) ──
