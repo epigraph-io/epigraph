@@ -4,8 +4,8 @@
 //!
 //! The gate is `AppState::maintenance_viewer`'s. Without it, `ScopedPool`'s
 //! fallback leases from the APPLICATION pool when no maintenance pool is
-//! attached: on a privileged application DSN (prod until the app-role move)
-//! the route kept serving a surface D9 removed, and on the application role it
+//! attached: on a privileged application DSN (any deployment before its
+//! app-role move) the route kept serving a surface D9 removed, and on the application role it
 //! would spend a bypass viewer on a filtered connection (an empty 200). The
 //! arms below run on a PRIVILEGED application DSN (the superuser test pool),
 //! so the refusal cannot be the second shape.

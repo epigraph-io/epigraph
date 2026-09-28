@@ -1208,8 +1208,8 @@ impl AppState {
         // Operator decision D9 (batch W12a): with no maintenance pool attached
         // -- every real `server`, which builds none -- `maintenance_session`
         // would lease from the APPLICATION pool. On a superuser application DSN
-        // (prod until the app-role move) that is a bypass that keeps serving a
-        // maintenance surface D9 removed; on the application role it is a
+        // (any deployment before its app-role move) that is a bypass that keeps
+        // serving a maintenance surface D9 removed; on the application role it is a
         // bypass viewer on a filtered connection, the empty-200 shape. So the
         // gate comes first, and the routes answer 501 MOVED. The mirror of
         // `epigraph-mcp/src/maintenance.rs::maintenance_viewer`'s first check.

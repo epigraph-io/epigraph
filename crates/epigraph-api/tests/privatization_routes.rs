@@ -647,8 +647,8 @@ async fn a_seed_set_larger_than_the_node_cap_is_refused_rather_than_truncated(po
 ///
 /// The state here is `split_state`'s shape WITHOUT the attached maintenance
 /// pool: its `ScopedPool` is the superuser test pool, i.e. the posture of a
-/// deployment whose application DSN can bypass row security (prod until the
-/// app-role move). Before D9's gate in `AppState::maintenance_viewer`,
+/// deployment whose application DSN can bypass row security (any deployment
+/// before its app-role move). Before D9's gate in `AppState::maintenance_viewer`,
 /// `ScopedPool`'s fallback would have leased that privileged pool and kept
 /// serving the lifecycle. Asserted: the typed MOVED error for a create, a
 /// read, a list and an approve; the wire contract (status 501, the JSON body);
