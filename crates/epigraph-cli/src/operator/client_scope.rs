@@ -32,6 +32,12 @@
 //! * **Human clients only.** A `service` client's scopes are managed by
 //!   `bootstrap_clients` (the canonical names ARE their scope definition) and
 //!   an `agent` client's by the approval route; both are refused.
+//! * **Active clients only, for a grant.** A `revoked`, `suspended` or
+//!   `pending` human client is refused a grant: it would carry the scope the
+//!   moment it was reactivated or approved, and any party can DCR-register a
+//!   `pending` human client, so a mistyped id could otherwise land on a
+//!   look-alike. A revoke is allowed on any status (taking authority away is
+//!   always safe). The dry run prints the status.
 //! * **Both arrays, one scope.** The scope is added to (or removed from)
 //!   `allowed_scopes` AND `granted_scopes`, so the two never disagree about it.
 //!   Every other element of each array is kept, in its original order: the two
@@ -111,6 +117,8 @@ pub struct Outcome {
     pub op: ScopeOp,
     pub client: Uuid,
     pub client_name: String,
+    /// `oauth_clients.status` as read (a grant is refused unless `active`).
+    pub client_status: String,
     pub scope: String,
     pub allowed_before: Vec<String>,
     pub granted_before: Vec<String>,
@@ -163,7 +171,8 @@ pub fn with_scope(scopes: &[String], scope: &str, op: ScopeOp) -> Vec<String> {
 ///
 /// # Errors
 /// The scope is not admin-only; no client has that id; the client is not a
-/// human client; or a statement fails (nothing is committed).
+/// human client; a grant targets a client whose status is not `active`; or a
+/// statement fails (nothing is committed).
 pub async fn run(
     conn: &mut PgConnection,
     op: ScopeOp,
@@ -189,6 +198,16 @@ pub async fn run(
              agent client's by the approval route. Nothing was written.",
             row.client_name,
             row.client_type
+        );
+    }
+    if op == ScopeOp::Grant && row.status != "active" {
+        bail!(
+            "refusing to grant {scope} to client {client} ({:?}): its status is {:?}, not \
+             \"active\". A revoked, suspended or pending client would carry the scope the \
+             moment it was reactivated or approved. Approve or reactivate it first, through \
+             its own audited path, then grant. Nothing was written.",
+            row.client_name,
+            row.status
         );
     }
 
@@ -221,6 +240,7 @@ pub async fn run(
                 "client_id": row.client_id,
                 "client_name": row.client_name,
                 "client_type": row.client_type,
+                "status": row.status,
                 "agent_id": row.agent_id,
                 "owner_id": row.owner_id,
             },
@@ -255,6 +275,7 @@ pub async fn run(
         op,
         client,
         client_name: row.client_name,
+        client_status: row.status,
         scope: scope.to_string(),
         allowed_before: row.allowed_scopes,
         granted_before: row.granted_scopes,
@@ -286,12 +307,13 @@ pub fn describe(o: &Outcome) -> String {
         )
     };
     format!(
-        "{mode}: {} {} on client {} ({:?}): {what}\n  allowed_scopes: {:?} -> {:?}\n  \
-         granted_scopes: {:?} -> {:?}\n  {audit}",
+        "{mode}: {} {} on client {} ({:?}, status {}): {what}\n  allowed_scopes: {:?} -> \
+         {:?}\n  granted_scopes: {:?} -> {:?}\n  {audit}",
         o.op.command(),
         o.scope,
         o.client,
         o.client_name,
+        o.client_status,
         o.allowed_before,
         o.allowed_after,
         o.granted_before,

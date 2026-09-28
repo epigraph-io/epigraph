@@ -8,7 +8,8 @@
 //! kept in order (the fixture's two arrays differ, as a real client's may);
 //! idempotence; one `security_events` row per `--apply` with who, the client,
 //! the scope and both arrays before and after; a dry run that writes nothing;
-//! and the maintenance-DSN-only connection.
+//! a grant refused to a client that is not `active` (a revoke is not); and
+//! the maintenance-DSN-only connection.
 
 mod viewer_fixture;
 
@@ -162,6 +163,7 @@ async fn a_human_client_is_granted_an_admin_only_scope_with_one_audit_row(pool: 
     assert_eq!(dry.code, 0, "{}", dry.show());
     assert!(dry.stdout.contains("DRY RUN"), "{}", dry.show());
     assert!(dry.stdout.contains("granted"), "{}", dry.show());
+    assert!(dry.stdout.contains("status active"), "{}", dry.show());
     assert_eq!(scopes(&pool, c).await, (v(ALLOWED), v(GRANTED)));
     assert_eq!(
         all_scope_audit_rows(&pool).await,
@@ -214,6 +216,70 @@ async fn a_human_client_is_granted_an_admin_only_scope_with_one_audit_row(pool: 
         .expect("session_user");
     assert_eq!(d["operator"]["session_user"], session_user, "{d}");
     assert!(d["operator"].get("os_user").is_some(), "{d}");
+    assert_eq!(d["client"]["status"], "active", "{d}");
+}
+
+/// A grant to a human client whose status is not `active` is refused, exit 1,
+/// with nothing written and no audit row: it would carry the scope the moment
+/// it was reactivated or approved, and anyone can register a `pending` human
+/// client. A REVOKE on such a client is allowed (taking authority away is
+/// always safe) and audited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_grant_to_a_client_that_is_not_active_is_refused_and_a_revoke_is_not(pool: PgPool) {
+    for status in ["revoked", "suspended", "pending"] {
+        let c = seed_client(&pool, "human", GRANTED, GRANTED, None, None).await;
+        sqlx::query("UPDATE oauth_clients SET status = $2 WHERE id = $1")
+            .bind(c)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("set status");
+        for mode in ["--dry-run", "--apply"] {
+            let r = run_op(
+                &pool,
+                &["grant-client-scope", &c.to_string(), "claims:admin", mode],
+            )
+            .await;
+            assert_eq!(r.code, 1, "{status} {mode}: {}", r.show());
+            assert!(
+                r.stderr.contains(&format!("its status is \"{status}\"")),
+                "{status} {mode}: {}",
+                r.show()
+            );
+        }
+        assert_eq!(scopes(&pool, c).await, (v(GRANTED), v(GRANTED)), "{status}");
+        assert!(
+            audit(&pool, c).await.is_empty(),
+            "{status}: nothing audited"
+        );
+    }
+
+    let held = &["claims:read", "claims:admin"];
+    let c = seed_client(&pool, "human", held, held, None, None).await;
+    sqlx::query("UPDATE oauth_clients SET status = 'revoked' WHERE id = $1")
+        .bind(c)
+        .execute(&pool)
+        .await
+        .expect("set status");
+    let r = run_op(
+        &pool,
+        &[
+            "revoke-client-scope",
+            &c.to_string(),
+            "claims:admin",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(r.stdout.contains("status revoked"), "{}", r.show());
+    assert_eq!(
+        scopes(&pool, c).await,
+        (v(&["claims:read"]), v(&["claims:read"]))
+    );
+    let rows = audit(&pool, c).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2["client"]["status"], "revoked");
 }
 
 /// Granting a held scope changes nothing, and the `--apply` is still recorded
