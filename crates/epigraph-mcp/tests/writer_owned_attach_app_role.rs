@@ -591,7 +591,7 @@ async fn submit_ds_evidence_on_a_writer_frame_reports_an_unwritten_cache(pool: P
 /// OAuth owner -- the cause and what it touched.
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(pool: PgPool) {
-    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
     let f = dedup_fixture(&pool, agent, group).await;
 
     let r = epigraph_mcp::tools::supersede::mark_duplicate(
@@ -608,7 +608,11 @@ async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(
     .expect("the stamped dedup lands on the app role");
     let body = first_text(&r);
     assert_eq!(body["mode"], "mark_duplicate", "{body}");
-    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    // D9: the act commits on the app role and the cascade is deferred; the
+    // replay applies it on the maintenance connection.
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let report = replay_now(&pool, "w12a-dedup").await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
     let (current, supersedes): (bool, Option<Uuid>) =
         sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
             .bind(f.dup)
@@ -637,20 +641,12 @@ async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(
         "another writer's edge into the duplicate now points at the canonical"
     );
 
-    let event_id: Uuid = body["cascade"]["audit_event_id"]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .expect("the applied cascade carries its audit row id");
-    let (et, who, details): (String, Option<Uuid>, serde_json::Value) = sqlx::query_as(
-        "SELECT event_type::text, agent_id, details FROM security_events WHERE id = $1",
-    )
-    .bind(event_id)
-    .fetch_one(&pool)
-    .await
-    .expect("the cascade's audit row");
-    assert_eq!(et, "cascade.admin_applied");
+    let (_, who, details) = applied_row(&pool, "dedup", f.dup).await;
     assert_eq!(who, Some(agent), "attributed to the caller's stamped agent");
-    assert_eq!(details["cause"], "dedup");
+    assert_eq!(
+        details["replay_of"]["deferred_event_id"], body["cascade"]["audit_event_id"],
+        "the applied row names the deferral it replays: {details}"
+    );
     assert_eq!(
         details["trigger"]["oauth"]["owner_id"],
         serde_json::json!(agent),
@@ -683,23 +679,57 @@ async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(
 // Migration 117 (batch W10): the retraction cascade is an administrative act.
 // ===========================================================================
 
-/// [`app_role_server`] whose `ScopedPool` also carries a MAINTENANCE pool: a
-/// second downgraded pool whose sessions are `epigraph_maintenance`, the shape
-/// `main` attaches for an explicitly configured `MAINTENANCE_DATABASE_URL`.
-async fn app_role_server_with_admin(pool: &PgPool) -> (EpiGraphMcpFull, Uuid, Uuid, Viewer) {
+/// Run the deferred-cascade replay once, as `epigraph-cascade-replay.timer`
+/// does under operator decision D9 (batch W12a): `replay_deferred` on a
+/// connection that runs as `epigraph_maintenance` (not a superuser). Every
+/// request path defers under D9 (no request-serving MCP server attaches a
+/// maintenance pool), so the tests below assert the deferral and then the
+/// replay's effect, where they used to assert an in-process applied cascade.
+async fn replay_now(pool: &PgPool, label: &str) -> epigraph_engine::admin_cascade::ReplayReport {
     let url = fixture::database_url_for(pool).await;
     let maintenance = fixture::downgraded_pool(pool, "epigraph_maintenance").await;
     let scoped =
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
             .await
-            .expect("app-role ScopedPool")
+            .expect("ScopedPool")
             .with_maintenance_pool(maintenance);
-    let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
-    let server = build_scoped_test_server(plain, scoped);
-    let agent = server.server_agent_id().await.expect("server agent");
-    let group = personal_group_of(pool, agent).await;
-    let viewer = Viewer::resolve(pool, agent).await.expect("viewer");
-    (server, agent, group, viewer)
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    session
+        .assert_privileged()
+        .await
+        .expect("the replay's connection is privileged");
+    let (conn, admin_viewer) = session.split();
+    epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        admin_viewer,
+        label,
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("replay")
+}
+
+/// The one `cascade.admin_applied` row the replay wrote for `(cause, subject)`:
+/// `(id, agent_id, details)`.
+async fn applied_row(
+    pool: &PgPool,
+    cause: &str,
+    subject: Uuid,
+) -> (Uuid, Option<Uuid>, serde_json::Value) {
+    sqlx::query_as(
+        "SELECT id, agent_id, details FROM security_events \
+          WHERE event_type = 'cascade.admin_applied' AND details->>'cause' = $1 \
+            AND details#>>'{trigger,subject_id}' = $2::text",
+    )
+    .bind(cause)
+    .bind(subject)
+    .fetch_one(pool)
+    .await
+    .expect("exactly one applied row for the cascade")
 }
 
 /// A caller that is NOT an admin: a `claims:write` token issued to `owner`.
@@ -915,7 +945,7 @@ async fn supersede_fixture(pool: &PgPool, agent: Uuid, group: Uuid) -> Supersede
 /// `security_events` row names the caller.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_tool_on_the_app_role_runs_its_cascade_with_admin_authority(pool: PgPool) {
-    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
     let f = supersede_fixture(&pool, agent, group).await;
 
     let r = epigraph_mcp::tools::supersede::supersede_claim(
@@ -932,7 +962,10 @@ async fn supersede_tool_on_the_app_role_runs_its_cascade_with_admin_authority(po
     .await
     .expect("the owner's supersede lands on the app role");
     let body = first_text(&r);
-    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    // D9: deferred on the request path, applied by the replay.
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let report = replay_now(&pool, "w12a-supersede").await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
     let new_id: Uuid = body["new_claim_id"]
         .as_str()
         .and_then(|s| s.parse().ok())
@@ -961,25 +994,19 @@ async fn supersede_tool_on_the_app_role_runs_its_cascade_with_admin_authority(po
         gone,
         "the BBA frozen from the retired claim was invalidated"
     );
-    assert!(
-        body["belief_cascade"]["invalidated_bbas"].as_u64() >= Some(1),
-        "{body}"
-    );
 
-    let event_id: Uuid = body["cascade"]["audit_event_id"]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .expect("audit row id");
-    let (et, who, details): (String, Option<Uuid>, serde_json::Value) = sqlx::query_as(
-        "SELECT event_type::text, agent_id, details FROM security_events WHERE id = $1",
+    let (event_id, who, details) = applied_row(&pool, "supersede", f.old).await;
+    let invalidated: Option<i64> = sqlx::query_scalar(
+        "SELECT (details#>>'{belief,invalidated_bbas}')::bigint FROM security_events \
+          WHERE event_type = 'cascade.belief_rederived' \
+            AND details->>'applied_event_id' = $1::text",
     )
     .bind(event_id)
     .fetch_one(&pool)
     .await
-    .expect("the cascade's audit row");
-    assert_eq!(et, "cascade.admin_applied");
+    .expect("the belief row the replay wrote");
+    assert!(invalidated >= Some(1), "{invalidated:?}");
     assert_eq!(who, Some(agent));
-    assert_eq!(details["cause"], "supersede");
     assert_eq!(details["trigger"]["subject_id"], serde_json::json!(f.old));
     assert_eq!(details["trigger"]["object_id"], serde_json::json!(new_id));
     assert_eq!(
@@ -1089,12 +1116,13 @@ fn mentions(body: &serde_json::Value, id: Uuid) -> bool {
 /// The supersede cascade re-points EVERY writer's edge on the retired claim,
 /// including edges between another group's PRIVATE claims and the caller's
 /// public one, and re-derives the private downstream claim. The caller cannot
-/// read those rows, so the tool result names none of them: `cascade.touched`
-/// is counts, and the belief report keeps only claims the caller can read
-/// (the world claim T is still reported). The audit rows keep every id.
+/// read those rows, so the tool result names none of them. Under operator
+/// decision D9 the result is always the deferral (no `touched`, no belief
+/// report, a reason with no ids); the replay then touches the private rows and
+/// its audit rows keep every id.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_supersede_result_names_no_row_the_caller_cannot_read(pool: PgPool) {
-    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
     let f = supersede_fixture(&pool, agent, group).await;
     let t: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
         .bind(f.outgoing)
@@ -1141,7 +1169,15 @@ async fn the_supersede_result_names_no_row_the_caller_cannot_read(pool: PgPool) 
     .await
     .expect("the owner's supersede lands on the app role");
     let body = first_text(&r);
-    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    assert!(body["cascade"]["touched"].is_null(), "{body}");
+    assert_eq!(
+        body["cascade"]["reason"],
+        epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED,
+        "{body}"
+    );
+    let report = replay_now(&pool, "w12a-no-leak").await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
     let new_id = parse_uuid_field(&body, "new_claim_id");
     let (moved_in, moved_out): (Uuid, Uuid) = sqlx::query_as(
         "SELECT (SELECT target_id FROM edges WHERE id = $1), \
@@ -1169,40 +1205,26 @@ async fn the_supersede_result_names_no_row_the_caller_cannot_read(pool: PgPool) 
             "the result names {what} ({id}): {body}"
         );
     }
-    assert!(
-        body["cascade"]["touched"]["edges_retargeted"].is_u64(),
-        "touched carries counts: {body}"
-    );
-    assert_eq!(
-        body["cascade"]["touched"]["edges_retargeted"],
-        serde_json::json!(2),
-        "{body}"
-    );
-    assert!(
-        body["belief_cascade"]["targets"]
-            .as_array()
-            .is_some_and(|a| a.contains(&serde_json::json!(t))),
-        "a downstream claim the caller CAN read is still reported: {body}"
-    );
 
-    let event = parse_uuid_field(&body["cascade"], "audit_event_id");
-    let touched: serde_json::Value =
-        sqlx::query_scalar("SELECT details->'touched' FROM security_events WHERE id = $1")
-            .bind(event)
-            .fetch_one(&pool)
-            .await
-            .expect("applied row");
+    let (event, _, details) = applied_row(&pool, "supersede", f.old).await;
+    let touched = &details["touched"];
     assert!(
-        mentions(&touched, into_old) && mentions(&touched, out_of_old),
+        mentions(touched, into_old) && mentions(touched, out_of_old),
         "the audit row keeps the ids: {touched}"
     );
-    let belief_event = parse_uuid_field(&body["cascade"], "belief_audit_event_id");
-    let belief: serde_json::Value =
-        sqlx::query_scalar("SELECT details->'belief' FROM security_events WHERE id = $1")
-            .bind(belief_event)
-            .fetch_one(&pool)
-            .await
-            .expect("belief row");
+    let belief: serde_json::Value = sqlx::query_scalar(
+        "SELECT details->'belief' FROM security_events \
+          WHERE event_type = 'cascade.belief_rederived' \
+            AND details->>'applied_event_id' = $1::text",
+    )
+    .bind(event)
+    .fetch_one(&pool)
+    .await
+    .expect("belief row");
+    assert!(
+        mentions(&belief, t),
+        "the downstream claim the caller can read was re-derived: {belief}"
+    );
     assert!(
         mentions(&belief, hp2),
         "the belief audit row keeps it: {belief}"
@@ -1228,7 +1250,7 @@ fn consolidate_params(ids: &[Uuid], content: &str) -> epigraph_mcp::types::Conso
 async fn consolidate_tool_on_the_app_role_runs_its_edge_migration_with_admin_authority(
     pool: PgPool,
 ) {
-    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
     let s1 = public_claim_of(&pool, agent, group, "my source one").await;
     let s2 = public_claim_of(&pool, agent, group, "my source two").await;
     let (x, x_group) = fixture::seed_agent_with_group(&pool, "writer-x").await;
@@ -1245,8 +1267,10 @@ async fn consolidate_tool_on_the_app_role_runs_its_edge_migration_with_admin_aut
     .await
     .expect("the owner's consolidation lands on the app role");
     let body = first_text(&r);
-    assert_eq!(body["cascade"]["status"], "applied", "{body}");
-    assert_eq!(body["edges_migrated"], serde_json::json!(2), "{body}");
+    // D9: deferred on the request path, applied by the replay.
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let report = replay_now(&pool, "w12a-consolidate").await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
     let merged = parse_uuid_field(&body, "merged_claim_id");
     let (t, s): (Uuid, Uuid) = sqlx::query_as(
         "SELECT (SELECT target_id FROM edges WHERE id = $1), \
@@ -1258,17 +1282,17 @@ async fn consolidate_tool_on_the_app_role_runs_its_edge_migration_with_admin_aut
     .await
     .expect("edges");
     assert_eq!((t, s), (merged, merged), "both edges follow the merge");
-    let event = parse_uuid_field(&body["cascade"], "audit_event_id");
-    let (et, who, cause): (String, Option<Uuid>, String) = sqlx::query_as(
-        "SELECT event_type::text, agent_id, details->>'cause' FROM security_events WHERE id = $1",
-    )
-    .bind(event)
-    .fetch_one(&pool)
-    .await
-    .expect("audit row");
+    let (_, who, details) = applied_row(&pool, "consolidate", merged).await;
+    assert_eq!(who, Some(agent), "attributed to the caller");
     assert_eq!(
-        (et.as_str(), who, cause.as_str()),
-        ("cascade.admin_applied", Some(agent), "consolidate")
+        details["touched"]["edges_migrated"]
+            .as_array()
+            .map(Vec::len)
+            .or_else(|| details["touched"]["edges_migrated"]
+                .as_u64()
+                .map(|n| n as usize)),
+        Some(2),
+        "{details}"
     );
 }
 
@@ -1491,12 +1515,8 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
 /// cross-owner change exists without the row naming its caller.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_applied_repair_never_commits_without_its_audit_row(pool: PgPool) {
-    let (server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
     let f = supersede_fixture(&pool, agent, group).await;
-    sqlx::query("REVOKE INSERT ON security_events FROM epigraph_maintenance")
-        .execute(&pool)
-        .await
-        .expect("revoke the maintenance role's audit append");
 
     let r = epigraph_mcp::tools::supersede::supersede_claim(
         &server,
@@ -1512,10 +1532,18 @@ async fn an_applied_repair_never_commits_without_its_audit_row(pool: PgPool) {
     .await
     .expect("the act still commits");
     let body = first_text(&r);
-    assert_eq!(body["cascade"]["status"], "failed", "{body}");
-    assert!(
-        body["cascade"]["audit_error"].is_string(),
-        "and says its audit row could not be written: {body}"
+    // D9: deferred on the request path. The REPLAY is where the repair and
+    // its audit row commit together, so that is where the append is refused.
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    sqlx::query("REVOKE INSERT ON security_events FROM epigraph_maintenance")
+        .execute(&pool)
+        .await
+        .expect("revoke the maintenance role's audit append");
+    let report = replay_now(&pool, "w12a-no-audit").await;
+    assert_eq!(
+        (report.applied, report.failed),
+        (0, 1),
+        "the repair failed with its refused audit row: {report:?}"
     );
     let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
         .bind(f.old)
@@ -1618,44 +1646,36 @@ async fn candidate_state(pool: &PgPool, cand: Uuid, edge: Uuid) -> (String, bool
 ///   by the replay, loudly, and changes nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn retire_tool_under_118_runs_on_the_admin_path_and_defers_without_one(pool: PgPool) {
-    let (admin_server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let (first_server, agent, group, viewer) = app_role_server(&pool).await;
     let (server, agent2, _, viewer2) = app_role_server(&pool).await;
     let auth = non_admin_owner(agent);
     let auth2 = non_admin_owner(agent2);
     fixture::apply_migration_118_stale_guard(&pool).await;
 
-    // The admin path.
+    // D9: the request path records the whole retirement as deferred; the
+    // replay's admin path carries it out under the requester's name.
     let (applied, applied_edge) = promoted_candidate(&pool, agent, group, "promoted").await;
     fixture::assert_stale_guard_refuses_the_app_role(&pool, applied).await;
-    let body = retire_as(&admin_server, &viewer, &auth, applied).await;
-    assert_eq!(body["cascade"]["status"], "applied", "{body}");
-    assert_eq!(body["retired"], true, "{body}");
-    assert_eq!(body["candidate"]["status"], "stale", "{body}");
-    assert_eq!(body["retirement"]["previous_status"], "promoted", "{body}");
+    let body = retire_as(&first_server, &viewer, &auth, applied).await;
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    assert_eq!(body["retired"], false, "{body}");
+    let report = replay_now(&pool, "w12a-retire-first").await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
     assert_eq!(
         candidate_state(&pool, applied, applied_edge).await,
         ("stale".to_string(), false)
     );
-    let event = parse_uuid_field(&body["cascade"], "audit_event_id");
-    let (et, who, cause, decided_by): (String, Option<Uuid>, String, Option<Uuid>) =
-        sqlx::query_as(
-            "SELECT se.event_type::text, se.agent_id, se.details->>'cause', mc.decided_by \
-               FROM security_events se, match_candidates mc \
-              WHERE se.id = $1 AND mc.id = $2",
-        )
-        .bind(event)
-        .bind(applied)
-        .fetch_one(&pool)
-        .await
-        .expect("audit row");
+    let (_, who, details) = applied_row(&pool, "match_retire", applied).await;
+    let decided_by: Option<Uuid> =
+        sqlx::query_scalar("SELECT decided_by FROM match_candidates WHERE id = $1")
+            .bind(applied)
+            .fetch_one(&pool)
+            .await
+            .expect("candidate");
+    assert_eq!((who, decided_by), (Some(agent), Some(agent)));
     assert_eq!(
-        (et.as_str(), who, cause.as_str(), decided_by),
-        (
-            "cascade.admin_applied",
-            Some(agent),
-            "match_retire",
-            Some(agent)
-        )
+        details["touched"]["previous_status"], "promoted",
+        "{details}"
     );
 
     // No admin connection: deferred, candidate untouched.
