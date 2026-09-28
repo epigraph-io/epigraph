@@ -39,6 +39,23 @@ use sqlx::{PgPool, Row};
 use tracing::instrument;
 use uuid::Uuid;
 
+/// The `error_message` of a row the reaper failed: it was still `running`
+/// past the stale bound on its last attempt.
+pub const REAPED_SPENT_MESSAGE: &str = "reaped: still running past the stale bound on its last \
+     attempt (the drain run was killed or died mid-job); no further attempt";
+
+/// One row [`PostgresJobQueue::reap_stale_jobs_counting_attempts`] touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapedJob {
+    /// The job row.
+    pub id: Uuid,
+    /// Its type.
+    pub job_type: String,
+    /// `true`: the reap used its last attempt and the row is now `failed`.
+    /// `false`: it is back to `pending`.
+    pub failed: bool,
+}
+
 // ============================================================================
 // PostgreSQL Job Queue
 // ============================================================================
@@ -62,23 +79,6 @@ use uuid::Uuid;
 /// Database errors are mapped to `JobError::ProcessingFailed` with
 /// descriptive messages. Callers should implement retry logic for
 /// transient failures.
-/// The `error_message` of a row the reaper failed: it was still `running`
-/// past the stale bound on its last attempt.
-pub const REAPED_SPENT_MESSAGE: &str = "reaped: still running past the stale bound on its last \
-     attempt (the drain run was killed or died mid-job); no further attempt";
-
-/// One row [`PostgresJobQueue::reap_stale_jobs_counting_attempts`] touched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReapedJob {
-    /// The job row.
-    pub id: Uuid,
-    /// Its type.
-    pub job_type: String,
-    /// `true`: the reap used its last attempt and the row is now `failed`.
-    /// `false`: it is back to `pending`.
-    pub failed: bool,
-}
-
 #[derive(Clone)]
 pub struct PostgresJobQueue {
     pool: PgPool,
