@@ -70,6 +70,29 @@ pub enum StepOpError {
     },
     #[error("invalid input: {0}")]
     Invalid(String),
+    /// A mid-chain insert whose `prev -> next` `step_follows` edge this session
+    /// may not delete. Under row security the DELETE would match nothing and
+    /// report success, and the two INSERTs that follow would leave `prev` with
+    /// two successors: a forked chain. Nothing is written.
+    #[error(
+        "cannot insert a step between {prev} and {next}: this session may not remove the \
+         step_follows edge between them (row security matched {removable} of {existing}), so \
+         the insert would fork the chain; nothing was written. Append the step instead \
+         (omit position), or have the workflow's owner or an operator rewire it"
+    )]
+    ChainRewireRefused {
+        prev: Uuid,
+        next: Uuid,
+        existing: i64,
+        removable: u64,
+    },
+    /// `delete_step`'s soft delete changed no row: the session may not write
+    /// the step's head claim.
+    #[error(
+        "step {step_claim_id} (lineage {lineage}) was not changed: this session cannot write \
+         its claim, so it was not soft-deleted"
+    )]
+    StepNotWritable { step_claim_id: Uuid, lineage: Uuid },
     #[error("db error: {0}")]
     Db(#[from] sqlx::Error),
     #[error("repo error: {0}")]
@@ -249,6 +272,46 @@ pub async fn add_step(
         _ => chain.len(),
     };
 
+    // A mid-chain insert first removes `prev -> next`, and REFUSES before
+    // writing anything if it could not: under row security (115's owner-scoped
+    // DELETE) a DELETE the session may not make matches zero rows and reports
+    // success, and inserting `prev -> step` beside the surviving `prev -> next`
+    // forks the chain. The count is of the edges the session can SEE (it walked
+    // the chain through them); a chain inferred from orphan order has none, and
+    // then nothing needs removing.
+    let rewire = if !chain.is_empty() && position > 0 && position < chain.len() {
+        let (prev, next) = (chain[position - 1], chain[position]);
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges \
+             WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
+        )
+        .bind(prev)
+        .bind(next)
+        .fetch_one(&mut *conn)
+        .await?;
+        let removable = sqlx::query(
+            "DELETE FROM edges \
+             WHERE source_id = $1 AND target_id = $2 \
+               AND relationship = 'step_follows'",
+        )
+        .bind(prev)
+        .bind(next)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        if i64::try_from(removable).unwrap_or(i64::MAX) < existing {
+            return Err(StepOpError::ChainRewireRefused {
+                prev,
+                next,
+                existing,
+                removable,
+            });
+        }
+        Some((prev, next))
+    } else {
+        None
+    };
+
     let agent_id = get_or_create_system_agent(&mut *conn).await?;
     let step_lineage = Uuid::new_v4();
 
@@ -344,18 +407,8 @@ pub async fn add_step(
                 None,
             )
             .await?;
-        } else {
-            let prev = chain[position - 1];
-            let next = chain[position];
-            sqlx::query(
-                "DELETE FROM edges \
-                 WHERE source_id = $1 AND target_id = $2 \
-                   AND relationship = 'step_follows'",
-            )
-            .bind(prev)
-            .bind(next)
-            .execute(&mut *conn)
-            .await?;
+        } else if let Some((prev, next)) = rewire {
+            // `prev -> next` was removed (and verified) above.
             epigraph_db::EdgeRepository::create_if_not_exists_conn(
                 &mut *conn,
                 prev,
@@ -419,12 +472,28 @@ pub async fn delete_step(
         lineage: step_lineage_id,
     })?;
 
+    // Checked: a soft delete that changed no row must not report the new
+    // truth value. A step claim the session may read but not write is refused
+    // by `claims_tenancy`'s WITH CHECK (42501); a row its USING filtered would
+    // change nothing. Both are the same named refusal.
     let new_truth: f64 = 0.05;
-    sqlx::query("UPDATE claims SET truth_value = $1 WHERE id = $2")
+    let not_writable = || StepOpError::StepNotWritable {
+        step_claim_id: claim_id,
+        lineage: step_lineage_id,
+    };
+    let changed = sqlx::query("UPDATE claims SET truth_value = $1 WHERE id = $2")
         .bind(new_truth)
         .bind(claim_id)
         .execute(&mut *conn)
-        .await?;
+        .await
+        .map_err(|e| match e.as_database_error().and_then(|d| d.code()) {
+            Some(code) if code == "42501" => not_writable(),
+            _ => StepOpError::Db(e),
+        })?
+        .rows_affected();
+    if changed != 1 {
+        return Err(not_writable());
+    }
 
     Ok(DeleteStepResult {
         workflow_id,
