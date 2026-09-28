@@ -689,8 +689,8 @@ What that means for callers:
   (-> `recompute_claim_belief`), `backfill_embeddings` (-> `embed_backfill`)
   and `sweep_semantic_duplicates` (-> the `sweep_semantic_duplicates` CLI).
 * **No job runs in the server.** It builds no job pool and no maintenance pool,
-  starts no job runner and no stale-job reaper. `EPIGRAPH_DISABLE_JOBS` is no
-  longer read. The queue is drained by `drain_jobs`.
+  starts no job runner and no stale-job reaper. The queue is drained by
+  `drain_jobs`.
 
 **Connection budget.** The api process opens its application pool only:
 **10** connections per replica (it was API(10) + jobs(8) + maintenance(4) = 22

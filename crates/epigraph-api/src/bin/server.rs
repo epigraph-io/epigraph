@@ -318,7 +318,7 @@ async fn main() {
         // recorded in the act's own transaction (`cascade.deferred`), and the
         // replay timer applies it; the job queue is the drain timer's. The
         // connection budget is therefore the application pool alone
-        // (`docs/deploy.md` §1c-bis). `EPIGRAPH_DISABLE_JOBS` is no longer read.
+        // (`docs/deploy.md` §1c-bis).
         tracing::info!(
             target: "tenancy.maintenance",
             "{}",
