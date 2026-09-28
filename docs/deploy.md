@@ -1271,6 +1271,14 @@ the caller may perform the act when it is the claim's **author**, holds
 (any claim it can read). The pre-OA1 token-owner rule, and MCP's operator-link
 arm, still admit whom they admitted.
 
+**Which claims that reaches.** A claim written through an MCP server is authored
+by that server's signer agent and owned by the signer's group, not by the human
+behind the OAuth token. For such a claim a `claims:write` caller passes no arm
+unless it writes the signer's group (an HTTP signer carries no operator link), so
+retiring it over OAuth still needs `claims:admin`. Before withdrawing an
+administrative grant from a human client, check who authors and owns the claims
+that human retires.
+
 * A claim the caller cannot read answers exactly like a missing one (HTTP
   `404`; MCP `claim <id> not found`). For a dedup this holds for the duplicate
   AND the canonical.
