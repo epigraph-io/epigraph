@@ -40,14 +40,30 @@
 //! is removed but left in [`ALLOWED`] fails too, so the table cannot turn into
 //! folklore.
 //!
+//! A function token (one spelled `name(`) is counted by its BARE IDENTIFIER as
+//! a whole word, so a path to the function item
+//! (`let f = ScopedPool::maintenance_session;`) and a renaming import
+//! (`use epigraph_db::resolve_maintenance_url as r;`) count like a call
+//! (review W12a-D4). The two queue types are not counted bare (they are named
+//! legitimately as types), so renaming either of them (`use ... as`, a `type`
+//! alias) is refused outright.
+//!
 //! # Known limits
 //!
-//! A name assembled at run time (`concat!`, `format!` of two halves) is not
-//! caught; nor is a DSN handed over under another variable name. A token
-//! inside a string literal counts (none does today). A whole-line `//`
-//! comment is skipped; a trailing comment after code is not (none carries a
-//! token). `#[cfg(test)]` removal is by brace span from the attribute's `mod`
-//! item, which is how every in-source test module here is written.
+//! * Only [`ROOTS`] is scanned. A helper in a LINKED crate (epigraph-engine,
+//!   an epigraph-db repo) that leases `maintenance_session` and is called from
+//!   a route is not seen here: the lease happens outside both crates. None
+//!   exists today (the sites outside the two crates are the operator CLIs in
+//!   epigraph-cli and the drain-only job handlers in epigraph-jobs); a new one
+//!   is a review question, not something this scan can answer.
+//! * A name assembled at run time (`concat!`, `format!` of two halves) or
+//!   produced by a macro is not caught; nor is a DSN handed over under another
+//!   variable name, nor a queue type reached through a generic parameter.
+//! * A token inside a string literal counts (none does today). A whole-line
+//!   `//` comment is skipped; a trailing comment after code is not (none
+//!   carries a token). `#[cfg(test)]` removal is by brace span from the
+//!   attribute's `mod` item, which is how every in-source test module here is
+//!   written.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -140,6 +156,38 @@ const ENV_READERS: &[&str] = &[
 ];
 
 const ROOTS: &[&str] = &["crates/epigraph-api/src", "crates/epigraph-mcp/src"];
+
+/// Occurrences of `tok` in `code`.
+///
+/// A token ending in `(` names a FUNCTION, and is counted by its bare
+/// identifier as a whole word, not by its call spelling: a call is one use,
+/// and so is a path to the function item (`let f = ScopedPool::maintenance_session;`)
+/// or a renaming import (`use epigraph_db::resolve_maintenance_url as r;`),
+/// neither of which contains `name(` (review W12a-D4). Other tokens
+/// (`JobRunner::new`, `PostgresJobQueue::new`) are counted as written; their
+/// types' renaming is refused by [`no_register_type_is_renamed`].
+fn token_count(code: &str, tok: &str) -> usize {
+    match tok.strip_suffix('(') {
+        Some(ident) => ident_count(code, ident),
+        None => code.matches(tok).count(),
+    }
+}
+
+/// Whole-word occurrences of the identifier `ident` in `code`.
+fn ident_count(code: &str, ident: &str) -> usize {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.match_indices(ident)
+        .filter(|(at, _)| {
+            let before = code[..*at].chars().next_back();
+            let after = code[at + ident.len()..].chars().next();
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        })
+        .count()
+}
+
+/// The two queue types whose constructor is a [`TOKENS`] entry. Renamed (a
+/// `use ... as` or a `type` alias), `Alias::new` would not match the token.
+const REGISTER_TYPES: &[&str] = &["JobRunner", "PostgresJobQueue"];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -260,7 +308,7 @@ fn only_the_drain_timer_and_its_registration_acquire_maintenance_authority() {
     let mut found: BTreeMap<(String, &str), usize> = BTreeMap::new();
     for (rel, code) in sources() {
         for tok in TOKENS {
-            let n = code.matches(tok).count();
+            let n = token_count(&code, tok);
             if n > 0 {
                 found.insert((rel.clone(), tok), n);
             }
@@ -367,4 +415,41 @@ fn the_variable_is_named_only_by_the_boot_refusals_and_the_drain_timer() {
          `std::env::var`. If the new site is the drain timer's own, update VARIABLE_NAMED with \
          the reason."
     );
+}
+
+#[test]
+fn no_register_type_is_renamed() {
+    for (rel, code) in sources() {
+        for ty in REGISTER_TYPES {
+            for renamed in [format!("{ty} as "), format!("= {ty};"), format!("= {ty}<")] {
+                assert!(
+                    !code.contains(&renamed),
+                    "{rel} renames `{ty}` (`{renamed}`): `<alias>::new` would then escape the \
+                     D9 register's `{ty}::new` token. Use the type by its own name"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_identifier_count_sees_paths_and_renames_but_not_longer_names() {
+    // Calibration of `token_count` on the shapes review W12a-D4 used to bypass
+    // the call spelling, and on the near-misses it must not count.
+    let t = "maintenance_session(";
+    assert_eq!(token_count("s.maintenance_session(r)", t), 1);
+    assert_eq!(
+        token_count("let f = epigraph_db::ScopedPool::maintenance_session;", t),
+        1
+    );
+    assert_eq!(
+        token_count(
+            "use epigraph_db::resolve_maintenance_url as r;",
+            "resolve_maintenance_url("
+        ),
+        1
+    );
+    assert_eq!(token_count("fn maintenance_session_privilege() {}", t), 0);
+    assert_eq!(token_count("self.xmaintenance_session(", t), 0);
+    assert_eq!(token_count("JobRunner::new(q)", "JobRunner::new"), 1);
 }
