@@ -16,6 +16,8 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod claim_act;
+
 /// The committed development JWT secret. NEVER acceptable in production.
 /// Single source of truth — every consumer must reference this const, not a
 /// copy of the literal.
