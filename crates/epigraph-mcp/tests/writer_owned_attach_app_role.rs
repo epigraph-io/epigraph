@@ -1759,3 +1759,220 @@ async fn retire_tool_under_118_runs_on_the_admin_path_and_defers_without_one(poo
         "{failed:?}"
     );
 }
+
+// ===========================================================================
+// Migration 120 (D8): the administrative cascade keeps a writer's edge its
+// writer's.
+// ===========================================================================
+
+/// An edge `writer` writes between two public claims (a session stamped as the
+/// writer, privileged harness connection: 120's arm (i) applies to privileged
+/// sessions with a principal), plus its edge-factor perspective.
+async fn writer_edge(pool: &PgPool, writer: Uuid, source: Uuid, target: Uuid) -> Uuid {
+    let v = Viewer::resolve(pool, writer).await.expect("resolve");
+    let csv = |ids: &[Uuid]| {
+        ids.iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, false), \
+                set_config('epigraph.writable_group_ids', $2, false), \
+                set_config('epigraph.principal_id', $3, false)",
+    )
+    .bind(csv(v.group_bind().expect("scoped")))
+    .bind(csv(v.writable_groups()))
+    .bind(writer.to_string())
+    .execute(&mut *conn)
+    .await
+    .expect("stamp the writer");
+    let e: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports') RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("the writer's edge");
+    // Its edge-factor perspective (what `ensure_edge_perspective` creates when
+    // a BBA is wired onto the edge).
+    sqlx::query("INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, $2, 'edge')")
+        .bind(e)
+        .bind(format!("edge {e}"))
+        .execute(&mut *conn)
+        .await
+        .expect("edge perspective");
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', '', false), \
+                set_config('epigraph.writable_group_ids', '', false), \
+                set_config('epigraph.principal_id', '', false)",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("unstamp");
+    e
+}
+
+/// `(owner, visibility, co_owner, writer_group_id, source, target)` of an edge.
+type EdgeState = (Uuid, String, Option<Uuid>, Option<Uuid>, Uuid, Uuid);
+
+async fn edge_state(pool: &PgPool, e: Uuid) -> EdgeState {
+    sqlx::query_as(
+        "SELECT owner_group_id, visibility::text, co_owner_group_id, writer_group_id, \
+                source_id, target_id FROM edges WHERE id = $1",
+    )
+    .bind(e)
+    .fetch_one(pool)
+    .await
+    .expect("edge state")
+}
+
+/// Brief test 9, on the maintenance login (the replay): the dedup, supersede
+/// and consolidation cascades each re-point ANOTHER writer's edge onto the
+/// canonical / replacement / merged claim, and that edge is still its writer's
+/// afterwards (120's arm (u): a re-point keeps a public edge's owner), with its
+/// author record. The writer's edge-keyed BBA moves with the dedup and stays
+/// the writer's (`writer_owned`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_admin_cascade_keeps_another_writers_edge_its_writers(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    let bt = binary_truth(&pool).await;
+
+    // dedup
+    let dup = public_claim_of(&pool, agent, group, "my duplicate").await;
+    let canonical = seed_claim(&pool, "a world canonical", 0.5).await;
+    let xc1 = public_claim_of(&pool, x, x_group, "X cites my duplicate").await;
+    let dedup_edge = writer_edge(&pool, x, xc1, dup).await;
+    let x_bba = {
+        let p = pool.clone();
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            let v = Viewer::resolve(&p, x).await.expect("resolve");
+            let csv = |ids: &[Uuid]| {
+                ids.iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            sqlx::query(
+                "SELECT set_config('epigraph.group_ids', $1, false), \
+                        set_config('epigraph.writable_group_ids', $2, false), \
+                        set_config('epigraph.principal_id', $3, false)",
+            )
+            .bind(csv(v.group_bind().expect("scoped")))
+            .bind(csv(v.writable_groups()))
+            .bind(x.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp X");
+            let id = epigraph_db::MassFunctionRepository::store_with_perspective(
+                &mut *conn,
+                dup,
+                bt,
+                Some(x),
+                Some(dedup_edge),
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+            .expect("X's edge-keyed BBA");
+            (conn, id)
+        })
+        .await
+    };
+    assert_eq!(
+        tenancy(&pool, "mass_functions", x_bba).await,
+        (x_group, "public".to_string(), true),
+        "fixture shape: X's writer-owned BBA"
+    );
+    // supersede
+    let old = public_claim_of(&pool, agent, group, "my claim, to be corrected").await;
+    let xc2 = public_claim_of(&pool, x, x_group, "X cites my claim").await;
+    let supersede_edge = writer_edge(&pool, x, xc2, old).await;
+    // consolidate
+    let s1 = public_claim_of(&pool, agent, group, "my source one").await;
+    let s2 = public_claim_of(&pool, agent, group, "my source two").await;
+    let xc3 = public_claim_of(&pool, x, x_group, "X cites my source").await;
+    let consolidate_edge = writer_edge(&pool, x, xc3, s1).await;
+    for e in [dedup_edge, supersede_edge, consolidate_edge] {
+        let s = edge_state(&pool, e).await;
+        assert_eq!(
+            (s.0, s.3),
+            (x_group, Some(x_group)),
+            "fixture shape: X's edge"
+        );
+    }
+
+    epigraph_mcp::tools::supersede::mark_duplicate(
+        &server,
+        &viewer,
+        epigraph_mcp::types::MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("dedup");
+    let r = epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &viewer,
+        epigraph_mcp::types::SupersedeClaimParams {
+            claim_id: old.to_string(),
+            content: "my claim, corrected".to_string(),
+            truth_value: 0.6,
+            reason: "a correction".to_string(),
+        },
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("supersede");
+    let new_id = parse_uuid_field(&first_text(&r), "new_claim_id");
+    let r = epigraph_mcp::tools::consolidate::consolidate_claims(
+        &server,
+        &viewer,
+        consolidate_params(&[s1, s2], "my merged claim"),
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("consolidate");
+    let merged = parse_uuid_field(&first_text(&r), "merged_claim_id");
+
+    let report = replay_now(&pool, "w12b-test9").await;
+    assert_eq!((report.applied, report.failed), (3, 0), "{report:?}");
+
+    for (e, moved_to, why) in [
+        (dedup_edge, canonical, "dedup"),
+        (supersede_edge, new_id, "supersede"),
+        (consolidate_edge, merged, "consolidate"),
+    ] {
+        let s = edge_state(&pool, e).await;
+        assert_eq!(s.5, moved_to, "{why}: the cascade re-pointed X's edge");
+        assert_eq!(
+            (s.0, s.1.as_str(), s.2, s.3),
+            (x_group, "public", None, Some(x_group)),
+            "{why}: X's edge is still X's after the administrative re-point"
+        );
+    }
+    let (bba_claim, bba_owner, bba_writer_owned): (Uuid, Uuid, bool) = sqlx::query_as(
+        "SELECT claim_id, owner_group_id, writer_owned FROM mass_functions WHERE id = $1",
+    )
+    .bind(x_bba)
+    .fetch_one(&pool)
+    .await
+    .expect("X's BBA moved, not removed");
+    assert_eq!(
+        (bba_claim, bba_owner, bba_writer_owned),
+        (canonical, x_group, true),
+        "X's edge-keyed BBA moved to the canonical and is still X's"
+    );
+}
