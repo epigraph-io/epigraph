@@ -224,15 +224,39 @@ async fn a_human_client_is_granted_an_admin_only_scope_with_one_audit_row(pool: 
         serde_json::json!(this_uid()),
         "the kernel's uid of the process that ran it: {d}"
     );
+    assert_eq!(
+        d["operator"]["login_uid"],
+        serde_json::json!(this_login_uid()),
+        "the kernel's audit login uid, inherited by the spawned binary: {d}"
+    );
     assert!(d["operator"].get("client_addr").is_some(), "{d}");
     assert!(d["operator"].get("application_name").is_some(), "{d}");
 }
 
-/// The uid of this test process, which spawns the binary under the same uid.
+/// The REAL uid of this test process, which spawns the binary under the same
+/// real uid: the first field of the `Uid:` line of `/proc/self/status`.
 fn this_uid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").expect("/proc/self").uid()
+    let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("Uid:"))
+        .expect("a Uid: line");
+    line.split_whitespace()
+        .nth(1)
+        .expect("the real uid field")
+        .parse()
+        .expect("a numeric uid")
 }
+
+/// This test process's audit login uid, which a spawned child inherits, or
+/// `None` where the kernel has none (unset reads as `4294967295`).
+fn this_login_uid() -> Option<u32> {
+    std::fs::read_to_string("/proc/self/loginuid")
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        .filter(|&u| u != u32::MAX)
+}
+
 
 /// A grant to a human client whose status is not `active` is refused, exit 1,
 /// with nothing written and no audit row: it would carry the scope the moment

@@ -55,11 +55,16 @@
 //!
 //!   "Who ran it" is several facts, none of which is an identity on its own:
 //!   the database login (`session_user`; a shared maintenance login names no
-//!   person), the process's real uid and its passwd name (read from the
-//!   kernel, not the environment), the connection's client address and
-//!   `application_name`, and `os_user`, which is `SUDO_USER` / `USER` /
-//!   `LOGNAME` and therefore ADVISORY: anyone can set it. The row records
-//!   `os_user_source` to say so.
+//!   person), the process's REAL uid and its passwd name (the first field of
+//!   the kernel's `Uid:` line in `/proc/self/status`, not the environment),
+//!   the process's audit login uid (`/proc/self/loginuid`: set at login, kept
+//!   across `sudo`, and not settable by an unprivileged process; `None` where
+//!   the kernel has none, as in many containers), the connection's client
+//!   address and `application_name`, and `os_user`, which is `SUDO_USER` /
+//!   `USER` / `LOGNAME` and therefore ADVISORY: anyone can set it. The row
+//!   records `os_user_source` to say so. Run the binary directly as the
+//!   operator: under `sudo -u <service account>` the real uid names that
+//!   account, and only the login uid still names the person.
 //! * **`--dry-run`** runs the same statements, the audit row included, in a
 //!   transaction that is rolled back, and prints what would change.
 //!
@@ -107,33 +112,75 @@ pub struct Operator {
     /// The OS user the ENVIRONMENT names (`SUDO_USER`, else `USER`, else
     /// `LOGNAME`). Advisory: any caller can set these variables.
     pub os_user: Option<String>,
-    /// The process's real uid, from the kernel (`/proc/self`'s owner).
+    /// The process's REAL uid, from the kernel (the first field of the `Uid:`
+    /// line in `/proc/self/status`). Not the owner of `/proc/self`, which is
+    /// the EFFECTIVE uid, and root for a non-dumpable process.
     pub process_uid: Option<u32>,
     /// `process_uid`'s name in `/etc/passwd`, if it has one.
     pub process_user: Option<String>,
+    /// The audit login uid (`/proc/self/loginuid`): the uid of the login
+    /// session this process descends from. `sudo` does not change it and an
+    /// unprivileged process cannot set it. `None` when the kernel reports it
+    /// unset (`4294967295`) or the file is missing.
+    pub login_uid: Option<u32>,
+    /// `login_uid`'s name in `/etc/passwd`, if it has one.
+    pub login_user: Option<String>,
 }
 
 impl Operator {
     /// The operator of THIS process: `session_user` as the maintenance
-    /// connection reported it, the environment's (advisory) user name, and
-    /// the process's real uid and passwd name.
+    /// connection reported it, the environment's (advisory) user name, the
+    /// process's real uid, its audit login uid, and their passwd names.
     #[must_use]
     pub fn of_this_process(session_user: String) -> Self {
         let process_uid = Self::process_uid();
+        let login_uid = Self::login_uid();
         Self {
             session_user,
             os_user: Self::os_user_from_env(),
             process_uid,
             process_user: process_uid.and_then(Self::passwd_name),
+            login_uid,
+            login_user: login_uid.and_then(Self::passwd_name),
         }
     }
 
-    /// The real uid of this process: the owner of `/proc/self`, which the
-    /// kernel sets and no environment variable can change. `None` off Linux.
+    /// The REAL uid of this process, from the kernel's `/proc/self/status`,
+    /// which no environment variable can change. `None` off Linux.
     #[must_use]
     pub fn process_uid() -> Option<u32> {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .as_deref()
+            .and_then(Self::real_uid_from_status)
+    }
+
+    /// The real uid in a `/proc/<pid>/status` text: the FIRST of the four
+    /// fields on its `Uid:` line (real, effective, saved set, filesystem).
+    #[must_use]
+    pub fn real_uid_from_status(status: &str) -> Option<u32> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|f| f.parse().ok())
+    }
+
+    /// The audit login uid of this process (`/proc/self/loginuid`), or `None`
+    /// when unset or unavailable.
+    #[must_use]
+    pub fn login_uid() -> Option<u32> {
+        std::fs::read_to_string("/proc/self/loginuid")
+            .ok()
+            .as_deref()
+            .and_then(Self::login_uid_from_proc)
+    }
+
+    /// Parse a `/proc/<pid>/loginuid` text: `4294967295` (`(uid_t)-1`) means
+    /// the kernel never set one, which is `None`, as is anything unparsable.
+    #[must_use]
+    pub fn login_uid_from_proc(text: &str) -> Option<u32> {
+        text.trim().parse().ok().filter(|&u: &u32| u != u32::MAX)
     }
 
     /// `uid`'s login name from `/etc/passwd`, or `None` when it has no entry
@@ -290,6 +337,8 @@ pub async fn run(
                                    by the caller",
                 "process_uid": operator.process_uid,
                 "process_user": operator.process_user,
+                "login_uid": operator.login_uid,
+                "login_user": operator.login_user,
                 "client_addr": client_addr,
                 "application_name": application_name,
             },
@@ -401,6 +450,27 @@ mod tests {
         ] {
             assert!(validate_scope(s).is_err(), "{s:?} must be refused");
         }
+    }
+
+    /// The `Uid:` line lists real, effective, saved and filesystem uids. A
+    /// line where they differ (a setuid run) must yield the REAL one.
+    #[test]
+    fn the_real_uid_is_the_first_field_of_the_uid_line() {
+        let status = "Name:\tepigraph-operator\nUmask:\t0002\nState:\tR (running)\n\
+                      Tgid:\t4242\nPid:\t4242\nPPid:\t4200\n\
+                      Uid:\t1001\t0\t0\t0\nGid:\t1001\t1001\t1001\t1001\n";
+        assert_eq!(Operator::real_uid_from_status(status), Some(1001));
+        assert_eq!(Operator::real_uid_from_status("Name:\tx\n"), None);
+        assert_eq!(Operator::real_uid_from_status("Uid:\tabc\t0\n"), None);
+    }
+
+    #[test]
+    fn an_unset_login_uid_is_none() {
+        assert_eq!(Operator::login_uid_from_proc("1001"), Some(1001));
+        assert_eq!(Operator::login_uid_from_proc("1001\n"), Some(1001));
+        assert_eq!(Operator::login_uid_from_proc("0"), Some(0));
+        assert_eq!(Operator::login_uid_from_proc("4294967295"), None);
+        assert_eq!(Operator::login_uid_from_proc(""), None);
     }
 
     #[test]

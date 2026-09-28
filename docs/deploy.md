@@ -1347,11 +1347,15 @@ a HUMAN's own client an admin-only scope:
   client's agent) whose `details` hold the operator, the client (with its
   status), the scope, `changed`, and both arrays before and after. The
   operator is several facts, none an identity alone: the database login
-  (`session_user`), the process's real uid and its passwd name (from the
-  kernel), the connection's client address (also the row's `ip_address`) and
-  `application_name`, and `os_user` from `SUDO_USER`/`USER`/`LOGNAME`, which is
-  advisory (`os_user_source` says so: anyone can set it). A shared maintenance
-  login names no person; a per-operator login does. A
+  (`session_user`), the process's REAL uid and its passwd name (the first
+  field of the `Uid:` line in `/proc/self/status`, from the kernel), its audit
+  login uid and passwd name (`/proc/self/loginuid`, which `sudo` does not
+  change; `null` where the kernel has none), the connection's client address
+  (also the row's `ip_address`) and `application_name`, and `os_user` from
+  `SUDO_USER`/`USER`/`LOGNAME`, which is advisory (`os_user_source` says so:
+  anyone can set it). Run the binary directly as yourself: under `sudo -u` the
+  real uid names the target account, and only the login uid still names you. A
+  shared maintenance login names no person; a per-operator login does. A
   no-op `--apply` is recorded too (`changed: false`), which is how a grant made
   some other way is ratified. A dry run writes nothing.
 
