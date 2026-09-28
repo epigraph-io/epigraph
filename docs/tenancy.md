@@ -430,7 +430,12 @@ is a bulk attestation key), so they stay world-owned: administrative. A write
 refused on an edge the caller can read answers `not_owner` naming the rule
 (another writer's, or administrative), never "not found". When an edge's owner
 retracts or deletes it, its own edge-keyed BBAs are deleted in the act and every
-other writer's are removed by the maintenance replay (cause `edge_retract`).
+other writer's are removed by the maintenance replay (cause `edge_retract`); the
+replay also re-derives the belief of the claims the owner's own BBAs lived on,
+which the deferral records, since the owner cannot write another owner's cache.
+A deferral names only an edge out of force (an act that deletes the row closes
+its window first). The owner-only rule is row security: it is enforced for
+sessions on the application role, and a privileged session bypasses it.
 
 **The retraction cascade is an administrative act (117).** A supersede, a dedup
 or a consolidation is the caller's act, written with the caller's authority on

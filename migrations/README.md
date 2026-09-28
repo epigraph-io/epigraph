@@ -628,8 +628,10 @@ Current reservation:
   'group'`): a public-to-public owner change of an endpoint never rewrites a
   public edge. `edges_delete_owner` loses 115's source-writer arm (owner and
   co-owner only). `epigraph_record_cascade_deferral` accepts cause
-  `edge_retract` (an edge owner's retract or delete; the replay removes other
-  writers' edge-keyed BBAs). `epigraph_reown_legacy_edges_to_signer(p_limit,
+  `edge_retract` (an edge owner's retract or delete of an edge now out of
+  force; the replay removes other writers' edge-keyed BBAs and re-derives the
+  belief of those claims and of the claims the owner's own deleted BBAs lived
+  on, which the deferral carries as its sources). `epigraph_reown_legacy_edges_to_signer(p_limit,
   p_exclude_signers)` (maintenance only, NOT run by the migration; the
   exclusion list is mandatory) re-owns a legacy world edge to a signer that
   resolves to an operator or personal group. 077's `edges_tenancy` WITH CHECK
