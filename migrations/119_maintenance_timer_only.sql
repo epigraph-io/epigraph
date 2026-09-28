@@ -21,10 +21,10 @@
 --       graph clustering runner's retention sweep (`graph_cluster_runs`,
 --       `graph_clusters`, `cluster_edges`, `claim_cluster_membership`) and the
 --       theme rebuild (`claim_themes`). 070 gave `epigraph_maintenance`
---       SELECT/INSERT/UPDATE and no DELETE on them, which was invisible while
---       the queue ran on whatever DSN `server` had (a superuser in every
---       deployment so far). On a non-superuser maintenance login every
---       clustering job would stop at its first DELETE. Rows a foreign key
+--       SELECT/INSERT/UPDATE and no DELETE on them, which is invisible to a
+--       queue running on a superuser DSN (a superuser holds every privilege).
+--       On a non-superuser maintenance login every clustering job would stop
+--       at its first DELETE. Rows a foreign key
 --       removes by referential action need no grant (the action runs as the
 --       table owner), so the list is exactly the tables a handler names in a
 --       DELETE statement. `claim_encryption` and the other sealed-content

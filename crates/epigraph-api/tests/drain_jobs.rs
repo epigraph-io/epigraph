@@ -2,8 +2,7 @@
 //! W12a; migration 119).
 //!
 //! Before D9 the API `server` ran the queue in-process on whatever DSN it had,
-//! a superuser in every deployment so far, so a missing grant on the
-//! maintenance role was invisible. The drain now runs as a non-superuser LOGIN
+//! and on a superuser DSN a missing grant on the maintenance role is invisible. The drain now runs as a non-superuser LOGIN
 //! in `epigraph_maintenance`, and these tests run it that way:
 //!
 //! * the LIBRARY arms (`jobs_drain::drain`) on a `ScopedPool` downgraded to
@@ -130,12 +129,15 @@ async fn seed_embedded_claims(pool: &PgPool, agent: Uuid, n: usize) {
     }
 }
 
-/// Every job type the drain timer inherits from `server`, drained once on the
-/// maintenance login: a graph clustering run (its retention sweep DELETEs from
-/// the four clustering tables), a theme rebuild (it wipes `claim_themes`) and a
-/// privatization apply (the real lifecycle: world, plan, dispatch). Any grant
-/// 119 missed fails its job with `permission denied`, and the report says so.
-/// A second run then does nothing and exits 0.
+/// Every one of the SIX handlers the drain registers, run on the maintenance
+/// login: a graph clustering run (its retention sweep DELETEs from the four
+/// clustering tables), a theme rebuild (it wipes `claim_themes`), a
+/// privatization apply and then its revert (the real lifecycle: world, plan,
+/// dispatch), a privatization reseal check (clears the group's flag), and an
+/// `embedding_generation` job (the owning provider's handler, with a mock
+/// embedder, writes the claim's vector). Any grant 119 missed fails its job
+/// with `permission denied`, and the report says so. A final run then does
+/// nothing and exits 0.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
     let world = fx::World::seed(&pool).await;
@@ -187,10 +189,37 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
             .expect("seed the apply job");
         id
     };
+    // `embedding_generation`: a public claim with no vector.
+    let unembedded = viewer_fixture::seed_public_claim(&pool, world.actor, "drain embed me").await;
+    let embed = enqueue(
+        &pool,
+        EpiGraphJob::EmbeddingGeneration {
+            claim_id: unembedded,
+        },
+    )
+    .await;
+    // `privatization_reseal`: a group flagged for re-seal with no stale epoch
+    // seal, so the check clears the flag (an UPDATE of `groups`).
+    sqlx::query("UPDATE groups SET reseal_required_at = now() WHERE id = $1")
+        .bind(world.target_group)
+        .execute(&pool)
+        .await
+        .expect("flag the group for re-seal");
+    let reseal = enqueue(
+        &pool,
+        EpiGraphJob::PrivatizationReseal {
+            group_id: world.target_group,
+            dispatched_by: world.actor,
+            correlation_id: "drain-reseal".to_string(),
+        },
+    )
+    .await;
 
     let scoped = maintenance_scoped(&pool).await;
     assert_maintenance_posture(&scoped).await;
-    let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::Mock);
+    // The owning provider's kind, so `embedding_generation` is registered; the
+    // embedder is the mock, so no network call is made.
+    let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::OpenAi);
     let report = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
         .await
         .expect("the drain ran");
@@ -204,6 +233,8 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
         ("cluster_graph", cluster),
         ("theme_cluster_rebuild", theme),
         ("privatization_apply", apply),
+        ("embedding_generation", embed),
+        ("privatization_reseal", reseal),
     ] {
         assert_eq!(
             job_state(&pool, id).await,
@@ -238,8 +269,49 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
         old_left, 0,
         "retain_runs = 1: the old run should have been deleted by the retention sweep"
     );
+    let has_vector: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(unembedded)
+            .fetch_one(&pool)
+            .await
+            .expect("the claim");
+    assert!(has_vector, "the embedding job ran but wrote no vector");
+    let still_flagged: bool =
+        sqlx::query_scalar("SELECT reseal_required_at IS NOT NULL FROM groups WHERE id = $1")
+            .bind(world.target_group)
+            .fetch_one(&pool)
+            .await
+            .expect("the group");
+    assert!(!still_flagged, "the reseal check did not clear the flag");
 
-    // A second run: nothing left, nothing done, exit 0. (The theme rebuild's
+    // The sixth handler: revert the applied plan.
+    let revert_correlation = fx::dispatch(&pool, &world, plan, "reverting").await;
+    let revert = {
+        let job = fx::revert_job(plan, world.actor, &revert_correlation);
+        let id: Uuid = job.id.into();
+        PostgresJobQueue::new(pool.clone())
+            .enqueue(job)
+            .await
+            .expect("seed the revert job");
+        id
+    };
+    let reverted = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("the revert drain ran");
+    assert!(reverted.failures.is_empty(), "{:?}", reverted.failures);
+    assert_eq!(
+        job_state(&pool, revert).await,
+        ("completed".to_string(), None),
+        "privatization_revert did not complete"
+    );
+    assert_eq!(fx::plan_state(&pool, plan).await, "reverted");
+    assert_eq!(
+        fx::tenancy(&pool, claim).await.0,
+        "public",
+        "the revert job ran but the plan's claim is still restricted"
+    );
+
+    // A final run: nothing left, nothing done, exit 0. (The theme rebuild's
     // follow-up enqueue, if it made one, was drained in the first run.)
     let again = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
         .await
