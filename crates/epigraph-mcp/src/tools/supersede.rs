@@ -137,19 +137,23 @@ pub(crate) async fn admin_session_or_deferral<'s>(
 ///    CALLER's viewer on a transaction stamped with that viewer. A claim it
 ///    cannot read is `claim <id> not found`, the same text a missing id gets,
 ///    so nothing here is an existence oracle.
-/// 2. [`epigraph_auth::claim_act::claim_act_arm`] (shared with HTTP): the
-///    claim's author, a writer of its owning group, a `claims:admin` holder, or
-///    the pre-OA1 token-owner rule; then the HTTP operator arm
-///    (`require_owner_or_admin`'s, `allow_actor = false`). Otherwise the named
-///    refusal [`crate::errors::claim_not_writer`].
-/// 3. THE STAMP. When the caller's viewer can write the claim's owning group,
-///    the act runs on the caller's own stamped transaction (the one step 1
-///    read on): D1's "the act keeps the CALLER's authority", and the cascade
-///    deferral is attributed to the caller. Otherwise (a `claims:admin`,
-///    token-owner or operator admission on a claim the caller does not write)
-///    it runs, as before OA1, on a transaction stamped from this server's own
-///    agent. Either way the database decides the write: a stamp that cannot
-///    write the row is refused and nothing commits.
+/// 2. [`epigraph_auth::claim_act::claim_act_arm`] (shared with HTTP): a
+///    `claims:admin` holder, or a caller whose viewer WRITES the claim's owning
+///    group (its author or not). Authorship alone admits nothing, and no
+///    transport-specific arm is added here. Otherwise the named refusal
+///    [`crate::errors::claim_not_writer`].
+/// 3. THE STAMP. Every non-admin act runs on the caller's own stamped
+///    transaction, the one step 1 read on (D1: "the act keeps the CALLER's
+///    authority"), so the authority read and the write see the same state,
+///    and the cascade deferral is attributed to the caller. A `claims:admin`
+///    caller that writes the owning group does the same. Only a `claims:admin`
+///    caller on a claim it does NOT write acts on a transaction stamped from
+///    this server's own agent: that is how the tool worked before batch OA1,
+///    when `claims:admin` was its scope. No other admission may borrow the
+///    server agent's stamp, because that would hand a `claims:write` caller
+///    the server agent's write authority over the group. Either way the
+///    database decides the write: a stamp that cannot write the row is
+///    refused and nothing commits.
 ///
 /// # stdio (no `AuthContext`)
 ///
@@ -204,30 +208,27 @@ async fn begin_claim_act<'p>(
         author,
         owner_group,
     };
-    let arm = match epigraph_auth::claim_act::claim_act_arm(
+    let Some(arm) = epigraph_auth::claim_act::claim_act_arm(
         auth,
         viewer.principal(),
         viewer.writable_groups(),
         target,
-    ) {
-        Some(arm) => arm.as_str(),
-        None => match auth.agent_id {
-            // `allow_actor = false`: operated agents are stdio-only.
-            Some(caller)
-                if crate::tools::claims::operator_arm_allows(server, caller, author, false)
-                    .await? =>
-            {
-                "operator"
-            }
-            _ => return Err(crate::errors::claim_not_writer(claim, action)),
-        },
+    ) else {
+        return Err(crate::errors::claim_not_writer(claim, action));
     };
-    tracing::info!(tool, claim = %claim, arm, "claim act admitted");
+    tracing::info!(tool, claim = %claim, arm = arm.as_str(), "claim act admitted");
 
     if viewer.writable_groups().contains(&owner_group) {
         if let Some(caller) = viewer.principal() {
             return Ok((caller_tx, caller));
         }
+    }
+    if arm != epigraph_auth::claim_act::ClaimActArm::Admin {
+        // Not reachable through `claim_act_arm` (a non-admin arm requires the
+        // owning group in a Scoped viewer's writable set, and a Scoped viewer
+        // has a principal). Refused rather than falling through to the server
+        // agent's stamp below, which only `claims:admin` may borrow.
+        return Err(crate::errors::claim_not_writer(claim, action));
     }
     // Rolled back: it read, and wrote nothing.
     drop(caller_tx);

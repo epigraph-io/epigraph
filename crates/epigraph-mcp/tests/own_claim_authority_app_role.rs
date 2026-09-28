@@ -12,6 +12,10 @@
 //!   `cascade.deferred` row naming the caller, and the replay applies it on the
 //!   maintenance connection);
 //! * a writer of the claim's owning group may do the same;
+//! * authorship alone is not write authority: an author whose membership in
+//!   the owning group was revoked, or who is only a reader there, is refused
+//!   by name on both tools, and the act never borrows the MCP server agent's
+//!   stamp for it;
 //! * a bystander with `claims:write` is refused by name on a claim it can read,
 //!   and on a claim it cannot read gets exactly the answer a random id gets
 //!   (duplicate and canonical alike);
@@ -128,6 +132,19 @@ async fn add_member(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
     .execute(pool)
     .await
     .expect("seed membership");
+}
+
+async fn revoke(pool: &PgPool, group: Uuid, agent: Uuid) {
+    let n = sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("revoke")
+    .rows_affected();
+    assert_eq!(n, 1, "exactly one membership revoked");
 }
 
 async fn is_current(pool: &PgPool, claim: Uuid) -> bool {
@@ -356,47 +373,72 @@ async fn the_author_dedups_its_own_claim_with_claims_write(pool: PgPool) {
     assert_eq!(edge_target(&pool, incoming).await, canonical);
 }
 
-/// The AUTHOR arm on its own: the human wrote the claim, but the claim is owned
-/// by a group the human does not write (the server agent's). Only authorship
-/// admits it, the act runs on the server agent's stamp, and it lands. A
-/// bystander on the same claim is refused, so the admission is authorship and
-/// not the claim's shape.
+/// Authorship is not write authority. The human wrote the claim while a
+/// `writer` of the server agent's group, then that membership was REVOKED; a
+/// second author is only a `reader` there. Neither writes the owning group, so
+/// both are refused by name on both tools, nothing is written, no cascade is
+/// recorded, and in particular the act does not run on the MCP server agent's
+/// stamp (which CAN write that group: before this rule a `claims:write` author
+/// retired and rewrote the group's claim through it).
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_author_is_admitted_on_a_claim_in_a_group_it_does_not_write(pool: PgPool) {
+async fn an_author_who_no_longer_writes_the_owning_group_is_refused(pool: PgPool) {
     let (server, server_agent) = app_role_server(&pool).await;
     let server_group = personal_group_of(&pool, server_agent).await;
-    let (h, _) = fixture::seed_agent_with_group(&pool, "oa1-human").await;
-    let (b, _) = fixture::seed_agent_with_group(&pool, "oa1-bystander").await;
-    let c = claim_of(
+    let (revoked, _) = fixture::seed_agent_with_group(&pool, "oa1-revoked-author").await;
+    let (reader, rg) = fixture::seed_agent_with_group(&pool, "oa1-reader-author").await;
+    add_member(&pool, server_group, revoked, "writer").await;
+    add_member(&pool, server_group, reader, "reader").await;
+    let by_revoked = claim_of(
         &pool,
-        h,
+        revoked,
         server_group,
         "public",
-        "written by h, owned elsewhere",
+        "written while a member",
     )
     .await;
-
-    let err = supersede_claim(
-        &server,
-        &viewer(&pool, b).await,
-        supersede_params(c),
-        Some(&human(b, &["claims:write"])),
+    let by_reader = claim_of(
+        &pool,
+        reader,
+        server_group,
+        "group",
+        "group-private, author only reads",
     )
-    .await
-    .expect_err("a bystander on the same claim is refused");
-    assert_not_claim_writer(&err, c);
+    .await;
+    let reader_own = claim_of(&pool, reader, rg, "public", "the reader's own claim").await;
+    revoke(&pool, server_group, revoked).await;
 
-    let r = supersede_claim(
-        &server,
-        &viewer(&pool, h).await,
-        supersede_params(c),
-        Some(&human(h, &["claims:write"])),
+    for (author, c) in [(revoked, by_revoked), (reader, by_reader)] {
+        let v = viewer(&pool, author).await;
+        assert!(
+            !v.writable_groups().contains(&server_group),
+            "fixture: the author does not write the owning group"
+        );
+        let auth = human(author, &["claims:read", "claims:write"]);
+
+        let mut p = supersede_params(c);
+        p.content = "content the author may not write into this group".to_string();
+        let err = supersede_claim(&server, &v, p, Some(&auth))
+            .await
+            .expect_err("an author without write authority may not supersede");
+        assert_not_claim_writer(&err, c);
+
+        // The canonical is one the author does write (the reader's own claim
+        // for both, readable as public), so only the duplicate decides.
+        let err = mark_duplicate(&server, &v, dedup_params(c, reader_own), Some(&auth))
+            .await
+            .expect_err("an author without write authority may not mark a duplicate");
+        assert_not_claim_writer(&err, c);
+
+        assert!(is_current(&pool, c).await, "nothing was written");
+        assert_eq!(successors(&pool, c).await, 0, "no replacement exists");
+    }
+    let deferrals: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'cascade.deferred'",
     )
+    .fetch_one(&pool)
     .await
-    .expect("the author is admitted by authorship alone");
-    assert!(!is_current(&pool, c).await);
-    let (who, _) = deferral(&pool, &first_text(&r)).await;
-    assert_eq!(who, Some(server_agent));
+    .expect("count");
+    assert_eq!(deferrals, 0, "a refused act records no cascade");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

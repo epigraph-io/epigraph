@@ -333,6 +333,55 @@ async fn a_writer_of_the_owning_group_may_supersede_over_http(pool: PgPool) {
     assert_eq!(deferral_agent(&pool, &resp.cascade).await, Some(w));
 }
 
+/// Authorship is not write authority, over HTTP as over MCP: the author of a
+/// claim in a group whose `writer` membership it has lost is refused BY NAME on
+/// both routes (before OA1's shared rule it reached the database, whose row
+/// security refused it with a generic 403), and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_author_who_no_longer_writes_the_owning_group_is_refused_by_name(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (_, og) = seed_agent_with_group(&pool, "oa1-http-owner").await;
+    let (h, hg) = seed_agent_with_group(&pool, "oa1-http-revoked-author").await;
+    add_member(&pool, og, h, "writer").await;
+    let c = claim_of(&pool, h, og, "public", "written while a member").await;
+    let mine = claim_of(&pool, h, hg, "public", "the author's own claim").await;
+    let n = sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(og)
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("revoke")
+    .rows_affected();
+    assert_eq!(n, 1);
+
+    let e = supersede_claim(
+        ViewerExtractor(viewer(&pool, h).await),
+        State(state.clone()),
+        human(h, &["claims:write"]),
+        Path(c),
+        supersede_body(c),
+    )
+    .await
+    .expect_err("a revoked author may not supersede");
+    assert_not_claim_writer(e, c).await;
+
+    let e = mark_duplicate(
+        ViewerExtractor(viewer(&pool, h).await),
+        State(state.clone()),
+        human(h, &["claims:write"]),
+        Path(c),
+        dedup_body(mine),
+    )
+    .await
+    .expect_err("a revoked author may not mark a duplicate");
+    assert_not_claim_writer(e, c).await;
+
+    assert!(is_current(&pool, c).await, "nothing was written");
+    assert!(is_current(&pool, mine).await, "nothing was written");
+}
+
 /// A bystander with `claims:write`: `403 not_owner` on a claim it can read (on
 /// both routes, nothing written); on a claim it cannot read, byte-for-byte the
 /// 404 a random id gets (the supersede target, the duplicate, the canonical).

@@ -57,6 +57,16 @@ async fn wire_supports(pool: &sqlx::PgPool, agent: Uuid, source: Uuid, target: U
     );
 }
 
+/// The claim's author (`claims.agent_id`), for attributing the BBA the edge
+/// factor wires from it.
+async fn author_of(pool: &sqlx::PgPool, claim_id: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await
+        .expect("read the claim's author")
+}
+
 async fn betp(pool: &sqlx::PgPool, claim_id: Uuid) -> Option<f64> {
     sqlx::query_scalar::<_, Option<f64>>("SELECT pignistic_prob FROM claims WHERE id = $1")
         .bind(claim_id)
@@ -98,12 +108,16 @@ async fn supersede_route_reports_and_applies_the_belief_cascade() {
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
 
     let tag = Uuid::new_v4();
-    let a =
-        common::seed_claim_with_agent(&pool, &format!("http cascade supporter {tag}"), client_id)
-            .await;
+    // A claim the token's agent writes (batch OA1's claim-act rule).
+    let a = common::seed_claim_writable_by_client(
+        &pool,
+        &format!("http cascade supporter {tag}"),
+        client_id,
+    )
+    .await;
     plant_interval(&pool, a).await;
     let b = common::seed_claim(&pool, &format!("http cascade downstream {tag}")).await;
-    wire_supports(&pool, client_id, a, b).await;
+    wire_supports(&pool, author_of(&pool, a).await, a, b).await;
 
     assert!(
         betp(&pool, b).await.is_some(),
@@ -300,12 +314,16 @@ async fn supersede_route_without_an_admin_connection_defers_the_cascade() {
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
 
     let tag = Uuid::new_v4();
-    let a =
-        common::seed_claim_with_agent(&pool, &format!("http deferred supporter {tag}"), client_id)
-            .await;
+    // A claim the token's agent writes (batch OA1's claim-act rule).
+    let a = common::seed_claim_writable_by_client(
+        &pool,
+        &format!("http deferred supporter {tag}"),
+        client_id,
+    )
+    .await;
     plant_interval(&pool, a).await;
     let b = common::seed_claim(&pool, &format!("http deferred downstream {tag}")).await;
-    wire_supports(&pool, client_id, a, b).await;
+    wire_supports(&pool, author_of(&pool, a).await, a, b).await;
     let before = betp(&pool, b).await;
     assert!(
         before.is_some(),

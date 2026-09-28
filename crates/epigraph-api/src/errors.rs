@@ -267,9 +267,10 @@ pub enum ApiError {
 
     /// `403`, `not_owner` with `rule = "not_claim_writer"` (batch OA1,
     /// operator decision D1): the caller can READ the claim but may not
-    /// supersede it or mark it a duplicate, because it is not the claim's
-    /// author, holds no `admin`/`writer` membership in the group that owns it,
-    /// and lacks `claims:admin` (`epigraph_auth::claim_act`). Nothing was
+    /// supersede it or mark it a duplicate, because it holds no
+    /// `admin`/`writer` membership in the group that owns it (authorship alone
+    /// is not write authority) and lacks `claims:admin`
+    /// (`epigraph_auth::claim_act`). Nothing was
     /// written. A claim the caller cannot read answers `404` instead, exactly
     /// like a missing one, so this is no existence oracle.
     #[error("{message}")]

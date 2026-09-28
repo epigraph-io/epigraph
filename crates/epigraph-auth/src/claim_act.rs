@@ -20,9 +20,23 @@
 //! only ever concerns a claim the caller could already see, so it is no
 //! existence oracle.
 //!
-//! The database still decides the write itself: every arm here admits a
-//! caller to ASK, and the act then runs on a stamped transaction whose row
-//! security refuses a row the stamp cannot write.
+//! # The rule is the caller's own write authority
+//!
+//! Without `claims:admin`, a caller is admitted only when its viewer can WRITE
+//! the group that owns the claim (`admin` or `writer` membership, live). That
+//! is exactly the `WITH CHECK` of `claims_tenancy` (migration 077:
+//! `owner_group_id = ANY(epigraph_writable_groups())`), so the pre-check and
+//! the database agree, and the refusal carries a name instead of a raw row
+//! security error. Authorship alone admits nothing: an author whose membership
+//! in the owning group was revoked, or downgraded to `reader`, no longer
+//! writes that claim, and must not be able to retire or rewrite it. The
+//! [`ClaimActArm::Author`] label only says which of the two write-capable
+//! callers asked.
+//!
+//! Every non-admin act then runs on a transaction stamped with the CALLER's
+//! viewer, the one the gate read ran on. Only [`ClaimActArm::Admin`] may act
+//! on a claim the caller does not write (on MCP, on the server agent's stamp,
+//! as before batch OA1, when `claims:admin` was the tool's scope).
 
 use crate::AuthContext;
 use uuid::Uuid;
@@ -47,14 +61,11 @@ pub struct ClaimActTarget {
 pub enum ClaimActArm {
     /// The token holds `claims:admin`: any claim the caller can read.
     Admin,
-    /// The caller's agent principal is the claim's author.
+    /// The caller writes the group that owns the claim AND is its author.
     Author,
-    /// The caller holds `admin` or `writer` in the group that owns the claim.
+    /// The caller writes the group that owns the claim (`admin` or `writer`)
+    /// and did not author it.
     GroupWriter,
-    /// The token's owner (or, with none, its client) is recorded as the
-    /// claim's author: the rule both transports applied before OA1, kept so
-    /// that no caller admitted then is refused now.
-    TokenOwner,
 }
 
 impl ClaimActArm {
@@ -65,7 +76,6 @@ impl ClaimActArm {
             Self::Admin => "claims_admin",
             Self::Author => "author",
             Self::GroupWriter => "group_writer",
-            Self::TokenOwner => "token_owner",
         }
     }
 }
@@ -77,12 +87,16 @@ impl ClaimActArm {
 /// the token alone: group membership is live state, and a token's scopes say
 /// nothing about it.
 ///
-/// Returns the first arm that admits the caller, in the order
-/// [`ClaimActArm::Admin`], [`ClaimActArm::Author`],
-/// [`ClaimActArm::GroupWriter`], [`ClaimActArm::TokenOwner`], or `None` for a
-/// refusal. A transport may add arms of its own after a `None` (MCP keeps its
-/// operator-link arm), never before, and never an arm that widens a refusal
-/// into an allow on anything the caller cannot read.
+/// [`ClaimActArm::Admin`] for a `claims:admin` token; otherwise `None` unless
+/// `writable_groups` holds the claim's owning group, and then
+/// [`ClaimActArm::Author`] or [`ClaimActArm::GroupWriter`]. A transport must
+/// not add arms of its own: any admission here that is not `Admin` is one the
+/// caller's own stamp can carry out, and the transport runs it on that stamp.
+///
+/// There is deliberately no arm comparing the token's `owner_id` or
+/// `client_id` with the claim's author. Those are `oauth_clients.id` values
+/// and `claims.agent_id` is an `agents.id`; equating the two is a type
+/// confusion that a colliding id would turn into a silent grant.
 #[must_use]
 pub fn claim_act_arm(
     auth: &AuthContext,
@@ -93,25 +107,23 @@ pub fn claim_act_arm(
     if auth.has_scope("claims:admin") {
         return Some(ClaimActArm::Admin);
     }
+    if !writable_groups.contains(&target.owner_group) {
+        return None;
+    }
     if viewer_principal == Some(target.author) {
-        return Some(ClaimActArm::Author);
+        Some(ClaimActArm::Author)
+    } else {
+        Some(ClaimActArm::GroupWriter)
     }
-    if writable_groups.contains(&target.owner_group) {
-        return Some(ClaimActArm::GroupWriter);
-    }
-    if auth.owner_id.unwrap_or(auth.client_id) == target.author {
-        return Some(ClaimActArm::TokenOwner);
-    }
-    None
 }
 
 /// The human-readable refusal for a claim act the caller may not perform.
 #[must_use]
 pub fn not_claim_writer_message(claim_id: Uuid, action: &str) -> String {
     format!(
-        "cannot {action} claim {claim_id}: the caller is not its author, holds no admin or \
-         writer membership in the group that owns it, and lacks claims:admin; nothing was \
-         written"
+        "cannot {action} claim {claim_id}: the caller holds no admin or writer membership in \
+         the group that owns it (authorship alone is not write authority) and lacks \
+         claims:admin; nothing was written"
     )
 }
 
@@ -149,12 +161,26 @@ mod tests {
     }
 
     #[test]
-    fn the_author_is_admitted_without_claims_admin() {
+    fn the_author_who_writes_the_owning_group_is_admitted_without_claims_admin() {
         let t = target();
         let a = auth(Uuid::new_v4(), Some(Uuid::new_v4()), &["claims:write"]);
         assert_eq!(
-            claim_act_arm(&a, Some(t.author), &[], t),
+            claim_act_arm(&a, Some(t.author), &[t.owner_group], t),
             Some(ClaimActArm::Author)
+        );
+    }
+
+    /// Authorship is not write authority: an author whose membership in the
+    /// owning group was revoked or downgraded (so the group is not in its
+    /// writable set) is refused, exactly as a bystander is.
+    #[test]
+    fn an_author_who_does_not_write_the_owning_group_is_refused() {
+        let t = target();
+        let a = auth(Uuid::new_v4(), Some(Uuid::new_v4()), &["claims:write"]);
+        assert_eq!(claim_act_arm(&a, Some(t.author), &[], t), None);
+        assert_eq!(
+            claim_act_arm(&a, Some(t.author), &[Uuid::new_v4()], t),
+            None
         );
     }
 
@@ -183,20 +209,16 @@ mod tests {
         );
     }
 
+    /// The token's `owner_id` / `client_id` (`oauth_clients.id` values) are
+    /// never compared with the claim's author (an `agents.id`): a token whose
+    /// owner or client id equals the author's id admits nothing on its own.
     #[test]
-    fn the_pre_oa1_token_owner_rule_still_admits() {
+    fn a_token_owner_or_client_id_equal_to_the_author_admits_nothing() {
         let t = target();
         let with_owner = auth(Uuid::new_v4(), Some(t.author), &["claims:write"]);
-        assert_eq!(
-            claim_act_arm(&with_owner, None, &[], t),
-            Some(ClaimActArm::TokenOwner)
-        );
-        // No owner: the client id stands in, as it always did.
+        assert_eq!(claim_act_arm(&with_owner, None, &[], t), None);
         let ownerless = auth(t.author, None, &["claims:write"]);
-        assert_eq!(
-            claim_act_arm(&ownerless, None, &[], t),
-            Some(ClaimActArm::TokenOwner)
-        );
+        assert_eq!(claim_act_arm(&ownerless, None, &[], t), None);
     }
 
     #[test]

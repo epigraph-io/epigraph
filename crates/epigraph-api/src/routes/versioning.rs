@@ -188,8 +188,8 @@ pub struct VersionHistoryResponse {
 ///
 /// - 400 Bad Request: Validation failures or claim already superseded
 /// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
-///   `not_claim_writer`): the caller can read the claim but is not its author,
-///   not a writer of its owning group, and lacks `claims:admin`
+///   `not_claim_writer`): the caller can read the claim but does not write its
+///   owning group (authorship alone is not enough) and lacks `claims:admin`
 /// - 404 Not Found: Claim does not exist, or the caller cannot read it (the two
 ///   are indistinguishable)
 /// - 201 Created: New claim created successfully
@@ -317,8 +317,10 @@ pub async fn supersede_claim(
             })?
     };
 
-    // 6b. The ACT's authority (batch OA1, operator decision D1): the claim's
-    //     author, a writer of its owning group, or a `claims:admin` holder.
+    // 6b. The ACT's authority (batch OA1, operator decision D1): write
+    //     authority over the claim's owning group (the same test as
+    //     `claims_tenancy`'s WITH CHECK, so the refusal is named instead of a
+    //     generic row-security 403), or a `claims:admin` holder.
     //     `claims:write` above is the scope; this is the per-claim rule, shared
     //     with MCP (`epigraph_auth::claim_act`). The cascade that follows is
     //     administrative and never runs with the caller's authority.
@@ -628,8 +630,9 @@ pub async fn supersede_claim(
 /// - 400 Bad Request: duplicate_id == canonical_id, or claim already superseded
 /// - 401 Unauthorized: no bearer token
 /// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
-///   `not_claim_writer`): the caller can read the duplicate but is not its
-///   author, not a writer of its owning group, and lacks `claims:admin`
+///   `not_claim_writer`): the caller can read the duplicate but does not write
+///   its owning group (authorship alone is not enough) and lacks
+///   `claims:admin`
 /// - 404 Not Found: the claim or the canonical does not exist, or the caller
 ///   cannot read it (the two are indistinguishable)
 /// - 200 OK: duplicate marked successfully
