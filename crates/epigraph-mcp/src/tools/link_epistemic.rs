@@ -67,8 +67,9 @@ use epigraph_engine::edge_factor::{auto_wire_edge_if_epistemic, EdgeFactorOutcom
 /// **non-Neutral** `RestrictionKind`, which is what actually moves belief.
 ///
 /// `supersedes` is excluded on purpose: it has dedicated semantics
-/// (`supersede_claim`, scope `claims:admin`, flips `is_current=false` + nulls
-/// the superseded claim's embedding). Letting any `claims:write` agent write a
+/// (`supersede_claim`: scope `claims:write` plus write authority over the
+/// claim's owning group, or `claims:admin`, since batch OA1; it flips
+/// `is_current=false` + nulls the superseded claim's embedding). Letting any `claims:write` agent write a
 /// bare `supersedes` edge here would create an inconsistent state.
 pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "supports",

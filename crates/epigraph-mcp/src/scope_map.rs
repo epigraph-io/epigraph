@@ -106,8 +106,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("store_workflow", "claims:write"),
     ("submit_claim", "claims:write"),
     // The two claim-retiring ACTS (batch OA1, operator decision D1). The act
-    // is the caller's own write to its own claim; the per-claim rule (author,
-    // writer of the owning group, or claims:admin for any readable claim) is
+    // is the caller's own write to a claim it may write; the per-claim rule
+    // (admin/writer membership in the owning group, for a dedup of both the
+    // duplicate and the canonical, or claims:admin for any readable claim) is
     // `epigraph_auth::claim_act`, enforced in `tools/supersede.rs`. The
     // cascade that follows re-points OTHER writers' rows, so it is
     // administrative: it runs on the maintenance connection and is deferred to

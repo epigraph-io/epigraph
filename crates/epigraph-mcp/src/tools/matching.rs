@@ -301,10 +301,12 @@ pub async fn decide_match_candidate(
 /// A SEPARATE tool from [`decide_match_candidate`] on purpose. `SCOPE_MAP` holds
 /// one scope per tool, and this is not the same kind of act as promote/reject:
 /// those are additive and take `claims:write` (the scope that files a challenge),
-/// while this withdraws an assertion another principal made and takes
-/// `claims:admin` (the scope that supersedes). Keeping them in one tool would
-/// force one of the two to carry the wrong scope, and 50 of 825 production
-/// oauth_clients hold `claims:write`.
+/// while this withdraws an assertion the MATCHER made, never the caller's own,
+/// and takes `claims:admin`: withdrawing another principal's assertion is an
+/// administrative act. (Supersession shared that scope until batch OA1; it is
+/// now the caller's own act on a claim it writes, at `claims:write`, so it is
+/// no longer the justification here.) Keeping them in one tool would force one
+/// of the two to carry the wrong scope, and `claims:write` is widely held.
 ///
 /// The edge is RETRACTED (`valid_to` closed), not deleted, so the promotion's
 /// provenance — `properties.decided_by` in particular — survives; see

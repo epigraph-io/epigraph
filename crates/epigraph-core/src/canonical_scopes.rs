@@ -78,11 +78,14 @@
 /// takes effect at the next refresh, and an already-minted access token keeps
 /// the scope until it expires.
 ///
-/// Holding `claims:admin` is NOT needed to supersede or dedup one's OWN claims:
-/// since batch OA1 those two acts need `claims:write` plus write authority over
-/// the claim (its author, or an admin/writer of its owning group), and
-/// `claims:admin` is the arm for any claim the caller can read
-/// (`epigraph_auth::claim_act`).
+/// Holding `claims:admin` is NOT needed to supersede or dedup a claim the
+/// caller may write: since batch OA1 those two acts need `claims:write` plus
+/// write authority over the claim (`admin` or `writer` membership in its owning
+/// group; being its author is not enough; for a dedup, over the canonical too),
+/// and `claims:admin` is the arm for any claim the caller can read
+/// (`epigraph_auth::claim_act`). The caller's own stamp decides the write; only
+/// a `claims:admin` caller on MCP may act on a claim it does not write, with
+/// the MCP server agent's stamp.
 pub const ADMIN_ONLY_SCOPES: &[&str] = &[
     "claims:admin",
     "clients:admin",

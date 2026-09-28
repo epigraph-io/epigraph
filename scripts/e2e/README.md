@@ -278,7 +278,8 @@ decision or conversion before the operator drops `claims_privacy`,
    - `POST /api/v1/claims` and `POST /claims`: opaque 500;
    - `PUT` and `PATCH /api/v1/claims/:id`: 500 42501 on own public, 404 on own
      private;
-   - `POST /claims/:id/dedup` (claims:admin): 409 "already superseded or
+   - `POST /claims/:id/dedup` (claims:admin at the time; since batch OA1,
+     claims:write plus write authority over both claims): 409 "already superseded or
      invalid input", a misleading status for an RLS refusal;
    - `PUT /claims/:id/embedding`;
    - `POST /api/v1/evidence`, `PUT /evidence/:id`, `PUT /evidence/:id/embedding`;

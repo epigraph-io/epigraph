@@ -446,9 +446,12 @@ sessions on the application role, and a privileged session bypasses it.
 **The retraction cascade is an administrative act (117).** A supersede, a dedup
 or a consolidation is the caller's act, written with the caller's authority on
 its own stamped transaction. Since batch OA1 the two claim acts need only
-`claims:write` plus write authority over the claim: its author, an
-`admin`/`writer` of its owning group, or a `claims:admin` holder
-(`epigraph_auth::claim_act`, shared by HTTP and MCP). A claim the caller cannot
+`claims:write` plus write authority over the claim: `admin`/`writer`
+membership in its owning group (authorship alone admits nothing; for a dedup
+the canonical is judged the same way), or `claims:admin`
+(`epigraph_auth::claim_act`, shared by HTTP and MCP). The one exception to
+"the caller's own stamp" is a `claims:admin` caller over MCP on a claim it does
+not write, which acts with the MCP server agent's stamp, as before OA1. A claim the caller cannot
 read is answered like a missing one; a readable one it may not retire is
 refused as `not_owner` / `not_claim_writer`. What follows it --
 re-pointing and retracting other writers' edges, moving and invalidating their

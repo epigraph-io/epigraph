@@ -3127,7 +3127,9 @@ pub struct DecideMatchCandidateParams {
 /// verdict on it. `SCOPE_MAP` is one scope per tool, and retirement is a different
 /// class of act from promote/reject: those are additive (`claims:write`, the scope
 /// that files a challenge), whereas retirement withdraws an assertion another
-/// principal made (`claims:admin`, the scope that supersedes). Folding it back into
+/// principal (the matcher) made, never the caller's own, which is administrative
+/// (`claims:admin`). Supersession is no longer the analogy: since batch OA1 it is
+/// the caller's act on a claim it writes, at `claims:write`. Folding it back into
 /// `decide_match_candidate` would force one of the two to hold the wrong scope.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RetireMatchCandidateParams {

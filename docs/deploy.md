@@ -1266,32 +1266,49 @@ W10 split the two; OA1 makes the scopes agree with that split.
 | `POST /api/v1/claims/:id/dedup` | `claims:admin` | `claims:write` + the rule below |
 
 The per-claim rule, shared by both transports (`epigraph_auth::claim_act`):
-the caller may perform the act when it is the claim's **author**, holds
-**`admin` or `writer` in the group that owns it**, or holds **`claims:admin`**
-(any claim it can read). The pre-OA1 token-owner rule, and MCP's operator-link
-arm, still admit whom they admitted.
+the caller may perform the act when its viewer **writes the group that owns the
+claim** (`admin` or `writer` membership, live), or it holds **`claims:admin`**
+(any claim it can read). For a dedup, the **canonical** is judged by the same
+rule as the duplicate: the cascade re-points other writers' edges and BBAs onto
+it, so a `claims:write` caller may only choose a canonical it could write.
+
+* **Authorship alone admits nothing.** An author whose membership in the
+  owning group was revoked, or downgraded to `reader`, can no longer retire or
+  rewrite that claim at `claims:write`. (The non-admin rule is exactly
+  `claims_tenancy`'s `WITH CHECK`, so it refuses by name what the database
+  would refuse anyway.)
+* The pre-OA1 comparison of the token's owner/client id (an `oauth_clients.id`)
+  with the claim's author (an `agents.id`) is gone. MCP's operator-link arm no
+  longer admits a claim act: before OA1 the tools required `claims:admin`, so it
+  never decided one in production. `resolve_backlog_item` and `patch_claim`
+  keep it. An operated agent's claims are owned by the operator's personal
+  group, which the operator writes, so the operator is admitted by the rule
+  above on its own stamp.
 
 **Which claims that reaches.** A claim written through an MCP server is authored
 by that server's signer agent and owned by the signer's group, not by the human
-behind the OAuth token. For such a claim a `claims:write` caller passes no arm
-unless it writes the signer's group (an HTTP signer carries no operator link), so
-retiring it over OAuth still needs `claims:admin`. Before withdrawing an
-administrative grant from a human client, check who authors and owns the claims
-that human retires.
+behind the OAuth token. For such a claim a `claims:write` caller is admitted
+only if it writes the signer's group, so retiring it over OAuth otherwise still
+needs `claims:admin`. Before withdrawing an administrative grant from a human
+client, check which groups own the claims that human retires, and whether the
+human writes them.
 
 * A claim the caller cannot read answers exactly like a missing one (HTTP
   `404`; MCP `claim <id> not found`). For a dedup this holds for the duplicate
   AND the canonical.
-* A claim the caller can read but may not retire is refused by name: HTTP `403`
-  with `{"error": "not_owner", "rule": "not_claim_writer", "claim_id": ...,
-  "retryable": false}`; MCP `-32600` with the same keys in `data`. Nothing is
+* A claim the caller can read but may not retire (or a canonical it may not
+  choose) is refused by name: HTTP `403` with `{"error": "not_owner", "rule":
+  "not_claim_writer", "claim_id": ..., "retryable": false}`, `claim_id` naming
+  the claim refused; MCP `-32600` with the same keys in `data`. Nothing is
   written.
-* The act runs on a transaction stamped with the caller's authority (HTTP
-  always; MCP whenever the caller writes the claim's group, otherwise with the
-  server agent's as before). The database still decides the write, so a
-  `claims:admin` caller whose stamp cannot write the row's group is refused
-  (`403`, nothing written) on an application-role deployment. That residual is
-  unchanged by OA1.
+* The act runs on a transaction stamped with the CALLER's own authority, the
+  one the authority read ran on. The single exception: over MCP, a
+  `claims:admin` caller on a claim it does not write acts with the MCP server
+  agent's stamp, exactly as every call did before OA1 (when `claims:admin` was
+  the tools' scope). No other admission borrows the server agent's stamp. Over
+  HTTP the database still decides a `claims:admin` write, so an admin whose
+  stamp cannot write the row's group is refused (`403`, nothing written) on an
+  application-role deployment; that residual is unchanged by OA1.
 * The cascade is unchanged: reported `{"status": "deferred"}` and applied by the
   replay timer on the maintenance DSN (D9).
 
@@ -1319,13 +1336,22 @@ a HUMAN's own client an admin-only scope:
 * scopes from `ADMIN_ONLY_SCOPES` only, checked before connecting;
 * `client_type = 'human'` only: service clients (`bootstrap_clients`) and agent
   clients (the approval route) are refused;
+* a GRANT only to a client whose `status` is `active` (a revoked, suspended or
+  pending client would carry the scope once reactivated or approved); a revoke
+  works on any status; every run prints the status;
 * the scope is added to, or removed from, BOTH `allowed_scopes` and
   `granted_scopes`; every other element of each array is kept in order;
 * idempotent; exactly one of `--dry-run` / `--apply` is required;
 * every `--apply` writes one `security_events` row
   (`oauth.client_scope_granted` / `oauth.client_scope_revoked`, `agent_id` = the
-  client's agent) whose `details` hold the operator (database login and OS
-  user), the client, the scope, `changed`, and both arrays before and after. A
+  client's agent) whose `details` hold the operator, the client (with its
+  status), the scope, `changed`, and both arrays before and after. The
+  operator is several facts, none an identity alone: the database login
+  (`session_user`), the process's real uid and its passwd name (from the
+  kernel), the connection's client address (also the row's `ip_address`) and
+  `application_name`, and `os_user` from `SUDO_USER`/`USER`/`LOGNAME`, which is
+  advisory (`os_user_source` says so: anyone can set it). A shared maintenance
+  login names no person; a per-operator login does. A
   no-op `--apply` is recorded too (`changed: false`), which is how a grant made
   some other way is ratified. A dry run writes nothing.
 

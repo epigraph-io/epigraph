@@ -1143,7 +1143,8 @@ async fn d9_every_cascading_route_defers_on_the_app_role_without_a_maintenance_p
             Request::builder()
                 .method(Method::POST)
                 .uri(format!("/api/v1/claims/{dup}/dedup"))
-                // The dedup route is claims:admin.
+                // An admin token. Since batch OA1 claims:write would do too:
+                // w writes both the duplicate's and the canonical's group.
                 .header(axum::http::header::AUTHORIZATION, format!("Bearer {admin}"))
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
