@@ -495,12 +495,22 @@ async fn the_binary_refuses_without_a_privileged_maintenance_login_and_yields_to
     )
     .await;
 
-    let unset = run_drain(&app_url, None);
+    // Unset, with a PRIVILEGED login as DATABASE_URL: the fallback would work,
+    // which is exactly why it is refused (the refusal's own text, not the
+    // resolver's WARN that also names the variable).
+    let unset = run_drain(&maint_url, None);
     assert_eq!(unset.code, Some(1), "{}", unset.stderr);
     assert!(
-        unset.stderr.contains("MAINTENANCE_DATABASE_URL is not set"),
+        unset
+            .stderr
+            .contains("runs only on an explicitly configured maintenance DSN"),
         "{}",
         unset.stderr
+    );
+    assert_eq!(
+        job_state(&pool, job).await.0,
+        "pending",
+        "the fallback to a privileged DATABASE_URL drained a job"
     );
     let unpriv = run_drain(&app_url, Some(&app_url));
     assert_eq!(unpriv.code, Some(1), "{}", unpriv.stderr);
