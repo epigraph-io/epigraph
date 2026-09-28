@@ -1881,7 +1881,7 @@ pub struct LinkHierarchicalResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchEdgeParams {
     #[schemars(
-        description = "UUID of the edge to patch. Must be an edge YOU can read and this server's agent can write; otherwise (for example an edge touching another group's private claim) it reports not found and nothing is written."
+        description = "UUID of the edge to patch. Must be an edge YOU can read and this server's agent can write. An edge you cannot read (for example one touching another group's private claim) reports not found; one you can read but the server's agent may not update (for example a world-owned edge between two public claims) is refused as such. Either way nothing is written."
     )]
     pub edge_id: String,
 
@@ -1921,7 +1921,7 @@ pub struct PatchEdgeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteEdgeParams {
     #[schemars(
-        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge YOU can read and this server's agent can write; otherwise it reports not found and nothing is written."
+        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge YOU can read and this server's agent can write. An edge you cannot read reports not found; one you can read but the server's agent may not retract (for example a world-owned edge between two public claims) is refused as such. Either way nothing is written."
     )]
     pub edge_id: String,
 }

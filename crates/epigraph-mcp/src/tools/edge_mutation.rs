@@ -114,6 +114,7 @@ fn resolve_valid_to(raw: Option<&str>) -> Result<Option<DateTime<Utc>>, McpError
 fn map_edge_err(e: DbError) -> McpError {
     match e {
         DbError::NotFound { id, .. } => invalid_params(format!("edge {id} not found")),
+        e @ DbError::WriteRefused { .. } => crate::errors::db_caller_error(e),
         other => internal_error(other),
     }
 }

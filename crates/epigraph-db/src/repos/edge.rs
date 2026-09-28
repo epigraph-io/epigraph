@@ -920,24 +920,40 @@ impl EdgeRepository {
     /// invalidation, not data loss, and they regenerate from live edges.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::WriteRefused` (and nothing retracted) when an in-force edge
+    /// this session can read was not closed: migration 117's owner-scoped
+    /// UPDATE matches no row it refuses and reports success.
+    /// `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn retract(pool: &PgPool, edge_ids: &[Uuid]) -> Result<Vec<Uuid>, DbError> {
         if edge_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let closed: Vec<Uuid> = sqlx::query_scalar(
+        let mut tx = pool.begin().await?;
+        let (closed, refused): (Vec<Uuid>, Option<Uuid>) = sqlx::query_as(
             r#"
-            UPDATE edges
-               SET valid_to = now()
-             WHERE id = ANY($1)
-               AND valid_to IS NULL
-            RETURNING id
+            WITH seen AS (SELECT id FROM edges WHERE id = ANY($1) AND valid_to IS NULL),
+                 done AS (
+                    UPDATE edges
+                       SET valid_to = now()
+                     WHERE id = ANY($1)
+                       AND valid_to IS NULL
+                    RETURNING id)
+            SELECT COALESCE((SELECT array_agg(id) FROM done), ARRAY[]::uuid[]),
+                   (SELECT id FROM seen EXCEPT SELECT id FROM done LIMIT 1)
             "#,
         )
         .bind(edge_ids)
-        .fetch_all(pool)
+        .fetch_one(&mut *tx)
         .await?;
+        if let Some(id) = refused {
+            return Err(DbError::WriteRefused {
+                entity: "edge".to_string(),
+                id,
+                action: "retract".to_string(),
+            });
+        }
+        tx.commit().await?;
         Ok(closed)
     }
 
@@ -1338,39 +1354,79 @@ impl EdgeRepository {
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
         properties_merge: Option<serde_json::Value>,
     ) -> Result<EdgeRow, DbError> {
+        // Migration 117 made UPDATE on `edges` owner-scoped with a RESTRICTIVE
+        // USING clause, so an edge this session can READ but not update (a
+        // world-owned edge between two public claims, another group's edge)
+        // matches zero rows WITHOUT an error. `seen` reads the row under the
+        // statement's snapshot, so the one statement tells "no such edge"
+        // (`NotFound`) from "refused" (`WriteRefused`) instead of reporting a
+        // refused patch as a missing edge.
         let row = sqlx::query!(
             r#"
-            UPDATE edges
-            SET valid_to = COALESCE($2, valid_to),
-                properties = CASE
-                    WHEN $3::jsonb IS NULL THEN properties
-                    ELSE properties || $3::jsonb
-                END
-            WHERE id = $1
-            RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            WITH seen AS (SELECT 1 FROM edges WHERE id = $1),
+                 upd AS (
+                    UPDATE edges
+                    SET valid_to = COALESCE($2, valid_to),
+                        properties = CASE
+                            WHEN $3::jsonb IS NULL THEN properties
+                            ELSE properties || $3::jsonb
+                        END
+                    WHERE id = $1
+                    RETURNING id, source_id, source_type, target_id, target_type, relationship,
+                              properties, valid_from, valid_to)
+            SELECT upd.id AS "id?", upd.source_id AS "source_id?",
+                   upd.source_type AS "source_type?", upd.target_id AS "target_id?",
+                   upd.target_type AS "target_type?", upd.relationship AS "relationship?",
+                   upd.properties AS "properties?", upd.valid_from AS "valid_from?",
+                   upd.valid_to AS "valid_to?",
+                   EXISTS (SELECT 1 FROM seen) AS "visible!"
+              FROM (SELECT 1) AS one LEFT JOIN upd ON true
             "#,
             id,
             valid_to,
             properties_merge,
         )
-        .fetch_optional(executor)
-        .await?
-        .ok_or(DbError::NotFound {
-            entity: "edge".to_string(),
-            id,
-        })?;
+        .fetch_one(executor)
+        .await?;
 
-        Ok(EdgeRow {
-            id: row.id,
-            source_id: row.source_id,
-            source_type: row.source_type,
-            target_id: row.target_id,
-            target_type: row.target_type,
-            relationship: row.relationship,
-            properties: row.properties,
-            valid_from: row.valid_from,
-            valid_to: row.valid_to,
-        })
+        match (
+            row.id,
+            row.source_id,
+            row.source_type,
+            row.target_id,
+            row.target_type,
+            row.relationship,
+            row.properties,
+        ) {
+            (
+                Some(id),
+                Some(source_id),
+                Some(source_type),
+                Some(target_id),
+                Some(target_type),
+                Some(relationship),
+                Some(properties),
+            ) => Ok(EdgeRow {
+                id,
+                source_id,
+                source_type,
+                target_id,
+                target_type,
+                relationship,
+                properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            }),
+            _ if row.visible => Err(DbError::WriteRefused {
+                entity: "edge".to_string(),
+                id,
+                action: "update".to_string(),
+            }),
+            _ => Err(DbError::NotFound {
+                entity: "edge".to_string(),
+                id,
+            }),
+        }
     }
 
     /// Delete an edge by ID
@@ -1396,23 +1452,41 @@ impl EdgeRepository {
     /// Generic over the executor for the same reason as
     /// [`Self::update_valid_to_and_properties`]: the MCP `delete_edge` tool runs
     /// it on an author-stamped transaction. The SQL is byte-identical.
+    ///
+    /// # Errors
+    /// `DbError::WriteRefused` when the edge is in force and readable by this
+    /// session but row security refused the retraction (migration 117's
+    /// owner-scoped UPDATE matches zero rows without an error; `open` reads the
+    /// row under the statement's snapshot to tell the two apart).
     pub async fn retract_by_id<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
     ) -> Result<bool, DbError> {
-        let result = sqlx::query!(
+        let r = sqlx::query!(
             r#"
-            UPDATE edges
-               SET valid_to = now()
-             WHERE id = $1
-               AND valid_to IS NULL
+            WITH open AS (SELECT 1 FROM edges WHERE id = $1 AND valid_to IS NULL),
+                 upd AS (
+                    UPDATE edges
+                       SET valid_to = now()
+                     WHERE id = $1
+                       AND valid_to IS NULL
+                    RETURNING 1)
+            SELECT (SELECT count(*) FROM open) AS "open!", (SELECT count(*) FROM upd) AS "closed!"
             "#,
             id
         )
-        .execute(executor)
+        .fetch_one(executor)
         .await?;
+        let (open, closed) = (r.open, r.closed);
 
-        Ok(result.rows_affected() > 0)
+        if closed < open {
+            return Err(DbError::WriteRefused {
+                entity: "edge".to_string(),
+                id,
+                action: "retract".to_string(),
+            });
+        }
+        Ok(closed > 0)
     }
 
     /// Delete all edges between two entities
@@ -1435,23 +1509,36 @@ impl EdgeRepository {
         target_id: Uuid,
         target_type: &str,
     ) -> Result<u64, DbError> {
-        let result = sqlx::query!(
+        // Checked, in a transaction: an in-force edge this session can read
+        // but not retract (migration 117) refuses the whole call.
+        let mut tx = pool.begin().await?;
+        let r = sqlx::query!(
             r#"
-            UPDATE edges
-               SET valid_to = now()
-            WHERE source_id = $1 AND source_type = $2
-              AND target_id = $3 AND target_type = $4
-              AND valid_to IS NULL
+            WITH seen AS (
+                    SELECT 1 FROM edges
+                     WHERE source_id = $1 AND source_type = $2
+                       AND target_id = $3 AND target_type = $4
+                       AND valid_to IS NULL),
+                 done AS (
+                    UPDATE edges
+                       SET valid_to = now()
+                    WHERE source_id = $1 AND source_type = $2
+                      AND target_id = $3 AND target_type = $4
+                      AND valid_to IS NULL
+                    RETURNING 1)
+            SELECT (SELECT count(*) FROM seen) AS "seen!", (SELECT count(*) FROM done) AS "done!"
             "#,
             source_id,
             source_type,
             target_id,
             target_type
         )
-        .execute(pool)
+        .fetch_one(&mut *tx)
         .await?;
-
-        Ok(result.rows_affected())
+        let changed =
+            super::require_all_changed("edge from", source_id, "retract", (r.seen, r.done))?;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Count edges for an entity (as either source or target)

@@ -56,6 +56,13 @@ pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
             message: Cow::from(message),
             data: None,
         },
+        // Row security let the caller read the row but not change it
+        // (migrations 115/117): the same class of denial.
+        e @ epigraph_db::DbError::WriteRefused { .. } => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(e.to_string()),
+            data: None,
+        },
         other => internal_error(other),
     }
 }

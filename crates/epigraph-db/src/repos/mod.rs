@@ -166,3 +166,36 @@ pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityE
 pub use span::{SpanRepository, SpanRow};
 pub use task::{TaskRepository, TaskRow};
 pub use workflow_execution::{WorkflowExecutionRepository, WorkflowExecutionRow};
+
+/// Compare what a write could SEE with what it CHANGED, and refuse loudly when
+/// row security left a row it had to change as it was.
+///
+/// Migrations 115 and 117 made DELETE (every tier-A table) and UPDATE (`edges`
+/// and the four registries) owner-scoped with RESTRICTIVE USING clauses. A
+/// USING clause that refuses a row does not raise: the statement matches zero
+/// rows and reports success. A caller that must change the rows it names runs
+/// one statement shaped
+///
+/// ```sql
+/// WITH seen AS (SELECT 1 FROM t WHERE <pred>),
+///      done AS (DELETE FROM t WHERE <pred> RETURNING 1)
+/// SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
+/// ```
+///
+/// (`seen` reads under the statement's snapshot, before the write) and hands
+/// the pair here. Returns the number changed.
+pub(crate) fn require_all_changed(
+    entity: &str,
+    id: uuid::Uuid,
+    action: &str,
+    (seen, done): (i64, i64),
+) -> Result<u64, crate::errors::DbError> {
+    if done < seen {
+        return Err(crate::errors::DbError::WriteRefused {
+            entity: entity.to_string(),
+            id,
+            action: action.to_string(),
+        });
+    }
+    Ok(u64::try_from(done).unwrap_or(0))
+}
