@@ -562,6 +562,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          tenancy is the parent claim's, established by the INSERT that precedes it.",
     ),
     (
+        "entity_type.rs",
+        "get_by_name_conn",
+        "READ of the `entity_types` registry by name, plus its `to_regclass` probe. The \
+         registry is instance-wide and carries no tenancy, so a viewer would filter nothing. \
+         Connection-taking since batch W12b (migration 120) so the HTTP edge create route's \
+         read-through rides its caller-stamped write transaction, under a SAVEPOINT.",
+    ),
+    (
         "event.rs",
         "publish_or_log_conn",
         "WRITE, append-only. Publishes an event row inside the caller's transaction and returns \
@@ -1819,6 +1827,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          and the projected row shape are unchanged and were not re-derived here. REACH IS WIDER \
          THAN MOTIVATION: one other production call site -- `epigraph-mcp/src/tools/rdf.rs` -- \
          still passes `&PgPool`, which satisfies `E: PgExecutor<'e>`, and was not edited.",
+    ),
+    (
+        "entity_type.rs",
+        "resolve_row",
+        "The `to_regclass` probe that folds `table_present` into a registry row (private). \
+         Reads the catalog, not a tenant table. Executor-generic since batch W12b so \
+         `get_by_name_conn` can run it on the caller's connection; the `&PgPool` callers \
+         (`get_by_name`, `list_all`) are unchanged.",
     ),
     (
         "entity.rs",

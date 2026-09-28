@@ -1,0 +1,322 @@
+//! Migration 120 (operator decision D8) through the HTTP edge write routes, on
+//! the APPLICATION ROLE.
+//!
+//! Before batch W12b the five edge write handlers ran on the unstamped raw
+//! pool: every HTTP-created edge between two public claims landed world-owned
+//! (administrative from birth), and on the application role the owner's own
+//! patch and retract matched zero rows. They now run on a transaction stamped
+//! with the caller's viewer (`AppState::write_as`).
+//!
+//! # The instrument
+//!
+//! BOTH pools of the `AppState` are downgraded to `epigraph_app`: the stamped
+//! `ScopedPool` (`connect_downgraded_for_tests`) that the converted handlers
+//! write through, and the raw `db_pool` their post-commit side effects use. A
+//! superuser pool bypasses every policy, so on one "the patch changed 0 rows"
+//! and "the patch changed 1 row" would be indistinguishable. Handlers are
+//! invoked directly, with the caller's `ViewerExtractor`.
+
+mod viewer_fixture;
+
+use axum::extract::{Path, State};
+use axum::response::IntoResponse;
+use axum::Json;
+use epigraph_api::errors::ApiError;
+use epigraph_api::middleware::bearer::ViewerExtractor;
+use epigraph_api::routes::edges::{
+    create_edge, create_hierarchical_edge, delete_edge, patch_edge, relate_claims,
+    CreateEdgeRequest, LinkHierarchicalRequest, PatchEdgeRequest, RelateClaimsRequest,
+};
+use epigraph_api::state::{ApiConfig, AppState};
+use epigraph_db::visibility::Viewer;
+use epigraph_db::{ScopedPool, SessionGucMode};
+use http_body_util::BodyExt;
+use sqlx::PgPool;
+use uuid::Uuid;
+use viewer_fixture::{
+    database_url_for, downgraded_pool, seed_agent_with_group, seed_edge, seed_group_claim,
+    seed_public_claim, world_group,
+};
+
+async fn app_role_state(pool: &PgPool) -> AppState {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: every arm here is vacuous"
+    );
+    let url = database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let raw = downgraded_pool(pool, "epigraph_app").await;
+    let mut state = AppState::with_db(raw, ApiConfig::default());
+    state.scoped = Some(scoped);
+    state
+        .load_entity_type_cache()
+        .await
+        .expect("load the entity-type cache");
+    state
+}
+
+async fn viewer(pool: &PgPool, agent: Uuid) -> Viewer {
+    Viewer::resolve(pool, agent).await.expect("resolve")
+}
+
+/// `(owner, visibility, co_owner, writer_group_id, valid_to IS NULL, properties)`.
+type Row = (
+    Uuid,
+    String,
+    Option<Uuid>,
+    Option<Uuid>,
+    bool,
+    serde_json::Value,
+);
+
+async fn row(pool: &PgPool, e: Uuid) -> Row {
+    sqlx::query_as(
+        "SELECT owner_group_id, visibility::text, co_owner_group_id, writer_group_id, \
+                valid_to IS NULL, properties FROM edges WHERE id = $1",
+    )
+    .bind(e)
+    .fetch_one(pool)
+    .await
+    .expect("edge row")
+}
+
+fn create_body(source: Uuid, target: Uuid) -> CreateEdgeRequest {
+    CreateEdgeRequest {
+        source_id: source,
+        target_id: target,
+        source_type: "claim".to_string(),
+        target_type: "claim".to_string(),
+        relationship: "supports".to_string(),
+        properties: None,
+        labels: None,
+        valid_from: None,
+        valid_to: None,
+        if_not_exists: false,
+    }
+}
+
+fn note(n: &str) -> PatchEdgeRequest {
+    PatchEdgeRequest {
+        valid_to: None,
+        properties: Some(serde_json::json!({ "note": n })),
+    }
+}
+
+/// The status and JSON body an `ApiError` renders.
+async fn rendered(e: ApiError) -> (u16, serde_json::Value) {
+    let resp = e.into_response();
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+async fn assert_not_owner(e: ApiError, rule: &str) {
+    let (status, body) = rendered(e).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"], "not_owner", "{body}");
+    assert_eq!(body["rule"], rule, "{body}");
+    assert_eq!(body["retryable"], false, "{body}");
+}
+
+/// Test 12: the owner creates, patches and retracts over HTTP on the
+/// application role, one row each, and the edge is its writer group's. A
+/// bystander who can read it gets `403 not_owner` naming the rule, with nothing
+/// written; a world edge names the administrative rule; an edge the bystander
+/// cannot read is still a 404.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (author, _) = seed_agent_with_group(&pool, "author").await;
+    let (w, w_g) = seed_agent_with_group(&pool, "http-writer-w").await;
+    let (z, _) = seed_agent_with_group(&pool, "http-bystander-z").await;
+    let a = seed_public_claim(&pool, author, "w12b http public a").await;
+    let b = seed_public_claim(&pool, author, "w12b http public b").await;
+    let c = seed_public_claim(&pool, author, "w12b http public c").await;
+    let world_edge = seed_edge(&pool, b, c).await;
+    assert_eq!(row(&pool, world_edge).await.0, world_group(&pool).await);
+    let w_private = seed_group_claim(&pool, w, w_g, "w12b http W-private").await;
+    let hidden = seed_edge(&pool, w_private, a).await;
+
+    // W creates: 201, its own, the author record set.
+    let (status, Json(created)) = create_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        None,
+        Json(create_body(a, b)),
+    )
+    .await
+    .expect("the owner creates its edge over HTTP on the application role");
+    assert_eq!(status.as_u16(), 201);
+    assert!(created.owned_by_caller);
+    let edge = created.edge.id;
+    let r = row(&pool, edge).await;
+    assert_eq!(
+        (r.0, r.1.as_str(), r.2, r.3, r.4),
+        (w_g, "public", None, Some(w_g), true)
+    );
+
+    // Z: refused by name, nothing written.
+    let refused = patch_edge(
+        ViewerExtractor(viewer(&pool, z).await),
+        State(state.clone()),
+        None,
+        Path(edge),
+        Json(note("by z")),
+    )
+    .await
+    .expect_err("not Z's to patch");
+    assert_not_owner(refused, "owned_by_another_writer").await;
+    let refused = delete_edge(
+        ViewerExtractor(viewer(&pool, z).await),
+        State(state.clone()),
+        None,
+        Path(edge),
+    )
+    .await
+    .expect_err("not Z's to delete");
+    assert_not_owner(refused, "owned_by_another_writer").await;
+    let r = row(&pool, edge).await;
+    assert!(
+        r.4 && r.5 == serde_json::json!({}),
+        "nothing written: {r:?}"
+    );
+
+    // A world edge: administrative. An invisible edge: 404.
+    let refused = delete_edge(
+        ViewerExtractor(viewer(&pool, z).await),
+        State(state.clone()),
+        None,
+        Path(world_edge),
+    )
+    .await
+    .expect_err("admin-only");
+    assert_not_owner(refused, "administrative_edge").await;
+    let missing = delete_edge(
+        ViewerExtractor(viewer(&pool, z).await),
+        State(state.clone()),
+        None,
+        Path(hidden),
+    )
+    .await
+    .expect_err("invisible to Z");
+    assert_eq!(rendered(missing).await.0, 404);
+
+    // W patches and retracts its own: one row each.
+    let Json(patched) = patch_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        None,
+        Path(edge),
+        Json(note("by w")),
+    )
+    .await
+    .expect("the owner patches its edge");
+    assert_eq!(patched.properties["note"], "by w");
+    let status = delete_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        None,
+        Path(edge),
+    )
+    .await
+    .expect("the owner retracts its edge");
+    assert_eq!(status.as_u16(), 204);
+    let r = row(&pool, edge).await;
+    assert!(!r.4, "retracted");
+    assert_eq!(r.5["note"], "by w");
+}
+
+/// The other two converted write routes own their edges by the caller too, and
+/// a caller that may not write the meet of a mixed edge is refused (403) with
+/// nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hierarchical_and_relate_are_the_callers_and_a_mixed_edge_is_decided_by_its_group(
+    pool: PgPool,
+) {
+    let state = app_role_state(&pool).await;
+    let (author, _) = seed_agent_with_group(&pool, "author").await;
+    let (w, w_g) = seed_agent_with_group(&pool, "http-writer-w").await;
+    let (owner, g) = seed_agent_with_group(&pool, "group-owner").await;
+    let (reader, _) = seed_agent_with_group(&pool, "reader-of-g").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(g)
+    .bind(reader)
+    .execute(&pool)
+    .await
+    .expect("reader membership");
+    let a = seed_public_claim(&pool, author, "w12b http public a").await;
+    let b = seed_public_claim(&pool, author, "w12b http public b").await;
+    let private = seed_group_claim(&pool, owner, g, "w12b http G-private").await;
+
+    let (_, Json(h)) = create_hierarchical_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        None,
+        Json(LinkHierarchicalRequest {
+            source_claim_id: a,
+            target_claim_id: b,
+            relationship: "decomposes_to".to_string(),
+            properties: None,
+        }),
+    )
+    .await
+    .expect("hierarchical link");
+    assert!(h.created && h.owned_by_caller);
+    assert_eq!(row(&pool, h.edge_id).await.0, w_g);
+
+    let (_, Json(rel)) = relate_claims(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        None,
+        Path(a),
+        Json(RelateClaimsRequest {
+            target_claim_id: b,
+            properties: None,
+        }),
+    )
+    .await
+    .expect("relate");
+    let ids: Vec<Uuid> = serde_json::from_value(rel["edge_ids"].clone()).expect("edge ids");
+    assert_eq!(ids.len(), 2);
+    for id in ids {
+        let r = row(&pool, id).await;
+        assert_eq!(
+            (r.0, r.3),
+            (w_g, Some(w_g)),
+            "both RELATES_TO edges are W's"
+        );
+    }
+
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM edges")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    let refused = create_edge(
+        ViewerExtractor(viewer(&pool, reader).await),
+        State(state.clone()),
+        None,
+        Json(create_body(a, private)),
+    )
+    .await
+    .expect_err("a reader of G may not write an edge the meet gives to G");
+    assert_eq!(rendered(refused).await.0, 403);
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM edges")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(after, before, "nothing written");
+}

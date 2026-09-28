@@ -251,6 +251,19 @@ pub enum ApiError {
         runs_on_kind: &'static str,
         runs_on_name: String,
     },
+
+    /// `403`, `not_owner` (migrations 115/117/120, operator decision D8): the
+    /// caller can READ the edge but may not patch, retract or delete it,
+    /// because it is another writer's (`rule = "owned_by_another_writer"`) or
+    /// administrative (`rule = "administrative_edge"`: world-owned, admin-only).
+    /// Nothing was written. An edge the caller cannot read answers `404`
+    /// instead, so this is no existence oracle.
+    #[error("{message}")]
+    EdgeNotOwned {
+        edge_id: uuid::Uuid,
+        rule: &'static str,
+        message: String,
+    },
 }
 
 impl ApiError {
@@ -262,6 +275,22 @@ impl ApiError {
             surface: surface.to_string(),
             runs_on_kind: "cli",
             runs_on_name: cli.to_string(),
+        }
+    }
+
+    /// The `not_owner` refusal for a write on a visible edge (see
+    /// [`ApiError::EdgeNotOwned`]).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn edge_not_owned(
+        refusal: epigraph_db::EdgeRefusal,
+        edge_id: uuid::Uuid,
+        action: &str,
+    ) -> Self {
+        Self::EdgeNotOwned {
+            edge_id,
+            rule: refusal.rule(),
+            message: refusal.message(edge_id, action),
         }
     }
 
@@ -311,6 +340,25 @@ impl IntoResponse for ApiError {
                     "runs_on": {"kind": runs_on_kind, "name": runs_on_name},
                     "retryable": false,
                     "decision": "D9",
+                })),
+            )
+                .into_response();
+        }
+        // The `not_owner` contract (migration 120, D8): machine-keyed like MOVED.
+        if let ApiError::EdgeNotOwned {
+            edge_id,
+            rule,
+            message,
+        } = &self
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "not_owner",
+                    "message": message,
+                    "edge_id": edge_id,
+                    "rule": rule,
+                    "retryable": false,
                 })),
             )
                 .into_response();
@@ -407,6 +455,7 @@ impl IntoResponse for ApiError {
                 "maintenance_surface_not_served",
                 None,
             ),
+            ApiError::EdgeNotOwned { .. } => (StatusCode::FORBIDDEN, "not_owner", None),
         };
 
         // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a
