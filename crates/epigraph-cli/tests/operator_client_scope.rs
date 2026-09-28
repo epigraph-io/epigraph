@@ -8,8 +8,9 @@
 //! kept in order (the fixture's two arrays differ, as a real client's may);
 //! idempotence; one `security_events` row per `--apply` with who, the client,
 //! the scope and both arrays before and after; a dry run that writes nothing;
-//! a grant refused to a client that is not `active` (a revoke is not); and
-//! the maintenance-DSN-only connection.
+//! a grant refused to a client that is not `active` (a revoke is not); the
+//! advisory environment user recorded beside the kernel's uid; and the
+//! maintenance-DSN-only connection.
 
 mod viewer_fixture;
 
@@ -217,6 +218,19 @@ async fn a_human_client_is_granted_an_admin_only_scope_with_one_audit_row(pool: 
     assert_eq!(d["operator"]["session_user"], session_user, "{d}");
     assert!(d["operator"].get("os_user").is_some(), "{d}");
     assert_eq!(d["client"]["status"], "active", "{d}");
+    assert_eq!(
+        d["operator"]["process_uid"],
+        serde_json::json!(this_uid()),
+        "the kernel's uid of the process that ran it: {d}"
+    );
+    assert!(d["operator"].get("client_addr").is_some(), "{d}");
+    assert!(d["operator"].get("application_name").is_some(), "{d}");
+}
+
+/// The uid of this test process, which spawns the binary under the same uid.
+fn this_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").expect("/proc/self").uid()
 }
 
 /// A grant to a human client whose status is not `active` is refused, exit 1,
@@ -280,6 +294,49 @@ async fn a_grant_to_a_client_that_is_not_active_is_refused_and_a_revoke_is_not(p
     let rows = audit(&pool, c).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].2["client"]["status"], "revoked");
+}
+
+/// The environment's user name is recorded as `os_user` and labelled advisory,
+/// because anyone can set `SUDO_USER`; beside it, the audit row carries the
+/// process's real uid from the kernel, which the environment cannot change,
+/// and that uid's passwd name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_environment_user_is_advisory_and_the_kernel_uid_is_recorded(pool: PgPool) {
+    let c = seed_client(&pool, "human", GRANTED, GRANTED, None, None).await;
+    let url = fixture::database_url_for(&pool).await;
+    let r = run_with_env(
+        &[
+            "grant-client-scope",
+            &c.to_string(),
+            "claims:admin",
+            "--apply",
+        ],
+        &[(DSN_ENV, url.as_str()), ("SUDO_USER", "someone-else")],
+        &["DATABASE_URL", "MAINTENANCE_DATABASE_URL"],
+    );
+    assert_eq!(r.code, 0, "{}", r.show());
+    let rows = audit(&pool, c).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let op = &rows[0].2["operator"];
+    assert_eq!(op["os_user"], "someone-else", "{op}");
+    assert!(
+        op["os_user_source"]
+            .as_str()
+            .is_some_and(|s| s.contains("advisory")),
+        "{op}"
+    );
+    let uid = this_uid();
+    assert_eq!(op["process_uid"], serde_json::json!(uid), "{op}");
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let name = passwd.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() > 2 && f[2] == uid.to_string()).then(|| f[0].to_string())
+    });
+    assert_eq!(op["process_user"], serde_json::json!(name), "{op}");
+    assert_ne!(
+        op["process_user"], "someone-else",
+        "the kernel's user is not the spoofed one"
+    );
 }
 
 /// Granting a held scope changes nothing, and the `--apply` is still recorded

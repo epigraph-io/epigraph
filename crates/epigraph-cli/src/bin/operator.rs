@@ -274,10 +274,7 @@ async fn main_inner() -> anyhow::Result<i32> {
                 Command::RevokeClientScope(a) => (client_scope::ScopeOp::Revoke, a),
                 _ => unreachable!("matched above"),
             };
-            let who = client_scope::Operator {
-                session_user: db.session_user.clone(),
-                os_user: client_scope::Operator::os_user_from_env(),
-            };
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
             let outcome = client_scope::run(
                 &mut conn,
                 op,

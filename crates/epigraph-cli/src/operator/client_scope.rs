@@ -47,11 +47,19 @@
 //!   or revoking one it holds in neither, changes nothing.
 //! * **Audited.** Every `--apply` writes exactly one `security_events` row
 //!   (`oauth.client_scope_granted` / `oauth.client_scope_revoked`) in the same
-//!   transaction as the change: who ran it (the database login and the OS
-//!   user), the client, the scope, and both arrays before and after, with
+//!   transaction as the change: who ran it, the client, the scope, and both
+//!   arrays before and after, with
 //!   `changed` saying whether anything moved. A no-op `--apply` is recorded too
 //!   (`changed: false`): it is how an operator ratifies a grant that was made
 //!   some other way.
+//!
+//!   "Who ran it" is several facts, none of which is an identity on its own:
+//!   the database login (`session_user`; a shared maintenance login names no
+//!   person), the process's real uid and its passwd name (read from the
+//!   kernel, not the environment), the connection's client address and
+//!   `application_name`, and `os_user`, which is `SUDO_USER` / `USER` /
+//!   `LOGNAME` and therefore ADVISORY: anyone can set it. The row records
+//!   `os_user_source` to say so.
 //! * **`--dry-run`** runs the same statements, the audit row included, in a
 //!   transaction that is rolled back, and prints what would change.
 //!
@@ -96,11 +104,52 @@ impl ScopeOp {
 pub struct Operator {
     /// `session_user` of the maintenance connection.
     pub session_user: String,
-    /// The OS user that ran the binary (`SUDO_USER`, else `USER`), if known.
+    /// The OS user the ENVIRONMENT names (`SUDO_USER`, else `USER`, else
+    /// `LOGNAME`). Advisory: any caller can set these variables.
     pub os_user: Option<String>,
+    /// The process's real uid, from the kernel (`/proc/self`'s owner).
+    pub process_uid: Option<u32>,
+    /// `process_uid`'s name in `/etc/passwd`, if it has one.
+    pub process_user: Option<String>,
 }
 
 impl Operator {
+    /// The operator of THIS process: `session_user` as the maintenance
+    /// connection reported it, the environment's (advisory) user name, and
+    /// the process's real uid and passwd name.
+    #[must_use]
+    pub fn of_this_process(session_user: String) -> Self {
+        let process_uid = Self::process_uid();
+        Self {
+            session_user,
+            os_user: Self::os_user_from_env(),
+            process_uid,
+            process_user: process_uid.and_then(Self::passwd_name),
+        }
+    }
+
+    /// The real uid of this process: the owner of `/proc/self`, which the
+    /// kernel sets and no environment variable can change. `None` off Linux.
+    #[must_use]
+    pub fn process_uid() -> Option<u32> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+    }
+
+    /// `uid`'s login name from `/etc/passwd`, or `None` when it has no entry
+    /// there (a container uid, an NSS-only account).
+    #[must_use]
+    pub fn passwd_name(uid: u32) -> Option<String> {
+        let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+        passwd.lines().find_map(|line| {
+            let mut f = line.split(':');
+            let name = f.next()?;
+            let _password = f.next()?;
+            let id: u32 = f.next()?.parse().ok()?;
+            (id == uid).then(|| name.to_string())
+        })
+    }
+
     /// The OS user from the environment: `SUDO_USER` first, so a `sudo -u`
     /// run records the person rather than the service account.
     #[must_use]
@@ -210,6 +259,9 @@ pub async fn run(
             row.status
         );
     }
+    let (client_addr, application_name) = SecurityEventRepository::connection_origin_conn(&mut tx)
+        .await
+        .context("reading the connection's origin")?;
 
     let allowed_after = with_scope(&row.allowed_scopes, scope, op);
     let granted_after = with_scope(&row.granted_scopes, scope, op);
@@ -234,6 +286,12 @@ pub async fn run(
             "operator": {
                 "session_user": operator.session_user,
                 "os_user": operator.os_user,
+                "os_user_source": "environment (SUDO_USER, USER, LOGNAME): advisory, settable \
+                                   by the caller",
+                "process_uid": operator.process_uid,
+                "process_user": operator.process_user,
+                "client_addr": client_addr,
+                "application_name": application_name,
             },
             "client": {
                 "id": client,
@@ -256,7 +314,7 @@ pub async fn run(
             },
             "reason": reason,
         }),
-        ip_address: None,
+        ip_address: client_addr,
         user_agent: None,
         correlation_id: None,
         created_at: chrono::Utc::now(),
