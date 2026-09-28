@@ -785,6 +785,10 @@ async fn apply_then_revert_restores_every_edge_tuple_exactly(pool: PgPool) {
 
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (w, w_g) = fixture::seed_agent_with_group(&pool, "writer-w").await;
+    // A second writer whose group is DELETED between apply and revert: its
+    // author record then names no group, and the revert must not hand the
+    // edge to it (writer_group_id has no foreign key).
+    let (gone, gone_g) = fixture::seed_agent_with_group(&pool, "writer-gone").await;
     let (_p, p_g) = fixture::seed_agent_with_group(&pool, "privatizing-group").await;
     let a = fixture::seed_public_claim(&pool, author, "public A, to privatize").await;
     let b = fixture::seed_public_claim(&pool, author, "public B").await;
@@ -802,6 +806,15 @@ async fn apply_then_revert_restores_every_edge_tuple_exactly(pool: PgPool) {
         (conn, (w_edge, structural))
     })
     .await;
+    let p = pool.clone();
+    let orphaned = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, gone).await;
+        let e = insert_edge(&mut conn, (b, "claim"), (a, "claim"))
+            .await
+            .expect("the second writer's claim -> claim edge");
+        (conn, e)
+    })
+    .await;
     let before = [
         tuple(&pool, w_edge).await,
         tuple(&pool, legacy).await,
@@ -816,6 +829,11 @@ async fn apply_then_revert_restores_every_edge_tuple_exactly(pool: PgPool) {
         ],
         "fixture shape"
     );
+    assert_eq!(
+        tuple(&pool, orphaned).await,
+        t(gone_g, "public", None, Some(gone_g)),
+        "fixture shape: the second writer's edge"
+    );
 
     // Apply.
     let mut tx = pool.begin().await.expect("begin");
@@ -827,7 +845,7 @@ async fn apply_then_revert_restores_every_edge_tuple_exactly(pool: PgPool) {
         .await
         .expect("re-meet (apply)");
     tx.commit().await.expect("commit apply");
-    for e in [w_edge, legacy, structural] {
+    for e in [w_edge, legacy, structural, orphaned] {
         let (o, v, co, _) = tuple(&pool, e).await;
         assert_eq!(
             (o, v.as_str(), co),
@@ -835,6 +853,33 @@ async fn apply_then_revert_restores_every_edge_tuple_exactly(pool: PgPool) {
             "applied: the meet"
         );
     }
+
+    // The second writer's group is deleted while the edge is privatized (the
+    // edge is the meet's now, so nothing else holds the group). A group
+    // DELETE is the forced path (`epigraph.allow_group_delete`); the ordinary
+    // one deprovisions and keeps the row.
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL epigraph.allow_group_delete = 'yes'")
+        .execute(&mut *tx)
+        .await
+        .expect("allow the group delete");
+    sqlx::query("DELETE FROM group_memberships WHERE group_id = $1")
+        .bind(gone_g)
+        .execute(&mut *tx)
+        .await
+        .expect("drop the memberships");
+    sqlx::query("DELETE FROM groups WHERE id = $1")
+        .bind(gone_g)
+        .execute(&mut *tx)
+        .await
+        .expect("delete the second writer's group");
+    tx.commit().await.expect("commit the group delete");
+    let still: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM groups WHERE id = $1)")
+        .bind(gone_g)
+        .fetch_one(&pool)
+        .await
+        .expect("group gone?");
+    assert!(!still, "fixture: the group is gone before the revert");
 
     // Revert.
     let mut tx = pool.begin().await.expect("begin");
@@ -862,6 +907,12 @@ async fn apply_then_revert_restores_every_edge_tuple_exactly(pool: PgPool) {
         after, before,
         "apply then revert restores the writer's edge, the legacy edge and the \
          out-of-scope edge byte for byte"
+    );
+    assert_eq!(
+        tuple(&pool, orphaned).await,
+        t(WORLD, "public", None, Some(gone_g)),
+        "an author record naming a deleted group reverts to the world, never to \
+         a group that does not exist (the author record itself is kept)"
     );
 }
 
