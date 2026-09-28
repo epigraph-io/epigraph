@@ -141,7 +141,9 @@ pub enum EdgeWithdrawal {
     /// follow-up).
     Retracted,
     /// The act is about to DELETE the row (the workflow step rewire). Call the
-    /// cleanup BEFORE the DELETE: the deferral's act check reads the row.
+    /// cleanup BEFORE the DELETE: the deferral's act check reads the row. The
+    /// cleanup closes the row's window (`valid_to = now()`) first, since the
+    /// definer admits only an edge out of force.
     BeingDeleted,
 }
 
@@ -1182,11 +1184,17 @@ impl EdgeRepository {
     ///   they lived on;
     /// * (b) it records a `cause = 'edge_retract'` deferral through 120's
     ///   `epigraph_record_cascade_deferral` (the session must own or co-own the
-    ///   edge; the row names the session principal). The deferral's `sources` are the claims of (a): the caller
+    ///   edge, and the edge must be out of force; the row names the session
+    ///   principal). The deferral's `sources` are the claims of (a): the caller
     ///   cannot re-derive a belief cache it does not own, so the administrative
     ///   replay re-derives them, together with the claims of every OTHER
     ///   writer's BBA keyed on the edge, which it removes. Recorded even when
     ///   only the caller's own BBAs existed, so their claims are re-derived.
+    ///
+    /// [`EdgeWithdrawal::BeingDeleted`] first closes the row's window
+    /// (`valid_to = now()`, the transaction's start, so `valid_to <= now()`
+    /// holds for the rest of the act): the deferral definer admits only an edge
+    /// out of force, and the row is deleted by the caller right after.
     ///
     /// A future-dated retraction, or an edge no BBA can be keyed on, does
     /// nothing.
@@ -1226,6 +1234,18 @@ impl EdgeRepository {
         .await?;
         if !keyed || !withdrawn || !owned {
             return Ok(BbaCleanup::default());
+        }
+        if withdrawal == EdgeWithdrawal::BeingDeleted {
+            // The row is deleted right after this returns; close its window
+            // first so the deferral definer sees an edge out of force (it
+            // admits no edge in force, so no deferral names a live edge).
+            sqlx::query(
+                "UPDATE edges SET valid_to = now() \
+                  WHERE id = $1 AND (valid_to IS NULL OR valid_to > now())",
+            )
+            .bind(edge_id)
+            .execute(&mut *conn)
+            .await?;
         }
         // (a) The caller's own rows, and the claims whose belief they moved.
         let own_claims: Vec<Uuid> = sqlx::query_scalar(

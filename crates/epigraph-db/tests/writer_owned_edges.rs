@@ -1385,10 +1385,10 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
     let b = fixture::seed_public_claim(&pool, author, "public B").await;
 
     let p = pool.clone();
-    let [retracted, future, unkeyed, genuine] =
+    let [retracted, future, unkeyed, genuine, live] =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             stamp(&mut conn, &p, w).await;
-            let mut ids = [Uuid::nil(); 4];
+            let mut ids = [Uuid::nil(); 5];
             for slot in &mut ids {
                 *slot = insert_edge(&mut conn, (a, "claim"), (b, "claim"))
                     .await
@@ -1401,6 +1401,7 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
         (retracted, "edge"),
         (future, "edge"),
         (genuine, "analytical"),
+        (live, "edge"),
     ] {
         sqlx::query("INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, $2, $3)")
             .bind(id)
@@ -1453,6 +1454,7 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
         (future, "a future-dated retraction"),
         (unkeyed, "an edge with no edge-factor perspective"),
         (genuine, "a genuine (non-edge) perspective"),
+        (live, "an edge in force that no act withdrew"),
     ] {
         assert_eq!(
             record(w, edge).await,

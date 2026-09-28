@@ -431,8 +431,10 @@ CREATE TRIGGER edges_owner_immutable
 --                  retract or delete act's own authority), read before any
 --                  DELETE of the row; an edge-factor perspective
 --                  (`perspectives.id = edge`, `perspective_type = 'edge'`)
---                  exists; and the edge is not retracted into the future (a
---                  future-dated `valid_to` records nothing). No object. The optional
+--                  exists; and the edge is OUT OF FORCE (`valid_to <= now()`):
+--                  an edge in force, or one retracted into the future, records
+--                  nothing. An act that deletes the row closes its window
+--                  first, in the same transaction. No object. The optional
 --                  sources are the claims whose OWN edge-keyed BBAs the act
 --                  deleted: the caller cannot re-derive a belief cache it does
 --                  not own, so the replay re-derives them. The replay is
@@ -516,7 +518,9 @@ BEGIN
                     SELECT 1 FROM unnest(v_sources) s
                      WHERE NOT public.epigraph_session_writes_node(s, 'claim')));
     ELSIF p_cause = 'edge_retract' THEN
-        -- The sources are the claims
+        -- The edge is out of force (a retract, or a row the act closed before
+        -- deleting it: `withdraw_edge_bbas_conn` sets `valid_to = now()` first),
+        -- so no deferral names an edge in force. The sources are the claims
         -- whose own edge-keyed BBAs the act deleted (distinct, at most 1000).
         -- They are not checked against `claims` here: under row security this
         -- frame may not see a claim the caller's BBA lived on, and refusing
@@ -528,7 +532,7 @@ BEGIN
             AND (SELECT count(DISTINCT s) FROM unnest(v_sources) s) = cardinality(v_sources)
             AND EXISTS (SELECT 1 FROM public.edges e
                          WHERE e.id = p_subject
-                           AND (e.valid_to IS NULL OR e.valid_to <= now())
+                           AND e.valid_to <= now()
                            AND (v_priv
                                 OR e.owner_group_id = ANY (public.epigraph_writable_groups())
                                 OR e.co_owner_group_id = ANY (public.epigraph_writable_groups())))

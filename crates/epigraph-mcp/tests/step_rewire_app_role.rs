@@ -269,6 +269,53 @@ async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPoo
     let b = parse_uuid_field(&add("appended b", None).await, "step_claim_id");
     assert_eq!(successors(&pool, s2).await, vec![a]);
     assert_eq!(successors(&pool, a).await, vec![b]);
+    // The a -> b link carries an edge-keyed BBA (seeded privileged), so the
+    // rewire's DELETE withdraws an edge factor: migration 120's cleanup must
+    // close the row's window and record the `edge_retract` deferral (the
+    // definer admits only an edge out of force) before the DELETE, in the act.
+    let ab: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'step_follows'",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("a -> b");
+    sqlx::query("INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, $2, 'edge')")
+        .bind(ab)
+        .bind(format!("w12b step edge {ab}"))
+        .execute(&pool)
+        .await
+        .expect("edge-factor perspective");
+    let frame = epigraph_db::FrameRepository::create(
+        &pool,
+        "binary_truth",
+        Some("w12b"),
+        &["TRUE".to_string(), "FALSE".to_string()],
+    )
+    .await
+    .expect("frame")
+    .id;
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &mut *conn,
+        b,
+        frame,
+        None,
+        Some(ab),
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        Some("test"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("an edge-keyed BBA on the chain link");
+    drop(conn);
+
     // Between a and b: both are the system agent's claims, so it may delete
     // a -> b and the insert lands.
     let mid = parse_uuid_field(&add("between a and b", Some(4)).await, "step_claim_id");
@@ -278,6 +325,25 @@ async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPoo
         "a -> mid, and a -> b is gone"
     );
     assert_eq!(successors(&pool, mid).await, vec![b]);
+    let gone: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM edges WHERE id = $1)")
+        .bind(ab)
+        .fetch_one(&pool)
+        .await
+        .expect("a -> b row");
+    assert!(gone, "the rewire deleted the a -> b row");
+    let deferred: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'cascade.deferred' AND details->>'cause' = 'edge_retract' \
+            AND details->'trigger'->>'subject_id' = $1::text",
+    )
+    .bind(ab)
+    .fetch_one(&pool)
+    .await
+    .expect("deferrals");
+    assert_eq!(
+        deferred, 1,
+        "the deleted link's edge-keyed BBA cleanup was deferred in the act"
+    );
 }
 
 /// `delete_step` on a step claim the stamped session may not write is
