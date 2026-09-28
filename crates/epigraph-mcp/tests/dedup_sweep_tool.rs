@@ -142,6 +142,13 @@ async fn dry_run_reports_without_mutating(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(current, 2, "dry run mutated nothing");
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type LIKE 'cascade.%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 0, "the dry run recorded a cascade row");
 }
 
 /// Executing collapses the exact-restatement pair, keeping the higher-truth
@@ -592,4 +599,227 @@ async fn every_collapsed_pair_is_audited_under_the_acting_agent(pool: PgPool) {
             "the report names its audit rows"
         );
     }
+
+    // Each act recorded its pending cascade in its own transaction (through
+    // 117's definer, naming the acting agent), and each applied row answers
+    // exactly that deferral, so a finished sweep leaves NOTHING pending: the
+    // replay timer must not apply these pairs a second time.
+    let deferred: Vec<(Uuid, Option<Uuid>, String)> = sqlx::query_as(
+        "SELECT id, agent_id, details->>'recorded_by' FROM security_events \
+          WHERE event_type = 'cascade.deferred' ORDER BY created_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the deferred rows");
+    assert_eq!(
+        deferred.len(),
+        2,
+        "one deferral per collapsed pair: {deferred:?}"
+    );
+    for (_, agent, recorded_by) in &deferred {
+        assert_eq!(*agent, Some(operator));
+        assert_eq!(recorded_by, "epigraph_record_cascade_deferral");
+    }
+    let answered: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT details#>>'{replay_of,deferred_event_id}', details#>>'{replay_of,replayed_by}' \
+           FROM security_events WHERE event_type = 'cascade.admin_applied'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the applied rows' replay_of");
+    let mut answered_ids: Vec<String> = answered
+        .iter()
+        .map(|(id, by)| {
+            assert_eq!(
+                by.as_deref(),
+                Some(epigraph_mcp::tools::dedup_sweep::SWEEP_REPLAYED_BY)
+            );
+            id.clone().expect("an applied row that answers no deferral")
+        })
+        .collect();
+    answered_ids.sort();
+    let mut deferred_ids: Vec<String> = deferred.iter().map(|r| r.0.to_string()).collect();
+    deferred_ids.sort();
+    assert_eq!(answered_ids, deferred_ids);
+    assert_eq!(
+        pending(&pool).await,
+        0,
+        "a finished sweep left cascades pending: the replay would apply them again"
+    );
+}
+
+/// Pending cascades, as the replay timer reads them.
+async fn pending(pool: &PgPool) -> usize {
+    epigraph_db::repos::admin_cascade::pending_replays(
+        pool,
+        100,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("pending replays")
+    .len()
+}
+
+/// The replay timer's pass, on a connection downgraded to
+/// `epigraph_maintenance` (the timer's login shape).
+async fn replay(pool: &PgPool) -> epigraph_engine::admin_cascade::ReplayReport {
+    let maintenance = fixture::downgraded_pool(pool, "epigraph_maintenance").await;
+    let scoped = fixture::scoped_pool(pool)
+        .await
+        .with_maintenance_pool(maintenance);
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+        .await
+        .expect("maintenance session");
+    session
+        .assert_privileged()
+        .await
+        .expect("the replay's connection is privileged");
+    let (conn, viewer) = session.split();
+    epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        viewer,
+        "w12a-test",
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("replay")
+}
+
+/// The applied row for `subject`: its agent and the deferral it answers.
+async fn applied_for(pool: &PgPool, subject: Uuid) -> Vec<(Option<Uuid>, Option<String>)> {
+    sqlx::query_as(
+        "SELECT agent_id, details#>>'{replay_of,deferred_event_id}' FROM security_events \
+          WHERE event_type = 'cascade.admin_applied' \
+            AND details#>>'{trigger,subject_id}' = $1::text",
+    )
+    .bind(subject)
+    .fetch_all(pool)
+    .await
+    .expect("applied rows")
+}
+
+/// The window between the act and its administrative cascade (two
+/// transactions). A sweep that dies after the act commits must not leave a
+/// collapsed pair with no cascade row: the act's own transaction records it as
+/// pending, on the maintenance login, so the replay timer finds it and applies
+/// it under the acting agent. Driven by running the act half alone, which is
+/// exactly the state a process killed before its apply leaves.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_collapse_that_dies_before_its_cascade_is_left_pending_for_the_replay(pool: PgPool) {
+    let a1 = seed_agent(&pool).await;
+    let a2 = seed_agent(&pool).await;
+    let strong = seed(&pool, a1, "said once", 0.9, &pgvec(0, 0.0), &[]).await;
+    let weak = seed(&pool, a2, "said once", 0.4, &pgvec(0, 0.001), &[]).await;
+    let operator = acting_agent(&pool).await;
+
+    let maintenance = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let scoped = fixture::scoped_pool(&pool)
+        .await
+        .with_maintenance_pool(maintenance);
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+        .await
+        .expect("maintenance session");
+    let (conn, _) = session.split();
+    let (_, deferral) =
+        epigraph_mcp::tools::dedup_sweep::collapse_pair_act(conn, operator, weak, strong)
+            .await
+            .expect("the act");
+    drop(session);
+
+    let (is_current, supersedes): (Option<bool>, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+            .bind(weak)
+            .fetch_one(&pool)
+            .await
+            .expect("weak");
+    assert_eq!(
+        (is_current, supersedes),
+        (Some(false), Some(strong)),
+        "the act committed"
+    );
+    assert!(
+        applied_for(&pool, weak).await.is_empty(),
+        "nothing applied yet"
+    );
+    let rows = epigraph_db::repos::admin_cascade::pending_replays(
+        &pool,
+        100,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("pending");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the interrupted collapse is not pending: {rows:?}"
+    );
+    assert_eq!(rows[0].event_id, deferral);
+    assert_eq!(rows[0].details["cause"], "dedup");
+    assert_eq!(rows[0].details["trigger"]["subject_id"], weak.to_string());
+    assert_eq!(rows[0].details["trigger"]["agent_id"], operator.to_string());
+
+    let r = replay(&pool).await;
+    assert_eq!(r.applied, 1, "{r:?}");
+    assert_eq!(
+        applied_for(&pool, weak).await,
+        vec![(Some(operator), Some(deferral.to_string()))],
+        "the replay's applied row names the acting agent and answers the deferral"
+    );
+    assert_eq!(pending(&pool).await, 0);
+}
+
+/// While a replay run holds the replay's advisory lock, the sweep does not
+/// apply a pair's cascade itself (the replay could be applying the same fresh
+/// deferral): the act commits with its pending row, the pair is reported in
+/// `left_to_replay` (not as a failure), and the replay timer applies it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pair_is_left_to_the_replay_while_a_replay_run_holds_its_lock(pool: PgPool) {
+    let a1 = seed_agent(&pool).await;
+    let a2 = seed_agent(&pool).await;
+    let strong = seed(&pool, a1, "said twice", 0.9, &pgvec(0, 0.0), &[]).await;
+    let weak = seed(&pool, a2, "said twice", 0.4, &pgvec(0, 0.001), &[]).await;
+    let operator = acting_agent(&pool).await;
+
+    let mut holder = pool.acquire().await.expect("a replay run's connection");
+    assert!(epigraph_db::repos::maintenance_lock::try_take(
+        &mut holder,
+        epigraph_db::repos::maintenance_lock::REPLAY_LOCK_KEY
+    )
+    .await
+    .expect("take the replay lock"));
+
+    let scoped = fixture::scoped_pool(&pool).await;
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+        .await
+        .expect("maintenance session");
+    let report = epigraph_mcp::tools::dedup_sweep::sweep(&mut session, &params(false), operator)
+        .await
+        .expect("sweep");
+    drop(session);
+    assert_eq!(report.pairs_marked, 1, "{report:?}");
+    assert!(report.failures.is_empty(), "{report:?}");
+    assert!(report.audit_event_ids.is_empty(), "{report:?}");
+    assert_eq!(report.left_to_replay, vec![format!("{weak} -> {strong}")]);
+    assert!(
+        applied_for(&pool, weak).await.is_empty(),
+        "the sweep applied a cascade while the replay held its lock"
+    );
+    assert_eq!(pending(&pool).await, 1);
+
+    epigraph_db::repos::maintenance_lock::release(
+        &mut holder,
+        epigraph_db::repos::maintenance_lock::REPLAY_LOCK_KEY,
+    )
+    .await
+    .expect("release");
+    drop(holder);
+    let r = replay(&pool).await;
+    assert_eq!(r.applied, 1, "{r:?}");
+    assert_eq!(applied_for(&pool, weak).await.len(), 1);
+    assert_eq!(applied_for(&pool, weak).await[0].0, Some(operator));
+    assert_eq!(pending(&pool).await, 0);
 }

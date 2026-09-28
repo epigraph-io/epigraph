@@ -18,6 +18,11 @@
 //! administrative cascade (`admin_cascade::apply_after_dedup`). Every collapsed
 //! pair gets ONE `cascade.admin_applied` row naming `--acting-agent` as the
 //! trigger, with cause `dedup`, so each collapse is audited as D1 requires.
+//! The act's own transaction also records the pair's pending cascade
+//! (`cascade.deferred`), which that applied row answers: a run killed between
+//! the act and its cascade leaves the pair for `replay_deferred_cascades`
+//! instead of unaudited. While a replay run holds the replay's lock, the pair
+//! is left to it (`left_to_replay` in the report; not a failure).
 //! Clusters whose wording differs are only reported, never collapsed.
 //!
 //! DRY RUN BY DEFAULT: without `--apply` it lists the clusters and writes

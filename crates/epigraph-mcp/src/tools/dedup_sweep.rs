@@ -32,6 +32,23 @@
 //! acting agent (`--acting-agent`) and cause `dedup`. Before W12a the sweep
 //! called `retraction_cascade::mark_duplicate_with_cascade` inline and wrote no
 //! audit row at all.
+//!
+//! # No window between the act and its audit trail
+//!
+//! The act commits BEFORE the cascade runs (they are two transactions: the
+//! repair re-verifies the committed act). So the act's transaction also records
+//! the pair's pending cascade (`cascade.deferred`, cause `dedup`, the acting
+//! agent as trigger) through the same 117 definer the request paths use
+//! ([`collapse_pair_act`]). If the process dies between the two halves, the
+//! collapsed pair is not lost: the replay timer finds it pending and applies it.
+//! The sweep's own apply then answers that row (`replay_of` names it), so a
+//! finished pair leaves nothing pending.
+//!
+//! The replay timer could otherwise pick the fresh row up between the act and
+//! the sweep's apply and apply the same pair twice (idempotent, but two applied
+//! rows). The sweep therefore applies a pair only while it holds the REPLAY's
+//! advisory lock; when a replay run holds it, the pair is left to that timer
+//! and reported in [`SweepResponse::left_to_replay`].
 
 use std::collections::HashMap;
 
@@ -43,10 +60,69 @@ use crate::errors::{internal_error, McpError};
 use crate::types::SweepSemanticDuplicatesParams;
 
 use epigraph_core::ClaimId;
+use epigraph_db::repos::maintenance_lock;
 use epigraph_db::ClaimRepository;
 use epigraph_engine::admin_cascade::{
-    apply_after_dedup, CascadeCause, CascadeState, CascadeTrigger,
+    apply_after_dedup, record_deferral, CascadeCause, CascadeState, CascadeTrigger, ReplayOrigin,
 };
+
+/// The reason on the `cascade.deferred` row the sweep records with each act.
+/// It names no row.
+pub const SWEEP_DEFERRAL_REASON: &str =
+    "recorded by the semantic-duplicate sweep with its act; the sweep applies the \
+     administrative cascade next, and the maintenance replay applies it if the sweep did not";
+
+/// The `replay_of.replayed_by` of the applied row with which the sweep answers
+/// its own deferral.
+pub const SWEEP_REPLAYED_BY: &str = "sweep_semantic_duplicates";
+
+/// The act half of one collapse, in ONE transaction on `conn`: retire `dup` and
+/// forward it at `survivor` (`ClaimRepository::mark_duplicate_act_conn`), and
+/// record the pair's pending administrative cascade (`cascade.deferred`, cause
+/// `dedup`, trigger `acting_agent`) through 117's deferral definer. Both commit
+/// or neither does, so a collapse can never exist without a pending or applied
+/// cascade row to answer for it.
+///
+/// Returns the trigger and the deferral row's id; the caller's
+/// [`apply_after_dedup`] answers that row by naming it in `replay_of`.
+///
+/// `conn` must be privileged (the maintenance connection): the definer then
+/// records the named acting agent, after checking that the act is committed
+/// state.
+///
+/// # Errors
+/// The act's refusal or failure, or the definer's; nothing commits.
+pub async fn collapse_pair_act(
+    conn: &mut sqlx::PgConnection,
+    acting_agent: Uuid,
+    dup: Uuid,
+    survivor: Uuid,
+) -> Result<(CascadeTrigger, Uuid), epigraph_db::DbError> {
+    use sqlx::Acquire;
+    let mut tx = conn.begin().await?;
+    // Its own transaction nests as a savepoint inside this one.
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(survivor),
+    )
+    .await?;
+    let trigger = CascadeTrigger::new(
+        CascadeCause::Dedup,
+        Some(acting_agent),
+        None,
+        dup,
+        Some(survivor),
+    );
+    let status = record_deferral(&mut *tx, &trigger, SWEEP_DEFERRAL_REASON).await?;
+    let deferral = status
+        .audit_event_id
+        .ok_or_else(|| epigraph_db::DbError::InvalidData {
+            reason: "the deferral definer returned no row id".to_string(),
+        })?;
+    tx.commit().await?;
+    Ok((trigger, deferral))
+}
 
 /// Disjoint-set over claim ids, so A~B and B~C land in one cluster even when
 /// A and C were never directly compared.
@@ -110,14 +186,20 @@ pub struct SweepResponse {
     /// The `cascade.admin_applied` rows written, one per pair whose
     /// administrative cascade committed.
     pub audit_event_ids: Vec<Uuid>,
+    /// Pairs whose act committed (with its `cascade.deferred` row) while a
+    /// replay run held the replay lock: the sweep did not apply their cascade,
+    /// and that timer applies it. Counted in `pairs_marked`; not failures.
+    pub left_to_replay: Vec<String>,
     /// Per-pair problems, in three classes that are **not** complementary with
     /// `pairs_marked`:
     ///
-    /// * `"<dup> -> <survivor>: <err>"` — the act itself failed. The pair is not
-    ///   counted in `pairs_marked`.
+    /// * `"<dup> -> <survivor>: <err>"` — the act itself failed (and wrote
+    ///   nothing, its deferral row included). The pair is not counted in
+    ///   `pairs_marked`.
     /// * `"<dup> -> <survivor> (cascade): <reason>"` — the act committed and
     ///   **is** counted, but the administrative repair failed and rolled back
-    ///   (its `cascade.admin_failed` row makes it replayable).
+    ///   (its `cascade.deferred` and `cascade.admin_failed` rows make it
+    ///   replayable).
     /// * `"<dup> -> <survivor> (belief cascade): <err>"` — the repair
     ///   committed, but the downstream belief re-derivation hit a non-fatal
     ///   error for one claim.
@@ -257,36 +339,59 @@ pub async fn sweep(
     // and returned, never fatal.
     let mut pairs_marked = 0_u64;
     let mut audit_event_ids: Vec<Uuid> = Vec::new();
+    let mut left_to_replay: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     if !dry_run {
         for (survivor, duplicates, _) in &exact_clusters {
             for dup in duplicates {
-                // The act: retire the duplicate and forward it at the survivor
-                // (its own transaction on this connection).
-                if let Err(e) = ClaimRepository::mark_duplicate_act_conn(
-                    &mut *conn,
-                    ClaimId::from_uuid(*dup),
-                    ClaimId::from_uuid(*survivor),
-                )
-                .await
-                {
-                    failures.push(format!("{dup} -> {survivor}: {e}"));
-                    continue;
-                }
+                // The act and its pending cascade row, in one transaction.
+                let (mut trigger, deferral) =
+                    match collapse_pair_act(&mut *conn, acting_agent, *dup, *survivor).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            failures.push(format!("{dup} -> {survivor}: {e}"));
+                            continue;
+                        }
+                    };
                 pairs_marked += 1;
+                // Apply only while holding the replay's lock, so a replay run
+                // cannot apply the same fresh deferral concurrently.
+                match maintenance_lock::try_take(&mut *conn, maintenance_lock::REPLAY_LOCK_KEY)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        left_to_replay.push(format!("{dup} -> {survivor}"));
+                        continue;
+                    }
+                    Err(e) => {
+                        failures.push(format!(
+                            "{dup} -> {survivor} (cascade): the replay lock could not be \
+                             taken ({e}); the pair is pending for the replay"
+                        ));
+                        continue;
+                    }
+                }
                 // The administrative cascade (D1): repair the edge and derived
                 // layers with its audit row, atomically, then re-derive belief.
-                // The acting operator is the trigger; the "caller" whose view
-                // the report is filtered to is the sweep's own bypass viewer.
-                let trigger = CascadeTrigger::new(
-                    CascadeCause::Dedup,
-                    Some(acting_agent),
-                    None,
-                    *dup,
-                    Some(*survivor),
-                );
+                // The acting operator is the trigger; the applied row answers
+                // the deferral just recorded. The "caller" whose view the
+                // report is filtered to is the sweep's own bypass viewer.
+                trigger.replay_of = Some(ReplayOrigin {
+                    deferred_event_id: deferral,
+                    replayed_by: SWEEP_REPLAYED_BY.to_string(),
+                });
                 let (status, report) =
                     apply_after_dedup(&mut *conn, viewer, viewer, &trigger, *dup, *survivor).await;
+                if let Err(e) =
+                    maintenance_lock::release(&mut *conn, maintenance_lock::REPLAY_LOCK_KEY).await
+                {
+                    // The lock is session-level: it is released when the
+                    // connection closes, at the latest.
+                    failures.push(format!(
+                        "{dup} -> {survivor} (cascade): the replay lock was not released ({e})"
+                    ));
+                }
                 match status.status {
                     CascadeState::Applied => {
                         if let Some(id) = status.audit_event_id {
@@ -323,6 +428,7 @@ pub async fn sweep(
         merge_candidates: to_out(near_clusters, false),
         pairs_marked,
         audit_event_ids,
+        left_to_replay,
         failures,
         next_offset: offset + candidates.len() as i64,
     })
