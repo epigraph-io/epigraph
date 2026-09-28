@@ -161,14 +161,22 @@ pub struct DrainReport {
 }
 
 impl DrainReport {
-    /// The process exit code: 3 out of time, 1 a job failed terminally, 0
-    /// otherwise (drained, locked, or only retryable failures left pending).
+    /// The process exit code: 1 when any job failed in this run, retryable or
+    /// terminal; otherwise 3 when the run ran out of time with work pending;
+    /// otherwise 0 (drained, or locked).
+    ///
+    /// A retryable failure is a failed run: the job is back to `pending` and
+    /// the next run retries it, but an operator hears about it the first time
+    /// (the timer's `OnFailure=` alert), not only once its retries are spent.
+    /// A failure outranks running out of time because the unit treats exit 3
+    /// as success (`SuccessExitStatus=3`): a failure in a long run must not be
+    /// reported as a clean continuation.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
-        if self.out_of_time {
-            3
-        } else if self.failures.iter().any(|f| f.terminal) {
+        if !self.failures.is_empty() {
             1
+        } else if self.out_of_time {
+            3
         } else {
             0
         }

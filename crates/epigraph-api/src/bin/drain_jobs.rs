@@ -20,9 +20,10 @@
 //!    oldest pending job of a registered type, one at a time, until none is
 //!    left or `--max-runtime` (default 50min) has elapsed.
 //!
-//! Exit codes: 0 drained (or locked); 1 a job failed terminally, or the run
-//! could not start; 3 out of time with work still pending. The report is JSON
-//! on stdout. It writes no audit event of its own.
+//! Exit codes: 0 drained (or locked); 1 a job failed in this run (retryable
+//! or terminal; a failure outranks running out of time), or the run could not
+//! start; 3 out of time with work still pending. The report is JSON on
+//! stdout. It writes no audit event of its own.
 //!
 //! Usage: `drain_jobs [--max-runtime <DURATION>]`, where DURATION is seconds
 //! or a number with `s`, `m`/`min` or `h`. `DATABASE_URL` and

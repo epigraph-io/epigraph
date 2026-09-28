@@ -430,11 +430,14 @@ async fn an_unregistered_job_type_at_the_head_of_the_queue_does_not_wedge_the_dr
 
 /// A job whose handler fails is put back to `pending` with the retry counted,
 /// and not retried in the same run (the next run is the backoff); when its
-/// retries are used up it is `failed` and the run exits 1.
+/// retries are used up it is `failed`. Every run in which it failed exits 1,
+/// the retryable ones included (brief: "1 a job failed").
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_failing_job_is_retried_next_run_then_fails_terminally(pool: PgPool) {
     // A privatization apply for a plan that does not exist: the handler
-    // refuses it.
+    // refuses it. Privatization jobs are enqueued with one retry; this one is
+    // given three, so the run sees retryable failures before the terminal one
+    // (the default for every other job type).
     let id = {
         let job = fx::apply_job(Uuid::new_v4(), Uuid::new_v4(), "no-such-dispatch");
         let id: Uuid = job.id.into();
@@ -444,45 +447,94 @@ async fn a_failing_job_is_retried_next_run_then_fails_terminally(pool: PgPool) {
             .expect("seed");
         id
     };
-    let max_retries: i32 = sqlx::query_scalar("SELECT max_retries FROM jobs WHERE id = $1")
+    sqlx::query("UPDATE jobs SET max_retries = 3 WHERE id = $1")
         .bind(id)
-        .fetch_one(&pool)
+        .execute(&pool)
         .await
-        .expect("max_retries");
+        .expect("give the job three retries");
 
     let scoped = maintenance_scoped(&pool).await;
     let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::Mock);
-    let first = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
-        .await
-        .expect("drain");
-    assert_eq!(first.failures.len(), 1, "{first:?}");
-    let (state, err) = job_state(&pool, id).await;
-    if first.failures[0].terminal {
-        // A permanent refusal uses up the retries at once.
-        assert_eq!(state, "failed");
-        assert_eq!(first.exit_code(), 1);
-    } else {
+    for attempt in 1..=2 {
+        let run = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+            .await
+            .expect("drain");
+        assert_eq!(run.failures.len(), 1, "attempt {attempt}: {run:?}");
+        assert!(
+            !run.failures[0].terminal,
+            "attempt {attempt} of 3 was reported terminal: {run:?}"
+        );
+        let (state, err) = job_state(&pool, id).await;
         assert_eq!(
             state, "pending",
-            "a retryable failure must go back to pending"
+            "attempt {attempt}: a retryable failure must go back to pending"
         );
-        assert!(err.is_some(), "the failure's error was not recorded");
+        assert!(
+            err.is_some(),
+            "attempt {attempt}: the error was not recorded"
+        );
         assert_eq!(
-            first.exit_code(),
-            0,
-            "a retry still pending is not a failed run"
+            run.exit_code(),
+            1,
+            "attempt {attempt}: a run in which a job failed must alert, even while the job \
+             still has retries"
         );
-        let mut last = first;
-        for _ in 0..max_retries {
-            last = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
-                .await
-                .expect("drain");
-            if last.failures.iter().any(|f| f.terminal) {
-                break;
-            }
-        }
-        assert_eq!(job_state(&pool, id).await.0, "failed");
-        assert_eq!(last.exit_code(), 1);
+    }
+    let last = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert!(
+        last.failures.len() == 1 && last.failures[0].terminal,
+        "the third failure must be terminal: {last:?}"
+    );
+    assert_eq!(job_state(&pool, id).await.0, "failed");
+    assert_eq!(last.exit_code(), 1);
+    let after = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert!(
+        after.failures.is_empty() && after.completed == 0,
+        "a failed job was picked up again: {after:?}"
+    );
+    assert_eq!(after.exit_code(), 0);
+}
+
+/// The exit code's order: a failure (retryable or terminal) is 1 even when
+/// the run also ran out of time, because the unit treats 3 as success; out of
+/// time alone is 3; nothing to report is 0. A pure check of the report, with
+/// no database.
+#[test]
+fn a_failed_job_outranks_running_out_of_time_in_the_exit_code() {
+    let failure = |terminal| jobs_drain::DrainFailure {
+        job_id: Uuid::nil(),
+        job_type: "cluster_graph".to_string(),
+        error: "boom".to_string(),
+        terminal,
+    };
+    let clean = jobs_drain::DrainReport::default();
+    assert_eq!(clean.exit_code(), 0);
+    let late = jobs_drain::DrainReport {
+        out_of_time: true,
+        ..jobs_drain::DrainReport::default()
+    };
+    assert_eq!(late.exit_code(), 3);
+    for terminal in [false, true] {
+        let failed = jobs_drain::DrainReport {
+            failures: vec![failure(terminal)],
+            ..jobs_drain::DrainReport::default()
+        };
+        assert_eq!(failed.exit_code(), 1, "terminal={terminal}");
+        let failed_and_late = jobs_drain::DrainReport {
+            failures: vec![failure(terminal)],
+            out_of_time: true,
+            ..jobs_drain::DrainReport::default()
+        };
+        assert_eq!(
+            failed_and_late.exit_code(),
+            1,
+            "a failure in a run that also ran out of time exited as the unit's success code \
+             (terminal={terminal})"
+        );
     }
 }
 
