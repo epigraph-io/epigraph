@@ -8,15 +8,30 @@
 //! that build the request-serving binaries `server` and `epigraph-mcp-full`),
 //! comment-stripped, with `#[cfg(test)]` modules removed:
 //!
-//! * the four spellings that ACQUIRE maintenance authority or run the job
-//!   queue -- `maintenance_database_url(`, `with_maintenance_pool(`,
-//!   `JobRunner::new`, `PostgresJobQueue::new` -- appear only at the sites in
-//!   [`ALLOWED`], at exactly the counts recorded there: the `drain_jobs` timer
-//!   binary, the one job-registration function it calls, and the test-only
-//!   `build_app_for_tests_with_admin_cascade` helper;
+//! * the spellings that ACQUIRE maintenance authority or run the job queue
+//!   ([`TOKENS`]) appear only at the sites in [`ALLOWED`], at exactly the
+//!   counts recorded there. Two families:
+//!   - resolving or attaching the maintenance DSN, and running the queue:
+//!     `maintenance_database_url(`, `resolve_maintenance_url(`,
+//!     `with_maintenance_pool(`, `JobRunner::new`, `PostgresJobQueue::new`
+//!     (the `drain_jobs` timer binary, the one job-registration function it
+//!     calls, and the test-only `build_app_for_tests_with_admin_cascade`
+//!     helper);
+//!   - leasing a maintenance connection from a `ScopedPool`:
+//!     `maintenance_session(`, `unscoped_for_maintenance(`,
+//!     `maintenance_inner(`. `ScopedPool` falls back to the APPLICATION pool
+//!     when no maintenance pool is attached (the operator CLI fleet relies on
+//!     that), so in a request binary such a call is a bypass on the
+//!     application DSN: on a privileged application DSN, the very surface D9
+//!     removed. The permitted sites are the two gated `maintenance_viewer`s
+//!     (each refuses first when no maintenance pool is attached) and the
+//!     embedding job handler, which only the drain registers;
 //! * the environment variable is READ only by the two boot refusals (the
 //!   `server` and `epigraph-mcp-full` mains), each of which hands it straight to
-//!   the D9 predicate;
+//!   the D9 predicate; and its NAME appears in production code only there and
+//!   in the drain timer's own messages ([`VARIABLE_NAMED`]), which catches a
+//!   read that does not go through `std::env::var` (a clap `env = ...`
+//!   binding, a scan of `std::env::vars()` that compares names);
 //! * `DbReputationService` (epigraph-jobs), a maintenance-pool consumer with no
 //!   constructor anywhere, is not wired into either crate: if it is ever wired,
 //!   it belongs in the drain timer, not a request binary.
@@ -27,7 +42,9 @@
 //!
 //! # Known limits
 //!
-//! A token inside a string literal counts (none does today). A whole-line `//`
+//! A name assembled at run time (`concat!`, `format!` of two halves) is not
+//! caught; nor is a DSN handed over under another variable name. A token
+//! inside a string literal counts (none does today). A whole-line `//`
 //! comment is skipped; a trailing comment after code is not (none carries a
 //! token). `#[cfg(test)]` removal is by brace span from the attribute's `mod`
 //! item, which is how every in-source test module here is written.
@@ -37,9 +54,25 @@ use std::path::{Path, PathBuf};
 
 const TOKENS: &[&str] = &[
     "maintenance_database_url(",
+    "resolve_maintenance_url(",
     "with_maintenance_pool(",
     "JobRunner::new",
     "PostgresJobQueue::new",
+    "maintenance_session(",
+    "unscoped_for_maintenance(",
+    "maintenance_inner(",
+];
+
+/// The [`TOKENS`] that name a `ScopedPool` / `epigraph_db` function, each of
+/// which must still be DEFINED in `epigraph-db/src/pool.rs` under that name: a
+/// token that matches nothing anywhere certifies nothing.
+const POOL_FNS: &[&str] = &[
+    "maintenance_database_url(",
+    "resolve_maintenance_url(",
+    "with_maintenance_pool(",
+    "maintenance_session(",
+    "unscoped_for_maintenance(",
+    "maintenance_inner(",
 ];
 
 /// `(repo-relative file, token, count)`: every permitted site.
@@ -65,6 +98,38 @@ const ALLOWED: &[(&str, &str, usize)] = &[
         "with_maintenance_pool(",
         1,
     ),
+    // `AppState::maintenance_viewer`: refuses with `NotServed` first when no
+    // maintenance pool is attached, so the application-pool fallback is never
+    // reached on a request unit.
+    (
+        "crates/epigraph-api/src/state.rs",
+        "maintenance_session(",
+        1,
+    ),
+    // `epigraph-mcp`'s `maintenance_viewer`: the same gate, then the lease.
+    (
+        "crates/epigraph-mcp/src/maintenance.rs",
+        "maintenance_session(",
+        1,
+    ),
+    // `ClaimEmbeddingJobService`, the `embedding_generation` handler: only
+    // `jobs_drain::build_job_runner` (the drain timer) registers it.
+    (
+        "crates/epigraph-api/src/embedding_restore.rs",
+        "unscoped_for_maintenance(",
+        2,
+    ),
+];
+
+/// `(repo-relative file, count)`: every production-code occurrence of the
+/// variable's NAME, `MAINTENANCE_DATABASE_URL` (the `epigraph_db` constant's
+/// name is the same text, so a use of the constant counts too).
+const VARIABLE_NAMED: &[(&str, usize)] = &[
+    // The boot refusal's one read.
+    ("crates/epigraph-api/src/bin/server.rs", 1),
+    ("crates/epigraph-mcp/src/main.rs", 1),
+    // The drain timer's usage text and its unset-variable refusal.
+    ("crates/epigraph-api/src/bin/drain_jobs.rs", 2),
 ];
 
 /// The only files that may read the environment variable, and why: each is a
@@ -266,4 +331,40 @@ fn the_unwired_reputation_service_stays_out_of_the_request_crates() {
              D9 it belongs in the drain timer, never in a request-serving binary"
         );
     }
+}
+
+#[test]
+fn every_pool_token_still_names_a_function_epigraph_db_defines() {
+    let pool = std::fs::read_to_string(repo_root().join("crates/epigraph-db/src/pool.rs"))
+        .expect("read pool.rs");
+    for tok in POOL_FNS {
+        assert!(
+            pool.contains(&format!("fn {tok}")),
+            "`{tok}` is no longer defined in epigraph-db/src/pool.rs: the register would scan \
+             for a name nothing can call. Rename the token with the function"
+        );
+    }
+}
+
+#[test]
+fn the_variable_is_named_only_by_the_boot_refusals_and_the_drain_timer() {
+    let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    for (rel, code) in sources() {
+        let n = code.matches("MAINTENANCE_DATABASE_URL").count();
+        if n > 0 {
+            found.insert(rel, n);
+        }
+    }
+    let want: BTreeMap<String, usize> = VARIABLE_NAMED
+        .iter()
+        .map(|(f, n)| ((*f).to_string(), *n))
+        .collect();
+    assert_eq!(
+        found, want,
+        "\n\nA request-serving crate names MAINTENANCE_DATABASE_URL somewhere new (or a \
+         recorded site went away). Under operator decision D9 only the two boot refusals may \
+         read it, and a clap `env = ...` binding or a scan of the environment reads it without \
+         `std::env::var`. If the new site is the drain timer's own, update VARIABLE_NAMED with \
+         the reason."
+    );
 }
