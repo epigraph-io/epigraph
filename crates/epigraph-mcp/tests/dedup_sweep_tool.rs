@@ -823,3 +823,66 @@ async fn a_pair_is_left_to_the_replay_while_a_replay_run_holds_its_lock(pool: Pg
     assert_eq!(applied_for(&pool, weak).await[0].0, Some(operator));
     assert_eq!(pending(&pool).await, 0);
 }
+
+/// `collapse_pair_act`'s two halves commit together or not at all (review
+/// W12a-D2). Every other test drives the definer's success path, which cannot
+/// tell one transaction from two. Here the deferral half FAILS after the act
+/// half has run: the acting agent names no `agents` row, so the definer's
+/// `security_events` INSERT is refused (the `agent_id` foreign key). If the act
+/// had committed on its own, before the deferral's transaction, the duplicate
+/// would now be retired with no cascade row to answer for it, which is the
+/// window the single transaction exists to close. So: an error, the duplicate
+/// still current and unforwarded, its embedding intact, and no `cascade.*` row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_deferral_rolls_the_act_back_with_it(pool: PgPool) {
+    let a1 = seed_agent(&pool).await;
+    let a2 = seed_agent(&pool).await;
+    let strong = seed(&pool, a1, "said thrice", 0.9, &pgvec(0, 0.0), &[]).await;
+    let weak = seed(&pool, a2, "said thrice", 0.4, &pgvec(0, 0.001), &[]).await;
+    let not_an_agent = Uuid::new_v4();
+
+    let maintenance = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let scoped = fixture::scoped_pool(&pool)
+        .await
+        .with_maintenance_pool(maintenance);
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+        .await
+        .expect("maintenance session");
+    let (conn, _) = session.split();
+    let err = epigraph_mcp::tools::dedup_sweep::collapse_pair_act(conn, not_an_agent, weak, strong)
+        .await
+        .expect_err("the deferral names no agent, so the definer must refuse it");
+    drop(session);
+    // The refusal is the deferral's, not the act's: the act alone succeeds on
+    // this pair (the success tests above), and the violated constraint is the
+    // audit row's agent key, which only the definer's INSERT touches.
+    assert!(
+        format!("{err:?}").contains("security_events_agent_id_fkey"),
+        "the failure did not come from the deferral half: {err:?}"
+    );
+
+    let (is_current, supersedes, embedded): (Option<bool>, Option<Uuid>, bool) = sqlx::query_as(
+        "SELECT is_current, supersedes, embedding IS NOT NULL FROM claims WHERE id = $1",
+    )
+    .bind(weak)
+    .fetch_one(&pool)
+    .await
+    .expect("weak");
+    assert_eq!(
+        (is_current, supersedes, embedded),
+        (Some(true), None, true),
+        "the act committed without its deferral: a collapse with no cascade row"
+    );
+    let cascade_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type LIKE 'cascade.%' \
+            AND details#>>'{trigger,subject_id}' = $1::text",
+    )
+    .bind(weak)
+    .fetch_one(&pool)
+    .await
+    .expect("cascade rows");
+    assert_eq!(cascade_rows, 0);
+    assert_eq!(pending(&pool).await, 0);
+}
