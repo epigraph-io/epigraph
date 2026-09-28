@@ -256,6 +256,52 @@ pub async fn stuck_replays<'e, E: sqlx::PgExecutor<'e>>(
         .collect())
 }
 
+/// The replay backlog at a glance (operator decision D9's staleness check,
+/// `replay_deferred_cascades --report-only`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PendingSummary {
+    /// Pending cascades still inside the replay window (failed fewer than
+    /// `max_failures` times).
+    pub pending: i64,
+    /// Pending cascades held out as stuck (failed `max_failures` times or
+    /// more) until an operator retires them.
+    pub stuck: i64,
+    /// Seconds since the oldest unanswered `cascade.deferred` /
+    /// `cascade.admin_failed` row of any pending cascade, stuck ones included;
+    /// `None` when nothing is pending.
+    pub oldest_age_s: Option<i64>,
+}
+
+/// [`PendingSummary`] over the same pending set [`pending_replays`] and
+/// [`stuck_replays`] read (the one `PENDING_CTE`). A read: it writes nothing.
+///
+/// # Errors
+/// `DbError::QueryFailed` on a failed query.
+pub async fn pending_summary<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    max_failures: i64,
+) -> Result<PendingSummary, DbError> {
+    let sql = format!(
+        "{PENDING_CTE} SELECT count(*) FILTER (WHERE failures < $5), \
+                              count(*) FILTER (WHERE failures >= $5), \
+                              floor(extract(epoch FROM now() - min(created_at)))::bigint \
+                         FROM counted"
+    );
+    let (pending, stuck, oldest_age_s): (i64, i64, Option<i64>) = sqlx::query_as(&sql)
+        .bind(EVENT_DEFERRED)
+        .bind(EVENT_FAILED)
+        .bind(EVENT_APPLIED)
+        .bind(EVENT_RETIRED)
+        .bind(max_failures)
+        .fetch_one(executor)
+        .await?;
+    Ok(PendingSummary {
+        pending,
+        stuck,
+        oldest_age_s,
+    })
+}
+
 /// Retire the pending cascade that the `cascade.deferred` /
 /// `cascade.admin_failed` row `event_id` belongs to, without replaying it: an
 /// [`EVENT_RETIRED`] row carrying that row's cause and trigger, the operator's

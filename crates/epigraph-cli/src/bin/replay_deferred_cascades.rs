@@ -45,6 +45,17 @@
 //! application DSN never derives this act) and its login must bypass row
 //! security. Schedule it (systemd timer) on the host that holds that DSN; see
 //! the deploy runbook.
+//!
+//! # Under operator decision D9 (batch W12a)
+//!
+//! No request-serving process holds the maintenance DSN, so EVERY cascade is
+//! deferred and this binary, on `epigraph-cascade-replay.timer` (every 90 s,
+//! `--max-failures 20`), is what applies them. A run takes the replay's own
+//! session advisory lock first; a run that finds it held prints
+//! `{"locked": true}` and exits 0 without touching anything.
+//! `--report-only` prints `{"pending", "stuck", "oldest_age_s"}` from the same
+//! pending set in a READ ONLY transaction and takes no lock, so the staleness
+//! check can run beside a replay.
 
 use anyhow::{anyhow, bail, Context};
 use clap::Parser;
@@ -82,6 +93,12 @@ struct Cli {
     /// Who is running the replay; recorded in every applied row's `replay_of`.
     #[arg(long, default_value = "replay_deferred_cascades")]
     replayed_by: String,
+
+    /// Print the backlog as JSON `{"pending", "stuck", "oldest_age_s"}` and
+    /// exit, in a READ ONLY transaction: nothing is replayed, retired or
+    /// written. Takes no lock, so the staleness check can run beside a replay.
+    #[arg(long, conflicts_with = "retire")]
+    report_only: bool,
 }
 
 #[tokio::main]
@@ -112,6 +129,39 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("the maintenance connection cannot bypass row security")?;
     let (conn, viewer) = session.split();
+
+    if cli.report_only {
+        use sqlx::Acquire;
+        let mut tx = conn.begin().await.context("begin the report transaction")?;
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .context("make the report transaction read-only")?;
+        let summary =
+            epigraph_db::repos::admin_cascade::pending_summary(&mut *tx, cli.max_failures)
+                .await
+                .context("read the replay backlog")?;
+        tx.rollback().await.context("end the report transaction")?;
+        println!(
+            "{}",
+            serde_json::to_string(&summary).context("serialize the backlog summary")?
+        );
+        return Ok(());
+    }
+
+    // Operator decision D9 (batch W12a): this runs on a timer every 90 s, and an
+    // operator may run it by hand; the replay's own advisory lock keeps two runs
+    // from racing over the same cascades. A run that finds it held does nothing.
+    if !epigraph_db::repos::maintenance_lock::try_take(
+        &mut *conn,
+        epigraph_db::repos::maintenance_lock::REPLAY_LOCK_KEY,
+    )
+    .await
+    .context("take the replay lock")?
+    {
+        println!("{}", serde_json::json!({ "locked": true }));
+        return Ok(());
+    }
 
     if !cli.retire.is_empty() {
         let reason = cli
