@@ -1419,9 +1419,9 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
     // crates, where 083's REVOKE and its `epigraph_bypass()`-only write policies
     // deny the write with `42501` no matter what the source says. The lint was
     // redundant exactly where it looked and absent everywhere it would have
-    // bitten: `epigraph-jobs/src` runs on the MAINTENANCE pool (`bin/server.rs`
-    // builds `job_pool` from `maintenance_url`, and the tree's own `jobs_app`
-    // ROW_ONLY_BY_DESIGN note says so), and `no_unmaintained_dsn.rs` actively
+    // bitten: `epigraph-jobs/src` runs on the MAINTENANCE pool (since operator
+    // decision D9, `epigraph-api/src/bin/drain_jobs.rs` builds its one pool on
+    // the configured maintenance DSN), and `no_unmaintained_dsn.rs` actively
     // FORCES every `epigraph-cli/src/bin` target onto it. On those pools
     // `epigraph_bypass()` is true and the grant SUCCEEDS.
     //

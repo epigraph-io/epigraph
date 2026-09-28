@@ -416,12 +416,16 @@ connection (`epigraph_engine::admin_cascade`). Each repair commits in ONE
 transaction with its `security_events` row (`cascade.admin_applied`) naming the
 caller, the cause and what it touched; a failed repair rolls back and is
 recorded as `cascade.admin_failed`; the belief re-derivation that follows writes
-`cascade.belief_rederived`. That connection exists only when
-`MAINTENANCE_DATABASE_URL` is configured to a login that bypasses row security;
-it is never derived from `DATABASE_URL`, and a request path acquires it before
-the act commits. Without it the act still commits and the cascade is reported
+`cascade.belief_rederived`. **Under operator decision D9 (batch W12a) no
+request-serving process holds that connection**: the API `server` and
+`epigraph-mcp-full` (every transport) refuse to start when
+`MAINTENANCE_DATABASE_URL` is set, and attach no maintenance pool. So on a
+request path the act commits and the cascade is ALWAYS reported
 (`"cascade": {"status": "deferred"}`) and recorded (`cascade.deferred`) in the
-act's own transaction.
+act's own transaction; the replay timer (`epigraph-cascade-replay.timer`,
+below) applies it, normally within about two minutes. The in-process applied
+arm (`apply_after_*` on a maintenance connection the request path holds)
+remains only in test harnesses; the replay runs the same functions.
 
 A match-candidate retirement has no caller's act: its flip to `stale` is
 administrative too (migration 118's `match_candidates_stale_guard` refuses it on
@@ -448,9 +452,27 @@ Every repair re-verifies the committed act and is idempotent, so the
 fallback to `DATABASE_URL`), replays every deferred or failed cascade with no
 later `cascade.admin_applied` (or `cascade.retired`) row, naming the original
 caller and the deferral. The window takes cascades with fewer failed attempts
-first; one that has failed `--max-failures` times (default 5) is held out and
-reported as stuck (the CLI exits 2) until an operator retires it with
-`--retire <event id> --reason <text>`.
+first; one that has failed `--max-failures` times (default 5; the timer passes
+20, about 30 minutes at its 90-second period) is held out and reported as stuck
+(the CLI exits 2) until an operator retires it with
+`--retire <event id> --reason <text>`. Under D9 it runs on
+`epigraph-cascade-replay.timer` as a non-superuser maintenance login, takes its
+own advisory lock (a concurrent run does nothing), and
+`--report-only` prints `{"pending","stuck","oldest_age_s"}` read-only for the
+staleness alert.
+
+**Maintenance work lives in timers and operator CLIs (D9).** Besides the
+replay: the job queue is drained by `drain_jobs` (`epigraph-jobs-drain.timer`);
+the corpus-wide sweep, belief recompute and embedding backfill are the
+`sweep_semantic_duplicates`, `recompute_claim_belief` and `embed_backfill`
+CLIs (their MCP tools answer MOVED, JSON-RPC `-32600`); the embedding worklist
+route and the whole privatization lifecycle answer HTTP `501` MOVED. The
+sweep CLI collapses each pair through the act and `apply_after_dedup`, so
+every collapse has a `cascade.admin_applied` row naming `--acting-agent`
+(cause `dedup`). Migration 119 lets no application session enqueue a job and
+grants the maintenance role the job handlers' DELETEs; `maintenance_timer_only.rs`
+pins both, and `maintenance_surface_register.rs` pins that the request crates
+acquire no maintenance authority outside the drain.
 
 The replay acts on `security_events` rows, so 117 makes those rows the
 server's: a non-privileged session cannot write any `cascade.*` row itself (a

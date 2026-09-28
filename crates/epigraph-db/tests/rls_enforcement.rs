@@ -1727,7 +1727,7 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 ///
 /// | Site | Table | Pool | Disposition |
 /// |---|---|---|---|
-/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (`bin/server.rs` builds `job_pool` from `maintenance_url`; both `PostgresJobQueue::new` sites take it) | `epigraph_bypass()` is true, guard intact |
+/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (since D9 the only queue is `bin/drain_jobs.rs`'s, on the configured maintenance DSN; 119 lets no application session enqueue) | `epigraph_bypass()` is true, guard intact |
 /// | `edge.rs::create_symmetric_if_absent` | `edges` | app | **CORRECTED — see below.** Constraint-backed from migration 090 |
 /// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | ditto; `alternative_of` additionally carries `edges_alternative_of_symmetric_uniq`, whose predicate 091 narrowed to rows in force |
 /// | `graph_view.rs` (**3** sites, in 2 functions) | `edges` | app | already-decomposed claims reappear as undecomposed |
