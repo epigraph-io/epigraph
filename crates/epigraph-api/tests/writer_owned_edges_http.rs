@@ -458,7 +458,7 @@ async fn a_viewer_holding_handlers_edge_is_the_callers(pool: PgPool) {
     assert!(!row(&pool, shared.edge_id).await.4, "retracted");
 
     // forget_convention: the REFUTES edge is W's.
-    forget_convention(
+    let Json(forgotten) = forget_convention(
         ViewerExtractor(viewer(&pool, w).await),
         State(state.clone()),
         auth_with(w, &["claims:admin"]),
@@ -466,6 +466,7 @@ async fn a_viewer_holding_handlers_edge_is_the_callers(pool: PgPool) {
     )
     .await
     .expect("W forgets the convention");
+    assert_eq!(forgotten.claim_id, convention);
     let refutes: Vec<(Uuid, String, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
         "SELECT owner_group_id, visibility::text, co_owner_group_id, writer_group_id \
            FROM edges WHERE target_id = $1 AND relationship = 'REFUTES'",
