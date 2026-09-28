@@ -26,6 +26,14 @@ name = "epigraph-migrate"
 path = "src/bin/epigraph-migrate.rs"
 required-features = ["db"]
 
+# Operator decision D9 (batch W12a): the job queue's drain, run by
+# epigraph-jobs-drain.timer on the maintenance DSN. It lives in this crate
+# because it registers `ClaimEmbeddingJobService` (src/embedding_restore.rs).
+[[bin]]
+name = "drain_jobs"
+path = "src/bin/drain_jobs.rs"
+required-features = ["db"]
+
 
 [dependencies]
 epigraph-auth = { workspace = true }

@@ -611,6 +611,89 @@ impl PostgresJobQueue {
         Ok(deleted)
     }
 
+    /// Claim the oldest pending job whose type is in `job_types` and whose id
+    /// is not in `exclude`, flipping it to `running` in the same statement
+    /// (`FOR UPDATE SKIP LOCKED`, as [`JobQueue::dequeue`]).
+    ///
+    /// The drain timer (`drain_jobs`, operator decision D9) uses this instead
+    /// of the trait's `dequeue` for two reasons, both about a run that must
+    /// terminate:
+    ///
+    /// * a pending job of a type no handler is registered for (an
+    ///   `embedding_generation` job on an instance whose embedding provider
+    ///   may not write `claims.embedding`) would otherwise be dequeued at the
+    ///   head of the queue on every iteration, and the run would never reach
+    ///   the jobs behind it;
+    /// * a job that failed and was put back to `pending` in this run is
+    ///   excluded, so its retry waits for the next run instead of spinning.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error, or when the claimed
+    /// row cannot be parsed.
+    #[instrument(skip(self))]
+    pub async fn dequeue_of_types(
+        &self,
+        job_types: &[String],
+        exclude: &[Uuid],
+    ) -> Result<Option<Job>, JobError> {
+        let row = sqlx::query(
+            r"
+            WITH next_job AS (
+                SELECT id
+                FROM jobs
+                WHERE state = 'pending'
+                  AND job_type = ANY($1)
+                  AND NOT (id = ANY($2))
+                ORDER BY created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE jobs
+            SET state = 'running',
+                started_at = NOW(),
+                updated_at = NOW()
+            FROM next_job
+            WHERE jobs.id = next_job.id
+            RETURNING jobs.id, jobs.job_type, jobs.payload, jobs.state,
+                      jobs.retry_count, jobs.max_retries, jobs.created_at,
+                      jobs.updated_at, jobs.started_at, jobs.completed_at,
+                      jobs.error_message
+            ",
+        )
+        .bind(job_types)
+        .bind(exclude)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to dequeue job: {e}"),
+        })?;
+        row.map(|r| job_from_row(&r)).transpose()
+    }
+
+    /// How many `pending` jobs have a type in `job_types` and an id not in
+    /// `exclude`: the work [`Self::dequeue_of_types`] would still hand out.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error.
+    #[instrument(skip(self))]
+    pub async fn count_pending_of_types(
+        &self,
+        job_types: &[String],
+        exclude: &[Uuid],
+    ) -> Result<i64, JobError> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM jobs \
+              WHERE state = 'pending' AND job_type = ANY($1) AND NOT (id = ANY($2))",
+        )
+        .bind(job_types)
+        .bind(exclude)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to count pending jobs: {e}"),
+        })
+    }
+
     /// Recover stale running jobs.
     ///
     /// Jobs that have been in `Running` state for too long may indicate
