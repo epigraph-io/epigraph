@@ -56,6 +56,13 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
     .expect("seed agent")
 }
 
+/// The operator agent a collapse is attributed to (`--acting-agent` on the
+/// CLI; the server's own agent in the MCP tool). Every collapsed pair's
+/// `cascade.admin_applied` row names it.
+async fn acting_agent(pool: &PgPool) -> Uuid {
+    seed_agent(pool).await
+}
+
 /// `content` drives content_hash, so identical content => exact-restatement.
 async fn seed(
     pool: &PgPool,
@@ -106,16 +113,15 @@ async fn dry_run_reports_without_mutating(pool: PgPool) {
     let a = seed(&pool, a1, "identical text", 0.9, &pgvec(0, 0.0), &[]).await;
     let b = seed(&pool, a2, "identical text", 0.5, &pgvec(0, 0.001), &[]).await;
 
-    let server = build_server(pool.clone()).await;
     let j = json_of(
         sweep_semantic_duplicates(
-            &server,
             &mut fixture::scoped_pool(&pool)
                 .await
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
             params(true),
+            acting_agent(&pool).await,
         )
         .await
         .expect("sweep"),
@@ -147,16 +153,15 @@ async fn execute_collapses_exact_restatements_keeping_highest_truth(pool: PgPool
     let strong = seed(&pool, a1, "same words", 0.9, &pgvec(0, 0.0), &[]).await;
     let weak = seed(&pool, a2, "same words", 0.4, &pgvec(0, 0.001), &[]).await;
 
-    let server = build_server(pool.clone()).await;
     let j = json_of(
         sweep_semantic_duplicates(
-            &server,
             &mut fixture::scoped_pool(&pool)
                 .await
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
             params(false),
+            acting_agent(&pool).await,
         )
         .await
         .expect("sweep"),
@@ -212,16 +217,15 @@ async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
     )
     .await;
 
-    let server = build_server(pool.clone()).await;
     let j = json_of(
         sweep_semantic_duplicates(
-            &server,
             &mut fixture::scoped_pool(&pool)
                 .await
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
             params(false),
+            acting_agent(&pool).await,
         )
         .await
         .expect("sweep"),
@@ -261,16 +265,15 @@ async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
     seed(&pool, a2, "chain text", 0.8, &pgvec(0, 0.010), &[]).await;
     seed(&pool, a3, "chain text", 0.7, &pgvec(0, 0.020), &[]).await;
 
-    let server = build_server(pool.clone()).await;
     let j = json_of(
         sweep_semantic_duplicates(
-            &server,
             &mut fixture::scoped_pool(&pool)
                 .await
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
             params(true),
+            acting_agent(&pool).await,
         )
         .await
         .expect("sweep"),
@@ -323,16 +326,15 @@ async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
         .unwrap();
     }
 
-    let server = build_server(pool.clone()).await;
     let j = json_of(
         sweep_semantic_duplicates(
-            &server,
             &mut fixture::scoped_pool(&pool)
                 .await
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
             params(true),
+            acting_agent(&pool).await,
         )
         .await
         .expect("sweep"),
@@ -362,18 +364,17 @@ async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
         .await;
     }
 
-    let server = build_server(pool.clone()).await;
     let mut p = params(true);
     p.limit = Some(2);
     let j = json_of(
         sweep_semantic_duplicates(
-            &server,
             &mut fixture::scoped_pool(&pool)
                 .await
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
             p,
+            acting_agent(&pool).await,
         )
         .await
         .expect("sweep"),
@@ -450,13 +451,13 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
 
     let j = json_of(
         sweep_semantic_duplicates(
-            &server,
             &mut fixture::scoped_pool(&pool)
                 .await
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
             params(false),
+            acting_agent(&pool).await,
         )
         .await
         .expect("sweep"),
@@ -533,4 +534,62 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
         "the duplicate's supporter moved to the survivor; keeping its old \
          cached BetP is a derived record with nothing behind it"
     );
+}
+
+/// Operator decision D1's audit rule on the bulk path (batch W12a): every
+/// collapsed pair goes through the administrative cascade and gets EXACTLY ONE
+/// `cascade.admin_applied` row naming the acting agent, cause `dedup`, the
+/// duplicate as subject and the survivor as object, and the report returns
+/// that row's id. Before W12a the sweep collapsed inline
+/// (`mark_duplicate_with_cascade`) and wrote no audit row at all. Two pairs,
+/// so a sweep that audited only the first would be caught.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_collapsed_pair_is_audited_under_the_acting_agent(pool: PgPool) {
+    let a1 = seed_agent(&pool).await;
+    let a2 = seed_agent(&pool).await;
+    let a3 = seed_agent(&pool).await;
+    let strong = seed(&pool, a1, "thrice said", 0.9, &pgvec(0, 0.0), &[]).await;
+    let weak1 = seed(&pool, a2, "thrice said", 0.5, &pgvec(0, 0.001), &[]).await;
+    let weak2 = seed(&pool, a3, "thrice said", 0.4, &pgvec(0, 0.002), &[]).await;
+    let operator = acting_agent(&pool).await;
+
+    let scoped = fixture::scoped_pool(&pool).await;
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
+        .await
+        .expect("a maintenance session over the test database");
+    let report = epigraph_mcp::tools::dedup_sweep::sweep(&mut session, &params(false), operator)
+        .await
+        .expect("sweep");
+    drop(session);
+    assert_eq!(report.pairs_marked, 2, "{report:?}");
+    assert!(report.failures.is_empty(), "{report:?}");
+
+    let rows: Vec<(Uuid, Option<Uuid>, String, String, String)> = sqlx::query_as(
+        "SELECT id, agent_id, details->>'cause', details#>>'{trigger,subject_id}', \
+                details#>>'{trigger,object_id}' \
+           FROM security_events WHERE event_type = 'cascade.admin_applied' ORDER BY created_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the applied rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "one applied row per collapsed pair: {rows:?}"
+    );
+    let mut subjects: Vec<String> = rows.iter().map(|r| r.3.clone()).collect();
+    subjects.sort();
+    let mut want = vec![weak1.to_string(), weak2.to_string()];
+    want.sort();
+    assert_eq!(subjects, want);
+    for (id, agent, cause, _, object) in &rows {
+        assert_eq!(*agent, Some(operator), "attributed to the acting agent");
+        assert_eq!(cause, "dedup");
+        assert_eq!(object, &strong.to_string(), "forwarded at the survivor");
+        assert!(
+            report.audit_event_ids.contains(id),
+            "the report names its audit rows"
+        );
+    }
 }

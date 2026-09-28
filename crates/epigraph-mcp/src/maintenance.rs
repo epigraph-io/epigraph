@@ -200,8 +200,9 @@ pub(crate) async fn maintenance_tool_session(
 /// `ScopedPool::maintenance_session`, shared with the CLI and API wrappers.
 ///
 /// ```ignore
-/// let mut session = maintenance::maintenance_viewer(self, SystemReason::DedupSweep).await?;
-/// tools::dedup_sweep::sweep_semantic_duplicates(self, &mut session, params).await
+/// let mut session =
+///     maintenance::maintenance_tool_session(self, MaintenanceTool::SweepSemanticDuplicates).await?;
+/// tools::dedup_sweep::sweep_semantic_duplicates(&mut session, params, acting_agent).await
 /// ```
 ///
 /// # Errors

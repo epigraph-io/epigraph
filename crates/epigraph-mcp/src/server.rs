@@ -1035,7 +1035,8 @@ impl EpiGraphMcpFull {
             crate::maintenance::MaintenanceTool::SweepSemanticDuplicates,
         )
         .await?;
-        tools::dedup_sweep::sweep_semantic_duplicates(self, &mut session, params).await
+        let acting_agent = self.server_agent_id().await?;
+        tools::dedup_sweep::sweep_semantic_duplicates(&mut session, params, acting_agent).await
     }
 
     // ── Alternative-set candidate finder (1 tool) ──
