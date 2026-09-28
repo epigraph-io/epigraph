@@ -3253,3 +3253,133 @@ async fn a_non_owner_cannot_point_supersedes_at_a_private_claim(pool: PgPool) {
         .await
         .expect("a privileged session sets any supersedes");
 }
+
+// ===========================================================================
+// ZERO-ROW WRITES ARE REFUSED, NOT REPORTED AS DONE (W10 sweep)
+// ===========================================================================
+
+/// A pool whose every connection is `epigraph_app`, stamped for `agent` as
+/// `ScopedPool::begin_as` would: the shape a repository function that takes a
+/// `&PgPool` runs on when a caller hands it an application connection.
+async fn stamped_app_pool(pool: &PgPool, agent: Uuid) -> PgPool {
+    use sqlx::Executor;
+    let v = Viewer::resolve(pool, agent).await.expect("resolve viewer");
+    let groups = csv(v.group_bind().expect("scoped viewer"));
+    let writable = csv(v.writable_groups());
+    let url = fixture::database_url_for(pool).await;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _meta| {
+            let (groups, writable) = (groups.clone(), writable.clone());
+            Box::pin(async move {
+                conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+                    .await?;
+                sqlx::query(
+                    "SELECT set_config('epigraph.group_ids', $1, false), \
+                            set_config('epigraph.writable_group_ids', $2, false), \
+                            set_config('epigraph.principal_id', $3, false)",
+                )
+                .bind(groups)
+                .bind(writable)
+                .bind(agent.to_string())
+                .execute(&mut *conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("stamped app pool")
+}
+
+fn is_write_refused(r: &Result<impl std::fmt::Debug, epigraph_db::DbError>) -> bool {
+    matches!(r, Err(epigraph_db::DbError::WriteRefused { .. }))
+}
+
+/// Migrations 115 and 117 made DELETE and (on `edges` and the registries)
+/// UPDATE owner-scoped with RESTRICTIVE USING clauses, which refuse a row by
+/// matching nothing. The repository functions that must change the rows they
+/// name now compare what they could see with what they changed, on the
+/// application role:
+/// * a world claim, a world frame, a world edge: readable, refused
+///   (`WriteRefused`), unchanged; a missing id is still `false` / `NotFound`;
+/// * a claim's BBAs, one the session's own and one another writer's:
+///   `delete_for_claim` refuses and deletes NEITHER (it runs in a
+///   transaction), so a partial delete never leaves the claim's belief
+///   combining the survivor;
+/// * `EdgeRepository::retract` over the session's own edge and a world edge:
+///   refused, and the session's own edge is NOT retracted either.
+#[sqlx::test(migrations = "../../migrations")]
+#[allow(clippy::too_many_lines)]
+async fn zero_row_writes_are_refused_not_reported_as_done(pool: PgPool) {
+    use epigraph_db::{ClaimRepository, EdgeRepository};
+    let (x, gx) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "writer-y").await;
+    assert_app_role_does_not_bypass(&pool).await;
+    let world_claim = fixture::seed_public_claim(&pool, x, "a world claim").await;
+    let other = fixture::seed_public_claim(&pool, x, "another world claim").await;
+    let own_private = fixture::seed_group_claim(&pool, x, gx, "X's private claim").await;
+    let world_edge = fixture::seed_edge(&pool, world_claim, other).await;
+    let own_edge = fixture::seed_edge(&pool, own_private, world_claim).await;
+    let frame = seed_frame(&pool, "binary_truth").await;
+    let app = stamped_app_pool(&pool, x).await;
+
+    // A world claim: readable, not X's to delete.
+    let r = ClaimRepository::delete(&app, world_claim.into()).await;
+    assert!(is_write_refused(&r), "{r:?}");
+    assert!(exists(&pool, "claims", world_claim).await);
+    let missing = ClaimRepository::delete(&app, Uuid::new_v4().into())
+        .await
+        .expect("a missing claim is not an error");
+    assert!(!missing, "a missing claim is `false`, as before");
+
+    // A world frame: readable, not X's to update (117).
+    let r = FrameRepository::set_property(&app, frame, "k", &serde_json::json!(1)).await;
+    assert!(is_write_refused(&r), "{r:?}");
+    let r = FrameRepository::set_property(&app, Uuid::new_v4(), "k", &serde_json::json!(1)).await;
+    assert!(
+        matches!(r, Err(epigraph_db::DbError::NotFound { .. })),
+        "{r:?}"
+    );
+
+    // The claim's BBAs: X's own and Y's (both writer-owned, 114).
+    let p = pool.clone();
+    let mine = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, x).await;
+        let b = store_bba(&mut conn, world_claim, frame, x, None).await;
+        (conn, b)
+    })
+    .await;
+    let p = pool.clone();
+    let theirs = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, y).await;
+        let b = store_bba(&mut conn, world_claim, frame, y, None).await;
+        (conn, b)
+    })
+    .await;
+    let r = MassFunctionRepository::delete_for_claim(&app, world_claim).await;
+    assert!(is_write_refused(&r), "{r:?}");
+    assert!(
+        exists(&pool, "mass_functions", mine).await
+            && exists(&pool, "mass_functions", theirs).await,
+        "refused as a whole: X's own BBA was not deleted either"
+    );
+
+    // Retracting X's own edge together with a world edge.
+    let r = EdgeRepository::retract(&app, &[own_edge, world_edge]).await;
+    assert!(is_write_refused(&r), "{r:?}");
+    let open: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM edges WHERE id = ANY($1) AND valid_to IS NULL")
+            .bind(vec![own_edge, world_edge])
+            .fetch_one(&pool)
+            .await
+            .expect("open edges");
+    assert_eq!(
+        open, 2,
+        "refused as a whole: X's own edge is still in force"
+    );
+    let closed = EdgeRepository::retract(&app, &[own_edge])
+        .await
+        .expect("X retracts its own edge");
+    assert_eq!(closed, vec![own_edge]);
+}

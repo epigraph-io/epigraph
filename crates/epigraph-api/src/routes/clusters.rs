@@ -347,6 +347,16 @@ async fn gc_bridge_runs(pool: &sqlx::PgPool, retain: u32) -> Result<(), ApiError
     // (`graph_clusters` is not declared FK to `graph_cluster_runs`, and
     // `claim_cluster_membership.run_id` isn't either; only
     // `claim_cluster_membership.cluster_id` cascades. So we explicitly clean.)
+    //
+    // ZERO ROWS IS FINE HERE (W10 sweep). On the application role this
+    // membership DELETE is owner-scoped (migration 115) and may match nothing
+    // without an error. Nothing is lost: every membership row hangs off a
+    // `graph_clusters` row of the same run, and the `graph_clusters` DELETE
+    // below removes those memberships through
+    // `claim_cluster_membership_cluster_id_fkey ON DELETE CASCADE`, a
+    // referential action that consults no policy. This statement is
+    // idempotent cleanup that runs first only so a privileged session does
+    // the work without the cascade.
     sqlx::query(
         "DELETE FROM claim_cluster_membership
          WHERE run_id NOT IN (SELECT run_id FROM graph_cluster_runs)",

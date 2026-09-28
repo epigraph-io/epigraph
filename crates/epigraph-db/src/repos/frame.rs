@@ -488,7 +488,9 @@ impl FrameRepository {
     /// Uses `||` (JSONB merge) so existing keys are preserved.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::NotFound` for a frame this session cannot read,
+    /// `DbError::WriteRefused` for one it can read but not update (migration
+    /// 117), `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool, value))]
     pub async fn set_property(
         pool: &PgPool,
@@ -496,18 +498,31 @@ impl FrameRepository {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<(), DbError> {
-        sqlx::query(
+        // Checked: migration 117's owner-scoped UPDATE on `frames` matches no
+        // row it refuses (a world frame is nobody's) and reports success.
+        let counts: (i64, i64) = sqlx::query_as(
             r#"
-            UPDATE frames
-               SET properties = properties || jsonb_build_object($2::text, $3::jsonb)
-             WHERE id = $1
+            WITH seen AS (SELECT 1 FROM frames WHERE id = $1),
+                 done AS (
+                    UPDATE frames
+                       SET properties = properties || jsonb_build_object($2::text, $3::jsonb)
+                     WHERE id = $1
+                    RETURNING 1)
+            SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )
         .bind(frame_id)
         .bind(key)
         .bind(value)
-        .execute(pool)
+        .fetch_one(pool)
         .await?;
+        if counts == (0, 0) {
+            return Err(DbError::NotFound {
+                entity: "frame".to_string(),
+                id: frame_id,
+            });
+        }
+        super::require_all_changed("frame", frame_id, "update", counts)?;
         Ok(())
     }
 

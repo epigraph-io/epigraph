@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH seen AS (SELECT 1 FROM claims WHERE id = $1),\n                 done AS (DELETE FROM claims WHERE id = $1 RETURNING 1)\n            SELECT (SELECT count(*) FROM seen) AS \"seen!\", (SELECT count(*) FROM done) AS \"done!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seen!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "done!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "7757be6c7e47bbdd141b841c5f49ef6378140b60d6acc5af5736d23969ff31c1"
+}

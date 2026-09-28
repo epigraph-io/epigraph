@@ -3445,25 +3445,30 @@ impl ClaimRepository {
     /// Delete a claim by ID
     ///
     /// # Returns
-    /// Returns `true` if the claim was deleted, `false` if it didn't exist.
+    /// Returns `true` if the claim was deleted, `false` if this session cannot
+    /// read it (it does not exist, or is invisible).
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::WriteRefused` when the claim is readable but migration 115's
+    /// owner-scoped DELETE refused it (a refused DELETE matches no row and
+    /// reports success, so the one statement compares what it saw with what it
+    /// deleted); `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn delete(pool: &PgPool, id: ClaimId) -> Result<bool, DbError> {
         let uuid: Uuid = id.into();
 
-        let result = sqlx::query!(
+        let r = sqlx::query!(
             r#"
-            DELETE FROM claims
-            WHERE id = $1
+            WITH seen AS (SELECT 1 FROM claims WHERE id = $1),
+                 done AS (DELETE FROM claims WHERE id = $1 RETURNING 1)
+            SELECT (SELECT count(*) FROM seen) AS "seen!", (SELECT count(*) FROM done) AS "done!"
             "#,
             uuid
         )
-        .execute(pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(super::require_all_changed("claim", uuid, "delete", (r.seen, r.done))? > 0)
     }
 
     /// Get a claim by ID on a caller-supplied connection.

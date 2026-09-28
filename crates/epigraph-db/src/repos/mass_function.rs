@@ -491,20 +491,37 @@ impl MassFunctionRepository {
     /// Returns the number of rows deleted.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::WriteRefused` when a readable BBA of the claim is not this
+    /// session's to delete (then none is deleted: a partial delete would leave
+    /// the claim's belief combining the survivors); `DbError::QueryFailed` if
+    /// the database query fails.
     #[instrument(skip(pool))]
     pub async fn delete_for_claim(pool: &PgPool, claim_id: Uuid) -> Result<u64, DbError> {
-        let result = sqlx::query(
+        // Checked: since 114 a claim's BBAs are routinely OTHER writers' rows,
+        // which 115's owner-scoped DELETE skips without an error. Deleting only
+        // the session's own and reporting the claim cleared would leave the
+        // rest combining; refuse instead, and roll back the rows it could
+        // delete (the transaction is dropped uncommitted).
+        let mut tx = pool.begin().await?;
+        let counts: (i64, i64) = sqlx::query_as(
             r#"
-            DELETE FROM mass_functions
-            WHERE claim_id = $1
+            WITH seen AS (SELECT 1 FROM mass_functions WHERE claim_id = $1),
+                 done AS (DELETE FROM mass_functions WHERE claim_id = $1 RETURNING 1)
+            SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )
         .bind(claim_id)
-        .execute(pool)
+        .fetch_one(&mut *tx)
         .await?;
-
-        Ok(result.rows_affected())
+        if counts.1 < counts.0 {
+            return Err(DbError::WriteRefused {
+                entity: "mass functions of claim".to_string(),
+                id: claim_id,
+                action: "delete".to_string(),
+            });
+        }
+        tx.commit().await?;
+        Ok(u64::try_from(counts.1).unwrap_or(0))
     }
 
     /// Delete every mass function keyed to a single perspective.
