@@ -47,18 +47,10 @@ use crate::embedding_restore::{ClaimEmbeddingJobService, EmbeddingProviderKind};
 /// a job that outlives the unit's start timeout is killed by systemd, and an
 /// uncounted reset would re-run it and have it killed again forever. The
 /// counted reset bounds that loop by the job's `max_retries`, then fails the
-/// row (a failure of the run: exit 1).
+/// row (a failure of the run: exit 1). A one-attempt row (`max_retries <= 1`:
+/// the privatization jobs and the unseal's `embedding_generation` jobs) is
+/// reset uncounted and re-delivered to its handler instead.
 pub const STALE_AFTER: Duration = Duration::from_secs(90 * 60);
-
-/// Job types reaped WITHOUT counting an attempt: the privatization handlers
-/// run one attempt plus re-delivery (`max_retries = 1`), and their own state
-/// check makes a re-delivered job a no-op refusal. A counted reap would fail
-/// such a job before its handler runs and leave the plan mid-flight.
-pub const RESUMABLE_ON_REAP: [&str; 3] = [
-    epigraph_jobs::privatization::APPLY_JOB_TYPE,
-    epigraph_jobs::privatization::REVERT_JOB_TYPE,
-    epigraph_jobs::privatization::RESEAL_JOB_TYPE,
-];
 
 /// The per-connection statement timeout of the drain's pool, unless
 /// `EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS` overrides it: a runaway clustering query,
@@ -219,10 +211,7 @@ pub async fn drain(
     max_runtime: Duration,
 ) -> Result<DrainReport, JobError> {
     let started = Instant::now();
-    let resumable: Vec<String> = RESUMABLE_ON_REAP.iter().map(ToString::to_string).collect();
-    let reaped = queue
-        .reap_stale_jobs_counting_attempts(STALE_AFTER, &resumable)
-        .await?;
+    let reaped = queue.reap_stale_jobs_counting_attempts(STALE_AFTER).await?;
     let mut report = DrainReport {
         recovered_stale: reaped.iter().filter(|r| !r.failed).count() as u64,
         failures: reaped

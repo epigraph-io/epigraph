@@ -114,7 +114,7 @@ async fn a_counted_reap_bounds_a_job_killed_on_every_attempt(pool: PgPool) {
 
     for attempt in 1..=2 {
         let reaped = q
-            .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &[])
+            .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
             .await
             .unwrap();
         assert_eq!(reaped.len(), 1, "attempt {attempt}: {reaped:?}");
@@ -128,7 +128,7 @@ async fn a_counted_reap_bounds_a_job_killed_on_every_attempt(pool: PgPool) {
         make_stale_again(&pool, looping).await;
     }
     let reaped = q
-        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &[])
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
         .await
         .unwrap();
     assert_eq!(reaped.len(), 1, "{reaped:?}");
@@ -141,38 +141,54 @@ async fn a_counted_reap_bounds_a_job_killed_on_every_attempt(pool: PgPool) {
     assert_eq!(err.as_deref(), Some(epigraph_jobs::REAPED_SPENT_MESSAGE));
 
     let again = q
-        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &[])
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
         .await
         .unwrap();
     assert!(again.is_empty(), "a failed row was reaped again: {again:?}");
     assert_eq!(q.count_by_state(JobState::Running).await.unwrap(), 1);
 }
 
-/// A resumable type (one attempt plus re-delivery) is reset WITHOUT counting,
-/// so a one-attempt job is re-delivered to its handler instead of failed
-/// before it runs. The control: the same row reaped without the exemption is
-/// failed at once, so the exemption is what keeps it alive.
+/// The reap is decided by the row's own attempt budget, not its type (review
+/// W12a-D7). A one-attempt row (`max_retries = 1`, as
+/// `PrivatizationRepository::enqueue_job_conn` enqueues every job it writes:
+/// the privatization types AND the unseal's `embedding_generation`) is reset
+/// WITHOUT counting, whatever its type, so it is re-delivered to its handler
+/// instead of failed before it runs. The control: a privatization row with a
+/// multi-attempt budget, on its last attempt, IS failed by the reap, so it is
+/// the budget, not a type exemption, that keeps the one-attempt rows alive.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_resumable_type_is_reset_without_counting_its_one_attempt(pool: PgPool) {
+async fn a_one_attempt_row_is_reset_without_counting_whatever_its_type(pool: PgPool) {
     let q = PostgresJobQueue::new(pool.clone());
-    let resumable = vec!["privatization_apply".to_string()];
+    let one_attempt = [
+        insert_running(&pool, "privatization_apply", 0, 1).await,
+        insert_running(&pool, "embedding_generation", 0, 1).await,
+        insert_running(&pool, "cluster_graph", 0, 1).await,
+    ];
+    let spent = insert_running(&pool, "privatization_apply", 2, 3).await;
 
-    let kept = insert_running(&pool, "privatization_apply", 0, 1).await;
     let reaped = q
-        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &resumable)
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
         .await
         .unwrap();
-    assert_eq!(reaped.len(), 1);
-    assert!(!reaped[0].failed, "{reaped:?}");
-    let (state, retries, err, _) = row(&pool, kept).await;
-    assert_eq!((state.as_str(), retries, err), ("pending", 0, None));
-
-    let control = insert_running(&pool, "privatization_apply", 0, 1).await;
-    let reaped = q
-        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &[])
-        .await
-        .unwrap();
-    assert_eq!(reaped.len(), 1);
-    assert!(reaped[0].failed, "{reaped:?}");
-    assert_eq!(row(&pool, control).await.0, "failed");
+    assert_eq!(reaped.len(), 4, "{reaped:?}");
+    for id in one_attempt {
+        let r = reaped.iter().find(|r| r.id == id).expect("reaped");
+        assert!(
+            !r.failed,
+            "a one-attempt {} row was failed: {reaped:?}",
+            r.job_type
+        );
+        let (state, retries, err, done) = row(&pool, id).await;
+        assert_eq!(
+            (state.as_str(), retries, err, done),
+            ("pending", 0, None, false),
+            "a one-attempt {} row must go back to pending with its attempt uncounted",
+            r.job_type
+        );
+    }
+    let r = reaped.iter().find(|r| r.id == spent).expect("reaped");
+    assert!(r.failed, "{reaped:?}");
+    let (state, retries, err, done) = row(&pool, spent).await;
+    assert_eq!((state.as_str(), retries, done), ("failed", 3, true));
+    assert_eq!(err.as_deref(), Some(epigraph_jobs::REAPED_SPENT_MESSAGE));
 }

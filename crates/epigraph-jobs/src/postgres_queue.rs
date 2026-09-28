@@ -729,15 +729,24 @@ impl PostgresJobQueue {
     /// itself, with an `error_message` that says why, rather than left `pending`
     /// for the runner's pre-check to fail without a word.
     ///
-    /// # `resumable_types` are reset WITHOUT counting
+    /// # A one-attempt row (`max_retries <= 1`) is reset WITHOUT counting
     ///
-    /// The privatization handlers are built around ONE attempt plus
-    /// re-delivery (`max_retries = 1`, see `repos/privatization.rs`): a worker
-    /// that died after committing its terminal write is re-delivered, and the
-    /// handler's own state check makes that re-delivery a no-op refusal. A
-    /// counted reap would fail such a job before the handler runs and leave its
-    /// plan mid-flight. Those types keep [`Self::recover_stale_jobs`]'
-    /// behaviour.
+    /// The row's own attempt budget decides, not a list of job types. A row
+    /// enqueued with one attempt (`PrivatizationRepository::enqueue_job_conn`
+    /// writes `max_retries = 1` for every type it enqueues: the privatization
+    /// apply, revert and reseal jobs AND the unseal's `embedding_generation`
+    /// jobs) is built around ONE attempt plus re-delivery: a worker that died
+    /// mid-job is re-delivered, and the handler's own state check makes a
+    /// re-delivery after its terminal write a no-op refusal. A counted reap
+    /// would compute `0 + 1 >= 1` and fail such a job before its handler ever
+    /// runs (a privatization plan left mid-flight; a restored claim left with no
+    /// embedding). So those rows keep [`Self::recover_stale_jobs`]' behaviour.
+    ///
+    /// Deciding by the row means a new one-attempt enqueuer is covered without
+    /// editing a list here. The cost: a one-attempt job that is killed on EVERY
+    /// run is re-delivered on every run, as it was before this reaper existed.
+    /// What bounds it in practice is the drain unit's start timeout, whose
+    /// failure mails the operator (`OnFailure=`).
     ///
     /// # Errors
     /// `JobError::ProcessingFailed` on a database error or an invalid duration.
@@ -745,7 +754,6 @@ impl PostgresJobQueue {
     pub async fn reap_stale_jobs_counting_attempts(
         &self,
         stale_threshold: std::time::Duration,
-        resumable_types: &[String],
     ) -> Result<Vec<ReapedJob>, JobError> {
         let cutoff = Utc::now()
             - chrono::Duration::from_std(stale_threshold).map_err(|e| {
@@ -757,8 +765,8 @@ impl PostgresJobQueue {
             r"
             WITH stale AS (
                 SELECT id,
-                       NOT (job_type = ANY($2)) AS counted,
-                       NOT (job_type = ANY($2)) AND retry_count + 1 >= max_retries AS spent
+                       max_retries > 1 AS counted,
+                       max_retries > 1 AND retry_count + 1 >= max_retries AS spent
                   FROM jobs
                  WHERE state = 'running' AND started_at < $1
                  FOR UPDATE SKIP LOCKED
@@ -769,7 +777,7 @@ impl PostgresJobQueue {
                    state         = CASE WHEN s.spent THEN 'failed' ELSE 'pending' END,
                    started_at    = CASE WHEN s.spent THEN j.started_at ELSE NULL END,
                    completed_at  = CASE WHEN s.spent THEN NOW() ELSE j.completed_at END,
-                   error_message = CASE WHEN s.spent THEN $3 ELSE j.error_message END,
+                   error_message = CASE WHEN s.spent THEN $2 ELSE j.error_message END,
                    updated_at    = NOW()
               FROM stale s
              WHERE j.id = s.id
@@ -777,7 +785,6 @@ impl PostgresJobQueue {
             ",
         )
         .bind(cutoff)
-        .bind(resumable_types)
         .bind(REAPED_SPENT_MESSAGE)
         .fetch_all(&self.pool)
         .await

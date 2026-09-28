@@ -17,8 +17,9 @@
 //! 4. take the drain's advisory lock on that connection; when another run
 //!    holds it, print `{"locked": true}` and exit 0;
 //! 5. reap `running` rows older than 90 minutes (a counted attempt: back to
-//!    `pending`, or `failed` once the attempts are used up; the privatization
-//!    types are reset uncounted, see `jobs_drain::RESUMABLE_ON_REAP`), then run
+//!    `pending`, or `failed` once the attempts are used up; a one-attempt row,
+//!    `max_retries <= 1`, is reset uncounted, see
+//!    `PostgresJobQueue::reap_stale_jobs_counting_attempts`), then run
 //!    the oldest pending job of a registered type, one at a time, until none
 //!    is left or `--max-runtime` (default 50min) has elapsed.
 //!

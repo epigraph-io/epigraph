@@ -379,10 +379,14 @@ async fn the_drain_reaps_a_stale_running_job_and_leaves_a_fresh_one(pool: PgPool
 
 /// The drain's reaper counts the attempt: a stale job on its LAST attempt is
 /// failed by the reaper (never run again, never left pending), which is a
-/// failure of the run (exit 1). A stale privatization job, whose handler is
-/// built on one attempt plus re-delivery, is reset uncounted and re-delivered
-/// to its handler, which records its own verdict (here a refusal: its plan does
-/// not exist) instead of the reaper's.
+/// failure of the run (exit 1). A stale ONE-ATTEMPT job (`max_retries = 1`, as
+/// the privatization repository enqueues every job it writes) is reset
+/// uncounted instead, whatever its type:
+/// * a privatization job is re-delivered to its handler, which records its own
+///   verdict (here a refusal: its plan does not exist) instead of the reaper's;
+/// * an `embedding_generation` job from an unseal (review W12a-D7) goes back to
+///   `pending` with its one attempt intact, for the drain that registers its
+///   handler; it is neither failed by the reaper nor counted as a failure.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool: PgPool) {
     let spent = enqueue(
@@ -421,11 +425,46 @@ async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool:
     .await
     .expect("age the privatization job");
 
+    let embedding = enqueue(
+        &pool,
+        EpiGraphJob::EmbeddingGeneration {
+            claim_id: Uuid::new_v4(),
+        },
+    )
+    .await;
+    // One attempt, as `PrivatizationRepository::enqueue_job_conn` enqueues the
+    // unseal's re-embedding job.
+    sqlx::query(
+        "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours', \
+                retry_count = 0, max_retries = 1 WHERE id = $1",
+    )
+    .bind(embedding)
+    .execute(&pool)
+    .await
+    .expect("age the embedding job");
+
     let scoped = maintenance_scoped(&pool).await;
     let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::Mock);
     let report = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
         .await
         .expect("the drain ran");
+
+    let (state, retries, err): (String, i32, Option<String>) =
+        sqlx::query_as("SELECT state, retry_count, error_message FROM jobs WHERE id = $1")
+            .bind(embedding)
+            .fetch_one(&pool)
+            .await
+            .expect("the embedding job row");
+    assert_eq!(
+        (state.as_str(), retries, err),
+        ("pending", 0, None),
+        "a stale one-attempt embedding_generation job was failed or counted by the reaper: a \
+         restored claim would be left with no embedding and no further attempt"
+    );
+    assert!(
+        report.failures.iter().all(|f| f.job_id != embedding),
+        "{report:?}"
+    );
 
     assert_eq!(
         job_state(&pool, spent).await,
@@ -452,8 +491,8 @@ async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool:
          would be left mid-flight"
     );
     assert_eq!(
-        report.recovered_stale, 1,
-        "only the privatization job goes back to pending: {report:?}"
+        report.recovered_stale, 2,
+        "the two one-attempt jobs, and only they, go back to pending: {report:?}"
     );
 }
 
