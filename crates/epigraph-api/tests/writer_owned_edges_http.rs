@@ -190,10 +190,8 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
     let w_private = seed_group_claim(&pool, w, w_g, "w12b http W-private").await;
     let hidden = seed_edge(&pool, w_private, a).await;
 
-    // The scope check is unconditional in the converted handlers: a token
-    // without `edges:write` is refused, and so is a request that reaches the
-    // handler with no `AuthContext` (unreachable behind `ViewerExtractor`, but
-    // the handler no longer treats it as "skip the check"). Nothing written.
+    // A token without `edges:write` cannot create (403), and nothing is
+    // written. The other handlers are checked on W's OWN edge below.
     let edges_before: i64 = sqlx::query_scalar("SELECT count(*) FROM edges")
         .fetch_one(&pool)
         .await
@@ -210,24 +208,11 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
         matches!(no_scope, ApiError::Forbidden { .. }),
         "{no_scope:?}"
     );
-    let no_auth = delete_edge(
-        ViewerExtractor(viewer(&pool, w).await),
-        State(state.clone()),
-        None,
-        Path(world_edge),
-    )
-    .await
-    .expect_err("no AuthContext");
-    assert!(
-        matches!(no_auth, ApiError::Unauthorized { .. }),
-        "{no_auth:?}"
-    );
     let edges_after: i64 = sqlx::query_scalar("SELECT count(*) FROM edges")
         .fetch_one(&pool)
         .await
         .expect("count");
     assert_eq!(edges_after, edges_before, "nothing written");
-    assert!(row(&pool, world_edge).await.4, "the world edge is in force");
 
     // W creates: 201, its own, the author record set.
     let (status, Json(created)) = create_edge(
@@ -246,6 +231,57 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
         (r.0, r.1.as_str(), r.2, r.3, r.4),
         (w_g, "public", None, Some(w_g), true)
     );
+
+    // The scope check is unconditional in every converted handler: W, whose
+    // edge this is and who may otherwise patch, retract and relate, is
+    // refused 403 by each without `edges:write`, and nothing is written.
+    let no_scope = || auth_with(w, &["claims:read"]);
+    let edges_before: i64 = sqlx::query_scalar("SELECT count(*) FROM edges")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    let refused = patch_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        no_scope(),
+        Path(edge),
+        Json(note("without the scope")),
+    )
+    .await
+    .expect_err("patch without edges:write");
+    assert!(matches!(refused, ApiError::Forbidden { .. }), "{refused:?}");
+    let refused = delete_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        no_scope(),
+        Path(edge),
+    )
+    .await
+    .expect_err("delete without edges:write");
+    assert!(matches!(refused, ApiError::Forbidden { .. }), "{refused:?}");
+    let refused = relate_claims(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        no_scope(),
+        Path(a),
+        Json(RelateClaimsRequest {
+            target_claim_id: b,
+            properties: None,
+        }),
+    )
+    .await
+    .expect_err("relate without edges:write");
+    assert!(matches!(refused, ApiError::Forbidden { .. }), "{refused:?}");
+    let r = row(&pool, edge).await;
+    assert!(
+        r.4 && r.5 == serde_json::json!({}),
+        "W's edge is untouched: {r:?}"
+    );
+    let edges_after: i64 = sqlx::query_scalar("SELECT count(*) FROM edges")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(edges_after, edges_before, "relate wrote no edge");
 
     // Z: refused by name, nothing written.
     let refused = patch_edge(
