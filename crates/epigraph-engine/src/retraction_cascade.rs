@@ -220,8 +220,10 @@ pub async fn cascade_after_supersede(
 /// Repair belief on the claims whose edge-keyed BBAs a withdrawn edge's
 /// administrative cleanup removed (migration 120, cause `edge_retract`).
 ///
-/// `claims` are the targets the removed BBAs lived on; `invalidated` is how many
-/// were removed (recorded in the report, not re-derived). Each target is
+/// `claims` are the targets the removed BBAs lived on, plus the claims whose
+/// own edge-keyed BBAs the edge's owner deleted in its act; `invalidated` is
+/// how many the administrative removal deleted (recorded in the report, not
+/// re-derived). Each target is
 /// recomputed from its surviving BBAs, or has its cache cleared when none
 /// remain. Never fails: see the module docs on best-effort semantics.
 pub async fn cascade_after_edge_withdrawal(

@@ -1176,15 +1176,17 @@ impl EdgeRepository {
     /// edge`, `perspective_type = 'edge'`: every BBA keyed on the edge hangs off
     /// it, by FK) and the act withdrew it (see [`EdgeWithdrawal`]):
     ///
-    /// * (b) it records a `cause = 'edge_retract'` deferral through 120's
-    ///   `epigraph_record_cascade_deferral` (the session must own or co-own the
-    ///   edge; the row names the session principal), so the administrative
-    ///   replay removes every OTHER writer's BBA keyed on the edge and re-derives
-    ///   the affected beliefs. Recorded even when only the caller's own BBAs
-    ///   exist, so the re-derivation runs;
     /// * (a) it deletes the caller's OWN edge-keyed BBAs, scoped explicitly to
     ///   the session's writable set, so a privileged stamped session is held to
-    ///   the same owner scope as the application role.
+    ///   the same owner scope as the application role, and collects the claims
+    ///   they lived on;
+    /// * (b) it records a `cause = 'edge_retract'` deferral through 120's
+    ///   `epigraph_record_cascade_deferral` (the session must own or co-own the
+    ///   edge; the row names the session principal). The deferral's `sources` are the claims of (a): the caller
+    ///   cannot re-derive a belief cache it does not own, so the administrative
+    ///   replay re-derives them, together with the claims of every OTHER
+    ///   writer's BBA keyed on the edge, which it removes. Recorded even when
+    ///   only the caller's own BBAs existed, so their claims are re-derived.
     ///
     /// A future-dated retraction, or an edge no BBA can be keyed on, does
     /// nothing.
@@ -1225,6 +1227,24 @@ impl EdgeRepository {
         if !keyed || !withdrawn || !owned {
             return Ok(BbaCleanup::default());
         }
+        // (a) The caller's own rows, and the claims whose belief they moved.
+        let own_claims: Vec<Uuid> = sqlx::query_scalar(
+            "WITH gone AS ( \
+                 DELETE FROM mass_functions \
+                  WHERE perspective_id = $1 \
+                    AND owner_group_id = ANY (public.epigraph_writable_groups()) \
+                 RETURNING claim_id) \
+             SELECT claim_id FROM gone",
+        )
+        .bind(edge_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let deleted = own_claims.len() as u64;
+        let mut sources = own_claims;
+        sources.sort_unstable();
+        sources.dedup();
+        // (b) The deferral: every other writer's rows, and the re-derivation
+        // of `sources`, which the caller cannot write.
         let principal: Option<Uuid> = sqlx::query_scalar("SELECT public.epigraph_principal_id()")
             .fetch_one(&mut *conn)
             .await?;
@@ -1234,20 +1254,11 @@ impl EdgeRepository {
             principal,
             edge_id,
             None,
-            &[],
+            &sources,
             oauth,
             reason,
         )
         .await?;
-        let deleted = sqlx::query(
-            "DELETE FROM mass_functions \
-              WHERE perspective_id = $1 \
-                AND owner_group_id = ANY (public.epigraph_writable_groups())",
-        )
-        .bind(edge_id)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
         Ok(BbaCleanup {
             deleted,
             deferral_event_id: Some(deferral),

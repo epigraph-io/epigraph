@@ -432,10 +432,14 @@ CREATE TRIGGER edges_owner_immutable
 --                  DELETE of the row; an edge-factor perspective
 --                  (`perspectives.id = edge`, `perspective_type = 'edge'`)
 --                  exists; and the edge is not retracted into the future (a
---                  future-dated `valid_to` records nothing). No object, no
---                  sources. The replay is STATE-DERIVED: it removes the
---                  edge-keyed BBAs only while the edge is absent or out of
---                  force, so a stale deferral does nothing state does not
+--                  future-dated `valid_to` records nothing). No object. The optional
+--                  sources are the claims whose OWN edge-keyed BBAs the act
+--                  deleted: the caller cannot re-derive a belief cache it does
+--                  not own, so the replay re-derives them. The replay is
+--                  STATE-DERIVED: it removes the edge-keyed BBAs only while the
+--                  edge is absent or out of force, and a source only asks it to
+--                  re-derive a claim's belief from the rows the claim has, so a
+--                  stale or forged deferral does nothing state does not
 --                  justify.
 CREATE OR REPLACE FUNCTION public.epigraph_record_cascade_deferral(
     p_cause text, p_agent_id uuid, p_subject uuid, p_object uuid, p_sources uuid[],
@@ -465,11 +469,14 @@ BEGIN
     END IF;
     IF p_subject IS NULL
        OR (p_cause IN ('supersede', 'dedup')) <> (p_object IS NOT NULL)
-       OR (p_cause = 'consolidate') <> (cardinality(v_sources) > 0) THEN
+       OR (p_cause = 'edge_retract' AND p_object IS NOT NULL)
+       OR (p_cause <> 'edge_retract'
+           AND (p_cause = 'consolidate') <> (cardinality(v_sources) > 0)) THEN
         RAISE EXCEPTION 'CX01: a % deferral names a subject%; no deferral was recorded', p_cause,
             CASE p_cause WHEN 'supersede' THEN ' and an object, and no sources'
                          WHEN 'dedup' THEN ' and an object, and no sources'
                          WHEN 'consolidate' THEN ' and its sources, and no object'
+                         WHEN 'edge_retract' THEN ', optional claim sources, and no object'
                          ELSE ', and no object or sources' END
             USING ERRCODE = '22023';
     END IF;
@@ -509,7 +516,17 @@ BEGIN
                     SELECT 1 FROM unnest(v_sources) s
                      WHERE NOT public.epigraph_session_writes_node(s, 'claim')));
     ELSIF p_cause = 'edge_retract' THEN
-        v_ok := EXISTS (SELECT 1 FROM public.edges e
+        -- The sources are the claims
+        -- whose own edge-keyed BBAs the act deleted (distinct, at most 1000).
+        -- They are not checked against `claims` here: under row security this
+        -- frame may not see a claim the caller's BBA lived on, and refusing
+        -- would roll back an honest retract. A source only asks the replay to
+        -- re-derive that claim's belief from the rows it has (an unknown id
+        -- re-derives nothing), so a wrong one changes nothing that state does
+        -- not justify.
+        v_ok := cardinality(v_sources) <= 1000
+            AND (SELECT count(DISTINCT s) FROM unnest(v_sources) s) = cardinality(v_sources)
+            AND EXISTS (SELECT 1 FROM public.edges e
                          WHERE e.id = p_subject
                            AND (e.valid_to IS NULL OR e.valid_to <= now())
                            AND (v_priv
@@ -544,7 +561,8 @@ BEGIN
 
     v_trigger := jsonb_build_object('agent_id', v_agent, 'oauth', v_oauth,
                                     'subject_id', p_subject, 'object_id', p_object);
-    IF p_cause = 'consolidate' THEN
+    IF p_cause = 'consolidate'
+       OR (p_cause = 'edge_retract' AND cardinality(v_sources) > 0) THEN
         v_trigger := v_trigger || jsonb_build_object('sources', to_jsonb(v_sources));
     ELSIF p_cause = 'match_retire' THEN
         v_trigger := v_trigger || jsonb_build_object('candidate_status', v_status);

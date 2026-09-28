@@ -6,6 +6,10 @@
 //! * (b) another writer's BBA on the same edge survives the act, is deferred as
 //!   `cause = 'edge_retract'` naming the owner, and the maintenance replay
 //!   removes it with a `cascade.admin_applied` row naming the owner;
+//! * the owner cannot write the belief cache of a claim it does not own, so
+//!   the deferral carries the claims its own deleted BBAs lived on and the
+//!   replay re-derives them: the cache after the replay is exactly what a
+//!   fresh recompute from the surviving rows writes, per claim;
 //! * a replay of an `edge_retract` whose edge is back in force removes nothing
 //!   and writes `admin_applied` with zero counts and a reason, never
 //!   `admin_failed`;
@@ -506,4 +510,215 @@ async fn the_one_shot_sweep_is_audited_and_spares_a_genuine_perspective(pool: Pg
     );
     assert_eq!(applied[0].2["touched"]["sweep_reason"], "w12b legacy sweep");
     assert_eq!(applied[0].2["touched"]["bbas_deleted"], 1);
+}
+
+// ---------------------------------------------------------------------------
+// The owner's own BBAs: their claims' belief is re-derived by the replay.
+//
+// The owner deletes its own edge-keyed BBAs in the act, but it cannot write
+// the belief cache of a claim it does not own, so the deferral carries those
+// claims (`trigger.sources`) and the replay re-derives them. Without that, a
+// claim on which only the owner held the edge-keyed BBA keeps a cache the
+// retracted edge still moves.
+// ---------------------------------------------------------------------------
+
+/// `agent`'s plain BBA on `claim` (no perspective: not keyed on any edge), with
+/// masses unlike the edge-keyed ones, so the cache with and without the
+/// edge-keyed row differs.
+async fn plain_bba(pool: &PgPool, agent: Uuid, claim: Uuid, frame: Uuid) -> Uuid {
+    let p = pool.clone();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, agent).await;
+        let id = MassFunctionRepository::store_with_perspective(
+            &mut *conn,
+            claim,
+            frame,
+            Some(agent),
+            None,
+            &serde_json::json!({"1": 0.5, "0,1": 0.5}),
+            None,
+            Some("test"),
+            None,
+            None,
+            "unknown",
+            None,
+        )
+        .await
+        .expect("store the plain BBA");
+        (conn, id)
+    })
+    .await
+}
+
+/// Recompute `claim`'s cached belief on `frame` from the rows it has, on the
+/// maintenance connection (what a fresh administrative recompute writes).
+async fn recompute(pool: &PgPool, claim: Uuid, frame: Uuid) -> bool {
+    let scoped = maintenance_scoped(pool).await;
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, admin_viewer) = session.split();
+    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(conn, admin_viewer, claim, frame)
+        .await
+        .expect("recompute")
+}
+
+type Cache = (Option<f64>, Option<f64>);
+
+async fn cached(pool: &PgPool, claim: Uuid) -> Cache {
+    sqlx::query_as("SELECT belief, pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("cached belief")
+}
+
+async fn binary_frame(pool: &PgPool) -> Uuid {
+    FrameRepository::create(
+        pool,
+        "binary_truth",
+        Some("w12b"),
+        &["TRUE".to_string(), "FALSE".to_string()],
+    )
+    .await
+    .expect("frame")
+    .id
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_owners_retract_rederives_the_belief_its_own_bba_moved(pool: PgPool) {
+    let (plain, scoped) = app_role_pools(&pool).await;
+    let w1 = side(
+        &pool,
+        build_scoped_test_server(plain.clone(), scoped.clone()),
+    )
+    .await;
+    let w2 = side(
+        &pool,
+        build_scoped_test_server_generated_signer(plain, scoped),
+    )
+    .await;
+    let author = fixture::seed_agent_with_group(&pool, "author").await.0;
+    let a = fixture::seed_public_claim(&pool, author, "w12b rederive source").await;
+    let b = fixture::seed_public_claim(&pool, author, "w12b rederive target").await;
+    let frame = binary_frame(&pool).await;
+
+    // The owner is the ONLY writer with a BBA keyed on its edge; the target
+    // also carries another writer's plain BBA, which survives everything.
+    let edge = owned_edge(&pool, w1.agent, a, b).await;
+    let own = bba(&pool, w1.agent, b, frame, edge).await;
+    let survivor = plain_bba(&pool, w2.agent, b, frame).await;
+    assert!(recompute(&pool, b, frame).await, "fixture: cache populated");
+    let before = cached(&pool, b).await;
+    assert!(before.1.is_some(), "fixture: a cached belief {before:?}");
+
+    let out = do_delete_edge(
+        &w1.server,
+        &w1.viewer,
+        DeleteEdgeParams {
+            edge_id: edge.to_string(),
+        },
+    )
+    .await
+    .expect("the owner retracts its edge");
+    let out = text(&out);
+    assert_eq!(out["bba_cleanup"]["deleted"], 1, "{out}");
+    assert!(!bba_exists(&pool, own).await, "(a) went in the act");
+    let rows = cascade_rows(&pool, edge).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].2["trigger"]["sources"],
+        serde_json::json!([b]),
+        "the deferral carries the claim the owner's own BBA lived on"
+    );
+
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    let rows = cascade_rows(&pool, edge).await;
+    let applied: Vec<_> = rows
+        .iter()
+        .filter(|r| r.0 == "cascade.admin_applied")
+        .collect();
+    assert_eq!(applied.len(), 1, "{rows:?}");
+    let touched = &applied[0].2["touched"];
+    assert_eq!(
+        touched["bbas_deleted"], 0,
+        "nothing foreign to remove: {touched}"
+    );
+    assert_eq!(touched["owner_claims_rederived"], 1, "{touched}");
+
+    assert!(
+        bba_exists(&pool, survivor).await,
+        "the plain BBA is untouched"
+    );
+    let after = cached(&pool, b).await;
+    assert_ne!(
+        after, before,
+        "the cache no longer carries the retracted edge's BBA"
+    );
+    assert!(
+        after.1.is_some(),
+        "b is still backed by the plain BBA: {after:?}"
+    );
+    assert!(recompute(&pool, b, frame).await);
+    assert_eq!(
+        cached(&pool, b).await,
+        after,
+        "the replay left exactly what a fresh recompute from the surviving rows writes"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_owners_claim_and_another_writers_claim_are_both_rederived(pool: PgPool) {
+    let (plain, scoped) = app_role_pools(&pool).await;
+    let w1 = side(
+        &pool,
+        build_scoped_test_server(plain.clone(), scoped.clone()),
+    )
+    .await;
+    let w2 = side(
+        &pool,
+        build_scoped_test_server_generated_signer(plain, scoped),
+    )
+    .await;
+    let author = fixture::seed_agent_with_group(&pool, "author").await.0;
+    let a = fixture::seed_public_claim(&pool, author, "w12b per-claim a").await;
+    let b = fixture::seed_public_claim(&pool, author, "w12b per-claim b").await;
+    let frame = binary_frame(&pool).await;
+
+    // The owner's edge-keyed BBA is on a, another writer's on b: the replay
+    // removes (and so re-derives) b, and must re-derive a too.
+    let edge = owned_edge(&pool, w1.agent, a, b).await;
+    bba(&pool, w1.agent, a, frame, edge).await;
+    let foreign = bba(&pool, w2.agent, b, frame, edge).await;
+    assert!(recompute(&pool, a, frame).await);
+    assert!(recompute(&pool, b, frame).await);
+    let (a0, b0) = (cached(&pool, a).await, cached(&pool, b).await);
+    assert!(a0.1.is_some() && b0.1.is_some(), "fixture: {a0:?} {b0:?}");
+
+    do_delete_edge(
+        &w1.server,
+        &w1.viewer,
+        DeleteEdgeParams {
+            edge_id: edge.to_string(),
+        },
+    )
+    .await
+    .expect("the owner retracts its edge");
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    assert!(!bba_exists(&pool, foreign).await, "the replay removed b's");
+
+    let none: Cache = (None, None);
+    assert_eq!(
+        cached(&pool, a).await,
+        none,
+        "a has no BBA left, so no cache"
+    );
+    assert_eq!(
+        cached(&pool, b).await,
+        none,
+        "b has no BBA left, so no cache"
+    );
 }

@@ -177,7 +177,9 @@ pub struct CascadeTrigger {
     pub subject_id: Uuid,
     /// The replacement (supersede) or the canonical claim (dedup).
     pub object_id: Option<Uuid>,
-    /// The retired sources of a consolidation.
+    /// The retired sources of a consolidation; for an `edge_retract`, the
+    /// claims whose own edge-keyed BBAs the owner's act deleted (the replay
+    /// re-derives their belief).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<Uuid>,
     /// A match-candidate retirement's precondition: the candidate's status
@@ -806,14 +808,18 @@ pub async fn apply_match_retire(
 /// remove every BBA keyed on the withdrawn edge
 /// ([`epigraph_db::EdgeRepository::remove_withdrawn_edge_bbas_conn`], keyed on
 /// `perspective_type = 'edge'`) with its audit row, atomically, then re-derive
-/// the affected claims' beliefs
+/// the beliefs of the claims those BBAs lived on AND of the trigger's
+/// `sources`: the claims whose OWN edge-keyed BBAs the owner's act already
+/// deleted (the owner cannot re-derive a cache it does not own)
 /// ([`crate::retraction_cascade::cascade_after_edge_withdrawal`]).
 ///
 /// STATE-DERIVED: when the edge is in force at the time of the call (its owner
 /// un-retracted it, or the deferral was stale) nothing is removed and the
 /// applied row says so (`touched.edge_withdrawn = false`, zero counts, and a
 /// reason). That is a legitimate state, so it is `admin_applied`, never
-/// `admin_failed`, which would go stuck and page the operator.
+/// `admin_failed`, which would go stuck and page the operator. The `sources`
+/// are re-derived in that case too: the owner's rows are gone whatever the
+/// edge's state, and a re-derivation only reads the rows a claim has.
 ///
 /// The applied row names `trigger.agent_id`: the edge's owner whose act
 /// deferred it (or, for the one-shot legacy sweep, the acting operator).
@@ -836,6 +842,7 @@ pub async fn apply_after_edge_retract(
                 "edge_withdrawn": r.withdrawn,
                 "bbas_deleted": r.deleted,
                 "claims_affected": r.claims.len(),
+                "owner_claims_rederived": trigger.sources.len(),
             });
             if !r.withdrawn {
                 t["reason"] = serde_json::json!(
@@ -852,13 +859,17 @@ pub async fn apply_after_edge_retract(
         Ok(r) => r,
         Err(e) => return failed(admin, trigger, "the edge-keyed BBA removal", e).await,
     };
-    if removed.claims.is_empty() {
+    let mut claims = removed.claims;
+    claims.extend(trigger.sources.iter().copied());
+    claims.sort_unstable();
+    claims.dedup();
+    if claims.is_empty() {
         return applied(applied_id, &touched, None);
     }
     let report = crate::retraction_cascade::cascade_after_edge_withdrawal(
         &mut *admin,
         admin_viewer,
-        &removed.claims,
+        &claims,
         removed.deleted,
     )
     .await;

@@ -1421,25 +1421,29 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
     .await
     .expect("retract (privileged)");
 
-    let record = |agent: Uuid, edge: Uuid| {
-        let p = pool.clone();
-        async move {
-            fixture::as_role(&p.clone(), "epigraph_app", |mut conn| async move {
-                stamp(&mut conn, &p, agent).await;
-                let r: Result<Uuid, String> = sqlx::query_scalar(
-                    "SELECT public.epigraph_record_cascade_deferral(\
-                         'edge_retract', $1, $2, NULL, NULL, NULL, 'w12b')",
-                )
-                .bind(agent)
-                .bind(edge)
-                .fetch_one(&mut *conn)
+    let record_full =
+        |agent: Uuid, edge: Uuid, object: Option<Uuid>, sources: Option<Vec<Uuid>>| {
+            let p = pool.clone();
+            async move {
+                fixture::as_role(&p.clone(), "epigraph_app", |mut conn| async move {
+                    stamp(&mut conn, &p, agent).await;
+                    let r: Result<Uuid, String> = sqlx::query_scalar(
+                        "SELECT public.epigraph_record_cascade_deferral(\
+                         'edge_retract', $1, $2, $3, $4, NULL, 'w12b')",
+                    )
+                    .bind(agent)
+                    .bind(edge)
+                    .bind(object)
+                    .bind(sources)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| code(&e));
+                    (conn, r)
+                })
                 .await
-                .map_err(|e| code(&e));
-                (conn, r)
-            })
-            .await
-        }
-    };
+            }
+        };
+    let record = |agent: Uuid, edge: Uuid| record_full(agent, edge, None, None);
     assert_eq!(
         record(z, retracted).await,
         Err("42501".to_string()),
@@ -1456,17 +1460,45 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
             "{why} records nothing"
         );
     }
+    // The shape: no object; the sources (the claims of the owner's own deleted
+    // BBAs) are distinct.
+    assert_eq!(
+        record_full(w, retracted, Some(a), None).await,
+        Err("22023".to_string()),
+        "an edge_retract deferral names no object"
+    );
+    assert_eq!(
+        record_full(w, retracted, None, Some(vec![a, a])).await,
+        Err("42501".to_string()),
+        "duplicate sources are refused"
+    );
     record(w, retracted)
         .await
         .expect("the owner records its withdrawn edge factor");
-    let rows: Vec<(Option<Uuid>, String)> = sqlx::query_as(
-        "SELECT agent_id, details->'trigger'->>'subject_id' FROM security_events \
-          WHERE event_type = 'cascade.deferred' AND details->>'cause' = 'edge_retract'",
+    record_full(w, retracted, None, Some(vec![a, b]))
+        .await
+        .expect("the owner records its withdrawn edge factor with its own claims");
+    let rows: Vec<(Option<Uuid>, String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT agent_id, details->'trigger'->>'subject_id', details->'trigger'->'sources' \
+           FROM security_events \
+          WHERE event_type = 'cascade.deferred' AND details->>'cause' = 'edge_retract' \
+          ORDER BY created_at, id",
     )
     .fetch_all(&pool)
     .await
     .expect("deferrals");
-    assert_eq!(rows, vec![(Some(w), retracted.to_string())]);
+    assert_eq!(
+        rows,
+        vec![
+            (Some(w), retracted.to_string(), None),
+            (
+                Some(w),
+                retracted.to_string(),
+                Some(serde_json::json!([a, b]))
+            ),
+        ],
+        "the sources reach the trigger the replay reads, and only when given"
+    );
 }
 
 // ===========================================================================
