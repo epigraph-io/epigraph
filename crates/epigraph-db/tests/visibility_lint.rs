@@ -1541,6 +1541,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     // ── Batch W10 (migration 117): the administrative cascade's audit row.
     (
         "admin_cascade.rs",
+        "open_edge_retract_sources",
+        "READ of `security_events`: the claim ids the open `edge_retract` deferrals of one edge \
+         recorded (the `open` set of the one `PENDING_CTE`), for the replay's re-derivation \
+         (migration 120). Maintenance connection only; it returns ids from audit rows the \
+         deferral definer wrote from the session's own BBA rows, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
         "pending_replays",
         "READ of `security_events` for the operator's replay of deferred administrative cascades \
          (migration 117). Runs on the maintenance connection only (an application session cannot \

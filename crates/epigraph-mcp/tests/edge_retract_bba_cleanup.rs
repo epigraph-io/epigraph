@@ -20,7 +20,9 @@
 //!   one whose id equals a withdrawn edge's;
 //! * the claims a deferral asks the replay to re-derive are STATE (the claims
 //!   of the session's own edge-keyed rows, derived by the definer): a caller
-//!   naming another writer's claims is refused, and their caches are untouched.
+//!   naming another writer's claims is refused, and their caches are untouched;
+//! * two acts on one edge before a replay both reach it: the replay re-derives
+//!   the claims of every open deferral of the edge, not only the oldest one's.
 //!
 //! Both MCP servers and every BBA write run on the application role
 //! (`epigraph_app`); the replay and the sweep on a non-superuser
@@ -731,7 +733,9 @@ async fn the_owners_claim_and_another_writers_claim_are_both_rederived(pool: PgP
 // definer derives an `edge_retract`'s sources itself (the claims of the
 // session's OWN BBA rows keyed on the edge, read before the act deletes them)
 // and refuses caller-named ones: a caller naming another writer's claims must
-// not make the privileged replay rewrite or clear their belief caches.
+// not make the privileged replay rewrite or clear their belief caches. And two
+// acts on one edge before a replay both reach it: the replay re-derives the
+// union of every pending deferral's sources, not only the oldest one's.
 // ---------------------------------------------------------------------------
 
 type Cache3 = (Option<f64>, Option<f64>, Option<f64>);
@@ -893,3 +897,70 @@ async fn a_caller_cannot_name_the_claims_an_edge_retract_rederives(pool: PgPool)
     );
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_acts_on_one_edge_before_a_replay_both_reach_it(pool: PgPool) {
+    let (plain, scoped) = app_role_pools(&pool).await;
+    let w1 = side(&pool, build_scoped_test_server(plain, scoped)).await;
+    let author = fixture::seed_agent_with_group(&pool, "author").await.0;
+    let a = fixture::seed_public_claim(&pool, author, "w12b union a").await;
+    let b = fixture::seed_public_claim(&pool, author, "w12b union b").await;
+    let c = fixture::seed_public_claim(&pool, author, "w12b union c").await;
+    let frame = binary_frame(&pool).await;
+
+    // Act 1: the owner's BBA on a goes with its retract.
+    let edge = owned_edge(&pool, w1.agent, a, b).await;
+    bba(&pool, w1.agent, a, frame, edge).await;
+    assert!(recompute(&pool, a, frame).await, "fixture: a's cache");
+    assert!(cached(&pool, a).await.1.is_some());
+    do_delete_edge(
+        &w1.server,
+        &w1.viewer,
+        DeleteEdgeParams {
+            edge_id: edge.to_string(),
+        },
+    )
+    .await
+    .expect("act 1: the owner retracts its edge");
+    // Act 2, before any replay: a BBA keyed on the edge onto c, then a patch
+    // that sets the window again; the act deletes it and defers c.
+    bba(&pool, w1.agent, c, frame, edge).await;
+    assert!(recompute(&pool, c, frame).await, "fixture: c's cache");
+    assert!(cached(&pool, c).await.1.is_some());
+    let out = do_patch_edge(
+        &w1.server,
+        &w1.viewer,
+        PatchEdgeParams {
+            edge_id: edge.to_string(),
+            valid_to: Some("now".to_string()),
+            properties: None,
+        },
+    )
+    .await
+    .expect("act 2: the owner patches its retracted edge");
+    assert_eq!(
+        text(&out)["bba_cleanup"]["deleted"],
+        1,
+        "act 2 deleted c's row"
+    );
+    let deferred: Vec<serde_json::Value> = cascade_rows(&pool, edge)
+        .await
+        .into_iter()
+        .filter(|r| r.0 == "cascade.deferred")
+        .map(|r| r.2["trigger"]["sources"].clone())
+        .collect();
+    assert_eq!(
+        deferred,
+        vec![serde_json::json!([a]), serde_json::json!([c])],
+        "two deferrals, one per act"
+    );
+
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    let none: Cache = (None, None);
+    assert_eq!(cached(&pool, a).await, none, "act 1's claim is re-derived");
+    assert_eq!(
+        cached(&pool, c).await,
+        none,
+        "act 2's claim is re-derived too, though its deferral collapsed into act 1's"
+    );
+}

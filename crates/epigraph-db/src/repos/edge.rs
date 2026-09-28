@@ -1317,7 +1317,8 @@ impl EdgeRepository {
     /// (`valid_to <= now()`). An edge in force at the time of the call (its
     /// owner un-retracted it, or the deferral was stale) removes nothing and
     /// reports `withdrawn = false`, so a deferral can never make it do what the
-    /// edge's state does not justify.
+    /// edge's state does not justify. It first locks the edge row (`FOR
+    /// UPDATE`), so an act in flight on the edge commits before it reads.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if a query fails.
@@ -1326,15 +1327,18 @@ impl EdgeRepository {
         conn: &mut sqlx::PgConnection,
         edge_id: Uuid,
     ) -> Result<WithdrawnEdgeBbas, DbError> {
-        let withdrawn: bool = sqlx::query_scalar(
+        // Lock the row (when it exists) before reading its state: an owner's
+        // act on the edge holds the row until it commits, so its deferral is
+        // committed, and visible to the caller's next read, once this returns.
+        let in_force: Option<bool> = sqlx::query_scalar(
             "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
-             SELECT NOT EXISTS (SELECT 1 FROM edges e \
-                                 WHERE e.id = $1 \
-                                   AND (e.valid_to IS NULL OR e.valid_to > now()))",
+             SELECT e.valid_to IS NULL OR e.valid_to > now() \
+               FROM edges e WHERE e.id = $1 FOR UPDATE",
         )
         .bind(edge_id)
-        .fetch_one(&mut *conn)
+        .fetch_optional(&mut *conn)
         .await?;
+        let withdrawn = !in_force.unwrap_or(false);
         if !withdrawn {
             return Ok(WithdrawnEdgeBbas::default());
         }

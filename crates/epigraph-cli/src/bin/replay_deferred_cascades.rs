@@ -62,7 +62,10 @@
 //! An edge owner's retract or delete records a `cause = 'edge_retract'`
 //! deferral; this replay removes every other writer's BBAs keyed on the edge,
 //! state-derived (an edge back in force removes nothing and is still
-//! `admin_applied`), and re-derives the affected beliefs.
+//! `admin_applied`), and re-derives the affected beliefs: the claims of the
+//! BBAs it removes and the claims every open deferral of the edge recorded
+//! (120's definer derives those from the owner's own rows; no caller names
+//! them).
 //! `--sweep-withdrawn-edge-bbas --acting-agent <uuid> --reason <text>` is a
 //! ONE-SHOT for edges withdrawn before withdrawals recorded deferrals: it runs
 //! the same removal over every edge-factor perspective whose edge is absent or

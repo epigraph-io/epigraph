@@ -809,10 +809,13 @@ pub async fn apply_match_retire(
 /// remove every BBA keyed on the withdrawn edge
 /// ([`epigraph_db::EdgeRepository::remove_withdrawn_edge_bbas_conn`], keyed on
 /// `perspective_type = 'edge'`) with its audit row, atomically, then re-derive
-/// the beliefs of the claims those BBAs lived on AND of the trigger's
-/// `sources`: the claims whose OWN edge-keyed BBAs the owner's act already
-/// deleted (the owner cannot re-derive a cache it does not own)
-/// ([`crate::retraction_cascade::cascade_after_edge_withdrawal`]).
+/// the beliefs of the claims those BBAs lived on AND the `sources` of every
+/// OPEN `edge_retract` deferral of the edge (not only the trigger's: two acts
+/// before one replay record two deferrals, and this run's applied row closes
+/// both). A deferral's sources are the claims whose OWN edge-keyed BBAs the
+/// owner's act deleted, derived by 120's definer from the session's rows,
+/// never named by the caller (the owner cannot re-derive a cache it does not
+/// own) ([`crate::retraction_cascade::cascade_after_edge_withdrawal`]).
 ///
 /// STATE-DERIVED: when the edge is in force at the time of the call (its owner
 /// un-retracted it, or the deferral was stale) nothing is removed and the
@@ -837,13 +840,26 @@ pub async fn apply_after_edge_retract(
     let repaired = repair_with_audit!(
         admin,
         trigger,
-        |tx| epigraph_db::EdgeRepository::remove_withdrawn_edge_bbas_conn(&mut tx, edge_id),
+        |tx| async {
+            // The removal locks the edge row first; the open deferrals read
+            // after it include every committed act on the edge, and the
+            // applied row this transaction writes closes them all.
+            let removed =
+                epigraph_db::EdgeRepository::remove_withdrawn_edge_bbas_conn(&mut tx, edge_id)
+                    .await?;
+            let mut sources = audit::open_edge_retract_sources(&mut *tx, edge_id).await?;
+            sources.extend(trigger.sources.iter().copied());
+            sources.sort_unstable();
+            sources.dedup();
+            Ok::<_, epigraph_db::DbError>((removed, sources))
+        },
         |r| {
+            let (r, sources) = (&r.0, &r.1);
             let mut t = serde_json::json!({
                 "edge_withdrawn": r.withdrawn,
                 "bbas_deleted": r.deleted,
                 "claims_affected": r.claims.len(),
-                "owner_claims_rederived": trigger.sources.len(),
+                "owner_claims_rederived": sources.len(),
             });
             if !r.withdrawn {
                 t["reason"] = serde_json::json!(
@@ -856,12 +872,12 @@ pub async fn apply_after_edge_retract(
             t
         }
     );
-    let (removed, applied_id, touched) = match repaired {
+    let ((removed, sources), applied_id, touched) = match repaired {
         Ok(r) => r,
         Err(e) => return failed(admin, trigger, "the edge-keyed BBA removal", e).await,
     };
     let mut claims = removed.claims;
-    claims.extend(trigger.sources.iter().copied());
+    claims.extend(sources);
     claims.sort_unstable();
     claims.dedup();
     if claims.is_empty() {

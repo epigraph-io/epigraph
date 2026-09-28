@@ -130,12 +130,13 @@ pub async fn record<'e, E: sqlx::PgExecutor<'e>>(
     Ok(id)
 }
 
-/// The pending cascades, keyed and counted: one row per (cause, subject) --
-/// its oldest [`EVENT_DEFERRED`] / [`EVENT_FAILED`] row with no
-/// [`EVENT_APPLIED`] or [`EVENT_RETIRED`] row for the same cause and subject at
-/// or after it -- with the number of [`EVENT_FAILED`] rows written for that
-/// cascade since. Binds: `$1` deferred, `$2` failed, `$3` applied, `$4`
-/// retired.
+/// The pending cascades, keyed and counted. `open` is every
+/// [`EVENT_DEFERRED`] / [`EVENT_FAILED`] row with no [`EVENT_APPLIED`] or
+/// [`EVENT_RETIRED`] row for the same cause and subject at or after it (the
+/// rows the next applied row for that cascade closes); `pend` keeps one per
+/// (cause, subject), its oldest; `counted` adds the number of [`EVENT_FAILED`]
+/// rows written for that cascade since. Binds: `$1` deferred, `$2` failed,
+/// `$3` applied, `$4` retired.
 ///
 /// The subject is compared NORMALISED (lower case, hex digits only, a
 /// `urn:uuid:` prefix dropped): the replay parses it as a UUID, which accepts
@@ -150,16 +151,19 @@ const PENDING_CTE: &str = "\
                               '^urn:uuid:|[^0-9a-f]', '', 'g') AS subj \
           FROM security_events e \
          WHERE e.event_type IN ($1, $2, $3, $4)), \
-    pend AS ( \
-        SELECT DISTINCT ON (d.cause, d.subj) d.id, d.details, d.created_at, d.cause, d.subj \
+    open AS ( \
+        SELECT d.id, d.details, d.created_at, d.cause, d.subj \
           FROM ev d \
          WHERE d.event_type IN ($1, $2) \
            AND NOT EXISTS (SELECT 1 FROM ev a \
                             WHERE a.event_type IN ($3, $4) \
                               AND a.cause IS NOT DISTINCT FROM d.cause \
                               AND a.subj IS NOT DISTINCT FROM d.subj \
-                              AND a.created_at >= d.created_at) \
-         ORDER BY d.cause, d.subj, d.created_at, d.id), \
+                              AND a.created_at >= d.created_at)), \
+    pend AS ( \
+        SELECT DISTINCT ON (o.cause, o.subj) o.id, o.details, o.created_at, o.cause, o.subj \
+          FROM open o \
+         ORDER BY o.cause, o.subj, o.created_at, o.id), \
     counted AS ( \
         SELECT p.id, p.details, p.created_at, \
                (SELECT count(*) FROM ev f \
@@ -300,6 +304,49 @@ pub async fn pending_summary<'e, E: sqlx::PgExecutor<'e>>(
         stuck,
         oldest_age_s,
     })
+}
+
+/// The claims every OPEN `edge_retract` row of `edge` recorded as its
+/// `sources` (the `open` set of [`PENDING_CTE`]: the rows the next applied row
+/// for the edge closes), distinct and sorted.
+///
+/// Two acts on one edge before a replay record two deferrals, and the replay
+/// runs only the oldest one's trigger; its applied row then closes both. The
+/// replay re-derives this union, so the second act's claims are not lost.
+/// Every row read here was written by 120's deferral definer, which derives the
+/// sources from the session's own BBA rows, or by the maintenance connection:
+/// no caller names them.
+///
+/// Maintenance connection only (an application session cannot read other
+/// principals' audit rows). Run it in the replay's transaction after the edge
+/// row is locked, so an act in flight on the edge has committed its deferral.
+///
+/// # Errors
+/// `DbError::QueryFailed` on a failed query.
+pub async fn open_edge_retract_sources<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    edge: Uuid,
+) -> Result<Vec<Uuid>, DbError> {
+    let sql = format!(
+        "{PENDING_CTE} \
+         SELECT DISTINCT s.v::uuid \
+           FROM open o \
+          CROSS JOIN LATERAL jsonb_array_elements_text( \
+                CASE WHEN jsonb_typeof(o.details->'trigger'->'sources') = 'array' \
+                     THEN o.details->'trigger'->'sources' ELSE '[]'::jsonb END) AS s(v) \
+          WHERE o.cause = 'edge_retract' \
+            AND s.v ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$' \
+            AND o.subj = regexp_replace(lower($5::text), '^urn:uuid:|[^0-9a-f]', '', 'g') \
+          ORDER BY 1"
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(EVENT_DEFERRED)
+        .bind(EVENT_FAILED)
+        .bind(EVENT_APPLIED)
+        .bind(EVENT_RETIRED)
+        .bind(edge)
+        .fetch_all(executor)
+        .await?)
 }
 
 /// Retire the pending cascade that the `cascade.deferred` /
