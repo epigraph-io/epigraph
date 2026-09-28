@@ -1299,6 +1299,26 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "withdraw_edge_bbas_conn",
+        "WRITE (batch W12b, migration 120): an edge owner's withdrawal of its own edge. Reads only \
+         the edge-factor perspective's existence and the edge's own `valid_to` / owner for the \
+         edge the caller's act just wrote; records the `edge_retract` deferral through 120's \
+         definer and deletes the session's OWN edge-keyed BBAs (session write predicate).",
+    ),
+    (
+        "edge.rs",
+        "remove_withdrawn_edge_bbas_conn",
+        "WRITE on the MAINTENANCE connection only (the `edge_retract` replay and the one-shot \
+         sweep): administrative by design, so it filters nothing; state-derived.",
+    ),
+    (
+        "edge.rs",
+        "withdrawn_edges_with_bbas_conn",
+        "READ on the MAINTENANCE connection only: the one-shot legacy sweep's candidates across \
+         every owner, which a viewer would hide from it.",
+    ),
+    (
+        "edge.rs",
         "create_if_not_exists_conn",
         "WRITE. `create_if_not_exists` on a caller's connection so an ingest's edges ride the \
          same transaction as the claims they join. Its dedup probe is the VISIBILITY-EXEMPT \

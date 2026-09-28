@@ -215,6 +215,120 @@ async fn the_replay_refuses_the_fallback_reports_read_only_and_yields_to_its_loc
     drop_login(&pool, &maint_role).await;
 }
 
+/// Migration 120's one-shot legacy sweep, on the real binary and a
+/// non-superuser maintenance login: it refuses without an acting operator or a
+/// reason, and with both it removes the BBAs of an edge withdrawn before
+/// withdrawals recorded deferrals, audited as `edge_retract` naming the acting
+/// operator. The engine arm (`epigraph-mcp/tests/edge_retract_bba_cleanup.rs`)
+/// pins that a genuine perspective's BBA is never a candidate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_withdrawn_edge_bba_sweep_needs_an_actor_and_a_reason_and_audits_them(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let a = viewer_fixture::seed_public_claim(&pool, operator, "w12b cli sweep a").await;
+    let b = viewer_fixture::seed_public_claim(&pool, operator, "w12b cli sweep b").await;
+    let edge = viewer_fixture::seed_edge(&pool, a, b).await;
+    sqlx::query(
+        "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'w12b', 'edge')",
+    )
+    .bind(edge)
+    .execute(&pool)
+    .await
+    .expect("edge-factor perspective");
+    let frame = epigraph_db::FrameRepository::create(
+        &pool,
+        "binary_truth",
+        Some("w12b"),
+        &["TRUE".to_string(), "FALSE".to_string()],
+    )
+    .await
+    .expect("frame")
+    .id;
+    let bba = epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        b,
+        frame,
+        Some(operator),
+        Some(edge),
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        Some("test"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("a BBA keyed on the edge");
+    sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
+        .bind(edge)
+        .execute(&pool)
+        .await
+        .expect("retract (privileged)");
+    let bba_left = format!("SELECT count(*) FROM mass_functions WHERE id = '{bba}'");
+
+    let r = run(
+        REPLAY,
+        &["--sweep-withdrawn-edge-bbas", "--reason", "w12b"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_ne!(r.code, Some(0), "{}", r.stdout);
+    assert!(r.stderr.contains("--acting-agent"), "{}", r.stderr);
+    let operator_arg = operator.to_string();
+    let r = run(
+        REPLAY,
+        &[
+            "--sweep-withdrawn-edge-bbas",
+            "--acting-agent",
+            &operator_arg,
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_ne!(r.code, Some(0), "{}", r.stdout);
+    assert!(r.stderr.contains("--reason"), "{}", r.stderr);
+    assert_eq!(
+        count(&pool, &bba_left).await,
+        1,
+        "a refused sweep removed nothing"
+    );
+
+    let r = run(
+        REPLAY,
+        &[
+            "--sweep-withdrawn-edge-bbas",
+            "--acting-agent",
+            &operator_arg,
+            "--reason",
+            "w12b legacy sweep",
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let out: serde_json::Value = serde_json::from_str(r.stdout.trim()).expect("JSON");
+    assert_eq!(
+        (out["swept"].clone(), out["failed"].clone()),
+        (serde_json::json!(1), serde_json::json!(0)),
+        "{out}"
+    );
+    assert_eq!(count(&pool, &bba_left).await, 0, "the sweep removed it");
+    let audit: (Option<Uuid>, serde_json::Value) = sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'cascade.admin_applied' AND details->>'cause' = 'edge_retract'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the sweep's audit row");
+    assert_eq!(audit.0, Some(operator), "names the acting operator");
+    assert_eq!(audit.1["touched"]["sweep_reason"], "w12b legacy sweep");
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
 fn pgvec(axis: usize, tilt: f32) -> String {
     let mut v = vec![0.0f32; DIM];
     v[axis] = 1.0;

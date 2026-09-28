@@ -56,6 +56,18 @@
 //! `--report-only` prints `{"pending", "stuck", "oldest_age_s"}` from the same
 //! pending set in a READ ONLY transaction and takes no lock, so the staleness
 //! check can run beside a replay.
+//!
+//! # `edge_retract` (migration 120) and the one-shot legacy sweep
+//!
+//! An edge owner's retract or delete records a `cause = 'edge_retract'`
+//! deferral; this replay removes every other writer's BBAs keyed on the edge,
+//! state-derived (an edge back in force removes nothing and is still
+//! `admin_applied`), and re-derives the affected beliefs.
+//! `--sweep-withdrawn-edge-bbas --acting-agent <uuid> --reason <text>` is a
+//! ONE-SHOT for edges withdrawn before withdrawals recorded deferrals: it runs
+//! the same removal over every edge-factor perspective whose edge is absent or
+//! out of force, each audited as `edge_retract` naming the acting operator.
+//! Not for the timer.
 
 use anyhow::{anyhow, bail, Context};
 use clap::Parser;
@@ -86,9 +98,24 @@ struct Cli {
     #[arg(long = "retire", value_name = "EVENT_ID")]
     retire: Vec<uuid::Uuid>,
 
-    /// Why the cascades named by --retire are retired; recorded in each row.
-    #[arg(long, requires = "retire")]
+    /// Why the cascades named by --retire are retired, or why
+    /// --sweep-withdrawn-edge-bbas runs; recorded in each row.
+    #[arg(long)]
     reason: Option<String>,
+
+    /// ONE-SHOT, not for the timer (migration 120): remove the edge-keyed BBAs
+    /// of every edge that is absent or out of force (withdrawn before
+    /// withdrawals recorded deferrals), through the same administrative path
+    /// as an `edge_retract` replay, and re-derive the affected beliefs. Each
+    /// edge's audit row is cause `edge_retract`, naming --acting-agent, with
+    /// --reason. Up to --limit edges per run. Requires both.
+    #[arg(long, conflicts_with_all = ["retire", "report_only"])]
+    sweep_withdrawn_edge_bbas: bool,
+
+    /// The operator the one-shot sweep's audit rows name (D1: an
+    /// administrative cascade names the principal that triggered it).
+    #[arg(long, requires = "sweep_withdrawn_edge_bbas")]
+    acting_agent: Option<uuid::Uuid>,
 
     /// Who is running the replay; recorded in every applied row's `replay_of`.
     #[arg(long, default_value = "replay_deferred_cascades")]
@@ -108,6 +135,25 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
+    if cli.reason.is_some() && cli.retire.is_empty() && !cli.sweep_withdrawn_edge_bbas {
+        bail!("--reason is recorded only with --retire or --sweep-withdrawn-edge-bbas");
+    }
+    let sweep = if cli.sweep_withdrawn_edge_bbas {
+        let acting = cli.acting_agent.ok_or_else(|| {
+            anyhow!(
+                "--sweep-withdrawn-edge-bbas needs --acting-agent <uuid>: the audit rows name the \
+                 operator who ran it"
+            )
+        })?;
+        let reason = cli
+            .reason
+            .clone()
+            .filter(|r| !r.trim().is_empty())
+            .ok_or_else(|| anyhow!("--sweep-withdrawn-edge-bbas needs a non-empty --reason"))?;
+        Some((acting, reason))
+    } else {
+        None
+    };
 
     let maint =
         epigraph_cli::MaintenancePool::connect_to(&cli.database_url, "replay_deferred_cascades")
@@ -160,6 +206,31 @@ async fn main() -> anyhow::Result<()> {
     .context("take the replay lock")?
     {
         println!("{}", serde_json::json!({ "locked": true }));
+        return Ok(());
+    }
+
+    if let Some((acting, reason)) = sweep {
+        let items = epigraph_engine::admin_cascade::sweep_withdrawn_edge_bbas(
+            conn, viewer, acting, &reason, cli.limit,
+        )
+        .await
+        .context("list the withdrawn edges carrying BBAs")?;
+        let failed = items
+            .iter()
+            .filter(|i| i.status.status != epigraph_engine::admin_cascade::CascadeState::Applied)
+            .count();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "swept": items.len(),
+                "failed": failed,
+                "items": items,
+            }))
+            .context("serialize the sweep report")?
+        );
+        if failed > 0 {
+            bail!("{failed} withdrawn edge(s) failed their BBA removal; re-run the sweep");
+        }
         return Ok(());
     }
 

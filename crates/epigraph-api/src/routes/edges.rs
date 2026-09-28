@@ -1027,6 +1027,17 @@ pub async fn delete_edge(
             id: id.to_string(),
         });
     }
+    // The retraction withdraws the edge: the caller's own edge-keyed BBAs go
+    // now and every other writer's are deferred to the maintenance replay
+    // (cause `edge_retract`), in this transaction (migration 120, D1).
+    EdgeRepository::withdraw_edge_bbas_conn(
+        &mut tx,
+        id,
+        epigraph_db::EdgeWithdrawal::Retracted,
+        None,
+        epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+    )
+    .await?;
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the retraction: {e}"),
     })?;
@@ -1338,6 +1349,18 @@ pub async fn patch_edge(
         }
         Err(e) => return Err(e.into()),
     };
+    // A patch that took the edge out of force withdraws it (migration 120);
+    // a future-dated `valid_to` withdraws nothing yet and records nothing.
+    if request.valid_to.is_some() {
+        EdgeRepository::withdraw_edge_bbas_conn(
+            &mut tx,
+            id,
+            epigraph_db::EdgeWithdrawal::Retracted,
+            None,
+            epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+        )
+        .await?;
+    }
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the patch: {e}"),
     })?;

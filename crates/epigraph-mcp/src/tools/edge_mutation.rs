@@ -71,17 +71,17 @@
 //!   already documents per-edge provenance as deferred for MCP writes; these
 //!   tools follow that precedent rather than inventing a second provenance
 //!   path.
-//! * **BBA invalidation.** Neither the HTTP routes nor these wrappers touch
-//!   the `perspective_id = edge_id` mass function that
-//!   `edge_factor::auto_wire_ds_for_edge` stored when an epistemic edge was
-//!   created. Retiring or deleting the edge therefore leaves the target's
-//!   combined belief still carrying the retracted edge's contribution — the
-//!   exact invalidation-vs-recombination problem
-//!   `epigraph_engine::retraction_cascade` was written for. Wiring that
-//!   cascade into the edge-mutation path is a belief-semantics decision with
-//!   its own design surface (cross-frame BBAs, the unbacked/`clear_claim_belief`
-//!   rule) and is intentionally NOT bundled into a wrapper that claims REST
-//!   parity.
+//!
+//! # BBA cleanup on withdrawal (migration 120)
+//!
+//! A retract (`delete_edge`), or a patch whose `valid_to` takes the edge out
+//! of force, runs `EdgeRepository::withdraw_edge_bbas_conn` in the same
+//! transaction: the caller's OWN `perspective_id = edge_id` BBAs are deleted
+//! (`bba_cleanup.deleted`), and a `cause = 'edge_retract'` deferral hands every
+//! other writer's to the maintenance replay, which removes them and re-derives
+//! the affected beliefs (D1: the cross-owner half is administrative). Before
+//! this, a retracted edge's BBA kept moving its target's belief. A future-dated
+//! `valid_to` withdraws nothing yet and records nothing.
 
 use chrono::{DateTime, Utc};
 use rmcp::model::*;
@@ -229,6 +229,23 @@ pub async fn do_patch_edge(
         Ok(updated) => updated,
         Err(e) => return Err(refuse_or_map(&mut tx, viewer, edge_id, "patch", e).await),
     };
+    // A patch that took the edge out of force withdraws it: its edge-keyed
+    // BBAs are cleaned up in this transaction (migration 120). A future-dated
+    // `valid_to` withdraws nothing yet, and the helper records nothing.
+    let bba_cleanup = if valid_to.is_some() {
+        let cleanup = EdgeRepository::withdraw_edge_bbas_conn(
+            &mut tx,
+            edge_id,
+            epigraph_db::EdgeWithdrawal::Retracted,
+            None,
+            epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+        )
+        .await
+        .map_err(crate::errors::db_caller_error)?;
+        cleanup.deferral_event_id.map(|_| cleanup)
+    } else {
+        None
+    };
 
     // Best-effort durable events, mirroring the HTTP route's pair.
     let _ = EventRepository::publish_or_log_conn(
@@ -273,6 +290,7 @@ pub async fn do_patch_edge(
         valid_from: updated.valid_from.map(|t| t.to_rfc3339()),
         valid_to: updated.valid_to.map(|t| t.to_rfc3339()),
         retired: valid_to.is_some(),
+        bba_cleanup,
     })
 }
 
@@ -313,6 +331,19 @@ pub async fn do_delete_edge(
     if !deleted {
         return Err(invalid_params(format!("edge {edge_id} not found")));
     }
+    // The owner's retraction withdraws the edge: (a) its own edge-keyed BBAs
+    // go now, (b) every other writer's go through the maintenance replay
+    // (cause `edge_retract`), both recorded in this transaction (migration
+    // 120; D1 makes the cross-owner half administrative).
+    let bba_cleanup = EdgeRepository::withdraw_edge_bbas_conn(
+        &mut tx,
+        edge_id,
+        epigraph_db::EdgeWithdrawal::Retracted,
+        None,
+        epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+    )
+    .await
+    .map_err(crate::errors::db_caller_error)?;
 
     // SAVEPOINT-wrapped inside `publish_or_log_conn`: a refused event cannot
     // abort the retraction, and it shares the retraction's fate.
@@ -328,6 +359,7 @@ pub async fn do_delete_edge(
     success_json(&DeleteEdgeResponse {
         edge_id: edge_id.to_string(),
         deleted: true,
+        bba_cleanup,
     })
 }
 

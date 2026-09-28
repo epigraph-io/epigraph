@@ -109,6 +109,10 @@ pub enum CascadeCause {
     Consolidate,
     /// A promoted match candidate was retired.
     MatchRetire,
+    /// An edge's owner retracted or deleted it (migration 120): every OTHER
+    /// writer's edge-keyed BBA on it is removed administratively and the
+    /// affected beliefs re-derived.
+    EdgeRetract,
 }
 
 impl CascadeCause {
@@ -120,6 +124,7 @@ impl CascadeCause {
             Self::Dedup => "dedup",
             Self::Consolidate => "consolidate",
             Self::MatchRetire => "match_retire",
+            Self::EdgeRetract => "edge_retract",
         }
     }
 
@@ -131,6 +136,7 @@ impl CascadeCause {
             "dedup" => Some(Self::Dedup),
             "consolidate" => Some(Self::Consolidate),
             "match_retire" => Some(Self::MatchRetire),
+            "edge_retract" => Some(Self::EdgeRetract),
             _ => None,
         }
     }
@@ -796,6 +802,113 @@ pub async fn apply_match_retire(
     }
 }
 
+/// The `edge_retract` cascade (migration 120), on the maintenance connection:
+/// remove every BBA keyed on the withdrawn edge
+/// ([`epigraph_db::EdgeRepository::remove_withdrawn_edge_bbas_conn`], keyed on
+/// `perspective_type = 'edge'`) with its audit row, atomically, then re-derive
+/// the affected claims' beliefs
+/// ([`crate::retraction_cascade::cascade_after_edge_withdrawal`]).
+///
+/// STATE-DERIVED: when the edge is in force at the time of the call (its owner
+/// un-retracted it, or the deferral was stale) nothing is removed and the
+/// applied row says so (`touched.edge_withdrawn = false`, zero counts, and a
+/// reason). That is a legitimate state, so it is `admin_applied`, never
+/// `admin_failed`, which would go stuck and page the operator.
+///
+/// The applied row names `trigger.agent_id`: the edge's owner whose act
+/// deferred it (or, for the one-shot legacy sweep, the acting operator).
+/// `touched` carries COUNTS only, never another writer's BBA ids or source
+/// agents, because the row's `agent_id` can read it. `sweep_reason` is the
+/// operator's text for the one-shot sweep, recorded in `touched`.
+pub async fn apply_after_edge_retract(
+    admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
+    trigger: &CascadeTrigger,
+    sweep_reason: Option<&str>,
+) -> CascadeStatus {
+    let edge_id = trigger.subject_id;
+    let repaired = repair_with_audit!(
+        admin,
+        trigger,
+        |tx| epigraph_db::EdgeRepository::remove_withdrawn_edge_bbas_conn(&mut tx, edge_id),
+        |r| {
+            let mut t = serde_json::json!({
+                "edge_withdrawn": r.withdrawn,
+                "bbas_deleted": r.deleted,
+                "claims_affected": r.claims.len(),
+            });
+            if !r.withdrawn {
+                t["reason"] = serde_json::json!(
+                    "the edge is in force at the time of the replay; nothing was removed"
+                );
+            }
+            if let Some(why) = sweep_reason {
+                t["sweep_reason"] = serde_json::json!(why);
+            }
+            t
+        }
+    );
+    let (removed, applied_id, touched) = match repaired {
+        Ok(r) => r,
+        Err(e) => return failed(admin, trigger, "the edge-keyed BBA removal", e).await,
+    };
+    if removed.claims.is_empty() {
+        return applied(applied_id, &touched, None);
+    }
+    let report = crate::retraction_cascade::cascade_after_edge_withdrawal(
+        &mut *admin,
+        admin_viewer,
+        &removed.claims,
+        removed.deleted,
+    )
+    .await;
+    let belief = record_belief(admin, trigger, applied_id, &report).await;
+    applied(applied_id, &touched, Some((&report, belief)))
+}
+
+/// One edge the one-shot legacy sweep handled.
+#[derive(Debug, Clone, Serialize)]
+pub struct WithdrawnEdgeSweepItem {
+    /// The withdrawn edge whose BBAs were removed.
+    pub edge_id: Uuid,
+    /// What the removal did (its audit row names the acting operator).
+    pub status: CascadeStatus,
+}
+
+/// The one-shot legacy sweep (`replay_deferred_cascades
+/// --sweep-withdrawn-edge-bbas`), on the maintenance connection: every edge
+/// whose edge-keyed BBAs outlived it (an edge-factor perspective with BBAs whose
+/// edge is absent or out of force, retracted before migration 120 recorded
+/// deferrals) goes through [`apply_after_edge_retract`], audited as cause
+/// `edge_retract` naming `acting_agent` (the operator running it, D1) with
+/// `reason`. NOT on the timer. Up to `limit` edges per run.
+///
+/// # Errors
+/// Only the candidate query's error; each edge's own failure is in its item.
+pub async fn sweep_withdrawn_edge_bbas(
+    admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
+    acting_agent: Uuid,
+    reason: &str,
+    limit: i64,
+) -> Result<Vec<WithdrawnEdgeSweepItem>, DbError> {
+    let edges =
+        epigraph_db::EdgeRepository::withdrawn_edges_with_bbas_conn(&mut *admin, limit).await?;
+    let mut items = Vec::with_capacity(edges.len());
+    for edge_id in edges {
+        let trigger = CascadeTrigger::new(
+            CascadeCause::EdgeRetract,
+            Some(acting_agent),
+            None,
+            edge_id,
+            None,
+        );
+        let status = apply_after_edge_retract(admin, admin_viewer, &trigger, Some(reason)).await;
+        items.push(WithdrawnEdgeSweepItem { edge_id, status });
+    }
+    Ok(items)
+}
+
 /// One replayed cascade.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayItem {
@@ -931,6 +1044,9 @@ pub async fn replay_deferred(
                 apply_match_retire(admin, admin_viewer, &trigger, subject)
                     .await
                     .0
+            }
+            (CascadeCause::EdgeRetract, _) => {
+                apply_after_edge_retract(admin, admin_viewer, &trigger, None).await
             }
             (CascadeCause::Supersede | CascadeCause::Dedup, None) => {
                 report.unreadable += 1;

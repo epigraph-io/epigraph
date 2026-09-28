@@ -190,6 +190,15 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
          other goes through migration 115's `epigraph_cascade_delete_edge_bbas`)",
     ),
     (
+        "edge.rs::withdraw_edge_bbas_conn",
+        "derived from edge id (batch W12b, migration 120: an edge owner's retract deletes its OWN \
+         edge-keyed BBAs). The DELETE carries the SESSION's write predicate inline \
+         (`owner_group_id = ANY (epigraph_writable_groups())`), which is the stamp's authority; a \
+         spliced `{WRITABLE}` marker would bind the CALLER's viewer, which on the MCP transport is \
+         not the stamped principal. Row security's owner-scoped DELETE backs it on the \
+         application role",
+    ),
+    (
         "mass_function.rs::update_claim_belief",
         "derived from claim id",
     ),
@@ -226,6 +235,12 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     (
         "evidence.rs::store_embedding",
         "embedding backfill, corpus-wide",
+    ),
+    (
+        "edge.rs::remove_withdrawn_edge_bbas_conn",
+        "the `edge_retract` administrative cascade (batch W12b, migration 120), on the \
+         maintenance connection only: the replay and the one-shot legacy sweep; state-derived \
+         (acts only on an absent or out-of-force edge)",
     ),
     (
         "match_candidate.rs::retract_candidate_edges",

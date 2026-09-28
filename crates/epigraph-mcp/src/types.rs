@@ -1919,6 +1919,12 @@ pub struct PatchEdgeResponse {
     pub valid_from: Option<String>,
     pub valid_to: Option<String>,
     pub retired: bool,
+    /// When this patch took the edge out of force (`valid_to <= now()`), the
+    /// edge-keyed BBA cleanup that ran in the same transaction (migration 120):
+    /// the caller's own BBAs deleted, and the deferral that hands every other
+    /// writer's to the maintenance replay. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bba_cleanup: Option<epigraph_db::BbaCleanup>,
 }
 
 /// Parameters for the `delete_edge` MCP tool — mirrors
@@ -1939,6 +1945,12 @@ pub struct DeleteEdgeParams {
 pub struct DeleteEdgeResponse {
     pub edge_id: String,
     pub deleted: bool,
+    /// The edge-keyed BBA cleanup that ran in the retraction's transaction
+    /// (migration 120): `deleted` counts the caller's own BBAs removed;
+    /// `deferral_event_id` is the `edge_retract` deferral handing every other
+    /// writer's BBAs to the maintenance replay (absent when no BBA can be keyed
+    /// on the edge).
+    pub bba_cleanup: epigraph_db::BbaCleanup,
 }
 
 /// Parameters for the `link_alternative` MCP tool.

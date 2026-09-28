@@ -125,7 +125,8 @@ pub use repos::community::{CommunityMemberRow, CommunityRow, MembershipOutcome};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{
-    AttributedClaimRow, EdgeRefusal, EdgeRow, SymmetricEdgeUpsert, EPISTEMIC_RELATIONSHIPS,
+    AttributedClaimRow, BbaCleanup, EdgeRefusal, EdgeRow, EdgeWithdrawal, SymmetricEdgeUpsert,
+    WithdrawnEdgeBbas, EDGE_RETRACT_DEFERRAL_REASON, EPISTEMIC_RELATIONSHIPS,
 };
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};

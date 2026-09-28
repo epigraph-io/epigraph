@@ -1304,6 +1304,109 @@ async fn a_retracted_link_asserted_again_is_a_new_edge(pool: PgPool) {
 }
 
 // ===========================================================================
+// 14. The `edge_retract` deferral is the edge owner's, for a withdrawn edge factor.
+// ===========================================================================
+
+/// 120's `epigraph_record_cascade_deferral` records `edge_retract` only for an
+/// edge the session owns or co-owns, that carries an edge-factor perspective
+/// (`perspective_type = 'edge'`), and that is not retracted into the future.
+/// Everything else is CX03 (42501), with nothing recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_factor(
+    pool: PgPool,
+) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, _) = fixture::seed_agent_with_group(&pool, "writer-w").await;
+    let (z, _) = fixture::seed_agent_with_group(&pool, "bystander-z").await;
+    let a = fixture::seed_public_claim(&pool, author, "public A").await;
+    let b = fixture::seed_public_claim(&pool, author, "public B").await;
+
+    let p = pool.clone();
+    let [retracted, future, unkeyed, genuine] =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, w).await;
+            let mut ids = [Uuid::nil(); 4];
+            for slot in &mut ids {
+                *slot = insert_edge(&mut conn, (a, "claim"), (b, "claim"))
+                    .await
+                    .expect("W links");
+            }
+            (conn, ids)
+        })
+        .await;
+    for (id, kind) in [
+        (retracted, "edge"),
+        (future, "edge"),
+        (genuine, "analytical"),
+    ] {
+        sqlx::query("INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(format!("w12b {kind} {id}"))
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .expect("perspective");
+    }
+    sqlx::query(
+        "UPDATE edges SET valid_to = CASE WHEN id = $2 THEN now() + interval '1 day' \
+                                          ELSE now() END \
+          WHERE id = ANY($1)",
+    )
+    .bind(vec![retracted, future, unkeyed, genuine])
+    .bind(future)
+    .execute(&pool)
+    .await
+    .expect("retract (privileged)");
+
+    let record = |agent: Uuid, edge: Uuid| {
+        let p = pool.clone();
+        async move {
+            fixture::as_role(&p.clone(), "epigraph_app", |mut conn| async move {
+                stamp(&mut conn, &p, agent).await;
+                let r: Result<Uuid, String> = sqlx::query_scalar(
+                    "SELECT public.epigraph_record_cascade_deferral(\
+                         'edge_retract', $1, $2, NULL, NULL, NULL, 'w12b')",
+                )
+                .bind(agent)
+                .bind(edge)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| code(&e));
+                (conn, r)
+            })
+            .await
+        }
+    };
+    assert_eq!(
+        record(z, retracted).await,
+        Err("42501".to_string()),
+        "a bystander cannot defer a cascade over another writer's edge"
+    );
+    for (edge, why) in [
+        (future, "a future-dated retraction"),
+        (unkeyed, "an edge with no edge-factor perspective"),
+        (genuine, "a genuine (non-edge) perspective"),
+    ] {
+        assert_eq!(
+            record(w, edge).await,
+            Err("42501".to_string()),
+            "{why} records nothing"
+        );
+    }
+    record(w, retracted)
+        .await
+        .expect("the owner records its withdrawn edge factor");
+    let rows: Vec<(Option<Uuid>, String)> = sqlx::query_as(
+        "SELECT agent_id, details->'trigger'->>'subject_id' FROM security_events \
+          WHERE event_type = 'cascade.deferred' AND details->>'cause' = 'edge_retract'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("deferrals");
+    assert_eq!(rows, vec![(Some(w), retracted.to_string())]);
+}
+
+// ===========================================================================
 // 17. Catalog ratchets.
 // ===========================================================================
 

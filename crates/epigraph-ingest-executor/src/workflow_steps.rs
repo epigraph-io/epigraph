@@ -281,14 +281,34 @@ pub async fn add_step(
     // then nothing needs removing.
     let rewire = if !chain.is_empty() && position > 0 && position < chain.len() {
         let (prev, next) = (chain[position - 1], chain[position]);
-        let existing: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM edges \
+        // Every prev -> next row the session can see, RETRACTED ones included:
+        // `ordered_steps` follows a retracted `step_follows` too (`LIMIT 1`, no
+        // `valid_to` filter), so a surviving retracted row would still fork the
+        // order.
+        let existing_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM edges \
              WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
         )
         .bind(prev)
         .bind(next)
-        .fetch_one(&mut *conn)
+        .fetch_all(&mut *conn)
         .await?;
+        let existing = i64::try_from(existing_ids.len()).unwrap_or(i64::MAX);
+        // Migration 120: the rewire DELETEs these rows, so it withdraws them.
+        // Their edge-keyed BBA cleanup (the session's own now, any other
+        // writer's deferred to the maintenance replay) is recorded BEFORE the
+        // DELETE, while the rows still exist. A row the session does not own is
+        // left to the refusal below, which rolls the whole act back.
+        for id in &existing_ids {
+            epigraph_db::EdgeRepository::withdraw_edge_bbas_conn(
+                &mut *conn,
+                *id,
+                epigraph_db::EdgeWithdrawal::BeingDeleted,
+                None,
+                epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+            )
+            .await?;
+        }
         let removable = sqlx::query(
             "DELETE FROM edges \
              WHERE source_id = $1 AND target_id = $2 \

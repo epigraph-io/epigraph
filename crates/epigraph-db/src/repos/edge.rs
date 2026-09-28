@@ -126,6 +126,50 @@ impl EdgeRefusal {
     }
 }
 
+/// The reason an `edge_retract` deferral records (the server's own text; it
+/// names no row and reaches the edge's owner).
+pub const EDGE_RETRACT_DEFERRAL_REASON: &str =
+    "the edge's owner withdrew it; any other writer's BBAs keyed on it are removed, and the \
+     affected beliefs re-derived, by the maintenance replay (operator decision D1)";
+
+/// How an application act left an edge, for [`EdgeRepository::withdraw_edge_bbas_conn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeWithdrawal {
+    /// The act set `valid_to` (a retract, or a patch that closed the window).
+    /// Only a `valid_to <= now()` counts: a FUTURE-dated retraction withdraws
+    /// nothing yet and records nothing (its cleanup once it passes is a
+    /// follow-up).
+    Retracted,
+    /// The act is about to DELETE the row (the workflow step rewire). Call the
+    /// cleanup BEFORE the DELETE: the deferral's act check reads the row.
+    BeingDeleted,
+}
+
+/// What [`EdgeRepository::withdraw_edge_bbas_conn`] did in the caller's act.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BbaCleanup {
+    /// The caller's OWN edge-keyed BBAs deleted in its act.
+    pub deleted: u64,
+    /// The `cascade.deferred` row (cause `edge_retract`) that hands every
+    /// other writer's BBAs keyed on the edge to the administrative replay;
+    /// `None` when the edge carries no edge-factor perspective (so no BBA can
+    /// be keyed on it) or the retraction is future-dated.
+    pub deferral_event_id: Option<Uuid>,
+}
+
+/// What [`EdgeRepository::remove_withdrawn_edge_bbas_conn`] did on the
+/// maintenance connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WithdrawnEdgeBbas {
+    /// Whether the edge was absent or out of force at the time of the call
+    /// (the state the removal requires). `false`: nothing was removed.
+    pub withdrawn: bool,
+    /// Edge-keyed BBAs removed.
+    pub deleted: u64,
+    /// The distinct claims those BBAs lived on (their belief is re-derived).
+    pub claims: Vec<Uuid>,
+}
+
 /// Which existing rows the create-or-get dedup probe counts as "present".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DedupProbe {
@@ -1122,6 +1166,176 @@ impl EdgeRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_one(executor).await?)
+    }
+
+    /// The edge-keyed BBA cleanup every application act that withdraws an edge
+    /// runs, in the act's own transaction (migration 120; D1 names edge-keyed
+    /// BBA deletes an administrative cascade).
+    ///
+    /// When the edge carries an edge-factor perspective (`perspectives.id =
+    /// edge`, `perspective_type = 'edge'`: every BBA keyed on the edge hangs off
+    /// it, by FK) and the act withdrew it (see [`EdgeWithdrawal`]):
+    ///
+    /// * (b) it records a `cause = 'edge_retract'` deferral through 120's
+    ///   `epigraph_record_cascade_deferral` (the session must own or co-own the
+    ///   edge; the row names the session principal), so the administrative
+    ///   replay removes every OTHER writer's BBA keyed on the edge and re-derives
+    ///   the affected beliefs. Recorded even when only the caller's own BBAs
+    ///   exist, so the re-derivation runs;
+    /// * (a) it deletes the caller's OWN edge-keyed BBAs, scoped explicitly to
+    ///   the session's writable set, so a privileged stamped session is held to
+    ///   the same owner scope as the application role.
+    ///
+    /// A future-dated retraction, or an edge no BBA can be keyed on, does
+    /// nothing.
+    ///
+    /// # Errors
+    /// The deferral definer's refusal or any query error; the caller's act
+    /// rolls back with it.
+    #[instrument(skip(conn, oauth))]
+    pub async fn withdraw_edge_bbas_conn(
+        conn: &mut sqlx::PgConnection,
+        edge_id: Uuid,
+        withdrawal: EdgeWithdrawal,
+        oauth: Option<&serde_json::Value>,
+        reason: &str,
+    ) -> Result<BbaCleanup, DbError> {
+        // Reads only whether an edge-factor perspective exists for the edge the
+        // caller's act touches, the edge's own `valid_to`, and whether the
+        // session owns it. An edge the session does not own is left alone: the
+        // act itself is refused by row security (and rolls back), and the
+        // deferral definer would refuse it anyway.
+        let (keyed, withdrawn, owned): (bool, bool, bool) = sqlx::query_as(
+            "-- VISIBILITY-EXEMPT: the state of an edge the caller's act touches.\n\
+             SELECT EXISTS (SELECT 1 FROM perspectives p \
+                             WHERE p.id = $1 AND p.perspective_type = 'edge'), \
+                    COALESCE((SELECT CASE WHEN $2 THEN true \
+                                          ELSE e.valid_to IS NOT NULL AND e.valid_to <= now() END \
+                                FROM edges e WHERE e.id = $1), false), \
+                    COALESCE((SELECT public.epigraph_bypass() \
+                                     OR e.owner_group_id = ANY (public.epigraph_writable_groups()) \
+                                     OR e.co_owner_group_id \
+                                        = ANY (public.epigraph_writable_groups()) \
+                                FROM edges e WHERE e.id = $1), false)",
+        )
+        .bind(edge_id)
+        .bind(withdrawal == EdgeWithdrawal::BeingDeleted)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !keyed || !withdrawn || !owned {
+            return Ok(BbaCleanup::default());
+        }
+        let principal: Option<Uuid> = sqlx::query_scalar("SELECT public.epigraph_principal_id()")
+            .fetch_one(&mut *conn)
+            .await?;
+        let deferral = crate::repos::admin_cascade::record_deferral(
+            &mut *conn,
+            "edge_retract",
+            principal,
+            edge_id,
+            None,
+            &[],
+            oauth,
+            reason,
+        )
+        .await?;
+        let deleted = sqlx::query(
+            "DELETE FROM mass_functions \
+              WHERE perspective_id = $1 \
+                AND owner_group_id = ANY (public.epigraph_writable_groups())",
+        )
+        .bind(edge_id)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        Ok(BbaCleanup {
+            deleted,
+            deferral_event_id: Some(deferral),
+        })
+    }
+
+    /// The administrative half of an `edge_retract` cascade, on the
+    /// MAINTENANCE connection: remove every BBA keyed on the edge (keyed on
+    /// `perspective_type = 'edge'`, so a genuine perspective's BBAs are never
+    /// touched) and return the claims they lived on.
+    ///
+    /// STATE-DERIVED: it acts only while the edge row is absent or out of force
+    /// (`valid_to <= now()`). An edge in force at the time of the call (its
+    /// owner un-retracted it, or the deferral was stale) removes nothing and
+    /// reports `withdrawn = false`, so a deferral can never make it do what the
+    /// edge's state does not justify.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if a query fails.
+    #[instrument(skip(conn))]
+    pub async fn remove_withdrawn_edge_bbas_conn(
+        conn: &mut sqlx::PgConnection,
+        edge_id: Uuid,
+    ) -> Result<WithdrawnEdgeBbas, DbError> {
+        let withdrawn: bool = sqlx::query_scalar(
+            "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
+             SELECT NOT EXISTS (SELECT 1 FROM edges e \
+                                 WHERE e.id = $1 \
+                                   AND (e.valid_to IS NULL OR e.valid_to > now()))",
+        )
+        .bind(edge_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !withdrawn {
+            return Ok(WithdrawnEdgeBbas::default());
+        }
+        let claims: Vec<Uuid> = sqlx::query_scalar(
+            "WITH gone AS ( \
+                 DELETE FROM mass_functions mf \
+                  USING perspectives p \
+                  WHERE p.id = mf.perspective_id \
+                    AND p.id = $1 \
+                    AND p.perspective_type = 'edge' \
+                 RETURNING mf.claim_id) \
+             SELECT claim_id FROM gone",
+        )
+        .bind(edge_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let deleted = claims.len() as u64;
+        let mut distinct: Vec<Uuid> = claims;
+        distinct.sort_unstable();
+        distinct.dedup();
+        Ok(WithdrawnEdgeBbas {
+            withdrawn: true,
+            deleted,
+            claims: distinct,
+        })
+    }
+
+    /// The edges whose BBAs outlived them: an edge-factor perspective
+    /// (`perspective_type = 'edge'`) with BBAs keyed on it whose edge is absent
+    /// or out of force. The one-shot legacy sweep
+    /// (`replay_deferred_cascades --sweep-withdrawn-edge-bbas`) removes their
+    /// BBAs through the same administrative path as an `edge_retract` replay.
+    /// Maintenance connection only.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(conn))]
+    pub async fn withdrawn_edges_with_bbas_conn(
+        conn: &mut sqlx::PgConnection,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, DbError> {
+        Ok(sqlx::query_scalar(
+            "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
+             SELECT p.id FROM perspectives p \
+              WHERE p.perspective_type = 'edge' \
+                AND EXISTS (SELECT 1 FROM mass_functions mf WHERE mf.perspective_id = p.id) \
+                AND NOT EXISTS (SELECT 1 FROM edges e \
+                                 WHERE e.id = p.id \
+                                   AND (e.valid_to IS NULL OR e.valid_to > now())) \
+              ORDER BY p.id \
+              LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?)
     }
 
     /// Why a write this session was just refused on edge `id` was refused:
