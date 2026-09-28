@@ -95,8 +95,13 @@
 //! `crates/epigraph-api/src/routes` (`edges.rs` included) that contains
 //! `INSERT INTO edges` or `INSERT INTO public.edges`.
 //!
-//! A file's test region starts at its first `#[cfg(test)]` or
-//! `#[cfg(all(test, ..))]` line and is not scanned.
+//! A file's test code is not scanned: the brace extent of every inline module
+//! gated `#[cfg(test)]` or `#[cfg(all(test, ..))]` (its attributes included),
+//! and the whole file of an out-of-line one (`#[cfg(test)] mod name;` in any
+//! route file excludes `routes/name.rs`). Everything else IS scanned, including
+//! code after a test module and a `cfg(test)` item that is not a module (a
+//! test-only const or fn): a brace inside a string, char literal or comment
+//! does not move a module's extent.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -132,30 +137,256 @@ const RAW_INSERTS: &[(&str, usize)] =
 /// The total [`RAW_INSERTS`] may never exceed.
 const RAW_HIGH_WATER: usize = 11;
 
-/// Where a route file's test region starts (not scanned).
-fn test_region_start(lines: &[&str]) -> usize {
-    lines
-        .iter()
-        .position(|l| {
-            let t = l.trim_start();
-            t.starts_with("#[cfg(test)]") || t.starts_with("#[cfg(all(test")
-        })
-        .unwrap_or(lines.len())
+/// Whether `line` (trimmed) opens with a test-gating `cfg` attribute.
+fn is_cfg_test(line: &str) -> bool {
+    line.starts_with("#[cfg(test)]") || line.starts_with("#[cfg(all(test")
 }
 
-/// Raw `INSERT INTO edges` code lines of one route file's non-test region.
-fn count_raw_inserts(src: &str) -> usize {
+/// `text` with every leading outer attribute (`#[...]`) removed.
+fn strip_attributes(mut text: &str) -> &str {
+    loop {
+        let t = text.trim_start();
+        if !t.starts_with("#[") {
+            return t;
+        }
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in t.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(e) => text = &t[e..],
+            None => return "",
+        }
+    }
+}
+
+/// The name of the module `item` declares, when it declares one.
+fn module_name(item: &str) -> Option<&str> {
+    let mut t = item.trim_start();
+    for vis in ["pub(crate) ", "pub(super) ", "pub "] {
+        if let Some(rest) = t.strip_prefix(vis) {
+            t = rest.trim_start();
+        }
+    }
+    let rest = t.strip_prefix("mod ")?;
+    let name: &str = rest
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or("");
+    (!name.is_empty()).then_some(name)
+}
+
+/// How many lines `text` (starting at an item whose first `{` opens a block)
+/// spans up to that block's matching `}`, skipping braces inside string, raw
+/// string, byte string and char literals and comments. `None` when the block
+/// never closes.
+fn block_line_span(text: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    let (mut i, mut depth, mut lines, mut opened) = (0usize, 0usize, 0usize, false);
+    let ident = |k: usize| k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_');
+    while i < b.len() {
+        match b[i] {
+            b'\n' => lines += 1,
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut nest = 0usize;
+                while i < b.len() {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        nest += 1;
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        nest -= 1;
+                        i += 2;
+                        if nest == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    if b[i] == b'\n' {
+                        lines += 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'r' if !ident(i) && matches!(b.get(i + 1), Some(b'"' | b'#')) => {
+                let mut j = i + 1;
+                let mut hashes = 0usize;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'"') {
+                    j += 1;
+                    loop {
+                        match b.get(j) {
+                            None => return None,
+                            Some(b'"')
+                                if b[j + 1..]
+                                    .iter()
+                                    .take(hashes)
+                                    .filter(|c| **c == b'#')
+                                    .count()
+                                    == hashes =>
+                            {
+                                j += 1 + hashes;
+                                break;
+                            }
+                            Some(b'\n') => lines += 1,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    if i < b.len() && b[i] == b'\n' {
+                        lines += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'\'' => {
+                // A char literal ('x', '\n', '\u{..}'); otherwise a lifetime.
+                if b.get(i + 1) == Some(&b'\\') {
+                    i += 2;
+                    while i < b.len() && b[i] != b'\'' {
+                        i += 1;
+                    }
+                } else if b.get(i + 2) == Some(&b'\'') {
+                    i += 2;
+                }
+            }
+            b'{' => {
+                depth += 1;
+                opened = true;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if opened && depth == 0 {
+                    return Some(lines);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Which lines of a route file are test code (not scanned), and the names of
+/// the out-of-line test modules it declares (their files are not scanned).
+fn test_lines(src: &str) -> (Vec<bool>, Vec<String>) {
     let lines: Vec<&str> = src.lines().collect();
-    let end = test_region_start(&lines);
-    lines[..end]
-        .iter()
-        .filter(|l| {
-            !l.trim_start().starts_with("//")
+    let mut mask = vec![false; lines.len()];
+    let mut out_of_line = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if !is_cfg_test(lines[i].trim_start()) {
+            i += 1;
+            continue;
+        }
+        // The gated item: the rest of the attribute line, or the next line
+        // that is not blank, an attribute or a comment.
+        let mut j = i;
+        let mut item = strip_attributes(lines[i]);
+        while item.is_empty() || item.starts_with("//") {
+            j += 1;
+            if j >= lines.len() {
+                break;
+            }
+            item = strip_attributes(lines[j]);
+        }
+        let Some(name) = (j < lines.len()).then(|| module_name(item)).flatten() else {
+            // Not a module: a test-only const or fn is scanned.
+            i += 1;
+            continue;
+        };
+        let rest = lines[j..].join("\n");
+        let from = rest.find(item).unwrap_or(0);
+        let (semi, brace) = (rest[from..].find(';'), rest[from..].find('{'));
+        let last = match (semi, brace) {
+            (Some(sc), Some(br)) if sc < br => {
+                out_of_line.push(name.to_string());
+                j
+            }
+            (Some(_), None) => {
+                out_of_line.push(name.to_string());
+                j
+            }
+            (_, Some(_)) => {
+                j + block_line_span(&rest[from..])
+                    .unwrap_or_else(|| panic!("the test module `{name}` never closes"))
+            }
+            (None, None) => lines.len() - 1,
+        };
+        for m in mask.iter_mut().take(last + 1).skip(i) {
+            *m = true;
+        }
+        i = last + 1;
+    }
+    (mask, out_of_line)
+}
+
+/// Raw `INSERT INTO edges` code lines of one route file, outside its test code.
+fn count_raw_inserts(src: &str) -> usize {
+    let (mask, _) = test_lines(src);
+    src.lines()
+        .zip(mask)
+        .filter(|(l, test)| {
+            !test
+                && !l.trim_start().starts_with("//")
                 && (l.contains("INSERT INTO edges") || l.contains("INSERT INTO public.edges"))
         })
         .count()
 }
 
+/// `EdgeRepository::create*` calls on the raw pool in one route file, outside
+/// its test code.
+fn count_unstamped_creates(src: &str) -> usize {
+    let lines: Vec<&str> = src.lines().collect();
+    let (mask, _) = test_lines(src);
+    let mut n = 0usize;
+    for i in 0..lines.len() {
+        let l = lines[i];
+        if mask[i] || l.trim_start().starts_with("//") || !l.contains("EdgeRepository::create") {
+            continue;
+        }
+        let call: String = lines[i..(i + 3).min(lines.len())].join(" ");
+        let from = call.find("EdgeRepository::create").expect("present");
+        if is_raw_pool_executor(&call[from..]) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Every route file except the out-of-line test modules route files declare.
 fn route_files() -> Vec<PathBuf> {
     let dir = repo_root().join(ROUTES);
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -164,6 +395,15 @@ fn route_files() -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "rs"))
         .collect();
+    let test_files: Vec<String> = entries
+        .iter()
+        .flat_map(|p| test_lines(&std::fs::read_to_string(p).expect("read route file")).1)
+        .map(|m| format!("{m}.rs"))
+        .collect();
+    entries.retain(|p| {
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        !test_files.contains(&name)
+    });
     entries.sort();
     entries
 }
@@ -209,20 +449,7 @@ fn measure() -> BTreeMap<String, usize> {
             continue;
         }
         let src = std::fs::read_to_string(&p).expect("read route file");
-        let lines: Vec<&str> = src.lines().collect();
-        let end = test_region_start(&lines);
-        let mut n = 0usize;
-        for i in 0..end {
-            let l = lines[i];
-            if l.trim_start().starts_with("//") || !l.contains("EdgeRepository::create") {
-                continue;
-            }
-            let call: String = lines[i..(i + 3).min(end)].join(" ");
-            let from = call.find("EdgeRepository::create").expect("present");
-            if is_raw_pool_executor(&call[from..]) {
-                n += 1;
-            }
-        }
+        let n = count_unstamped_creates(&src);
         if n > 0 {
             out.insert(name, n);
         }
@@ -310,5 +537,69 @@ fn the_raw_insert_scanner_skips_comments_and_every_test_region_spelling() {
     assert!(
         measure_raw_inserts().values().sum::<usize>() > 0,
         "the raw-insert scanner is vacuous"
+    );
+}
+
+/// A test region is a gated MODULE's extent, never "the rest of the file".
+#[test]
+fn only_a_test_modules_extent_is_skipped_and_code_after_it_is_scanned() {
+    // An early test-only const (routes/agents.rs has one) does not hide the
+    // production code after it, from either register.
+    let early = "#[cfg(test)]\n\
+                 const K: usize = 64;\n\
+                 fn prod() {\n\
+                 sqlx::query(\"INSERT INTO edges (source_id) VALUES ($1)\");\n\
+                 EdgeRepository::create(\n&state.db_pool, a, \"claim\");\n\
+                 }\n";
+    assert_eq!(count_raw_inserts(early), 1);
+    assert_eq!(count_unstamped_creates(early), 1);
+    // A brace in a string, a char literal or a comment inside a test module
+    // does not move its end; code after the module is scanned.
+    let braces = "#[cfg(test)]\n\
+                  #[allow(clippy::all)]\n\
+                  mod tests {\n\
+                  const S: &str = \"{ INSERT INTO edges {\";\n\
+                  const C: char = '{';\n\
+                  // }\n\
+                  fn t<'a>(x: &'a str) -> &'a str { x }\n\
+                  }\n\
+                  fn after() { sqlx::query(\"INSERT INTO edges (x) VALUES ($1)\"); }\n";
+    assert_eq!(count_raw_inserts(braces), 1);
+    // `mod name;` masks only its own line; the file is excluded instead.
+    let outline = "#[cfg(test)]\nmod negative_tests;\n\
+                   fn c() { sqlx::query(\"INSERT INTO public.edges (x) VALUES ($1)\"); }\n";
+    assert_eq!(count_raw_inserts(outline), 1);
+    assert_eq!(test_lines(outline).1, vec!["negative_tests".to_string()]);
+    // The attribute on the same line as the module.
+    let same = "#[cfg(all(test, feature = \"db\"))] mod db_tests {\n\
+                const S: &str = \"INSERT INTO edges\";\n}\n";
+    assert_eq!(count_raw_inserts(same), 0);
+    // The route tree's own out-of-line test module is not a route file.
+    assert!(route_files()
+        .iter()
+        .all(|p| p.file_name().unwrap() != "negative_tests.rs"));
+    // On the real route files, every skipped run ends where its module does
+    // (a closing brace, or `mod name;`), so no extent swallows the file.
+    let mut runs = 0usize;
+    for p in route_files() {
+        let src = std::fs::read_to_string(&p).expect("read route file");
+        let lines: Vec<&str> = src.lines().collect();
+        let (mask, _) = test_lines(&src);
+        for i in 0..lines.len() {
+            if mask[i] && mask.get(i + 1) != Some(&true) {
+                runs += 1;
+                let end = lines[i].trim_end();
+                assert!(
+                    end.ends_with('}') || end.ends_with(';'),
+                    "{}:{}: a test module's extent ends on {end:?}",
+                    p.display(),
+                    i + 1
+                );
+            }
+        }
+    }
+    assert!(
+        runs > 10,
+        "the test-module scanner found almost nothing: {runs}"
     );
 }
