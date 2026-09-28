@@ -16,9 +16,11 @@
 //!    connection reads and writes nothing, with no error;
 //! 4. take the drain's advisory lock on that connection; when another run
 //!    holds it, print `{"locked": true}` and exit 0;
-//! 5. reset `running` rows older than 90 minutes to `pending`, then run the
-//!    oldest pending job of a registered type, one at a time, until none is
-//!    left or `--max-runtime` (default 50min) has elapsed.
+//! 5. reap `running` rows older than 90 minutes (a counted attempt: back to
+//!    `pending`, or `failed` once the attempts are used up; the privatization
+//!    types are reset uncounted, see `jobs_drain::RESUMABLE_ON_REAP`), then run
+//!    the oldest pending job of a registered type, one at a time, until none
+//!    is left or `--max-runtime` (default 50min) has elapsed.
 //!
 //! Exit codes: 0 drained (or locked); 1 a job failed in this run (retryable
 //! or terminal; a failure outranks running out of time), or the run could not

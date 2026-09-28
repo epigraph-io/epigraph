@@ -377,6 +377,86 @@ async fn the_drain_reaps_a_stale_running_job_and_leaves_a_fresh_one(pool: PgPool
     );
 }
 
+/// The drain's reaper counts the attempt: a stale job on its LAST attempt is
+/// failed by the reaper (never run again, never left pending), which is a
+/// failure of the run (exit 1). A stale privatization job, whose handler is
+/// built on one attempt plus re-delivery, is reset uncounted and re-delivered
+/// to its handler, which records its own verdict (here a refusal: its plan does
+/// not exist) instead of the reaper's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool: PgPool) {
+    let spent = enqueue(
+        &pool,
+        EpiGraphJob::ClusterGraph {
+            resolution: 1.0,
+            retain_runs: 5,
+        },
+    )
+    .await;
+    sqlx::query(
+        "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours', \
+                retry_count = max_retries - 1 WHERE id = $1",
+    )
+    .bind(spent)
+    .execute(&pool)
+    .await
+    .expect("age the job on its last attempt");
+    let redelivered = {
+        let job = fx::apply_job(Uuid::new_v4(), Uuid::new_v4(), "no-such-dispatch");
+        let id: Uuid = job.id.into();
+        PostgresJobQueue::new(pool.clone())
+            .enqueue(job)
+            .await
+            .expect("seed");
+        id
+    };
+    // One attempt, as the privatization repository enqueues it (the fixture
+    // takes the queue's default).
+    sqlx::query(
+        "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours', \
+                retry_count = 0, max_retries = 1 WHERE id = $1",
+    )
+    .bind(redelivered)
+    .execute(&pool)
+    .await
+    .expect("age the privatization job");
+
+    let scoped = maintenance_scoped(&pool).await;
+    let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::Mock);
+    let report = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("the drain ran");
+
+    assert_eq!(
+        job_state(&pool, spent).await,
+        (
+            "failed".to_string(),
+            Some(epigraph_jobs::REAPED_SPENT_MESSAGE.to_string())
+        ),
+        "a stale job on its last attempt must be failed by the reaper, not run again"
+    );
+    let spent_failure = report
+        .failures
+        .iter()
+        .find(|f| f.job_id == spent)
+        .unwrap_or_else(|| panic!("the reaped failure is not reported: {report:?}"));
+    assert!(spent_failure.terminal);
+    assert_eq!(report.exit_code(), 1, "{report:?}");
+
+    let (state, err) = job_state(&pool, redelivered).await;
+    assert_eq!(state, "failed", "{report:?}");
+    assert_ne!(
+        err.as_deref(),
+        Some(epigraph_jobs::REAPED_SPENT_MESSAGE),
+        "the privatization job was failed by the reaper before its handler ran: its plan \
+         would be left mid-flight"
+    );
+    assert_eq!(
+        report.recovered_stale, 1,
+        "only the privatization job goes back to pending: {report:?}"
+    );
+}
+
 /// The provider gate on `embedding_generation`, and why the drain filters by
 /// registered type: with a provider that may not write `claims.embedding` the
 /// handler is not registered, and a pending `embedding_generation` job at the

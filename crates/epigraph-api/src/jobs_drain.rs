@@ -39,10 +39,26 @@ use uuid::Uuid;
 
 use crate::embedding_restore::{ClaimEmbeddingJobService, EmbeddingProviderKind};
 
-/// A job left in `running` longer than this is reset to `pending` at the start
-/// of a run. It exceeds the 45-minute statement timeout, so a job that is
-/// legitimately running is never reset out from under itself.
+/// A job left in `running` longer than this is reaped at the start of a run.
+/// It exceeds the 45-minute statement timeout, so a job that is legitimately
+/// running is never reset out from under itself.
+///
+/// A reap COUNTS as a used attempt ([`PostgresJobQueue::reap_stale_jobs_counting_attempts`]):
+/// a job that outlives the unit's start timeout is killed by systemd, and an
+/// uncounted reset would re-run it and have it killed again forever. The
+/// counted reset bounds that loop by the job's `max_retries`, then fails the
+/// row (a failure of the run: exit 1).
 pub const STALE_AFTER: Duration = Duration::from_secs(90 * 60);
+
+/// Job types reaped WITHOUT counting an attempt: the privatization handlers
+/// run one attempt plus re-delivery (`max_retries = 1`), and their own state
+/// check makes a re-delivered job a no-op refusal. A counted reap would fail
+/// such a job before its handler runs and leave the plan mid-flight.
+pub const RESUMABLE_ON_REAP: [&str; 3] = [
+    epigraph_jobs::privatization::APPLY_JOB_TYPE,
+    epigraph_jobs::privatization::REVERT_JOB_TYPE,
+    epigraph_jobs::privatization::RESEAL_JOB_TYPE,
+];
 
 /// The per-connection statement timeout of the drain's pool, unless
 /// `EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS` overrides it: a runaway clustering query,
@@ -147,7 +163,9 @@ pub struct DrainReport {
     /// `true` when another run held the drain lock, so this one did nothing.
     /// Set by the binary, never by [`drain`].
     pub locked: bool,
-    /// Stale `running` rows reset to `pending` before draining.
+    /// Stale `running` rows reset to `pending` before draining. A stale row
+    /// whose reap used its last attempt is not counted here: it is `failed`
+    /// and listed in `failures` (terminal).
     pub recovered_stale: u64,
     /// The job types this run had a handler for.
     pub registered: Vec<String>,
@@ -183,9 +201,9 @@ impl DrainReport {
     }
 }
 
-/// Drain the queue once: reset stale `running` rows, then claim and run the
-/// oldest pending job of a registered type, one at a time, until none is left
-/// or `max_runtime` has elapsed.
+/// Drain the queue once: reap stale `running` rows (a counted attempt, see
+/// [`STALE_AFTER`]), then claim and run the oldest pending job of a registered
+/// type, one at a time, until none is left or `max_runtime` has elapsed.
 ///
 /// Each job's final state is written back with `JobQueue::update`:
 /// `completed`; or, on a handler error, `pending` again with the retry counted
@@ -201,8 +219,22 @@ pub async fn drain(
     max_runtime: Duration,
 ) -> Result<DrainReport, JobError> {
     let started = Instant::now();
+    let resumable: Vec<String> = RESUMABLE_ON_REAP.iter().map(ToString::to_string).collect();
+    let reaped = queue
+        .reap_stale_jobs_counting_attempts(STALE_AFTER, &resumable)
+        .await?;
     let mut report = DrainReport {
-        recovered_stale: queue.recover_stale_jobs(STALE_AFTER).await?,
+        recovered_stale: reaped.iter().filter(|r| !r.failed).count() as u64,
+        failures: reaped
+            .iter()
+            .filter(|r| r.failed)
+            .map(|r| DrainFailure {
+                job_id: r.id,
+                job_type: r.job_type.clone(),
+                error: epigraph_jobs::REAPED_SPENT_MESSAGE.to_string(),
+                terminal: true,
+            })
+            .collect(),
         registered: {
             let mut t = runner.registered_job_types();
             t.sort();

@@ -62,6 +62,23 @@ use uuid::Uuid;
 /// Database errors are mapped to `JobError::ProcessingFailed` with
 /// descriptive messages. Callers should implement retry logic for
 /// transient failures.
+/// The `error_message` of a row the reaper failed: it was still `running`
+/// past the stale bound on its last attempt.
+pub const REAPED_SPENT_MESSAGE: &str = "reaped: still running past the stale bound on its last \
+     attempt (the drain run was killed or died mid-job); no further attempt";
+
+/// One row [`PostgresJobQueue::reap_stale_jobs_counting_attempts`] touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapedJob {
+    /// The job row.
+    pub id: Uuid,
+    /// Its type.
+    pub job_type: String,
+    /// `true`: the reap used its last attempt and the row is now `failed`.
+    /// `false`: it is back to `pending`.
+    pub failed: bool,
+}
+
 #[derive(Clone)]
 pub struct PostgresJobQueue {
     pool: PgPool,
@@ -692,6 +709,97 @@ impl PostgresJobQueue {
         .map_err(|e| JobError::ProcessingFailed {
             message: format!("Failed to count pending jobs: {e}"),
         })
+    }
+
+    /// The drain timer's reaper (`drain_jobs`, operator decision D9): reset
+    /// every `running` row whose `started_at` is older than `stale_threshold`,
+    /// COUNTING the reap as a used attempt, and fail the row outright once its
+    /// attempts are used up.
+    ///
+    /// # Why a reap counts
+    ///
+    /// Under D9 the queue is drained by a oneshot unit that systemd kills after
+    /// its start timeout. A job that needs longer than that is killed mid-run,
+    /// left `running`, reset by a later run's reaper, re-run and killed again.
+    /// [`Self::recover_stale_jobs`] resets without counting, so that loop never
+    /// ends and starves the queue behind it on every cycle. Counting the reap
+    /// bounds it by `max_retries`, like a handler error.
+    ///
+    /// The row that uses its last attempt here is set `failed` by the reaper
+    /// itself, with an `error_message` that says why, rather than left `pending`
+    /// for the runner's pre-check to fail without a word.
+    ///
+    /// # `resumable_types` are reset WITHOUT counting
+    ///
+    /// The privatization handlers are built around ONE attempt plus
+    /// re-delivery (`max_retries = 1`, see `repos/privatization.rs`): a worker
+    /// that died after committing its terminal write is re-delivered, and the
+    /// handler's own state check makes that re-delivery a no-op refusal. A
+    /// counted reap would fail such a job before the handler runs and leave its
+    /// plan mid-flight. Those types keep [`Self::recover_stale_jobs`]'
+    /// behaviour.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error or an invalid duration.
+    #[instrument(skip(self))]
+    pub async fn reap_stale_jobs_counting_attempts(
+        &self,
+        stale_threshold: std::time::Duration,
+        resumable_types: &[String],
+    ) -> Result<Vec<ReapedJob>, JobError> {
+        let cutoff = Utc::now()
+            - chrono::Duration::from_std(stale_threshold).map_err(|e| {
+                JobError::ProcessingFailed {
+                    message: format!("Invalid duration: {e}"),
+                }
+            })?;
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            r"
+            WITH stale AS (
+                SELECT id,
+                       NOT (job_type = ANY($2)) AS counted,
+                       NOT (job_type = ANY($2)) AND retry_count + 1 >= max_retries AS spent
+                  FROM jobs
+                 WHERE state = 'running' AND started_at < $1
+                 FOR UPDATE SKIP LOCKED
+            )
+            UPDATE jobs j
+               SET retry_count   = CASE WHEN s.counted THEN j.retry_count + 1
+                                        ELSE j.retry_count END,
+                   state         = CASE WHEN s.spent THEN 'failed' ELSE 'pending' END,
+                   started_at    = CASE WHEN s.spent THEN j.started_at ELSE NULL END,
+                   completed_at  = CASE WHEN s.spent THEN NOW() ELSE j.completed_at END,
+                   error_message = CASE WHEN s.spent THEN $3 ELSE j.error_message END,
+                   updated_at    = NOW()
+              FROM stale s
+             WHERE j.id = s.id
+            RETURNING j.id, j.job_type, j.state
+            ",
+        )
+        .bind(cutoff)
+        .bind(resumable_types)
+        .bind(REAPED_SPENT_MESSAGE)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to reap stale jobs: {e}"),
+        })?;
+        let reaped: Vec<ReapedJob> = rows
+            .into_iter()
+            .map(|(id, job_type, state)| ReapedJob {
+                id,
+                job_type,
+                failed: state == "failed",
+            })
+            .collect();
+        if !reaped.is_empty() {
+            tracing::warn!(
+                reaped = reaped.len(),
+                failed = reaped.iter().filter(|r| r.failed).count(),
+                "Reaped stale running jobs"
+            );
+        }
+        Ok(reaped)
     }
 
     /// Recover stale running jobs.
