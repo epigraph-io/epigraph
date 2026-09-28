@@ -59,7 +59,14 @@ pub const WRITER_COLUMNS: &[(&str, Option<&str>)] = &[
     ("claim_signature_revocations", Some("revoked_by")),
 ];
 
-/// `edges.signer_id` is the writer of an edge.
+/// `edges.signer_id` is the writer of an edge, as far as this tool's
+/// `--derived keep-writer` mode reads one.
+///
+/// On legacy rows `signer_id` is, where set, a BULK ATTESTATION key rather than
+/// an author, so it attributes nothing. Since migration 120 the author record
+/// is `edges.writer_group_id` (a group, set from the writing session), and a
+/// re-own never rewrites a public edge, so this column no longer decides where
+/// any edge lands.
 pub const EDGE_WRITER: &str = "signer_id";
 
 /// How a table hangs off a claim.
