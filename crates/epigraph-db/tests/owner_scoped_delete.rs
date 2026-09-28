@@ -3,9 +3,11 @@
 //! 077's FOR ALL policies used the READ predicate as DELETE's USING, so the
 //! rows a session could remove were the rows it could read. 115 adds one
 //! RESTRICTIVE, FOR DELETE policy per table (owner in the writable set; for
-//! `edges` also the co-owner, and the source's writer for an edge nobody owns),
-//! and moves the three cascades that remove other writers' edge-keyed BBAs
-//! behind an audited definer.
+//! `edges` also the co-owner, and until migration 120 the source's writer for
+//! an edge nobody owns), and moves the three cascades that remove other
+//! writers' edge-keyed BBAs behind an audited definer. Migration 120 (D8)
+//! removed the source-writer arm: an edge between two public claims is now its
+//! writer's, and a world-owned edge is administrative.
 //!
 //! Migration 117 then made those cascades an ADMINISTRATIVE act: the definer
 //! keeps only its owner arm (a non-privileged call over another writer's row
@@ -473,54 +475,94 @@ async fn an_owner_deletes_its_own_claim_and_every_edge_pointing_at_it(pool: PgPo
     );
 }
 
-/// An edge nobody owns (both endpoints public) is deletable by the writer of
-/// its SOURCE, and by nobody else: the `workflow_steps.rs` step rewire shape.
-/// A group-owned edge is deletable by its owner's writers.
+/// Migration 120 (D8) removed 115's source-writer arm. A world-owned edge (a
+/// legacy edge, or one written without a principal) is deletable by NO
+/// application session: not by the writer of its source claim, not by the
+/// writer of its target, not by a bystander. Only a privileged session removes
+/// it. An edge a writer wrote between two public claims is that writer's, so
+/// the SOURCE claim's writer cannot delete another writer's edge either, and
+/// the edge's own writer can. A group-owned edge is deletable by its owner's
+/// writers, as before.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_world_owned_edge_is_deletable_by_its_sources_writer_only(pool: PgPool) {
+async fn a_world_owned_edge_is_deletable_by_no_application_session(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (w, w_group) = fixture::seed_agent_with_group(&pool, "source-writer").await;
     let (x, _) = fixture::seed_agent_with_group(&pool, "bystander").await;
+    let (z, _) = fixture::seed_agent_with_group(&pool, "edge-writer-z").await;
     let mine = seed_public_claim_owned_by(&pool, w, w_group, "W's public claim").await;
     let world = fixture::seed_public_claim(&pool, author, "a world claim").await;
     let private = fixture::seed_group_claim(&pool, w, w_group, "W's private claim").await;
     let out_edge = fixture::seed_edge(&pool, mine, world).await;
     let in_edge = fixture::seed_edge(&pool, world, mine).await;
     let group_edge = fixture::seed_edge(&pool, world, private).await;
-    let group_owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM edges WHERE id = $1")
-        .bind(group_edge)
-        .fetch_one(&pool)
-        .await
-        .expect("group edge owner");
-    assert_eq!(group_owner, w_group, "fixture shape: the meet is W's group");
+    let owners: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT owner_group_id FROM edges WHERE id = ANY($1) ORDER BY array_position($1, id)",
+    )
+    .bind(vec![out_edge, in_edge, group_edge])
+    .fetch_all(&pool)
+    .await
+    .expect("edge owners");
+    assert_eq!(
+        owners,
+        vec![WORLD, WORLD, w_group],
+        "fixture shape: two principal-less (world) edges and the meet"
+    );
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
-    let (x_out, w_in, w_out, w_group_edge) =
+    let (x_out, w_in, w_out, z_edge, w_on_z, z_on_z, w_group_edge) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             stamp(&mut conn, &p, x).await;
             let x_out = delete_by_id(&mut conn, "edges", out_edge).await;
             stamp(&mut conn, &p, w).await;
             let w_in = delete_by_id(&mut conn, "edges", in_edge).await;
             let w_out = delete_by_id(&mut conn, "edges", out_edge).await;
+            // Z links FROM W's claim: Z's edge, whose source W writes.
+            stamp(&mut conn, &p, z).await;
+            let z_edge: Uuid = sqlx::query_scalar(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+                 VALUES ($1, 'claim', $2, 'claim', 'supports') RETURNING id",
+            )
+            .bind(mine)
+            .bind(world)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("Z links from W's claim");
+            stamp(&mut conn, &p, w).await;
+            let w_on_z = delete_by_id(&mut conn, "edges", z_edge).await;
             let w_group_edge = delete_by_id(&mut conn, "edges", group_edge).await;
-            (conn, (x_out, w_in, w_out, w_group_edge))
+            stamp(&mut conn, &p, z).await;
+            let z_on_z = delete_by_id(&mut conn, "edges", z_edge).await;
+            (
+                conn,
+                (x_out, w_in, w_out, z_edge, w_on_z, z_on_z, w_group_edge),
+            )
         })
         .await;
+    assert_eq!(x_out, 0, "a bystander cannot delete a world-owned edge");
+    assert_eq!(w_in, 0, "nor can the writer of its target");
     assert_eq!(
-        x_out, 0,
-        "a bystander cannot delete W's outgoing world-owned edge"
+        w_out, 0,
+        "nor can the writer of its SOURCE: 115's source-writer arm is gone"
     );
     assert_eq!(
-        w_in, 0,
-        "W cannot delete a world-owned edge whose source it cannot write"
+        w_on_z, 0,
+        "the source claim's writer cannot delete another writer's edge"
     );
-    assert_eq!(
-        w_out, 1,
-        "W deletes the world-owned edge its own claim sources"
-    );
+    assert_eq!(z_on_z, 1, "the edge's own writer deletes it");
     assert_eq!(w_group_edge, 1, "W deletes an edge its group owns");
     assert!(exists(&pool, "edges", in_edge).await);
+    assert!(exists(&pool, "edges", out_edge).await);
+    assert!(!exists(&pool, "edges", z_edge).await);
+
+    // Privileged: the only session that removes a world-owned edge.
+    let n = delete_by_id(
+        &mut pool.acquire().await.expect("acquire"),
+        "edges",
+        out_edge,
+    )
+    .await;
+    assert_eq!(n, 1, "a privileged session removes a legacy edge");
 }
 
 // ===========================================================================

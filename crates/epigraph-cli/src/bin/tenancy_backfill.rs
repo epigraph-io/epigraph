@@ -935,8 +935,15 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 const DEFINER_FUNCTIONS: &[&str] = &[
     "epigraph_claims_require_tenancy",
     "epigraph_node_tenancy",
+    // Last redefined by migration 120 (writer-owned edges: CREATE OR REPLACE,
+    // re-owned in its section 9). Kept HERE, unconditional, rather than moved
+    // to `DEFERRED_DEFINER_FUNCTIONS` at 120: both exist since 070, and the
+    // deferred register is presence-gated, so moving them would turn "a
+    // missing 070 body is a finding" into "skipped".
     "epigraph_edges_tenancy",
     "epigraph_inherit_tenancy_stmt",
+    // Last redefined by migration 120 (114's body plus the `m.v = 'group'`
+    // conjunct on the edges statement); see the note above.
     "epigraph_propagate_tenancy",
     // `epigraph_ownership_transcribe` (071) was the sixth entry until PR-22.
     // Migration 084 drops the function with the table it wrote through, so an
@@ -1071,6 +1078,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_session_writes_node", 115),
     ("epigraph_cascade_delete_edge_bbas", 115),
     ("epigraph_cascade_delete_node_edges", 115),
+    // 120, writer-owned edges (D8). The scope predicate is IMMUTABLE SQL and
+    // reads no table, so its owner changes no answer; it is registered because
+    // the tenancy trigger (a maintenance-owned definer) must hold EXECUTE on
+    // it, which the migration grants to the maintenance role. The legacy
+    // re-own fails CLOSED under a non-member owner: its `edges` UPDATE is
+    // refused by 117's owner-scoped policy, so it re-owns nothing with an
+    // error, which a green pre-flight must not hide.
+    ("epigraph_edge_writer_scope", 120),
+    ("epigraph_reown_legacy_edges_to_signer", 120),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

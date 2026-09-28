@@ -609,9 +609,41 @@ Current reservation:
   `epigraph_maintenance`). Undo is in the file's header. **Applied to
   throwaway databases only (5433, with 113), NOT to any deployed database.**
 
-- **120+**: public next (120 is reserved for batch W12b)
+- **120**: public `writer_owned_edges` (batch W12b, operator decision D8) — an
+  edge between two public claims is owned by its WRITER's group and stays
+  public. `edges.writer_group_id` (nullable, no default, no FK) records the
+  writing session's group (`epigraph_writer_group()`) on every INSERT, whatever
+  the caller bound; it is never recomputed, `edges_owner_immutable` now watches
+  it, and only the privatization revert reads it.
+  `epigraph_edge_writer_scope(src_type, tgt_type)` (IMMUTABLE) is D8's scope:
+  both endpoints `claim` / `evidence`, or a `synthesis` source. In scope and
+  both endpoints public, `epigraph_edges_tenancy()` owns the edge by the
+  writer's group (world when the session has no principal or no writable
+  group; this applies to privileged sessions that carry a principal too, a
+  deliberate difference from 114 section 2(b)); a re-point of a public edge
+  keeps its owner (arm (u)); every other public-meet edge (agent, paper,
+  workflow, trace ... endpoints) stays `('public', world)`, administrative; 072's
+  no-widening arm and four meet arms are unchanged.
+  `epigraph_propagate_tenancy()` is 114's body plus one conjunct (`m.v =
+  'group'`): a public-to-public owner change of an endpoint never rewrites a
+  public edge. `edges_delete_owner` loses 115's source-writer arm (owner and
+  co-owner only). `epigraph_record_cascade_deferral` accepts cause
+  `edge_retract` (an edge owner's retract or delete; the replay removes other
+  writers' edge-keyed BBAs). `epigraph_reown_legacy_edges_to_signer(p_limit,
+  p_exclude_signers)` (maintenance only, NOT run by the migration; the
+  exclusion list is mandatory) re-owns a legacy world edge to a signer that
+  resolves to an operator or personal group. 077's `edges_tenancy` WITH CHECK
+  world arm is kept (principal-less and out-of-scope inserts). Carries `SET
+  LOCAL lock_timeout = '3s'` (the column add takes ACCESS EXCLUSIVE; apply in a
+  maintenance window, re-run on a timeout). Behaviour in
+  `epigraph-db/tests/writer_owned_edges.rs`. **Deploy order: apply 120 only
+  once per-caller HTTP identity serves, and BEFORE any binary built with it
+  serves.** Undo is in the file's header. **Applied to throwaway databases only
+  (5433, with 113), NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `120` or
+- **121+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `121` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

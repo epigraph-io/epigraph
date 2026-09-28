@@ -520,13 +520,14 @@ async fn no_other_table_restamps_its_owner_on_update(pool: PgPool) {
     );
 }
 
-/// The restrictive WITH CHECK where 077's permissive one would admit: an edge
-/// W's group owns with `visibility = 'public'` between two public claims. W
-/// may update it, but re-pointing its source at another public claim makes the
-/// restamp stamp it `('public', world)` -- a row nobody owns, which 077's world
-/// arm admits and 117's WITH CHECK refuses. W cannot hand its edge to nobody.
+/// An edge W's group owns with `visibility = 'public'` between two public
+/// claims. Before migration 120 re-pointing its source at another public claim
+/// made the restamp stamp it `('public', world)` -- a row nobody owns, which
+/// 117's WITH CHECK refused. Since 120 (D8) the restamp keeps a public edge's
+/// owner (arm (u)), so the owner's re-point is admitted and the edge is still
+/// W's: W can neither lose its edge nor hand it to nobody by re-pointing it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_owner_cannot_hand_its_edge_to_nobody_by_repointing_it(pool: PgPool) {
+async fn an_owner_repoints_its_public_edge_and_still_owns_it(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (w, g) = fixture::seed_agent_with_group(&pool, "owner-w").await;
     let a = fixture::seed_public_claim(&pool, author, "public claim A").await;
@@ -569,14 +570,14 @@ async fn an_owner_cannot_hand_its_edge_to_nobody_by_repointing_it(pool: PgPool) 
     );
     assert_eq!(
         repoint,
-        Err("42501".to_string()),
-        "a re-point whose restamp leaves the edge world-owned is refused"
+        Ok(1),
+        "the owner's re-point of its public edge is admitted"
     );
     let after = edge_row(&pool, edge).await;
     assert_eq!(
-        (after.0, after.2),
-        (a, g),
-        "the edge kept its source and owner"
+        (after.0, after.2, after.3),
+        (c, g, None),
+        "the edge moved and W's group still owns it"
     );
 }
 

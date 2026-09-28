@@ -1333,6 +1333,15 @@ async fn arm_d_body_carries_the_three_case_meet_over_co_ownership(pool: PgPool) 
         "the idempotence guard must compare the whole TRIPLE; on the pair alone \
          a co-ownership-only change would not be written.\n\n{src}"
     );
+    // Migration 120 (D8): the edges statement writes only where the new meet
+    // is NON-public, so a public-to-public owner change of an endpoint (the
+    // operator re-own and its reverse) never rewrites a public edge, and a
+    // writer-owned edge keeps its writer. Behaviour:
+    // `writer_owned_edges.rs::a_public_owner_change_leaves_public_edges_and_a_narrowing_takes_the_meet`.
+    assert!(
+        src.contains("AND m.v = 'group'"),
+        "the edges UPDATE must carry 120's `m.v = 'group'` conjunct.\n\n{src}"
+    );
     // Arm (d) must never raise — see this file's arm (d) tests for why.
     assert!(
         !src.contains("edge spans groups"),
