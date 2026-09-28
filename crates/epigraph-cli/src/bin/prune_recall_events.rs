@@ -31,7 +31,7 @@ struct Cli {
 
     /// Retention window in days. Defaults to RECALL_EVENTS_RETENTION_DAYS,
     /// then to 90.
-    #[arg(long, env = "RECALL_EVENTS_RETENTION_DAYS")]
+    #[arg(long, env = "RECALL_EVENTS_RETENTION_DAYS", hide_env_values = true)]
     retention_days: Option<i32>,
 
     /// Report how many rows WOULD be deleted without deleting them.

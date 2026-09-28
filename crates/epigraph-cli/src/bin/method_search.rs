@@ -34,7 +34,7 @@ struct Args {
     /// no working path to preserve. Naming the author is also what makes a
     /// tenancy declaration possible: `--public` owns the row with the author's
     /// personal group, and without an author there is no group to name.
-    #[arg(long, env = "EPIGRAPH_AGENT_ID")]
+    #[arg(long, env = "EPIGRAPH_AGENT_ID", hide_env_values = true)]
     agent_id: Uuid,
 
     /// Only process methods with evidence_score < 0.3

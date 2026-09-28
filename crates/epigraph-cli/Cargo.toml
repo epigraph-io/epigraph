@@ -135,6 +135,13 @@ name = "recompute_betp_run"
 path = "tests/recompute_betp_run.rs"
 required-features = ["db"]
 
+# Runs most of this crate's `db`-gated binaries' `--help`; without `db` their
+# `CARGO_BIN_EXE_*` do not exist and the test would not compile.
+[[test]]
+name = "help_hides_env_values"
+path = "tests/help_hides_env_values.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "bootstrap_clients"
 path = "src/bin/bootstrap_clients.rs"
