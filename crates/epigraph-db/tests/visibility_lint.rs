@@ -953,6 +953,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "security_event.rs",
+        "connection_origin_conn",
+        "READ of no table at all: `host(inet_client_addr())` and the session's \
+         `application_name`, the server's view of the CONNECTION it runs on. There is nothing to \
+         filter, so no viewer. Its only caller is `epigraph-operator grant-client-scope` / \
+         `revoke-client-scope` (batch OA1), which records the two values beside the login and the \
+         kernel uid in the `security_events` row it writes on the same transaction.",
+    ),
+    (
+        "security_event.rs",
         "correlation_is_attributed_to_conn",
         "READ of `security_events`, returning a BOOLEAN and no rows. It is the machine form of \
          FINAL-PLAN §6.5.5's sixth condition. MUST be the maintenance connection: migration 077's \
