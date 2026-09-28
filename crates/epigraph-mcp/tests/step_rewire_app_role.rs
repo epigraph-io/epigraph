@@ -106,7 +106,8 @@ struct Legacy {
 /// claims owned by the WORLD group (the shape pre-tenancy rows were
 /// backfilled to), chained `s0 -> s1 -> s2` by world-owned `step_follows`
 /// edges. No application session writes the world group, so none may delete
-/// those edges (115: owner, co-owner, or the source claim's writer).
+/// those edges (migration 120: owner or co-owner only; 115's source-writer arm
+/// is gone).
 async fn legacy_workflow(pool: &PgPool) -> Legacy {
     fixture::seed_agent_with_group(pool, "legacy-author").await;
     let world = fixture::world_group(pool).await;
@@ -310,4 +311,157 @@ async fn delete_step_on_a_claim_it_cannot_write_is_refused(pool: PgPool) {
         e.message.contains("not changed") || e.message.contains("cannot"),
         "the refusal says the step was not soft-deleted: {e:?}"
     );
+}
+
+/// Migration 120: the rewire's refusal probe counts a RETRACTED `prev -> next`
+/// too, because `ordered_steps` follows retracted `step_follows` rows (`LIMIT
+/// 1`, no `valid_to` filter). A legacy chain whose only `s0 -> s1` link is
+/// retracted (and world-owned, so no session may delete it) still refuses a
+/// mid-chain insert, with nothing written and the order unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_prev_to_next_alone_also_refuses_the_rewire(pool: PgPool) {
+    let wf = legacy_workflow(&pool).await;
+    let (s0, s1, s2) = (wf.steps[0].0, wf.steps[1].0, wf.steps[2].0);
+    let retracted = sqlx::query(
+        "UPDATE edges SET valid_to = now() - interval '1 hour' \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
+    )
+    .bind(s0)
+    .bind(s1)
+    .execute(&pool)
+    .await
+    .expect("retract s0 -> s1 (privileged)")
+    .rows_affected();
+    assert_eq!(retracted, 1, "fixture shape");
+    let workflow_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM workflows WHERE canonical_name = $1")
+            .bind(&wf.name)
+            .fetch_one(&pool)
+            .await
+            .expect("workflow id");
+    let order = || async {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_ingest_executor::workflow_steps::ordered_steps(&mut conn, workflow_id)
+            .await
+            .expect("ordered_steps")
+    };
+    assert_eq!(
+        order().await,
+        vec![s0, s1, s2],
+        "calibration: the walk follows the retracted link"
+    );
+    let before = step_count(&pool, &wf.name).await;
+    let server = app_role_server(&pool).await;
+
+    let r = epigraph_mcp::tools::step_ops::add_step(
+        &server,
+        AddStepParams {
+            canonical_name: wf.name.clone(),
+            step_text: "inserted mid-chain".to_string(),
+            position: Some(1),
+        },
+    )
+    .await;
+    let e = r.expect_err("a retracted prev -> next the session cannot remove is refused");
+    assert!(e.message.contains("step_follows"), "{e:?}");
+    let all_out: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'step_follows'",
+    )
+    .bind(s0)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        all_out, 1,
+        "exactly one step_follows out of s0, retracted or not"
+    );
+    assert_eq!(step_count(&pool, &wf.name).await, before, "nothing written");
+    assert_eq!(order().await, vec![s0, s1, s2], "the order is unchanged");
+}
+
+/// Operator default W12-OD2: `add_step` writes under the shared
+/// `workflow-ingest-system` principal, so after migration 120 its chain edges
+/// between two step claims (`step_follows`, `decomposes_to`) are owned by THAT
+/// agent's writer group, whichever MCP caller asked, and `executes` (workflow
+/// -> claim) is a structural edge outside D8's scope, so world-owned. Two
+/// servers with different signing agents therefore share the chain: the second
+/// rewires the first's links. The caller's AUTHORITY over the workflow is the
+/// app-layer check the per-caller identity batch adds, which is not in this
+/// branch's base; this pins the database half only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_callers_chain_edges_share_the_workflow_ingest_owner(pool: PgPool) {
+    let wf = legacy_workflow(&pool).await;
+    let s2 = wf.steps[2].0;
+    let url = fixture::database_url_for(&pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let plain = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let first = build_scoped_test_server(plain.clone(), scoped.clone());
+    let second = build_scoped_test_server_generated_signer(plain, scoped);
+    let first_agent = first.server_agent_id().await.expect("agent");
+    let second_agent = second.server_agent_id().await.expect("agent");
+    assert_ne!(first_agent, second_agent, "two different callers");
+
+    async fn add(server: &EpiGraphMcpFull, name: &str, text: &str, position: Option<u32>) -> Uuid {
+        let r = epigraph_mcp::tools::step_ops::add_step(
+            server,
+            AddStepParams {
+                canonical_name: name.to_string(),
+                step_text: text.to_string(),
+                position,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("add_step {text}: {e:?}"));
+        parse_uuid_field(&first_text(&r), "step_claim_id")
+    }
+    let a = add(&first, &wf.name, "by the first caller", None).await;
+    let b = add(&second, &wf.name, "by the second caller", None).await;
+
+    let system: Uuid =
+        sqlx::query_scalar("SELECT id FROM agents WHERE display_name = 'workflow-ingest-system'")
+            .fetch_one(&pool)
+            .await
+            .expect("the workflow-ingest-system agent");
+    let shared = personal_group_of(&pool, system).await;
+    let world = fixture::world_group(&pool).await;
+    let owners: Vec<(String, Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT relationship, owner_group_id, writer_group_id FROM edges \
+          WHERE target_id = ANY($1) ORDER BY relationship, target_id",
+    )
+    .bind(vec![a, b])
+    .fetch_all(&pool)
+    .await
+    .expect("the new edges");
+    assert!(!owners.is_empty());
+    for (rel, owner, writer) in &owners {
+        assert_eq!(
+            *writer,
+            Some(shared),
+            "{rel}: the author record is the shared agent's"
+        );
+        let want = if rel == "executes" { world } else { shared };
+        assert_eq!(*owner, want, "{rel}: {owners:?}");
+    }
+    for g in [
+        personal_group_of(&pool, first_agent).await,
+        personal_group_of(&pool, second_agent).await,
+    ] {
+        assert!(
+            owners.iter().all(|(_, o, _)| *o != g),
+            "no caller's own group owns a chain edge"
+        );
+    }
+    assert_eq!(successors(&pool, s2).await, vec![a]);
+
+    // The accepted residual: the second caller rewires the first caller's link.
+    let mid = add(&second, &wf.name, "between the two callers", Some(4)).await;
+    assert_eq!(
+        successors(&pool, a).await,
+        vec![mid],
+        "a -> mid, a -> b gone"
+    );
+    assert_eq!(successors(&pool, mid).await, vec![b]);
 }
