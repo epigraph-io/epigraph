@@ -20,9 +20,12 @@ mod viewer_fixture;
 
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
+use axum::Extension;
 use axum::Json;
 use epigraph_api::errors::ApiError;
+use epigraph_api::middleware::bearer::AuthContext;
 use epigraph_api::middleware::bearer::ViewerExtractor;
+use epigraph_api::middleware::ClientType;
 use epigraph_api::routes::edges::{
     create_edge, create_hierarchical_edge, delete_edge, patch_edge, relate_claims,
     CreateEdgeRequest, LinkHierarchicalRequest, PatchEdgeRequest, RelateClaimsRequest,
@@ -65,6 +68,24 @@ async fn app_role_state(pool: &PgPool) -> AppState {
 
 async fn viewer(pool: &PgPool, agent: Uuid) -> Viewer {
     Viewer::resolve(pool, agent).await.expect("resolve")
+}
+
+/// The `AuthContext` `bearer_auth_middleware` attaches for `agent`'s token with
+/// `scopes`. The converted handlers take `ViewerExtractor`, which refuses a
+/// request without one, so they check the scope unconditionally.
+fn auth_with(agent: Uuid, scopes: &[&str]) -> Option<Extension<AuthContext>> {
+    Some(Extension(AuthContext {
+        client_id: agent,
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: ClientType::Service,
+        scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+        jti: Uuid::new_v4(),
+    }))
+}
+
+fn auth(agent: Uuid) -> Option<Extension<AuthContext>> {
+    auth_with(agent, &["edges:write"])
 }
 
 /// `(owner, visibility, co_owner, writer_group_id, valid_to IS NULL, properties)`.
@@ -148,11 +169,50 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
     let w_private = seed_group_claim(&pool, w, w_g, "w12b http W-private").await;
     let hidden = seed_edge(&pool, w_private, a).await;
 
+    // The scope check is unconditional in the converted handlers: a token
+    // without `edges:write` is refused, and so is a request that reaches the
+    // handler with no `AuthContext` (unreachable behind `ViewerExtractor`, but
+    // the handler no longer treats it as "skip the check"). Nothing written.
+    let edges_before: i64 = sqlx::query_scalar("SELECT count(*) FROM edges")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    let no_scope = create_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth_with(w, &["claims:read"]),
+        Json(create_body(a, b)),
+    )
+    .await
+    .expect_err("no edges:write scope");
+    assert!(
+        matches!(no_scope, ApiError::Forbidden { .. }),
+        "{no_scope:?}"
+    );
+    let no_auth = delete_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        None,
+        Path(world_edge),
+    )
+    .await
+    .expect_err("no AuthContext");
+    assert!(
+        matches!(no_auth, ApiError::Unauthorized { .. }),
+        "{no_auth:?}"
+    );
+    let edges_after: i64 = sqlx::query_scalar("SELECT count(*) FROM edges")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(edges_after, edges_before, "nothing written");
+    assert!(row(&pool, world_edge).await.4, "the world edge is in force");
+
     // W creates: 201, its own, the author record set.
     let (status, Json(created)) = create_edge(
         ViewerExtractor(viewer(&pool, w).await),
         State(state.clone()),
-        None,
+        auth(w),
         Json(create_body(a, b)),
     )
     .await
@@ -170,7 +230,7 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
     let refused = patch_edge(
         ViewerExtractor(viewer(&pool, z).await),
         State(state.clone()),
-        None,
+        auth(z),
         Path(edge),
         Json(note("by z")),
     )
@@ -180,7 +240,7 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
     let refused = delete_edge(
         ViewerExtractor(viewer(&pool, z).await),
         State(state.clone()),
-        None,
+        auth(z),
         Path(edge),
     )
     .await
@@ -196,7 +256,7 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
     let refused = delete_edge(
         ViewerExtractor(viewer(&pool, z).await),
         State(state.clone()),
-        None,
+        auth(z),
         Path(world_edge),
     )
     .await
@@ -205,7 +265,7 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
     let missing = delete_edge(
         ViewerExtractor(viewer(&pool, z).await),
         State(state.clone()),
-        None,
+        auth(z),
         Path(hidden),
     )
     .await
@@ -216,7 +276,7 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
     let Json(patched) = patch_edge(
         ViewerExtractor(viewer(&pool, w).await),
         State(state.clone()),
-        None,
+        auth(w),
         Path(edge),
         Json(note("by w")),
     )
@@ -226,7 +286,7 @@ async fn the_owner_writes_its_edge_over_http_and_a_bystander_is_refused_by_name(
     let status = delete_edge(
         ViewerExtractor(viewer(&pool, w).await),
         State(state.clone()),
-        None,
+        auth(w),
         Path(edge),
     )
     .await
@@ -265,7 +325,7 @@ async fn hierarchical_and_relate_are_the_callers_and_a_mixed_edge_is_decided_by_
     let (_, Json(h)) = create_hierarchical_edge(
         ViewerExtractor(viewer(&pool, w).await),
         State(state.clone()),
-        None,
+        auth(w),
         Json(LinkHierarchicalRequest {
             source_claim_id: a,
             target_claim_id: b,
@@ -281,7 +341,7 @@ async fn hierarchical_and_relate_are_the_callers_and_a_mixed_edge_is_decided_by_
     let (_, Json(rel)) = relate_claims(
         ViewerExtractor(viewer(&pool, w).await),
         State(state.clone()),
-        None,
+        auth(w),
         Path(a),
         Json(RelateClaimsRequest {
             target_claim_id: b,
@@ -308,7 +368,7 @@ async fn hierarchical_and_relate_are_the_callers_and_a_mixed_edge_is_decided_by_
     let refused = create_edge(
         ViewerExtractor(viewer(&pool, reader).await),
         State(state.clone()),
-        None,
+        auth(reader),
         Json(create_body(a, private)),
     )
     .await

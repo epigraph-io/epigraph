@@ -67,9 +67,13 @@
 //! INSERT, and the provenance rows of `delete_edge`, `patch_edge` and
 //! `relate_claims`. Stamping them is follow-up work.
 //!
-//! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES` and
-//! `AUTH_OPTIONAL_PROVENANCE_SITES` rows for this file all sit in those write
-//! handlers and are unchanged.
+//! The five converted handlers take `ViewerExtractor`, which refuses a request
+//! with no `AuthContext`; their `edges:write` scope check and their provenance
+//! blocks are therefore unconditional (`let Some(..) = auth_ctx else { return
+//! Err(Unauthorized) }`), and this file has no row left in
+//! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES` or
+//! `AUTH_OPTIONAL_PROVENANCE_SITES`. The routes sit behind
+//! `bearer_auth_middleware` either way, so this is not an auth-posture change.
 //!
 //! [`ApiError::EdgeNotOwned`]: crate::errors::ApiError::EdgeNotOwned
 //! [`AppState::write_as`]: crate::AppState::write_as
@@ -653,10 +657,14 @@ pub async fn create_edge(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateEdgeRequest>,
 ) -> Result<(StatusCode, Json<CreateEdgeResponse>), ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     // ONE transaction stamped with the CALLER's viewer (migration 120, D8):
     // the validation reads, the existence probes and the INSERT. Unstamped, an
@@ -871,8 +879,8 @@ pub async fn create_edge(
     // whole purpose of if_not_exists for drainer retries. DS recomputation
     // (above) is the one exception — see its comment for why.
     if was_created {
-        // Record provenance when OAuth2-authenticated
-        if let Some(axum::Extension(ref auth)) = auth_ctx {
+        // Record provenance (always authenticated here: see the scope check).
+        {
             let hash_input = format!(
                 "{}:{}:{}",
                 request.source_id, request.relationship, request.target_id
@@ -1000,10 +1008,14 @@ pub async fn delete_edge(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     // Stamped with the CALLER's viewer (migration 120): the edge's owner or
     // co-owner retracts it; anybody else who can read it is refused by name.
@@ -1042,8 +1054,8 @@ pub async fn delete_edge(
         message: format!("Failed to commit the retraction: {e}"),
     })?;
 
-    // Record provenance when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    // Record provenance (always authenticated here: see the scope check).
+    {
         let content_hash = blake3::hash(id.as_bytes());
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
@@ -1160,10 +1172,14 @@ pub async fn create_hierarchical_edge(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<LinkHierarchicalRequest>,
 ) -> Result<(StatusCode, Json<LinkHierarchicalResponse>), ApiError> {
-    // Enforce scope when OAuth2-authenticated (mirrors generic POST /api/v1/edges).
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     // Tight relationship allow-list — narrower than VALID_RELATIONSHIPS by design.
     if !is_hierarchical_relationship(&request.relationship) {
@@ -1291,10 +1307,14 @@ pub async fn patch_edge(
     Path(id): Path<Uuid>,
     Json(request): Json<PatchEdgeRequest>,
 ) -> Result<Json<EdgeResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated (mirrors create_edge / delete_edge).
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     if request.is_empty() {
         return Err(ApiError::ValidationError {
@@ -1375,8 +1395,8 @@ pub async fn patch_edge(
     // blake3(id.as_bytes()) and patch_payload was None — same edge always
     // produced the same hash no matter what changed. The provenance log was
     // reduced to "this edge was patched at some point," losing all diff
-    // information.
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    // information. Always authenticated here: see the scope check.
+    {
         let diff_bytes = serde_json::to_vec(&diff).unwrap_or_default();
         let content_hash = blake3::hash(&diff_bytes);
         if let Err(e) = crate::middleware::provenance::record_provenance(
@@ -1481,10 +1501,14 @@ pub async fn relate_claims(
     Path(source_id): Path<Uuid>,
     Json(request): Json<RelateClaimsRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     if source_id == request.target_claim_id {
         return Err(ApiError::ValidationError {
@@ -1559,8 +1583,9 @@ pub async fn relate_claims(
     // after the commit on the raw pool, as before.
     let pool = &state.db_pool;
 
-    // Record provenance for both edges
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    // Record provenance for both edges (always authenticated here: see the
+    // scope check).
+    {
         for eid in [edge1, edge2] {
             let hash_input = format!("{}:RELATES_TO:{}", source_id, request.target_claim_id);
             let content_hash = blake3::hash(hash_input.as_bytes());
