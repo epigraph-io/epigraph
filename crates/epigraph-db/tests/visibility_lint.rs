@@ -1103,6 +1103,24 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          and membership decisions made under the old identity.",
     ),
     (
+        "oauth_client.rs",
+        "lock_by_id_conn",
+        "READ, `FOR UPDATE`, of one `oauth_clients` row: the table has no tenancy at all, the \
+         same absent-column argument as `get_by_id_conn` above. Its only caller is \
+         `epigraph-operator grant-client-scope` / `revoke-client-scope` (batch OA1), which runs \
+         on the maintenance DSN alone and refuses a login outside `epigraph_maintenance`; the \
+         row lock is what makes the scope change it computes a compare-and-swap.",
+    ),
+    (
+        "oauth_client.rs",
+        "set_scopes_conn",
+        "WRITE of `allowed_scopes` and `granted_scopes` on one `oauth_clients` row, a table with \
+         no tenancy (see `get_by_id_conn`). The authority is the caller's, not a row predicate: \
+         `epigraph-operator`'s scope commands (batch OA1) reach it only on the maintenance DSN, \
+         only for a HUMAN client and only for an admin-only scope, and write their \
+         `security_events` row on the same transaction.",
+    ),
+    (
         "privatization.rs",
         "create_previewed_plan",
         "WRITE of one `privatization_plans` row in the `previewed` state. `privatization_plans` \

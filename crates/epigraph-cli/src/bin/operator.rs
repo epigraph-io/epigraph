@@ -3,9 +3,10 @@
 //! See `epigraph_cli::operator` for what each subcommand does and why. This
 //! file is argument parsing and exit codes only.
 //!
-//! Every subcommand is a DRY RUN unless `--apply` is given, and every
-//! subcommand connects on `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` alone and refuses
-//! a session user that is not a member of `epigraph_maintenance`.
+//! Every subcommand is a DRY RUN unless `--apply` is given (the two scope
+//! commands take exactly one of `--dry-run` / `--apply`, and refuse neither),
+//! and every subcommand connects on `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` alone
+//! and refuses a session user that is not a member of `epigraph_maintenance`.
 //!
 //! Exit codes: 0 success; 1 refused or failed before writing (for
 //! `hide-evidence --apply`, also an invariant violation, rolled back); 2 a
@@ -22,16 +23,19 @@
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
 //!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
+//!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
+//!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 
 use clap::{Parser, Subcommand};
-use epigraph_cli::operator::{self, hide, link, reown, reverse};
+use epigraph_cli::operator::{self, client_scope, hide, link, reown, reverse};
 use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(
     name = "epigraph-operator",
-    about = "Operator ownership backfill: retired links, claim re-own, and its reversal"
+    about = "Operator ownership backfill (retired links, claim re-own, and its reversal) and \
+             audited admin-only scope grants on human OAuth clients"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -113,6 +117,13 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+    /// Grant ONE admin-only scope to a HUMAN's own OAuth client, in both
+    /// `allowed_scopes` and `granted_scopes`, with a `security_events` row.
+    GrantClientScope(ScopeArgs),
+    /// Revoke ONE admin-only scope from a HUMAN's own OAuth client, from both
+    /// arrays, with a `security_events` row. A live access token keeps the
+    /// scope until it expires; the next refresh drops it.
+    RevokeClientScope(ScopeArgs),
     /// Restore every row a manifest's run moved to the owner it recorded.
     ReownReverse {
         /// A manifest to reverse. Repeatable: several are applied newest-first
@@ -128,8 +139,32 @@ enum Command {
     },
 }
 
+/// The arguments of `grant-client-scope` and `revoke-client-scope`.
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("mode").required(true).args(["dry_run", "apply"])))]
+struct ScopeArgs {
+    /// The client's `oauth_clients.id` (a UUID; not the `client_id` string).
+    client: Uuid,
+    /// An admin-only scope (`epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES`).
+    scope: String,
+    /// Run everything, the audit row included, in a transaction that is rolled
+    /// back, and print what would change.
+    #[arg(long)]
+    dry_run: bool,
+    /// Commit the change and its audit row.
+    #[arg(long)]
+    apply: bool,
+    /// Recorded in the audit row.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
 async fn main_inner() -> anyhow::Result<i32> {
     let cli = Cli::parse();
+    // Refuse a non-admin-only scope before any connection is made.
+    if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
+        client_scope::validate_scope(&a.scope)?;
+    }
     if let Command::ReownClaims { batch_size, .. } | Command::ReownReverse { batch_size, .. } =
         &cli.command
     {
@@ -225,6 +260,35 @@ async fn main_inner() -> anyhow::Result<i32> {
                 lock_timeout,
             };
             hide::run_standalone(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(0)
+        }
+        Command::GrantClientScope(a) | Command::RevokeClientScope(a) if !a.dry_run && !a.apply => {
+            // Unreachable through clap (the `mode` group is required); kept so
+            // a refactor that drops the group cannot turn a bare invocation
+            // into a write.
+            anyhow::bail!("exactly one of --dry-run or --apply is required")
+        }
+        cmd @ (Command::GrantClientScope(_) | Command::RevokeClientScope(_)) => {
+            let (op, a) = match cmd {
+                Command::GrantClientScope(a) => (client_scope::ScopeOp::Grant, a),
+                Command::RevokeClientScope(a) => (client_scope::ScopeOp::Revoke, a),
+                _ => unreachable!("matched above"),
+            };
+            let who = client_scope::Operator {
+                session_user: db.session_user.clone(),
+                os_user: client_scope::Operator::os_user_from_env(),
+            };
+            let outcome = client_scope::run(
+                &mut conn,
+                op,
+                a.client,
+                &a.scope,
+                a.apply,
+                a.reason.as_deref(),
+                &who,
+            )
+            .await?;
+            println!("{}", client_scope::describe(&outcome));
             Ok(0)
         }
         Command::ReownReverse {
