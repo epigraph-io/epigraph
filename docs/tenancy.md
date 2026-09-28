@@ -432,8 +432,14 @@ refused on an edge the caller can read answers `not_owner` naming the rule
 retracts or deletes it, its own edge-keyed BBAs are deleted in the act and every
 other writer's are removed by the maintenance replay (cause `edge_retract`); the
 replay also re-derives the belief of the claims the owner's own BBAs lived on,
-which the deferral records, since the owner cannot write another owner's cache.
-A deferral names only an edge out of force (an act that deletes the row closes
+since the owner cannot write another owner's cache. The deferral definer derives
+those claims itself, from the session's own BBA rows keyed on the edge, before
+the act deletes them; a caller names none. So the replay re-derives only claims
+that carried a BBA keyed on the edge. A re-derivation recomputes a claim's
+belief from the rows it has, and clears a cache that no surviving row backs.
+Two acts on one edge before one replay are both re-derived: the replay reads the
+claims of every open deferral of the edge, not only the oldest one's. A
+deferral names only an edge out of force (an act that deletes the row closes
 its window first). The owner-only rule is row security: it is enforced for
 sessions on the application role, and a privileged session bypasses it.
 
