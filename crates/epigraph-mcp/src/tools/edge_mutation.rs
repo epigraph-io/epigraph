@@ -45,9 +45,15 @@
 //! reported as "not found" with nothing written. Before that gate (batch H-a
 //! review) neither tool took a viewer, so any `claims:write` caller could
 //! retire or relabel an edge touching a server-group-private claim it could not
-//! read. Whether the caller should also need OWNERSHIP of the edge (edges carry
-//! no author column; the candidates are its endpoints' authors) is the
-//! cross-agent authority question (H-b, #374), not this gate's.
+//! read.
+//!
+//! WRITE authority is the edge's OWNER (migrations 117/120, operator decision
+//! D8): an edge between two public claims is owned by its writer's group, so
+//! the writing session patches, retracts and deletes its own edge and nobody
+//! else's; a world-owned edge (legacy, principal-less, or structural) is
+//! administrative. A write the database refuses on an edge the caller CAN read
+//! answers the explicit `not_owner` refusal naming the rule
+//! (`errors::edge_not_owner`), never "not found".
 //!
 //! # `valid_to: "now"`
 //!
@@ -127,6 +133,27 @@ pub async fn patch_edge(
     do_patch_edge(server, viewer, params).await
 }
 
+/// Map a refused write on a VISIBLE edge to the explicit `not_owner` refusal
+/// (the rule named: another writer's edge, or an administrative one), and every
+/// other repo error through [`map_edge_err`]. Reads the edge's owner on the
+/// same transaction, through the caller's viewer.
+async fn refuse_or_map(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    edge_id: uuid::Uuid,
+    action: &str,
+    e: DbError,
+) -> McpError {
+    if !matches!(e, DbError::WriteRefused { .. }) {
+        return map_edge_err(e);
+    }
+    match EdgeRepository::refusal_for(&mut *conn, viewer, edge_id).await {
+        Ok(Some(refusal)) => crate::errors::edge_not_owner(refusal, edge_id, action),
+        Ok(None) => invalid_params(format!("edge {edge_id} not found")),
+        Err(read) => internal_error(read),
+    }
+}
+
 /// The caller-read gate both tools apply, on the write transaction.
 async fn require_visible_edge(
     conn: &mut sqlx::PgConnection,
@@ -191,14 +218,17 @@ pub async fn do_patch_edge(
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, actor_id, "patch_edge").await?;
     require_visible_edge(&mut tx, viewer, edge_id).await?;
-    let updated = EdgeRepository::update_valid_to_and_properties(
+    let updated = match EdgeRepository::update_valid_to_and_properties(
         &mut *tx,
         edge_id,
         valid_to,
         params.properties,
     )
     .await
-    .map_err(map_edge_err)?;
+    {
+        Ok(updated) => updated,
+        Err(e) => return Err(refuse_or_map(&mut tx, viewer, edge_id, "patch", e).await),
+    };
 
     // Best-effort durable events, mirroring the HTTP route's pair.
     let _ = EventRepository::publish_or_log_conn(
@@ -276,9 +306,10 @@ pub async fn do_delete_edge(
     // `EdgeRepository::delete` reports absence as `Ok(false)`, not
     // `DbError::NotFound`, so the 404-equivalent is raised here. Returning
     // before COMMIT drops `tx`, which rolls back; nothing was written anyway.
-    let deleted = EdgeRepository::retract_by_id(&mut *tx, edge_id)
-        .await
-        .map_err(map_edge_err)?;
+    let deleted = match EdgeRepository::retract_by_id(&mut *tx, edge_id).await {
+        Ok(deleted) => deleted,
+        Err(e) => return Err(refuse_or_map(&mut tx, viewer, edge_id, "delete", e).await),
+    };
     if !deleted {
         return Err(invalid_params(format!("edge {edge_id} not found")));
     }

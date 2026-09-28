@@ -81,6 +81,51 @@ pub struct EdgeRow {
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Why a session that can READ an edge was refused a patch, retract or delete
+/// of it (migrations 115/117/120: edge writes are owner / co-owner scoped).
+///
+/// A refusal is named, never reported as "not found": the caller can see the
+/// edge, so "not found" would misreport a denial as absence. An edge the caller
+/// cannot see keeps the not-found answer, so this is no existence oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeRefusal {
+    /// The edge is owned by a group this session cannot write (another
+    /// writer's edge, or a group-private edge the session only reads).
+    OwnedByAnotherWriter,
+    /// The edge is world-owned: a legacy edge with no attributable author, an
+    /// edge written without a principal, or a structural edge outside operator
+    /// decision D8's scope. Only the administrative (maintenance) path changes
+    /// it.
+    Administrative,
+}
+
+impl EdgeRefusal {
+    /// The machine-readable rule, as the refusal bodies carry it.
+    #[must_use]
+    pub const fn rule(self) -> &'static str {
+        match self {
+            Self::OwnedByAnotherWriter => "owned_by_another_writer",
+            Self::Administrative => "administrative_edge",
+        }
+    }
+
+    /// The caller-facing text, naming the rule. `action` is what was refused
+    /// ("patch", "retract", "delete").
+    #[must_use]
+    pub fn message(self, id: Uuid, action: &str) -> String {
+        match self {
+            Self::OwnedByAnotherWriter => format!(
+                "edge {id} is owned by another writer: only its owner (or co-owner) may {action} \
+                 it; nothing was written"
+            ),
+            Self::Administrative => format!(
+                "edge {id} is an administrative (world-owned) edge; admin-only: no application \
+                 session may {action} it; nothing was written"
+            ),
+        }
+    }
+}
+
 /// Which existing rows the create-or-get dedup probe counts as "present".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DedupProbe {
@@ -1077,6 +1122,38 @@ impl EdgeRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_one(executor).await?)
+    }
+
+    /// Why a write this session was just refused on edge `id` was refused:
+    /// the edge is world-owned (administrative) or another writer's. `None`
+    /// when `viewer` cannot read the edge (the caller then answers "not
+    /// found", as before). Run it on the same transaction as the refused write,
+    /// after [`DbError::WriteRefused`].
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn refusal_for<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<EdgeRefusal>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.owner_group_id = '00000000-0000-0000-0000-000000000000'::uuid \
+               FROM edges e WHERE e.id = $1 /* {EDGE_VISIBILITY:e} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?.map(|world| {
+            if world {
+                EdgeRefusal::Administrative
+            } else {
+                EdgeRefusal::OwnedByAnotherWriter
+            }
+        }))
     }
 
     /// Retract edges by closing their validity interval instead of deleting them.

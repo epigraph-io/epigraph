@@ -97,15 +97,21 @@ async fn a_readable_edge_the_agent_may_not_update_is_refused_not_missing(pool: P
         "fixture shape: an edge touching the agent's private claim is its group's"
     );
 
-    // patch_edge: refused, named, nothing written.
+    // patch_edge: refused, named (migration 120: the explicit `not_owner`
+    // refusal naming the administrative rule), nothing written.
     let e = do_patch_edge(&server, &viewer, patch(world_edge))
         .await
         .expect_err("a world edge is not the agent's to patch");
     assert!(
-        e.message.contains("refused") && !e.message.contains("not found"),
+        e.message
+            .contains("administrative (world-owned) edge; admin-only")
+            && !e.message.contains("not found"),
         "the refusal is named, not reported as a missing edge: {e:?}"
     );
     assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{e:?}");
+    let data = e.data.clone().expect("the refusal carries data");
+    assert_eq!(data["error"], "not_owner", "{data}");
+    assert_eq!(data["rule"], "administrative_edge", "{data}");
     assert_eq!(
         edge_state(&pool, world_edge).await.1,
         serde_json::json!({}),
@@ -123,9 +129,10 @@ async fn a_readable_edge_the_agent_may_not_update_is_refused_not_missing(pool: P
     .await
     .expect_err("a world edge is not the agent's to retract");
     assert!(
-        e.message.contains("refused") && !e.message.contains("not found"),
+        e.message.contains("admin-only") && !e.message.contains("not found"),
         "{e:?}"
     );
+    assert_eq!(e.data.clone().expect("data")["error"], "not_owner");
     assert!(edge_state(&pool, world_edge).await.0, "still in force");
 
     // The agent's own edge: both work.
