@@ -86,7 +86,7 @@ back. Migration 062 forbids that pairing outright with
 | A claim-derived row (`evidence`, `triples`, …) | inherited from the parent claim by 070 arm (c), at insert |
 | A visibility change on a claim | propagated to 17 derived tables, `harvester_fragments` and `edges` by 070 arm (d), in the same transaction |
 | A `harvester_fragments` row whose provenance row arrives later | stamped from the cited claim by **089**, when the `harvester_claim_provenance` row linking them is inserted — but only if the fragment is still unstamped. See the note below the table. |
-| An edge | the **meet** of its two endpoints, 070 arm (b) |
+| An edge | the **meet** of its two endpoints, 070 arm (b); since **120** (operator decision D8) an edge between two public claims (or evidence, or from a `synthesis` source) is owned by its **writer's group** and stays public, and every other public-meet edge (an agent, paper, workflow, trace ... endpoint) stays `('public', world)`. See "Edges between public claims are their writer's (120)" below. |
 | A row with no derivable owner (`frames`, `contexts`, `perspectives`, `communities`, `recall_events`) | **must be declared by the writer.** Before 074 these landed on `('public', world)`; after 074 there is no default to land on. See the next section. `harvester_fragments` is in this set too, with one qualification — see below. |
 
 **`harvester_fragments` is the one table in two rows of that table, and the
@@ -173,7 +173,7 @@ over restating, because restating invites an accidental downgrade.
 | `claims` | `supersedes` | 074 arm 1 |
 | `claims` | `step_lineage_id` | 074 arm 2 |
 | the 17 claim-derived tables (`evidence`, `triples`, `claim_versions`, …) | `claim_id` | 074's `epigraph_derived_require_tenancy` |
-| `edges` | `source_id` / `target_id` | 072's `epigraph_edges_tenancy` (the endpoint meet) |
+| `edges` | `source_id` / `target_id` | 120's `epigraph_edges_tenancy` (the endpoint meet, or the writer's group between two public claims) |
 
 **Inheritance is checked even when you also declare.** The parent arms run
 *before* the "fully declared" arm, so binding `supersedes` to a group-private
@@ -389,23 +389,48 @@ the schema change.
 and UPDATE they admitted what a session could read. Two later migrations narrow
 that for a non-privileged session:
 
-* **DELETE is owner-scoped (115)** on every tier-A table: the row's owner (on
-  `edges`, the owner or co-owner, or for an edge between two public claims the
-  writer of its source) must be in the session's writable set. That last
-  source-writer arm is a non-owner DELETE; whether it survives the rule that a
-  non-privileged DELETE is owner-scoped is an open operator decision (the
-  workflow step rewire depends on it).
+* **DELETE is owner-scoped (115, 120)** on every tier-A table: the row's owner
+  (on `edges`, the owner or co-owner) must be in the session's writable set.
+  115 also admitted, for an edge nobody owned, the writer of its SOURCE node;
+  120 removed that arm (operator decision D8), so a non-privileged DELETE is
+  strictly owner or co-owner scoped.
 * **UPDATE of an edge or of an instance-wide registry row is owner-scoped
   (117).** `edges` (owner or co-owner) and `frames`, `contexts`, `perspectives`,
   `communities` (owner): both the row as it was and the row as it will be,
-  after `edges_tenancy` has restamped a re-pointed edge. A row nobody owns (an
-  edge between two public claims, a shared frame) is therefore not updatable
-  by any application session; its retraction, relabelling or re-pointing is a
+  after `edges_tenancy` has restamped a re-pointed edge. A row nobody owns (a
+  world-owned edge, a shared frame) is therefore not updatable by any
+  application session; its retraction, relabelling or re-pointing is a
   privileged act. The other tier-A tables already refuse a non-owner's UPDATE
   through their writable-set WITH CHECK and 115's owner-immutability guard.
   A re-point by a non-privileged session (the owner, or a co-owner moving the
   edge off the owner's endpoint) clears the edge's `signature`, `signer_id` and
   `content_hash`: the signed content named the old endpoints.
+
+### Edges between public claims are their writer's (120)
+
+Operator decision D8. `edges.writer_group_id` records the writing session's
+group (`epigraph_writer_group()`: the acting operator's personal group, else the
+principal's own) on every INSERT, whatever the caller bound; it is never
+recomputed and a non-privileged session cannot change it. When both endpoints
+are public AND both are epistemic nodes (`claim` or `evidence`; a `synthesis`
+source too), the edge is owned by that group and stays public: its writer
+patches, retracts and deletes it, and nobody else does. This applies to a
+privileged session that carries a principal too; a session with no principal
+(a maintenance login, a backfill) writes a world edge. Every other public-meet
+edge stays `('public', world)`. A re-point keeps a public edge's owner (the
+administrative cascade re-points other writers' edges, and they stay theirs);
+mixed and private endpoints keep the meet; an explicit `('group', G)`
+declaration between public endpoints is still kept. A public-to-public owner
+change of an endpoint (the operator re-own) no longer rewrites any edge; a
+narrowing takes the meet, and the privatization revert restores the writer from
+`writer_group_id`.
+
+Edges written before 120 carry no attributable author (`signer_id`, where set,
+is a bulk attestation key), so they stay world-owned: administrative. A write
+refused on an edge the caller can read answers `not_owner` naming the rule
+(another writer's, or administrative), never "not found". When an edge's owner
+retracts or deletes it, its own edge-keyed BBAs are deleted in the act and every
+other writer's are removed by the maintenance replay (cause `edge_retract`).
 
 **The retraction cascade is an administrative act (117).** A supersede, a dedup
 or a consolidation is the caller's act, written with the caller's authority on
