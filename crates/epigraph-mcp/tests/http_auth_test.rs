@@ -336,8 +336,10 @@ async fn wrong_scope_yields_scope_error() {
     let url = format!("http://{addr}/mcp");
     let c = client();
 
-    // Token has claims:read but NOT claims:admin (required by mark_duplicate).
-    let token = mint_token(SECRET, &["claims:read"]);
+    // Token has claims:read and claims:write but NOT claims:admin (required by
+    // delete_edge). `mark_duplicate` was this test's admin-gated tool until
+    // batch OA1 moved it to claims:write.
+    let token = mint_token(SECRET, &["claims:read", "claims:write"]);
 
     let session_id = mcp_handshake(&c, &url, &token).await;
 
@@ -346,10 +348,9 @@ async fn wrong_scope_yields_scope_error() {
         &url,
         &token,
         &session_id,
-        "mark_duplicate",
+        "delete_edge",
         serde_json::json!({
-            "duplicate_id": "00000000-0000-0000-0000-000000000001",
-            "canonical_id": "00000000-0000-0000-0000-000000000002"
+            "edge_id": "00000000-0000-0000-0000-000000000001"
         }),
     )
     .await;

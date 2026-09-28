@@ -854,7 +854,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. The read, the retirement and the new claim commit together on one transaction stamped from this server's agent: a claim the caller cannot read is reported as not found, and one owned by a group this server's agent cannot write is refused with nothing written. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
+        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. WHO MAY: scope claims:write, and the caller must be the claim's author, an admin or writer of the group that owns it, or hold claims:admin (which admits any claim it can read). A claim the caller cannot read is reported as not found, exactly like a missing one; one it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The retirement and the new claim commit together on one transaction stamped with the CALLER's authority when the caller writes the claim's group (otherwise with this server's agent's, as before), and the database refuses a row that stamp cannot write. The follow-on cascade (moving other writers' edges onto the replacement, invalidating their frozen BBAs) is administrative: it is reported as cascade.status=\"deferred\" and applied by the replay timer. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
     )]
     async fn supersede_claim(
         &self,
@@ -868,7 +868,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical's own row untouched. The duplicate's edges move to the canonical and their edge-keyed mass functions move with them; when the canonical is a PUBLIC claim this server's agent cannot write, the moved mass functions are owned by their writers' groups (public) and the canonical's frame assignments are created through an audited path (a duplicate bound to binary_truth at a non-zero hypothesis_index cannot pass that binding to such a canonical: the call is refused with nothing written). Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
+        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical's own row untouched. WHO MAY: scope claims:write, and the caller must be the DUPLICATE's author, an admin or writer of the group that owns it, or hold claims:admin; the canonical need only be readable by the caller (a non-public canonical must also be writable by it). A duplicate or canonical the caller cannot read is reported as not found, exactly like a missing one; a duplicate it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The follow-on cascade is administrative and reported as cascade.status=\"deferred\" (the replay timer applies it): the duplicate's edges move to the canonical and their edge-keyed mass functions move with them; when the canonical is a PUBLIC claim the caller cannot write, the moved mass functions are owned by their writers' groups (public) and the canonical's frame assignments are created through an audited path (a duplicate bound to binary_truth at a non-zero hypothesis_index cannot pass that binding to such a canonical: the call is refused with nothing written). Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
     )]
     async fn mark_duplicate(
         &self,
@@ -2252,14 +2252,14 @@ mod scope_guard_tests {
     #[test]
     fn scope_guard_allows_matching_scope() {
         let auth = auth_with_scopes(&["claims:admin"]);
-        assert!(EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "mark_duplicate").is_ok());
+        assert!(EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "delete_edge").is_ok());
     }
 
     #[test]
     fn scope_guard_rejects_missing_scope() {
-        let auth = auth_with_scopes(&["claims:read"]);
-        let err = EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "mark_duplicate")
-            .expect_err("read-only token must NOT be allowed to mark_duplicate");
+        let auth = auth_with_scopes(&["claims:write"]);
+        let err = EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "delete_edge")
+            .expect_err("a claims:write token must NOT be allowed to delete_edge");
         // Error message should mention the required scope name so callers can
         // debug a 403 without reading the source.
         assert!(

@@ -49,6 +49,29 @@ pub fn edge_not_owner(
     }
 }
 
+/// The explicit refusal for a claim act (`supersede_claim`, `mark_duplicate`)
+/// on a claim the caller can READ but may not retire (batch OA1, operator
+/// decision D1; the rule is `epigraph_auth::claim_act`).
+///
+/// `INVALID_REQUEST`, like [`edge_not_owner`]: a denial of authority. `data`
+/// carries `{"error": "not_owner", "rule": "not_claim_writer", "claim_id":
+/// "<id>", "retryable": false}`, the HTTP route's body keys. A claim the caller
+/// cannot read keeps the not-found answer instead (no existence oracle).
+pub fn claim_not_writer(claim_id: uuid::Uuid, action: &str) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: Cow::from(epigraph_auth::claim_act::not_claim_writer_message(
+            claim_id, action,
+        )),
+        data: Some(serde_json::json!({
+            "error": "not_owner",
+            "rule": epigraph_auth::claim_act::NOT_CLAIM_WRITER_RULE,
+            "claim_id": claim_id,
+            "retryable": false,
+        })),
+    }
+}
+
 pub fn parse_uuid(s: &str) -> Result<uuid::Uuid, McpError> {
     uuid::Uuid::parse_str(s).map_err(|e| invalid_params(format!("invalid UUID: {e}")))
 }

@@ -105,15 +105,26 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("stage_claims", "claims:write"),
     ("store_workflow", "claims:write"),
     ("submit_claim", "claims:write"),
+    // The two claim-retiring ACTS (batch OA1, operator decision D1). The act
+    // is the caller's own write to its own claim; the per-claim rule (author,
+    // writer of the owning group, or claims:admin for any readable claim) is
+    // `epigraph_auth::claim_act`, enforced in `tools/supersede.rs`. The
+    // cascade that follows re-points OTHER writers' rows, so it is
+    // administrative: it runs on the maintenance connection and is deferred to
+    // the replay timer, never with the caller's authority.
+    ("mark_duplicate", "claims:write"),
+    ("supersede_claim", "claims:write"),
     ("submit_ds_evidence", "claims:write"),
     ("theme_cluster", "claims:write"),
     ("update_labels", "claims:write"),
     ("update_with_evidence", "claims:write"),
     ("verify_claim", "claims:write"),
     // ─── claims:admin ──────────────────────────────────────────────────
-    // Retirement withdraws an assertion another principal made — same class
-    // of act as supersession, hence admin rather than the claims:write that
-    // covers promote/reject on `decide_match_candidate`.
+    // Retirement withdraws an assertion another principal made (the matcher's,
+    // never the caller's own), hence admin rather than the claims:write that
+    // covers promote/reject on `decide_match_candidate`. Supersession and
+    // dedup were in this bucket until batch OA1; they are the caller's own act
+    // on its own claim and moved to claims:write above.
     ("retire_match_candidate", "claims:admin"),
     // Hard-deletes the edge row: irreversible and audit-destroying, so it
     // sits with the other irreversible graph mutations rather than with
@@ -133,8 +144,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // way to remove an edge. If retraction proves sufficient in practice,
     // `delete_edge` should be withdrawn rather than left as the easier path.
     ("delete_edge", "claims:admin"),
-    ("mark_duplicate", "claims:admin"),
-    ("supersede_claim", "claims:admin"),
     // The three corpus-wide maintenance jobs. They run on a bypass viewer over
     // the maintenance connection, so they read and write EVERY tenant's rows
     // regardless of the caller: `sweep_semantic_duplicates` returns other
@@ -231,6 +240,10 @@ mod tests {
     /// while the HTTP route for the same power demanded `claims:admin`.
     /// Deleting both tools closes that asymmetry at the source rather than by
     /// levelling the two entries.
+    ///
+    /// `mark_duplicate` and `supersede_claim` were asserted here too until batch
+    /// OA1 moved them to `claims:write`; see
+    /// `claim_acts_are_write_scoped`.
     #[test]
     fn issue_122_admin_tools_are_admin_gated() {
         assert_eq!(
@@ -238,8 +251,20 @@ mod tests {
             Some("claims:admin"),
             "retirement is destructive+authoritative; claims:write must not reach it"
         );
-        assert_eq!(required_scope("mark_duplicate"), Some("claims:admin"));
-        assert_eq!(required_scope("supersede_claim"), Some("claims:admin"));
+        assert_eq!(required_scope("delete_edge"), Some("claims:admin"));
+    }
+
+    /// Batch OA1 (operator decision D1): supersede and dedup are the CALLER's
+    /// act on a claim it may write, so the scope is `claims:write`, and the
+    /// per-claim authority rule lives in `epigraph_auth::claim_act`. Asserted
+    /// by name, because the coverage test passes for any mapping: leaving them
+    /// at `claims:admin` would keep a human from retiring even their own claim
+    /// over OAuth, since no registration path grants a human client an
+    /// admin-only scope.
+    #[test]
+    fn claim_acts_are_write_scoped() {
+        assert_eq!(required_scope("supersede_claim"), Some("claims:write"));
+        assert_eq!(required_scope("mark_duplicate"), Some("claims:write"));
     }
 
     /// The three maintenance tools act across every tenant on a bypass viewer,
