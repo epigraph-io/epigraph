@@ -1014,12 +1014,12 @@ async fn find_cross_source_matches_omits_sweep_coverage_for_an_invisible_claim(p
     );
 }
 
-/// Migration 117: with NO administrative connection the retirement's act still
-/// commits (the candidate is `stale`), the cascade is reported deferred -- the
-/// matcher edge stays in force -- and a `security_events` row records the
-/// deferral under the acting agent.
+/// Migrations 117 and 118: with NO administrative connection nothing about the
+/// candidate changes -- it stays `promoted`, the matcher edge stays in force --
+/// and the whole retirement is recorded as a deferred request under the acting
+/// agent, carrying the status it was requested against.
 #[sqlx::test(migrations = "../../migrations")]
-async fn retire_without_an_admin_connection_commits_the_act_and_defers_the_cascade(pool: PgPool) {
+async fn retire_without_an_admin_connection_defers_the_whole_retirement(pool: PgPool) {
     let server = build_server_without_admin(pool.clone()).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
@@ -1045,9 +1045,11 @@ async fn retire_without_an_admin_connection_commits_the_act_and_defers_the_casca
         None,
     )
     .await
-    .expect("the act commits");
+    .expect("the request is recorded");
     let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
-    assert_eq!(body["candidate"]["status"], "stale");
+    assert_eq!(body["candidate"]["status"], "promoted", "{body}");
+    assert_eq!(body["retired"], false, "{body}");
+    assert!(body["retirement"].is_null(), "{body}");
     assert_eq!(body["cascade"]["status"], "deferred", "{body}");
     let event = body["cascade"]["audit_event_id"]
         .as_str()
@@ -1059,16 +1061,23 @@ async fn retire_without_an_admin_connection_commits_the_act_and_defers_the_casca
         "the deferred cascade retracted nothing"
     );
     let server_agent = server.server_agent_id().await.expect("server agent");
-    let (et, who, cause): (String, Option<Uuid>, String) = sqlx::query_as(
-        "SELECT event_type::text, agent_id, details->>'cause' FROM security_events \
-          WHERE id = $1::uuid",
-    )
-    .bind(&event)
-    .fetch_one(&pool)
-    .await
-    .expect("the deferral row");
+    let (et, who, cause, requested): (String, Option<Uuid>, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT event_type::text, agent_id, details->>'cause', \
+                    details#>>'{trigger,candidate_status}' \
+               FROM security_events WHERE id = $1::uuid",
+        )
+        .bind(&event)
+        .fetch_one(&pool)
+        .await
+        .expect("the deferral row");
     assert_eq!(
-        (et.as_str(), who, cause.as_str()),
-        ("cascade.deferred", Some(server_agent), "match_retire")
+        (et.as_str(), who, cause.as_str(), requested.as_deref()),
+        (
+            "cascade.deferred",
+            Some(server_agent),
+            "match_retire",
+            Some("promoted")
+        )
     );
 }

@@ -808,9 +808,10 @@ async fn retire_is_refused_to_a_claims_write_caller(pool: PgPool) {
     );
 }
 
-/// Migration 117: with NO administrative connection the retire verdict still
-/// commits its act (the candidate is `stale`), reports the cascade deferred
-/// with its `security_events` row, and leaves the matcher edge in force.
+/// Migrations 117 and 118: with NO administrative connection the retire
+/// verdict changes nothing about the candidate (it stays `promoted`, the
+/// matcher edge in force), says it did not retire, and records the whole
+/// retirement as a deferred request with its `security_events` row.
 #[sqlx::test(migrations = "../../migrations")]
 async fn retire_without_an_admin_connection_defers_the_cascade(pool: PgPool) {
     let agent = insert_agent(&pool).await;
@@ -830,12 +831,14 @@ async fn retire_without_an_admin_connection_defers_the_cascade(pool: PgPool) {
     assert_eq!(
         status,
         StatusCode::OK,
-        "the act commits (body: {})",
+        "the request is recorded (body: {})",
         String::from_utf8_lossy(&body)
     );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["cascade"]["status"], "deferred", "{json}");
-    assert_eq!(status_of(&pool, candidate).await, "stale");
+    assert_eq!(json["retired"], false, "{json}");
+    assert_eq!(json["status"], "promoted", "{json}");
+    assert_eq!(status_of(&pool, candidate).await, "promoted");
     let (edges, _, _) = matcher_edge_footprint(&pool, a, b).await;
     assert_eq!(edges, 1, "the deferred cascade retracted nothing");
     let event: Uuid = json["cascade"]["audit_event_id"]
@@ -1013,6 +1016,72 @@ async fn supersede_route_on_the_app_role_runs_the_cascade_on_the_maintenance_poo
             assert_eq!(json["cascade"]["status"], "deferred", "{json}");
             assert_eq!(et, "cascade.deferred");
             assert_eq!(target, old, "the deferred cascade moved nothing");
+        }
+    }
+}
+
+/// Migration 118 (W11, #518) on the APPLICATION ROLE: with its stale guard
+/// applied, the retire verdict works through the maintenance pool -- the
+/// candidate is `stale`, the matcher edge retracted, and the applied audit row
+/// names the caller -- and without one it changes nothing and records the
+/// retirement as a deferred request. Before the fix the verdict flipped the
+/// candidate on the caller's `epigraph_app` session, which 118 refuses (MC01),
+/// so both shapes failed with a database error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_route_on_the_app_role_under_118_runs_on_the_maintenance_pool_or_defers(
+    pool: PgPool,
+) {
+    let (w, _) = viewer_fixture::seed_agent_with_group(&pool, "w10-retirer").await;
+    let token = admin_bearer_token(w, Some(w), "agent");
+    let promote = decide_bearer_token(w, Some(w), "agent");
+    viewer_fixture::apply_migration_118_stale_guard(&pool).await;
+
+    for admin in [true, false] {
+        let a = insert_claim(&pool, w).await;
+        let b = insert_claim(&pool, w).await;
+        let candidate = insert_pending_candidate(&pool, a, b).await;
+        let resp = post_decide(pool.clone(), candidate, &promote, "promote").await;
+        assert_eq!(resp.status(), StatusCode::OK, "promote must succeed");
+        viewer_fixture::assert_stale_guard_refuses_the_app_role(&pool, candidate).await;
+
+        let resp = post_decide_on(
+            app_role_state(&pool, admin).await,
+            candidate,
+            &token,
+            "retire",
+        )
+        .await;
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }));
+        assert_eq!(status, StatusCode::OK, "admin={admin}: {json}");
+        let event: Uuid = json["cascade"]["audit_event_id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("the retirement names its audit row");
+        let (et, who, cause): (String, Option<Uuid>, String) = sqlx::query_as(
+            "SELECT event_type::text, agent_id, details->>'cause' \
+               FROM security_events WHERE id = $1",
+        )
+        .bind(event)
+        .fetch_one(&pool)
+        .await
+        .expect("audit row");
+        assert_eq!((who, cause.as_str()), (Some(w), "match_retire"));
+        let (edges, _, _) = matcher_edge_footprint(&pool, a, b).await;
+        if admin {
+            assert_eq!(json["cascade"]["status"], "applied", "{json}");
+            assert_eq!(json["retired"], true, "{json}");
+            assert_eq!(et, "cascade.admin_applied");
+            assert_eq!(status_of(&pool, candidate).await, "stale");
+            assert_eq!(edges, 0, "the matcher edge was retracted");
+        } else {
+            assert_eq!(json["cascade"]["status"], "deferred", "{json}");
+            assert_eq!(json["retired"], false, "{json}");
+            assert_eq!(et, "cascade.deferred");
+            assert_eq!(status_of(&pool, candidate).await, "promoted");
+            assert_eq!(edges, 1, "nothing was retracted");
         }
     }
 }

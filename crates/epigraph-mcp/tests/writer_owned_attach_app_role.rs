@@ -1527,3 +1527,202 @@ async fn an_applied_repair_never_commits_without_its_audit_row(pool: PgPool) {
     .expect("count");
     assert_eq!(applied, 0);
 }
+
+/// A promoted match candidate between two public claims, and its matcher edge
+/// (owned by nobody: both endpoints are public), seeded by the harness.
+async fn promoted_candidate(pool: &PgPool, agent: Uuid, group: Uuid, status: &str) -> (Uuid, Uuid) {
+    let c1 = public_claim_of(pool, agent, group, "match side one").await;
+    let c2 = public_claim_of(pool, agent, group, "match side two").await;
+    let (a, b) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
+    let edge = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, $2, 'claim', $3, 'claim', 'CORROBORATES', \
+                 '{\"source\": \"cross_source_matcher\"}'::jsonb)",
+    )
+    .bind(edge)
+    .bind(a)
+    .bind(b)
+    .execute(pool)
+    .await
+    .expect("matcher edge");
+    let cand: Uuid = sqlx::query_scalar(
+        "INSERT INTO match_candidates (claim_a, claim_b, score, features, status) \
+         VALUES ($1, $2, 0.9, '{}'::jsonb, $3) RETURNING id",
+    )
+    .bind(a)
+    .bind(b)
+    .bind(status)
+    .fetch_one(pool)
+    .await
+    .expect("candidate");
+    (cand, edge)
+}
+
+async fn retire_as(
+    server: &EpiGraphMcpFull,
+    viewer: &Viewer,
+    auth: &epigraph_auth::AuthContext,
+    cand: Uuid,
+) -> serde_json::Value {
+    first_text(
+        &epigraph_mcp::tools::matching::retire_match_candidate(
+            server,
+            viewer,
+            epigraph_mcp::types::RetireMatchCandidateParams {
+                candidate_id: cand.to_string(),
+            },
+            Some(auth),
+        )
+        .await
+        .expect("retire_match_candidate"),
+    )
+}
+
+async fn candidate_state(pool: &PgPool, cand: Uuid, edge: Uuid) -> (String, bool) {
+    sqlx::query_as(
+        "SELECT mc.status, e.valid_to IS NULL FROM match_candidates mc, edges e \
+          WHERE mc.id = $1 AND e.id = $2",
+    )
+    .bind(cand)
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .expect("candidate and edge")
+}
+
+/// Migration 118 (W11, #518) applied: its stale guard refuses a flip to
+/// `stale` on an application-role session. `retire_match_candidate` on the
+/// APPLICATION ROLE:
+/// * with a maintenance connection, the whole retirement runs there: the
+///   candidate is `stale`, the matcher edge retracted, and one applied audit
+///   row names the caller;
+/// * without one, nothing about the candidate changes; the retirement is a
+///   deferred request (its row records the status it was asked against), and
+///   the operator's replay carries it out;
+/// * a request whose candidate was decided again before the replay is refused
+///   by the replay, loudly, and changes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_tool_under_118_runs_on_the_admin_path_and_defers_without_one(pool: PgPool) {
+    let (admin_server, agent, group, viewer) = app_role_server_with_admin(&pool).await;
+    let (server, agent2, _, viewer2) = app_role_server(&pool).await;
+    let auth = non_admin_owner(agent);
+    let auth2 = non_admin_owner(agent2);
+    fixture::apply_migration_118_stale_guard(&pool).await;
+
+    // The admin path.
+    let (applied, applied_edge) = promoted_candidate(&pool, agent, group, "promoted").await;
+    fixture::assert_stale_guard_refuses_the_app_role(&pool, applied).await;
+    let body = retire_as(&admin_server, &viewer, &auth, applied).await;
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    assert_eq!(body["retired"], true, "{body}");
+    assert_eq!(body["candidate"]["status"], "stale", "{body}");
+    assert_eq!(body["retirement"]["previous_status"], "promoted", "{body}");
+    assert_eq!(
+        candidate_state(&pool, applied, applied_edge).await,
+        ("stale".to_string(), false)
+    );
+    let event = parse_uuid_field(&body["cascade"], "audit_event_id");
+    let (et, who, cause, decided_by): (String, Option<Uuid>, String, Option<Uuid>) =
+        sqlx::query_as(
+            "SELECT se.event_type::text, se.agent_id, se.details->>'cause', mc.decided_by \
+               FROM security_events se, match_candidates mc \
+              WHERE se.id = $1 AND mc.id = $2",
+        )
+        .bind(event)
+        .bind(applied)
+        .fetch_one(&pool)
+        .await
+        .expect("audit row");
+    assert_eq!(
+        (et.as_str(), who, cause.as_str(), decided_by),
+        (
+            "cascade.admin_applied",
+            Some(agent),
+            "match_retire",
+            Some(agent)
+        )
+    );
+
+    // No admin connection: deferred, candidate untouched.
+    let (deferred, deferred_edge) = promoted_candidate(&pool, agent, group, "promoted").await;
+    let body = retire_as(&server, &viewer2, &auth2, deferred).await;
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    assert_eq!(body["retired"], false, "{body}");
+    assert_eq!(body["candidate"]["status"], "promoted", "{body}");
+    assert_eq!(
+        candidate_state(&pool, deferred, deferred_edge).await,
+        ("promoted".to_string(), true)
+    );
+    let (et, who, asked): (String, Option<Uuid>, Option<String>) = sqlx::query_as(
+        "SELECT event_type::text, agent_id, details#>>'{trigger,candidate_status}' \
+           FROM security_events WHERE id = $1",
+    )
+    .bind(parse_uuid_field(&body["cascade"], "audit_event_id"))
+    .fetch_one(&pool)
+    .await
+    .expect("deferral row");
+    assert_eq!(
+        (et.as_str(), who, asked.as_deref()),
+        ("cascade.deferred", Some(agent2), Some("promoted"))
+    );
+
+    // A request made while the candidate was pending; it is promoted before
+    // the replay, so carrying the request out would withdraw a promotion the
+    // requester never saw.
+    let (moved, moved_edge) = promoted_candidate(&pool, agent, group, "pending").await;
+    let body = retire_as(&server, &viewer2, &auth2, moved).await;
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    sqlx::query("UPDATE match_candidates SET status = 'promoted' WHERE id = $1")
+        .bind(moved)
+        .execute(&pool)
+        .await
+        .expect("promoted meanwhile");
+
+    let maintenance = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let url = fixture::database_url_for(&pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("ScopedPool")
+            .with_maintenance_pool(maintenance);
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, admin_viewer) = session.split();
+    let report = epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        admin_viewer,
+        "w10-retire-test",
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("replay");
+    assert_eq!((report.applied, report.failed), (1, 1), "{report:?}");
+    assert_eq!(
+        candidate_state(&pool, deferred, deferred_edge).await,
+        ("stale".to_string(), false),
+        "the deferred request was carried out"
+    );
+    assert_eq!(
+        candidate_state(&pool, moved, moved_edge).await,
+        ("promoted".to_string(), true),
+        "the request made against another status changed nothing"
+    );
+    let failed = report
+        .items
+        .iter()
+        .find(|i| i.subject_id == Some(moved))
+        .expect("the refused request is reported");
+    assert!(
+        failed
+            .status
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("failed")),
+        "{failed:?}"
+    );
+}

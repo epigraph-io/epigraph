@@ -611,3 +611,38 @@ fn blake3_like(s: &str) -> Vec<u8> {
     }
     out
 }
+
+/// Apply migration 118's `match_candidates` stale guard (a VERBATIM copy of
+/// its sections 1 and 5; see `fixtures/migration_118_stale_guard.sql`) to the
+/// test database.
+///
+/// W10 (#517) and W11 (#518, which adds 118) are separate branches; the
+/// retirement tests that call this show W10's paths work with 118 in place.
+/// Pair it with [`assert_stale_guard_refuses_the_app_role`], which proves the
+/// guard is live.
+pub async fn apply_migration_118_stale_guard(pool: &PgPool) {
+    sqlx::raw_sql(include_str!("fixtures/migration_118_stale_guard.sql"))
+        .execute(pool)
+        .await
+        .expect("apply 118's stale guard");
+}
+
+/// CALIBRATION for [`apply_migration_118_stale_guard`]: an `epigraph_app`
+/// session's flip of `candidate` into `stale` is refused with the guard's own
+/// `MC01`, not with a permission error that shares its SQLSTATE (42501). The
+/// refused statement changes nothing.
+pub async fn assert_stale_guard_refuses_the_app_role(pool: &PgPool, candidate: Uuid) {
+    let refused = as_role(pool, "epigraph_app", |mut conn| async move {
+        let r = sqlx::query("UPDATE match_candidates SET status = 'stale' WHERE id = $1")
+            .bind(candidate)
+            .execute(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await;
+    let e = refused.expect_err("CALIBRATION: 118's guard refuses the app role's flip to stale");
+    assert!(
+        e.to_string().contains("MC01"),
+        "CALIBRATION: the refusal must be the guard's MC01, not a permission error: {e}"
+    );
+}

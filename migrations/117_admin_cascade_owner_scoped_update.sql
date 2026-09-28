@@ -112,13 +112,17 @@
 --     retracting colliding edges, re-pointing every other edge onto the
 --     canonical claim, moving and dropping their BBAs, and re-deriving them
 --     run on the maintenance connection;
---   * match-candidate retirement: the caller flips the candidate to `stale`;
---     retracting the matcher edge and removing its derived rows run on the
---     maintenance connection.
+--   * match-candidate retirement: administrative end to end. The flip to
+--     `stale`, retracting the matcher edge and removing its derived rows run
+--     together on the maintenance connection (a later migration refuses the
+--     flip on a non-privileged session, so the flip cannot be the caller's).
 -- Every administrative cascade writes one `security_events` row naming the
 -- triggering principal, the cause and what it touched. A server with no
 -- maintenance connection configured still commits the caller's act, reports
--- the cascade as deferred, and writes a `security_events` row saying so.
+-- the cascade as deferred, and writes a `security_events` row saying so. A
+-- retirement has no act of the caller's to commit: its deferral is the whole
+-- request, the candidate is left as it was, and the replay carries the
+-- request out while the candidate still has the status the deferral recorded.
 --
 -- 114's `epigraph_dedup_move_bbas` moved OTHER writers' BBAs onto the
 -- canonical on the deduplicating session's authority. Nothing non-privileged
@@ -357,10 +361,21 @@ CREATE TRIGGER edges_repoint_unsign
 --                        canonical that is public or written by the session
 --                        (114's attach rule, FA04, as the act checks it);
 --         consolidate  : every retired source, written by the session;
---         match_retire : the candidate is `stale`. `match_candidates` carries
---                        no tenancy, so the database holds no finer authority
---                        for a retirement than the table grant; the request
---                        paths gate it on the `claims:admin` scope.
+--         match_retire : the candidate exists; its current status is
+--                        recorded in the trigger (`candidate_status`) and is
+--                        the replay's precondition. The deferral is a REQUEST
+--                        to retire, which the operator's replay carries out.
+--                        `match_candidates` carries no tenancy, so the
+--                        database holds no finer authority for requesting a
+--                        retirement than the ability to call this definer;
+--                        the request paths gate it on the `claims:admin`
+--                        scope, and a non-privileged session that calls the
+--                        definer directly can enqueue a request the replay
+--                        will run. That is no wider than what the table grant
+--                        allowed before the flip to `stale` was reserved to
+--                        privileged sessions, and every request is an
+--                        attributed row the operator can read before
+--                        replaying (and retire with the replay's --retire).
 --       A privileged session is not held to the authority half (it may write
 --       any row under (a) anyway) but is to the state half. The OAuth part of
 --       the trigger is the server's report of the request, recorded as given;
@@ -397,6 +412,7 @@ DECLARE
     v_agent uuid;
     v_ok boolean;
     v_oauth jsonb;
+    v_status text;
     v_trigger jsonb;
     v_id uuid := gen_random_uuid();
 BEGIN
@@ -450,8 +466,8 @@ BEGIN
                     SELECT 1 FROM unnest(v_sources) s
                      WHERE NOT public.epigraph_session_writes_node(s, 'claim')));
     ELSE
-        v_ok := EXISTS (SELECT 1 FROM public.match_candidates mc
-                         WHERE mc.id = p_subject AND mc.status = 'stale');
+        SELECT mc.status INTO v_status FROM public.match_candidates mc WHERE mc.id = p_subject;
+        v_ok := v_status IS NOT NULL;
     END IF;
     IF NOT COALESCE(v_ok, false) THEN
         RAISE EXCEPTION 'CX03: the % act on % is not recorded as one this session made; a '
@@ -478,6 +494,8 @@ BEGIN
                                     'subject_id', p_subject, 'object_id', p_object);
     IF p_cause = 'consolidate' THEN
         v_trigger := v_trigger || jsonb_build_object('sources', to_jsonb(v_sources));
+    ELSIF p_cause = 'match_retire' THEN
+        v_trigger := v_trigger || jsonb_build_object('candidate_status', v_status);
     END IF;
     INSERT INTO public.security_events (id, event_type, agent_id, success, details)
     VALUES (v_id, 'cascade.deferred', v_agent, false,

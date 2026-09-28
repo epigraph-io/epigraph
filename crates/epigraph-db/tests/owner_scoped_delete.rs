@@ -868,13 +868,15 @@ async fn a_dedup_collision_with_another_writers_row_keeps_the_canonicals(pool: P
     );
 }
 
-/// Match-candidate retirement after migration 117: the ACT (flip to `stale`)
-/// lands on an unstamped application session; the CASCADE (retract the
-/// promoted matcher edge, drop its BBA -- X's writer-owned row) refuses that
-/// session, refuses to run before the act, and lands on the maintenance
-/// connection. The one-transaction `retire` refuses the application role.
-#[sqlx::test(migrations = "../../migrations")]
-async fn match_candidate_retirement_is_an_act_plus_a_maintenance_cascade(pool: PgPool) {
+/// Match-candidate retirement after migrations 117 and 118: administrative
+/// END TO END. The flip to `stale` and the cascade (retract the promoted
+/// matcher edge, drop its BBA -- X's writer-owned row) run in one transaction,
+/// on a privileged session only: the application role is refused before
+/// anything is written. On the maintenance connection a retirement requested
+/// against a status the candidate no longer has is refused with nothing
+/// changed; one requested against its current status lands, and a replay of
+/// it is harmless.
+async fn retirement_is_administrative_end_to_end(pool: PgPool, with_118: bool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (x, _) = fixture::seed_agent_with_group(&pool, "wirer-x").await;
     let c1 = fixture::seed_public_claim(&pool, author, "match side one").await;
@@ -909,6 +911,10 @@ async fn match_candidate_retirement_is_an_act_plus_a_maintenance_cascade(pool: P
         .await
         .expect("candidate");
     assert_app_role_does_not_bypass(&pool).await;
+    if with_118 {
+        fixture::apply_migration_118_stale_guard(&pool).await;
+        fixture::assert_stale_guard_refuses_the_app_role(&pool, cand.id).await;
+    }
 
     let p = pool.clone();
     let bba = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
@@ -921,60 +927,99 @@ async fn match_candidate_retirement_is_an_act_plus_a_maintenance_cascade(pool: P
         writer_owned(&pool, "mass_functions", bba).await.1,
         "fixture shape: X's writer-owned row"
     );
+    let status = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, String>("SELECT status FROM match_candidates WHERE id = $1")
+            .bind(cand.id)
+            .fetch_one(&pool)
+            .await
+            .expect("candidate status")
+    };
+    let edge_in_force = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, bool>("SELECT valid_to IS NULL FROM edges WHERE id = $1")
+            .bind(edge)
+            .fetch_one(&pool)
+            .await
+            .expect("edge")
+    };
 
-    let cascade = |pool: PgPool, role: &'static str| async move {
+    let retire = |pool: PgPool, role: &'static str, expected: Option<&'static str>| async move {
         fixture::as_role(&pool, role, |mut conn| async move {
-            let r = MatchCandidateRepo::retract_candidate_edges_conn(&mut conn, cand.id).await;
+            let r =
+                MatchCandidateRepo::retire_conn(&mut conn, cand.id, Some(author), expected).await;
             (conn, r)
         })
         .await
     };
-    let early = cascade(pool.clone(), "epigraph_maintenance").await;
-    assert!(
-        early
-            .as_ref()
-            .is_err_and(|e| e.to_string().contains("not stale")),
-        "the cascade runs only after the act: {early:?}"
-    );
 
+    // The application role, pooled or on a connection: refused, nothing written.
     let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
-    let whole = MatchCandidateRepo::new(app.clone())
-        .retire(cand.id, None)
-        .await;
+    let whole = MatchCandidateRepo::new(app).retire(cand.id, None).await;
     assert!(
         whole
             .as_ref()
             .is_err_and(|e| e.to_string().contains("privileged")),
-        "the one-transaction retire is not the application role's: {whole:?}"
+        "retirement is not the application role's: {whole:?}"
     );
-    let previous = MatchCandidateRepo::new(app)
-        .mark_retired(cand.id, None)
-        .await
-        .expect("the act lands on an unstamped app session");
-    assert_eq!(previous, "promoted");
-    let by_app = cascade(pool.clone(), "epigraph_app").await;
+    let by_app = retire(pool.clone(), "epigraph_app", Some("promoted")).await;
     assert!(
         by_app
             .as_ref()
             .is_err_and(|e| e.to_string().contains("privileged")),
         "{by_app:?}"
     );
+    assert_eq!(status(pool.clone()).await, "promoted");
+    assert!(edge_in_force(pool.clone()).await);
     assert!(exists(&pool, "mass_functions", bba).await);
 
-    let outcome = cascade(pool.clone(), "epigraph_maintenance")
+    // Requested against a status the candidate no longer has: refused loudly,
+    // nothing changed.
+    let moved_on = retire(pool.clone(), "epigraph_maintenance", Some("pending")).await;
+    assert!(
+        moved_on
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("decided again")),
+        "{moved_on:?}"
+    );
+    assert_eq!(status(pool.clone()).await, "promoted");
+    assert!(edge_in_force(pool.clone()).await);
+    assert!(exists(&pool, "mass_functions", bba).await);
+
+    let outcome = retire(pool.clone(), "epigraph_maintenance", Some("promoted"))
         .await
-        .expect("the maintenance connection retracts");
+        .expect("the maintenance connection retires");
+    assert_eq!(outcome.previous_status, "promoted");
     assert_eq!(outcome.edges_retracted, 1);
     assert_eq!(outcome.bbas_invalidated, 1);
+    assert_eq!(status(pool.clone()).await, "stale");
+    assert!(!edge_in_force(pool.clone()).await);
     assert!(!exists(&pool, "mass_functions", bba).await);
-    let again = cascade(pool.clone(), "epigraph_maintenance")
+    let decided_by: Option<Uuid> =
+        sqlx::query_scalar("SELECT decided_by FROM match_candidates WHERE id = $1")
+            .bind(cand.id)
+            .fetch_one(&pool)
+            .await
+            .expect("decided_by");
+    assert_eq!(decided_by, Some(author), "the retirement names who asked");
+    let again = retire(pool.clone(), "epigraph_maintenance", Some("promoted"))
         .await
-        .expect("a replay is harmless");
+        .expect("a replay of a carried-out request is harmless");
+    assert_eq!(again.previous_status, "stale");
     assert_eq!((again.edges_retracted, again.bbas_invalidated), (0, 0));
     assert!(
         cascade_audit(&pool).await.is_empty(),
         "no definer, no definer audit"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn match_candidate_retirement_is_administrative_end_to_end(pool: PgPool) {
+    retirement_is_administrative_end_to_end(pool, false).await;
+}
+
+/// The same, with migration 118's stale guard applied (W11, #518).
+#[sqlx::test(migrations = "../../migrations")]
+async fn match_candidate_retirement_is_administrative_end_to_end_under_118(pool: PgPool) {
+    retirement_is_administrative_end_to_end(pool, true).await;
 }
 
 /// Maintenance and the superuser are unchanged: both remove another writer's
@@ -3027,11 +3072,22 @@ async fn a_deferral_names_only_the_recording_sessions_own_act(pool: PgPool) {
             "t",
         )
         .await;
-        let retire_pending = ac::record_deferral(
+        let retire_request = ac::record_deferral(
             &mut *conn,
             "match_retire",
             Some(r),
             cand,
+            None,
+            &[],
+            None,
+            "t",
+        )
+        .await;
+        let retire_missing = ac::record_deferral(
+            &mut *conn,
+            "match_retire",
+            Some(r),
+            Uuid::new_v4(),
             None,
             &[],
             None,
@@ -3052,7 +3108,7 @@ async fn a_deferral_names_only_the_recording_sessions_own_act(pool: PgPool) {
                     dedup_public,
                     consolidate_r,
                     consolidate_a,
-                    retire_pending,
+                    (retire_request, retire_missing),
                 ),
             ),
         )
@@ -3067,7 +3123,7 @@ async fn a_deferral_names_only_the_recording_sessions_own_act(pool: PgPool) {
         dedup_public,
         consolidate_r,
         consolidate_a,
-        retire_pending,
+        (retire_request, retire_missing),
     ) = got;
     assert_eq!(
         repoint.expect("pointing its own claim at a PUBLIC claim is admitted (a dedup shape)"),
@@ -3095,9 +3151,22 @@ async fn a_deferral_names_only_the_recording_sessions_own_act(pool: PgPool) {
         "R cannot defer a consolidation of A's sources: {consolidate_r:?}"
     );
     consolidate_a.expect("A defers its own consolidation");
+    // A retirement deferral is the whole REQUEST (migration 118 reserves the
+    // flip to `stale` to a privileged session): admitted for a candidate that
+    // exists, in any status, recording that status as the replay's
+    // precondition; refused for one that does not exist.
+    let retire_request = retire_request.expect("a retirement request of a promoted candidate");
+    let requested: Option<String> = sqlx::query_scalar(
+        "SELECT details#>>'{trigger,candidate_status}' FROM security_events WHERE id = $1",
+    )
+    .bind(retire_request)
+    .fetch_one(&pool)
+    .await
+    .expect("the retirement request row");
+    assert_eq!(requested.as_deref(), Some("promoted"));
     assert!(
-        is_cx(&retire_pending, "CX03"),
-        "a retirement deferral needs a stale candidate: {retire_pending:?}"
+        is_cx(&retire_missing, "CX03"),
+        "a retirement request names an existing candidate: {retire_missing:?}"
     );
 
     // The genuine row: attributed to A by the database, built by the definer.

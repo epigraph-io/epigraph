@@ -1948,7 +1948,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. The flip is the caller's act; the edge retraction and derived-row deletes run as the server's administrative cascade on its maintenance connection and are audited (the result's `cascade` says applied, deferred or failed). Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
+        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. Retirement is administrative end to end: the flip, the edge retraction and the derived-row deletes run together on the server's maintenance connection and are audited. Without one nothing changes and the retirement is recorded as a deferred request for the operator's replay (the result's `retired` and `cascade` say which: applied, deferred or failed). Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
     )]
     async fn retire_match_candidate(
         &self,

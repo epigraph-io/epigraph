@@ -564,9 +564,12 @@ Current reservation:
   `epigraph_maintenance` gains DELETE on `factors` and `bp_messages`. A
   BEFORE UPDATE trigger `edges_repoint_unsign` clears an edge's signature
   columns when a non-privileged session changes its endpoints. The
-  application splits supersede, dedup, consolidation and match-candidate
-  retirement into the caller's act (its own stamped transaction) and a repair
-  that runs on the maintenance connection (`epigraph_engine::admin_cascade`),
+  application splits supersede, dedup and consolidation into the caller's act
+  (its own stamped transaction) and a repair that runs on the maintenance
+  connection (`epigraph_engine::admin_cascade`); a match-candidate retirement
+  runs whole (the flip to `stale` included, which 118 reserves to a privileged
+  session) on the maintenance connection, or is recorded as a deferred request
+  with the candidate's status as the replay's precondition. Each repair is
   committed together with its `cascade.admin_applied` row, or recorded as
   `cascade.deferred` (in the act's transaction) when the process has no usable
   maintenance DSN; `replay_deferred_cascades` replays those (fewest failed

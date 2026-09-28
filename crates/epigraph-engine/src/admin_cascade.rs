@@ -6,9 +6,8 @@
 //! two things:
 //!
 //! * the CALLER's act -- retire its claim and insert the replacement, mark its
-//!   duplicate, merge its sources, flip the candidate to `stale` -- which runs
-//!   with the caller's own write authority on its own stamped transaction,
-//!   exactly as before; and
+//!   duplicate, merge its sources -- which runs with the caller's own write
+//!   authority on its own stamped transaction, exactly as before; and
 //! * the CASCADE that follows -- re-pointing and retracting edges other writers
 //!   asserted, moving, dropping and invalidating their edge-keyed BBAs, and
 //!   re-deriving belief downstream -- which touches rows the caller does not
@@ -18,9 +17,20 @@
 //!
 //! Every `apply_after_*` function here takes that maintenance connection. The
 //! request paths (MCP `supersede_claim` / `mark_duplicate` /
-//! `consolidate_claims` / `retire_match_candidate`, and the matching HTTP
-//! routes) acquire it BEFORE committing the act, commit the act, then call one
-//! of the `apply_after_*` functions.
+//! `consolidate_claims`, and the matching HTTP routes) acquire it BEFORE
+//! committing the act, commit the act, then call one of the `apply_after_*`
+//! functions.
+//!
+//! # A match-candidate retirement has no caller's act
+//!
+//! Its act, the flip to `stale`, is administrative too: migration 118's
+//! `match_candidates_stale_guard` refuses it on a non-privileged session. So
+//! [`apply_match_retire`] runs the flip AND the cascade in one transaction on
+//! the maintenance connection, with the applied row naming the caller. Without
+//! a maintenance connection nothing about the candidate changes: the request
+//! path records the whole retirement as deferred ([`record_deferral`], whose
+//! definer records the candidate's status at that moment), and the replay
+//! carries it out only while the candidate still has that status.
 //!
 //! # The audit trail
 //!
@@ -52,7 +62,9 @@
 //! its deferral commit together. Every repair re-verifies the committed act
 //! and is idempotent, so [`replay_deferred`] runs the same `apply_after_*` call
 //! on a maintenance connection later (`replay_deferred_cascades`, a CLI on the
-//! operator's maintenance DSN).
+//! operator's maintenance DSN). A match-candidate retirement commits no act:
+//! its deferral is the whole request, and the replay runs
+//! [`apply_match_retire`] against the status the deferral recorded.
 //!
 //! # Best-effort, like the belief cascade
 //!
@@ -157,6 +169,13 @@ pub struct CascadeTrigger {
     /// The retired sources of a consolidation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<Uuid>,
+    /// A match-candidate retirement's precondition: the candidate's status
+    /// when the retirement was requested. The retirement is carried out only
+    /// while the candidate still has it (or is already `stale`); see
+    /// [`MatchCandidateRepo::retire_conn`]. A deferral's is recorded by the
+    /// database, not by the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_status: Option<String>,
     /// Set when this run replays a deferred or failed cascade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_of: Option<ReplayOrigin>,
@@ -179,6 +198,7 @@ impl CascadeTrigger {
             subject_id,
             object_id,
             sources: Vec::new(),
+            candidate_status: None,
             replay_of: None,
         }
     }
@@ -192,6 +212,9 @@ impl CascadeTrigger {
         });
         if !self.sources.is_empty() {
             trigger["sources"] = serde_json::json!(self.sources);
+        }
+        if let Some(status) = &self.candidate_status {
+            trigger["candidate_status"] = serde_json::json!(status);
         }
         let mut details = serde_json::json!({
             "cause": self.cause.as_str(),
@@ -230,6 +253,10 @@ impl CascadeTrigger {
             subject_id,
             object_id: uuid(t.get("object_id")),
             sources,
+            candidate_status: t
+                .get("candidate_status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             replay_of: None,
         })
     }
@@ -717,21 +744,32 @@ pub async fn apply_after_consolidate(
     }
 }
 
-/// The match-candidate retirement cascade: retract the candidate's matcher
-/// edges and remove their derived rows
-/// ([`MatchCandidateRepo::retract_candidate_edges_conn`], with its audit row,
-/// atomically). The returned outcome is filtered to `caller`.
-pub async fn apply_after_match_retire(
+/// The whole match-candidate retirement, on the maintenance connection: flip
+/// the candidate to `stale` (decided by `trigger.agent_id`), retract its
+/// matcher edges and remove their derived rows
+/// ([`MatchCandidateRepo::retire_conn`]), and write its audit row, in ONE
+/// transaction. `trigger.candidate_status`, when set, is the status the
+/// retirement was requested against, and a candidate decided again since is
+/// refused (the status is `failed` and nothing changed). The returned outcome
+/// is filtered to `caller`.
+pub async fn apply_match_retire(
     admin: &mut sqlx::PgConnection,
     caller: &Viewer,
     trigger: &CascadeTrigger,
     candidate_id: Uuid,
 ) -> (CascadeStatus, Option<RetirementOutcome>) {
+    let expected = trigger.candidate_status.clone();
     let repaired = repair_with_audit!(
         admin,
         trigger,
-        |tx| MatchCandidateRepo::retract_candidate_edges_conn(&mut tx, candidate_id),
+        |tx| MatchCandidateRepo::retire_conn(
+            &mut tx,
+            candidate_id,
+            trigger.agent_id,
+            expected.as_deref()
+        ),
         |o| serde_json::json!({
+            "previous_status": o.previous_status,
             "edges_retracted": o.retracted_edges.iter().map(|e| e.edge_id).collect::<Vec<_>>(),
             "edges_retracted_now": o.edges_retracted,
             "factors_deleted": o.factors_deleted,
@@ -747,7 +785,7 @@ pub async fn apply_after_match_retire(
             (status, Some(outcome))
         }
         Err(e) => (
-            failed(admin, trigger, "the match-candidate retirement cascade", e).await,
+            failed(admin, trigger, "the match-candidate retirement", e).await,
             None,
         ),
     }
@@ -817,7 +855,10 @@ pub struct ReplayReport {
 /// with the trigger the deferral recorded (so the applied row still names the
 /// original caller) plus `replay_of` naming the deferral and `replayed_by`.
 /// Every repair re-verifies the committed act, so a deferral whose act was
-/// since undone fails loudly instead of repairing, and is left pending.
+/// since undone fails loudly instead of repairing, and is left pending. A
+/// deferred match-candidate retirement is the request itself: the replay
+/// carries it out while the candidate still has the status the deferral
+/// recorded, and fails loudly (left pending) once it was decided again.
 ///
 /// # Errors
 /// Only the pending-row query's error; each cascade's own failure is reported
@@ -882,7 +923,7 @@ pub async fn replay_deferred(
             }
             (CascadeCause::Consolidate, _) => apply_after_consolidate(admin, &trigger).await,
             (CascadeCause::MatchRetire, _) => {
-                apply_after_match_retire(admin, admin_viewer, &trigger, subject)
+                apply_match_retire(admin, admin_viewer, &trigger, subject)
                     .await
                     .0
             }
@@ -974,6 +1015,15 @@ mod tests {
         );
         t.sources = vec![Uuid::new_v4(), Uuid::new_v4()];
         assert_eq!(CascadeTrigger::from_audit(&t.audit_details()), Some(t));
+        let mut r = CascadeTrigger::new(
+            CascadeCause::MatchRetire,
+            Some(Uuid::new_v4()),
+            None,
+            Uuid::new_v4(),
+            None,
+        );
+        r.candidate_status = Some("promoted".to_string());
+        assert_eq!(CascadeTrigger::from_audit(&r.audit_details()), Some(r));
         for c in [
             CascadeCause::Supersede,
             CascadeCause::Dedup,

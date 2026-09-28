@@ -19,6 +19,15 @@
 //! it should not; every applied replay writes its own audit row naming the
 //! original caller, the deferral it replays and `--replayed-by`.
 //!
+//! A deferred match-candidate retirement is different: its act, the flip to
+//! `stale`, is administrative too (migration 118 refuses it on a
+//! non-privileged session), so the deferral is the whole REQUEST and the
+//! candidate was left as it was. The replay carries the request out (flip,
+//! retraction and derived-row deletes in one transaction) only while the
+//! candidate still has the status the deferral recorded; one decided again in
+//! between fails loudly and stays pending until retired below. Read the
+//! pending `match_retire` requests before a run if they need review.
+//!
 //! # Stuck cascades
 //!
 //! A cascade whose repair has failed `--max-failures` times (its act was

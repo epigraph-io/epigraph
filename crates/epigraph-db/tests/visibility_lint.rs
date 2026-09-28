@@ -1229,21 +1229,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "match_candidate.rs",
-        "mark_retired_conn",
-        "WRITE. The retirement's act on `match_candidates`, which carries no tenancy columns; the \
-         callers gate it on claims:admin.",
+        "retire_conn",
+        "WRITE, privileged only (refuses otherwise). The whole retirement (the flip to stale and \
+         its cascade) on the maintenance connection; migration 118 reserves the flip to a \
+         privileged session.",
     ),
     (
         "match_candidate.rs",
         "mark_retired_on",
-        "WRITE. `mark_retired_conn`'s body: lock and flip one `match_candidates` row, a table \
-         with no tenancy columns to filter on.",
-    ),
-    (
-        "match_candidate.rs",
-        "retract_candidate_edges_conn",
-        "WRITE, privileged only (refuses otherwise). The retirement's cascade on the maintenance \
-         connection; its read verifies the committed act.",
+        "WRITE. `retire_conn`'s act: lock, check the requested status and flip one \
+         `match_candidates` row, a table with no tenancy columns to filter on; called only on a \
+         privileged session.",
     ),
     (
         "match_candidate.rs",

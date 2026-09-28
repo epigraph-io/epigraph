@@ -321,53 +321,62 @@ pub async fn retire_match_candidate(
     server.reject_if_read_only()?;
     let candidate_id = parse_uuid(&params.candidate_id)?;
     let acting_agent = server.agent_id().await?;
+    let repo = MatchCandidateRepo::new(server.pool.clone());
+    // `match_candidates` carries no tenancy; a missing id is the caller's
+    // error, reported before anything is written or deferred.
+    let before = repo.get(candidate_id).await.map_err(|e| match e {
+        sqlx::Error::RowNotFound => {
+            invalid_params(format!("match candidate {candidate_id} not found"))
+        }
+        e => internal_error(e),
+    })?;
 
-    // THE ACT (migration 117): flip the candidate to `stale`, on a transaction
-    // stamped from the acting agent. `match_candidates` carries no tenancy; the
-    // stamp is there so the deferral row below, when there is one, is
-    // attributed to the session principal that `security_events_append` admits.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(
-        server,
-        acting_agent,
-        "retire_match_candidate",
-    )
-    .await?;
-    let previous_status =
-        MatchCandidateRepo::mark_retired_conn(&mut tx, candidate_id, Some(acting_agent))
-            .await
-            .map_err(internal_error)?;
-    let trigger = CascadeTrigger::new(
+    // Migrations 117 and 118: the retirement is ADMINISTRATIVE end to end.
+    // The flip to `stale` is refused on a non-privileged session (118's
+    // `match_candidates_stale_guard`), and the matcher edge it retracts is
+    // owned by nobody when both claims are public (117). So the flip, the
+    // retraction and the derived-row deletes run together, in one transaction,
+    // on the maintenance connection, audited under this caller; the status the
+    // caller saw is the precondition, so a candidate decided again meanwhile is
+    // refused rather than retired.
+    let mut trigger = CascadeTrigger::new(
         CascadeCause::MatchRetire,
         Some(acting_agent),
         crate::tools::supersede::oauth_principal(auth),
         candidate_id,
         None,
     );
-    let (mut session, deferred) =
-        crate::tools::supersede::admin_session_or_deferral(server, &mut tx, &trigger).await?;
-    tx.commit().await.map_err(internal_error)?;
-
-    // THE CASCADE, with administrative authority on the maintenance
-    // connection: retract the matcher edge (a promoted edge between two public
-    // claims is owned by nobody) and delete its derived rows. Audited
-    // atomically; what comes back is filtered to the caller's viewer.
-    let (cascade, retirement) = match (session.as_mut(), deferred) {
-        (Some(session), _) => {
-            admin_cascade::apply_after_match_retire(session.conn(), viewer, &trigger, candidate_id)
-                .await
+    trigger.candidate_status = Some(before.status.clone());
+    let (cascade, retirement) = match crate::maintenance::admin_cascade_session(server).await {
+        Ok(mut session) => {
+            admin_cascade::apply_match_retire(session.conn(), viewer, &trigger, candidate_id).await
         }
-        (None, status) => (status, None),
+        // No maintenance connection: nothing about the candidate changes. The
+        // whole retirement is recorded as a deferred request, on a transaction
+        // stamped from the acting agent (117's definer attributes the row to
+        // the session principal and records the candidate's status itself),
+        // for the operator's replay to carry out.
+        Err(reason) => {
+            let mut tx = crate::claim_helper::begin_author_stamped_tx(
+                server,
+                acting_agent,
+                "retire_match_candidate",
+            )
+            .await?;
+            let status = admin_cascade::record_deferral(&mut *tx, &trigger, &reason)
+                .await
+                .map_err(internal_error)?;
+            tx.commit().await.map_err(internal_error)?;
+            (status, None)
+        }
     };
-    let retirement = retirement.map(|mut r| {
-        r.previous_status.clone_from(&previous_status);
-        r
-    });
 
-    let repo = MatchCandidateRepo::new(server.pool.clone());
     let updated = repo.get(candidate_id).await.map_err(internal_error)?;
+    let retired = retirement.is_some();
     success_json(&serde_json::json!({
         "candidate": row_to_out(updated),
-        "previous_status": previous_status,
+        "previous_status": before.status,
+        "retired": retired,
         "cascade": cascade,
         "retirement": retirement,
     }))

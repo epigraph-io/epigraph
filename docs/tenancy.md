@@ -407,9 +407,9 @@ that for a non-privileged session:
   edge off the owner's endpoint) clears the edge's `signature`, `signer_id` and
   `content_hash`: the signed content named the old endpoints.
 
-**The retraction cascade is an administrative act (117).** A supersede, a dedup,
-a consolidation or a match-candidate retirement is the caller's act, written with
-the caller's authority on its own stamped transaction. What follows it --
+**The retraction cascade is an administrative act (117).** A supersede, a dedup
+or a consolidation is the caller's act, written with the caller's authority on
+its own stamped transaction. What follows it --
 re-pointing and retracting other writers' edges, moving and invalidating their
 edge-keyed BBAs, re-deriving belief -- runs on the server's maintenance
 connection (`epigraph_engine::admin_cascade`). Each repair commits in ONE
@@ -422,6 +422,16 @@ it is never derived from `DATABASE_URL`, and a request path acquires it before
 the act commits. Without it the act still commits and the cascade is reported
 (`"cascade": {"status": "deferred"}`) and recorded (`cascade.deferred`) in the
 act's own transaction.
+
+A match-candidate retirement has no caller's act: its flip to `stale` is
+administrative too (migration 118's `match_candidates_stale_guard` refuses it on
+a non-privileged session). The flip, the matcher-edge retraction and the
+derived-row deletes run together, in one transaction, on the maintenance
+connection, with one `cascade.admin_applied` row naming the caller. Without the
+connection nothing about the candidate changes: the whole retirement is recorded
+as a deferred request, with the candidate's status at that moment, and the
+replay carries it out only while the candidate still has that status (a
+candidate decided again in between fails loudly and stays pending).
 
 What the caller is told is filtered to what it may read: `cascade.touched` is
 counts only, and the belief report keeps only claims the caller's viewer can
@@ -449,8 +459,10 @@ definer `epigraph_record_cascade_deferral`, which attributes the row to the
 session principal and admits it only for an act that session made (write
 authority over the retired claim and its successor for a supersede; over the
 duplicate, onto a canonical that is public or written by the session, for a
-dedup; over every source for a consolidation; a `stale` candidate for a
-match-candidate retirement, whose table has no tenancy). A non-privileged
+dedup; over every source for a consolidation; an existing candidate for a
+match-candidate retirement request, whose table has no tenancy -- the request
+paths gate it on `claims:admin`, and the definer records the candidate's status
+as the replay's precondition). A non-privileged
 UPDATE may point `claims.supersedes` only at a claim that is public or written
 by the session.
 

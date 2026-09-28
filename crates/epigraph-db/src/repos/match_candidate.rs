@@ -269,83 +269,49 @@ impl MatchCandidateRepo {
     /// is `pending`, `rejected` or already `stale` simply has no matcher edge
     /// to delete, and the flip to `stale` is idempotent.
     ///
-    /// # Migration 117: the act and the cascade
+    /// # Migrations 117 and 118: an administrative act, on a privileged session
     ///
-    /// Retirement is two things. The ACT is flipping the candidate to `stale`
-    /// ([`Self::mark_retired`]); `match_candidates` carries no tenancy, and the
-    /// callers gate it on `claims:admin`. The CASCADE retracts the matcher edge
-    /// and removes its derived rows ([`Self::retract_candidate_edges_conn`]);
-    /// a promoted matcher edge between two public claims is owned by nobody,
-    /// and since 117 only a privileged session may retract it. This method runs
-    /// both in ONE transaction and therefore refuses a non-privileged pool; a
-    /// request path runs the act on its own pool and the cascade on the
-    /// maintenance connection (`epigraph_engine::admin_cascade`).
+    /// Retirement is administrative end to end. Its cascade retracts a matcher
+    /// edge that, between two public claims, nobody owns (117), and its act,
+    /// the flip to `stale`, is refused on a non-privileged session by 118's
+    /// `match_candidates_stale_guard` (MC01). So the flip and the cascade run
+    /// together, in ONE transaction, on a privileged (maintenance) session:
+    /// this method on a pool, [`Self::retire_conn`] on a connection. A request
+    /// path with no maintenance connection records the retirement as a
+    /// deferred request instead and leaves the candidate untouched
+    /// (`epigraph_engine::admin_cascade`).
     pub async fn retire(&self, id: Uuid, by: Option<Uuid>) -> sqlx::Result<RetirementOutcome> {
-        let mut tx = self.pool.begin().await?;
-        require_privileged(&mut tx, "MatchCandidateRepo::retire").await?;
-        let previous_status = mark_retired_on(&mut tx, id, by).await?;
-        let mut outcome = retract_candidate_edges(&mut tx, id).await?;
-        tx.commit().await?;
-        outcome.previous_status = previous_status;
-        Ok(outcome)
+        let mut conn = self.pool.acquire().await?;
+        Self::retire_conn(&mut conn, id, by, None).await
     }
 
-    /// The retirement's act: flip the candidate to `stale`, recording who and
-    /// when, and return its previous status. Tolerates any starting status (see
-    /// [`Self::retire`]). The matcher edge and its derived rows are the
-    /// administrative cascade's ([`Self::retract_candidate_edges_conn`]).
-    pub async fn mark_retired(&self, id: Uuid, by: Option<Uuid>) -> sqlx::Result<String> {
-        let mut tx = self.pool.begin().await?;
-        let previous = mark_retired_on(&mut tx, id, by).await?;
-        tx.commit().await?;
-        Ok(previous)
-    }
-
-    /// [`Self::mark_retired`] on a connection the caller owns (inside the
-    /// caller's transaction), so the act can commit together with whatever the
-    /// caller records beside it.
-    pub async fn mark_retired_conn(
+    /// [`Self::retire`] on a connection the caller owns: the maintenance
+    /// connection of a request path, or of the operator's replay.
+    ///
+    /// `expected_status`, when given, is the status the candidate had when the
+    /// retirement was requested. The retirement goes ahead only if the
+    /// candidate still has that status (or is already `stale`, when the flip is
+    /// idempotent); otherwise the candidate was decided again in between, and
+    /// retiring it would withdraw a decision the requester never saw. The
+    /// refusal is loud and nothing is written.
+    ///
+    /// # Errors
+    /// A protocol error on a non-privileged session, or when the candidate's
+    /// status is no longer `expected_status`; the query's error otherwise (a
+    /// missing candidate is `RowNotFound`).
+    pub async fn retire_conn(
         conn: &mut sqlx::PgConnection,
         id: Uuid,
         by: Option<Uuid>,
-    ) -> sqlx::Result<String> {
-        mark_retired_on(conn, id, by).await
-    }
-
-    /// The retirement's cascade, on the privileged maintenance connection:
-    /// retract the candidate's matcher edges and delete their `factors`,
-    /// `bp_messages` and edge-keyed BBAs.
-    ///
-    /// Re-verifies the committed act (the candidate is `stale`), so it acts
-    /// only on a retirement that happened, and it is idempotent: an edge
-    /// already retracted keeps its `valid_to`, and the derived rows are already
-    /// gone. That makes it the replay of a deferred cascade too. The returned
-    /// `previous_status` is `stale` (the act's caller holds the real one).
-    ///
-    /// # Errors
-    /// A protocol error on a non-privileged session or for a candidate that is
-    /// not `stale`; the query's error otherwise.
-    pub async fn retract_candidate_edges_conn(
-        conn: &mut sqlx::PgConnection,
-        id: Uuid,
+        expected_status: Option<&str>,
     ) -> sqlx::Result<RetirementOutcome> {
         use sqlx::Acquire;
         let mut tx = conn.begin().await?;
-        require_privileged(&mut tx, "MatchCandidateRepo::retract_candidate_edges_conn").await?;
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1 FOR UPDATE")
-                .bind(id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if status != "stale" {
-            return Err(sqlx::Error::Protocol(format!(
-                "match candidate {id} is {status}, not stale: its retirement has not been \
-                 recorded, so its matcher edge is not retracted"
-            )));
-        }
+        require_privileged(&mut tx, "MatchCandidateRepo::retire_conn").await?;
+        let previous_status = mark_retired_on(&mut tx, id, by, expected_status).await?;
         let mut outcome = retract_candidate_edges(&mut tx, id).await?;
         tx.commit().await?;
-        outcome.previous_status = status;
+        outcome.previous_status = previous_status;
         Ok(outcome)
     }
 
@@ -547,13 +513,14 @@ async fn require_privileged(conn: &mut sqlx::PgConnection, what: &str) -> sqlx::
     }
     Err(sqlx::Error::Protocol(format!(
         "{what} runs only on a privileged (maintenance) connection: a promoted matcher edge \
-         between two public claims is owned by nobody, and since migration 117 only a \
-         privileged session retracts it"
+         between two public claims is owned by nobody (migration 117), and the flip to \
+         `stale` is an administrative act (migration 118)"
     )))
 }
 
-/// The act of [`MatchCandidateRepo::retire`]: row-lock the candidate, flip it
-/// to `stale`, return its previous status.
+/// The act of [`MatchCandidateRepo::retire_conn`]: row-lock the candidate,
+/// check it still has `expected_status` (when given), flip it to `stale`, and
+/// return its previous status.
 ///
 /// The row lock serialises retirement against a *subsequent* decide -- that
 /// path's first write is `set_status`, which blocks here -- and against a
@@ -563,17 +530,31 @@ async fn require_privileged(conn: &mut sqlx::PgConnection, what: &str) -> sqlx::
 /// one that has already committed `set_status` and is mid-INSERT is not held
 /// by this lock. Its edge survives the retirement's cascade, leaving the row
 /// `stale` with a live matcher edge; retiring again cleans it up.
+///
+/// The flip is checked (`rows_affected == 1`): on a privileged session nothing
+/// filters the row, so a flip that changed nothing means the row vanished
+/// under the lock, and the retirement must not report success.
 async fn mark_retired_on(
     conn: &mut sqlx::PgConnection,
     id: Uuid,
     by: Option<Uuid>,
+    expected_status: Option<&str>,
 ) -> sqlx::Result<String> {
     let previous_status: String =
         sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1 FOR UPDATE")
             .bind(id)
             .fetch_one(&mut *conn)
             .await?;
-    sqlx::query(
+    if let Some(expected) = expected_status {
+        if previous_status != expected && previous_status != "stale" {
+            return Err(sqlx::Error::Protocol(format!(
+                "match candidate {id} was {expected} when its retirement was requested and is \
+                 {previous_status} now: it was decided again in between, so the request is not \
+                 carried out; nothing was changed"
+            )));
+        }
+    }
+    let flipped = sqlx::query(
         "UPDATE match_candidates
          SET status = 'stale', decided_at = now(), decided_by = $2
          WHERE id = $1",
@@ -581,7 +562,14 @@ async fn mark_retired_on(
     .bind(id)
     .bind(by)
     .execute(&mut *conn)
-    .await?;
+    .await?
+    .rows_affected();
+    if flipped != 1 {
+        return Err(sqlx::Error::Protocol(format!(
+            "match candidate {id}: the flip to stale changed {flipped} rows, not 1; nothing was \
+             retired"
+        )));
+    }
     Ok(previous_status)
 }
 
