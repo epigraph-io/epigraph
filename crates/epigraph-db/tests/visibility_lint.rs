@@ -472,6 +472,19 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "maintenance_lock.rs",
+        "try_take",
+        "NO TABLE. `SELECT pg_try_advisory_lock($1)` on the maintenance timer's own connection \
+         (operator decision D9, batch W12a): it reads and writes no row of any table, so there \
+         is nothing a viewer could filter. The connection is the timer's, held for its run.",
+    ),
+    (
+        "maintenance_lock.rs",
+        "release",
+        "NO TABLE. `SELECT pg_advisory_unlock($1)`, the inverse of `try_take`; it touches no \
+         row of any table.",
+    ),
+    (
         "foreign_attach.rs",
         "is_foreign_public_claim",
         "ROUTING QUESTION, not a disclosure (migration 114). Returns one boolean: whether the \

@@ -42,6 +42,7 @@ pub mod group_membership;
 pub mod instance_admin;
 pub mod learning_event;
 pub mod lineage;
+pub mod maintenance_lock;
 pub mod mass_function;
 pub mod match_candidate;
 pub mod method;
