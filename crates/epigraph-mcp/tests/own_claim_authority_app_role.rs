@@ -432,11 +432,17 @@ async fn a_canonical_the_caller_cannot_write_is_refused_at_claims_write(pool: Pg
 /// recorded, and in particular the act does not run on the MCP server agent's
 /// stamp (which CAN write that group: before this rule a `claims:write` author
 /// retired and rewrote the group's claim through it).
+///
+/// Each author's dedup names a canonical in THAT author's own personal group,
+/// which the author writes, so the canonical check admits it and the
+/// duplicate alone decides. (A canonical the author cannot write would be
+/// refused first, naming the canonical, and the duplicate's gate would never
+/// be reached.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_author_who_no_longer_writes_the_owning_group_is_refused(pool: PgPool) {
     let (server, server_agent) = app_role_server(&pool).await;
     let server_group = personal_group_of(&pool, server_agent).await;
-    let (revoked, _) = fixture::seed_agent_with_group(&pool, "oa1-revoked-author").await;
+    let (revoked, revoked_g) = fixture::seed_agent_with_group(&pool, "oa1-revoked-author").await;
     let (reader, rg) = fixture::seed_agent_with_group(&pool, "oa1-reader-author").await;
     add_member(&pool, server_group, revoked, "writer").await;
     add_member(&pool, server_group, reader, "reader").await;
@@ -456,14 +462,29 @@ async fn an_author_who_no_longer_writes_the_owning_group_is_refused(pool: PgPool
         "group-private, author only reads",
     )
     .await;
+    let revoked_own = claim_of(
+        &pool,
+        revoked,
+        revoked_g,
+        "public",
+        "the revoked author's own claim",
+    )
+    .await;
     let reader_own = claim_of(&pool, reader, rg, "public", "the reader's own claim").await;
     revoke(&pool, server_group, revoked).await;
 
-    for (author, c) in [(revoked, by_revoked), (reader, by_reader)] {
+    for (author, own_group, c, canonical) in [
+        (revoked, revoked_g, by_revoked, revoked_own),
+        (reader, rg, by_reader, reader_own),
+    ] {
         let v = viewer(&pool, author).await;
         assert!(
             !v.writable_groups().contains(&server_group),
             "fixture: the author does not write the owning group"
+        );
+        assert!(
+            v.writable_groups().contains(&own_group),
+            "fixture: the author writes the canonical's group"
         );
         let auth = human(author, &["claims:read", "claims:write"]);
 
@@ -474,14 +495,16 @@ async fn an_author_who_no_longer_writes_the_owning_group_is_refused(pool: PgPool
             .expect_err("an author without write authority may not supersede");
         assert_not_claim_writer(&err, c);
 
-        // The canonical is one the author does write (the reader's own claim
-        // for both, readable as public), so only the duplicate decides.
-        let err = mark_duplicate(&server, &v, dedup_params(c, reader_own), Some(&auth))
+        // The canonical is the author's OWN claim, in a group it writes, so
+        // the canonical check admits it and only the duplicate decides: the
+        // refusal must name the duplicate `c`, not the canonical.
+        let err = mark_duplicate(&server, &v, dedup_params(c, canonical), Some(&auth))
             .await
             .expect_err("an author without write authority may not mark a duplicate");
         assert_not_claim_writer(&err, c);
 
         assert!(is_current(&pool, c).await, "nothing was written");
+        assert!(is_current(&pool, canonical).await, "nothing was written");
         assert_eq!(successors(&pool, c).await, 0, "no replacement exists");
     }
     let deferrals: i64 = sqlx::query_scalar(
