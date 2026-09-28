@@ -10,7 +10,9 @@
 //! - **admin**: superset of every scope, including admin-only scopes.
 //! - **read-write** (`wo`): admin minus the admin-only scopes. Despite the
 //!   `wo` name (held over from EpigraphV2), this role gets read+write — it
-//!   just can't perform admin-gated operations like dedup or client mgmt.
+//!   just can't perform admin-gated operations like client management or
+//!   deduplicating a claim it cannot write (its own claims it may supersede
+//!   and dedup at `claims:write` since batch OA1).
 //! - **read-only** (`ro`): every read scope, no writes, no admin.
 
 /// Scopes that gate admin-only operations. These are EXCLUDED from `wo` and
@@ -53,6 +55,34 @@
 /// (`routes/admin.rs`) writes `granted_scopes` verbatim with no validation
 /// against `allowed_scopes`, so a `clients:admin` holder can grant it. That is
 /// pre-existing and is not closed here.
+///
+/// # An operator may grant these to a HUMAN's own client (batch OA1)
+///
+/// No registration path grants any scope in this list to a human client. An
+/// operator who decides that a particular human should hold one grants it with
+/// `epigraph-operator grant-client-scope <client-id> <scope>` (and withdraws it
+/// with `revoke-client-scope`): maintenance DSN only, scopes from THIS list
+/// only, `client_type = 'human'` only (service and agent clients are refused;
+/// `bootstrap_clients` and the approval route manage theirs), both
+/// `allowed_scopes` and `granted_scopes` kept consistent for that scope,
+/// idempotent, with a `--dry-run`, and one `security_events` row
+/// (`oauth.client_scope_granted` / `oauth.client_scope_revoked`) naming who,
+/// the client, the scope and both arrays before and after. That replaces a raw
+/// `UPDATE oauth_clients`.
+///
+/// **A human's agents carry exactly that human's scopes.** Agents acting
+/// through the human's OAuth client (a connector that mints and refreshes the
+/// human's tokens) hold whatever that client is granted: the refresh grant
+/// re-reads `oauth_clients.granted_scopes`. So if the human has superuser
+/// access, so do their agents, from their next token refresh; a revocation
+/// takes effect at the next refresh, and an already-minted access token keeps
+/// the scope until it expires.
+///
+/// Holding `claims:admin` is NOT needed to supersede or dedup one's OWN claims:
+/// since batch OA1 those two acts need `claims:write` plus write authority over
+/// the claim (its author, or an admin/writer of its owning group), and
+/// `claims:admin` is the arm for any claim the caller can read
+/// (`epigraph_auth::claim_act`).
 pub const ADMIN_ONLY_SCOPES: &[&str] = &[
     "claims:admin",
     "clients:admin",

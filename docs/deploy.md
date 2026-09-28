@@ -1250,3 +1250,81 @@ redirects or proxies. Nothing in this repository wires
 `ConfigurableWebhookHandler` into a runner yet; when something does, it should
 pass `PinnedHttpClient`. The `HttpClient` trait stays open for test mocks, so a
 second production implementation is a review red flag, not a compile error.
+
+## Batch OA1 — own-claim authority, and audited admin-only scope grants
+
+Operator decision D1 says a supersede or a dedup is the CALLER's act (its own
+write to its own claim) and only the cascade after it is administrative. Batch
+W10 split the two; OA1 makes the scopes agree with that split.
+
+### 1. `supersede` and `mark_duplicate` need `claims:write`, not `claims:admin`
+
+| Surface | Before | After |
+|---|---|---|
+| MCP `supersede_claim`, `mark_duplicate` | `claims:admin` | `claims:write` |
+| `POST /api/v1/claims/:id/supersede` | `claims:write` + author/admin | `claims:write` + the rule below |
+| `POST /api/v1/claims/:id/dedup` | `claims:admin` | `claims:write` + the rule below |
+
+The per-claim rule, shared by both transports (`epigraph_auth::claim_act`):
+the caller may perform the act when it is the claim's **author**, holds
+**`admin` or `writer` in the group that owns it**, or holds **`claims:admin`**
+(any claim it can read). The pre-OA1 token-owner rule, and MCP's operator-link
+arm, still admit whom they admitted.
+
+* A claim the caller cannot read answers exactly like a missing one (HTTP
+  `404`; MCP `claim <id> not found`). For a dedup this holds for the duplicate
+  AND the canonical.
+* A claim the caller can read but may not retire is refused by name: HTTP `403`
+  with `{"error": "not_owner", "rule": "not_claim_writer", "claim_id": ...,
+  "retryable": false}`; MCP `-32600` with the same keys in `data`. Nothing is
+  written.
+* The act runs on a transaction stamped with the caller's authority (HTTP
+  always; MCP whenever the caller writes the claim's group, otherwise with the
+  server agent's as before). The database still decides the write, so a
+  `claims:admin` caller whose stamp cannot write the row's group is refused
+  (`403`, nothing written) on an application-role deployment. That residual is
+  unchanged by OA1.
+* The cascade is unchanged: reported `{"status": "deferred"}` and applied by the
+  replay timer on the maintenance DSN (D9).
+
+Clients that relied on a `claims:write` token being REFUSED at the MCP scope
+check for these two tools now reach the per-claim rule instead. Conversely, a
+token holding `claims:admin` WITHOUT `claims:write` no longer reaches them (the
+HTTP supersede route already required `claims:write`): an administrative client
+should hold both, as `epigraph-admin` does.
+
+### 2. `epigraph-operator grant-client-scope` / `revoke-client-scope`
+
+```
+EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... \
+  epigraph-operator grant-client-scope <oauth_clients.id> <scope> --dry-run
+EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... \
+  epigraph-operator grant-client-scope <oauth_clients.id> <scope> --apply --reason "..."
+```
+
+The audited replacement for a raw `UPDATE oauth_clients` when an operator gives
+a HUMAN's own client an admin-only scope:
+
+* maintenance DSN only (the dedicated variable; no fallback to `DATABASE_URL`
+  or `MAINTENANCE_DATABASE_URL`; a login outside `epigraph_maintenance` is
+  refused);
+* scopes from `ADMIN_ONLY_SCOPES` only, checked before connecting;
+* `client_type = 'human'` only: service clients (`bootstrap_clients`) and agent
+  clients (the approval route) are refused;
+* the scope is added to, or removed from, BOTH `allowed_scopes` and
+  `granted_scopes`; every other element of each array is kept in order;
+* idempotent; exactly one of `--dry-run` / `--apply` is required;
+* every `--apply` writes one `security_events` row
+  (`oauth.client_scope_granted` / `oauth.client_scope_revoked`, `agent_id` = the
+  client's agent) whose `details` hold the operator (database login and OS
+  user), the client, the scope, `changed`, and both arrays before and after. A
+  no-op `--apply` is recorded too (`changed: false`), which is how a grant made
+  some other way is ratified. A dry run writes nothing.
+
+**A human's agents carry that human's scopes.** Agents acting through the
+human's OAuth client hold what that client is granted, because the refresh
+grant re-reads `granted_scopes`: a grant reaches them at their next refresh. A
+revocation also takes effect at the next refresh; an access token minted before
+it keeps the scope until it expires.
+
+No migration.
