@@ -1338,23 +1338,11 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              namespace, whose only writer is the definer mint. Creating an ordinary signer row \
              is a route-authorized capability gated above the database.",
         ),
-        (
-            "jobs_app",
-            "privatization_apply",
-            "The `job_type NOT IN ('privatization_*')` arm is row-only. Its instruction here used \
-             to be 'delete it or key it on the session when PR-18 adds the job types it names'. \
-             PR-18's apply slice ADDS THEM — `epigraph_jobs::privatization::APPLY_JOB_TYPE` and \
-             `REVERT_JOB_TYPE` are these literals, pinned by a unit test in that module — and the \
-             arm is KEPT rather than deleted or rewritten. Deleting it would remove the only thing \
-             that distinguishes privatization work from ordinary work on an INSERT, and this is an \
-             INSERT arm: `WITH CHECK` is evaluated for a non-bypass role even though `jobs_app`'s \
-             `USING` is bypass-only, because a plain INSERT reads no existing row. Rewriting it to \
-             name a session helper would change what it means, not how it is spelled — the \
-             predicate is about the WORK, and the session identity is already covered by the two \
-             disjuncts above it. The production enqueue is \
-             `PrivatizationRepository::enqueue_job_conn` on the maintenance connection, which the \
-             first disjunct admits.",
-        ),
+        // `jobs_app`'s row-only `job_type NOT IN ('privatization_*')` arm was
+        // listed here until migration 119 (batch W12a, D9) removed it: the
+        // queue's consumer is now a privileged timer, so the WITH CHECK admits
+        // only the two session predicates and an application session enqueues
+        // nothing (`maintenance_timer_only.rs`).
         (
             "security_events_append",
             "agent_id IS NULL",

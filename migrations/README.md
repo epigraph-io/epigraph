@@ -591,9 +591,27 @@ Current reservation:
   **Applied to throwaway databases only (5433, with 113, 114 and 115), NOT to
   any deployed database.**
 
-- **118+**: public next
+- **118**: claimed by another open branch (not present on this one); a database
+  at 119 without it applies it later in version order.
 
-Next public migration **outside both reserved tenancy ranges** must be `118` or
+- **119**: public `maintenance_timer_only` (batch W12a, operator decision D9) —
+  the maintenance DSN lives only in timers and operator CLIs, never in a
+  request-serving process. `epigraph_maintenance` gains DELETE on `jobs`,
+  `graph_cluster_runs`, `graph_clusters`, `cluster_edges`,
+  `claim_cluster_membership` and `claim_themes` (the tables a job handler
+  deletes from; the drain timer runs them on a non-superuser maintenance
+  login). The sealed-content tables are deliberately not granted. `jobs_app`'s
+  WITH CHECK becomes the two session predicates only (`epigraph_bypass()` /
+  `epigraph_definer_bypass()`): 077's denylist let any application session
+  enqueue any non-privatization job, which after D9 a privileged timer runs.
+  Carries `SET LOCAL lock_timeout = '3s'`. Behaviour in
+  `epigraph-db/tests/maintenance_timer_only.rs` (arms as `epigraph_app` and
+  `epigraph_maintenance`). Undo is in the file's header. **Applied to
+  throwaway databases only (5433, with 113), NOT to any deployed database.**
+
+- **120+**: public next (120 is reserved for batch W12b)
+
+Next public migration **outside both reserved tenancy ranges** must be `120` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
