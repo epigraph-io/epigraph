@@ -767,6 +767,105 @@ async fn a_public_owner_change_leaves_public_edges_and_a_narrowing_takes_the_mee
 }
 
 // ===========================================================================
+// 7. Privatization: apply then revert restores every tuple exactly.
+// ===========================================================================
+
+/// Apply (restrict endpoint A into group P, then the boundary re-meet) and
+/// revert (restore A to public, then the re-meet) on a privileged connection,
+/// as the privatization job runs them. Three edges touch A:
+///   * W's claim -> claim edge: `(W_g, public)` -> the meet -> `(W_g, public)`
+///     again, from the author record;
+///   * a legacy (principal-less) edge: world -> the meet -> world;
+///   * W's OUT-OF-SCOPE agent -> claim edge, which carries W's author record
+///     but was stamped world: world -> the meet -> world, never W's.
+/// Every author record is untouched throughout.
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_then_revert_restores_every_edge_tuple_exactly(pool: PgPool) {
+    use epigraph_db::repos::privatization::PrivatizationRepository;
+
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, w_g) = fixture::seed_agent_with_group(&pool, "writer-w").await;
+    let (_p, p_g) = fixture::seed_agent_with_group(&pool, "privatizing-group").await;
+    let a = fixture::seed_public_claim(&pool, author, "public A, to privatize").await;
+    let b = fixture::seed_public_claim(&pool, author, "public B").await;
+    let legacy = fixture::seed_edge(&pool, a, b).await;
+
+    let p = pool.clone();
+    let (w_edge, structural) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        let w_edge = insert_edge(&mut conn, (a, "claim"), (b, "claim"))
+            .await
+            .expect("W's claim -> claim edge");
+        let structural = insert_edge(&mut conn, (w, "agent"), (a, "claim"))
+            .await
+            .expect("W's agent -> claim edge");
+        (conn, (w_edge, structural))
+    })
+    .await;
+    let before = [
+        tuple(&pool, w_edge).await,
+        tuple(&pool, legacy).await,
+        tuple(&pool, structural).await,
+    ];
+    assert_eq!(
+        before,
+        [
+            t(w_g, "public", None, Some(w_g)),
+            t(WORLD, "public", None, None),
+            t(WORLD, "public", None, Some(w_g)),
+        ],
+        "fixture shape"
+    );
+
+    // Apply.
+    let mut tx = pool.begin().await.expect("begin");
+    let moved = PrivatizationRepository::restrict_claims_conn(&mut tx, &[a], p_g)
+        .await
+        .expect("restrict A");
+    assert_eq!(moved, vec![a]);
+    PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &[a])
+        .await
+        .expect("re-meet (apply)");
+    tx.commit().await.expect("commit apply");
+    for e in [w_edge, legacy, structural] {
+        let (o, v, co, _) = tuple(&pool, e).await;
+        assert_eq!(
+            (o, v.as_str(), co),
+            (p_g, "group", None),
+            "applied: the meet"
+        );
+    }
+
+    // Revert.
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL epigraph.allow_declassify = 'yes'")
+        .execute(&mut *tx)
+        .await
+        .expect("allow declassify");
+    sqlx::query("UPDATE claims SET visibility = 'public', owner_group_id = $2 WHERE id = $1")
+        .bind(a)
+        .bind(WORLD)
+        .execute(&mut *tx)
+        .await
+        .expect("restore A");
+    PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &[a])
+        .await
+        .expect("re-meet (revert)");
+    tx.commit().await.expect("commit revert");
+
+    let after = [
+        tuple(&pool, w_edge).await,
+        tuple(&pool, legacy).await,
+        tuple(&pool, structural).await,
+    ];
+    assert_eq!(
+        after, before,
+        "apply then revert restores the writer's edge, the legacy edge and the \
+         out-of-scope edge byte for byte"
+    );
+}
+
+// ===========================================================================
 // 8. Re-points (raw SQL; see the module doc).
 // ===========================================================================
 
@@ -1160,6 +1259,31 @@ async fn the_trigger_and_the_reown_carry_the_writer_rule_and_the_one_scope(pool:
             "epigraph_reown_legacy_edges_to_signer".to_string()
         ]
     );
+}
+
+/// The privatization revert is Rust, so its half of "one scope, read in every
+/// recompute site" is a source ratchet: the body of
+/// `recompute_boundary_meet_conn` must consult the scope predicate AND the
+/// author record for the both-public owner.
+#[test]
+fn the_privatization_revert_reads_the_scope_and_the_author_record() {
+    let src = include_str!("../src/repos/privatization.rs");
+    let start = src
+        .find("pub async fn recompute_boundary_meet_conn(")
+        .expect("recompute_boundary_meet_conn exists");
+    let end = start
+        + src[start..]
+            .find("\n    }\n")
+            .expect("the function body ends");
+    let body = &src[start..end];
+    for needle in [
+        "public.epigraph_edge_writer_scope(e.source_type, e.target_type)",
+        "wg.id = e.writer_group_id",
+        "THEN e.writer_group_id END AS wg",
+        "THEN COALESCE(ep.wg,",
+    ] {
+        assert!(body.contains(needle), "the revert lost `{needle}`:\n{body}");
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
