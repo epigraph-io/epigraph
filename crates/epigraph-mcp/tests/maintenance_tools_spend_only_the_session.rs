@@ -23,11 +23,31 @@
 
 use std::path::Path;
 
-/// `(file under src/tools, function)` for each maintenance tool.
+/// `(file under src/tools, function)` for each maintenance tool: the function
+/// that SPENDS the session. For the dedup sweep that is `sweep`, which both the
+/// MCP tool body (`sweep_semantic_duplicates`, a thin wrapper that hands its
+/// session straight on) and the operator CLI of the same name call (batch
+/// W12a, operator decision D9). The wrapper is checked for pool names too, in
+/// [`WRAPPERS`].
 const MAINTENANCE_TOOLS: &[(&str, &str)] = &[
     ("cdst_maintenance.rs", "recompute_beliefs"),
-    ("dedup_sweep.rs", "sweep_semantic_duplicates"),
+    ("dedup_sweep.rs", "sweep"),
     ("embeddings.rs", "backfill_embeddings"),
+];
+
+/// Tool bodies that take the session and hand it, whole, to a function in
+/// [`MAINTENANCE_TOOLS`]: they must name no pool, and must pass the session on.
+const WRAPPERS: &[(&str, &str, &str)] = &[(
+    "dedup_sweep.rs",
+    "sweep_semantic_duplicates",
+    "sweep(session,",
+)];
+
+const POOL_NEEDLES: [&str; 4] = [
+    "server.pool",
+    "_server.pool",
+    ".pool.acquire",
+    ".pool.begin",
 ];
 
 /// Drop `//` line comments (including `///` and `//!`). String literals are
@@ -71,12 +91,7 @@ fn the_three_maintenance_tools_name_no_server_pool() {
         let src = std::fs::read_to_string(tools_dir().join(file)).expect("read tool source");
         let stripped = strip_line_comments(&src);
         let body = function_body(&stripped, func);
-        for needle in [
-            "server.pool",
-            "_server.pool",
-            ".pool.acquire",
-            ".pool.begin",
-        ] {
+        for needle in POOL_NEEDLES {
             if body.contains(needle) {
                 findings.push(format!("tools/{file}::{func} names `{needle}`"));
             }
@@ -89,6 +104,20 @@ fn the_three_maintenance_tools_name_no_server_pool() {
         assert!(
             body.contains("session.split()"),
             "tools/{file}::{func} must take its connection and viewer from the session"
+        );
+    }
+    for (file, func, hand_on) in WRAPPERS {
+        let src = std::fs::read_to_string(tools_dir().join(file)).expect("read tool source");
+        let stripped = strip_line_comments(&src);
+        let body = function_body(&stripped, func);
+        for needle in POOL_NEEDLES {
+            if body.contains(needle) {
+                findings.push(format!("tools/{file}::{func} names `{needle}`"));
+            }
+        }
+        assert!(
+            body.contains("MaintenanceSession") && body.contains(hand_on),
+            "tools/{file}::{func} no longer hands its MaintenanceSession on whole (`{hand_on}`)"
         );
     }
     assert!(
