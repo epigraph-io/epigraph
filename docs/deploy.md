@@ -1279,9 +1279,10 @@ it, so a `claims:write` caller may only choose a canonical it could write.
   would refuse anyway.)
 * The pre-OA1 comparison of the token's owner/client id (an `oauth_clients.id`)
   with the claim's author (an `agents.id`) is gone. MCP's operator-link arm no
-  longer admits a claim act: before OA1 the tools required `claims:admin`, so it
-  never decided one in production. `resolve_backlog_item` and `patch_claim`
-  keep it. Claims an operated agent submits AFTER the operator link are owned
+  longer admits a claim act: before OA1 the tools' scope was `claims:admin`, so
+  on any deployment the arm could only ever run for a caller that already held
+  `claims:admin`, and removing it takes nothing away. `resolve_backlog_item`
+  and `patch_claim` keep it. Claims an operated agent submits AFTER the operator link are owned
   by the operator's personal group, which the operator writes, so the operator
   is admitted by the rule above on its own stamp. Claims still owned by the
   agent's own personal group (written before the link, or by a write path that

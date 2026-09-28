@@ -26,8 +26,9 @@
 //! over the claim's owning group, or `claims:admin`) and no longer consults
 //! this operator arm: the act runs on the caller's own stamp, and the operator
 //! arm would otherwise have lent a `claims:write` caller the MCP server
-//! agent's stamp. Before OA1 the tool's scope was `claims:admin`, so the
-//! operator arm was never what admitted an HTTP supersede in production. The
+//! agent's stamp. Before OA1 the tool's scope was `claims:admin`, so on any
+//! deployment the operator arm could only ever run for a caller that already
+//! held `claims:admin` and was never the arm that decided an HTTP supersede. The
 //! HTTP halves below therefore exercise the arm through `resolve_backlog_item`,
 //! which still runs it, and
 //! `the_operators_http_principal_may_retire_and_patch_its_agents_claims` pins
