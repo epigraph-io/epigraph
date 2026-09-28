@@ -954,6 +954,69 @@ async fn a_repoint_keeps_the_writers_owner_for_the_owner_and_the_cascade(pool: P
     );
 }
 
+/// Arm (u) keeps the owner a public edge HAS, not the one its author record
+/// would give: an edge a privileged session re-owned (an operator's
+/// administrative re-own, so its owner differs from its author record) keeps
+/// that owner when the cascade re-points it on a principal-less session, and so
+/// does a re-point onto a structural endpoint. Without (u) the re-point would
+/// recompute the owner from the author record (or the scope) and silently undo
+/// the re-own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_repoint_keeps_the_owner_the_edge_has_not_the_author_record(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, w_g) = fixture::seed_agent_with_group(&pool, "writer-w").await;
+    let (_o, o_g) = fixture::seed_agent_with_group(&pool, "operator-o").await;
+    let a = fixture::seed_public_claim(&pool, author, "public A").await;
+    let b = fixture::seed_public_claim(&pool, author, "public B").await;
+    let c = fixture::seed_public_claim(&pool, author, "public C").await;
+
+    let p = pool.clone();
+    let edge = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        let e = insert_edge(&mut conn, (a, "claim"), (b, "claim"))
+            .await
+            .expect("W links");
+        (conn, e)
+    })
+    .await;
+    sqlx::query("UPDATE edges SET owner_group_id = $2 WHERE id = $1")
+        .bind(edge)
+        .bind(o_g)
+        .execute(&pool)
+        .await
+        .expect("an administrative re-own (privileged)");
+    assert_eq!(tuple(&pool, edge).await, t(o_g, "public", None, Some(w_g)));
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    unstamp(&mut conn).await;
+    let n = exec2(
+        &mut conn,
+        "UPDATE edges SET target_id = $2 WHERE id = $1",
+        edge,
+        c,
+    )
+    .await;
+    assert_eq!(n, Ok(1));
+    assert_eq!(
+        tuple(&pool, edge).await,
+        t(o_g, "public", None, Some(w_g)),
+        "the cascade's re-point keeps the owner the edge has"
+    );
+    let n = sqlx::query("UPDATE edges SET target_id = $2, target_type = 'agent' WHERE id = $1")
+        .bind(edge)
+        .bind(author)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected());
+    drop(conn);
+    assert_eq!(n.expect("re-point onto a structural endpoint"), 1);
+    assert_eq!(
+        tuple(&pool, edge).await,
+        t(o_g, "public", None, Some(w_g)),
+        "so does a re-point onto a structural endpoint"
+    );
+}
+
 /// Re-points never widen: onto a group claim the edge takes the meet; a group
 /// edge re-pointed onto public endpoints stays group with its co-owner; a
 /// mixed private edge re-pointed onto a PUBLIC canonical (the statement the
