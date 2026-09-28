@@ -18,21 +18,42 @@ use sqlx::types::Json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// A server whose ScopedPool carries a privileged maintenance pool (the
-/// harness superuser pool), so the retirement's administrative cascade
-/// (migration 117) runs, as it does on a server configured with
-/// `MAINTENANCE_DATABASE_URL`.
+/// A server with NO maintenance pool, the only shape a request-serving MCP
+/// server has under operator decision D9 (batch W12a): the retirement's
+/// administrative cascade (migrations 117/118) is recorded as a deferred
+/// request, and [`replay`] -- the replay timer's function, on a maintenance
+/// connection -- carries it out.
 async fn build_server(pool: PgPool, read_only: bool) -> EpiGraphMcpFull {
-    let scoped = fixture::scoped_pool(&pool)
-        .await
-        .with_maintenance_pool(pool.clone());
+    let scoped = fixture::scoped_pool(&pool).await;
     build_server_with(pool, read_only, scoped)
 }
 
-/// A server with NO maintenance pool: its cascades defer.
-async fn build_server_without_admin(pool: PgPool) -> EpiGraphMcpFull {
-    let scoped = fixture::scoped_pool(&pool).await;
-    build_server_with(pool, false, scoped)
+/// Run the deferred-cascade replay once, as `epigraph-cascade-replay.timer`
+/// does: `replay_deferred` on a connection that runs as
+/// `epigraph_maintenance` (not a superuser).
+async fn replay(pool: &PgPool) -> epigraph_engine::admin_cascade::ReplayReport {
+    let maintenance = fixture::downgraded_pool(pool, "epigraph_maintenance").await;
+    let scoped = fixture::scoped_pool(pool)
+        .await
+        .with_maintenance_pool(maintenance);
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    session
+        .assert_privileged()
+        .await
+        .expect("the replay's connection is privileged");
+    let (conn, viewer) = session.split();
+    epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        viewer,
+        "w12a-test",
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("replay")
 }
 
 fn build_server_with(
@@ -612,12 +633,48 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
     .await
     .expect("retire");
     let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
-    assert_eq!(body["candidate"]["status"], "stale");
-    assert_eq!(body["previous_status"], "promoted");
-    assert_eq!(body["cascade"]["status"], "applied", "{body}");
-    assert_eq!(body["retirement"]["previous_status"], "promoted");
-    assert_eq!(body["retirement"]["edges_retracted"], 1);
-    assert_eq!(body["retirement"]["factors_deleted"], 1);
+    // D9: the request-serving server defers the whole retirement...
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    assert_eq!(body["candidate"]["status"], "promoted", "{body}");
+    assert_eq!(
+        edge_relationships(&pool, a, b).await,
+        vec!["CORROBORATES".to_string()],
+        "nothing is retracted before the replay"
+    );
+    // ...and the replay, on the maintenance connection, carries it out.
+    let report = replay(&pool).await;
+    assert_eq!(
+        (report.pending, report.applied, report.failed),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    let (applied_counts, replay_of): (serde_json::Value, Option<String>) = sqlx::query_as(
+        "SELECT details->'touched', details#>>'{replay_of,deferred_event_id}' \
+           FROM security_events \
+          WHERE event_type = 'cascade.admin_applied' \
+            AND details#>>'{trigger,subject_id}' = $1::text",
+    )
+    .bind(cand)
+    .fetch_one(&pool)
+    .await
+    .expect("the replay's applied row");
+    assert_eq!(
+        replay_of.as_deref(),
+        body["cascade"]["audit_event_id"].as_str(),
+        "the applied row names the deferral it replays"
+    );
+    assert_eq!(applied_counts["edges_retracted_now"], 1, "{applied_counts}");
+    assert_eq!(applied_counts["factors_deleted"], 1, "{applied_counts}");
+    assert_eq!(
+        applied_counts["previous_status"], "promoted",
+        "{applied_counts}"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "stale");
 
     assert!(
         edge_relationships(&pool, a, b).await.is_empty(),
@@ -805,6 +862,10 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
     )
     .await
     .expect("retire");
+    // D9: the retirement is deferred on the request server and carried out by
+    // the replay on the maintenance connection.
+    let report = replay(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
     assert!(
         edge_relationships(&pool, a, b).await.is_empty(),
         "precondition: retirement took the edge out of force"
@@ -1020,7 +1081,7 @@ async fn find_cross_source_matches_omits_sweep_coverage_for_an_invisible_claim(p
 /// agent, carrying the status it was requested against.
 #[sqlx::test(migrations = "../../migrations")]
 async fn retire_without_an_admin_connection_defers_the_whole_retirement(pool: PgPool) {
-    let server = build_server_without_admin(pool.clone()).await;
+    let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
     let b = insert_claim(&pool, agent).await;

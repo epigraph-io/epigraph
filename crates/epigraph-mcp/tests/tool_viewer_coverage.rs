@@ -231,7 +231,11 @@ fn tools(src: &str) -> Vec<(String, Acquisition)> {
 
         let acq = if body.contains("request_viewer(") {
             Acquisition::Request
-        } else if body.contains("maintenance_viewer(") {
+        } else if body.contains("maintenance_viewer(") || body.contains("maintenance_tool_session(")
+        {
+            // `maintenance_tool_session` (operator decision D9, batch W12a) is
+            // the three tools' entry: it answers MOVED with no maintenance pool
+            // and otherwise mints the same bypass through `maintenance_viewer`.
             Acquisition::Maintenance
         } else {
             Acquisition::None
