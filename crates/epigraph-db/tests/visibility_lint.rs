@@ -1505,6 +1505,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "admin_cascade.rs",
+        "pending_summary",
+        "READ of `security_events`: counts and the oldest age over the same pending set as \
+         `pending_replays` / `stuck_replays` (one `PENDING_CTE`), for the replay's read-only \
+         `--report-only` staleness check (operator decision D9). Maintenance connection only; it \
+         returns two counts and an age, no row and no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
         "record",
         "INSERT INTO `security_events` (append-only; 077's security_events_append admits a row \
          attributed to the session principal, or any row on the maintenance connection; 117 \
