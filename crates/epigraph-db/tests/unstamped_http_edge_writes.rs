@@ -14,37 +14,40 @@
 //! ownership until the handler is stamped.
 //!
 //! The five edge write handlers in `routes/edges.rs` were converted by W12b and
-//! are not in this register. None of the sites below holds a stamped
-//! transaction where it writes; several handlers hold a `Viewer`, but their
-//! other statements run on the raw pool too, and converting one statement of a
-//! handler would leave it on two connections (the "whole handlers or nothing"
-//! rule `no_unscoped_pool.rs` records). Stamping them is a follow-up.
+//! are not in this register, and so were the in-scope edge statements of
+//! `conventions.rs::share_skill` (claim -> claim SHARED_BY) and
+//! `conventions.rs::forget_convention` (evidence -> claim REFUTES): both
+//! handlers hold a `Viewer`, and every other statement they make autocommits on
+//! the raw pool, so moving the one edge statement onto `AppState::write_as`
+//! splits no transaction. None of the sites below holds a stamped transaction
+//! where it writes. Each in-scope site's disposition is in the table: a
+//! STRUCTURAL site (an agent, trace, frame, context, span, perspective or
+//! community endpoint) is administrative by D8's own rule, and stamping it
+//! would only record `writer_group_id`.
 //!
 //! # The register (per site, at this commit)
 //!
-//! | file | handler | endpoints -> relationship | in D8 scope |
-//! |---|---|---|---|
-//! | assess.rs | assess_claim | claim -> frame WITHIN_FRAME | no |
-//! | assess.rs | assess_claim | evidence -> claim SUPPORTS | yes |
-//! | assess.rs | assess_claim | evidence -> claim CONTRADICTS | yes |
-//! | belief.rs | submit_evidence | claim -> context SCOPED_BY | no |
-//! | belief.rs | submit_evidence | claim -> frame WITHIN_FRAME | no |
-//! | belief.rs | submit_evidence | evidence -> claim SUPPORTS | yes |
-//! | belief.rs | submit_evidence | evidence -> claim CONTRADICTS | yes |
-//! | belief.rs | submit_evidence | evidence -> agent GENERATED_BY | no |
-//! | belief.rs | submit_evidence | perspective -> claim CONTRIBUTES_TO | no |
-//! | claims.rs | create_claim | agent -> claim AUTHORED | no |
-//! | claims.rs | create_claim | claim -> trace HAS_TRACE | no |
-//! | claims.rs | create_claim | claim -> evidence DERIVED_FROM | yes |
-//! | community.rs | add_member | perspective -> community MEMBER_OF | no |
-//! | conventions.rs | learn_convention | agent -> claim AUTHORED | no |
-//! | conventions.rs | learn_convention | evidence -> claim SUPPORTS | yes |
-//! | conventions.rs | learn_convention | trace -> claim TRACES | no |
-//! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no |
-//! | conventions.rs | forget_convention | evidence -> claim REFUTES | yes |
-//! | conventions.rs | share_skill | claim -> claim SHARED_BY | yes |
-//! | cross_source.rs | decide_candidate (promote) | claim -> claim (matcher) | yes |
-//! | crud.rs | create_evidence | claim -> evidence DERIVED_FROM | yes |
+//! | file | handler | endpoints -> relationship | in D8 scope | disposition |
+//! |---|---|---|---|---|
+//! | assess.rs | assess_claim | claim -> frame WITHIN_FRAME | no | structural |
+//! | assess.rs | assess_claim | evidence -> claim SUPPORTS | yes | DEAD WRITE: the source id is a `mass_functions` id typed `evidence`; `edges_validate_refs` refuses it (measured) and `let _` swallows the error, so no edge lands |
+//! | assess.rs | assess_claim | evidence -> claim CONTRADICTS | yes | DEAD WRITE, as above |
+//! | belief.rs | submit_evidence | claim -> context SCOPED_BY | no | structural |
+//! | belief.rs | submit_evidence | claim -> frame WITHIN_FRAME | no | structural |
+//! | belief.rs | submit_evidence | evidence -> claim SUPPORTS | yes | DEAD WRITE: the same `mass_functions`-id-as-evidence shape |
+//! | belief.rs | submit_evidence | evidence -> claim CONTRADICTS | yes | DEAD WRITE, as above |
+//! | belief.rs | submit_evidence | evidence -> agent GENERATED_BY | no | structural (and the same dead shape) |
+//! | belief.rs | submit_evidence | perspective -> claim CONTRIBUTES_TO | no | structural |
+//! | claims.rs | create_claim | agent -> claim AUTHORED | no | structural |
+//! | claims.rs | create_claim | claim -> trace HAS_TRACE | no | structural |
+//! | claims.rs | create_claim | claim -> evidence DERIVED_FROM | yes | holds a `Viewer`; a post-commit best-effort statement; conversion deferred (no direct test harness for the signed create path yet) |
+//! | community.rs | add_member | perspective -> community MEMBER_OF | no | structural |
+//! | conventions.rs | learn_convention | agent -> claim AUTHORED | no | structural |
+//! | conventions.rs | learn_convention | evidence -> claim SUPPORTS | yes | holds no `Viewer` (an `AuthContext` only) |
+//! | conventions.rs | learn_convention | trace -> claim TRACES | no | structural |
+//! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no | structural |
+//! | cross_source.rs | decide_candidate (promote) | claim -> claim (matcher) | yes | OPERATOR CONFIRMATION: the MCP `decide_match_candidate` promote writes the same matcher edge on its unstamped pool, so stamping the HTTP side alone would split the matcher edges' owner by surface; the matcher retirement path deletes them administratively either way |
+//! | crud.rs | create_evidence | claim -> evidence DERIVED_FROM | yes | holds no `Viewer` |
 //! | crud.rs | create_reasoning_trace | claim -> trace HAS_TRACE | no |
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
 //! | provenance.rs | set_provenance | claim -> agent ATTRIBUTED_TO | no |
@@ -107,7 +110,9 @@ const UNSTAMPED: &[(&str, usize)] = &[
     ("belief.rs", 6),
     ("claims.rs", 3),
     ("community.rs", 1),
-    ("conventions.rs", 6),
+    // 6 before the W12b revise, which stamped `share_skill`'s and
+    // `forget_convention`'s in-scope edge statements.
+    ("conventions.rs", 4),
     ("cross_source.rs", 1),
     ("crud.rs", 2),
     ("perspective.rs", 1),
@@ -116,7 +121,7 @@ const UNSTAMPED: &[(&str, usize)] = &[
 ];
 
 /// The total the register may never exceed.
-const HIGH_WATER: usize = 30;
+const HIGH_WATER: usize = 28;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

@@ -26,6 +26,7 @@ use epigraph_api::errors::ApiError;
 use epigraph_api::middleware::bearer::AuthContext;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::middleware::ClientType;
+use epigraph_api::routes::conventions::{forget_convention, share_skill, ShareSkillRequest};
 use epigraph_api::routes::edges::{
     create_edge, create_hierarchical_edge, delete_edge, patch_edge, relate_claims,
     CreateEdgeRequest, LinkHierarchicalRequest, PatchEdgeRequest, RelateClaimsRequest,
@@ -58,6 +59,26 @@ async fn app_role_state(pool: &PgPool) -> AppState {
             .expect("app-role ScopedPool");
     let raw = downgraded_pool(pool, "epigraph_app").await;
     let mut state = AppState::with_db(raw, ApiConfig::default());
+    state.scoped = Some(scoped);
+    state
+        .load_entity_type_cache()
+        .await
+        .expect("load the entity-type cache");
+    state
+}
+
+/// The shape of a deployment still serving on a privileged DSN (before the
+/// application-role move): the raw `db_pool` is the harness superuser, so a
+/// handler's unstamped statements land; the stamped `ScopedPool` is the
+/// application role, so an edge written through `AppState::write_as` is held
+/// to the caller's own writable groups and proves the stamp.
+async fn privileged_raw_state(pool: &PgPool) -> AppState {
+    let url = database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
     state.scoped = Some(scoped);
     state
         .load_entity_type_cache()
@@ -379,4 +400,83 @@ async fn hierarchical_and_relate_are_the_callers_and_a_mixed_edge_is_decided_by_
         .await
         .expect("count");
     assert_eq!(after, before, "nothing written");
+}
+
+/// Brief 4.4: a registered handler that already holds a viewer writes its
+/// in-scope edge on a transaction stamped with the caller's viewer.
+/// `share_skill` (claim -> claim SHARED_BY) and `forget_convention`
+/// (evidence -> claim REFUTES) write every other statement on the raw pool
+/// (autocommit, no transaction to split), so their edge statement alone moved
+/// to `AppState::write_as`. The edge is the caller's, and the caller (not a
+/// bystander) can retract it on the application role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_viewer_holding_handlers_edge_is_the_callers(pool: PgPool) {
+    let state = privileged_raw_state(&pool).await;
+    let app = app_role_state(&pool).await;
+    let (author, _) = seed_agent_with_group(&pool, "author").await;
+    let (w, w_g) = seed_agent_with_group(&pool, "http-sharer-w").await;
+    let (z, _) = seed_agent_with_group(&pool, "http-bystander-z").await;
+    let workflow = seed_public_claim(&pool, author, "w12b http shared workflow").await;
+    let convention = seed_public_claim(&pool, author, "w12b http convention").await;
+
+    // share_skill: the SHARED_BY edge is W's.
+    let (status, Json(shared)) = share_skill(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        Json(ShareSkillRequest {
+            workflow_id: workflow,
+        }),
+    )
+    .await
+    .expect("W shares the workflow");
+    assert_eq!(status.as_u16(), 201);
+    let r = row(&pool, shared.edge_id).await;
+    assert_eq!(
+        (r.0, r.1.as_str(), r.2, r.3, r.4),
+        (w_g, "public", None, Some(w_g), true),
+        "the caller's SHARED_BY edge, not an administrative one"
+    );
+    let refused = delete_edge(
+        ViewerExtractor(viewer(&pool, z).await),
+        State(app.clone()),
+        auth(z),
+        Path(shared.edge_id),
+    )
+    .await
+    .expect_err("not Z's to retract");
+    assert_not_owner(refused, "owned_by_another_writer").await;
+    assert!(row(&pool, shared.edge_id).await.4, "still in force");
+    let status = delete_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(app.clone()),
+        auth(w),
+        Path(shared.edge_id),
+    )
+    .await
+    .expect("W retracts the edge it wrote");
+    assert_eq!(status.as_u16(), 204);
+    assert!(!row(&pool, shared.edge_id).await.4, "retracted");
+
+    // forget_convention: the REFUTES edge is W's.
+    forget_convention(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth_with(w, &["claims:admin"]),
+        Path(convention),
+    )
+    .await
+    .expect("W forgets the convention");
+    let refutes: Vec<(Uuid, String, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT owner_group_id, visibility::text, co_owner_group_id, writer_group_id \
+           FROM edges WHERE target_id = $1 AND relationship = 'REFUTES'",
+    )
+    .bind(convention)
+    .fetch_all(&pool)
+    .await
+    .expect("REFUTES edges");
+    assert_eq!(
+        refutes,
+        vec![(w_g, "public".to_string(), None, Some(w_g))],
+        "exactly one REFUTES edge, the caller's"
+    );
 }
