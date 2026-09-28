@@ -1281,9 +1281,12 @@ it, so a `claims:write` caller may only choose a canonical it could write.
   with the claim's author (an `agents.id`) is gone. MCP's operator-link arm no
   longer admits a claim act: before OA1 the tools required `claims:admin`, so it
   never decided one in production. `resolve_backlog_item` and `patch_claim`
-  keep it. An operated agent's claims are owned by the operator's personal
-  group, which the operator writes, so the operator is admitted by the rule
-  above on its own stamp.
+  keep it. Claims an operated agent submits AFTER the operator link are owned
+  by the operator's personal group, which the operator writes, so the operator
+  is admitted by the rule above on its own stamp. Claims still owned by the
+  agent's own personal group (written before the link, or by a write path that
+  does not re-own) are NOT: the operator needs `claims:admin` for those, or
+  must first move them with `epigraph-operator reown-claims`.
 
 **Which claims that reaches.** A claim written through an MCP server is authored
 by that server's signer agent and owned by the signer's group, not by the human
