@@ -9,8 +9,9 @@
 //! idempotence; one `security_events` row per `--apply` with who, the client,
 //! the scope and both arrays before and after; a dry run that writes nothing;
 //! a grant refused to a client that is not `active` (a revoke is not); the
-//! advisory environment user recorded beside the kernel's uid; and the
-//! maintenance-DSN-only connection.
+//! advisory environment user recorded beside the kernel's uid; the
+//! maintenance-DSN-only connection; and the happy path as a real NOSUPERUSER
+//! maintenance login, the shape the runbook uses.
 
 mod viewer_fixture;
 
@@ -337,6 +338,58 @@ async fn the_environment_user_is_advisory_and_the_kernel_uid_is_recorded(pool: P
         op["process_user"], "someone-else",
         "the kernel's user is not the spoofed one"
     );
+}
+
+/// The happy path as a REAL maintenance login: `NOSUPERUSER`, a member of
+/// `epigraph_maintenance`, the shape the runbook prescribes. (Every other test
+/// here connects as the cluster superuser, for which the membership check is
+/// trivially true.) The grant applies to both arrays and the one audit row
+/// names that login.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_grant_applies_as_a_non_superuser_maintenance_login(pool: PgPool) {
+    let c = seed_client(&pool, "human", ALLOWED, GRANTED, None, None).await;
+    let url = fixture::database_url_for(&pool).await;
+    let role = format!("oa1_maint_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'probe-only' NOSUPERUSER IN ROLE epigraph_maintenance"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create role");
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (_, host) = rest.split_once('@').expect("credentials");
+    let dsn = format!("{scheme}://{role}:probe-only@{host}");
+    let r = run_with_env(
+        &[
+            "grant-client-scope",
+            &c.to_string(),
+            "claims:admin",
+            "--apply",
+            "--reason",
+            "as a maintenance login",
+        ],
+        &[(DSN_ENV, &dsn)],
+        &["DATABASE_URL", "MAINTENANCE_DATABASE_URL"],
+    );
+    let rolsuper: bool = sqlx::query_scalar("SELECT rolsuper FROM pg_roles WHERE rolname = $1")
+        .bind(&role)
+        .fetch_one(&pool)
+        .await
+        .expect("role row");
+    // Drop the cluster-global role BEFORE asserting, so a failure cannot leak it.
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&pool)
+        .await
+        .expect("drop role");
+
+    assert!(!rolsuper, "fixture: the login is not a superuser");
+    assert_eq!(r.code, 0, "{}", r.show());
+    let (allowed, granted) = scopes(&pool, c).await;
+    assert!(allowed.contains(&"claims:admin".to_string()), "{allowed:?}");
+    assert!(granted.contains(&"claims:admin".to_string()), "{granted:?}");
+    let rows = audit(&pool, c).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2["operator"]["session_user"], role.as_str());
 }
 
 /// Granting a held scope changes nothing, and the `--apply` is still recorded
