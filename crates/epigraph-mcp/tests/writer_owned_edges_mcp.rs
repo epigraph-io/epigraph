@@ -14,7 +14,12 @@
 //! * W patches and retracts its own edge; W then links the same triple again
 //!   and gets a NEW in-force edge (never a silent `was_created = false` onto the
 //!   retracted row); Z re-asserting the triple gets W's edge back with
-//!   `owned_by_caller = false`.
+//!   `owned_by_caller = false`;
+//! * the same holds for the SYMMETRIC link tools (`link_epistemic` with
+//!   `contradicts`, in either direction, and `link_alternative`): their probe
+//!   matches rows in force only, so a retracted symmetric link asserted again
+//!   is a new edge. (The matcher's own promotion probe still matches any
+//!   state; it is not a caller link.)
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -26,8 +31,11 @@ use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::edge_mutation::{do_delete_edge, do_patch_edge};
+use epigraph_mcp::tools::link_alternative::do_link_alternative;
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
-use epigraph_mcp::types::{DeleteEdgeParams, LinkEpistemicParams, PatchEdgeParams};
+use epigraph_mcp::types::{
+    DeleteEdgeParams, LinkAlternativeParams, LinkEpistemicParams, PatchEdgeParams,
+};
 use rmcp::model::ErrorCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -87,13 +95,17 @@ fn text(result: &rmcp::model::CallToolResult) -> String {
 }
 
 async fn link(s: &Side, a: Uuid, b: Uuid) -> Linked {
+    link_as(s, a, b, "supports").await
+}
+
+async fn link_as(s: &Side, a: Uuid, b: Uuid, relationship: &str) -> Linked {
     let r = do_link_epistemic(
         &s.server,
         &s.viewer,
         LinkEpistemicParams {
             source_claim_id: a.to_string(),
             target_claim_id: b.to_string(),
-            relationship: "supports".to_string(),
+            relationship: relationship.to_string(),
             properties: None,
         },
     )
@@ -226,4 +238,80 @@ async fn a_bystander_is_refused_by_name_and_the_writer_owns_its_edge(pool: PgPoo
         (by_z.edge_id, by_z.was_created, by_z.owned_by_caller),
         (again.edge_id, false, false)
     );
+}
+
+#[derive(serde::Deserialize)]
+struct Alternative {
+    edge_id: Uuid,
+    created: bool,
+}
+
+async fn alternative(s: &Side, a: Uuid, b: Uuid) -> Alternative {
+    let r = do_link_alternative(
+        &s.server,
+        &s.viewer,
+        LinkAlternativeParams {
+            claim_a: a.to_string(),
+            claim_b: b.to_string(),
+            target_claim_id: None,
+            rationale: None,
+        },
+    )
+    .await
+    .expect("link_alternative");
+    let raw = text(&r);
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{e}: {raw}"))
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_symmetric_link_asserted_again_is_a_new_edge(pool: PgPool) {
+    let (plain, scoped) = app_role_pools(&pool).await;
+    let w = side(&pool, build_scoped_test_server(plain, scoped)).await;
+    let author = fixture::seed_agent_with_group(&pool, "author").await.0;
+    let a = fixture::seed_public_claim(&pool, author, "w12b symmetric a").await;
+    let b = fixture::seed_public_claim(&pool, author, "w12b symmetric b").await;
+
+    // link_epistemic, `contradicts` (symmetric): W links a -> b, re-asserts it
+    // (a dedup hit while in force), retracts it, then asserts it in the
+    // REVERSE direction.
+    let first = link_as(&w, a, b, "contradicts").await;
+    assert!(first.was_created && first.owned_by_caller);
+    let hit = link_as(&w, b, a, "contradicts").await;
+    assert_eq!(
+        (hit.edge_id, hit.was_created),
+        (first.edge_id, false),
+        "in force, either direction is the same symmetric edge"
+    );
+    do_delete_edge(&w.server, &w.viewer, delete(first.edge_id))
+        .await
+        .expect("W retracts its contradicts link");
+    assert!(!state(&pool, first.edge_id).await.2, "retracted");
+    let again = link_as(&w, b, a, "contradicts").await;
+    assert!(
+        again.was_created,
+        "a retracted symmetric link asserted again is a new edge, not a silent no-op"
+    );
+    assert_ne!(again.edge_id, first.edge_id);
+    let (owner, vis, live, _) = state(&pool, again.edge_id).await;
+    assert_eq!((owner, vis.as_str(), live), (w.group, "public", true));
+    assert!(again.owned_by_caller);
+    // And a further re-assert finds the NEW edge, never the retracted twin.
+    let hit = link_as(&w, a, b, "contradicts").await;
+    assert_eq!((hit.edge_id, hit.was_created), (again.edge_id, false));
+
+    // link_alternative (`alternative_of`, symmetric): the same.
+    let alt = alternative(&w, a, b).await;
+    assert!(alt.created);
+    do_delete_edge(&w.server, &w.viewer, delete(alt.edge_id))
+        .await
+        .expect("W retracts its alternative_of link");
+    let alt2 = alternative(&w, b, a).await;
+    assert!(
+        alt2.created,
+        "a retracted alternative_of asserted again is a new edge"
+    );
+    assert_ne!(alt2.edge_id, alt.edge_id);
+    assert!(state(&pool, alt2.edge_id).await.2, "in force");
+    let alt3 = alternative(&w, a, b).await;
+    assert_eq!((alt3.edge_id, alt3.created), (alt2.edge_id, false));
 }

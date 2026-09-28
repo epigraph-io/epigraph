@@ -688,6 +688,13 @@ impl EdgeRepository {
     ///
     /// Returns `true` when a new row was inserted, `false` on a dedup hit.
     ///
+    /// The probe matches a row in ANY state, a retracted one included: a
+    /// matcher promotion over a pair whose matcher edge was retracted stays a
+    /// dedup hit, as the matcher's retirement path expects. The link tools'
+    /// forms ([`Self::create_symmetric_if_absent_returning_conn`],
+    /// [`Self::create_symmetric_if_absent_oriented_conn`]) match rows in force
+    /// only (migration 120), so a writer's retract-then-relink is a new edge.
+    ///
     /// Single-statement `INSERT … SELECT … WHERE NOT EXISTS`, with
     /// `ON CONFLICT DO NOTHING` behind it.
     ///
@@ -826,7 +833,11 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<(Uuid, bool), DbError> {
-        let inserted: Option<Uuid> = sqlx::query_scalar(
+        // In force only (migration 120): a retracted link asserted again is a
+        // new edge, never a silent `false` onto the retracted row. 091's
+        // `edges_alternative_of_symmetric_uniq` covers `valid_to IS NULL` rows
+        // only, so the new row does not conflict with the retracted one.
+        let insert = format!(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
              SELECT $1, 'claim', $2, 'claim', $3, $4
@@ -835,36 +846,40 @@ impl EdgeRepository {
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
                    AND relationship = $3
+                   AND {EDGE_IN_FORCE_UNALIASED}
              )
              ON CONFLICT DO NOTHING
-             RETURNING id",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .bind(Json(properties))
-        .fetch_optional(&mut *conn)
-        .await?;
+             RETURNING id"
+        );
+        let inserted: Option<Uuid> = sqlx::query_scalar(&insert)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .bind(Json(properties))
+            .fetch_optional(&mut *conn)
+            .await?;
 
         if let Some(id) = inserted {
             return Ok((id, true));
         }
 
-        // Dedup hit — surface the id of the existing symmetric edge.
-        let existing: Uuid = sqlx::query_scalar(
+        // Dedup hit — surface the id of the existing symmetric edge in force.
+        let probe = format!(
             "-- VISIBILITY-EXEMPT: symmetric-dedup probe inside a WRITE path;
              -- same reasoning as `create_or_get`'s.
              SELECT id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
                AND relationship = $3
-             LIMIT 1",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .fetch_one(&mut *conn)
-        .await?;
+               AND {EDGE_IN_FORCE_UNALIASED}
+             LIMIT 1"
+        );
+        let existing: Uuid = sqlx::query_scalar(&probe)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .fetch_one(&mut *conn)
+            .await?;
 
         Ok((existing, false))
     }
@@ -920,7 +935,13 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<SymmetricEdgeUpsert, DbError> {
-        let inserted: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+        // In force only (migration 120), as `create_symmetric_if_absent_returning_conn`:
+        // a retracted link asserted again is a new edge (and the belief wiring
+        // keyed on it attaches to a row in force), never a silent
+        // `was_created = false` onto the retracted row. 090's
+        // `edges_symmetric_relationship_uniq` covers matcher-sourced
+        // `valid_to IS NULL` rows only, so the new row does not conflict.
+        let insert = format!(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
              SELECT $1, 'claim', $2, 'claim', $3, $4
@@ -929,15 +950,17 @@ impl EdgeRepository {
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
                    AND relationship = $3
+                   AND {EDGE_IN_FORCE_UNALIASED}
              )
-             RETURNING id, source_id, target_id",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .bind(Json(properties))
-        .fetch_optional(&mut *conn)
-        .await?;
+             RETURNING id, source_id, target_id"
+        );
+        let inserted: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(&insert)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .bind(Json(properties))
+            .fetch_optional(&mut *conn)
+            .await?;
 
         if let Some((edge_id, source_id, target_id)) = inserted {
             return Ok(SymmetricEdgeUpsert {
@@ -948,20 +971,22 @@ impl EdgeRepository {
             });
         }
 
-        // Dedup hit — surface the existing row AS STORED, which may be the
-        // reverse of the caller's (a, b).
-        let (edge_id, source_id, target_id): (Uuid, Uuid, Uuid) = sqlx::query_as(
+        // Dedup hit — surface the existing row in force AS STORED, which may be
+        // the reverse of the caller's (a, b).
+        let probe = format!(
             "SELECT id, source_id, target_id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
                AND relationship = $3
-             LIMIT 1",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .fetch_one(&mut *conn)
-        .await?;
+               AND {EDGE_IN_FORCE_UNALIASED}
+             LIMIT 1"
+        );
+        let (edge_id, source_id, target_id): (Uuid, Uuid, Uuid) = sqlx::query_as(&probe)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .fetch_one(&mut *conn)
+            .await?;
 
         Ok(SymmetricEdgeUpsert {
             edge_id,
