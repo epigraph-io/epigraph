@@ -55,13 +55,45 @@
 //! | spans.rs | close_span | span -> claim generated | no |
 //! | spans.rs | close_span | span -> claim uses_evidence | no |
 //!
+//!
+//! # The second register: raw `INSERT INTO edges` in a route file
+//!
+//! A route file that writes an edge with its own SQL instead of the repo layer
+//! is registered too ([`RAW_INSERTS`]), stamped or not. Measured at this commit
+//! every one of them runs unstamped:
+//!
+//! | file | handler | endpoints -> relationship | executor | in D8 scope |
+//! |---|---|---|---|---|
+//! | crud.rs | promote_staged_edges (claims:admin) | any staged pair (x2 statements) | `state.db_pool` | when the staged pair is claim/evidence at both ends |
+//! | experiment_loop.rs | create_experiment | experiment -> claim tests_hypothesis | `state.db_pool` | no |
+//! | experiment_loop.rs | submit_results | experiment_result -> experiment result_of | `state.db_pool` | no |
+//! | experiment_loop.rs | analyze_result | analysis -> experiment_result analyzes | `state.db_pool` | no |
+//! | experiment_loop.rs | analyze_result | analysis -> claim provides_evidence | `state.db_pool` | no |
+//! | submit.rs | persist_packet | agent -> claim AUTHORED, claim -> trace HAS_TRACE, trace -> claim TRACES, trace -> evidence USES_EVIDENCE | a transaction begun on `state.db_pool` | no |
+//! | submit.rs | persist_packet | evidence -> claim SUPPORTS | a transaction begun on `state.db_pool` | yes |
+//!
+//! # What this file does NOT see
+//!
+//! An edge INSERT inside another repo function that a raw-pool handler reaches
+//! (for example `ClaimRepository`, `AnalysisRepository`, `WorkflowRepository`,
+//! `SemanticLinkRepository` writing edges of their own) is not counted here. The
+//! raw-pool handler that reaches it is in `no_unscoped_pool.rs`'s per-file
+//! register, which is where its stamping is tracked.
+//!
 //! # How a site is counted
 //!
-//! A code line (not a whole-line comment) of a non-test region of a file under
-//! `crates/epigraph-api/src/routes` that names `EdgeRepository::create` (any
-//! `create*` form), whose executor argument (the text up to the first comma
-//! over that line and the next two) is the raw pool: `state.db_pool` or a
-//! `pool` alias. A file's `#[cfg(test)]` region is not scanned.
+//! [`UNSTAMPED`]: a code line (not a whole-line comment) of a non-test region
+//! of a file under `crates/epigraph-api/src/routes` that names
+//! `EdgeRepository::create` (any `create*` form), whose executor argument (the
+//! text up to the first comma over that line and the next two) is the raw
+//! pool: `state.db_pool` or a `pool` alias.
+//!
+//! [`RAW_INSERTS`]: a code line of a non-test region of any file under
+//! `crates/epigraph-api/src/routes` (`edges.rs` included) that contains
+//! `INSERT INTO edges` or `INSERT INTO public.edges`.
+//!
+//! A file's test region starts at its first `#[cfg(test)]` or
+//! `#[cfg(all(test, ..))]` line and is not scanned.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -86,6 +118,64 @@ const UNSTAMPED: &[(&str, usize)] = &[
 /// The total the register may never exceed.
 const HIGH_WATER: usize = 30;
 
+/// Route-layer raw `INSERT INTO edges` statements, per file (see the module
+/// doc's second register). Lower a row when a statement moves to the repo
+/// layer on a stamped transaction; delete it at zero. Never raise one.
+const RAW_INSERTS: &[(&str, usize)] =
+    &[("crud.rs", 2), ("experiment_loop.rs", 4), ("submit.rs", 5)];
+
+/// The total [`RAW_INSERTS`] may never exceed.
+const RAW_HIGH_WATER: usize = 11;
+
+/// Where a route file's test region starts (not scanned).
+fn test_region_start(lines: &[&str]) -> usize {
+    lines
+        .iter()
+        .position(|l| {
+            let t = l.trim_start();
+            t.starts_with("#[cfg(test)]") || t.starts_with("#[cfg(all(test")
+        })
+        .unwrap_or(lines.len())
+}
+
+/// Raw `INSERT INTO edges` code lines of one route file's non-test region.
+fn count_raw_inserts(src: &str) -> usize {
+    let lines: Vec<&str> = src.lines().collect();
+    let end = test_region_start(&lines);
+    lines[..end]
+        .iter()
+        .filter(|l| {
+            !l.trim_start().starts_with("//")
+                && (l.contains("INSERT INTO edges") || l.contains("INSERT INTO public.edges"))
+        })
+        .count()
+}
+
+fn route_files() -> Vec<PathBuf> {
+    let dir = repo_root().join(ROUTES);
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn measure_raw_inserts() -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for p in route_files() {
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        let src = std::fs::read_to_string(&p).expect("read route file");
+        let n = count_raw_inserts(&src);
+        if n > 0 {
+            out.insert(name, n);
+        }
+    }
+    out
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -105,16 +195,8 @@ fn is_raw_pool_executor(call: &str) -> bool {
 }
 
 fn measure() -> BTreeMap<String, usize> {
-    let dir = repo_root().join(ROUTES);
     let mut out = BTreeMap::new();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
-    entries.sort();
-    for p in entries {
+    for p in route_files() {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         if name == "edges.rs" {
             // Converted by W12b; its remaining raw-pool sites are post-commit
@@ -123,10 +205,7 @@ fn measure() -> BTreeMap<String, usize> {
         }
         let src = std::fs::read_to_string(&p).expect("read route file");
         let lines: Vec<&str> = src.lines().collect();
-        let end = lines
-            .iter()
-            .position(|l| l.trim_start().starts_with("#[cfg(test)]"))
-            .unwrap_or(lines.len());
+        let end = test_region_start(&lines);
         let mut n = 0usize;
         for i in 0..end {
             let l = lines[i];
@@ -187,5 +266,44 @@ fn the_scanner_sees_a_raw_pool_executor_and_not_a_stamped_one() {
     assert!(
         measure().values().sum::<usize>() > 0,
         "the scanner is vacuous"
+    );
+}
+
+#[test]
+fn the_route_layer_raw_edge_inserts_are_exactly_the_register() {
+    let measured = measure_raw_inserts();
+    let recorded: BTreeMap<String, usize> = RAW_INSERTS
+        .iter()
+        .map(|(f, n)| ((*f).to_string(), *n))
+        .collect();
+    assert_eq!(
+        measured, recorded,
+        "the route-layer raw `INSERT INTO edges` statements changed. A NEW one writes \
+         an edge outside the repo layer: move it into `crates/epigraph-db/src/repos/` \
+         and run it on a transaction stamped with the caller's viewer \
+         (`AppState::write_as`). A statement that went away: lower its row."
+    );
+    let total: usize = RAW_INSERTS.iter().map(|(_, n)| n).sum();
+    assert!(
+        total <= RAW_HIGH_WATER,
+        "the raw-insert register grew past its high-water mark ({total} > {RAW_HIGH_WATER})"
+    );
+}
+
+#[test]
+fn the_raw_insert_scanner_skips_comments_and_every_test_region_spelling() {
+    let src = "fn a() {\n\
+               sqlx::query(\"INSERT INTO edges (source_id) VALUES ($1)\");\n\
+               // INSERT INTO edges in a comment\n\
+               sqlx::query(\"INSERT INTO public.edges (source_id) VALUES ($1)\");\n\
+               }\n\
+               #[cfg(all(test, feature = \"db\"))]\n\
+               mod tests { const S: &str = \"INSERT INTO edges\"; }\n";
+    assert_eq!(count_raw_inserts(src), 2);
+    let plain = "fn a() {}\n#[cfg(test)]\nmod t { const S: &str = \"INSERT INTO edges\"; }\n";
+    assert_eq!(count_raw_inserts(plain), 0);
+    assert!(
+        measure_raw_inserts().values().sum::<usize>() > 0,
+        "the raw-insert scanner is vacuous"
     );
 }
