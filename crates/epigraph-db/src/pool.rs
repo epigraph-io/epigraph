@@ -123,6 +123,43 @@ pub async fn create_pool_from_options(
 /// use once RLS is FORCEd (PR-17).
 pub const MAINTENANCE_DATABASE_URL: &str = "MAINTENANCE_DATABASE_URL";
 
+/// The refusal a REQUEST-SERVING process (`server`, `epigraph-mcp-full` on any
+/// transport) prints when [`MAINTENANCE_DATABASE_URL`] is set in its
+/// environment (operator decision D9, batch W12a).
+pub const REQUEST_UNIT_HOLDS_MAINTENANCE_DSN: &str =
+    "MAINTENANCE_DATABASE_URL is set; a request-serving process never holds the maintenance DSN \
+     (operator decision D9). Remove it from this unit's EnvironmentFile; cascades are applied by \
+     epigraph-cascade-replay.timer.";
+
+/// The one INFO line a request-serving process logs (target
+/// `tenancy.maintenance`) when it starts without a maintenance DSN, which is the
+/// only state D9 supports.
+pub const MAINTENANCE_SURFACE_NOT_SERVED: &str =
+    "maintenance surface not served by this unit (D9); cascades defer to \
+     epigraph-cascade-replay.timer, jobs run on epigraph-jobs-drain.timer";
+
+/// Whether a REQUEST-SERVING process may start, given the value of
+/// [`MAINTENANCE_DATABASE_URL`] in its environment (operator decision D9).
+///
+/// The maintenance DSN is held only by the timers (`replay_deferred_cascades`,
+/// `drain_jobs`) and the operator's CLIs. A request-serving process that finds
+/// the variable set is exactly the misconfiguration D9 forbids, and would
+/// otherwise silently re-arm in-process cascades, so it refuses to start: one
+/// code path, every environment, no override.
+///
+/// An exported-but-EMPTY (or whitespace) value is treated as unset, the same
+/// rule [`resolve_maintenance_url`] applies: it carries no credential, so the
+/// process holds nothing D9 removes.
+///
+/// # Errors
+/// [`REQUEST_UNIT_HOLDS_MAINTENANCE_DSN`] when the variable carries a value.
+pub fn request_unit_maintenance_dsn_check(configured: Option<&str>) -> Result<(), &'static str> {
+    match configured {
+        Some(v) if !v.trim().is_empty() => Err(REQUEST_UNIT_HOLDS_MAINTENANCE_DSN),
+        _ => Ok(()),
+    }
+}
+
 /// Where [`maintenance_database_url`] got its answer.
 ///
 /// Carried rather than discarded because the two cases have different

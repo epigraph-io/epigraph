@@ -236,7 +236,52 @@ pub enum ApiError {
     /// only a status that says "this specific thing has expired" carries that.
     #[error("Gone: {reason}")]
     Gone { reason: String },
+
+    /// `501 Not Implemented`, MOVED (operator decision D9, batch W12a): the
+    /// route is a MAINTENANCE surface, and a request-serving process holds no
+    /// maintenance connection. Structured and non-retryable; nothing was
+    /// written. `runs_on` names where the work runs instead (an operator CLI),
+    /// or `kind: "none"` when nothing serves it yet.
+    ///
+    /// Not 503 (transient, which invites retries) and not 403 (the caller's
+    /// authority is not in question).
+    #[error("Not served on this unit (operator decision D9): {surface} runs on {runs_on_kind} `{runs_on_name}`")]
+    MaintenanceSurfaceNotServed {
+        surface: String,
+        runs_on_kind: &'static str,
+        runs_on_name: String,
+    },
 }
+
+impl ApiError {
+    /// The MOVED answer for a maintenance route whose work an operator CLI runs
+    /// on the maintenance DSN (operator decision D9).
+    #[must_use]
+    pub fn moved_to_cli(surface: &str, cli: &str) -> Self {
+        Self::MaintenanceSurfaceNotServed {
+            surface: surface.to_string(),
+            runs_on_kind: "cli",
+            runs_on_name: cli.to_string(),
+        }
+    }
+
+    /// The MOVED answer for every privatization lifecycle route (operator
+    /// decision D9): the lifecycle has no serving unit until it has its own
+    /// design (an authenticated two-person approval without a DB-holding
+    /// request process).
+    #[must_use]
+    pub fn privatization_lifecycle_not_served(surface: &str) -> Self {
+        Self::MaintenanceSurfaceNotServed {
+            surface: surface.to_string(),
+            runs_on_kind: "none",
+            runs_on_name: PRIVATIZATION_LIFECYCLE_NOT_SERVED.to_string(),
+        }
+    }
+}
+
+/// `runs_on.name` for the privatization lifecycle routes under D9.
+pub const PRIVATIZATION_LIFECYCLE_NOT_SERVED: &str =
+    "privatization lifecycle unavailable under D9: see operator";
 
 /// JSON error response structure
 #[derive(Serialize)]
@@ -249,6 +294,27 @@ struct ErrorResponse {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // The MOVED contract (operator decision D9) has its own body, keyed for
+        // machines: `error`, `runs_on`, `retryable`, `decision`.
+        if let ApiError::MaintenanceSurfaceNotServed {
+            surface,
+            runs_on_kind,
+            runs_on_name,
+        } = &self
+        {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({
+                    "error": "maintenance_surface_not_served",
+                    "message": self.to_string(),
+                    "surface": surface,
+                    "runs_on": {"kind": runs_on_kind, "name": runs_on_name},
+                    "retryable": false,
+                    "decision": "D9",
+                })),
+            )
+                .into_response();
+        }
         let (status, error_type, details) = match &self {
             ApiError::BadRequest { message } => (
                 StatusCode::BAD_REQUEST,
@@ -333,6 +399,13 @@ impl IntoResponse for ApiError {
                 StatusCode::GONE,
                 "Gone",
                 Some(serde_json::json!({ "reason": reason })),
+            ),
+            // Answered above with its own body; kept here so the match stays
+            // exhaustive.
+            ApiError::MaintenanceSurfaceNotServed { .. } => (
+                StatusCode::NOT_IMPLEMENTED,
+                "maintenance_surface_not_served",
+                None,
             ),
         };
 

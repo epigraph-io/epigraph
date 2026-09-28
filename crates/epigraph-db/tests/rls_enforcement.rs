@@ -1796,26 +1796,38 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 /// This test pins the ONE property that is enforceable here and now: the job
 /// queue, the only guard site whose widening would let an app connection
 /// dispatch work that later runs with `epigraph_bypass()` TRUE, is on the
-/// maintenance pool.
+/// maintenance pool. Since operator decision D9 (batch W12a) the queue lives
+/// only in the `drain_jobs` timer binary, whose one pool is built on the
+/// CONFIGURED maintenance DSN (the fallback to `DATABASE_URL` is refused), and
+/// migration 119 lets no application session enqueue at all
+/// (`maintenance_timer_only.rs`).
 #[test]
 fn guard_subquery_sites_are_enumerated() {
+    let drain = include_str!("../../epigraph-api/src/bin/drain_jobs.rs");
+    assert!(
+        drain.contains("PostgresJobQueue::new(scoped.inner().clone())"),
+        "the job queue must be built on the drain's maintenance pool"
+    );
+    let pool_decl = drain
+        .split("let scoped = ")
+        .nth(1)
+        .expect("the drain's pool must be constructed in drain_jobs.rs");
+    assert!(
+        pool_decl.starts_with(
+            "epigraph_db::ScopedPool::connect_with_options(\n        &maintenance_url"
+        ),
+        "the drain's pool must be built from maintenance_url. If it moves to the app DSN, \
+         `enqueue_unique_pending`'s `WHERE NOT EXISTS` guard becomes an unconditional insert \
+         under RLS — no error, duplicate jobs."
+    );
+    assert!(
+        drain.contains("source != epigraph_db::MaintenanceDsnSource::Configured"),
+        "drain_jobs must refuse the fallback to the application DSN"
+    );
     let server = include_str!("../../epigraph-api/src/bin/server.rs");
     assert!(
-        server.contains("PostgresJobQueue::new(job_pool"),
-        "the job queue must be built on job_pool"
-    );
-    let job_pool_decl = server
-        .split("let job_scoped = ")
-        .nth(1)
-        .expect("job_scoped must be constructed in server.rs");
-    assert!(
-        job_pool_decl.starts_with(
-            "epigraph_db::ScopedPool::connect_with_options(\n            &maintenance_url"
-        ),
-        "job_pool must be built from maintenance_url. If it moves to the app DSN, \
-         `enqueue_unique_pending`'s `WHERE NOT EXISTS` guard becomes an unconditional insert \
-         under RLS — no error, duplicate jobs — and `jobs_app`'s job_type exclusion becomes the \
-         only thing standing between an app connection and a bypass-running job."
+        !server.contains("PostgresJobQueue::new("),
+        "bin/server.rs builds a job queue again; under D9 the queue is the drain timer's"
     );
 }
 

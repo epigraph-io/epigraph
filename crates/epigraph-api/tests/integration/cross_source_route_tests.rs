@@ -1085,3 +1085,114 @@ async fn retire_route_on_the_app_role_under_118_runs_on_the_maintenance_pool_or_
         }
     }
 }
+
+/// The `cascade.deferred` rows recorded for `subject`, with their `recorded_by`.
+async fn deferrals_for(pool: &PgPool, subject: Uuid) -> Vec<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT details->>'recorded_by' FROM security_events \
+          WHERE event_type = 'cascade.deferred' \
+            AND details#>>'{trigger,subject_id}' = $1::text",
+    )
+    .bind(subject)
+    .fetch_all(pool)
+    .await
+    .expect("read the deferral rows")
+}
+
+/// Operator decision D9 (batch W12a), on the APPLICATION ROLE with no
+/// maintenance pool -- the only state a request-serving `server` has now. Each
+/// of the three cascading routes (supersede, dedup, and the claims:admin
+/// match-candidate retire) commits the caller's act (none for a retire, whose
+/// whole request is the deferral), answers success with `cascade.status ==
+/// "deferred"` and the D9 reason (no ids in it), and records EXACTLY ONE
+/// `cascade.deferred` row for its subject, written through 117's verifying
+/// definer (`recorded_by`). The replay timer applies them later.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d9_every_cascading_route_defers_on_the_app_role_without_a_maintenance_pool(pool: PgPool) {
+    let (w, w_group) = viewer_fixture::seed_agent_with_group(&pool, "d9-writer").await;
+    let write = decide_bearer_token(w, Some(w), "agent");
+    let admin = admin_bearer_token(w, Some(w), "agent");
+    let reason = epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED;
+    viewer_fixture::apply_migration_118_stale_guard(&pool).await;
+
+    // Supersede.
+    let old = public_claim_owned_by(&pool, w, w_group, "d9 superseded").await;
+    let (status, json) = post_supersede_on(app_role_state(&pool, false).await, old, &write).await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::CREATED,
+        "{status} {json}"
+    );
+    assert_eq!(json["cascade"]["status"], "deferred", "{json}");
+    assert_eq!(json["cascade"]["reason"], reason, "{json}");
+    let is_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .expect("old claim");
+    assert!(!is_current, "the supersede act did not commit");
+    assert_eq!(
+        deferrals_for(&pool, old).await,
+        vec![Some("epigraph_record_cascade_deferral".to_string())]
+    );
+
+    // Dedup.
+    let dup = public_claim_owned_by(&pool, w, w_group, "d9 duplicate").await;
+    let canonical = public_claim_owned_by(&pool, w, w_group, "d9 canonical").await;
+    let resp = create_router(app_role_state(&pool, false).await)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/claims/{dup}/dedup"))
+                // The dedup route is claims:admin.
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {admin}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "canonical_id": canonical }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }));
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["cascade"]["status"], "deferred", "{json}");
+    assert_eq!(json["cascade"]["reason"], reason, "{json}");
+    let supersedes: Option<Uuid> =
+        sqlx::query_scalar("SELECT supersedes FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup claim");
+    assert_eq!(supersedes, Some(canonical), "the dedup act did not commit");
+    assert_eq!(
+        deferrals_for(&pool, dup).await,
+        vec![Some("epigraph_record_cascade_deferral".to_string())]
+    );
+
+    // The claims:admin retire.
+    let a = insert_claim(&pool, w).await;
+    let b = insert_claim(&pool, w).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+    let resp = post_decide(pool.clone(), candidate, &write, "promote").await;
+    assert_eq!(resp.status(), StatusCode::OK, "promote must succeed");
+    let resp = post_decide_on(
+        app_role_state(&pool, false).await,
+        candidate,
+        &admin,
+        "retire",
+    )
+    .await;
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }));
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["cascade"]["status"], "deferred", "{json}");
+    assert_eq!(
+        deferrals_for(&pool, candidate).await,
+        vec![Some("epigraph_record_cascade_deferral".to_string())]
+    );
+}

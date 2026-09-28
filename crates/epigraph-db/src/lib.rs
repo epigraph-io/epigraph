@@ -69,10 +69,11 @@ pub use label_validation::reject_unexpanded_labels;
 pub use pool::{
     apply_statement_timeout, assert_maintenance_privilege, create_pool, create_pool_from_options,
     create_pool_with_options, maintenance_database_url, maintenance_verdict,
-    probe_maintenance_privilege, probe_maintenance_privilege_conn, resolve_maintenance_url,
-    MaintenanceConn, MaintenanceDsnSource, MaintenancePrivilege, MaintenanceSession,
-    MaintenanceVerdict, ScopedConn, ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx,
-    SessionGucMode, MAINTENANCE_DATABASE_URL,
+    probe_maintenance_privilege, probe_maintenance_privilege_conn,
+    request_unit_maintenance_dsn_check, resolve_maintenance_url, MaintenanceConn,
+    MaintenanceDsnSource, MaintenancePrivilege, MaintenanceSession, MaintenanceVerdict, ScopedConn,
+    ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, MAINTENANCE_DATABASE_URL,
+    MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
 };
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository,

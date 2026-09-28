@@ -307,12 +307,11 @@ pub struct AppState {
     /// retirement: re-pointing and invalidating rows other writers own, on the
     /// maintenance connection.
     ///
-    /// `bin/server.rs` sets it only when `MAINTENANCE_DATABASE_URL` was
-    /// CONFIGURED (not the documented fallback to `DATABASE_URL`) and the boot
-    /// probe found that login privileged, so the cascade's authority always
-    /// comes from explicit configuration and never from the application DSN.
-    /// `false` everywhere else: the caller's act still commits and the cascade
-    /// is reported as deferred, with a `security_events` row.
+    /// `bin/server.rs` never sets it (operator decision D9, batch W12a): a
+    /// request-serving process holds no maintenance DSN, so the caller's act
+    /// commits and the cascade is reported as deferred, with a
+    /// `security_events` row, and the replay timer applies it. Only a state
+    /// handed a maintenance pool (the test harness) enables it.
     #[cfg(feature = "db")]
     pub admin_cascade: bool,
     /// API configuration
@@ -1197,7 +1196,7 @@ impl AppState {
     pub async fn maintenance_viewer(
         &self,
         reason: epigraph_db::visibility::SystemReason,
-    ) -> Result<epigraph_db::MaintenanceSession<'_>, epigraph_db::DbError> {
+    ) -> Result<epigraph_db::MaintenanceSession<'_>, MaintenanceViewerError> {
         let scoped = self
             .scoped
             .as_ref()
@@ -1206,7 +1205,32 @@ impl AppState {
                          lease can be minted; use AppState::with_scoped_pool"
                     .to_string(),
             })?;
-        scoped.maintenance_session(reason).await
+        // Operator decision D9 (batch W12a): with no maintenance pool attached
+        // -- every real `server`, which builds none -- `maintenance_session`
+        // would lease from the APPLICATION pool. On a superuser application DSN
+        // (prod until the app-role move) that is a bypass that keeps serving a
+        // maintenance surface D9 removed; on the application role it is a
+        // bypass viewer on a filtered connection, the empty-200 shape. So the
+        // gate comes first, and the routes answer 501 MOVED. The mirror of
+        // `epigraph-mcp/src/maintenance.rs::maintenance_viewer`'s first check.
+        // `ScopedPool`'s fallback itself stays: the operator CLI fleet uses it.
+        if !scoped.has_maintenance_pool() {
+            return Err(MaintenanceViewerError::NotServed);
+        }
+        Ok(scoped.maintenance_session(reason).await?)
+    }
+
+    /// Whether this process serves the MAINTENANCE surface at all: a
+    /// maintenance pool is attached. Never true for `bin/server.rs` under
+    /// operator decision D9 (it builds none); a test harness that attaches one
+    /// exercises the handlers behind the gate. The same condition
+    /// [`Self::maintenance_viewer`] refuses on.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn serves_maintenance_surface(&self) -> bool {
+        self.scoped
+            .as_ref()
+            .is_some_and(epigraph_db::ScopedPool::has_maintenance_pool)
     }
 
     /// A connection stamped with `viewer`'s tenancy context, in whichever form
@@ -2334,17 +2358,90 @@ mod rls_verdict_tests {
     }
 }
 
-/// Whether `bin/server.rs` enables the ADMINISTRATIVE CASCADE (migration 117):
-/// only for a maintenance DSN that was CONFIGURED through
-/// `MAINTENANCE_DATABASE_URL` (never the documented fallback to
+/// Why [`AppState::maintenance_viewer`] handed out no session.
+#[cfg(feature = "db")]
+#[derive(Debug, thiserror::Error)]
+pub enum MaintenanceViewerError {
+    /// This process serves no maintenance surface (operator decision D9): no
+    /// maintenance pool is attached. A route answers it with 501 MOVED
+    /// ([`crate::errors::ApiError::MaintenanceSurfaceNotServed`]).
+    #[error(
+        "this unit does not serve the maintenance surface (operator decision D9): it holds no \
+         maintenance connection"
+    )]
+    NotServed,
+    /// Building or acquiring the session failed.
+    #[error(transparent)]
+    Db(#[from] epigraph_db::DbError),
+}
+
+/// Whether a process that HOLDS a maintenance DSN may run the ADMINISTRATIVE
+/// CASCADE (migration 117) in-process: only for a DSN that was CONFIGURED
+/// through `MAINTENANCE_DATABASE_URL` (never the documented fallback to
 /// `DATABASE_URL`, which would derive an administrative act from the
-/// application DSN) AND whose login the boot probe found bypassing row
-/// security. Anything else defers every cascade (recorded) and still commits
-/// the caller's act.
+/// application DSN) AND whose login bypasses row security.
+///
+/// No request-serving binary holds one after operator decision D9 (batch
+/// W12a): `bin/server.rs` refuses to start when the variable is set
+/// ([`request_unit_may_start`]) and never enables the cascade, so every cascade
+/// it triggers is deferred (recorded) and applied by the replay timer. The rule
+/// is kept because it is still the rule for any state that is handed a
+/// maintenance pool (the test harness's
+/// `build_app_for_tests_with_admin_cascade`).
 #[cfg(feature = "db")]
 #[must_use]
 pub fn admin_cascade_enabled(source: epigraph_db::MaintenanceDsnSource, bypass: bool) -> bool {
     source == epigraph_db::MaintenanceDsnSource::Configured && bypass
+}
+
+/// Whether the API `server` may start, given the value of
+/// `MAINTENANCE_DATABASE_URL` in its environment (operator decision D9).
+///
+/// A request-serving process never holds the maintenance DSN: the variable SET
+/// refuses boot (exit 1, in every environment, no override), and absent is the
+/// only supported state. `epigraph-mcp-full` applies the same rule through the
+/// same predicate, `epigraph_db::request_unit_maintenance_dsn_check`. An
+/// exported-but-empty value counts as absent (it carries no credential), the
+/// same rule `epigraph_db::resolve_maintenance_url` applies.
+///
+/// A build without the `db` feature connects to no database at all, so it
+/// holds no DSN of either kind and does not carry this check.
+///
+/// # Errors
+/// The D9 refusal text, which `bin/server.rs` prints before exiting.
+#[cfg(feature = "db")]
+pub fn request_unit_may_start(configured: Option<&str>) -> Result<(), &'static str> {
+    epigraph_db::request_unit_maintenance_dsn_check(configured)
+}
+
+#[cfg(all(test, feature = "db"))]
+mod request_unit_boot_tests {
+    use super::request_unit_may_start;
+
+    /// Absent (or exported empty) serves; any value refuses with the D9 text,
+    /// whatever it names. A DSN that happens to be the application DSN, or an
+    /// unprivileged login, is refused too: the rule is about the process
+    /// holding the variable, not about what the variable can do.
+    #[test]
+    fn a_set_maintenance_dsn_refuses_boot_and_absent_serves() {
+        assert_eq!(request_unit_may_start(None), Ok(()));
+        assert_eq!(request_unit_may_start(Some("")), Ok(()));
+        assert_eq!(request_unit_may_start(Some("   ")), Ok(()));
+        for set in [
+            "postgres://maint@db/epigraph",
+            "postgres://app@db/epigraph",
+            "x",
+        ] {
+            let err = request_unit_may_start(Some(set))
+                .expect_err("a request-serving process started holding the maintenance DSN");
+            assert!(
+                err.starts_with("MAINTENANCE_DATABASE_URL is set;")
+                    && err.contains("(operator decision D9)")
+                    && err.contains("epigraph-cascade-replay.timer"),
+                "the refusal does not name the rule and the fix: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, feature = "db"))]

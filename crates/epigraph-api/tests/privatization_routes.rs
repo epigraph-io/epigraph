@@ -638,6 +638,133 @@ async fn a_seed_set_larger_than_the_node_cap_is_refused_rather_than_truncated(po
 }
 
 // ===========================================================================
+// Operator decision D9 (batch W12a): the lifecycle is dark on a request unit
+// ===========================================================================
+
+/// **Without a maintenance pool -- every real `server` under D9 -- every
+/// privatization lifecycle route answers 501 MOVED and writes nothing, even on
+/// a PRIVILEGED application DSN.**
+///
+/// The state here is `split_state`'s shape WITHOUT the attached maintenance
+/// pool: its `ScopedPool` is the superuser test pool, i.e. the posture of a
+/// deployment whose application DSN can bypass row security (prod until the
+/// app-role move). Before D9's gate in `AppState::maintenance_viewer`,
+/// `ScopedPool`'s fallback would have leased that privileged pool and kept
+/// serving the lifecycle. Asserted: the typed MOVED error for a create, a
+/// read, a list and an approve; the wire contract (status 501, the JSON body);
+/// and that no plan row was written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lifecycle_is_not_served_without_a_maintenance_pool(pool: PgPool) {
+    let world = World::seed(&pool).await;
+    let claim = seed_group_claim(&pool, world.actor, world.target_group, "d9 dark").await;
+    let raw = downgraded_pool(&pool, "epigraph_app").await;
+    let mut state = AppState::with_db(raw, ApiConfig::default());
+    state.scoped = Some(scoped_pool(&pool).await);
+    let privileged: bool = sqlx::query_scalar("SELECT public.epigraph_bypass()")
+        .fetch_one(state.scoped.as_ref().expect("scoped").inner())
+        .await
+        .expect("probe the scoped pool");
+    assert!(
+        privileged,
+        "CALIBRATION: the application DSN here is privileged, so a 501 is the D9 gate and not \
+         an unprivileged pool"
+    );
+    assert!(!state.serves_maintenance_surface());
+    let viewer = || async {
+        ViewerExtractor(
+            Viewer::resolve(&pool, world.actor)
+                .await
+                .expect("resolve the actor"),
+        )
+    };
+    let plans_before: i64 = sqlx::query_scalar("SELECT count(*) FROM privatization_plans")
+        .fetch_one(&pool)
+        .await
+        .expect("count plans");
+
+    let expect_moved = |surface: &str, err: ApiError| match err {
+        ApiError::MaintenanceSurfaceNotServed {
+            surface: s,
+            runs_on_kind,
+            runs_on_name,
+        } => {
+            assert_eq!(s, surface);
+            assert_eq!(runs_on_kind, "none", "the lifecycle has no serving unit");
+            assert_eq!(
+                runs_on_name,
+                epigraph_api::errors::PRIVATIZATION_LIFECYCLE_NOT_SERVED
+            );
+        }
+        other => panic!("{surface} answered {other:?}, not MOVED"),
+    };
+
+    let err = create_plan(
+        viewer().await,
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![claim])),
+    )
+    .await
+    .expect_err("create_plan was served");
+    expect_moved("create_plan", err);
+    let err = get_plan(
+        viewer().await,
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Path(Uuid::new_v4()),
+    )
+    .await
+    .expect_err("get_plan was served");
+    expect_moved("get_plan", err);
+    let err = list_plans(
+        viewer().await,
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Query(PlanListQuery::default()),
+    )
+    .await
+    .expect_err("list_plans was served");
+    expect_moved("list_plans", err);
+    let err = approve_plan(
+        viewer().await,
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Path(Uuid::new_v4()),
+    )
+    .await
+    .expect_err("approve_plan was served");
+    expect_moved("approve_plan", err);
+
+    // The wire contract.
+    let resp = axum::response::IntoResponse::into_response(
+        ApiError::privatization_lifecycle_not_served("create_plan"),
+    );
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .expect("body")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+    assert_eq!(json["error"], "maintenance_surface_not_served", "{json}");
+    assert_eq!(
+        json["runs_on"],
+        serde_json::json!({
+            "kind": "none",
+            "name": epigraph_api::errors::PRIVATIZATION_LIFECYCLE_NOT_SERVED,
+        }),
+        "{json}"
+    );
+    assert_eq!(json["retryable"], false, "{json}");
+    assert_eq!(json["decision"], "D9", "{json}");
+
+    let plans_after: i64 = sqlx::query_scalar("SELECT count(*) FROM privatization_plans")
+        .fetch_one(&pool)
+        .await
+        .expect("count plans");
+    assert_eq!(plans_after, plans_before, "a MOVED route wrote a plan");
+}
+
+// ===========================================================================
 // Fixtures local to this file
 // ===========================================================================
 
@@ -648,9 +775,14 @@ async fn a_seed_set_larger_than_the_node_cap_is_refused_rather_than_truncated(po
 /// `search_voids_methods_scoped_read.rs` build, and for the same reason: it is
 /// the only `AppState` in the test suite on which `read_as` and
 /// `maintenance_viewer` do not refuse.
+///
+/// The superuser pool is ATTACHED as the maintenance pool: under operator
+/// decision D9 (batch W12a) a real `server` attaches none, and the lifecycle
+/// answers 501 MOVED (`the_lifecycle_is_not_served_without_a_maintenance_pool`
+/// below). The suites here exercise the handlers behind that gate.
 async fn split_state(pool: &PgPool) -> AppState {
     let raw = downgraded_pool(pool, "epigraph_app").await;
-    let scoped = scoped_pool(pool).await;
+    let scoped = scoped_pool(pool).await.with_maintenance_pool(pool.clone());
 
     let mut state = AppState::with_db(raw, ApiConfig::default());
     state.scoped = Some(scoped);
