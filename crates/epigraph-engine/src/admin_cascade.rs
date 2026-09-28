@@ -84,13 +84,18 @@ use epigraph_db::{ClaimRepository, DbError, MatchCandidateRepo};
 
 use crate::retraction_cascade::{cascade_after_dedup, cascade_after_supersede, CascadeReport};
 
-/// The reason a request path reports when no maintenance connection is
-/// configured for this process.
+/// The reason a request path reports when it holds no maintenance connection,
+/// which under operator decision D9 (batch W12a) is every request-serving
+/// process: the cascade is deferred and the replay timer
+/// (`epigraph-cascade-replay.timer`, `replay_deferred_cascades`) applies it.
+///
+/// Names no row: it reaches the caller. A client must not retry the act (a
+/// retry hits "already superseded" / "already retired"); completion is
+/// observable as the edges moving and beliefs changing.
 pub const REASON_NOT_CONFIGURED: &str =
-    "no administrative (maintenance) connection is configured for this server \
-     (MAINTENANCE_DATABASE_URL unset, or not a member of epigraph_maintenance); the caller's \
-     act committed and the cascade across other writers' rows is deferred for an operator to \
-     replay";
+    "this server does not hold the administrative connection (operator decision D9); the \
+     caller's act committed and the cascade across other writers' rows is applied by the \
+     maintenance replay (normally within about two minutes)";
 
 /// What triggered an administrative cascade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

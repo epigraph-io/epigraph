@@ -1061,7 +1061,20 @@ async fn supersede_without_an_admin_connection_commits_the_act_and_defers(pool: 
         (et.as_str(), who, cause.as_str()),
         ("cascade.deferred", Some(agent), "supersede")
     );
-    assert!(reason.contains("MAINTENANCE_DATABASE_URL"), "{reason}");
+    // The D9 wording (batch W12a): the server does not hold the administrative
+    // connection, and the maintenance replay applies the cascade. It names no
+    // row, and it no longer tells the operator to set the maintenance
+    // variable on this unit, which now refuses boot.
+    assert_eq!(
+        reason,
+        epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED,
+        "{reason}"
+    );
+    assert!(
+        reason.contains("operator decision D9") && reason.contains("maintenance replay"),
+        "{reason}"
+    );
+    assert!(!reason.contains("MAINTENANCE_DATABASE_URL"), "{reason}");
 }
 
 // ===========================================================================
