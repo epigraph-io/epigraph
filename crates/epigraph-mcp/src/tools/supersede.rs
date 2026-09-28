@@ -133,15 +133,20 @@ pub(crate) async fn admin_session_or_deferral<'s>(
 ///
 /// The scope is `claims:write` (`scope_map`); this is the per-claim rule.
 ///
-/// 1. `claim` (and `also_readable`, the dedup's canonical) are read through the
+/// 1. `claim` (and `canonical`, the dedup's target) are read through the
 ///    CALLER's viewer on a transaction stamped with that viewer. A claim it
 ///    cannot read is `claim <id> not found`, the same text a missing id gets,
-///    so nothing here is an existence oracle.
+///    so nothing here is an existence oracle. Both are read before either is
+///    judged, so a refusal never concerns a claim the caller cannot see.
 /// 2. [`epigraph_auth::claim_act::claim_act_arm`] (shared with HTTP): a
 ///    `claims:admin` holder, or a caller whose viewer WRITES the claim's owning
 ///    group (its author or not). Authorship alone admits nothing, and no
 ///    transport-specific arm is added here. Otherwise the named refusal
-///    [`crate::errors::claim_not_writer`].
+///    [`crate::errors::claim_not_writer`]. The same rule is then applied to
+///    `canonical`: brief (a) asks write authority over the target claim(s),
+///    and the cascade that follows re-points OTHER writers' edges and BBAs
+///    onto the canonical with administrative authority, so a `claims:write`
+///    caller may only choose a canonical it could write itself.
 /// 3. THE STAMP. Every non-admin act runs on the caller's own stamped
 ///    transaction, the one step 1 read on (D1: "the act keeps the CALLER's
 ///    authority"), so the authority read and the write see the same state,
@@ -164,7 +169,7 @@ async fn begin_claim_act<'p>(
     viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     claim: uuid::Uuid,
-    also_readable: Option<uuid::Uuid>,
+    canonical: Option<uuid::Uuid>,
     tool: &'static str,
     action: &str,
 ) -> Result<(epigraph_db::ScopedTx<'p>, uuid::Uuid), McpError> {
@@ -197,12 +202,16 @@ async fn begin_claim_act<'p>(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| not_found(claim))?;
-    if let Some(other) = also_readable {
-        ClaimRepository::write_target_of(&mut *caller_tx, viewer, other)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| not_found(other))?;
-    }
+    let canonical_target = match canonical {
+        Some(other) => Some((
+            other,
+            ClaimRepository::write_target_of(&mut *caller_tx, viewer, other)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| not_found(other))?,
+        )),
+        None => None,
+    };
 
     let target = epigraph_auth::claim_act::ClaimActTarget {
         author,
@@ -216,6 +225,25 @@ async fn begin_claim_act<'p>(
     ) else {
         return Err(crate::errors::claim_not_writer(claim, action));
     };
+    if let Some((other, (other_author, other_group))) = canonical_target {
+        let other_target = epigraph_auth::claim_act::ClaimActTarget {
+            author: other_author,
+            owner_group: other_group,
+        };
+        if epigraph_auth::claim_act::claim_act_arm(
+            auth,
+            viewer.principal(),
+            viewer.writable_groups(),
+            other_target,
+        )
+        .is_none()
+        {
+            return Err(crate::errors::claim_not_writer(
+                other,
+                "mark a duplicate onto",
+            ));
+        }
+    }
     tracing::info!(tool, claim = %claim, arm = arm.as_str(), "claim act admitted");
 
     if viewer.writable_groups().contains(&owner_group) {
@@ -248,11 +276,12 @@ pub async fn mark_duplicate(
     let dup_claim_id = ClaimId::from_uuid(dup);
 
     // THE ACT's gate and stamp (batch OA1), as `supersede_claim` above: the
-    // duplicate is the claim the caller must be able to retire; the canonical
-    // must only be READABLE by the caller (the act writes the duplicate's row
-    // alone, and its FA04 refusal still demands write authority over a
-    // non-public canonical). Either one the caller cannot read is reported as
-    // not found, exactly like a missing claim.
+    // caller must be able to write BOTH the duplicate and the canonical (or
+    // hold claims:admin). The act writes the duplicate's row alone, but the
+    // cascade re-points other writers' edges and BBAs onto the canonical, so
+    // the canonical is the caller's choice to make only where it could write
+    // itself. Either one the caller cannot read is reported as not found,
+    // exactly like a missing claim.
     let (mut tx, actor) = begin_claim_act(
         server,
         viewer,

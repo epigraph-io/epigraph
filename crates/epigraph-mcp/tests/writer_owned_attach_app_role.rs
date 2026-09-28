@@ -14,8 +14,10 @@
 //! (`fixture::downgraded_pool`). Seeding and `Viewer::resolve` run on the
 //! original superuser pool, as the fixture's own header requires.
 //!
-//! `mark_duplicate` is driven here once, for the server agent's own duplicate
-//! (it now dedups on a connection stamped from the server agent). The move of
+//! `mark_duplicate` is driven here for the server agent's own duplicate onto a
+//! world canonical (it dedups on a connection stamped from the server agent;
+//! since batch OA1 an unwritable canonical needs `claims:admin`, see
+//! `dedup_owner`). The move of
 //! OTHER writers' BBAs on a stamped application session is pinned in
 //! `epigraph-db/tests/writer_owned_derived_rows.rs::
 //! mark_duplicate_onto_a_world_canonical_moves_every_writers_bba`.
@@ -602,7 +604,7 @@ async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(
             canonical_id: f.canonical.to_string(),
             reason: None,
         },
-        Some(&non_admin_owner(agent)),
+        Some(&dedup_owner(agent)),
     )
     .await
     .expect("the stamped dedup lands on the app role");
@@ -744,6 +746,25 @@ fn non_admin_owner(owner: Uuid) -> epigraph_auth::AuthContext {
     }
 }
 
+/// The token the dedup tests here drive `mark_duplicate` with: the
+/// duplicate's writer, WITH `claims:admin`.
+///
+/// Every dedup in this file marks the agent's own duplicate onto a WORLD
+/// canonical the agent cannot write, because that is the shape whose cascade
+/// (moving other writers' edges and BBAs onto a public claim nobody here owns)
+/// these tests pin. Since batch OA1 the canonical is a target claim of the act:
+/// a `claims:write` caller may only choose a canonical it could write, so this
+/// shape needs `claims:admin` (see `own_claim_authority_app_role.rs::
+/// a_canonical_the_caller_cannot_write_is_refused_at_claims_write`). The act
+/// still runs on the same stamp as before, the caller's viewer (the server
+/// agent's, which writes the duplicate's group), so the cascade under test is
+/// unchanged.
+fn dedup_owner(owner: Uuid) -> epigraph_auth::AuthContext {
+    let mut auth = non_admin_owner(owner);
+    auth.scopes.push("claims:admin".to_string());
+    auth
+}
+
 /// A public claim owned by `group`, authored by `agent`.
 async fn public_claim_of(pool: &PgPool, agent: Uuid, group: Uuid, content: &str) -> Uuid {
     let id = Uuid::new_v4();
@@ -862,7 +883,7 @@ async fn mark_duplicate_without_an_admin_connection_commits_the_act_and_defers(p
             canonical_id: f.canonical.to_string(),
             reason: None,
         },
-        Some(&non_admin_owner(agent)),
+        Some(&dedup_owner(agent)),
     )
     .await
     .expect("the act commits");
@@ -1312,6 +1333,14 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
     let xc = public_claim_of(&pool, x, x_group, "X's claim").await;
     let into_s1 = edge_between(&pool, xc, s1).await;
     let auth = non_admin_owner(agent);
+    // The same token with claims:admin for the dedup onto a world canonical
+    // (see `dedup_owner`); one OAuth client throughout, as the deferral rows
+    // below expect.
+    let dedup_auth = {
+        let mut a = auth.clone();
+        a.scopes.push("claims:admin".to_string());
+        a
+    };
 
     let sup = first_text(
         &epigraph_mcp::tools::supersede::supersede_claim(
@@ -1337,7 +1366,7 @@ async fn deferred_cascades_are_replayed_on_the_maintenance_connection(pool: PgPo
                 canonical_id: df.canonical.to_string(),
                 reason: None,
             },
-            Some(&auth),
+            Some(&dedup_auth),
         )
         .await
         .expect("dedup act"),
@@ -1919,7 +1948,7 @@ async fn the_admin_cascade_keeps_another_writers_edge_its_writers(pool: PgPool) 
             canonical_id: canonical.to_string(),
             reason: None,
         },
-        Some(&non_admin_owner(agent)),
+        Some(&dedup_owner(agent)),
     )
     .await
     .expect("dedup");

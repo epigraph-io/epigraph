@@ -630,9 +630,9 @@ pub async fn supersede_claim(
 /// - 400 Bad Request: duplicate_id == canonical_id, or claim already superseded
 /// - 401 Unauthorized: no bearer token
 /// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
-///   `not_claim_writer`): the caller can read the duplicate but does not write
-///   its owning group (authorship alone is not enough) and lacks
-///   `claims:admin`
+///   `not_claim_writer`): the caller can read the duplicate (or the canonical)
+///   but does not write its owning group (authorship alone is not enough) and
+///   lacks `claims:admin`; `claim_id` names the claim refused
 /// - 404 Not Found: the claim or the canonical does not exist, or the caller
 ///   cannot read it (the two are indistinguishable)
 /// - 200 OK: duplicate marked successfully
@@ -688,12 +688,15 @@ pub async fn mark_duplicate(
     }
 
     // Both claims, read through the CALLER's viewer: one it cannot read is 404,
-    // exactly like a missing one, whichever of the two it is. Only then is the
-    // duplicate's authority decided, so the refusal below concerns a claim the
-    // caller can see. The canonical needs READ authority only: the act writes
-    // the duplicate's row alone (a non-public canonical additionally needs
-    // write authority, which the act's FA04 refusal enforces).
-    let dup_target = {
+    // exactly like a missing one, whichever of the two it is. Only then is
+    // authority decided, first over the duplicate and then over the canonical,
+    // so a refusal below concerns a claim the caller can see. The canonical
+    // needs the same write authority as the duplicate (batch OA1, brief (a):
+    // "the caller may write the target claim(s)"): the act writes the
+    // duplicate's row alone, but the cascade then re-points OTHER writers'
+    // edges and BBAs onto the canonical with administrative authority, so a
+    // `claims:write` caller may only pick a canonical it could write itself.
+    let (dup_target, canonical_target) = {
         let mut read = state.read_as(&viewer).await.map_err(|e| {
             tracing::error!(
                 target: "tenancy.scoped_read",
@@ -716,11 +719,11 @@ pub async fn mark_duplicate(
             .await
             .map_err(db)?
             .ok_or_else(|| not_found(dup_id))?;
-        ClaimRepository::write_target_of(&mut *read, &viewer, req.canonical_id)
+        let canonical = ClaimRepository::write_target_of(&mut *read, &viewer, req.canonical_id)
             .await
             .map_err(db)?
             .ok_or_else(|| not_found(req.canonical_id))?;
-        dup
+        (dup, canonical)
     };
     let arm = crate::middleware::scopes::require_claim_act_authority(
         &auth,
@@ -732,6 +735,17 @@ pub async fn mark_duplicate(
         },
         dup_id,
         "mark as a duplicate",
+    )?;
+    crate::middleware::scopes::require_claim_act_authority(
+        &auth,
+        viewer.principal(),
+        viewer.writable_groups(),
+        epigraph_auth::claim_act::ClaimActTarget {
+            author: canonical_target.0,
+            owner_group: canonical_target.1,
+        },
+        req.canonical_id,
+        "mark a duplicate onto",
     )?;
     tracing::info!(
         handler = "mark_duplicate",

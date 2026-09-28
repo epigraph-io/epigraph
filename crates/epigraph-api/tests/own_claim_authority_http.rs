@@ -34,7 +34,7 @@ use epigraph_db::{ScopedPool, SessionGucMode};
 use http_body_util::BodyExt;
 use sqlx::PgPool;
 use uuid::Uuid;
-use viewer_fixture::{database_url_for, downgraded_pool, seed_agent_with_group, world_group};
+use viewer_fixture::{database_url_for, downgraded_pool, seed_agent_with_group};
 
 async fn app_role_state(pool: &PgPool) -> AppState {
     let bypassrls: bool =
@@ -250,14 +250,9 @@ async fn the_author_supersedes_and_dedups_its_own_claims_over_http(pool: PgPool)
     let (x, xg) = seed_agent_with_group(&pool, "oa1-http-x").await;
     let old = claim_of(&pool, h, hg, "group", "the human's private claim").await;
     let dup = claim_of(&pool, h, hg, "public", "the human's duplicate").await;
-    let canonical = claim_of(
-        &pool,
-        x,
-        world_group(&pool).await,
-        "public",
-        "a world canonical",
-    )
-    .await;
+    // A canonical the author writes: at claims:write the canonical is a target
+    // claim too (see `a_canonical_the_caller_cannot_write_is_refused_by_name`).
+    let canonical = claim_of(&pool, h, hg, "public", "the human's canonical").await;
     let xc = claim_of(&pool, x, xg, "public", "X cites the duplicate").await;
     let incoming = edge_between(&pool, xc, dup).await;
 
@@ -380,6 +375,42 @@ async fn an_author_who_no_longer_writes_the_owning_group_is_refused_by_name(pool
 
     assert!(is_current(&pool, c).await, "nothing was written");
     assert!(is_current(&pool, mine).await, "nothing was written");
+}
+
+/// The dedup's canonical needs write authority too at `claims:write`: a
+/// readable public canonical in another writer's group is `403 not_owner`
+/// naming the CANONICAL, with nothing written; `claims:admin` admits it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_canonical_the_caller_cannot_write_is_refused_by_name(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, hg) = seed_agent_with_group(&pool, "oa1-http-human").await;
+    let (x, xg) = seed_agent_with_group(&pool, "oa1-http-x").await;
+    let dup = claim_of(&pool, h, hg, "public", "the human's duplicate").await;
+    let theirs = claim_of(&pool, x, xg, "public", "X's attractive canonical").await;
+
+    let e = mark_duplicate(
+        ViewerExtractor(viewer(&pool, h).await),
+        State(state.clone()),
+        human(h, &["claims:write"]),
+        Path(dup),
+        dedup_body(theirs),
+    )
+    .await
+    .expect_err("a canonical the caller cannot write is refused");
+    assert_not_claim_writer(e, theirs).await;
+    assert!(is_current(&pool, dup).await, "nothing was written");
+
+    let Json(resp) = mark_duplicate(
+        ViewerExtractor(viewer(&pool, h).await),
+        State(state.clone()),
+        human(h, &["claims:write", "claims:admin"]),
+        Path(dup),
+        dedup_body(theirs),
+    )
+    .await
+    .expect("claims:admin admits any readable canonical");
+    assert!(!is_current(&pool, dup).await);
+    assert_eq!(deferral_agent(&pool, &resp.cascade).await, Some(h));
 }
 
 /// A bystander with `claims:write`: `403 not_owner` on a claim it can read (on

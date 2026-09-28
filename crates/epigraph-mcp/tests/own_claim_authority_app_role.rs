@@ -333,16 +333,16 @@ async fn the_author_supersedes_its_own_claim_with_claims_write(pool: PgPool) {
     );
 }
 
-/// The author marks its own claim a duplicate of a public claim it cannot write,
-/// with `claims:write` alone; the replay re-points another writer's edge onto
-/// the canonical.
+/// The author marks its own claim a duplicate of another claim it writes, with
+/// `claims:write` alone; the replay re-points another writer's edge onto the
+/// canonical.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_author_dedups_its_own_claim_with_claims_write(pool: PgPool) {
     let (server, _) = app_role_server(&pool).await;
     let (h, hg) = fixture::seed_agent_with_group(&pool, "oa1-human").await;
     let (x, xg) = fixture::seed_agent_with_group(&pool, "oa1-writer-x").await;
     let dup = claim_of(&pool, h, hg, "public", "the human's duplicate").await;
-    let canonical = seed_claim(&pool, "a world canonical", 0.5).await;
+    let canonical = claim_of(&pool, h, hg, "public", "the human's canonical").await;
     let xc = claim_of(&pool, x, xg, "public", "X cites the duplicate").await;
     let incoming = edge_between(&pool, xc, dup).await;
     let auth = human(h, &["claims:read", "claims:write"]);
@@ -371,6 +371,58 @@ async fn the_author_dedups_its_own_claim_with_claims_write(pool: PgPool) {
     let report = replay_now(&pool, "oa1-dedup").await;
     assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
     assert_eq!(edge_target(&pool, incoming).await, canonical);
+}
+
+/// The canonical is a target claim too (brief (a)): the cascade re-points other
+/// writers' edges and BBAs onto it with administrative authority, so at
+/// `claims:write` the caller must write the canonical's owning group as well.
+/// A readable public canonical in another writer's group is refused BY NAME,
+/// the refusal naming the canonical, nothing written and no cascade recorded;
+/// `claims:admin` admits the same dedup.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_canonical_the_caller_cannot_write_is_refused_at_claims_write(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "oa1-human").await;
+    let (x, xg) = fixture::seed_agent_with_group(&pool, "oa1-writer-x").await;
+    let dup = claim_of(&pool, h, hg, "public", "the human's duplicate").await;
+    let theirs = claim_of(&pool, x, xg, "public", "X's attractive canonical").await;
+    let hv = viewer(&pool, h).await;
+
+    let err = mark_duplicate(
+        &server,
+        &hv,
+        dedup_params(dup, theirs),
+        Some(&human(h, &["claims:read", "claims:write"])),
+    )
+    .await
+    .expect_err("a canonical the caller cannot write is refused at claims:write");
+    assert_not_claim_writer(&err, theirs);
+    assert!(is_current(&pool, dup).await, "nothing was written");
+    let deferrals: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'cascade.deferred'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(deferrals, 0, "a refused act records no cascade");
+
+    let r = mark_duplicate(
+        &server,
+        &hv,
+        dedup_params(dup, theirs),
+        Some(&human(h, &["claims:write", "claims:admin"])),
+    )
+    .await
+    .expect("claims:admin admits any readable canonical");
+    let (who, cause) = deferral(&pool, &first_text(&r)).await;
+    assert_eq!((who, cause.as_str()), (Some(h), "dedup"));
+    let supersedes: Option<Uuid> =
+        sqlx::query_scalar("SELECT supersedes FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("dup");
+    assert_eq!(supersedes, Some(theirs));
 }
 
 /// Authorship is not write authority. The human wrote the claim while a
