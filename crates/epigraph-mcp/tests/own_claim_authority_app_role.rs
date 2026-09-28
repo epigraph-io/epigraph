@@ -573,45 +573,70 @@ async fn a_bystander_with_claims_write_is_refused_by_name(pool: PgPool) {
 
 /// A claim the bystander cannot read answers exactly like a random id: for the
 /// supersede target, the duplicate, and the canonical.
+///
+/// Two hidden claims, because WHOSE authority reads the gate matters: one
+/// private to the human's group (no party in play but the human reads it), and
+/// one private to the MCP SERVER AGENT's own group, which the server agent can
+/// read and the bystander cannot. A gate that read through the server agent's
+/// authority instead of the caller's would find the second one and answer
+/// `not_owner` for it (an existence oracle over everything the server agent
+/// reads, which on the HTTP transport is the signer's group) while still
+/// answering "not found" for the first.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_bystander_cannot_learn_whether_a_hidden_claim_exists(pool: PgPool) {
-    let (server, _) = app_role_server(&pool).await;
+    let (server, server_agent) = app_role_server(&pool).await;
+    let server_group = personal_group_of(&pool, server_agent).await;
     let (h, hg) = fixture::seed_agent_with_group(&pool, "oa1-human").await;
     let (b, bg) = fixture::seed_agent_with_group(&pool, "oa1-bystander").await;
-    let hidden = claim_of(&pool, h, hg, "group", "the human's private claim").await;
+    let hidden_h = claim_of(&pool, h, hg, "group", "the human's private claim").await;
+    let hidden_s = claim_of(
+        &pool,
+        server_agent,
+        server_group,
+        "group",
+        "the server agent's private claim",
+    )
+    .await;
     let mine = claim_of(&pool, b, bg, "public", "the bystander's own claim").await;
     let random = Uuid::new_v4();
     let bv = viewer(&pool, b).await;
+    let sv = viewer(&pool, server_agent).await;
+    assert!(
+        sv.group_bind().is_some_and(|g| g.contains(&server_group)),
+        "fixture: the server agent reads its own group's private claim"
+    );
     let auth = human(b, &["claims:read", "claims:write"]);
 
-    let e_hidden = supersede_claim(&server, &bv, supersede_params(hidden), Some(&auth))
-        .await
-        .expect_err("hidden");
-    let e_random = supersede_claim(&server, &bv, supersede_params(random), Some(&auth))
-        .await
-        .expect_err("random");
-    assert_same_as_missing(&e_hidden, hidden, &e_random, random);
+    for hidden in [hidden_h, hidden_s] {
+        let e_hidden = supersede_claim(&server, &bv, supersede_params(hidden), Some(&auth))
+            .await
+            .expect_err("hidden");
+        let e_random = supersede_claim(&server, &bv, supersede_params(random), Some(&auth))
+            .await
+            .expect_err("random");
+        assert_same_as_missing(&e_hidden, hidden, &e_random, random);
 
-    // The duplicate hidden.
-    let e_hidden = mark_duplicate(&server, &bv, dedup_params(hidden, mine), Some(&auth))
-        .await
-        .expect_err("hidden duplicate");
-    let e_random = mark_duplicate(&server, &bv, dedup_params(random, mine), Some(&auth))
-        .await
-        .expect_err("random duplicate");
-    assert_same_as_missing(&e_hidden, hidden, &e_random, random);
+        // The duplicate hidden.
+        let e_hidden = mark_duplicate(&server, &bv, dedup_params(hidden, mine), Some(&auth))
+            .await
+            .expect_err("hidden duplicate");
+        let e_random = mark_duplicate(&server, &bv, dedup_params(random, mine), Some(&auth))
+            .await
+            .expect_err("random duplicate");
+        assert_same_as_missing(&e_hidden, hidden, &e_random, random);
 
-    // The canonical hidden, the duplicate the bystander's OWN claim: the act
-    // would be admitted, so only the canonical's visibility decides.
-    let e_hidden = mark_duplicate(&server, &bv, dedup_params(mine, hidden), Some(&auth))
-        .await
-        .expect_err("hidden canonical");
-    let e_random = mark_duplicate(&server, &bv, dedup_params(mine, random), Some(&auth))
-        .await
-        .expect_err("random canonical");
-    assert_same_as_missing(&e_hidden, hidden, &e_random, random);
+        // The canonical hidden, the duplicate the bystander's OWN claim: the act
+        // would be admitted, so only the canonical's visibility decides.
+        let e_hidden = mark_duplicate(&server, &bv, dedup_params(mine, hidden), Some(&auth))
+            .await
+            .expect_err("hidden canonical");
+        let e_random = mark_duplicate(&server, &bv, dedup_params(mine, random), Some(&auth))
+            .await
+            .expect_err("random canonical");
+        assert_same_as_missing(&e_hidden, hidden, &e_random, random);
 
-    assert!(is_current(&pool, hidden).await);
+        assert!(is_current(&pool, hidden).await);
+    }
     assert!(is_current(&pool, mine).await, "nothing was written");
 }
 
