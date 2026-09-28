@@ -178,8 +178,9 @@ pub struct CascadeTrigger {
     /// The replacement (supersede) or the canonical claim (dedup).
     pub object_id: Option<Uuid>,
     /// The retired sources of a consolidation; for an `edge_retract`, the
-    /// claims whose own edge-keyed BBAs the owner's act deleted (the replay
-    /// re-derives their belief).
+    /// claims whose own edge-keyed BBAs the owner's act deleted, as 120's
+    /// deferral definer derived them from the session's rows (the caller
+    /// names none; the replay re-derives their belief).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<Uuid>,
     /// A match-candidate retirement's precondition: the candidate's status

@@ -17,7 +17,10 @@
 //! * the one-shot legacy sweep removes the BBAs of an edge withdrawn before
 //!   any deferral existed, audited as `edge_retract` naming the acting
 //!   operator, and never touches a genuine (non-edge) perspective's BBA, even
-//!   one whose id equals a withdrawn edge's.
+//!   one whose id equals a withdrawn edge's;
+//! * the claims a deferral asks the replay to re-derive are STATE (the claims
+//!   of the session's own edge-keyed rows, derived by the definer): a caller
+//!   naming another writer's claims is refused, and their caches are untouched.
 //!
 //! Both MCP servers and every BBA write run on the application role
 //! (`epigraph_app`); the replay and the sweep on a non-superuser
@@ -722,3 +725,171 @@ async fn the_owners_claim_and_another_writers_claim_are_both_rederived(pool: PgP
         "b has no BBA left, so no cache"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The re-derivation set is the database's, never the caller's. The deferral
+// definer derives an `edge_retract`'s sources itself (the claims of the
+// session's OWN BBA rows keyed on the edge, read before the act deletes them)
+// and refuses caller-named ones: a caller naming another writer's claims must
+// not make the privileged replay rewrite or clear their belief caches.
+// ---------------------------------------------------------------------------
+
+type Cache3 = (Option<f64>, Option<f64>, Option<f64>);
+
+async fn cache3(pool: &PgPool, claim: Uuid) -> Cache3 {
+    sqlx::query_as("SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("cache")
+}
+
+fn sqlstate(e: &sqlx::Error) -> String {
+    e.as_database_error()
+        .and_then(|d| d.code().map(|c| c.to_string()))
+        .unwrap_or_else(|| e.to_string())
+}
+
+/// `agent`'s own direct call of the deferral definer on the application role
+/// (what a session with raw SQL can do), with `sources` as given.
+async fn direct_deferral(
+    pool: &PgPool,
+    agent: Uuid,
+    edge: Uuid,
+    sources: Option<Vec<Uuid>>,
+) -> Result<Uuid, String> {
+    let p = pool.clone();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, agent).await;
+        let r = sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_record_cascade_deferral(\
+             'edge_retract', $1, $2, NULL, $3, NULL, 'w12b direct')",
+        )
+        .bind(agent)
+        .bind(edge)
+        .bind(sources)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| sqlstate(&e));
+        (conn, r)
+    })
+    .await
+}
+
+/// `agent`'s BBA keyed on `perspective` onto `claim`, on the application role,
+/// or the refusal's SQLSTATE.
+async fn try_bba(
+    pool: &PgPool,
+    agent: Uuid,
+    claim: Uuid,
+    frame: Uuid,
+    perspective: Uuid,
+) -> Result<Uuid, String> {
+    let p = pool.clone();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, agent).await;
+        let r = MassFunctionRepository::store_with_perspective(
+            &mut *conn,
+            claim,
+            frame,
+            Some(agent),
+            Some(perspective),
+            &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+            None,
+            Some("test"),
+            None,
+            None,
+            "unknown",
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string());
+        (conn, r)
+    })
+    .await
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_caller_cannot_name_the_claims_an_edge_retract_rederives(pool: PgPool) {
+    let (plain, scoped) = app_role_pools(&pool).await;
+    let w1 = side(&pool, build_scoped_test_server(plain, scoped)).await;
+    let author = fixture::seed_agent_with_group(&pool, "author").await.0;
+    let a = fixture::seed_public_claim(&pool, author, "w12b forged a").await;
+    let b = fixture::seed_public_claim(&pool, author, "w12b forged b").await;
+    let (z, zg) = fixture::seed_agent_with_group(&pool, "bystander-z").await;
+    let v_pub = fixture::seed_public_claim(&pool, z, "w12b bystander public").await;
+    let v_priv = fixture::seed_group_claim(&pool, z, zg, "w12b bystander private").await;
+    let frame = binary_frame(&pool).await;
+    // A cache with no BBA rows behind it (what a belief-propagation apply
+    // writes directly): a re-derivation would clear it.
+    sqlx::query(
+        "UPDATE claims SET belief = 0.7, plausibility = 0.9, pignistic_prob = 0.8 \
+          WHERE id = ANY($1)",
+    )
+    .bind(vec![v_pub, v_priv])
+    .execute(&pool)
+    .await
+    .expect("seed caches");
+    let before = (cache3(&pool, v_pub).await, cache3(&pool, v_priv).await);
+
+    // W1 owns a withdrawn edge factor, and the honest cascade has drained.
+    let edge = owned_edge(&pool, w1.agent, a, b).await;
+    do_delete_edge(
+        &w1.server,
+        &w1.viewer,
+        DeleteEdgeParams {
+            edge_id: edge.to_string(),
+        },
+    )
+    .await
+    .expect("the owner retracts its edge");
+    let drained = replay_now(&pool).await;
+    assert_eq!((drained.applied, drained.failed), (1, 0), "{drained:?}");
+
+    // (a) Caller-named sources are refused, the bystander's claims first.
+    for named in [vec![v_pub, v_priv], vec![v_pub], vec![a]] {
+        assert_eq!(
+            direct_deferral(&pool, w1.agent, edge, Some(named.clone())).await,
+            Err("22023".to_string()),
+            "an edge_retract deferral takes no caller-named sources: {named:?}"
+        );
+    }
+    // (c) The sources the database derives are the claims of the session's
+    // own edge-keyed rows, and a writer cannot plant a row on a claim it
+    // cannot see: the same write onto a public claim is admitted (control).
+    try_bba(&pool, w1.agent, a, frame, edge)
+        .await
+        .expect("control: W1 keys a BBA on its edge onto a public claim");
+    let planted = try_bba(&pool, w1.agent, v_priv, frame, edge).await;
+    assert!(
+        planted
+            .as_ref()
+            .is_err_and(|e| e.contains("row-level security")),
+        "a writer cannot key a BBA on another group's private claim: {planted:?}"
+    );
+    // (b) With no sources named, the definer records the ones state gives:
+    // exactly the claim of W1's own row, never a bystander's.
+    let id = direct_deferral(&pool, w1.agent, edge, None)
+        .await
+        .expect("the owner may record its own withdrawn edge factor again");
+    let trigger: serde_json::Value =
+        sqlx::query_scalar("SELECT details->'trigger' FROM security_events WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("the deferral");
+    assert_eq!(
+        trigger["sources"],
+        serde_json::json!([a]),
+        "the sources are the session's own rows' claims: {trigger}"
+    );
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+
+    assert_eq!(
+        (cache3(&pool, v_pub).await, cache3(&pool, v_priv).await),
+        before,
+        "no deferral may rewrite a claim the caller held no BBA on"
+    );
+}
+

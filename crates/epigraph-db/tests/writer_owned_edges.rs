@@ -1424,7 +1424,9 @@ async fn a_retracted_link_asserted_again_is_a_new_edge(pool: PgPool) {
 /// 120's `epigraph_record_cascade_deferral` records `edge_retract` only for an
 /// edge the session owns or co-owns, that carries an edge-factor perspective
 /// (`perspective_type = 'edge'`), and that is not retracted into the future.
-/// Everything else is CX03 (42501), with nothing recorded.
+/// Everything else is CX03 (42501), with nothing recorded. It takes no object
+/// and no caller-named sources (CX01, 22023): it records as sources the claims
+/// of the session's own BBA rows keyed on the edge.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_factor(
     pool: PgPool,
@@ -1513,24 +1515,62 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
             "{why} records nothing"
         );
     }
-    // The shape: no object; the sources (the claims of the owner's own deleted
-    // BBAs) are distinct.
+    // The shape: no object, and no caller-named sources (CX01, 22023): the
+    // definer derives them.
     assert_eq!(
         record_full(w, retracted, Some(a), None).await,
         Err("22023".to_string()),
         "an edge_retract deferral names no object"
     );
-    assert_eq!(
-        record_full(w, retracted, None, Some(vec![a, a])).await,
-        Err("42501".to_string()),
-        "duplicate sources are refused"
-    );
+    for named in [vec![a], vec![a, b], vec![Uuid::new_v4()]] {
+        assert_eq!(
+            record_full(w, retracted, None, Some(named.clone())).await,
+            Err("22023".to_string()),
+            "an edge_retract deferral takes no caller-named sources: {named:?}"
+        );
+    }
+    // An empty array names nothing, as NULL does.
+    record_full(w, retracted, None, Some(vec![]))
+        .await
+        .expect("an empty source list is no source list");
+    // The sources are STATE: the claims of the session's OWN BBA rows keyed
+    // on the edge (W's on b, on two frames, recorded once), never another
+    // writer's (Z's on a), however the caller calls.
+    let mut frames = Vec::new();
+    for _ in 0..2 {
+        frames.push(
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO frames (name, hypotheses) \
+                 VALUES ('w12b ' || gen_random_uuid(), ARRAY['TRUE','FALSE']) RETURNING id",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("frame"),
+        );
+    }
+    for (who, claim, frame) in [(w, b, frames[0]), (w, b, frames[1]), (z, a, frames[0])] {
+        let p = pool.clone();
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, who).await;
+            sqlx::query(
+                "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, \
+                                             perspective_id, masses) \
+                 VALUES ($1, $2, $3, $4, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb)",
+            )
+            .bind(claim)
+            .bind(frame)
+            .bind(who)
+            .bind(retracted)
+            .execute(&mut *conn)
+            .await
+            .expect("an edge-keyed BBA");
+            (conn, ())
+        })
+        .await;
+    }
     record(w, retracted)
         .await
         .expect("the owner records its withdrawn edge factor");
-    record_full(w, retracted, None, Some(vec![a, b]))
-        .await
-        .expect("the owner records its withdrawn edge factor with its own claims");
     let rows: Vec<(Option<Uuid>, String, Option<serde_json::Value>)> = sqlx::query_as(
         "SELECT agent_id, details->'trigger'->>'subject_id', details->'trigger'->'sources' \
            FROM security_events \
@@ -1544,13 +1584,9 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
         rows,
         vec![
             (Some(w), retracted.to_string(), None),
-            (
-                Some(w),
-                retracted.to_string(),
-                Some(serde_json::json!([a, b]))
-            ),
+            (Some(w), retracted.to_string(), Some(serde_json::json!([b]))),
         ],
-        "the sources reach the trigger the replay reads, and only when given"
+        "no own rows, no sources; then exactly the claim of the session's own rows"
     );
 }
 

@@ -434,15 +434,19 @@ CREATE TRIGGER edges_owner_immutable
 --                  exists; and the edge is OUT OF FORCE (`valid_to <= now()`):
 --                  an edge in force, or one retracted into the future, records
 --                  nothing. An act that deletes the row closes its window
---                  first, in the same transaction. No object. The optional
---                  sources are the claims whose OWN edge-keyed BBAs the act
---                  deleted: the caller cannot re-derive a belief cache it does
---                  not own, so the replay re-derives them. The replay is
---                  STATE-DERIVED: it removes the edge-keyed BBAs only while the
---                  edge is absent or out of force, and a source only asks it to
---                  re-derive a claim's belief from the rows the claim has, so a
---                  stale or forged deferral does nothing state does not
---                  justify.
+--                  first, in the same transaction. No object and no
+--                  caller-named sources (CX01): the DEFINER derives the
+--                  sources, as the claims of the session's OWN BBA rows keyed
+--                  on the edge (owner group in the session's writable set),
+--                  so the act calls it BEFORE it deletes those rows. The
+--                  caller cannot re-derive a belief cache it does not own, so
+--                  the replay re-derives them. The replay is STATE-DERIVED: it
+--                  removes the edge-keyed BBAs only while the edge is absent or
+--                  out of force, and re-derives only claims that carried a BBA
+--                  keyed on the edge (the session's own, recorded here, and
+--                  those it removes). A re-derivation recomputes a claim's
+--                  belief from the rows it has, and clears a cache no
+--                  surviving row backs.
 CREATE OR REPLACE FUNCTION public.epigraph_record_cascade_deferral(
     p_cause text, p_agent_id uuid, p_subject uuid, p_object uuid, p_sources uuid[],
     p_oauth jsonb, p_reason text)
@@ -471,14 +475,16 @@ BEGIN
     END IF;
     IF p_subject IS NULL
        OR (p_cause IN ('supersede', 'dedup')) <> (p_object IS NOT NULL)
-       OR (p_cause = 'edge_retract' AND p_object IS NOT NULL)
+       OR (p_cause = 'edge_retract'
+           AND (p_object IS NOT NULL OR cardinality(v_sources) > 0))
        OR (p_cause <> 'edge_retract'
            AND (p_cause = 'consolidate') <> (cardinality(v_sources) > 0)) THEN
         RAISE EXCEPTION 'CX01: a % deferral names a subject%; no deferral was recorded', p_cause,
             CASE p_cause WHEN 'supersede' THEN ' and an object, and no sources'
                          WHEN 'dedup' THEN ' and an object, and no sources'
                          WHEN 'consolidate' THEN ' and its sources, and no object'
-                         WHEN 'edge_retract' THEN ', optional claim sources, and no object'
+                         WHEN 'edge_retract' THEN
+                             ', and no object or sources (the database derives them)'
                          ELSE ', and no object or sources' END
             USING ERRCODE = '22023';
     END IF;
@@ -520,17 +526,8 @@ BEGIN
     ELSIF p_cause = 'edge_retract' THEN
         -- The edge is out of force (a retract, or a row the act closed before
         -- deleting it: `withdraw_edge_bbas_conn` sets `valid_to = now()` first),
-        -- so no deferral names an edge in force. The sources are the claims
-        -- whose own edge-keyed BBAs the act deleted (distinct, at most 1000).
-        -- They are not checked against `claims` here: under row security this
-        -- frame may not see a claim the caller's BBA lived on, and refusing
-        -- would roll back an honest retract. A source only asks the replay to
-        -- re-derive that claim's belief from the rows it has (an unknown id
-        -- re-derives nothing), so a wrong one changes nothing that state does
-        -- not justify.
-        v_ok := cardinality(v_sources) <= 1000
-            AND (SELECT count(DISTINCT s) FROM unnest(v_sources) s) = cardinality(v_sources)
-            AND EXISTS (SELECT 1 FROM public.edges e
+        -- so no deferral names an edge in force.
+        v_ok := EXISTS (SELECT 1 FROM public.edges e
                          WHERE e.id = p_subject
                            AND e.valid_to <= now()
                            AND (v_priv
@@ -538,6 +535,18 @@ BEGIN
                                 OR e.co_owner_group_id = ANY (public.epigraph_writable_groups())))
             AND EXISTS (SELECT 1 FROM public.perspectives p
                          WHERE p.id = p_subject AND p.perspective_type = 'edge');
+        -- The sources are STATE, never the caller's word: the claims of the
+        -- session's OWN BBA rows keyed on the edge (the rows the act deletes
+        -- right after this call). A caller naming another writer's claims
+        -- would otherwise make the privileged replay rewrite or clear their
+        -- belief caches.
+        IF COALESCE(v_ok, false) THEN
+            v_sources := ARRAY(SELECT DISTINCT m.claim_id FROM public.mass_functions m
+                                WHERE m.perspective_id = p_subject
+                                  AND m.owner_group_id
+                                      = ANY (public.epigraph_writable_groups())
+                                ORDER BY m.claim_id);
+        END IF;
     ELSE
         SELECT mc.status INTO v_status FROM public.match_candidates mc WHERE mc.id = p_subject;
         v_ok := v_status IS NOT NULL;

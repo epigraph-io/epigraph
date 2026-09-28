@@ -76,10 +76,12 @@
 //!
 //! A retract (`delete_edge`), or a patch whose `valid_to` takes the edge out
 //! of force, runs `EdgeRepository::withdraw_edge_bbas_conn` in the same
-//! transaction: the caller's OWN `perspective_id = edge_id` BBAs are deleted
-//! (`bba_cleanup.deleted`), and a `cause = 'edge_retract'` deferral hands every
-//! other writer's to the maintenance replay, which removes them and re-derives
-//! the affected beliefs (D1: the cross-owner half is administrative). Before
+//! transaction: a `cause = 'edge_retract'` deferral (whose re-derivation set
+//! the database derives from the caller's own rows) hands every other writer's
+//! `perspective_id = edge_id` BBAs to the maintenance replay, which removes
+//! them and re-derives the affected beliefs (D1: the cross-owner half is
+//! administrative), and then the caller's OWN are deleted
+//! (`bba_cleanup.deleted`). Before
 //! this, a retracted edge's BBA kept moving its target's belief. A future-dated
 //! `valid_to` withdraws nothing yet and records nothing.
 
