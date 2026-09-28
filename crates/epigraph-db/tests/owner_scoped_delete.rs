@@ -3342,6 +3342,22 @@ async fn zero_row_writes_are_refused_not_reported_as_done(pool: PgPool) {
         "{r:?}"
     );
 
+    // A world perspective (a registry row nobody owns): refused (117), and a
+    // missing one is still NotFound. `set_source_reliability` is reachable from
+    // the MCP tool and the HTTP route.
+    let persp = Uuid::new_v4();
+    seed_perspective(&pool, persp).await;
+    let alpha: std::collections::HashMap<String, f64> = [("obs".to_string(), 0.5)].into();
+    let r = epigraph_db::PerspectiveRepository::set_source_reliability(&app, persp, &alpha).await;
+    assert!(is_write_refused(&r), "{r:?}");
+    let r =
+        epigraph_db::PerspectiveRepository::set_source_reliability(&app, Uuid::new_v4(), &alpha)
+            .await;
+    assert!(
+        matches!(r, Err(epigraph_db::DbError::NotFound { .. })),
+        "{r:?}"
+    );
+
     // The claim's BBAs: X's own and Y's (both writer-owned, 114).
     let p = pool.clone();
     let mine = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {

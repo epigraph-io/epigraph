@@ -162,32 +162,39 @@ impl PerspectiveRepository {
         map: &std::collections::HashMap<String, f64>,
     ) -> Result<(), DbError> {
         let value = serde_json::to_value(map).unwrap_or(serde_json::Value::Null);
-        let updated = sqlx::query(
+        // Migration 117: UPDATE of a registry row is owner-scoped, so a world
+        // perspective (nobody's) matches no row for a non-privileged session,
+        // without an error. `seen` reads it under the statement's snapshot, so
+        // a missing perspective (`NotFound`) and a refused one
+        // (`WriteRefused`) are told apart instead of either reading as done.
+        let counts: (i64, i64) = sqlx::query_as(
             r#"
-            UPDATE perspectives
-            SET properties = jsonb_set(
-                COALESCE(properties, '{}'::jsonb),
-                ARRAY[$2]::text[],
-                $3::jsonb,
-                true
-            )
-            WHERE id = $1
+            WITH seen AS (SELECT 1 FROM perspectives WHERE id = $1),
+                 done AS (
+                    UPDATE perspectives
+                    SET properties = jsonb_set(
+                        COALESCE(properties, '{}'::jsonb),
+                        ARRAY[$2]::text[],
+                        $3::jsonb,
+                        true
+                    )
+                    WHERE id = $1
+                    RETURNING 1)
+            SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )
         .bind(id)
         .bind(field)
         .bind(value)
-        .execute(pool)
+        .fetch_one(pool)
         .await?;
-        // Migration 117: UPDATE of a registry row is owner-scoped, so a world
-        // perspective (nobody's) matches no row for a non-privileged session.
-        // Report that, and a missing perspective, instead of a silent success.
-        if updated.rows_affected() == 0 {
+        if counts == (0, 0) {
             return Err(DbError::NotFound {
-                entity: "Perspective (or not updatable by this session)".to_string(),
+                entity: "Perspective".to_string(),
                 id,
             });
         }
+        super::require_all_changed("perspective", id, "update", counts)?;
         Ok(())
     }
 
