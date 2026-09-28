@@ -264,6 +264,19 @@ pub enum ApiError {
         rule: &'static str,
         message: String,
     },
+
+    /// `403`, `not_owner` with `rule = "not_claim_writer"` (batch OA1,
+    /// operator decision D1): the caller can READ the claim but may not
+    /// supersede it or mark it a duplicate, because it is not the claim's
+    /// author, holds no `admin`/`writer` membership in the group that owns it,
+    /// and lacks `claims:admin` (`epigraph_auth::claim_act`). Nothing was
+    /// written. A claim the caller cannot read answers `404` instead, exactly
+    /// like a missing one, so this is no existence oracle.
+    #[error("{message}")]
+    ClaimNotWritable {
+        claim_id: uuid::Uuid,
+        message: String,
+    },
 }
 
 impl ApiError {
@@ -363,6 +376,21 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        // The claim-act refusal (batch OA1): the same machine keys as the edge
+        // contract above, with the claim's id and its own rule.
+        if let ApiError::ClaimNotWritable { claim_id, message } = &self {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "not_owner",
+                    "message": message,
+                    "claim_id": claim_id,
+                    "rule": epigraph_auth::claim_act::NOT_CLAIM_WRITER_RULE,
+                    "retryable": false,
+                })),
+            )
+                .into_response();
+        }
         let (status, error_type, details) = match &self {
             ApiError::BadRequest { message } => (
                 StatusCode::BAD_REQUEST,
@@ -455,7 +483,9 @@ impl IntoResponse for ApiError {
                 "maintenance_surface_not_served",
                 None,
             ),
-            ApiError::EdgeNotOwned { .. } => (StatusCode::FORBIDDEN, "not_owner", None),
+            ApiError::EdgeNotOwned { .. } | ApiError::ClaimNotWritable { .. } => {
+                (StatusCode::FORBIDDEN, "not_owner", None)
+            }
         };
 
         // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a

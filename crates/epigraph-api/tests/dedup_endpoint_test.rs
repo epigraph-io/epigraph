@@ -17,7 +17,8 @@ async fn dedup_marks_duplicate_without_creating_new_claim() {
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let (token, _client_id) =
-        common::test_bearer_token_with_seeded_client(&pool, &["claims:admin"]).await;
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
     let body = serde_json::json!({
         "canonical_id": canonical,
         "reason": "auto-detected duplicate by content_hash",

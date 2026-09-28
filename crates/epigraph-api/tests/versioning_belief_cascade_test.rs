@@ -199,7 +199,8 @@ async fn dedup_route_reports_and_applies_the_belief_cascade() {
 
     let (addr, _shutdown) = common::spawn_app_with_admin_cascade(&url).await;
     let (token, client_id) =
-        common::test_bearer_token_with_seeded_client(&pool, &["claims:admin"]).await;
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
 
     let tag = Uuid::new_v4();
     let canonical = common::seed_claim(&pool, &format!("http dedup canonical {tag}")).await;

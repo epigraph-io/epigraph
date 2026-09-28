@@ -187,7 +187,11 @@ pub struct VersionHistoryResponse {
 /// # Errors
 ///
 /// - 400 Bad Request: Validation failures or claim already superseded
-/// - 404 Not Found: Claim does not exist
+/// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
+///   `not_claim_writer`): the caller can read the claim but is not its author,
+///   not a writer of its owning group, and lacks `claims:admin`
+/// - 404 Not Found: Claim does not exist, or the caller cannot read it (the two
+///   are indistinguishable)
 /// - 201 Created: New claim created successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -273,25 +277,24 @@ pub async fn supersede_claim(
             reason: "Truth value must be between 0.0 and 1.0".to_string(),
         })?;
 
-    // 6. The claim's owner, which the ownership gate below decides on, read
-    //    through the CALLER's viewer on a viewer-stamped connection.
+    // 6. The claim's author and owning group, which the authority gate below
+    //    decides on, read through the CALLER's viewer on a viewer-stamped
+    //    connection (`ClaimRepository::write_target_of`).
     //
     //    This was `SELECT agent_id FROM claims WHERE id = $1` on the raw pool,
     //    unfiltered while the handler held a Viewer (F-write-authz-reads-unfiltered,
     //    backlog 30c29c52). A `claims:admin` principal could therefore supersede
     //    a claim it cannot READ, because the gate asked only whose it was. A claim
-    //    the caller cannot see is now 404, exactly like one that does not exist.
+    //    the caller cannot see is 404, exactly like one that does not exist, so
+    //    the refusal in 6b below is only ever about a claim the caller can see.
     //
-    //    READ authority, `{VISIBILITY:c}` through `get_by_id`, and deliberately
-    //    not the write gate `{WRITABLE:c}`: the read decides 404 (can the caller
-    //    see it at all), and the DATABASE decides write authority, because the
-    //    write below runs on a transaction stamped with the caller's viewer and
+    //    READ authority, `{VISIBILITY:c}`, and deliberately not the write gate
+    //    `{WRITABLE:c}`: the read decides 404 (can the caller see it at all),
+    //    6b decides who may ASK, and the DATABASE decides the write itself,
+    //    because it runs on a transaction stamped with the caller's viewer and
     //    `claims_tenancy`'s `WITH CHECK` refuses a row whose owner group the
-    //    caller cannot write (answered 403, nothing written). A Rust-side
-    //    `{WRITABLE:c}` pre-check would only duplicate that decision, and on a
-    //    schema that still carries the orphan `*_privacy` policies it would
-    //    refuse a `claims:admin` supersede those policies admit today.
-    let agent_uuid: Uuid = {
+    //    caller cannot write (answered 403, nothing written).
+    let (agent_uuid, owner_group): (Uuid, Uuid) = {
         let mut read = state.read_as(&viewer).await.map_err(|e| {
             tracing::error!(
                 target: "tenancy.scoped_read",
@@ -303,7 +306,7 @@ pub async fn supersede_claim(
                 message: "Failed to acquire a scoped connection".to_string(),
             }
         })?;
-        ClaimRepository::get_by_id(&mut *read, &viewer, ClaimId::from_uuid(claim_id))
+        ClaimRepository::write_target_of(&mut *read, &viewer, claim_id)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("DB error: {e}"),
@@ -312,12 +315,30 @@ pub async fn supersede_claim(
                 entity: "Claim".to_string(),
                 id: claim_id.to_string(),
             })?
-            .agent_id
-            .as_uuid()
     };
 
-    // 6b. Ownership / admin gate
-    crate::middleware::scopes::require_owner_or_admin(&auth, agent_uuid)?;
+    // 6b. The ACT's authority (batch OA1, operator decision D1): the claim's
+    //     author, a writer of its owning group, or a `claims:admin` holder.
+    //     `claims:write` above is the scope; this is the per-claim rule, shared
+    //     with MCP (`epigraph_auth::claim_act`). The cascade that follows is
+    //     administrative and never runs with the caller's authority.
+    let arm = crate::middleware::scopes::require_claim_act_authority(
+        &auth,
+        viewer.principal(),
+        viewer.writable_groups(),
+        epigraph_auth::claim_act::ClaimActTarget {
+            author: agent_uuid,
+            owner_group,
+        },
+        claim_id,
+        "supersede",
+    )?;
+    tracing::info!(
+        handler = "supersede_claim",
+        claim = %claim_id,
+        arm = arm.as_str(),
+        "claim act admitted"
+    );
 
     // 7. Perform supersession on ONE transaction stamped with the CALLER's
     //    viewer.
@@ -606,7 +627,11 @@ pub async fn supersede_claim(
 ///
 /// - 400 Bad Request: duplicate_id == canonical_id, or claim already superseded
 /// - 401 Unauthorized: no bearer token
-/// - 404 Not Found: claim or canonical does not exist
+/// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
+///   `not_claim_writer`): the caller can read the duplicate but is not its
+///   author, not a writer of its owning group, and lacks `claims:admin`
+/// - 404 Not Found: the claim or the canonical does not exist, or the caller
+///   cannot read it (the two are indistinguishable)
 /// - 200 OK: duplicate marked successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -637,7 +662,12 @@ pub async fn mark_duplicate(
             reason: "dedup requires authentication".into(),
         })?
         .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+    // `claims:write`, not `claims:admin` (batch OA1, operator decision D1):
+    // marking a claim a duplicate is the caller's own write to that claim; the
+    // cascade that re-points OTHER writers' edges is administrative, runs on the
+    // maintenance connection and is deferred to the replay timer. Who may ask is
+    // the per-claim rule below.
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let principal = auth.owner_id.unwrap_or(auth.client_id);
     tracing::info!(
@@ -653,6 +683,59 @@ pub async fn mark_duplicate(
             message: "canonical_id cannot equal duplicate id".into(),
         });
     }
+
+    // Both claims, read through the CALLER's viewer: one it cannot read is 404,
+    // exactly like a missing one, whichever of the two it is. Only then is the
+    // duplicate's authority decided, so the refusal below concerns a claim the
+    // caller can see. The canonical needs READ authority only: the act writes
+    // the duplicate's row alone (a non-public canonical additionally needs
+    // write authority, which the act's FA04 refusal enforces).
+    let dup_target = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "mark_duplicate",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        let not_found = |id: Uuid| ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: id.to_string(),
+        };
+        let db = |e: epigraph_db::DbError| ApiError::InternalError {
+            message: format!("DB error: {e}"),
+        };
+        let dup = ClaimRepository::write_target_of(&mut *read, &viewer, dup_id)
+            .await
+            .map_err(db)?
+            .ok_or_else(|| not_found(dup_id))?;
+        ClaimRepository::write_target_of(&mut *read, &viewer, req.canonical_id)
+            .await
+            .map_err(db)?
+            .ok_or_else(|| not_found(req.canonical_id))?;
+        dup
+    };
+    let arm = crate::middleware::scopes::require_claim_act_authority(
+        &auth,
+        viewer.principal(),
+        viewer.writable_groups(),
+        epigraph_auth::claim_act::ClaimActTarget {
+            author: dup_target.0,
+            owner_group: dup_target.1,
+        },
+        dup_id,
+        "mark as a duplicate",
+    )?;
+    tracing::info!(
+        handler = "mark_duplicate",
+        claim = %dup_id,
+        arm = arm.as_str(),
+        "claim act admitted"
+    );
 
     // THE ACT (migration 117), on ONE transaction stamped with the CALLER's
     // viewer: mark the duplicate. The database decides write authority, so a
