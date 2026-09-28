@@ -1866,6 +1866,12 @@ pub struct LinkHierarchicalParams {
 pub struct LinkHierarchicalResponse {
     pub edge_id: String,
     pub created: bool,
+    /// Whether this server's writing session owns the returned edge (its owner
+    /// or co-owner is in the session's writable set), and so may patch,
+    /// retract or delete it. `false` on a re-assertion of another writer's edge
+    /// (operator decision D8: an edge between two public claims is its
+    /// writer's).
+    pub owned_by_caller: bool,
 }
 
 /// Parameters for the `patch_edge` MCP tool.
@@ -2046,6 +2052,9 @@ pub struct LinkEpistemicBelief {
 pub struct LinkEpistemicResponse {
     pub edge_id: String,
     pub was_created: bool,
+    /// Whether this server's writing session owns the returned edge (see
+    /// `LinkHierarchicalResponse::owned_by_caller`).
+    pub owned_by_caller: bool,
     pub relationship: String,
     pub belief_wired: bool,
     /// The claim `target_belief` describes, and the one the belief wire

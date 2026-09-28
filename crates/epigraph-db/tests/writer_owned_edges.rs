@@ -1205,6 +1205,105 @@ async fn the_legacy_reown_follows_an_attributable_signer_only(pool: PgPool) {
 }
 
 // ===========================================================================
+// 13. Retract, then link the same triple again.
+// ===========================================================================
+
+/// W links A -> B through `create_if_not_exists_conn` (the link tools' and the
+/// HTTP create route's path), retracts it, and links the same triple again:
+/// a NEW in-force edge is created (`was_created = true`, a different id), not
+/// a silent `was_created = false` onto the retracted row. Z re-asserting the
+/// same triple gets W's in-force edge back and is told it does not own it.
+/// The explicit re-run variant still counts the retracted row as present.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_link_asserted_again_is_a_new_edge(pool: PgPool) {
+    use epigraph_db::EdgeRepository;
+
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, w_g) = fixture::seed_agent_with_group(&pool, "writer-w").await;
+    let (z, _) = fixture::seed_agent_with_group(&pool, "other-z").await;
+    let a = fixture::seed_public_claim(&pool, author, "public A").await;
+    let b = fixture::seed_public_claim(&pool, author, "public B").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    async fn link_ab(
+        conn: &mut PgConnection,
+        a: Uuid,
+        b: Uuid,
+    ) -> Result<(epigraph_db::EdgeRow, bool), epigraph_db::DbError> {
+        EdgeRepository::create_if_not_exists_conn(
+            conn, a, "claim", b, "claim", "supports", None, None, None,
+        )
+        .await
+    }
+
+    let p = pool.clone();
+    let out = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        let (first, first_created) = link_ab(&mut conn, a, b).await.expect("W links");
+        let first_owned = EdgeRepository::owned_by_session(&mut *conn, first.id)
+            .await
+            .expect("owned");
+        let retracted = EdgeRepository::retract_by_id(&mut *conn, first.id)
+            .await
+            .expect("W retracts its own edge");
+        let (again, again_created) = link_ab(&mut conn, a, b).await.expect("W links again");
+        let (rerun, rerun_created) = EdgeRepository::create_if_absent_including_retracted_conn(
+            &mut conn, b, "claim", a, "claim", "refutes", None, None, None,
+        )
+        .await
+        .expect("a re-run writer's first link");
+        let rerun_retracted = EdgeRepository::retract_by_id(&mut *conn, rerun.id)
+            .await
+            .expect("retract it");
+        let (rerun_again, rerun_again_created) =
+            EdgeRepository::create_if_absent_including_retracted_conn(
+                &mut conn, b, "claim", a, "claim", "refutes", None, None, None,
+            )
+            .await
+            .expect("the re-run");
+        stamp(&mut conn, &p, z).await;
+        let (by_z, by_z_created) = link_ab(&mut conn, a, b).await.expect("Z re-asserts");
+        let z_owned = EdgeRepository::owned_by_session(&mut *conn, by_z.id)
+            .await
+            .expect("owned");
+        (
+            conn,
+            (
+                (first.id, first_created, first_owned, retracted),
+                (again.id, again_created, again.valid_to.is_none()),
+                (rerun.id, rerun_created, rerun_retracted),
+                (rerun_again.id, rerun_again_created),
+                (by_z.id, by_z_created, z_owned),
+            ),
+        )
+    })
+    .await;
+    let (first, again, rerun, rerun_again, by_z) = out;
+    assert_eq!((first.1, first.2, first.3), (true, true, true));
+    assert!(
+        again.1,
+        "the re-assertion inserts, it does not report the retracted row"
+    );
+    assert_ne!(again.0, first.0, "a new edge, not the retracted one");
+    assert!(again.2, "and it is in force");
+    assert_eq!(
+        tuple(&pool, again.0).await,
+        t(w_g, "public", None, Some(w_g))
+    );
+    assert!(rerun.1 && rerun.2);
+    assert_eq!(
+        (rerun_again.0, rerun_again.1),
+        (rerun.0, false),
+        "the explicit re-run variant never resurrects a retracted edge"
+    );
+    assert_eq!(
+        (by_z.0, by_z.1, by_z.2),
+        (again.0, false, false),
+        "Z gets W's in-force edge back, and is told it is not Z's"
+    );
+}
+
+// ===========================================================================
 // 17. Catalog ratchets.
 // ===========================================================================
 

@@ -81,6 +81,17 @@ pub struct EdgeRow {
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Which existing rows the create-or-get dedup probe counts as "present".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupProbe {
+    /// Only an in-force row ([`EDGE_IN_FORCE`]): a retracted link re-asserted
+    /// is a new edge.
+    InForce,
+    /// Any row, retracted included: an idempotent re-run never resurrects a
+    /// retracted edge.
+    AnyState,
+}
+
 /// Outcome of [`EdgeRepository::create_symmetric_if_absent_oriented`].
 ///
 /// `source_id` / `target_id` are the endpoints AS RECORDED on the surviving
@@ -243,6 +254,18 @@ impl EdgeRepository {
     /// `#[tool_router]`'s boxed `dyn Future + Send` an `Acquire<'a>` bound fails
     /// to prove `for<'x> &'x mut PgConnection: Acquire<'x>`.
     ///
+    /// # The probe matches IN-FORCE rows only (migration 120, D8)
+    ///
+    /// An edge's writer may now retract its own edge. If the probe also matched
+    /// a RETRACTED row, a writer that retracts a link and then re-asserts the
+    /// same `(source, target, relationship)` would get the retracted row back
+    /// with `was_created = false`: a silent no-op that reports success and
+    /// leaves no link in force. So a retracted row is not a duplicate here, and
+    /// the re-assertion inserts a new in-force edge. A caller whose RE-RUN must
+    /// never resurrect a retracted edge (an idempotent ingestion re-run, where
+    /// the retraction was an owner's or the administrative cascade's decision)
+    /// uses [`Self::create_if_absent_including_retracted_conn`] instead.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database operation fails.
     #[allow(clippy::too_many_arguments)]
@@ -257,43 +280,198 @@ impl EdgeRepository {
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(EdgeRow, bool), DbError> {
+        Self::create_if_absent_conn(
+            conn,
+            DedupProbe::InForce,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// [`Self::create_if_absent_including_retracted_conn`] on a pool.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database operation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_absent_including_retracted(
+        pool: &PgPool,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_if_absent_including_retracted_conn(
+            &mut conn,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_if_not_exists_conn`], but a RETRACTED row with the
+    /// same `(source, target, relationship)` also counts as present: nothing is
+    /// inserted and that row is returned with `was_created = false`.
+    ///
+    /// For an idempotent RE-RUN of a structural writer (document and workflow
+    /// ingestion, claim decomposition) whose edge may since have been retracted
+    /// by its owner or by the administrative cascade (a dedup collision, a
+    /// supersede migration): re-running the ingestion must not resurrect that
+    /// decision. It is the behaviour every caller had before migration 120.
+    /// Never use it for a caller's own ASSERTION (a link tool, the HTTP create
+    /// route): there it turns "retract, then link again" into a silent no-op.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database operation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_absent_including_retracted_conn(
+        conn: &mut sqlx::PgConnection,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        Self::create_if_absent_conn(
+            conn,
+            DedupProbe::AnyState,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// Does the SESSION own edge `id` (its owner or co-owner is in the
+    /// session's writable set)? The `owned_by_caller` a link tool or the HTTP
+    /// create route reports next to a created or re-asserted edge: after
+    /// migration 120 a re-assertion of another writer's edge returns THEIR edge,
+    /// which this caller can neither patch, retract nor delete.
+    ///
+    /// Run it on the same stamped connection as the write. An unstamped or
+    /// bypass session has an empty writable set and gets `false`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn owned_by_session<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "-- VISIBILITY-EXEMPT: an ownership test, not a read. It answers only \
+             whether the SESSION's writable set holds the edge's owner or \
+             co-owner, and a writable group is always a readable one, so it says \
+             nothing about an edge this session cannot already see.\n\
+             SELECT EXISTS (SELECT 1 FROM edges e \
+                             WHERE e.id = $1 \
+                               AND (e.owner_group_id = ANY (public.epigraph_writable_groups()) \
+                                    OR e.co_owner_group_id \
+                                       = ANY (public.epigraph_writable_groups())))",
+        )
+        .bind(id)
+        .fetch_one(executor)
+        .await?)
+    }
+
+    /// The one dedup probe + INSERT behind [`Self::create_if_not_exists_conn`]
+    /// and [`Self::create_if_absent_including_retracted_conn`].
+    #[allow(clippy::too_many_arguments)]
+    async fn create_if_absent_conn(
+        conn: &mut sqlx::PgConnection,
+        probe: DedupProbe,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
         use sqlx::Acquire;
         let mut tx = conn.begin().await?;
 
-        let existing = sqlx::query!(
-            r#"
-            -- VISIBILITY-EXEMPT: dedup probe inside a WRITE path
-            -- (`create_or_get`). It must see an existing edge regardless of who
-            -- is asking, or the "get" half silently becomes "create" and the
-            -- table grows a duplicate every time a caller without read access
-            -- re-asserts a link that is already there. PR-16 owns the
-            -- write-side authorization that decides whether the caller may
-            -- create the edge at all.
-            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
-            FROM edges
-            WHERE source_id = $1 AND target_id = $2 AND relationship = $3
-            LIMIT 1
-            "#,
-            source_id,
-            target_id,
-            relationship,
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
+        // VISIBILITY-EXEMPT (both spellings): dedup probe inside a WRITE path
+        // (`create_or_get`). It must see an existing edge regardless of who is
+        // asking, or the "get" half silently becomes "create" and the table
+        // grows a duplicate every time a caller without read access re-asserts
+        // a link that is already there. PR-16 owns the write-side authorization
+        // that decides whether the caller may create the edge at all.
+        let sql = match probe {
+            DedupProbe::InForce => format!(
+                "-- VISIBILITY-EXEMPT: dedup probe inside a WRITE path (in-force rows).\n\
+                 SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
+                        e.relationship, e.properties, e.valid_from, e.valid_to \
+                   FROM edges e \
+                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3 \
+                    AND {EDGE_IN_FORCE} \
+                  LIMIT 1"
+            ),
+            DedupProbe::AnyState => "-- VISIBILITY-EXEMPT: dedup probe inside a WRITE path \
+                 (retracted rows included).\n\
+                 SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
+                        e.relationship, e.properties, e.valid_from, e.valid_to \
+                   FROM edges e \
+                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3 \
+                  LIMIT 1"
+                .to_string(),
+        };
+        #[allow(clippy::type_complexity)]
+        let existing: Option<(
+            Uuid,
+            Uuid,
+            String,
+            Uuid,
+            String,
+            String,
+            serde_json::Value,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )> = sqlx::query_as(&sql)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relationship)
+            .fetch_optional(&mut *tx)
+            .await?;
 
         if let Some(row) = existing {
             tx.commit().await?;
             return Ok((
                 EdgeRow {
-                    id: row.id,
-                    source_id: row.source_id,
-                    source_type: row.source_type,
-                    target_id: row.target_id,
-                    target_type: row.target_type,
-                    relationship: row.relationship,
-                    properties: row.properties,
-                    valid_from: row.valid_from,
-                    valid_to: row.valid_to,
+                    id: row.0,
+                    source_id: row.1,
+                    source_type: row.2,
+                    target_id: row.3,
+                    target_type: row.4,
+                    relationship: row.5,
+                    properties: row.6,
+                    valid_from: row.7,
+                    valid_to: row.8,
                 },
                 false,
             ));

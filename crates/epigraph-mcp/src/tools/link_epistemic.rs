@@ -434,11 +434,18 @@ pub async fn do_link_epistemic(
         }
     };
 
+    // Migration 120 (D8): a re-assertion of another writer's edge returns THEIR
+    // edge, which this session can neither patch, retract nor delete. Say so.
+    let owned_by_caller = EdgeRepository::owned_by_session(&mut *tx, edge_id)
+        .await
+        .map_err(internal_error)?;
+
     tx.commit().await.map_err(internal_error)?;
 
     success_json(&LinkEpistemicResponse {
         edge_id: edge_id.to_string(),
         was_created,
+        owned_by_caller,
         relationship: params.relationship,
         belief_wired,
         belief_target_claim_id: wire_target.to_string(),

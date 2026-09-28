@@ -1275,6 +1275,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "create_if_absent_conn",
+        "WRITE. The one dedup probe + INSERT behind create_if_not_exists_conn (in-force rows, \
+         migration 120) and create_if_absent_including_retracted_conn (any row). The probe is \
+         the VISIBILITY-EXEMPT write-path read `create_or_get` documents (it must see an \
+         existing edge regardless of who asks, or the get half becomes a duplicate create); the \
+         INSERT is authorised by edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "edge.rs",
+        "create_if_absent_including_retracted_conn",
+        "WRITE. create_if_absent_conn with a retracted row counting as present, for an \
+         idempotent ingestion / decomposition RE-RUN that must never resurrect an edge its owner \
+         or the administrative cascade retracted. Same exempt probe, same WITH CHECK.",
+    ),
+    (
+        "edge.rs",
         "create_if_not_exists_conn",
         "WRITE. `create_if_not_exists` on a caller's connection so an ingest's edges ride the \
          same transaction as the claims they join. Its dedup probe is the VISIBILITY-EXEMPT \
@@ -1914,6 +1930,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          render on a public claim, so its read policy admits every row — and the lookup is the \
          get half of an ingest's get-or-create, which must find the row whoever asks. Widened \
          so the lookup rides the same transaction as the create it guards.",
+    ),
+    (
+        "edge.rs",
+        "owned_by_session",
+        "READ of one `edges` row by primary key, returning only whether its owner or co-owner \
+         is in the SESSION's writable set (migration 120's `owned_by_caller`). A writable group \
+         is always a readable one, so it answers true only for an edge this session can \
+         already see, and false says nothing about an edge it cannot.",
     ),
     (
         "edge.rs",

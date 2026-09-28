@@ -283,7 +283,7 @@ pub async fn execute_workflow_ingest_plan(
     // can still see the lineage. Idempotent on re-ingest via
     // create_if_not_exists.
     let variant_of_edge_created = if let Some(parent_id_uuid) = parent_id {
-        EdgeRepository::create_if_not_exists_conn(
+        EdgeRepository::create_if_absent_including_retracted_conn(
             &mut *conn,
             workflow_id,
             "workflow",
@@ -450,7 +450,7 @@ pub async fn execute_workflow_ingest_plan(
     // same clock tick, which is why `c.id ASC` was there at all.
     let mut executes_edges = 0_usize;
     for (plan_index, planned) in plan.claims.iter().enumerate() {
-        let (_row, _was_created) = EdgeRepository::create_if_not_exists_conn(
+        let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
             &mut *conn,
             workflow_id,
             "workflow",
@@ -490,7 +490,7 @@ pub async fn execute_workflow_ingest_plan(
             .copied()
             .unwrap_or(edge.target_id);
 
-        let (row, was_created) = EdgeRepository::create_if_not_exists_conn(
+        let (row, was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
             &mut *conn,
             src,
             &src_type,
