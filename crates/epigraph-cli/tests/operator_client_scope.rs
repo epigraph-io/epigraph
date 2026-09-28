@@ -147,10 +147,18 @@ async fn all_scope_audit_rows(pool: &PgPool) -> i64 {
 const ALLOWED: &[&str] = &["claims:read", "claims:write", "evidence:write"];
 const GRANTED: &[&str] = &["claims:read", "claims:write"];
 
+/// `url` with `application_name=<name>` appended to its query string.
+fn with_application_name(url: &str, name: &str) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}application_name={name}")
+}
+
 /// The dry run reports the change and writes nothing (no scope, no audit row);
 /// the apply appends the scope to BOTH arrays, keeps every other element in
 /// order, and writes one audit row naming who, the client, the scope and both
-/// arrays before and after.
+/// arrays before and after, and where the connection came from: the client
+/// address the SERVER saw (in `details` and in the row's `ip_address`) and the
+/// `application_name` the DSN set.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_human_client_is_granted_an_admin_only_scope_with_one_audit_row(pool: PgPool) {
     let agent = seed_agent(&pool).await;
@@ -173,8 +181,11 @@ async fn a_human_client_is_granted_an_admin_only_scope_with_one_audit_row(pool: 
         "a dry run writes nothing"
     );
 
-    let r = run_op(
-        &pool,
+    let app_dsn = with_application_name(
+        &fixture::database_url_for(&pool).await,
+        "oa1-scope-audit-test",
+    );
+    let r = run_with_env(
         &[
             "grant-client-scope",
             &id,
@@ -183,8 +194,9 @@ async fn a_human_client_is_granted_an_admin_only_scope_with_one_audit_row(pool: 
             "--reason",
             "oa1 test grant",
         ],
-    )
-    .await;
+        &[(DSN_ENV, app_dsn.as_str())],
+        &["DATABASE_URL", "MAINTENANCE_DATABASE_URL"],
+    );
     assert_eq!(r.code, 0, "{}", r.show());
     assert!(r.stdout.contains("APPLIED"), "{}", r.show());
     let (allowed, granted) = scopes(&pool, c).await;
@@ -229,8 +241,30 @@ async fn a_human_client_is_granted_an_admin_only_scope_with_one_audit_row(pool: 
         serde_json::json!(this_login_uid()),
         "the kernel's audit login uid, inherited by the spawned binary: {d}"
     );
-    assert!(d["operator"].get("client_addr").is_some(), "{d}");
-    assert!(d["operator"].get("application_name").is_some(), "{d}");
+
+    // The connection's origin, as the server saw it. The test pool reaches the
+    // same server over TCP from the same host, so it sees the same address; a
+    // Unix-socket DSN would make both NULL and fail the first assertion.
+    let addr: Option<String> = sqlx::query_scalar("SELECT host(inet_client_addr())")
+        .fetch_one(&pool)
+        .await
+        .expect("inet_client_addr");
+    let addr = addr.expect("fixture: the test pool connects over TCP");
+    assert_eq!(d["operator"]["client_addr"], addr.as_str(), "{d}");
+    assert_eq!(
+        d["operator"]["application_name"], "oa1-scope-audit-test",
+        "{d}"
+    );
+    let ip: Option<String> = sqlx::query_scalar(
+        "SELECT host(ip_address) FROM security_events \
+          WHERE event_type = 'oauth.client_scope_granted' \
+            AND details->'client'->>'id' = $1::text",
+    )
+    .bind(c)
+    .fetch_one(&pool)
+    .await
+    .expect("audit row ip_address");
+    assert_eq!(ip.as_deref(), Some(addr.as_str()), "the row's ip_address");
 }
 
 /// The REAL uid of this test process, which spawns the binary under the same
@@ -256,7 +290,6 @@ fn this_login_uid() -> Option<u32> {
         .and_then(|t| t.trim().parse::<u32>().ok())
         .filter(|&u| u != u32::MAX)
 }
-
 
 /// A grant to a human client whose status is not `active` is refused, exit 1,
 /// with nothing written and no audit row: it would carry the scope the moment
