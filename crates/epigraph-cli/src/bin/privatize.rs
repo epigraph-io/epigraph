@@ -57,11 +57,11 @@ use uuid::Uuid;
 #[command(name = "epigraph-privatize", version, about, long_about = None)]
 struct Cli {
     /// Base URL of the EpiGraph API, e.g. `https://epigraph.example/`.
-    #[arg(long, env = "EPIGRAPH_API")]
+    #[arg(long, env = "EPIGRAPH_API", hide_env_values = true)]
     api: String,
     /// Bearer token for an instance admin who also administers the plan's
     /// target group (FINAL-PLAN §6.6).
-    #[arg(long, env = "EPIGRAPH_TOKEN")]
+    #[arg(long, env = "EPIGRAPH_TOKEN", hide_env_values = true)]
     token: String,
     #[command(subcommand)]
     command: Command,
@@ -78,6 +78,7 @@ enum Command {
         #[arg(
             long,
             env = "EPIGRAPH_GROUP_BASE_KEY",
+            hide_env_values = true,
             conflicts_with = "base_key_file"
         )]
         base_key_hex: Option<String>,
@@ -94,6 +95,7 @@ enum Command {
         #[arg(
             long,
             env = "EPIGRAPH_GROUP_BASE_KEY",
+            hide_env_values = true,
             conflicts_with = "base_key_file"
         )]
         base_key_hex: Option<String>,
@@ -113,10 +115,10 @@ enum Command {
         #[arg(long)]
         plan: Uuid,
         /// The base key the content is currently sealed under.
-        #[arg(long, env = "EPIGRAPH_GROUP_OLD_BASE_KEY")]
+        #[arg(long, env = "EPIGRAPH_GROUP_OLD_BASE_KEY", hide_env_values = true)]
         old_base_key_hex: String,
         /// The base key to re-seal under.
-        #[arg(long, env = "EPIGRAPH_GROUP_BASE_KEY")]
+        #[arg(long, env = "EPIGRAPH_GROUP_BASE_KEY", hide_env_values = true)]
         new_base_key_hex: String,
     },
 }

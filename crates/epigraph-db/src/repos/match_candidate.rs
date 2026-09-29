@@ -268,122 +268,51 @@ impl MatchCandidateRepo {
     /// Tolerates any starting status (the CLI does the same): a candidate that
     /// is `pending`, `rejected` or already `stale` simply has no matcher edge
     /// to delete, and the flip to `stale` is idempotent.
+    ///
+    /// # Migrations 117 and 118: an administrative act, on a privileged session
+    ///
+    /// Retirement is administrative end to end. Its cascade retracts a matcher
+    /// edge that, between two public claims, nobody owns (117), and its act,
+    /// the flip to `stale`, is refused on a non-privileged session by 118's
+    /// `match_candidates_stale_guard` (MC01). So the flip and the cascade run
+    /// together, in ONE transaction, on a privileged (maintenance) session:
+    /// this method on a pool, [`Self::retire_conn`] on a connection. A request
+    /// path with no maintenance connection records the retirement as a
+    /// deferred request instead and leaves the candidate untouched
+    /// (`epigraph_engine::admin_cascade`).
     pub async fn retire(&self, id: Uuid, by: Option<Uuid>) -> sqlx::Result<RetirementOutcome> {
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.acquire().await?;
+        Self::retire_conn(&mut conn, id, by, None).await
+    }
 
-        // Row-lock the candidate. This serialises retirement against a
-        // *subsequent* decide — that path's first write is `set_status`, which
-        // blocks here — and against a concurrent retire of the same row.
-        //
-        // It does NOT close the window against a promote already in flight:
-        // `decide_candidate`'s promote arm runs `set_status` and
-        // `create_symmetric_if_absent` as two separate statements in two
-        // implicit transactions, so one that has already committed
-        // `set_status` and is mid-INSERT is not held by this lock. Its edge is
-        // invisible to the SELECT below and survives the retirement, leaving
-        // the row `stale` with a live matcher edge. Retiring again cleans it
-        // up. Making that impossible means folding the promote arm's two
-        // statements into one transaction, which is a change to the promote
-        // path, not to this one.
-        let (claim_a, claim_b, previous_status): (Uuid, Uuid, String) = sqlx::query_as(
-            "SELECT claim_a, claim_b, status FROM match_candidates
-             WHERE id = $1
-             FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        // Capture the full rows, not just their ids: this SELECT is the undo
-        // snapshot (see `RetirementOutcome::retracted_edges`).
-        let retracted_edges: Vec<RetiredEdge> = sqlx::query_as(
-            "SELECT id AS edge_id, source_id, target_id, relationship, properties, created_at
-             FROM edges
-             WHERE ((source_id = $1 AND target_id = $2)
-                 OR (source_id = $2 AND target_id = $1))
-               AND properties->>'source' = 'cross_source_matcher'",
-        )
-        .bind(claim_a)
-        .bind(claim_b)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        let edge_ids: Vec<Uuid> = retracted_edges.iter().map(|e| e.edge_id).collect();
-
-        // `factors.properties->>'source_edge_id'` is text (the trigger builds
-        // it with `jsonb_build_object('source_edge_id', NEW.id)`), so compare
-        // against the text form of the ids.
-        let edge_id_texts: Vec<String> = edge_ids.iter().map(Uuid::to_string).collect();
-
-        let bp_messages_deleted = sqlx::query(
-            "DELETE FROM bp_messages WHERE factor_id IN
-             (SELECT id FROM factors WHERE properties->>'source_edge_id' = ANY($1))",
-        )
-        .bind(&edge_id_texts)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-
-        let factors_deleted =
-            sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = ANY($1)")
-                .bind(&edge_id_texts)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-
-        let bbas_invalidated =
-            sqlx::query("DELETE FROM mass_functions WHERE perspective_id = ANY($1)")
-                .bind(&edge_ids)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-
-        // RETRACT, do not DELETE. The edge is a primary epistemic record — the
-        // assertion "the matcher claimed these two claims match, and someone
-        // promoted it" — carrying `properties.decided_by`, the signature and the
-        // content hash. A DELETE here destroys who made the original promotion,
-        // because `match_candidates.decided_by` is overwritten with the RETIRER
-        // twenty lines below; nothing persisted would record the promoter.
-        //
-        // Closing `valid_to` removes the edge from every reader that honours
-        // `EDGE_IN_FORCE` (the derivation selector and the auto-wire guard) while
-        // keeping the row queryable and the retirement reversible. The derived rows
-        // above — bp_messages, factors, mass_functions — are still deleted: those
-        // are materializations (factors come from the `edges_auto_factor` trigger,
-        // BBAs are keyed `perspective_id = edge_id`), so removing them is cache
-        // invalidation and they regenerate from live edges.
-        //
-        // `AND valid_to IS NULL` makes this idempotent: retiring twice does not
-        // advance an existing retraction's timestamp.
-        let edges_retracted = sqlx::query(
-            "UPDATE edges SET valid_to = now() WHERE id = ANY($1) AND valid_to IS NULL",
-        )
-        .bind(&edge_ids)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-
-        sqlx::query(
-            "UPDATE match_candidates
-             SET status = 'stale', decided_at = now(), decided_by = $2
-             WHERE id = $1",
-        )
-        .bind(id)
-        .bind(by)
-        .execute(&mut *tx)
-        .await?;
-
+    /// [`Self::retire`] on a connection the caller owns: the maintenance
+    /// connection of a request path, or of the operator's replay.
+    ///
+    /// `expected_status`, when given, is the status the candidate had when the
+    /// retirement was requested. The retirement goes ahead only if the
+    /// candidate still has that status (or is already `stale`, when the flip is
+    /// idempotent); otherwise the candidate was decided again in between, and
+    /// retiring it would withdraw a decision the requester never saw. The
+    /// refusal is loud and nothing is written.
+    ///
+    /// # Errors
+    /// A protocol error on a non-privileged session, or when the candidate's
+    /// status is no longer `expected_status`; the query's error otherwise (a
+    /// missing candidate is `RowNotFound`).
+    pub async fn retire_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        by: Option<Uuid>,
+        expected_status: Option<&str>,
+    ) -> sqlx::Result<RetirementOutcome> {
+        use sqlx::Acquire;
+        let mut tx = conn.begin().await?;
+        require_privileged(&mut tx, "MatchCandidateRepo::retire_conn").await?;
+        let previous_status = mark_retired_on(&mut tx, id, by, expected_status).await?;
+        let mut outcome = retract_candidate_edges(&mut tx, id).await?;
         tx.commit().await?;
-
-        Ok(RetirementOutcome {
-            previous_status,
-            affected_claims: vec![claim_a, claim_b],
-            edges_retracted,
-            factors_deleted,
-            bp_messages_deleted,
-            bbas_invalidated,
-            retracted_edges,
-        })
+        outcome.previous_status = previous_status;
+        Ok(outcome)
     }
 
     pub async fn list_pending(&self, limit: i64) -> sqlx::Result<Vec<MatchCandidateRow>> {
@@ -570,4 +499,170 @@ impl MatchCandidateRepo {
         }
         q.fetch_all(&self.pool).await
     }
+}
+
+/// Refuse a non-privileged session (migration 114's
+/// `epigraph_session_is_privileged_writer()`), naming the caller.
+async fn require_privileged(conn: &mut sqlx::PgConnection, what: &str) -> sqlx::Result<()> {
+    let privileged: bool =
+        sqlx::query_scalar("SELECT public.epigraph_session_is_privileged_writer()")
+            .fetch_one(&mut *conn)
+            .await?;
+    if privileged {
+        return Ok(());
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "{what} runs only on a privileged (maintenance) connection: a promoted matcher edge \
+         between two public claims is owned by nobody (migration 117), and the flip to \
+         `stale` is an administrative act (migration 118)"
+    )))
+}
+
+/// The act of [`MatchCandidateRepo::retire_conn`]: row-lock the candidate,
+/// check it still has `expected_status` (when given), flip it to `stale`, and
+/// return its previous status.
+///
+/// The row lock serialises retirement against a *subsequent* decide -- that
+/// path's first write is `set_status`, which blocks here -- and against a
+/// concurrent retire of the same row. It does NOT close the window against a
+/// promote already in flight: `decide_candidate`'s promote arm runs
+/// `set_status` and `create_symmetric_if_absent` as two separate statements, so
+/// one that has already committed `set_status` and is mid-INSERT is not held
+/// by this lock. Its edge survives the retirement's cascade, leaving the row
+/// `stale` with a live matcher edge; retiring again cleans it up.
+///
+/// The flip is checked (`rows_affected == 1`): on a privileged session nothing
+/// filters the row, so a flip that changed nothing means the row vanished
+/// under the lock, and the retirement must not report success.
+async fn mark_retired_on(
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+    by: Option<Uuid>,
+    expected_status: Option<&str>,
+) -> sqlx::Result<String> {
+    let previous_status: String =
+        sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await?;
+    if let Some(expected) = expected_status {
+        if previous_status != expected && previous_status != "stale" {
+            return Err(sqlx::Error::Protocol(format!(
+                "match candidate {id} was {expected} when its retirement was requested and is \
+                 {previous_status} now: it was decided again in between, so the request is not \
+                 carried out; nothing was changed"
+            )));
+        }
+    }
+    let flipped = sqlx::query(
+        "UPDATE match_candidates
+         SET status = 'stale', decided_at = now(), decided_by = $2
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(by)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if flipped != 1 {
+        return Err(sqlx::Error::Protocol(format!(
+            "match candidate {id}: the flip to stale changed {flipped} rows, not 1; nothing was \
+             retired"
+        )));
+    }
+    Ok(previous_status)
+}
+
+/// The cascade of [`MatchCandidateRepo::retire`], unchecked: the callers
+/// establish the privilege and own the transaction. `previous_status` is left
+/// empty for the caller to fill.
+///
+/// Edges are matched by **claim pair + the `properties->>'source' =
+/// 'cross_source_matcher'` marker**, not by `relationship` (a `contradicts`
+/// promotion is equally retirable) and not by `candidate_id` (reversed-duplicate
+/// candidates share a single edge stamped with only one of their ids).
+async fn retract_candidate_edges(
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+) -> sqlx::Result<RetirementOutcome> {
+    let (claim_a, claim_b): (Uuid, Uuid) =
+        sqlx::query_as("SELECT claim_a, claim_b FROM match_candidates WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await?;
+
+    // Capture the full rows, not just their ids: this SELECT is the snapshot
+    // (see `RetirementOutcome::retracted_edges`).
+    let retracted_edges: Vec<RetiredEdge> = sqlx::query_as(
+        "SELECT id AS edge_id, source_id, target_id, relationship, properties, created_at
+         FROM edges
+         WHERE ((source_id = $1 AND target_id = $2)
+             OR (source_id = $2 AND target_id = $1))
+           AND properties->>'source' = 'cross_source_matcher'",
+    )
+    .bind(claim_a)
+    .bind(claim_b)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let edge_ids: Vec<Uuid> = retracted_edges.iter().map(|e| e.edge_id).collect();
+
+    // `factors.properties->>'source_edge_id'` is text (the trigger builds it
+    // with `jsonb_build_object('source_edge_id', NEW.id)`), so compare against
+    // the text form of the ids.
+    let edge_id_texts: Vec<String> = edge_ids.iter().map(Uuid::to_string).collect();
+
+    let bp_messages_deleted = sqlx::query(
+        "DELETE FROM bp_messages WHERE factor_id IN
+         (SELECT id FROM factors WHERE properties->>'source_edge_id' = ANY($1))",
+    )
+    .bind(&edge_id_texts)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+
+    let factors_deleted =
+        sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = ANY($1)")
+            .bind(&edge_id_texts)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+
+    // RETRACT, do not DELETE. The edge is a primary epistemic record -- the
+    // assertion "the matcher claimed these two claims match, and someone
+    // promoted it" -- carrying `properties.decided_by`, the signature and the
+    // content hash. Closing `valid_to` removes the edge from every reader that
+    // honours `EDGE_IN_FORCE` while keeping the row queryable and the
+    // retirement reversible. The derived rows -- bp_messages and factors above,
+    // mass_functions below -- are materializations, so removing them is cache
+    // invalidation and they regenerate from live edges.
+    //
+    // `AND valid_to IS NULL` makes this idempotent: retiring twice does not
+    // advance an existing retraction's timestamp.
+    let edges_retracted =
+        sqlx::query("UPDATE edges SET valid_to = now() WHERE id = ANY($1) AND valid_to IS NULL")
+            .bind(&edge_ids)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+
+    // The edge-keyed BBAs, routinely somebody else's rows (the writer who
+    // wired the edge, or the target claim's group). This runs on a privileged
+    // session, so `delete_edge_bbas` is the plain statement (migration 117).
+    let bbas_invalidated = crate::repos::mass_function::delete_edge_bbas(
+        &mut *conn,
+        &edge_ids,
+        crate::repos::mass_function::EdgeBbaCascade::MatchCandidateRetire,
+    )
+    .await?;
+
+    Ok(RetirementOutcome {
+        previous_status: String::new(),
+        affected_claims: vec![claim_a, claim_b],
+        edges_retracted,
+        factors_deleted,
+        bp_messages_deleted,
+        bbas_invalidated,
+        retracted_edges,
+    })
 }

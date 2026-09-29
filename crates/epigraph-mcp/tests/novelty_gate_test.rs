@@ -135,10 +135,14 @@ async fn exact_resubmit_still_dedups_with_novelty_threshold_param_present() {
 
     let content = format!("novelty-gate exact-resubmit test {}", Uuid::new_v4());
 
-    let first =
-        tools::claims::submit_claim(&server, &viewer, submit_params(&content, "ev-0", None))
-            .await
-            .expect("first submit_claim");
+    let first = tools::claims::submit_claim(
+        &server,
+        &viewer,
+        submit_params(&content, "ev-0", None),
+        None,
+    )
+    .await
+    .expect("first submit_claim");
     let first_id = first_text_claim_id(&first);
 
     // Resubmit the SAME content with a variety of novelty_threshold values,
@@ -155,6 +159,7 @@ async fn exact_resubmit_still_dedups_with_novelty_threshold_param_present() {
             &server,
             &viewer,
             submit_params(&content, &evidence, threshold),
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("resubmit with threshold {threshold:?} failed: {e:?}"));
@@ -188,10 +193,14 @@ async fn distinct_content_inserts_normally_when_embedder_unavailable() {
 
     for (i, threshold) in [None, Some(0.05), Some(0.0)].into_iter().enumerate() {
         let content = format!("novelty-gate distinct content {i} {}", Uuid::new_v4());
-        let result =
-            tools::claims::submit_claim(&server, &viewer, submit_params(&content, "ev", threshold))
-                .await
-                .unwrap_or_else(|e| panic!("submit_claim (threshold={threshold:?}) failed: {e:?}"));
+        let result = tools::claims::submit_claim(
+            &server,
+            &viewer,
+            submit_params(&content, "ev", threshold),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("submit_claim (threshold={threshold:?}) failed: {e:?}"));
         let claim_id = first_text_claim_id(&result);
 
         let row_count = claims_with_content_hash_count(&pool, &content).await;
@@ -231,7 +240,7 @@ async fn memorize_distinct_content_inserts_normally_when_embedder_unavailable() 
         tags: None,
         novelty_threshold: Some(0.05),
     };
-    tools::memory::memorize(&server, &viewer, params)
+    tools::memory::memorize(&server, &viewer, params, None)
         .await
         .expect("memorize");
 
@@ -243,9 +252,9 @@ async fn memorize_distinct_content_inserts_normally_when_embedder_unavailable() 
 }
 
 /// Pull `claim_id` out of a `submit_claim`/`memorize` `CallToolResult`.
-/// Mirrors `extract_submit_claim_id` in `src/tools/claims.rs` (not reused
-/// directly since that helper is private to the crate's src tree, not
-/// exported to integration tests).
+/// It mirrored `extract_submit_claim_id` in `src/tools/claims.rs`, which was
+/// removed when `resolve_backlog_item` stopped parsing `submit_claim`'s response
+/// and started running the submission's write phase on its own transaction.
 fn first_text_claim_id(result: &rmcp::model::CallToolResult) -> String {
     let text = result
         .content

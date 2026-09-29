@@ -104,7 +104,10 @@ DECLARE t text;
           -- ---- the operator-link record (107) ----------------------------
           -- FORCEd by 107 at creation, on the same precedent and for the same
           -- boot-assertion reason as the four above.
-          'operator_links'];
+          'operator_links',
+          -- ---- the evidence visibility pins (110) --------------------------
+          -- FORCEd by 110 at creation, same precedent and reason.
+          'evidence_visibility_pins'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

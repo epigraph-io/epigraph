@@ -44,15 +44,20 @@ use epigraph_mcp::EpiGraphMcpFull;
 )]
 struct Cli {
     /// PostgreSQL connection URL
-    #[arg(long, env = "DATABASE_URL")]
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
     /// Ed25519 secret key (64 hex chars). If omitted, generates a new keypair.
-    #[arg(long)]
+    ///
+    /// Also read from `EPIGRAPH_MCP_AGENT_KEY` (batch HTTP-id), so a service
+    /// can keep the key in a 0600 environment file instead of its command
+    /// line, which any local user can read (`ps`, `systemctl show`). The value
+    /// is never printed by `--help`.
+    #[arg(long, env = "EPIGRAPH_MCP_AGENT_KEY", hide_env_values = true)]
     agent_key: Option<String>,
 
     /// OpenAI API key for embedding generation. If omitted, uses mock embeddings.
-    #[arg(long, env = "OPENAI_API_KEY")]
+    #[arg(long, env = "OPENAI_API_KEY", hide_env_values = true)]
     openai_api_key: Option<String>,
 
     /// Listen on HTTP. Accepts either `host:port` (TCP) or `unix:/abs/path` (Unix socket).
@@ -71,7 +76,7 @@ struct Cli {
     /// set. Must be at least 32 bytes. The same secret signs and verifies tokens
     /// across both `epigraph-api` and `epigraph-mcp` — when rotating, restart
     /// both processes with the new value.
-    #[arg(long, env = "EPIGRAPH_JWT_SECRET")]
+    #[arg(long, env = "EPIGRAPH_JWT_SECRET", hide_env_values = true)]
     jwt_secret: Option<String>,
 
     /// Acknowledge that HTTP transport exposes all MCP tools without authentication.
@@ -87,6 +92,20 @@ struct Cli {
     #[arg(long)]
     allow_unauthenticated_http: bool,
 
+    /// Let callers of an `--allow-unauthenticated-http` listener WRITE, authored
+    /// by this listener's own signer agent.
+    ///
+    /// Off by default (batch HTTP-id): such a caller presents no credential, so
+    /// no human is named, and an HTTP write is authored by the calling human's
+    /// agent. Without this flag that listener is read-only for its callers
+    /// (every write tool is refused by the scope gate). With it, writes are
+    /// authored by the signer, which the listener's start-up and per-call gates
+    /// keep unlinked from any operator, so it carries no human's authority.
+    /// Meant for a trusted local socket (e.g. the e2e harness), not for a
+    /// listener any remote caller can reach. Requires `--allow-unauthenticated-http`.
+    #[arg(long)]
+    allow_unauthenticated_writes: bool,
+
     /// Additional `Host` / `Origin` authority to accept on the HTTP listener
     /// (repeatable; comma-separated in the env var).
     ///
@@ -100,6 +119,7 @@ struct Cli {
     #[arg(
         long = "allowed-host",
         env = "EPIGRAPH_MCP_ALLOWED_HOSTS",
+        hide_env_values = true,
         value_delimiter = ','
     )]
     allowed_host: Vec<String>,
@@ -121,12 +141,16 @@ struct Cli {
     /// stdio only, with a declared identity (`--agent-model` / `--agent-key`).
     /// Refused with `--listen`, and an HTTP listener whose signer already has a
     /// link refuses to start.
-    #[arg(long = "operator-id", env = "EPIGRAPH_OPERATOR_ID")]
+    #[arg(
+        long = "operator-id",
+        env = "EPIGRAPH_OPERATOR_ID",
+        hide_env_values = true
+    )]
     operator_id: Option<uuid::Uuid>,
 
     /// Absolute URL of the protected-resource metadata document, advertised in 401
     /// WWW-Authenticate challenges so MCP clients can discover the auth server.
-    #[arg(long, env = "EPIGRAPH_RESOURCE_METADATA_URL")]
+    #[arg(long, env = "EPIGRAPH_RESOURCE_METADATA_URL", hide_env_values = true)]
     resource_metadata_url: Option<String>,
 
     /// Provider model identifier for LLM-agent identity derivation (e.g.
@@ -134,7 +158,7 @@ struct Cli {
     /// the agent keypair is derived deterministically from `(model, prompt)` so
     /// identical configurations collapse to ONE agent. Absent -> unchanged
     /// behavior (a fresh keypair per process).
-    #[arg(long, env = "EPIGRAPH_AGENT_MODEL")]
+    #[arg(long, env = "EPIGRAPH_AGENT_MODEL", hide_env_values = true)]
     agent_model: Option<String>,
 
     /// Raw system prompt for LLM-agent identity derivation. Hashed internally
@@ -142,7 +166,7 @@ struct Cli {
     /// Prefer `--agent-system-prompt-hash` when the prompt should not be
     /// materialized in this process's argv/env at all. Ignored unless
     /// `--agent-model` is also set.
-    #[arg(long, env = "EPIGRAPH_AGENT_SYSTEM_PROMPT")]
+    #[arg(long, env = "EPIGRAPH_AGENT_SYSTEM_PROMPT", hide_env_values = true)]
     agent_system_prompt: Option<String>,
 
     /// Pre-computed BLAKE3 lowercase-hex digest of the system prompt. Lets the
@@ -150,7 +174,11 @@ struct Cli {
     /// putting the raw prompt in this process. Takes precedence over
     /// `--agent-system-prompt` when both are set. Ignored unless `--agent-model`
     /// is also set.
-    #[arg(long, env = "EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH")]
+    #[arg(
+        long,
+        env = "EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH",
+        hide_env_values = true
+    )]
     agent_system_prompt_hash: Option<String>,
 }
 
@@ -230,14 +258,7 @@ fn select_signer(
 
     // (3) explicit 32-byte key, no LLM identity.
     if let Some(key_hex) = agent_key {
-        let bytes = (0..key_hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-            .map_err(|e| format!("invalid agent-key hex: {e}"))?;
-        let key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "agent-key must be exactly 32 bytes (64 hex chars)".to_string())?;
+        let key = parse_agent_key(key_hex)?;
         let signer = AgentSigner::from_bytes(&key).map_err(|e| format!("agent-key: {e}"))?;
         return Ok(SelectedSigner {
             signer,
@@ -252,6 +273,43 @@ fn select_signer(
         llm_identity: None,
         identity_declared: false,
     })
+}
+
+/// Parse an `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` value into its 32 bytes.
+///
+/// Surrounding whitespace is trimmed first: a value read from an environment
+/// file or a shell export can carry a trailing space, CR or newline. What is
+/// left must be exactly 64 ASCII hex characters. Every other input is a named
+/// error, never a panic (the old byte-pair slicing panicked on an odd length
+/// or a multi-byte character) and never the `generate()` fallback, because the
+/// operator asked for one specific key. No error message echoes any part of
+/// the value: it is a secret, and `main` prints the error.
+fn parse_agent_key(raw: &str) -> Result<[u8; 32], String> {
+    const EXPECTED: &str = "expected exactly 64 hex chars (32 bytes); the value is not shown";
+    let key_hex = raw.trim();
+    if !key_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid agent-key: it contains a non-hex character; {EXPECTED}"
+        ));
+    }
+    if key_hex.len() % 2 != 0 {
+        return Err(format!(
+            "invalid agent-key: odd number of hex chars ({}); {EXPECTED}",
+            key_hex.len()
+        ));
+    }
+    if key_hex.len() != 64 {
+        return Err(format!(
+            "agent-key must be exactly 32 bytes: got {} hex chars; {EXPECTED}",
+            key_hex.len()
+        ));
+    }
+    let mut key = [0u8; 32];
+    // Cannot fail after the checks above; map the error to a fixed string
+    // anyway, because `FromHexError`'s Display names the offending character.
+    hex::decode_to_slice(key_hex, &mut key)
+        .map_err(|_| format!("invalid agent-key hex; {EXPECTED}"))?;
+    Ok(key)
 }
 
 /// Validate the `(--listen, --jwt-secret, --allow-unauthenticated-http)`
@@ -304,18 +362,65 @@ fn check_listen_auth_mode(
     }
 }
 
+/// Validate `--allow-unauthenticated-writes` (batch HTTP-id) and turn it into
+/// the injected context's write setting.
+///
+/// The flag only means something on the listener that injects a principal-less
+/// context, so it is refused anywhere else rather than silently ignored: an
+/// operator who passes it on a `--jwt-secret` listener or on stdio has a wrong
+/// picture of what their callers can do.
+fn unauthenticated_writes(
+    listen: Option<&str>,
+    allow_unauthenticated_http: bool,
+    allow_unauthenticated_writes: bool,
+) -> Result<epigraph_mcp::auth::UnauthenticatedWrites, String> {
+    use epigraph_mcp::auth::UnauthenticatedWrites;
+    if !allow_unauthenticated_writes {
+        return Ok(UnauthenticatedWrites::Refused);
+    }
+    if listen.is_none() || !allow_unauthenticated_http {
+        return Err(
+            "--allow-unauthenticated-writes applies only to an --allow-unauthenticated-http \
+             listener (--listen unix:/abs/path --allow-unauthenticated-http). An authenticated \
+             listener authors every write as the caller's own agent, and stdio as this \
+             process's agent; neither has a principal-less caller to let write."
+                .to_string(),
+        );
+    }
+    Ok(UnauthenticatedWrites::AsListenerSigner)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Logging to stderr (stdout reserved for MCP JSON-RPC in stdio mode)
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "epigraph_mcp=info".parse().unwrap()),
+                // `tenancy=info` so the default filter carries the D9 boot line
+                // below (target `tenancy.maintenance`), which is what an
+                // operator greps the journal for after a deploy.
+                .unwrap_or_else(|_| "epigraph_mcp=info,tenancy=info".parse().unwrap()),
         )
         .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
+
+    // Operator decision D9: a request-serving process never holds the
+    // maintenance DSN, and this binary is one on every transport (`--listen`
+    // for the HTTP units, stdio for agent containers and operator configs).
+    // Checked before every other gate and before any connection, so it is the
+    // first and only thing a misconfigured unit reports; one code path, every
+    // environment, no override flag. The refusal goes to stderr: on stdio,
+    // stdout is the JSON-RPC stream.
+    if let Err(refusal) = epigraph_db::request_unit_maintenance_dsn_check(
+        std::env::var(epigraph_db::MAINTENANCE_DATABASE_URL)
+            .ok()
+            .as_deref(),
+    ) {
+        eprintln!("ERROR: {refusal}");
+        std::process::exit(1);
+    }
 
     // Safety gate for the HTTP transport (see `check_listen_auth_mode`). Runs
     // before the DB connect so a misconfiguration surfaces immediately rather
@@ -330,6 +435,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
+    let unauthenticated_writes = match unauthenticated_writes(
+        cli.listen.as_deref(),
+        cli.allow_unauthenticated_http,
+        cli.allow_unauthenticated_writes,
+    ) {
+        Ok(writes) => writes,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
+        }
+    };
 
     // Operator gate (see `epigraph_mcp::operator`). Signer SELECTION is pure, so
     // it runs here, before the DB connect, and only its side effects (printing a
@@ -384,18 +500,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    carry one principal's group set into the next session's statements.
     //
     // `server.pool` is `scoped.inner().clone()` — the SAME pool, not a second
-    // one. Building both would double the connection count and make the
-    // hybrid hazard below genuinely worse rather than merely unaddressed.
+    // one. Building both would double the connection count.
     //
-    // THE THREE MAINTENANCE TOOLS ARE NOT ENABLED BY THIS, AND THAT IS
-    // DELIBERATE. `sweep_semantic_duplicates`, `recompute_beliefs` and
-    // `backfill_embeddings` still run their statements on `server.pool`, so
-    // minting a bypass viewer for them would spend it on an unprivileged
-    // connection: zero rows, no error. They are gated on
-    // `maintenance::maintenance_tools_run_on_the_maintenance_connection()`,
-    // which does NOT key on `scoped.is_some()` for exactly that reason, and
-    // `maintenance.rs`'s test module pins that this attachment does not un-gate
-    // them. Converting their query plumbing is PR-17's.
+    // THE THREE MAINTENANCE TOOLS ARE NOT ENABLED BY THIS, and after operator
+    // decision D9 nothing in this binary enables them: no maintenance pool is
+    // ever attached, so `maintenance::maintenance_viewer` answers MOVED (the
+    // tools run as operator CLIs on the maintenance DSN instead).
     tracing::info!("Connecting to database...");
     let guc_mode = epigraph_db::SessionGucMode::from_env(
         std::env::var("EPIGRAPH_SESSION_GUC_MODE")
@@ -447,6 +557,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let pool = scoped.inner().clone();
     tracing::info!("Database connected");
+    // Operator decision D9: no maintenance pool is attached, ever (the refusal
+    // above guarantees the variable is absent). The three maintenance tools
+    // therefore answer MOVED, naming the operator CLI that runs them, and every
+    // cascade a tool triggers is deferred and applied by the replay timer.
+    tracing::info!(
+        target: "tenancy.maintenance",
+        "{}",
+        epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
+    );
 
     // Create or restore agent signer. Precedence lives in `select_signer`
     // (unit-tested); here we only handle the side effects (secret-key print for
@@ -647,7 +766,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let probe = Arc::new(sessions.session());
                 let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
                     probe.clone() as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
-                );
+                )
+                .with_writes(unauthenticated_writes);
+                // Batch HTTP-id: say at boot which one this listener is.
+                match unauthenticated_writes {
+                    epigraph_mcp::auth::UnauthenticatedWrites::Refused => tracing::info!(
+                        "--allow-unauthenticated-http listener is READ-ONLY for its callers \
+                         (no authenticated principal, so no author): write tools are refused. \
+                         Writes go through an authenticated (--jwt-secret) listener."
+                    ),
+                    epigraph_mcp::auth::UnauthenticatedWrites::AsListenerSigner => {
+                        tracing::warn!(
+                            "--allow-unauthenticated-writes: callers of this listener write as its \
+                             own signer agent, which no human owns. Use it only on a trusted local \
+                             socket."
+                        );
+                    }
+                }
                 match probe.server_agent_id().await {
                     Ok(id) => principal.warmed_with(id),
                     Err(e) => {
@@ -682,7 +817,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             StreamableHttpServerConfig::default(),
         );
 
-        let router = axum::Router::new().nest_service("/mcp", service);
+        // Innermost layer: rewrite rmcp 0.15's session-error statuses to the MCP
+        // spec's (unknown/ended session 401/500 -> 404, no-session non-initialize
+        // 422 -> 400). A 401 on an unknown session made OAuth clients discard a
+        // valid token after every restart instead of re-initializing. It wraps
+        // the rmcp service ONLY: the auth and Host/Origin layers below are added
+        // outside it, so their own 401/403s never pass through the rewrite.
+        // See `epigraph_mcp::session_status`.
+        let router = epigraph_mcp::session_status::nest_mcp_service(service);
 
         let router = if let Some(secret) = cli.jwt_secret.as_deref() {
             use epigraph_auth::JwtConfig;
@@ -877,6 +1019,46 @@ mod listen_auth_gate_tests {
 }
 
 #[cfg(test)]
+mod unauthenticated_writes_gate_tests {
+    use super::unauthenticated_writes;
+    use epigraph_mcp::auth::UnauthenticatedWrites;
+
+    const UNIX: &str = "unix:/run/epigraph-mcp.sock";
+
+    /// Batch HTTP-id: without the flag the principal-less listener is
+    /// read-only, on every transport.
+    #[test]
+    fn writes_are_refused_unless_the_flag_is_given() {
+        for (listen, unauth) in [(Some(UNIX), true), (Some(UNIX), false), (None, false)] {
+            assert_eq!(
+                unauthenticated_writes(listen, unauth, false),
+                Ok(UnauthenticatedWrites::Refused)
+            );
+        }
+    }
+
+    /// The flag opts the principal-less listener into signer-authored writes.
+    #[test]
+    fn the_flag_on_an_unauthenticated_listener_allows_signer_writes() {
+        assert_eq!(
+            unauthenticated_writes(Some(UNIX), true, true),
+            Ok(UnauthenticatedWrites::AsListenerSigner)
+        );
+    }
+
+    /// Anywhere else the flag is refused, not ignored: an authenticated
+    /// listener has no principal-less caller, and neither does stdio.
+    #[test]
+    fn the_flag_without_an_unauthenticated_listener_is_refused() {
+        for (listen, unauth) in [(Some(UNIX), false), (None, false), (None, true)] {
+            let err = unauthenticated_writes(listen, unauth, true)
+                .expect_err("the flag must be refused without an unauthenticated listener");
+            assert!(err.contains("--allow-unauthenticated-http"), "got: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod signer_selection_tests {
     use super::{select_signer, SelectedSigner};
 
@@ -1036,5 +1218,88 @@ mod signer_selection_tests {
     #[test]
     fn malformed_agent_key_is_an_error() {
         assert!(select_signer(None, None, None, Some("zz")).is_err());
+    }
+
+    /// A key read from an env file or a shell export can carry surrounding
+    /// whitespace (a trailing space, CR or newline). It is trimmed, and the
+    /// signer is the SAME one the clean key gives: not merely `Ok`, which a
+    /// silent `generate()` would also be.
+    #[test]
+    fn agent_key_with_surrounding_whitespace_is_the_same_signer() {
+        let clean = select_signer(None, None, None, Some(KEY_HEX))
+            .unwrap()
+            .signer
+            .public_key();
+        for padded in [
+            format!("{KEY_HEX} "),
+            format!("{KEY_HEX}\r"),
+            format!("{KEY_HEX}\n"),
+            format!("{KEY_HEX}\r\n"),
+            format!(" \t{KEY_HEX}"),
+        ] {
+            let selected = select_signer(None, None, None, Some(&padded))
+                .unwrap_or_else(|e| panic!("{padded:?} must parse after trimming: {e}"));
+            assert_eq!(
+                selected.signer.public_key(),
+                clean,
+                "{padded:?} must give the clean key's signer"
+            );
+            assert!(selected.identity_declared);
+        }
+    }
+
+    /// Inputs the old byte-pair slicing PANICKED on (odd length, a multi-byte
+    /// character inside 64 bytes), plus the other malformed shapes, are each a
+    /// clean `Err`: no panic, and never the `generate()` fallback. A value that
+    /// trims to empty fails closed too.
+    #[test]
+    fn malformed_agent_key_values_are_errors_not_panics_or_fallbacks() {
+        let odd = &KEY_HEX[..63];
+        let multibyte = format!("{}\u{e9}", &KEY_HEX[..62]); // 64 bytes, 63 chars
+        assert_eq!(multibyte.len(), 64);
+        let internal_space = format!("{} {}", &KEY_HEX[..32], &KEY_HEX[33..]);
+        let short = &KEY_HEX[..62];
+        let long = format!("{KEY_HEX}01");
+        for bad in [
+            odd,
+            multibyte.as_str(),
+            internal_space.as_str(),
+            short,
+            long.as_str(),
+            "",
+            "   ",
+            "\r\n",
+        ] {
+            let outcome = std::panic::catch_unwind(|| select_signer(None, None, None, Some(bad)));
+            let result = outcome.unwrap_or_else(|_| panic!("{bad:?} must not panic"));
+            assert!(result.is_err(), "{bad:?} must be refused, not generate()d");
+        }
+    }
+
+    /// No error message echoes any part of the key: it is a secret, and `main`
+    /// prints the error. A non-hex LAST char, an odd length and a wrong length
+    /// are each checked for a 16-char run of the value.
+    #[test]
+    fn agent_key_errors_never_echo_the_value() {
+        let secret = "0123456789abcdef".repeat(4);
+        let non_hex = format!("{}g", &secret[..63]);
+        let odd = secret[..63].to_string();
+        let wrong_len = secret[..62].to_string();
+        for bad in [non_hex, odd, wrong_len] {
+            let Err(msg) = select_signer(None, None, None, Some(&bad)) else {
+                panic!("{bad:?} must be refused");
+            };
+            for window in bad.as_bytes().windows(16) {
+                let run = std::str::from_utf8(window).unwrap();
+                assert!(
+                    !msg.contains(run),
+                    "the error must not echo the key (found {run:?}): {msg}"
+                );
+            }
+            assert!(
+                !msg.contains("'g'"),
+                "the error must not name the bad char: {msg}"
+            );
+        }
     }
 }

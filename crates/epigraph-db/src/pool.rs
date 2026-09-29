@@ -123,6 +123,43 @@ pub async fn create_pool_from_options(
 /// use once RLS is FORCEd (PR-17).
 pub const MAINTENANCE_DATABASE_URL: &str = "MAINTENANCE_DATABASE_URL";
 
+/// The refusal a REQUEST-SERVING process (`server`, `epigraph-mcp-full` on any
+/// transport) prints when [`MAINTENANCE_DATABASE_URL`] is set in its
+/// environment (operator decision D9, batch W12a).
+pub const REQUEST_UNIT_HOLDS_MAINTENANCE_DSN: &str =
+    "MAINTENANCE_DATABASE_URL is set; a request-serving process never holds the maintenance DSN \
+     (operator decision D9). Remove it from this unit's EnvironmentFile; cascades are applied by \
+     epigraph-cascade-replay.timer.";
+
+/// The one INFO line a request-serving process logs (target
+/// `tenancy.maintenance`) when it starts without a maintenance DSN, which is the
+/// only state D9 supports.
+pub const MAINTENANCE_SURFACE_NOT_SERVED: &str =
+    "maintenance surface not served by this unit (D9); cascades defer to \
+     epigraph-cascade-replay.timer, jobs run on epigraph-jobs-drain.timer";
+
+/// Whether a REQUEST-SERVING process may start, given the value of
+/// [`MAINTENANCE_DATABASE_URL`] in its environment (operator decision D9).
+///
+/// The maintenance DSN is held only by the timers (`replay_deferred_cascades`,
+/// `drain_jobs`) and the operator's CLIs. A request-serving process that finds
+/// the variable set is exactly the misconfiguration D9 forbids, and would
+/// otherwise silently re-arm in-process cascades, so it refuses to start: one
+/// code path, every environment, no override.
+///
+/// An exported-but-EMPTY (or whitespace) value is treated as unset, the same
+/// rule [`resolve_maintenance_url`] applies: it carries no credential, so the
+/// process holds nothing D9 removes.
+///
+/// # Errors
+/// [`REQUEST_UNIT_HOLDS_MAINTENANCE_DSN`] when the variable carries a value.
+pub fn request_unit_maintenance_dsn_check(configured: Option<&str>) -> Result<(), &'static str> {
+    match configured {
+        Some(v) if !v.trim().is_empty() => Err(REQUEST_UNIT_HOLDS_MAINTENANCE_DSN),
+        _ => Ok(()),
+    }
+}
+
 /// Where [`maintenance_database_url`] got its answer.
 ///
 /// Carried rather than discarded because the two cases have different
@@ -437,15 +474,35 @@ pub fn maintenance_verdict(
 /// # Errors
 /// `DbError::QueryFailed` if the catalog cannot be read at all.
 pub async fn probe_maintenance_privilege(pool: &PgPool) -> Result<MaintenancePrivilege, DbError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|source| DbError::ConnectionFailed { source })?;
+    probe_maintenance_privilege_conn(&mut conn).await
+}
+
+/// [`probe_maintenance_privilege`] on one connection the caller already holds.
+///
+/// The same two statements, asked of the CONNECTION a maintenance job is about to
+/// spend its bypass viewer on, rather than of whichever connection a pool hands
+/// out. That is the form [`MaintenanceSession::assert_privileged`] needs: the
+/// boot-time probe vouches for a pool's DSN, and this one vouches for the leased
+/// connection itself.
+///
+/// # Errors
+/// `DbError::QueryFailed` if the catalog cannot be read at all.
+pub async fn probe_maintenance_privilege_conn(
+    conn: &mut PgConnection,
+) -> Result<MaintenancePrivilege, DbError> {
     let bypass_fn_exists: bool =
         sqlx::query_scalar("SELECT to_regprocedure('public.epigraph_bypass()') IS NOT NULL")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?;
 
     let bypass = if bypass_fn_exists {
         sqlx::query_scalar::<_, Option<bool>>("SELECT epigraph_bypass()")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?
             .unwrap_or(false)
@@ -464,7 +521,7 @@ pub async fn probe_maintenance_privilege(pool: &PgPool) -> Result<MaintenancePri
           WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') \
             AND (c.relrowsecurity OR c.relforcerowsecurity))",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|source| DbError::QueryFailed { source })?;
 
@@ -752,12 +809,64 @@ impl ScopedPool {
         mode: SessionGucMode,
         options: ScopedPoolOptions,
     ) -> Result<Self, DbError> {
+        Self::connect_inner(database_url, mode, options, None).await
+    }
+
+    /// TEST SUPPORT ONLY (the `test-support` feature, which only
+    /// dev-dependencies enable): [`Self::connect`] whose every connection is
+    /// DOWNGRADED to `role` with `SET SESSION AUTHORIZATION` right after it
+    /// connects, before any checkout.
+    ///
+    /// Why: `#[sqlx::test]` hands out a superuser DSN, and a superuser session
+    /// bypasses every RLS policy and counts as privileged everywhere
+    /// (`epigraph_bypass()` reads `session_user`, so `SET ROLE` is not enough).
+    /// A tool test driven through a `ScopedPool` on that DSN therefore cannot
+    /// observe what the application role is refused. `SET SESSION
+    /// AUTHORIZATION` changes `session_user` as well, exactly as the
+    /// `downgraded_pool` test fixture does for a plain pool; this is the same
+    /// move for the pool that carries the release scrub. The connecting role
+    /// must be a superuser, which is why no production DSN can use it.
+    ///
+    /// # Errors
+    /// `DbError::ConnectionFailed` if the pool cannot be established, or
+    /// `DbError::QueryFailed` for a `role` that is not a plain lower-case
+    /// identifier (it is spliced into a statement that takes no bind).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn connect_downgraded_for_tests(
+        database_url: &str,
+        mode: SessionGucMode,
+        role: &'static str,
+    ) -> Result<Self, DbError> {
+        if role.is_empty()
+            || !role
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
+        {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!("not a plain role identifier: {role}")),
+            });
+        }
+        Self::connect_inner(database_url, mode, ScopedPoolOptions::default(), Some(role)).await
+    }
+
+    async fn connect_inner(
+        database_url: &str,
+        mode: SessionGucMode,
+        options: ScopedPoolOptions,
+        downgrade_to: Option<&'static str>,
+    ) -> Result<Self, DbError> {
         let statement_timeout = options.statement_timeout;
         let inner = PgPoolOptions::new()
             .max_connections(options.max_connections)
             .acquire_timeout(options.acquire_timeout)
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
+                    if let Some(role) = downgrade_to {
+                        use sqlx::Executor;
+                        conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+                            .await?;
+                    }
                     if let Some(t) = statement_timeout {
                         apply_statement_timeout(conn, t).await?;
                     }
@@ -1588,6 +1697,34 @@ impl<'a> MaintenanceSession<'a> {
     /// call needs. See the type doc for why this is not a `DerefMut`.
     pub fn split(&mut self) -> (&mut PgConnection, &Viewer) {
         (&mut self.conn.0, &self.viewer)
+    }
+
+    /// Refuse unless THIS session's connection can actually spend the bypass
+    /// viewer it carries.
+    ///
+    /// A bypass viewer emits no SQL predicate, so what it sees is decided by the
+    /// connection alone. [`ScopedPool::maintenance_session`] draws from the
+    /// attached maintenance pool, or, with none attached, from the application
+    /// pool. Under row-level security an unprivileged connection makes every
+    /// corpus-wide statement return zero rows and update zero rows with no
+    /// error. That is the privileged-viewer / ordinary-pool hybrid, and it would
+    /// report success. This asks the leased connection itself, with the same two
+    /// questions and the same rule as the boot probe
+    /// ([`probe_maintenance_privilege_conn`], [`maintenance_verdict`]). Refused
+    /// when row security is active and the connection does not satisfy
+    /// `epigraph_bypass()`.
+    ///
+    /// A request-path caller (the MCP maintenance tools) runs this on every
+    /// session, so a misconfigured maintenance DSN is reported by the call that
+    /// would have been a silent no-op, not only in a boot log.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` from [`maintenance_verdict`], or
+    /// `DbError::QueryFailed` if the probe cannot run.
+    pub async fn assert_privileged(&mut self) -> Result<MaintenancePrivilege, DbError> {
+        let privilege = probe_maintenance_privilege_conn(&mut self.conn.0).await?;
+        maintenance_verdict(privilege, MaintenanceDsnSource::Configured)?;
+        Ok(privilege)
     }
 }
 

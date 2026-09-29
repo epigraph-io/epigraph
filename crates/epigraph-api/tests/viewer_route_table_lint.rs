@@ -272,7 +272,10 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // enforcing it, which is precisely the kind of reasoning this register
     // exists to keep visible rather than to accept silently.
     ("search.rs", 1),
-    ("workflows.rs", 4),
+    // 4 -> 3 (batch H-a): `report_outcome`'s unfiltered `SELECT content FROM
+    // claims` for the goal fallback became a `get_by_id_with_labels` read
+    // through the caller's viewer.
+    ("workflows.rs", 3),
 ];
 
 /// Fail-open scope-check sites: `if let Some(..) = auth_ctx { check_scopes(..) }`
@@ -351,7 +354,14 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // and is deliberately untouched — it is still counted, in the other
     // register, where the count stays 4.
     ("crud.rs", 6),
-    ("edges.rs", 5),
+    // `("edges.rs", 5)` REMOVED by batch W12b, on the PR-10 precedent above:
+    // the five write handlers (`create_edge`, `create_hierarchical_edge`,
+    // `patch_edge`, `delete_edge`, `relate_claims`) took `ViewerExtractor`,
+    // which refuses a request with no `AuthContext`, so their
+    // `if let Some(..) = auth_ctx { check_scopes }` blocks could no longer see
+    // `None`. They now take the prescribed `let Some(..) = auth_ctx else {
+    // return Err(ApiError::Unauthorized ..) }` shape and check `edges:write`
+    // unconditionally.
     ("papers.rs", 1),
     ("tasks.rs", 6),
     // `("webhooks.rs", 2)` REMOVED by PR-10, which converted both sites in
@@ -382,7 +392,10 @@ const AUTH_OPTIONAL_PROVENANCE_SITES: &[(&str, usize)] = &[
     ("agents.rs", 1),
     ("claims.rs", 1),
     ("crud.rs", 4),
-    ("edges.rs", 4),
+    // `("edges.rs", 4)` REMOVED by batch W12b: the provenance blocks of
+    // `create_edge`, `delete_edge`, `patch_edge` and `relate_claims` sit in
+    // handlers that now bind `AuthContext` unconditionally (see the
+    // `FAIL_OPEN_SCOPE_SITES` note), so they record provenance on every call.
 ];
 
 /// The third shape: `if let Some(..) = auth_ctx { .. Repository::.. }` blocks
@@ -495,7 +508,11 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("revoke_signature.rs", 1),
     // 4, not 5: the fifth is a `sqlx::query!` macro — see the note above.
     ("submit.rs", 4),
-    ("workflows.rs", 4),
+    // 4 -> 2 (batch H-a): `report_outcome`'s two unstamped, result-discarding
+    // `UPDATE claims` (truth value, counters) became
+    // `ClaimRepository::update_truth_value_conn` / `set_properties_conn` on a
+    // viewer-stamped transaction.
+    ("workflows.rs", 2),
 ];
 
 /// Tenancy-scoped tables whose route-layer writes this lint counts.

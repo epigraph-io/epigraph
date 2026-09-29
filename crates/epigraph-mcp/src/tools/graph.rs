@@ -26,47 +26,45 @@ pub async fn get_neighborhood(
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let direction = params.direction.as_deref().unwrap_or("both");
 
+    // The node's REAL endpoint type(s), read from the viewer-filtered edges
+    // (backlog cdd8d097). The repo reads below key on `(id, type)`, and this
+    // tool used to pass the literal "claim", so a paper, workflow or agent node
+    // returned 0 edges.
+    let node_types = EdgeRepository::endpoint_types(&server.pool, viewer, node_id)
+        .await
+        .map_err(internal_error)?;
+
     let mut edges = Vec::new();
+    let keep = |rel: &str| match params.relationship.as_deref() {
+        Some(filter) => filter == rel,
+        None => true,
+    };
 
     if direction == "outgoing" || direction == "both" {
-        let outgoing = EdgeRepository::get_by_source(&server.pool, viewer, node_id, "claim")
-            .await
-            .map_err(internal_error)?;
-        for e in outgoing {
-            if let Some(ref rel_filter) = params.relationship {
-                if e.relationship != *rel_filter {
-                    continue;
-                }
-            }
-            edges.push(NeighborhoodEdge {
-                edge_id: e.id.to_string(),
-                source_id: e.source_id.to_string(),
-                source_type: e.source_type,
-                target_id: e.target_id.to_string(),
-                target_type: e.target_type,
-                relationship: e.relationship,
-            });
+        for node_type in &node_types {
+            let outgoing = EdgeRepository::get_by_source(&server.pool, viewer, node_id, node_type)
+                .await
+                .map_err(internal_error)?;
+            edges.extend(
+                outgoing
+                    .into_iter()
+                    .filter(|e| keep(&e.relationship))
+                    .map(neighborhood_edge),
+            );
         }
     }
 
     if direction == "incoming" || direction == "both" {
-        let incoming = EdgeRepository::get_by_target(&server.pool, viewer, node_id, "claim")
-            .await
-            .map_err(internal_error)?;
-        for e in incoming {
-            if let Some(ref rel_filter) = params.relationship {
-                if e.relationship != *rel_filter {
-                    continue;
-                }
-            }
-            edges.push(NeighborhoodEdge {
-                edge_id: e.id.to_string(),
-                source_id: e.source_id.to_string(),
-                source_type: e.source_type,
-                target_id: e.target_id.to_string(),
-                target_type: e.target_type,
-                relationship: e.relationship,
-            });
+        for node_type in &node_types {
+            let incoming = EdgeRepository::get_by_target(&server.pool, viewer, node_id, node_type)
+                .await
+                .map_err(internal_error)?;
+            edges.extend(
+                incoming
+                    .into_iter()
+                    .filter(|e| keep(&e.relationship))
+                    .map(neighborhood_edge),
+            );
         }
     }
 
@@ -74,9 +72,21 @@ pub async fn get_neighborhood(
 
     success_json(&NeighborhoodResponse {
         node_id: node_id.to_string(),
+        node_types,
         edge_count: edges.len(),
         edges,
     })
+}
+
+fn neighborhood_edge(e: epigraph_db::EdgeRow) -> NeighborhoodEdge {
+    NeighborhoodEdge {
+        edge_id: e.id.to_string(),
+        source_id: e.source_id.to_string(),
+        source_type: e.source_type,
+        target_id: e.target_id.to_string(),
+        target_type: e.target_type,
+        relationship: e.relationship,
+    }
 }
 
 pub async fn traverse(
@@ -92,20 +102,31 @@ pub async fn traverse(
     let mut visited: HashSet<uuid::Uuid> = HashSet::new();
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
-    let mut queue: VecDeque<(uuid::Uuid, i32)> = VecDeque::new();
+    // Each queued node carries the endpoint type(s) it is known by (backlog
+    // aedde855). A node reached over an edge takes that edge's `target_type`;
+    // the start node's are read from its visible edges. The walk used to
+    // expand every node with `get_by_source(.., "claim")`, so it could neither
+    // leave a paper or workflow node nor type one as anything but 'unknown'.
+    let mut queue: VecDeque<(uuid::Uuid, i32, Vec<String>)> = VecDeque::new();
     let mut depth_reached = 0;
 
-    queue.push_back((start_id, 0));
+    let start_types = EdgeRepository::endpoint_types(&server.pool, viewer, start_id)
+        .await
+        .unwrap_or_default();
+    queue.push_back((start_id, 0, start_types));
     visited.insert(start_id);
 
-    while let Some((current_id, depth)) = queue.pop_front() {
+    while let Some((current_id, depth, node_types)) = queue.pop_front() {
         if nodes.len() >= node_limit {
             break;
         }
         depth_reached = depth_reached.max(depth);
 
-        // Try to get claim info for label/truth
-        let (label, truth) =
+        // Label/truth come from the claims table, so only a claim has them. A
+        // node with no known type (no visible edges: an isolated start node) is
+        // still probed as a claim, as before.
+        let may_be_claim = node_types.is_empty() || node_types.iter().any(|t| t == "claim");
+        let (label, truth) = if may_be_claim {
             match ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(current_id))
                 .await
             {
@@ -114,7 +135,10 @@ pub async fn traverse(
                     Some(claim.truth_value.value()),
                 ),
                 _ => (None, None),
-            };
+            }
+        } else {
+            (None, None)
+        };
 
         // Filter by min_truth — on the Dempster-Shafer pignistic probability,
         // NOT on `claims.truth_value` (backlog 14b98adc). No DS write path
@@ -157,7 +181,12 @@ pub async fn traverse(
             node_type: if truth.is_some() {
                 "claim".to_string()
             } else {
-                "unknown".to_string()
+                // The recorded endpoint type ('paper', 'workflow', 'agent',
+                // ...). 'unknown' only when none is visible.
+                node_types
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string())
             },
             label,
             truth_value: truth,
@@ -170,26 +199,36 @@ pub async fn traverse(
         });
 
         if depth < max_depth {
-            // Get outgoing edges
-            let outgoing = EdgeRepository::get_by_source(&server.pool, viewer, current_id, "claim")
-                .await
-                .unwrap_or_default();
+            // Outgoing edges under every type this node is known by. A node
+            // with no known type is expanded as a claim, the previous
+            // behaviour for exactly that case.
+            let expand_as: Vec<String> = if node_types.is_empty() {
+                vec!["claim".to_string()]
+            } else {
+                node_types
+            };
+            for node_type in &expand_as {
+                let outgoing =
+                    EdgeRepository::get_by_source(&server.pool, viewer, current_id, node_type)
+                        .await
+                        .unwrap_or_default();
 
-            for e in outgoing {
-                if let Some(ref rel_filter) = params.relationship {
-                    if e.relationship != *rel_filter {
-                        continue;
+                for e in outgoing {
+                    if let Some(ref rel_filter) = params.relationship {
+                        if e.relationship != *rel_filter {
+                            continue;
+                        }
                     }
-                }
 
-                edges.push(TraverseEdge {
-                    source_id: e.source_id.to_string(),
-                    target_id: e.target_id.to_string(),
-                    relationship: e.relationship,
-                });
+                    edges.push(TraverseEdge {
+                        source_id: e.source_id.to_string(),
+                        target_id: e.target_id.to_string(),
+                        relationship: e.relationship,
+                    });
 
-                if visited.insert(e.target_id) {
-                    queue.push_back((e.target_id, depth + 1));
+                    if visited.insert(e.target_id) {
+                        queue.push_back((e.target_id, depth + 1, vec![e.target_type]));
+                    }
                 }
             }
         }

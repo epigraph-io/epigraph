@@ -15,6 +15,40 @@
 //! and must be turned off explicitly. Sweeping ~450k claims is many bounded
 //! calls by design, driven by cron with an advancing `offset`, which keeps
 //! each call's blast radius reviewable.
+//!
+//! # Where it runs (operator decision D9, batch W12a)
+//!
+//! The collapse is an administrative act across every writer's rows, so it
+//! runs on a maintenance connection, which no request-serving process holds.
+//! The MCP tool answers MOVED on a real server; the operator runs the
+//! `sweep_semantic_duplicates` CLI (epigraph-cli), which calls [`sweep`].
+//!
+//! # Every collapse is audited as D1 requires
+//!
+//! Each pair goes through the same two halves as the single-shot
+//! `mark_duplicate`: the act (`ClaimRepository::mark_duplicate_act_conn`), then
+//! the administrative cascade (`admin_cascade::apply_after_dedup`), which
+//! commits its repair together with ONE `cascade.admin_applied` row naming the
+//! acting agent (`--acting-agent`) and cause `dedup`. Before W12a the sweep
+//! called `retraction_cascade::mark_duplicate_with_cascade` inline and wrote no
+//! audit row at all.
+//!
+//! # No window between the act and its audit trail
+//!
+//! The act commits BEFORE the cascade runs (they are two transactions: the
+//! repair re-verifies the committed act). So the act's transaction also records
+//! the pair's pending cascade (`cascade.deferred`, cause `dedup`, the acting
+//! agent as trigger) through the same 117 definer the request paths use
+//! ([`collapse_pair_act`]). If the process dies between the two halves, the
+//! collapsed pair is not lost: the replay timer finds it pending and applies it.
+//! The sweep's own apply then answers that row (`replay_of` names it), so a
+//! finished pair leaves nothing pending.
+//!
+//! The replay timer could otherwise pick the fresh row up between the act and
+//! the sweep's apply and apply the same pair twice (idempotent, but two applied
+//! rows). The sweep therefore applies a pair only while it holds the REPLAY's
+//! advisory lock; when a replay run holds it, the pair is left to that timer
+//! and reported in [`SweepResponse::left_to_replay`].
 
 use std::collections::HashMap;
 
@@ -23,10 +57,72 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::errors::{internal_error, McpError};
-use crate::server::EpiGraphMcpFull;
 use crate::types::SweepSemanticDuplicatesParams;
 
+use epigraph_core::ClaimId;
+use epigraph_db::repos::maintenance_lock;
 use epigraph_db::ClaimRepository;
+use epigraph_engine::admin_cascade::{
+    apply_after_dedup, record_deferral, CascadeCause, CascadeState, CascadeTrigger, ReplayOrigin,
+};
+
+/// The reason on the `cascade.deferred` row the sweep records with each act.
+/// It names no row.
+pub const SWEEP_DEFERRAL_REASON: &str =
+    "recorded by the semantic-duplicate sweep with its act; the sweep applies the \
+     administrative cascade next, and the maintenance replay applies it if the sweep did not";
+
+/// The `replay_of.replayed_by` of the applied row with which the sweep answers
+/// its own deferral.
+pub const SWEEP_REPLAYED_BY: &str = "sweep_semantic_duplicates";
+
+/// The act half of one collapse, in ONE transaction on `conn`: retire `dup` and
+/// forward it at `survivor` (`ClaimRepository::mark_duplicate_act_conn`), and
+/// record the pair's pending administrative cascade (`cascade.deferred`, cause
+/// `dedup`, trigger `acting_agent`) through 117's deferral definer. Both commit
+/// or neither does, so a collapse can never exist without a pending or applied
+/// cascade row to answer for it.
+///
+/// Returns the trigger and the deferral row's id; the caller's
+/// [`apply_after_dedup`] answers that row by naming it in `replay_of`.
+///
+/// `conn` must be privileged (the maintenance connection): the definer then
+/// records the named acting agent, after checking that the act is committed
+/// state.
+///
+/// # Errors
+/// The act's refusal or failure, or the definer's; nothing commits.
+pub async fn collapse_pair_act(
+    conn: &mut sqlx::PgConnection,
+    acting_agent: Uuid,
+    dup: Uuid,
+    survivor: Uuid,
+) -> Result<(CascadeTrigger, Uuid), epigraph_db::DbError> {
+    use sqlx::Acquire;
+    let mut tx = conn.begin().await?;
+    // Its own transaction nests as a savepoint inside this one.
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(survivor),
+    )
+    .await?;
+    let trigger = CascadeTrigger::new(
+        CascadeCause::Dedup,
+        Some(acting_agent),
+        None,
+        dup,
+        Some(survivor),
+    );
+    let status = record_deferral(&mut *tx, &trigger, SWEEP_DEFERRAL_REASON).await?;
+    let deferral = status
+        .audit_event_id
+        .ok_or_else(|| epigraph_db::DbError::InvalidData {
+            reason: "the deferral definer returned no row id".to_string(),
+        })?;
+    tx.commit().await?;
+    Ok((trigger, deferral))
+}
 
 /// Disjoint-set over claim ids, so A~B and B~C land in one cluster even when
 /// A and C were never directly compared.
@@ -57,54 +153,80 @@ impl UnionFind {
     }
 }
 
+/// One exact-restatement cluster or merge candidate the sweep found.
 #[derive(Debug, Serialize)]
-struct ClusterOut {
-    survivor: String,
-    duplicates: Vec<String>,
-    max_distance: f64,
+pub struct ClusterOut {
+    /// The claim every duplicate is forwarded at.
+    pub survivor: String,
+    /// The claims collapsed onto the survivor (or proposed for consolidation).
+    pub duplicates: Vec<String>,
+    /// The largest embedding distance between the survivor and a duplicate.
+    pub max_distance: f64,
     /// `true` when every member shares the survivor's content hash — an exact
     /// restatement set, safe to collapse with `mark_duplicate`. `false` means
     /// the members differ in wording, so collapsing would DISCARD text: those
     /// are surfaced as merge candidates for `consolidate_claims` instead.
-    exact: bool,
+    pub exact: bool,
 }
 
+/// What one sweep page found and did.
 #[derive(Debug, Serialize)]
-struct SweepResponse {
-    dry_run: bool,
-    scanned: usize,
+pub struct SweepResponse {
+    /// Whether this was a dry run (nothing written).
+    pub dry_run: bool,
+    /// Claims enumerated on this page.
+    pub scanned: usize,
     /// Exact-restatement clusters — acted on when `dry_run=false`.
-    clusters: Vec<ClusterOut>,
+    pub clusters: Vec<ClusterOut>,
     /// Near-but-not-identical clusters. Never auto-collapsed: an agent should
     /// synthesize these through `consolidate_claims` so no wording is lost.
-    merge_candidates: Vec<ClusterOut>,
-    /// Pairs whose collapse committed.
-    pairs_marked: u64,
-    /// Per-pair problems, in two classes that are **not** complementary with
+    pub merge_candidates: Vec<ClusterOut>,
+    /// Pairs whose collapse (the act) committed.
+    pub pairs_marked: u64,
+    /// The `cascade.admin_applied` rows written, one per pair whose
+    /// administrative cascade committed.
+    pub audit_event_ids: Vec<Uuid>,
+    /// Pairs whose act committed (with its `cascade.deferred` row) while a
+    /// replay run held the replay lock: the sweep did not apply their cascade,
+    /// and that timer applies it. Counted in `pairs_marked`; not failures.
+    pub left_to_replay: Vec<String>,
+    /// Per-pair problems, in three classes that are **not** complementary with
     /// `pairs_marked`:
     ///
-    /// * `"<dup> -> <survivor>: <err>"` — the collapse itself failed. The pair
-    ///   is not counted in `pairs_marked`.
-    /// * `"<dup> -> <survivor> (belief cascade): <err>"` — the collapse
-    ///   committed and **is** counted in `pairs_marked`, but the downstream
-    ///   belief repair (backlog 20e9ed83) hit a non-fatal error. Rolling the
-    ///   collapse back is not an option — its transaction is already done —
-    ///   and failing the whole sweep for one stale cache would be worse, so
-    ///   the pair stands and the failure is reported.
-    ///
-    /// So `pairs_marked + failures.len()` no longer equals the number of pairs
-    /// attempted, and a sweep can report failures while having collapsed every
-    /// pair successfully.
-    failures: Vec<String>,
+    /// * `"<dup> -> <survivor>: <err>"` — the act itself failed (and wrote
+    ///   nothing, its deferral row included). The pair is not counted in
+    ///   `pairs_marked`.
+    /// * `"<dup> -> <survivor> (cascade): <reason>"` — the act committed and
+    ///   **is** counted, but the administrative repair failed and rolled back
+    ///   (its `cascade.deferred` and `cascade.admin_failed` rows make it
+    ///   replayable).
+    /// * `"<dup> -> <survivor> (belief cascade): <err>"` — the repair
+    ///   committed, but the downstream belief re-derivation hit a non-fatal
+    ///   error for one claim.
+    pub failures: Vec<String>,
     /// Offset to pass on the next call to continue the sweep.
-    next_offset: i64,
+    pub next_offset: i64,
 }
 
-pub async fn sweep_semantic_duplicates(
-    server: &EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
-    params: SweepSemanticDuplicatesParams,
-) -> Result<CallToolResult, McpError> {
+/// One page of the sweep, on `session`'s connection: find clusters, and unless
+/// `params.dry_run` is not `Some(false)`, collapse the exact-restatement pairs,
+/// each through the act and the audited administrative cascade, attributed to
+/// `acting_agent` with cause `dedup`.
+///
+/// Every statement, reads and the collapse alike, runs on `session`'s
+/// connection, which must bypass RLS: the sweep's value is the pair that spans
+/// two tenants, and only a connection that sees every tenant can find it. No
+/// server pool is named here (`tests/maintenance_tools_spend_only_the_session.rs`).
+///
+/// # Errors
+/// A read failure (enumeration, neighbours, hashes). Per-pair write failures
+/// are reported in [`SweepResponse::failures`], never as an `Err`.
+pub async fn sweep(
+    session: &mut epigraph_db::MaintenanceSession<'_>,
+    params: &SweepSemanticDuplicatesParams,
+    acting_agent: Uuid,
+) -> Result<SweepResponse, epigraph_db::DbError> {
+    let (conn, viewer) = session.split();
     let threshold = params.similarity_threshold.unwrap_or(0.10).clamp(0.0, 2.0);
     let limit = params.limit.unwrap_or(500).clamp(1, 2000);
     let offset = params.offset.unwrap_or(0).max(0);
@@ -113,22 +235,26 @@ pub async fn sweep_semantic_duplicates(
     let agent_scope: Option<Vec<Uuid>> = match params.agent_scope.as_ref() {
         Some(v) => Some(
             v.iter()
-                .map(|s| crate::errors::parse_uuid(s))
+                .map(|s| {
+                    s.parse::<Uuid>()
+                        .map_err(|e| epigraph_db::DbError::InvalidData {
+                            reason: format!("agent_scope entry {s:?} is not a UUID: {e}"),
+                        })
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         None => None,
     };
 
     let candidates = ClaimRepository::enumerate_current_embedded(
-        &server.pool,
+        &mut *conn,
         viewer,
         agent_scope.as_deref(),
         params.labels_scope.as_deref(),
         offset,
         limit,
     )
-    .await
-    .map_err(internal_error)?;
+    .await?;
 
     // Pair discovery: per-claim ANN top-5, keeping pairs under the threshold.
     let mut uf = UnionFind::new();
@@ -137,9 +263,8 @@ pub async fn sweep_semantic_duplicates(
 
     for c in &candidates {
         meta.insert(c.id, (c.truth_value, c.created_at));
-        let neighbors = ClaimRepository::nearest_neighbors_of_claim(&server.pool, viewer, c.id, 5)
-            .await
-            .map_err(internal_error)?;
+        let neighbors =
+            ClaimRepository::nearest_neighbors_of_claim(&mut *conn, viewer, c.id, 5).await?;
         for n in neighbors {
             if n.distance >= threshold {
                 continue;
@@ -165,9 +290,7 @@ pub async fn sweep_semantic_duplicates(
     }
 
     let all_ids: Vec<Uuid> = meta.keys().copied().collect();
-    let hashes = ClaimRepository::content_hashes_for(&server.pool, viewer, &all_ids)
-        .await
-        .map_err(internal_error)?;
+    let hashes = ClaimRepository::content_hashes_for(&mut *conn, viewer, &all_ids).await?;
 
     let mut exact_clusters: Vec<(Uuid, Vec<Uuid>, f64)> = Vec::new();
     let mut near_clusters: Vec<(Uuid, Vec<Uuid>, f64)> = Vec::new();
@@ -211,45 +334,77 @@ pub async fn sweep_semantic_duplicates(
     }
 
     // Execute: only exact-restatement clusters are collapsed automatically.
-    // Each pair is its own transaction, so one edge collision cannot roll back
-    // the whole sweep; failures are collected and returned, never fatal.
+    // Each pair is its own act and its own administrative transaction, so one
+    // edge collision cannot roll back the whole sweep; failures are collected
+    // and returned, never fatal.
     let mut pairs_marked = 0_u64;
+    let mut audit_event_ids: Vec<Uuid> = Vec::new();
+    let mut left_to_replay: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     if !dry_run {
         for (survivor, duplicates, _) in &exact_clusters {
             for dup in duplicates {
-                // Same retraction cascade as the single-shot `mark_duplicate`
-                // tool (backlog 20e9ed83): collapsing a cluster orphans and
-                // strands the duplicates' edge-factor BBAs exactly the same
-                // way, so the sweep must repair belief too — a bulk path that
-                // skipped it would reintroduce the defect at scale. Cascade
-                // errors land in `failures` alongside the mark failures; they
-                // do not undo an already-committed collapse, so `pairs_marked`
-                // still counts the pair.
-                // UNSTAMPED, for the same PR-17 reason recorded in
-                // `cdst_maintenance.rs`: `sweep_semantic_duplicates` is a
-                // MAINTENANCE tool, hard-gated off before the pool is consulted,
-                // and its target is the maintenance connection. The acquire below
-                // is a mechanical consequence of the engine signature change.
-                let mut conn = match server.pool.acquire().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("dedup sweep: could not acquire: {e}");
+                // The act and its pending cascade row, in one transaction.
+                let (mut trigger, deferral) =
+                    match collapse_pair_act(&mut *conn, acting_agent, *dup, *survivor).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            failures.push(format!("{dup} -> {survivor}: {e}"));
+                            continue;
+                        }
+                    };
+                pairs_marked += 1;
+                // Apply only while holding the replay's lock, so a replay run
+                // cannot apply the same fresh deferral concurrently.
+                match maintenance_lock::try_take(&mut *conn, maintenance_lock::REPLAY_LOCK_KEY)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        left_to_replay.push(format!("{dup} -> {survivor}"));
                         continue;
                     }
-                };
-                match epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-                    &mut conn, viewer, *dup, *survivor,
-                )
-                .await
+                    Err(e) => {
+                        failures.push(format!(
+                            "{dup} -> {survivor} (cascade): the replay lock could not be \
+                             taken ({e}); the pair is pending for the replay"
+                        ));
+                        continue;
+                    }
+                }
+                // The administrative cascade (D1): repair the edge and derived
+                // layers with its audit row, atomically, then re-derive belief.
+                // The acting operator is the trigger; the applied row answers
+                // the deferral just recorded. The "caller" whose view the
+                // report is filtered to is the sweep's own bypass viewer.
+                trigger.replay_of = Some(ReplayOrigin {
+                    deferred_event_id: deferral,
+                    replayed_by: SWEEP_REPLAYED_BY.to_string(),
+                });
+                let (status, report) =
+                    apply_after_dedup(&mut *conn, viewer, viewer, &trigger, *dup, *survivor).await;
+                if let Err(e) =
+                    maintenance_lock::release(&mut *conn, maintenance_lock::REPLAY_LOCK_KEY).await
                 {
-                    Ok(cascade) => {
-                        pairs_marked += 1;
-                        for err in cascade.errors {
-                            failures.push(format!("{dup} -> {survivor} (belief cascade): {err}"));
+                    // The lock is session-level: it is released when the
+                    // connection closes, at the latest.
+                    failures.push(format!(
+                        "{dup} -> {survivor} (cascade): the replay lock was not released ({e})"
+                    ));
+                }
+                match status.status {
+                    CascadeState::Applied => {
+                        if let Some(id) = status.audit_event_id {
+                            audit_event_ids.push(id);
                         }
                     }
-                    Err(e) => failures.push(format!("{dup} -> {survivor}: {e}")),
+                    CascadeState::Failed | CascadeState::Deferred => failures.push(format!(
+                        "{dup} -> {survivor} (cascade): {}",
+                        status.reason.unwrap_or_default()
+                    )),
+                }
+                for err in report.errors {
+                    failures.push(format!("{dup} -> {survivor} (belief cascade): {err}"));
                 }
             }
         }
@@ -266,16 +421,39 @@ pub async fn sweep_semantic_duplicates(
             .collect()
     };
 
-    let response = SweepResponse {
+    Ok(SweepResponse {
         dry_run,
         scanned: candidates.len(),
         clusters: to_out(exact_clusters, true),
         merge_candidates: to_out(near_clusters, false),
         pairs_marked,
+        audit_event_ids,
+        left_to_replay,
         failures,
         next_offset: offset + candidates.len() as i64,
-    };
+    })
+}
 
+/// The MCP tool body: [`sweep`], attributed to `acting_agent` (the server's
+/// own agent), as a tool result. Reached only on a server with a maintenance
+/// pool attached, which under D9 is a test harness; a real server answers
+/// MOVED before this (`maintenance::maintenance_tool_session`).
+///
+/// # Errors
+/// An MCP internal error on a read failure.
+pub async fn sweep_semantic_duplicates(
+    session: &mut epigraph_db::MaintenanceSession<'_>,
+    params: SweepSemanticDuplicatesParams,
+    acting_agent: Uuid,
+) -> Result<CallToolResult, McpError> {
+    // A malformed scope is the caller's error, answered as such (not as an
+    // internal error) before anything runs.
+    for s in params.agent_scope.iter().flatten() {
+        crate::errors::parse_uuid(s)?;
+    }
+    let response = sweep(session, &params, acting_agent)
+        .await
+        .map_err(internal_error)?;
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&response).map_err(internal_error)?,
     )]))

@@ -611,3 +611,23 @@ fn blake3_like(s: &str) -> Vec<u8> {
     }
     out
 }
+
+/// CALIBRATION for migration 118's `match_candidates` stale guard, which the
+/// migrator applies: an `epigraph_app` session's flip of `candidate` into `stale` is refused with the guard's own
+/// `MC01`, not with a permission error that shares its SQLSTATE (42501). The
+/// refused statement changes nothing.
+pub async fn assert_stale_guard_refuses_the_app_role(pool: &PgPool, candidate: Uuid) {
+    let refused = as_role(pool, "epigraph_app", |mut conn| async move {
+        let r = sqlx::query("UPDATE match_candidates SET status = 'stale' WHERE id = $1")
+            .bind(candidate)
+            .execute(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await;
+    let e = refused.expect_err("CALIBRATION: 118's guard refuses the app role's flip to stale");
+    assert!(
+        e.to_string().contains("MC01"),
+        "CALIBRATION: the refusal must be the guard's MC01, not a permission error: {e}"
+    );
+}

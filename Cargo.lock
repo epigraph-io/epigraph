@@ -1547,6 +1547,7 @@ dependencies = [
  "petgraph 0.7.1",
  "proptest",
  "rand 0.8.5",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -1554,6 +1555,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

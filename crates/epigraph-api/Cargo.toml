@@ -26,6 +26,14 @@ name = "epigraph-migrate"
 path = "src/bin/epigraph-migrate.rs"
 required-features = ["db"]
 
+# Operator decision D9 (batch W12a): the job queue's drain, run by
+# epigraph-jobs-drain.timer on the maintenance DSN. It lives in this crate
+# because it registers `ClaimEmbeddingJobService` (src/embedding_restore.rs).
+[[bin]]
+name = "drain_jobs"
+path = "src/bin/drain_jobs.rs"
+required-features = ["db"]
+
 
 [dependencies]
 epigraph-auth = { workspace = true }
@@ -96,7 +104,7 @@ tokio-test = "0.4"  # Async test utilities
 hex = "0.4"  # Hex decoding for signature tests
 http-body-util = "0.1"  # HTTP body utilities for collecting response bodies in tests
 epigraph-embeddings = { workspace = true }  # For embedding integration tests
-epigraph-db = { workspace = true }  # E2E encrypted subgraph tests
+epigraph-db = { workspace = true, features = ["test-support"] }  # E2E encrypted subgraph tests; test-support: the app-role ScopedPool (W10)
 blake3 = { workspace = true }  # Content hashing in E2E tests
 ed25519-dalek = { workspace = true }  # Agent signing keys in E2E tests
 rand = { workspace = true }  # Key generation in E2E tests
@@ -123,6 +131,10 @@ epigraph-privacy = { workspace = true }
 # TEST TARGET IS IN, and events emitted from `src/` are never captured. Same
 # version and same feature as `epigraph-mcp`, which set this precedent.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# `test-support` exposes `EgressGuard::exempt_socket_for_tests`, which lets a
+# webhook delivery test reach ONE exact local listener. Dev-dependency only, so
+# a release build of `server` does not contain it.
+epigraph-jobs = { workspace = true, features = ["test-support"] }
 
 [[test]]
 name = "boot_secret_gate_test"

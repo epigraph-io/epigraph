@@ -34,6 +34,7 @@ struct Cli {
     #[arg(
         long,
         env = "EPIGRAPH_API_URL",
+        hide_env_values = true,
         default_value = "http://localhost:3000"
     )]
     api_url: String,
@@ -44,7 +45,7 @@ struct Cli {
     /// PR-03. The JWT must carry a non-null `agent_id` claim — the API resolves
     /// the caller's read authority from it and refuses a principal-less token
     /// with 401 `invalid_token`.
-    #[arg(long, env = "EPIGRAPH_TOKEN")]
+    #[arg(long, env = "EPIGRAPH_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
     #[command(subcommand)]
@@ -283,13 +284,13 @@ enum MigrateCmd {
     /// Validate DB integrity: Bel <= Pl, mass sums ≈ 1.0, frames have hypotheses
     Validate {
         /// Database URL (overrides DATABASE_URL env var)
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         db_url: String,
     },
     /// Re-create mass functions from truth_value for claims without BBAs
     BootstrapMasses {
         /// Database URL (overrides DATABASE_URL env var)
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         db_url: String,
         /// Confidence scaling factor for mass assignment
         #[arg(long, default_value = "0.7")]
@@ -298,13 +299,13 @@ enum MigrateCmd {
     /// Report agent statistics
     ExtractAgents {
         /// Database URL (overrides DATABASE_URL env var)
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         db_url: String,
     },
     /// Backfill edges from FK references (perspectives, community members, mass functions)
     MaterializeEdges {
         /// Database URL (overrides DATABASE_URL env var)
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         db_url: String,
         /// Dry run: report what would be created without writing
         #[arg(long)]
@@ -313,7 +314,7 @@ enum MigrateCmd {
     /// Auto-create frames by clustering claim embeddings (k-means via linfa)
     CreateFrames {
         /// Database URL (overrides DATABASE_URL env var)
-        #[arg(long, env = "DATABASE_URL")]
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         db_url: String,
         /// Minimum k for k-means search
         #[arg(long, default_value = "2")]

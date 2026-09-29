@@ -5,8 +5,8 @@
 //! Two independent defects, both pinned here:
 //!
 //! 1. **Superseded rows resurfaced.** `query_claims(max_truth=0.4)` is used as
-//!    an assessment-queue proxy, and `ClaimRepository::list_by_truth_range`
-//!    neither filtered nor projected `is_current`, so already-refuted claims
+//!    an assessment-queue proxy, and `ClaimRepository::list_by_truth_range` (now
+//!    `list_by_belief_range`) neither filtered nor projected `is_current`, so already-refuted claims
 //!    came back as "pending low-truth" candidates every cycle.
 //! 2. **The response lied about currency.** Because the hardcode was a literal,
 //!    a superseded row was serialised as `is_current: true` with no

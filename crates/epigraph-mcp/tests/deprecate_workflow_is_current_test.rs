@@ -37,6 +37,7 @@ async fn mcp_deprecate_workflow_sets_is_current_false(pool: PgPool) {
             reason: "obsolete".into(),
             cascade: Some(false),
         },
+        None,
     )
     .await
     .unwrap();
@@ -75,6 +76,7 @@ async fn deprecate_workflow_nulls_embedding(pool: PgPool) {
             reason: "embedding test".into(),
             cascade: Some(false),
         },
+        None,
     )
     .await
     .unwrap();
@@ -118,6 +120,7 @@ async fn deprecate_workflow_cascade_nulls_embeddings(pool: PgPool) {
             reason: "cascade embed test".into(),
             cascade: Some(true),
         },
+        None,
     )
     .await
     .unwrap();
@@ -163,6 +166,7 @@ async fn deprecate_workflow_cascade_walks_supersedes_and_variant_of(pool: PgPool
             reason: "cascade test".into(),
             cascade: Some(true),
         },
+        None,
     )
     .await
     .unwrap();
@@ -247,6 +251,7 @@ async fn deprecate_workflow_cascade_read_failure_reports_its_real_cause(pool: Pg
             reason: "cascade read failure".into(),
             cascade: Some(true),
         },
+        None,
     )
     .await
     .expect_err("a cascade that cannot enumerate its children has not completed");

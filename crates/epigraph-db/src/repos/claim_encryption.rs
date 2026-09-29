@@ -154,17 +154,28 @@ impl ClaimEncryptionRepository {
     /// Delete encryption metadata for a claim
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::WriteRefused` when a row this session can read was not
+    /// deleted (row security refused it); `DbError::QueryFailed` if the
+    /// database query fails.
     #[instrument(skip(pool))]
     pub async fn delete_by_claim_id(pool: &PgPool, claim_id: Uuid) -> Result<(), DbError> {
-        sqlx::query(
+        // Checked: 115's owner-scoped DELETE matches no row it refuses, and
+        // reports success; a sealed row this session can read but not delete
+        // is a refusal, not a deleted row (`require_all_changed`). In a
+        // transaction, so a refusal also undoes the rows it could delete.
+        let mut tx = pool.begin().await?;
+        let counts: (i64, i64) = sqlx::query_as(
             r#"
-            DELETE FROM claim_encryption WHERE claim_id = $1
+            WITH seen AS (SELECT 1 FROM claim_encryption WHERE claim_id = $1),
+                 done AS (DELETE FROM claim_encryption WHERE claim_id = $1 RETURNING 1)
+            SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )
         .bind(claim_id)
-        .execute(pool)
+        .fetch_one(&mut *tx)
         .await?;
+        super::require_all_changed("claim_encryption of claim", claim_id, "delete", counts)?;
+        tx.commit().await?;
 
         Ok(())
     }

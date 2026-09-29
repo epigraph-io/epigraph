@@ -300,6 +300,17 @@ fn slugify_workflow_goal(s: &str) -> String {
         .join("-")
 }
 
+const DEFAULT_WORKFLOW_CONFIDENCE: f64 = 0.8;
+
+/// Resolve the caller-supplied workflow confidence: `None` and NaN fall back to
+/// 0.8; every other value (including +/-inf) is clamped to 0.0..=1.0.
+fn resolve_workflow_confidence(c: Option<f64>) -> f64 {
+    match c {
+        Some(v) if !v.is_nan() => v.clamp(0.0, 1.0),
+        _ => DEFAULT_WORKFLOW_CONFIDENCE,
+    }
+}
+
 /// Store a new hierarchical workflow.
 ///
 /// Input shape stays simple (`goal` + `steps[]`); internally builds a
@@ -311,6 +322,7 @@ pub async fn store_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: StoreWorkflowParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     use epigraph_ingest::common::schema::ThesisDerivation;
     use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
@@ -319,6 +331,7 @@ pub async fn store_workflow(
     let canonical_name = slugify_workflow_goal(&params.goal);
     let prereqs = params.prerequisites.unwrap_or_default();
     let tags = params.tags.unwrap_or_default();
+    let confidence = resolve_workflow_confidence(params.confidence);
 
     let phases = if params.steps.is_empty() {
         vec![]
@@ -337,7 +350,7 @@ pub async fn store_workflow(
                     rationale: String::new(),
                     operations: vec![],
                     generality: vec![],
-                    confidence: 0.8,
+                    confidence,
                     // Flat store_workflow steps have no operation atoms, so no
                     // evidence_type source; the BBA-wiring loop only fires for
                     // level-3 atoms.
@@ -369,6 +382,7 @@ pub async fn store_workflow(
             server,
             viewer,
             &extraction,
+            auth,
         )
         .await?;
 
@@ -888,6 +902,7 @@ pub async fn report_workflow_outcome(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: ReportWorkflowOutcomeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
 
@@ -939,21 +954,10 @@ pub async fn report_workflow_outcome(
         .await;
     }
 
-    let claim = ClaimRepository::get_by_id(
-        &server.pool,
-        viewer,
-        epigraph_core::ClaimId::from_uuid(workflow_id),
-    )
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| {
-        invalid_params(format!(
-            "workflow {workflow_id} not found in `workflows` or `claims` tables"
-        ))
-    })?;
-
-    let agent_id = server.agent_id().await?;
-    let agent_id_typed = AgentId::from_uuid(agent_id);
+    // Author = the request's principal (batch H-b, D1); signer = this server.
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
+    let signer_typed = AgentId::from_uuid(server.signer_agent_id().await?);
     let pub_key = server.signer.public_key();
 
     let quality = params
@@ -970,8 +974,9 @@ pub async fn report_workflow_outcome(
     .map_err(internal_error)?;
 
     let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
+    // `Evidence::agent_id` is `evidence.signer_id`: this server signs it.
     let mut evidence = Evidence::new(
-        agent_id_typed,
+        signer_typed,
         pub_key,
         evidence_hash,
         EvidenceType::Observation {
@@ -1041,8 +1046,42 @@ pub async fn report_workflow_outcome(
     // behind to make `evidence_content_hash_claim_unique` refuse the identical
     // retry that would land it.
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "report_workflow_outcome")
+        crate::claim_helper::begin_author_stamped_tx(server, author, "report_workflow_outcome")
             .await?;
+
+    // ── MIGRATION 114: A NON-OWNER REPORTING ON A PUBLIC WORKFLOW CLAIM ──
+    //
+    // Most legacy flat workflow claims are public and owned by a group no
+    // reporting agent can write (the world group). As in
+    // `tools::claims::update_with_evidence`: the outcome evidence and its BBA
+    // are the caller's own rows (the `<table>_attach_writer` trigger owns them
+    // by the caller's group, public), the DS cache is refreshed through the
+    // audited definer path inside `update_claim_belief`, and the claim ROW is
+    // not written -- its `truth_value` stays its owner's (`truth_written =
+    // false`). Asked on THIS stamped transaction, so "can read" and "can write"
+    // are the session's own answers.
+    //
+    // The claim itself is read on the same stamped transaction through the
+    // caller's viewer (not on `server.pool`, an unstamped application
+    // connection in production that sees no group-private row), so a caller's
+    // OWN group-private workflow claim is found, and an unreadable one answers
+    // exactly as a missing one.
+    let claim = ClaimRepository::get_by_id(
+        &mut *tx,
+        viewer,
+        epigraph_core::ClaimId::from_uuid(workflow_id),
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| {
+        invalid_params(format!(
+            "workflow {workflow_id} not found in `workflows` or `claims` tables"
+        ))
+    })?;
+    let foreign_claim =
+        epigraph_db::repos::foreign_attach::is_foreign_public_claim(&mut tx, workflow_id)
+            .await
+            .map_err(internal_error)?;
 
     EvidenceRepository::create(&mut *tx, &evidence)
         .await
@@ -1078,8 +1117,16 @@ pub async fn report_workflow_outcome(
     // registered as a residual in
     // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` with that reason.
     // After the DS wiring necessarily, because the value comes from it.
-    let after = TruthValue::clamped(ds.pignistic_prob);
-    {
+    //
+    // MIGRATION 114: skipped for a public workflow claim this caller does not
+    // own (see `foreign_claim` above); `truth_after` then reports the
+    // unchanged value.
+    let after = if foreign_claim {
+        claim.truth_value
+    } else {
+        TruthValue::clamped(ds.pignistic_prob)
+    };
+    if !foreign_claim {
         ClaimRepository::update_truth_value_conn(
             &mut tx,
             epigraph_core::ClaimId::from_uuid(workflow_id),
@@ -1087,8 +1134,8 @@ pub async fn report_workflow_outcome(
         )
         .await
         .map_err(internal_error)?;
-        tx.commit().await.map_err(internal_error)?;
     }
+    tx.commit().await.map_err(internal_error)?;
 
     // Update use counts in workflow JSON
     let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
@@ -1171,12 +1218,21 @@ pub async fn report_workflow_outcome(
         evidence_id: evidence.id.as_uuid().to_string(),
         truth_before: before,
         truth_after: after.value(),
+        truth_written: !foreign_claim,
+        cache_written: ds.cache_written,
         total_uses: use_count,
         success_rate: if use_count > 0 {
             success_count as f64 / use_count as f64
         } else {
             0.0
         },
+        warning: (!ds.cache_written).then(|| {
+            format!(
+                "workflow claim {workflow_id}'s cached belief was NOT updated: it is carried on \
+                 another frame (or on an older cache with no recorded frame), which a non-owner \
+                 does not re-point. The outcome evidence and its BBA are stored."
+            )
+        }),
     })
 }
 
@@ -1184,6 +1240,7 @@ pub async fn deprecate_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: DeprecateWorkflowParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
     let cascade = params.cascade.unwrap_or(false);
@@ -1255,10 +1312,12 @@ pub async fn deprecate_workflow(
     // is the correct direction: an unstamped read returns FEWER rows, so a
     // cascade planned on one connection and executed on another could silently
     // skip a child it was entitled to deprecate.
-    let agent_id = server.agent_id().await?;
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "deprecate_workflow")
-            .await?;
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.write_identity(auth, viewer).await?,
+        "deprecate_workflow",
+    )
+    .await?;
 
     // Deprecate the target workflow (A4: also set is_current = false).
     // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same
@@ -1409,5 +1468,41 @@ pub mod __test_only {
         pgvec: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         find_workflow_post_embed(server, viewer, &params, pgvec).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_workflow_confidence;
+
+    #[test]
+    fn none_defaults_to_0_8() {
+        assert_eq!(resolve_workflow_confidence(None), 0.8);
+    }
+
+    #[test]
+    fn in_range_passes_through() {
+        assert_eq!(resolve_workflow_confidence(Some(0.3)), 0.3);
+    }
+
+    #[test]
+    fn above_one_clamps_to_one() {
+        assert_eq!(resolve_workflow_confidence(Some(1.7)), 1.0);
+    }
+
+    #[test]
+    fn negative_clamps_to_zero() {
+        assert_eq!(resolve_workflow_confidence(Some(-0.5)), 0.0);
+    }
+
+    #[test]
+    fn nan_falls_back_to_default() {
+        assert_eq!(resolve_workflow_confidence(Some(f64::NAN)), 0.8);
+    }
+
+    #[test]
+    fn infinities_clamp() {
+        assert_eq!(resolve_workflow_confidence(Some(f64::INFINITY)), 1.0);
+        assert_eq!(resolve_workflow_confidence(Some(f64::NEG_INFINITY)), 0.0);
     }
 }

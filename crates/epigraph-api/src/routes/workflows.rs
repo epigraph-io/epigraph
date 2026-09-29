@@ -98,10 +98,10 @@
 //! `("workflows.rs", 4)` accordingly. Nothing further about it is recorded
 //! here — see `docs/tenancy/progress.json`.
 //!
-//! `deprecate_workflow` additionally carries an open entry whose owner is the
-//! write-gate programme, not a read shard: `F-write-authz-reads-unfiltered`.
-//! This shard does not touch it and it stays open. Nothing further about it is
-//! recorded here — see `docs/tenancy/progress.json`.
+//! `deprecate_workflow`'s existence gate (`F-write-authz-reads-unfiltered`) is
+//! now viewer-filtered on a stamped connection (batch H6): a caller cannot
+//! deprecate a workflow claim it cannot read. Its writes are still among the
+//! unconverted sites above.
 //!
 //! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` still carries
 //! `("workflows.rs", 4)` and `ROUTE_LAYER_WRITES` still carries
@@ -330,10 +330,20 @@ pub async fn store_workflow(
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
+    let decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
     let result =
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
             .map_err(workflow_ingest_error)?;
+    record_workflow_submitter(
+        &mut tx,
+        None,
+        &viewer,
+        &extraction,
+        result.workflow_id,
+        &decision,
+    )
+    .await?;
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
@@ -743,28 +753,60 @@ pub async fn get_workflow(
 }
 
 /// POST /api/v1/workflows/:id/outcome - Report execution outcome.
+///
+/// The truth update, the usage counters and the behavioral-execution row are
+/// written on ONE transaction stamped with the caller's viewer, and every error
+/// propagates. They used to be three independent writes on the raw pool, the
+/// two `claims` UPDATEs with their results discarded (`let _ =`): on a schema
+/// without the orphan `*_privacy` policies `claims_tenancy` refused both, and
+/// the route answered 200 with the new truth value while only the
+/// behavioral-execution row landed (MEASURED, batch H-a review, owner reporting
+/// on its own flat workflow claim).
 #[cfg(feature = "db")]
 pub async fn report_outcome(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Verify workflow exists
-    let workflow = sqlx::query_as::<_, WorkflowRow>(
-        "SELECT id, truth_value, properties FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: workflow_id.to_string(),
-    })?;
-
-    let before_truth = workflow.truth_value.unwrap_or(0.5);
+    // ── The target, read through the CALLER's viewer ──
+    //
+    // An unreadable workflow is 404, exactly like a missing one. The read also
+    // yields the goal the behavioral row falls back to, so the embedding round
+    // trip below can happen BEFORE the write transaction opens rather than
+    // holding it across an external call.
+    let (workflow_claim, labels) = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "report_outcome",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        epigraph_db::ClaimRepository::get_by_id_with_labels(
+            &mut *read,
+            &viewer,
+            epigraph_core::ClaimId::from_uuid(workflow_id),
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to fetch workflow: {e}"),
+        })?
+        .ok_or(ApiError::NotFound {
+            entity: "workflow".into(),
+            id: workflow_id.to_string(),
+        })?
+    };
+    if !labels.iter().any(|l| l == "workflow") {
+        return Err(ApiError::NotFound {
+            entity: "workflow".into(),
+            id: workflow_id.to_string(),
+        });
+    }
 
     // Compute variance from step executions
     let variance = if let Some(ref steps) = request.step_executions {
@@ -781,6 +823,91 @@ pub async fn report_outcome(
     let quality = request
         .quality
         .unwrap_or(if request.success { 1.0 } else { 0.0 });
+
+    // ── Behavioral execution inputs, and the goal embedding, before BEGIN ──
+    let parsed_goal: String = serde_json::from_str::<serde_json::Value>(&workflow_claim.content)
+        .ok()
+        .and_then(|v| v.get("goal").and_then(|g| g.as_str()).map(String::from))
+        .unwrap_or_default();
+
+    let behavioral_goal = request.goal_text.clone().unwrap_or(parsed_goal);
+
+    let (deviation_count, total_steps, tool_pattern, step_beliefs) =
+        if let Some(ref steps) = request.step_executions {
+            let dev_count = steps.iter().filter(|s| s.deviated).count() as i32;
+            let tot = steps.len() as i32;
+            let pattern: Vec<String> = steps.iter().map(|s| s.planned.clone()).collect();
+            let beliefs: serde_json::Value = steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    (
+                        i.to_string(),
+                        serde_json::json!({
+                            "deviated": s.deviated,
+                            "deviation_reason": s.deviation_reason,
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+                .into();
+            (dev_count, tot, pattern, beliefs)
+        } else {
+            (0, 0, vec![], serde_json::json!({}))
+        };
+
+    // Embed goal text for affinity matching. Best-effort: a missing vector is a
+    // NULL column, not a failed report.
+    let goal_embedding_pgvec = if let Some(embedder) = state.embedding_service() {
+        match embedder.generate(&behavioral_goal).await {
+            Ok(vec) => {
+                let pgvec = format!(
+                    "[{}]",
+                    vec.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                Some(pgvec)
+            }
+            Err(e) => {
+                tracing::warn!("behavioral goal embedding failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── ONE stamped transaction for the three writes ──
+    let mut tx = state.write_as(&viewer, "report_outcome").await?;
+    let refused = |e: &epigraph_db::DbError| {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            handler = "report_outcome",
+            workflow = %workflow_id,
+            error = %e,
+            "the database refused the outcome report"
+        );
+        crate::errors::write_refused("workflow claim")
+    };
+
+    // The counters are read on the transaction that writes them.
+    let workflow = sqlx::query_as::<_, WorkflowRow>(
+        "SELECT id, truth_value, properties FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
+    )
+    .bind(workflow_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to fetch workflow: {e}"),
+    })?
+    .ok_or(ApiError::NotFound {
+        entity: "workflow".into(),
+        id: workflow_id.to_string(),
+    })?;
+
+    let before_truth = workflow.truth_value.unwrap_or(0.5);
 
     // Update truth via Bayesian update
     // TODO: migrate to CDST pignistic probability (BayesianUpdater is deprecated)
@@ -800,12 +927,23 @@ pub async fn report_outcome(
             .value()
     };
 
-    // Update claim truth
-    let _ = sqlx::query("UPDATE claims SET truth_value = $1 WHERE id = $2")
-        .bind(after_truth)
-        .bind(workflow_id)
-        .execute(&state.db_pool)
-        .await;
+    // Update claim truth. `update_truth_value_conn` reports a row the UPDATE did
+    // not reach as NotFound, so an UPDATE hidden by row security cannot read as
+    // success either.
+    epigraph_db::ClaimRepository::update_truth_value_conn(
+        &mut tx,
+        epigraph_core::ClaimId::from_uuid(workflow_id),
+        epigraph_core::TruthValue::clamped(after_truth),
+    )
+    .await
+    .map_err(|e| {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            return refused(&e);
+        }
+        ApiError::InternalError {
+            message: format!("Failed to update the workflow's truth value: {e}"),
+        }
+    })?;
 
     // Update properties counters
     let mut props = workflow.properties.clone().unwrap_or(serde_json::json!({}));
@@ -835,74 +973,20 @@ pub async fn report_outcome(
     props["failure_count"] = serde_json::json!(failure_count);
     props["avg_variance"] = serde_json::json!(avg_variance);
 
-    let _ = sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
-        .bind(&props)
-        .bind(workflow_id)
-        .execute(&state.db_pool)
-        .await;
-
-    // ── Behavioral execution row (best-effort) ──────────────────────────
-    // Parse workflow goal for fallback
-    let parsed_goal: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1")
-        .bind(workflow_id)
-        .fetch_optional(&state.db_pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|content: String| {
-            serde_json::from_str::<serde_json::Value>(&content)
-                .ok()
-                .and_then(|v| v.get("goal").and_then(|g| g.as_str()).map(String::from))
-        })
-        .unwrap_or_default();
-
-    let behavioral_goal = request.goal_text.unwrap_or(parsed_goal);
-
-    let (deviation_count, total_steps, tool_pattern, step_beliefs) =
-        if let Some(ref steps) = request.step_executions {
-            let dev_count = steps.iter().filter(|s| s.deviated).count() as i32;
-            let tot = steps.len() as i32;
-            let pattern: Vec<String> = steps.iter().map(|s| s.planned.clone()).collect();
-            let beliefs: serde_json::Value = steps
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    (
-                        i.to_string(),
-                        serde_json::json!({
-                            "deviated": s.deviated,
-                            "deviation_reason": s.deviation_reason,
-                        }),
-                    )
-                })
-                .collect::<serde_json::Map<String, serde_json::Value>>()
-                .into();
-            (dev_count, tot, pattern, beliefs)
-        } else {
-            (0, 0, vec![], serde_json::json!({}))
-        };
-
-    // Embed goal text for affinity matching
-    let goal_embedding_pgvec = if let Some(embedder) = state.embedding_service() {
-        match embedder.generate(&behavioral_goal).await {
-            Ok(vec) => {
-                let pgvec = format!(
-                    "[{}]",
-                    vec.iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                Some(pgvec)
-            }
-            Err(e) => {
-                tracing::warn!("behavioral goal embedding failed: {e}");
-                None
-            }
+    epigraph_db::ClaimRepository::set_properties_conn(
+        &mut tx,
+        epigraph_core::ClaimId::from_uuid(workflow_id),
+        props,
+    )
+    .await
+    .map_err(|e| {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            return refused(&e);
         }
-    } else {
-        None
-    };
+        ApiError::InternalError {
+            message: format!("Failed to update the workflow's counters: {e}"),
+        }
+    })?;
 
     let behavioral_row = epigraph_db::BehavioralExecutionRow {
         id: Uuid::new_v4(),
@@ -919,15 +1003,21 @@ pub async fn report_outcome(
         run_label: None,
     };
 
-    if let Err(e) = epigraph_db::BehavioralExecutionRepository::create(
-        &state.db_pool,
+    // No longer best-effort: it commits with the counters it is the record of,
+    // or neither does.
+    epigraph_db::BehavioralExecutionRepository::create(
+        &mut *tx,
         behavioral_row,
         goal_embedding_pgvec.as_deref(),
     )
     .await
-    {
-        tracing::warn!(workflow_id = %workflow_id, "behavioral execution write failed: {e}");
-    }
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to record the behavioral execution: {e}"),
+    })?;
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the outcome report: {e}"),
+    })?;
 
     let success_rate = if use_count > 0 {
         success_count as f64 / use_count as f64
@@ -1398,28 +1488,74 @@ pub async fn deprecate_workflow(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cascade = params.cascade.unwrap_or(false);
 
-    // Verify workflow exists
-    let _exists = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to check workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: workflow_id.to_string(),
-    })?;
+    // The existence gate, read through the CALLER's viewer on a viewer-stamped
+    // connection. It was `SELECT id FROM claims WHERE id = $1 AND 'workflow' =
+    // ANY(labels)` on the raw pool, unfiltered while the handler held a Viewer
+    // (F-write-authz-reads-unfiltered, backlog 30c29c52), and it is this handler's
+    // ONLY gate. A caller could therefore deprecate a workflow claim it cannot
+    // read. An invisible workflow is now 404, exactly like a missing one. Read
+    // authority, not `{WRITABLE:c}`, for the reason given at the same gate in
+    // `versioning.rs::supersede_claim`: the writes below run on a transaction
+    // stamped with the caller's viewer, so the DATABASE decides write authority
+    // (a claim whose owner group the caller cannot write is refused, 403,
+    // nothing written). Whether a caller should be able to deprecate a workflow
+    // it can WRITE but does not own is the open ownership question (#374 /
+    // backlog 84b2a98d), not this read's.
+    {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "deprecate_workflow",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        let found = epigraph_db::ClaimRepository::get_by_id_with_labels(
+            &mut *read,
+            &viewer,
+            epigraph_core::ClaimId::from_uuid(workflow_id),
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to check workflow: {e}"),
+        })?;
+        match found {
+            Some((_, labels)) if labels.iter().any(|l| l == "workflow") => {}
+            _ => {
+                return Err(ApiError::NotFound {
+                    entity: "workflow".into(),
+                    id: workflow_id.to_string(),
+                })
+            }
+        }
+    }
 
-    // Collect IDs to deprecate
+    // ONE transaction, stamped with the CALLER's viewer, for the descendant read
+    // and every write.
+    //
+    // The writes used to be `let _ = deprecate_claim(&state.db_pool, ..)` and
+    // `let _ = set_truth_value(&state.db_pool, ..)`: unstamped, and their
+    // results discarded. On a schema without the orphan `*_privacy` policies
+    // (config A) `claims_tenancy` refused the UPDATE, the error was dropped, and
+    // the route answered 200 with `deprecated_ids` while `is_current` stayed
+    // true (MEASURED, batch H-a review, owner deprecating its own flat workflow
+    // claim). Now every error propagates, a claim UPDATE that touches no row is
+    // a failure, and nothing commits unless every id was deprecated.
+    let mut tx = state.write_as(&viewer, "deprecate_workflow").await?;
+
+    // Collect IDs to deprecate. A failed read is an error now, not an empty
+    // cascade: swallowed inside the transaction it would abort it silently.
     let mut ids_to_deprecate = vec![workflow_id];
     if cascade {
         let descendants =
-            epigraph_db::WorkflowRepository::find_descendants(&state.db_pool, &viewer, workflow_id)
+            epigraph_db::WorkflowRepository::find_descendants(&mut *tx, &viewer, workflow_id)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Failed to read the workflow's descendants: {e}"),
+                })?;
         ids_to_deprecate.extend(descendants);
     }
 
@@ -1437,17 +1573,54 @@ pub async fn deprecate_workflow(
         // (It additionally sets `updated_at = NOW()`, which the prior bare
         // UPDATE here omitted — a benign, more-correct side effect of
         // unifying on the repo method.)
-        let _ = epigraph_db::ClaimRepository::deprecate_claim(
-            &state.db_pool,
+        let touched = epigraph_db::ClaimRepository::deprecate_claim(
+            &mut *tx,
             epigraph_core::ClaimId::from_uuid(*id),
         )
-        .await;
+        .await
+        .map_err(|e| {
+            if crate::errors::db_is_insufficient_privilege(&e) {
+                tracing::warn!(
+                    target: "tenancy.scoped_write",
+                    handler = "deprecate_workflow",
+                    claim = %id,
+                    error = %e,
+                    "the database refused the deprecation"
+                );
+                crate::errors::write_refused("workflow claim")
+            } else {
+                ApiError::InternalError {
+                    message: format!("Failed to deprecate workflow claim {id}: {e}"),
+                }
+            }
+        })?;
+        // Zero rows means the row is not there for this caller to write: gone,
+        // or (for a cascaded descendant, which the read gate above did not
+        // check) invisible to it. Reporting it in `deprecated_ids` would be the
+        // success-over-nothing this conversion removes.
+        if touched != 1 {
+            return Err(ApiError::Conflict {
+                reason: format!(
+                    "workflow claim {id} could not be deprecated (no row updated); nothing was \
+                     written"
+                ),
+            });
+        }
         // Mirror onto the hierarchical `workflows` row when one exists
         // (no-op for flat-only workflows). Without this, deprecated
         // hierarchical workflows keep surfacing in
-        // `GET /api/v1/workflows/hierarchical/search`.
-        let _ = epigraph_db::WorkflowRepository::set_truth_value(&state.db_pool, *id, 0.05).await;
+        // `GET /api/v1/workflows/hierarchical/search`. Zero rows is the normal
+        // answer for a flat workflow, so only an ERROR fails the request.
+        epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, *id, 0.05)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to mirror the deprecation onto workflow {id}: {e}"),
+            })?;
     }
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the deprecation: {e}"),
+    })?;
 
     // Emit event
     let _ = epigraph_db::EventRepository::insert(
@@ -1561,14 +1734,31 @@ pub async fn record_behavioral_execution(
 pub async fn ingest_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
-    Json(extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Json(mut extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // H3 (batch H-b): the submitter key is this route's to write, never the
+    // caller's; see `workflow_ingest_submitter`.
+    if let Some(obj) = extraction.source.metadata.as_object_mut() {
+        obj.remove(epigraph_db::WorkflowRepository::SUBMITTER_KEY);
+    }
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
+    let auth = auth_ctx.as_ref().map(|a| &a.0);
+    let decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
     let result =
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
             .map_err(workflow_ingest_error)?;
+    record_workflow_submitter(
+        &mut tx,
+        auth,
+        &viewer,
+        &extraction,
+        result.workflow_id,
+        &decision,
+    )
+    .await?;
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
@@ -1898,6 +2088,9 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
             message: "workflow has no level-1 phase claim".into(),
         },
         E::Invalid(msg) => ApiError::BadRequest { message: msg },
+        e @ (E::ChainRewireRefused { .. } | E::StepNotWritable { .. }) => ApiError::Forbidden {
+            reason: e.to_string(),
+        },
         E::Repo(db) if db.is_personal_group_refusal() => ApiError::from(db),
         E::Executor(epigraph_ingest_executor::IngestExecutorError::Repository(db))
             if db.is_personal_group_refusal() =>
@@ -1916,6 +2109,270 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
     }
 }
 
+/// What [`workflow_authority`] admitted (batch H-b, H3).
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, Debug)]
+struct ApiWorkflowGrant {
+    /// The recorded submitter, if any.
+    owner: Option<Uuid>,
+    /// Admitted only through the audited admin arm: the write must then record
+    /// [`audit_api_admin_workflow_write`] on its own transaction.
+    admin: bool,
+}
+
+/// H3 (batch H-b; the MCP twin is `epigraph-mcp/src/tools/workflow_authority.rs`,
+/// whose module doc records the measurements and the rule). Refuse unless the
+/// caller has authority over workflow `workflow_id`: when a submitter is
+/// recorded, in this order, the submitter, its operator, or the AUDITED admin
+/// arm — `claims:admin` in the token AND a live grant on the token's client
+/// record (migration 111's predicate), never the scope alone. A workflow with
+/// no record (written before batch H-b) keeps today's behaviour, with a WARN.
+#[cfg(feature = "db")]
+async fn workflow_authority(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&crate::middleware::bearer::AuthContext>,
+    caller: Option<Uuid>,
+    workflow_id: Uuid,
+) -> Result<ApiWorkflowGrant, ApiError> {
+    let owner = epigraph_db::WorkflowRepository::submitter_of(&mut *conn, workflow_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("could not read the workflow's submitter: {e}"),
+        })?;
+    let Some(owner) = owner else {
+        tracing::warn!(
+            workflow_id = %workflow_id,
+            caller = ?caller,
+            "workflow mutation on a workflow with no recorded submitter (written before batch \
+             H-b): allowed, as before"
+        );
+        return Ok(ApiWorkflowGrant {
+            owner: None,
+            admin: false,
+        });
+    };
+    let allowed = ApiWorkflowGrant {
+        owner: Some(owner),
+        admin: false,
+    };
+    if caller == Some(owner) {
+        return Ok(allowed);
+    }
+    if let Some(caller) = caller {
+        // On the request's own transaction, not the raw pool (`no_unscoped_pool`).
+        let op = epigraph_db::AgentRepository::operator_of_author(&mut *conn, owner)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("could not read the submitter's operator: {e}"),
+            })?;
+        if op.is_some_and(|l| l.operator_id == caller) {
+            return Ok(allowed);
+        }
+    }
+    if let (Some(a), Some(caller)) = (auth, caller) {
+        if a.has_scope("claims:admin") {
+            let live = epigraph_db::SecurityEventRepository::admin_grant_is_live(
+                &mut *conn,
+                a.client_id,
+                caller,
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("could not re-check the admin grant: {e}"),
+            })?;
+            if live {
+                return Ok(ApiWorkflowGrant {
+                    owner: Some(owner),
+                    admin: true,
+                });
+            }
+            return Err(ApiError::Forbidden {
+                reason: format!(
+                    "workflow {workflow_id} was submitted by agent {owner}; the token carries \
+                     claims:admin, but its client record grants no live claims:admin to this \
+                     principal, so the audited admin path refused it (ADM02). Nothing was \
+                     written."
+                ),
+            });
+        }
+    }
+    Err(ApiError::Forbidden {
+        reason: format!(
+            "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
+             submitter, its submitter's operator, nor a live claims:admin holder. Nothing was \
+             written."
+        ),
+    })
+}
+
+/// Record a cross-owner workflow write admitted through the audited admin arm
+/// (`workflows.admin_write`, the MCP twin's event type) on the write's own
+/// transaction, so the two commit together or not at all.
+#[cfg(feature = "db")]
+async fn audit_api_admin_workflow_write(
+    conn: &mut sqlx::PgConnection,
+    auth: &crate::middleware::bearer::AuthContext,
+    admin: Uuid,
+    action: &str,
+    workflow_id: Uuid,
+    submitter: Option<Uuid>,
+    details: serde_json::Value,
+) -> Result<(), ApiError> {
+    let record = serde_json::json!({
+        "action": action,
+        "workflow_id": workflow_id,
+        "submitter": submitter,
+        "write": details,
+    });
+    // Migration 112's definer: this transaction is stamped from the system
+    // agent, whose session `security_events_append` would refuse an admin row.
+    epigraph_db::SecurityEventRepository::admin_audit_write(
+        &mut *conn,
+        auth.client_id,
+        auth.jti,
+        admin,
+        "workflows.admin_write",
+        &record,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!(
+            "{action}: could not write the admin audit row: {e}. Nothing was written."
+        ),
+    })
+}
+
+/// [`workflow_authority`] over the head of `canonical_name`, for the step routes.
+/// An unknown name is left to the executor, which reports it as not found.
+/// Returns the head and the grant, for the admin audit row.
+#[cfg(feature = "db")]
+async fn require_api_workflow_authority(
+    conn: &mut sqlx::PgConnection,
+    auth: &crate::middleware::bearer::AuthContext,
+    canonical_name: &str,
+) -> Result<Option<(Uuid, ApiWorkflowGrant)>, ApiError> {
+    let head = epigraph_db::WorkflowRepository::head_by_canonical(&mut *conn, canonical_name)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("could not resolve the workflow: {e}"),
+        })?;
+    let Some(head) = head else {
+        return Ok(None);
+    };
+    let grant = workflow_authority(conn, Some(auth), auth.agent_id, head).await?;
+    Ok(Some((head, grant)))
+}
+
+/// What an ingest records, decided BEFORE the plan walk on the same
+/// transaction (see [`workflow_ingest_submitter`]).
+#[cfg(feature = "db")]
+struct ApiIngestDecision {
+    /// Whether this call creates the row (only then is a submitter recorded).
+    creating: bool,
+    /// The submitter to record when creating, if any.
+    submitter: Option<Uuid>,
+    /// Admitted through the audited admin arm over an existing lineage.
+    admin: bool,
+    /// The anchors checked, for the audit row.
+    anchors: epigraph_db::repos::workflow::IngestAnchors,
+}
+
+/// The submitter an ingest should record, and the authority it needs, decided
+/// BEFORE the plan walk on the same transaction. The rule is the MCP twin's
+/// (`execute_workflow_ingest_with_inserted`): a re-ingest of an existing row
+/// records nothing and needs nothing (the executor writes nothing); a NEW
+/// generation of a canonical name that already has rows needs authority over
+/// that lineage's head and inherits its submitter, parent or no parent (the
+/// review's takeover: `generation + 1` with no parent recorded the attacker);
+/// a variant also needs authority over exactly the row the executor links as
+/// `parent_id`; a brand-new lineage records the caller, the viewer's principal.
+#[cfg(feature = "db")]
+async fn workflow_ingest_submitter(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&crate::middleware::bearer::AuthContext>,
+    viewer: &epigraph_db::Viewer,
+    extraction: &epigraph_ingest::workflow::WorkflowExtraction,
+) -> Result<ApiIngestDecision, ApiError> {
+    let caller = viewer.principal();
+    let anchors = epigraph_db::WorkflowRepository::ingest_anchors(
+        &mut *conn,
+        &extraction.source.canonical_name,
+        extraction.source.generation as i32,
+        extraction.source.parent_canonical_name.as_deref(),
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("workflow ingest: {e}"),
+    })?;
+    let creating = anchors.existing.is_none();
+    let mut inherited: Option<Option<Uuid>> = None;
+    let mut admin = false;
+    if creating {
+        let mut checked: Vec<Uuid> = Vec::with_capacity(2);
+        for anchor in [anchors.lineage_head, anchors.linked_parent]
+            .into_iter()
+            .flatten()
+        {
+            if checked.contains(&anchor) {
+                continue;
+            }
+            checked.push(anchor);
+            let grant = workflow_authority(conn, auth, caller, anchor).await?;
+            admin |= grant.admin;
+            inherited.get_or_insert(grant.owner);
+        }
+    }
+    Ok(ApiIngestDecision {
+        creating,
+        submitter: inherited.unwrap_or(caller),
+        admin,
+        anchors,
+    })
+}
+
+/// Record the submitter [`workflow_ingest_submitter`] decided, once, and the
+/// admin audit row when the ingest was admitted through the admin arm.
+#[cfg(feature = "db")]
+async fn record_workflow_submitter(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&crate::middleware::bearer::AuthContext>,
+    viewer: &epigraph_db::Viewer,
+    extraction: &epigraph_ingest::workflow::WorkflowExtraction,
+    workflow_id: Uuid,
+    decision: &ApiIngestDecision,
+) -> Result<(), ApiError> {
+    if decision.creating {
+        if let Some(agent) = decision.submitter {
+            epigraph_db::WorkflowRepository::record_submitter(&mut *conn, workflow_id, agent)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("workflow ingest: could not record the submitter: {e}"),
+                })?;
+        }
+    }
+    if decision.admin {
+        if let (Some(auth), Some(admin)) = (auth, viewer.principal()) {
+            audit_api_admin_workflow_write(
+                conn,
+                auth,
+                admin,
+                "workflow_ingest",
+                workflow_id,
+                decision.submitter,
+                serde_json::json!({
+                    "canonical_name": extraction.source.canonical_name,
+                    "generation": extraction.source.generation,
+                    "parent_canonical_name": extraction.source.parent_canonical_name,
+                    "lineage_head_before": decision.anchors.lineage_head,
+                    "linked_parent": decision.anchors.linked_parent,
+                }),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// POST /api/v1/workflows/steps - add a step to a hierarchical workflow.
 #[cfg(feature = "db")]
 pub async fn add_step(
@@ -1929,6 +2386,7 @@ pub async fn add_step(
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps").await?;
+    let authority = require_api_workflow_authority(&mut tx, &auth, &req.canonical_name).await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
         &req.canonical_name,
@@ -1937,6 +2395,25 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
+    if let (Some((head, grant)), Some(admin)) = (authority.filter(|(_, g)| g.admin), auth.agent_id)
+    {
+        audit_api_admin_workflow_write(
+            &mut tx,
+            &auth,
+            admin,
+            "add_step",
+            head,
+            grant.owner,
+            serde_json::json!({
+                "canonical_name": req.canonical_name,
+                "step_claim_id": r.step_claim_id,
+                "step_lineage_id": r.step_lineage_id,
+                "step_index": r.step_index,
+                "already_present": r.already_present,
+            }),
+        )
+        .await?;
+    }
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("add_step: could not commit: {e}"),
     })?;
@@ -1963,10 +2440,29 @@ pub async fn delete_step(
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps/delete").await?;
+    let authority = require_api_workflow_authority(&mut tx, &auth, &req.canonical_name).await?;
     let r =
         epigraph_ingest_executor::delete_step(&mut tx, &req.canonical_name, req.step_lineage_id)
             .await
             .map_err(map_step_err)?;
+    if let (Some((head, grant)), Some(admin)) = (authority.filter(|(_, g)| g.admin), auth.agent_id)
+    {
+        audit_api_admin_workflow_write(
+            &mut tx,
+            &auth,
+            admin,
+            "delete_step",
+            head,
+            grant.owner,
+            serde_json::json!({
+                "canonical_name": req.canonical_name,
+                "step_claim_id": r.step_claim_id,
+                "step_lineage_id": r.step_lineage_id,
+                "truth_value_after": r.truth_value,
+            }),
+        )
+        .await?;
+    }
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("delete_step: could not commit: {e}"),
     })?;
@@ -2516,5 +3012,211 @@ mod tests {
             map_step_err(S::Executor(X::AgentCreation("preflight".into()))),
             ApiError::InternalError { .. }
         ));
+    }
+
+    /// Batch H-b, H3 over HTTP: the ingest records its caller as submitter,
+    /// and `POST /api/v1/workflows/steps` then refuses a different caller
+    /// (403, nothing written) while the submitter is admitted. The MCP twin is
+    /// `epigraph-mcp/tests/workflow_caller_authority.rs`. Load-bearing: with
+    /// `require_api_workflow_authority` a no-op the stranger's step lands and
+    /// the 403 assertion fails.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn workflow_steps_refuse_a_caller_who_did_not_submit_the_workflow(pool: PgPool) {
+        use axum::routing::post;
+        let state = scoped_test_state(&pool).await;
+        let owner = test_auth();
+        let stranger = test_auth();
+        let router_as = |auth: crate::middleware::bearer::AuthContext| {
+            axum::Router::new()
+                .route("/api/v1/workflows/ingest", post(ingest_workflow))
+                .route("/api/v1/workflows/steps", post(add_step))
+                .layer(axum::Extension(auth))
+                .with_state(state.clone())
+        };
+        let post_json = |uri: &str, body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+
+        let resp = router_as(owner.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/ingest",
+                ingest_payload("h3-http-owned"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let recorded: Option<String> = sqlx::query_scalar(
+            "SELECT metadata->>'epigraph_submitted_by' FROM workflows \
+              WHERE canonical_name = 'h3-http-owned'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, owner.agent_id.map(|a| a.to_string()));
+
+        // Counted through the workflow's `executes` edges, not a `claims`
+        // content read: the route layer may not select claim content inline
+        // (`viewer_route_table_lint`), its test module included.
+        let executes_sql = "SELECT count(*) FROM edges e JOIN workflows w ON w.id = e.source_id \
+                            WHERE w.canonical_name = 'h3-http-owned' AND e.relationship = 'executes'";
+        let before: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let step = serde_json::json!({
+            "canonical_name": "h3-http-owned",
+            "step_text": "a stranger's step",
+        });
+        let resp = router_as(stranger)
+            .oneshot(post_json("/api/v1/workflows/steps", step.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let after: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "nothing written");
+
+        let resp = router_as(owner)
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-owned", "step_text": "the owner's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the submitter adds a step");
+    }
+
+    /// Batch H-b review, the HTTP twin of the MCP lineage-takeover and
+    /// admin-arm findings: a stranger's `generation + 1` ingest with NO parent
+    /// is refused (it used to record the stranger as submitter), a
+    /// `claims:admin` token whose client record grants nothing is refused on
+    /// the step route (it used to pass on the scope alone), and a live grant is
+    /// admitted with one `workflows.admin_write` audit row.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn workflow_lineage_and_admin_arm_are_checked_over_http(pool: PgPool) {
+        use axum::routing::post;
+        let state = scoped_test_state(&pool).await;
+        let owner = test_auth();
+        let stranger = test_auth();
+        let router_as = |auth: crate::middleware::bearer::AuthContext| {
+            axum::Router::new()
+                .route("/api/v1/workflows/ingest", post(ingest_workflow))
+                .route("/api/v1/workflows/steps", post(add_step))
+                .layer(axum::Extension(auth))
+                .with_state(state.clone())
+        };
+        let post_json = |uri: &str, body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let resp = router_as(owner.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/ingest",
+                ingest_payload("h3-http-lineage"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut hijack = ingest_payload("h3-http-lineage");
+        hijack["source"]["generation"] = serde_json::json!(1);
+        hijack["phases"][0]["summary"] = serde_json::json!("the stranger's generation");
+        let resp = router_as(stranger)
+            .oneshot(post_json("/api/v1/workflows/ingest", hijack))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a parentless new generation of another caller's lineage"
+        );
+        let generations: Vec<(i32, Option<String>)> = sqlx::query_as(
+            "SELECT generation, metadata->>'epigraph_submitted_by' FROM workflows \
+              WHERE canonical_name = 'h3-http-lineage' ORDER BY generation",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            generations,
+            vec![(0, owner.agent_id.map(|a| a.to_string()))],
+            "nothing written"
+        );
+
+        let executes_sql = "SELECT count(*) FROM edges e JOIN workflows w ON w.id = e.source_id \
+                            WHERE w.canonical_name = 'h3-http-lineage' AND e.relationship = 'executes'";
+        let audits_sql = "SELECT count(*) FROM security_events \
+                          WHERE event_type = 'workflows.admin_write' AND agent_id = $1";
+        let before: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut admin = test_auth();
+        admin.scopes.push("claims:admin".to_string());
+        let admin_agent = admin.agent_id.unwrap();
+        let resp = router_as(admin.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-lineage", "step_text": "a grantless admin's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "claims:admin in the token alone is not the audited admin path"
+        );
+        let after: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "nothing written");
+
+        // The same token once its client record grants claims:admin.
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, display_name) \
+             VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'h3 http admin')",
+        )
+        .bind(admin_agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
+                                        granted_scopes, status, agent_id) \
+             VALUES ($1, $2, 'h3 http admin', 'human', ARRAY['claims:admin'], \
+                     ARRAY['claims:admin'], 'active', $3)",
+        )
+        .bind(admin.client_id)
+        .bind(format!("h3-http-admin-{}", admin.client_id))
+        .bind(admin_agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let resp = router_as(admin)
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-lineage", "step_text": "an audited admin's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a live grant is admitted");
+        let audits: i64 = sqlx::query_scalar(audits_sql)
+            .bind(admin_agent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(audits, 1, "and the admin write is audited");
     }
 }

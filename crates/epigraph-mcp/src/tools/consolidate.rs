@@ -23,14 +23,21 @@ struct ConsolidateResponse {
     /// `true` when an identical merged claim by this agent already existed and
     /// was returned rather than inserted twice.
     already_existed: bool,
+    /// The administrative cascade that moved the sources' edges (migration
+    /// 117): applied, deferred or failed, with its `security_events` row. Absent
+    /// on the idempotent return, which wrote nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cascade: Option<epigraph_engine::admin_cascade::CascadeStatus>,
 }
 
 pub async fn consolidate_claims(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: ConsolidateClaimsParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    let acting_agent_id = server.agent_id().await?;
+    let acting = server.write_identity(auth, viewer).await?;
+    let acting_agent_id = acting.agent_id();
 
     let source_ids = params
         .source_claim_ids
@@ -81,9 +88,13 @@ pub async fn consolidate_claims(
     // PUBLIC foreign source is visible but its retirement UPDATE fails `WITH
     // CHECK`, which aborts the whole transaction — the merged row included.
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, acting_agent_id, "consolidate_claims")
-            .await?;
-    let result = ClaimRepository::consolidate_conn(
+        crate::claim_helper::begin_author_stamped_tx(server, acting, "consolidate_claims").await?;
+    //
+    // Migration 117: this is the consolidation's ACT only (the merged claim,
+    // the retired sources, the `supersedes` edges). The sources' other edges
+    // belong to whoever asserted them; moving them is the administrative
+    // cascade below.
+    let result = ClaimRepository::consolidate_act_conn(
         &mut tx,
         &source_ids,
         &params.merged_content,
@@ -108,11 +119,50 @@ pub async fn consolidate_claims(
         other if other.is_personal_group_refusal() => crate::errors::db_caller_error(other),
         other => internal_error(other),
     })?;
+    // The cascade's trigger, and its administrative session acquired BEFORE
+    // the act commits (or the deferral recorded in the act's own transaction).
+    // The idempotent return wrote nothing, so it has no cascade.
+    let trigger = epigraph_engine::admin_cascade::CascadeTrigger {
+        sources: source_ids.clone(),
+        ..epigraph_engine::admin_cascade::CascadeTrigger::new(
+            epigraph_engine::admin_cascade::CascadeCause::Consolidate,
+            Some(acting_agent_id),
+            crate::tools::supersede::oauth_principal(auth),
+            result.merged_id,
+            None,
+        )
+    };
+    let (mut session, deferred) = if result.already_existed {
+        (None, None)
+    } else {
+        let (session, status) =
+            crate::tools::supersede::admin_session_or_deferral(server, &mut tx, &trigger).await?;
+        (session, Some(status))
+    };
     // The idempotent-return branch rolled its SAVEPOINT back and wrote nothing;
     // committing the (then empty) outer transaction is harmless and uniform.
     tx.commit()
         .await
         .map_err(|e| internal_error(format!("consolidate_claims: could not commit: {e}")))?;
+
+    // THE CASCADE (migration 117), with administrative authority on the
+    // maintenance connection: re-point the sources' live edges onto the merged
+    // claim and retract the redundant copies, audited atomically. Best-effort:
+    // the merge has committed.
+    let cascade = match (session.as_mut(), deferred) {
+        (Some(session), _) => Some(
+            epigraph_engine::admin_cascade::apply_after_consolidate(session.conn(), &trigger).await,
+        ),
+        (None, status) => status,
+    };
+    let touched_count = |key: &str| -> u64 {
+        cascade
+            .as_ref()
+            .and_then(|c| c.touched.as_ref())
+            .and_then(|t| t.get(key))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
 
     // Post-commit embedding, best-effort: warn but never fail the merge (the
     // CLAUDE.md write-path invariant). Skipped on the idempotent return, where
@@ -139,10 +189,11 @@ pub async fn consolidate_claims(
     let response = ConsolidateResponse {
         merged_claim_id: result.merged_id.to_string(),
         superseded_ids: result.superseded.iter().map(ToString::to_string).collect(),
-        edges_migrated: result.edges_migrated,
-        edges_deduped: result.edges_deduped,
+        edges_migrated: touched_count("edges_migrated"),
+        edges_deduped: touched_count("edges_retracted"),
         embedded,
         already_existed: result.already_existed,
+        cascade,
     };
 
     Ok(CallToolResult::success(vec![Content::text(

@@ -1,6 +1,8 @@
 pub mod embedding_restore;
 pub mod errors;
 pub mod extractors;
+#[cfg(feature = "db")]
+pub mod jobs_drain;
 pub mod metrics;
 pub mod middleware;
 #[cfg(feature = "db")]
@@ -114,8 +116,40 @@ pub fn env_flag_enabled(raw: Option<&str>) -> bool {
 /// `ScopedPoolOptions::default()`'s 10: a `--workspace --no-fail-fast` run
 /// spawns many of these at once, and raising the per-app ceiling 2.5× would
 /// surface as "too many clients" in binaries unrelated to whatever changed.
+///
+/// # Webhook registration resolves names — through a stub here
+///
+/// `POST /api/v1/webhooks` resolves the target host (`epigraph_jobs::egress`).
+/// So that no integration binary depends on real DNS, this fixture installs
+/// [`test_webhook_egress`]: every name resolves to one fixed public address.
+/// A test that needs particular answers (a name that resolves to loopback, a
+/// name that does not resolve) uses [`build_app_for_tests_with_webhook_egress`].
 #[cfg(feature = "db")]
 pub async fn build_app_for_tests(database_url: &str) -> Result<axum::Router, sqlx::Error> {
+    build_app_for_tests_with_webhook_egress(database_url, test_webhook_egress()).await
+}
+
+/// The public address [`test_webhook_egress`] resolves every name to.
+pub const TEST_WEBHOOK_PUBLIC_ADDR: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34));
+
+/// The registration egress guard [`build_app_for_tests`] installs: a
+/// `StubResolver` answering every name with [`TEST_WEBHOOK_PUBLIC_ADDR`]. No
+/// network access. Registration never dials, so the address is never
+/// connected to.
+#[must_use]
+pub fn test_webhook_egress() -> epigraph_jobs::egress::EgressGuard {
+    epigraph_jobs::egress::EgressGuard::with_resolver(std::sync::Arc::new(
+        epigraph_jobs::egress::StubResolver::new().with_fallback([TEST_WEBHOOK_PUBLIC_ADDR]),
+    ))
+}
+
+/// [`build_app_for_tests`] with a caller-chosen webhook-registration guard.
+#[cfg(feature = "db")]
+pub async fn build_app_for_tests_with_webhook_egress(
+    database_url: &str,
+    webhook_egress: epigraph_jobs::egress::EgressGuard,
+) -> Result<axum::Router, sqlx::Error> {
     let scoped = epigraph_db::ScopedPool::connect_with_options(
         database_url,
         epigraph_db::SessionGucMode::Session,
@@ -127,7 +161,40 @@ pub async fn build_app_for_tests(database_url: &str) -> Result<axum::Router, sql
     .await
     .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
     let state =
-        crate::state::AppState::with_scoped_pool(scoped, crate::state::ApiConfig::default());
+        crate::state::AppState::with_scoped_pool(scoped, crate::state::ApiConfig::default())
+            .with_webhook_egress(webhook_egress);
+    Ok(crate::routes::create_router(state))
+}
+
+/// [`build_app_for_tests`] with the ADMINISTRATIVE CASCADE enabled (migration
+/// 117): the test DSN's own pool is attached as the maintenance pool, the shape
+/// `bin/server.rs` builds for an explicitly configured, privileged
+/// `MAINTENANCE_DATABASE_URL`. Test DSNs are the superuser, which bypasses row
+/// security, so the cascade runs as it would on a maintenance login.
+///
+/// # Errors
+/// As [`build_app_for_tests`].
+#[cfg(feature = "db")]
+pub async fn build_app_for_tests_with_admin_cascade(
+    database_url: &str,
+) -> Result<axum::Router, sqlx::Error> {
+    let scoped = epigraph_db::ScopedPool::connect_with_options(
+        database_url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
+    let maintenance = scoped.inner().clone();
+    let state = crate::state::AppState::with_scoped_pool(
+        scoped.with_maintenance_pool(maintenance),
+        crate::state::ApiConfig::default(),
+    )
+    .with_webhook_egress(test_webhook_egress())
+    .with_admin_cascade(true);
     Ok(crate::routes::create_router(state))
 }
 

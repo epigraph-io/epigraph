@@ -2015,9 +2015,38 @@ pub async fn create_theme_with_centroid(
 
     use epigraph_db::ClaimThemeRepository;
 
+    // ONE transaction, stamped with the caller's viewer, for the theme row, its
+    // centroid, the claim assignment and the count. They used to be four
+    // statements on the raw pool: on a schema without the orphan `*_privacy`
+    // policies the assignment (`UPDATE claims`) was refused, the handler
+    // answered 500, and the `claim_themes` row it had already committed stayed
+    // behind (MEASURED, batch H-a review: 500 with `claim_themes +1`). Stamped,
+    // an admin assigning claims in groups it can write succeeds, and one it
+    // cannot write is refused (403) with nothing written.
+    let refused = |e: &epigraph_db::DbError| {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            handler = "create_theme_with_centroid",
+            error = %e,
+            "the database refused the theme assignment"
+        );
+        crate::errors::write_refused("claim")
+    };
+    let map = |e: epigraph_db::DbError| {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            refused(&e)
+        } else {
+            ApiError::from(e)
+        }
+    };
+    let mut tx = state
+        .write_as(&viewer, "create_theme_with_centroid")
+        .await?;
+
     // Create theme
-    let theme =
-        ClaimThemeRepository::create(&state.db_pool, &request.label, &request.description).await?;
+    let theme = ClaimThemeRepository::create(&mut *tx, &request.label, &request.description)
+        .await
+        .map_err(map)?;
 
     // Centroid: use the caller's vector when supplied, otherwise average the
     // claims' own embeddings server-side. The latter is the path a theme-split
@@ -2033,25 +2062,35 @@ pub async fn create_theme_with_centroid(
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            ClaimThemeRepository::set_centroid(&state.db_pool, theme.id, &centroid_str).await?;
+            ClaimThemeRepository::set_centroid(&mut *tx, theme.id, &centroid_str)
+                .await
+                .map_err(map)?;
         }
         None => {
             ClaimThemeRepository::set_centroid_from_claims(
-                &state.db_pool,
+                &mut *tx,
                 &viewer,
                 theme.id,
                 &request.claim_ids,
             )
-            .await?;
+            .await
+            .map_err(map)?;
         }
     }
 
     // Bulk assign claims
-    let assigned =
-        ClaimThemeRepository::bulk_assign(&state.db_pool, &request.claim_ids, theme.id).await?;
+    let assigned = ClaimThemeRepository::bulk_assign(&mut *tx, &request.claim_ids, theme.id)
+        .await
+        .map_err(map)?;
 
     // Update count
-    ClaimThemeRepository::update_count(&state.db_pool, theme.id, assigned as i32).await?;
+    ClaimThemeRepository::update_count(&mut *tx, theme.id, assigned as i32)
+        .await
+        .map_err(map)?;
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the theme: {e}"),
+    })?;
 
     Ok((
         StatusCode::CREATED,

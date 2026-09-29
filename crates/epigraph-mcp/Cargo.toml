@@ -78,6 +78,9 @@ axum = "0.8"
 http = "1"
 
 [dev-dependencies]
+# `ScopedPool::connect_downgraded_for_tests`: the app-role tool tests
+# (`tests/writer_owned_attach_app_role.rs`). Test builds only.
+epigraph-db = { workspace = true, features = ["test-support"] }
 epigraph-ingest = { workspace = true }
 reqwest = { workspace = true }
 blake3 = { workspace = true }

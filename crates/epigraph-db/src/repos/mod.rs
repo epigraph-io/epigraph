@@ -4,6 +4,7 @@
 //! following the repository pattern to abstract database access.
 
 pub mod activity;
+pub mod admin_cascade;
 pub mod agent;
 pub mod agent_key;
 pub mod alternative_set;
@@ -33,6 +34,7 @@ pub mod evidence;
 pub mod evidence_encryption;
 pub mod experiment;
 pub mod factor;
+pub mod foreign_attach;
 pub mod frame;
 pub mod gap;
 pub mod graph_view;
@@ -42,6 +44,7 @@ pub mod group_membership;
 pub mod instance_admin;
 pub mod learning_event;
 pub mod lineage;
+pub mod maintenance_lock;
 pub mod mass_function;
 pub mod match_candidate;
 pub mod method;
@@ -79,13 +82,13 @@ pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
-    ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository, ClaimSortField,
-    ClaimSortOrder, ConsolidateMode, ConsolidateResult, DedupRepair, EvolveStepResult,
-    FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit, LabelQuery,
-    LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
-    SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
-    EXPANSION_RELATIONSHIPS,
+    AdminClaimAction, AdminClaimWrite, AdminToken, BeliefBoundedClaimHit, BeliefSort,
+    ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor,
+    ClaimPairDistance, ClaimRepository, ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration,
+    ConsolidateMode, ConsolidateResult, DedupRepair, EvolveStepResult, FrameClaimBeliefHit,
+    GraphExpansionHit, GroundedNeighbor, HybridHit, LabelQuery, LevelAndSourceType, LineageHead,
+    NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection, SupersedeEdgeMigration,
+    SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
@@ -163,8 +166,44 @@ pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};
 pub use pattern_template::{PatternTemplateRepository, PatternTemplateRow};
 pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORIZER_ID};
-pub use refresh_token::{RefreshTokenRepository, RefreshTokenRow};
+pub use refresh_token::{
+    RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
+    RefreshTokenRow,
+};
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
 pub use span::{SpanRepository, SpanRow};
 pub use task::{TaskRepository, TaskRow};
 pub use workflow_execution::{WorkflowExecutionRepository, WorkflowExecutionRow};
+
+/// Compare what a write could SEE with what it CHANGED, and refuse loudly when
+/// row security left a row it had to change as it was.
+///
+/// Migrations 115 and 117 made DELETE (every tier-A table) and UPDATE (`edges`
+/// and the four registries) owner-scoped with RESTRICTIVE USING clauses. A
+/// USING clause that refuses a row does not raise: the statement matches zero
+/// rows and reports success. A caller that must change the rows it names runs
+/// one statement shaped
+///
+/// ```sql
+/// WITH seen AS (SELECT 1 FROM t WHERE <pred>),
+///      done AS (DELETE FROM t WHERE <pred> RETURNING 1)
+/// SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
+/// ```
+///
+/// (`seen` reads under the statement's snapshot, before the write) and hands
+/// the pair here. Returns the number changed.
+pub(crate) fn require_all_changed(
+    entity: &str,
+    id: uuid::Uuid,
+    action: &str,
+    (seen, done): (i64, i64),
+) -> Result<u64, crate::errors::DbError> {
+    if done < seen {
+        return Err(crate::errors::DbError::WriteRefused {
+            entity: entity.to_string(),
+            id,
+            action: action.to_string(),
+        });
+    }
+    Ok(u64::try_from(done).unwrap_or(0))
+}

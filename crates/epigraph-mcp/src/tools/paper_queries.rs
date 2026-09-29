@@ -131,6 +131,7 @@ pub async fn query_paper(
             labels: Vec::new(),
             is_current: true,
             supersedes: None,
+            belief_score: None,
         });
     }
 
@@ -214,6 +215,7 @@ pub async fn query_claims_by_evidence(
                 labels: Vec::new(),
                 is_current: true,
                 supersedes: None,
+                belief_score: None,
             });
         }
 
@@ -262,6 +264,7 @@ pub async fn query_claims_by_methodology(
                         labels: Vec::new(),
                         is_current: true,
                         supersedes: None,
+                        belief_score: None,
                     });
                 }
             }
@@ -319,6 +322,7 @@ pub async fn query_claims_by_label(
             labels,
             is_current: c.is_current,
             supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
+            belief_score: None,
         });
     }
 

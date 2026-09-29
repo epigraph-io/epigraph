@@ -22,6 +22,56 @@ pub fn internal_error(e: impl std::fmt::Display) -> McpError {
     }
 }
 
+/// The explicit refusal for a patch, retract or delete of an edge the caller
+/// can READ but may not write (migrations 115/117/120; operator decision D8).
+///
+/// Caller-error class (`INVALID_REQUEST`): a denial of authority, not a server
+/// fault and not something a parameter change fixes. The message names the
+/// rule ("owned by another writer", or "an administrative (world-owned) edge;
+/// admin-only"), and `data` carries it for machines:
+/// `{"error": "not_owner", "rule": "owned_by_another_writer" |
+/// "administrative_edge", "edge_id": "<id>"}`. An edge the caller cannot read
+/// keeps the not-found answer instead (no existence oracle).
+pub fn edge_not_owner(
+    refusal: epigraph_db::EdgeRefusal,
+    edge_id: uuid::Uuid,
+    action: &str,
+) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: Cow::from(refusal.message(edge_id, action)),
+        data: Some(serde_json::json!({
+            "error": "not_owner",
+            "rule": refusal.rule(),
+            "edge_id": edge_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// The explicit refusal for a claim act (`supersede_claim`, `mark_duplicate`)
+/// on a claim the caller can READ but may not retire (batch OA1, operator
+/// decision D1; the rule is `epigraph_auth::claim_act`).
+///
+/// `INVALID_REQUEST`, like [`edge_not_owner`]: a denial of authority. `data`
+/// carries `{"error": "not_owner", "rule": "not_claim_writer", "claim_id":
+/// "<id>", "retryable": false}`, the HTTP route's body keys. A claim the caller
+/// cannot read keeps the not-found answer instead (no existence oracle).
+pub fn claim_not_writer(claim_id: uuid::Uuid, action: &str) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: Cow::from(epigraph_auth::claim_act::not_claim_writer_message(
+            claim_id, action,
+        )),
+        data: Some(serde_json::json!({
+            "error": "not_owner",
+            "rule": epigraph_auth::claim_act::NOT_CLAIM_WRITER_RULE,
+            "claim_id": claim_id,
+            "retryable": false,
+        })),
+    }
+}
+
 pub fn parse_uuid(s: &str) -> Result<uuid::Uuid, McpError> {
     uuid::Uuid::parse_str(s).map_err(|e| invalid_params(format!("invalid UUID: {e}")))
 }
@@ -54,6 +104,13 @@ pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
         | epigraph_db::DbError::PersonalGroupNotOwned { message } => McpError {
             code: ErrorCode::INVALID_REQUEST,
             message: Cow::from(message),
+            data: None,
+        },
+        // Row security let the caller read the row but not change it
+        // (migrations 115/117): the same class of denial.
+        e @ epigraph_db::DbError::WriteRefused { .. } => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(e.to_string()),
             data: None,
         },
         other => internal_error(other),

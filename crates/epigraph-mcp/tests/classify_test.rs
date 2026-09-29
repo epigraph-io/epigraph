@@ -73,7 +73,11 @@ async fn recompute_and_label(
     let viewer = fixture::public_viewer(pool).await;
     tools::cdst_maintenance::recompute_beliefs(
         server,
-        &viewer,
+        &mut fixture::scoped_pool(pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,

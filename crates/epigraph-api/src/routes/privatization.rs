@@ -922,6 +922,7 @@ pub async fn create_plan(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(body): Json<CreatePlanRequest>,
 ) -> Result<(axum::http::StatusCode, Json<PlanPreview>), ApiError> {
+    lifecycle_served(&state, "create_plan")?;
     use epigraph_db::repos::privatization::{
         ClosureDirection, ClosureRequest, NewPlan, PrivatizationRepository, RESTATEMENT_EDGE_TYPES,
     };
@@ -998,17 +999,7 @@ pub async fn create_plan(
     let mut session = state
         .maintenance_viewer(SystemReason::PrivatizationSelection)
         .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "tenancy.privatization",
-                error = %e,
-                handler = "create_plan",
-                "could not acquire the maintenance connection"
-            );
-            ApiError::InternalError {
-                message: "Failed to acquire a maintenance connection".to_string(),
-            }
-        })?;
+        .map_err(|e| maintenance_error(e, "create_plan"))?;
     let (maint, bypass) = session.split();
 
     let actor = crate::middleware::instance_authz::require_instance_admin_for_group(
@@ -1324,6 +1315,7 @@ pub async fn list_plans(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(params): Query<PlanListQuery>,
 ) -> Result<Json<PlanListResponse>, ApiError> {
+    lifecycle_served(&state, "list_plans")?;
     use epigraph_db::repos::privatization::PrivatizationRepository;
 
     let Some(axum::Extension(ref auth)) = auth_ctx else {
@@ -1372,6 +1364,7 @@ pub async fn get_plan(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(plan_id): Path<Uuid>,
 ) -> Result<Json<PlanSummary>, ApiError> {
+    lifecycle_served(&state, "get_plan")?;
     use epigraph_db::repos::privatization::PrivatizationRepository;
 
     let Some(axum::Extension(ref auth)) = auth_ctx else {
@@ -1418,6 +1411,7 @@ pub async fn get_plan_items(
     Path(plan_id): Path<Uuid>,
     Query(params): Query<PlanItemQuery>,
 ) -> Result<Json<PlanItemsResponse>, ApiError> {
+    lifecycle_served(&state, "get_plan_items")?;
     use epigraph_db::repos::privatization::PrivatizationRepository;
 
     let Some(axum::Extension(ref auth)) = auth_ctx else {
@@ -1576,6 +1570,7 @@ pub async fn approve_plan(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(plan_id): Path<Uuid>,
 ) -> Result<Json<PlanStateResponse>, ApiError> {
+    lifecycle_served(&state, "approve_plan")?;
     use epigraph_db::repos::privatization::{PlanTransition, PrivatizationRepository};
 
     let Some(axum::Extension(ref auth)) = auth_ctx else {
@@ -1679,6 +1674,7 @@ pub async fn apply_plan(
     Path(plan_id): Path<Uuid>,
     Json(body): Json<ApplyRequest>,
 ) -> Result<(axum::http::StatusCode, Json<DispatchResponse>), ApiError> {
+    lifecycle_served(&state, "apply_plan")?;
     let Some(axum::Extension(ref auth)) = auth_ctx else {
         return Err(ApiError::Unauthorized {
             reason: "authentication required".to_string(),
@@ -1776,6 +1772,7 @@ pub async fn abort_plan(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(plan_id): Path<Uuid>,
 ) -> Result<Json<PlanStateResponse>, ApiError> {
+    lifecycle_served(&state, "abort_plan")?;
     use epigraph_db::repos::privatization::{PlanTransition, PrivatizationRepository};
 
     let Some(axum::Extension(ref auth)) = auth_ctx else {
@@ -1885,6 +1882,7 @@ pub async fn revert_plan(
     Path(plan_id): Path<Uuid>,
     Json(body): Json<RevertRequest>,
 ) -> Result<(axum::http::StatusCode, Json<DispatchResponse>), ApiError> {
+    lifecycle_served(&state, "revert_plan")?;
     use epigraph_db::repos::privatization::PrivatizationRepository;
 
     let Some(axum::Extension(ref auth)) = auth_ctx else {
@@ -1982,6 +1980,7 @@ pub async fn get_audit(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(params): Query<AuditQueryParams>,
 ) -> Result<Json<AuditResponse>, ApiError> {
+    lifecycle_served(&state, "get_audit")?;
     use epigraph_db::repos::privatization::{AuditQuery, PrivatizationRepository};
     use epigraph_db::repos::security_event::SecurityEventRepository;
 
@@ -2105,6 +2104,7 @@ pub async fn seal_manifest(
     Path(plan_id): Path<Uuid>,
     Query(params): Query<ManifestQuery>,
 ) -> Result<Json<SealManifest>, ApiError> {
+    lifecycle_served(&state, "seal_manifest")?;
     use epigraph_db::repos::privatization::PrivatizationRepository;
 
     let Some(axum::Extension(ref auth)) = auth_ctx else {
@@ -2242,6 +2242,7 @@ pub async fn seal_commit(
     Path(plan_id): Path<Uuid>,
     Json(body): Json<SealCommitRequest>,
 ) -> Result<Json<CommitResponse>, ApiError> {
+    lifecycle_served(&state, "seal_commit")?;
     use epigraph_db::repos::privatization::{
         PrivatizationRepository, SealCommitEvidence, SealCommitItem, SealCommitVersion,
     };
@@ -2464,6 +2465,7 @@ pub async fn unseal_manifest(
     Path(plan_id): Path<Uuid>,
     Query(params): Query<ManifestQuery>,
 ) -> Result<Json<UnsealManifest>, ApiError> {
+    lifecycle_served(&state, "unseal_manifest")?;
     use base64::Engine as _;
     use epigraph_db::repos::privatization::PrivatizationRepository;
 
@@ -2616,6 +2618,7 @@ pub async fn unseal_commit(
     Path(plan_id): Path<Uuid>,
     Json(body): Json<UnsealCommitRequest>,
 ) -> Result<Json<CommitResponse>, ApiError> {
+    lifecycle_served(&state, "unseal_commit")?;
     use epigraph_db::repos::privatization::{
         PrivatizationRepository, UnsealCommitEvidence, UnsealCommitItem, UnsealCommitVersion,
     };
@@ -3109,16 +3112,52 @@ async fn maintenance(state: &AppState) -> Result<epigraph_db::MaintenanceSession
     state
         .maintenance_viewer(SystemReason::PrivatizationSelection)
         .await
-        .map_err(|e| {
+        .map_err(|e| maintenance_error(e, "privatization lifecycle"))
+}
+
+/// Map a refused maintenance session to the route's answer: 501 MOVED when
+/// this unit serves no maintenance surface (operator decision D9), a 500
+/// otherwise.
+#[cfg(feature = "db")]
+fn maintenance_error(e: crate::state::MaintenanceViewerError, surface: &str) -> ApiError {
+    match e {
+        crate::state::MaintenanceViewerError::NotServed => {
+            ApiError::privatization_lifecycle_not_served(surface)
+        }
+        crate::state::MaintenanceViewerError::Db(e) => {
             tracing::error!(
                 target: "tenancy.privatization",
                 error = %e,
+                handler = surface,
                 "could not acquire the maintenance connection"
             );
             ApiError::InternalError {
                 message: "Failed to acquire a maintenance connection".to_string(),
             }
-        })
+        }
+    }
+}
+
+/// The first statement of every privatization lifecycle route (operator
+/// decision D9, batch W12a): the whole lifecycle surface, the GETs included,
+/// answers 501 MOVED on a unit that serves no maintenance surface, which is
+/// every request-serving `server`. Checked before anything else runs, so no
+/// route reads, writes or authorizes on the application pool first.
+///
+/// The lifecycle needs its own design before it can return: an authenticated
+/// two-person approval without a DB-holding request process, and an exact
+/// revert. A CLI has no authenticated principal, so it would lose the
+/// two-person rule; that is why nothing serves it meanwhile.
+///
+/// # Errors
+/// [`ApiError::MaintenanceSurfaceNotServed`] when not served.
+#[cfg(feature = "db")]
+fn lifecycle_served(state: &AppState, surface: &str) -> Result<(), ApiError> {
+    if state.serves_maintenance_surface() {
+        Ok(())
+    } else {
+        Err(ApiError::privatization_lifecycle_not_served(surface))
+    }
 }
 
 /// Load a plan on the ACTOR's own stamped connection, or 404.

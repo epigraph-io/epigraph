@@ -132,10 +132,12 @@ const MARKER: &str = "MAINTENANCE-DSN-EXEMPT:";
 /// a `42501` — so it constructs no unmaintained pool and
 /// `the_exemption_set_is_exactly_what_was_reviewed`'s "still needs the
 /// exemption" arm would now FAIL on the entry. The hybrid concern was real and
-/// is answered where it lives rather than by keeping a pool exemption for it:
-/// `epigraph-mcp/src/maintenance.rs::maintenance_tools_run_on_the_maintenance_connection`
-/// is a gate that does not key on the pool's presence, and that module's test
-/// pins that attaching a `ScopedPool` does not enable the three tools.
+/// is answered where it lives rather than by keeping a pool exemption for it.
+/// Under operator decision D9 (batch W12a) `main.rs` builds NO second,
+/// privileged pool any more (it refuses to start when `MAINTENANCE_DATABASE_URL`
+/// is set), so the three maintenance tools answer MOVED;
+/// `epigraph-mcp/src/maintenance.rs`'s tests pin that attaching a `ScopedPool`
+/// alone does not enable them.
 const EXEMPT: &[(&str, &str)] = &[
     (
         "crates/epigraph-cli/src/bin/compare_routes.rs",
@@ -182,7 +184,18 @@ fn repo_root() -> PathBuf {
 /// Directories and files scanned, all repo-relative.
 ///
 /// These are the processes that run with no caller: CLI binaries, the job
-/// crate, the API and MCP entry points, and the operator scripts.
+/// crate, the `drain_jobs` timer (in `epigraph-api/src/bin`), and the operator
+/// scripts.
+///
+/// Since operator decision D9 (batch W12a) the API `server` and
+/// `epigraph-mcp-full` are NOT background writers: they build only their
+/// application `ScopedPool`, hold no maintenance DSN and refuse to start when
+/// given one. They stay in the scan (a banned construction in either is still
+/// a finding) but the rule that they acquire no maintenance authority at all is
+/// `maintenance_surface_register.rs`'s, not this file's. The job queue's
+/// background writer is now `bin/drain_jobs.rs`, whose one pool is built with
+/// `ScopedPool::connect_with_options` on the DSN `maintenance_database_url`
+/// returned (the fallback refused).
 const RUST_ROOTS: &[&str] = &[
     "crates/epigraph-cli/src/bin",
     "crates/epigraph-jobs/src",

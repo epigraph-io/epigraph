@@ -3,7 +3,8 @@
 # path must be measured on. Written 2026-09-23; run-e2e.sh has referenced this
 # file since it was authored, but it did not exist on disk.
 #
-#   CONFIG A  the clean public migration series (001 -> 101), nothing else.
+#   CONFIG A  the clean public migration series (001 -> head, 112 at batch H-b),
+#             nothing else.
 #   CONFIG B  A + the three orphan PERMISSIVE *_privacy policies and the two
 #             helper functions they call, replayed verbatim from production
 #             (captured from the live definitions with pg_get_expr).
@@ -39,7 +40,7 @@ E2E_DB="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*/([^/?]+)$#\1#')"
 set -euo pipefail
 WANT="${1:?usage: set-config.sh a|b}"
 export PGPASSWORD="$E2E_SU_PW"
-q() { psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -v ON_ERROR_STOP=1 -tA -c "$1"; }
+q() { psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -v ON_ERROR_STOP=1 -tA -c "$1"; }
 
 case "${WANT,,}" in
   a)

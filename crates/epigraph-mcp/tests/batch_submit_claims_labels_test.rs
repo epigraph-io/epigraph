@@ -23,12 +23,17 @@ async fn batch_submit_claims_attaches_per_entry_labels(pool: PgPool) {
         epigraph_mcp::types::BatchSubmitClaimsParams {
             claims: vec![epigraph_mcp::types::BatchClaimEntry {
                 content: content.into(),
+                methodology: None,
+                source_url: None,
+                reasoning: None,
+                novelty_threshold: None,
                 evidence_data: "ev".into(),
                 evidence_type: "logical".into(),
                 confidence: Some(0.8),
                 labels: vec!["capability-registry".into()],
             }],
         },
+        None,
     )
     .await
     .unwrap();

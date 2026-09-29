@@ -164,3 +164,39 @@ async fn theme_rebuild_runs_when_corpus_changed(pool: PgPool) {
         "rebuild produced no themes (summary={summary:?})"
     );
 }
+
+/// The rebuild is ONE transaction since 5cafc60a, so `NOW()` is the same
+/// instant for every statement in it: the `claims.updated_at` that
+/// `bulk_assign` writes and the `claim_themes.updated_at` that `update_count`
+/// writes are now EQUAL, where the old statement-by-statement run left the
+/// theme strictly later. The skip-check compares with `>=`, so a rebuild
+/// followed by an unchanged corpus must still skip on the next tick. Pinned on
+/// a real `run_theme_kmeans` (claims at NOW(), not seeded into the future), so
+/// a skip-check that required strict ordering would make the scheduled job
+/// rebuild on every tick, and this test would say so.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_real_rebuild_is_followed_by_a_skip(pool: PgPool) {
+    seed_claims_with_embeddings(&pool, 12, false).await;
+
+    let first = ThemeClusterRebuildHandler::handle_direct(&pool, 8, 2, true)
+        .await
+        .expect("first rebuild");
+    assert!(
+        !first.skipped,
+        "no themes existed, so the first run must rebuild"
+    );
+    assert!(
+        first.themes_created > 0,
+        "the first run built no themes: {first:?}"
+    );
+
+    let second = ThemeClusterRebuildHandler::handle_direct(&pool, 8, 2, true)
+        .await
+        .expect("second run");
+    assert!(
+        second.skipped,
+        "the corpus did not change after the rebuild, so the next tick must skip; it rebuilt \
+         instead ({second:?}), which means the skip-check no longer holds under the rebuild's \
+         single transaction timestamp"
+    );
+}

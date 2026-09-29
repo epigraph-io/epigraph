@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH seen AS (\n                    SELECT 1 FROM edges\n                     WHERE source_id = $1 AND source_type = $2\n                       AND target_id = $3 AND target_type = $4\n                       AND valid_to IS NULL),\n                 done AS (\n                    UPDATE edges\n                       SET valid_to = now()\n                    WHERE source_id = $1 AND source_type = $2\n                      AND target_id = $3 AND target_type = $4\n                      AND valid_to IS NULL\n                    RETURNING 1)\n            SELECT (SELECT count(*) FROM seen) AS \"seen!\", (SELECT count(*) FROM done) AS \"done!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seen!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "done!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "5c93300fdf22ae5932664e1825a12be16f304573a18533c73b2fa2ab5c93cf8d"
+}

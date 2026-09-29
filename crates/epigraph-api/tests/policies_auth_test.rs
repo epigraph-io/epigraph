@@ -192,6 +192,49 @@ async fn create_challenge_with_claims_write_returns_200() {
     );
 }
 
+/// A repeat request for the same (host, port, protocol) must answer 200 with
+/// the existing challenge's id, not a 500 from `uq_claims_content_hash_agent`.
+///
+/// The host carries a fresh UUID: this binary runs against a shared
+/// `DATABASE_URL`, and a fixed host would let a row left by an earlier run
+/// make BOTH requests repeats, so the first-create path would go unexercised.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_challenge_called_twice_is_idempotent() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let token = common::test_bearer_token_with_scopes(&["claims:write"]);
+    let body = serde_json::json!({
+        "host": format!("idempotent-{}.example.com", Uuid::new_v4()),
+        "port": 8443,
+        "protocol": "https"
+    });
+
+    let mut ids = Vec::new();
+    for which in ["first", "repeat"] {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/policy-challenges"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert_eq!(
+            status, 200,
+            "expected {which} request to return 200; body={text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        ids.push(v["id"].as_str().expect("id present").to_string());
+    }
+    assert_eq!(
+        ids[1], ids[0],
+        "repeat request for the same (host, port, protocol) must return the \
+         existing challenge's id, not create a duplicate"
+    );
+}
+
 // ── resolve_challenge ─────────────────────────────────────────────────────────
 
 /// No token → 401.

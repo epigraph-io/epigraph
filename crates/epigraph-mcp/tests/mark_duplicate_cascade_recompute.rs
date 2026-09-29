@@ -25,7 +25,7 @@ mod fixture;
 
 mod common;
 
-use common::{admin_auth, build_scoped_test_server, seed_claim, seed_claim_with_belief};
+use common::{build_scoped_test_server, seed_claim, seed_claim_with_belief};
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
 use epigraph_mcp::tools::supersede::mark_duplicate;
 use epigraph_mcp::types::{LinkEpistemicParams, MarkDuplicateParams};
@@ -48,6 +48,7 @@ async fn wire(
             relationship: relationship.to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("link_epistemic");
@@ -86,6 +87,7 @@ async fn link_only(
             relationship: relationship.to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("link_epistemic");
@@ -104,20 +106,22 @@ fn body(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 }
 
 async fn dedup(
+    pool: &PgPool,
     server: &epigraph_mcp::server::EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    _viewer: &epigraph_db::visibility::Viewer,
     dup: Uuid,
     canonical: Uuid,
 ) -> serde_json::Value {
+    let (auth, admin_viewer) = common::granted_server_admin(server, pool).await;
     let result = mark_duplicate(
         server,
-        viewer,
+        &admin_viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
             reason: Some("cascade regression fixture".to_string()),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("mark_duplicate succeeds");
@@ -214,7 +218,12 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
     let dup = seed_claim(&pool, "duplicate claim", 0.5).await;
@@ -242,15 +251,16 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
          live on the edge's TARGET)"
     );
 
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
     mark_duplicate(
         &server,
-        &viewer,
+        &admin_viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
             reason: Some("cascade regression fixture".to_string()),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("mark_duplicate succeeds");
@@ -330,7 +340,12 @@ async fn resourced_outgoing_edge_bba_is_re_derived_from_canonical(pool: PgPool) 
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     // `canonical` earns a HIGH interval from its own supporter W, so it is a
     // real (BBA-backed) interval rather than a hand-planted column value.
@@ -348,7 +363,7 @@ async fn resourced_outgoing_edge_bba_is_re_derived_from_canonical(pool: PgPool) 
         .await
         .expect("fixture: dup --supports--> V carries a BBA on V");
 
-    let json = dedup(&server, &viewer, dup, canonical).await;
+    let json = dedup(&pool, &server, &viewer, dup, canonical).await;
 
     // The edge itself moved to `canonical`...
     let (edge_after, masses_after) = edge_bba(&pool, canonical, v, "supports")
@@ -416,7 +431,12 @@ async fn target_of_both_a_collision_delete_and_a_resourced_edge_is_recomputed_la
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     // Factorless canonical: NULL belief/plausibility, exactly as
     // `ClaimRepository::supersede` and a plain `submit_claim` leave a claim.
@@ -441,7 +461,7 @@ async fn target_of_both_a_collision_delete_and_a_resourced_edge_is_recomputed_la
         "fixture: V starts with a cached BetP derived from dup's BBAs"
     );
 
-    let json = dedup(&server, &viewer, dup, canonical).await;
+    let json = dedup(&pool, &server, &viewer, dup, canonical).await;
 
     assert_eq!(orphaned_bba_count(&pool).await, 0);
     assert_eq!(stranded_bba_count(&pool).await, 0);
@@ -508,7 +528,12 @@ async fn bba_free_dedup_leaves_the_survivors_derived_columns_alone(pool: PgPool)
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
     let dup = seed_claim(&pool, "duplicate claim", 0.5).await;
@@ -542,7 +567,7 @@ async fn bba_free_dedup_leaves_the_survivors_derived_columns_alone(pool: PgPool)
          exactly why an unconditional clear is a mutation"
     );
 
-    let json = dedup(&server, &viewer, dup, canonical).await;
+    let json = dedup(&pool, &server, &viewer, dup, canonical).await;
 
     let after = read(canonical, pool.clone()).await;
     assert_eq!(

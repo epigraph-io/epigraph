@@ -119,19 +119,51 @@ pub struct BackfillEmbeddingsParams {
 ///
 /// Selection reuses `ClaimRepository::find_claims_needing_embeddings`, which
 /// excludes host-provenance telemetry and `is_current = false` rows per the
-/// invariant. Each vector is stored via `ClaimRepository::store_embedding`
-/// (an `UPDATE claims SET embedding`), so a failure on one claim is reported,
-/// not fatal — mirroring the CLI's per-row accounting.
+/// invariant. A failure on one claim is reported, not fatal — mirroring the
+/// CLI's per-row accounting.
+///
+/// # On the maintenance session's connection
+///
+/// Selection and every store run on `session`'s connection, which
+/// `maintenance::maintenance_viewer` has checked can bypass RLS. The gap is
+/// corpus-wide, so a per-tenant view would leave every other tenant unembedded.
+/// The server's application pool is never named here
+/// (`tests/maintenance_tools_spend_only_the_session.rs`).
+///
+/// # `store_embedding_if_unsealed`, chosen, not substituted
+///
+/// Each vector is stored with `ClaimRepository::store_embedding_if_unsealed`
+/// and the session's bypass viewer, NOT with `store_embedding`. That is a
+/// behavioural choice, and it is made because of the window. The read that
+/// selected a claim and the write that stores its vector are separated by a
+/// provider round trip, and inside it a claim can be SEALED or SUPERSEDED.
+/// `store_embedding_if_unsealed` takes the row lock first and re-checks
+/// `claim_encryption` and `is_current` against a snapshot that includes
+/// anything committed during the wait. `store_embedding` re-checks only the
+/// seal, and only against its own statement snapshot. A superseded claim
+/// therefore reports `failed` with "store matched no row" rather than
+/// receiving a vector CLAUDE.md says it must not carry. The bypass viewer
+/// renders its `{WRITABLE:c}` marker as nothing and binds nothing.
+///
+/// # One connection, held across the provider calls; no transaction held
+///
+/// The session's connection is held for the whole call (up to `limit` = 2000
+/// provider round trips) rather than re-leased per store. That keeps the
+/// bypass viewer inseparable from its connection, which is what
+/// `MaintenanceSession` exists for, and costs one of the small maintenance
+/// pool's connections for the duration. No TRANSACTION spans a provider call:
+/// each store opens and commits its own.
 pub async fn backfill_embeddings(
     server: &EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    session: &mut epigraph_db::MaintenanceSession<'_>,
     params: BackfillEmbeddingsParams,
 ) -> Result<CallToolResult, McpError> {
+    let (conn, viewer) = session.split();
     let limit = params.limit.unwrap_or(200).clamp(1, 2000);
     let dry_run = params.dry_run.unwrap_or(false);
 
     let rows =
-        epigraph_db::ClaimRepository::find_claims_needing_embeddings(&server.pool, viewer, limit)
+        epigraph_db::ClaimRepository::find_claims_needing_embeddings(&mut *conn, viewer, limit)
             .await
             .map_err(internal_error)?;
     let candidates = rows.len();
@@ -165,13 +197,21 @@ pub async fn backfill_embeddings(
         match server.embedder.generate(&content).await {
             Ok(vec) => {
                 let pgvec = crate::embed::format_pgvector(&vec);
-                match epigraph_db::ClaimRepository::store_embedding(&server.pool, claim_id, &pgvec)
-                    .await
+                match epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+                    &mut *conn, viewer, claim_id, &pgvec,
+                )
+                .await
                 {
                     Ok(true) => embedded += 1,
                     Ok(false) => {
                         failed += 1;
-                        push_capped(&mut errors, format!("{claim_id}: store affected 0 rows"));
+                        push_capped(
+                            &mut errors,
+                            format!(
+                                "{claim_id}: store matched no row (deleted, sealed or superseded \
+                                 since it was selected)"
+                            ),
+                        );
                     }
                     Err(e) => {
                         failed += 1;

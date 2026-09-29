@@ -50,7 +50,7 @@ enum Command {
         #[arg(long, default_value = "0.3")]
         search_radius: f64,
         /// Agent UUID
-        #[arg(long, env = "EPIGRAPH_AGENT_ID")]
+        #[arg(long, env = "EPIGRAPH_AGENT_ID", hide_env_values = true)]
         agent_id: Uuid,
         /// Optional research question
         #[arg(long)]

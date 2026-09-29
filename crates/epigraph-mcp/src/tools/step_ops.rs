@@ -58,12 +58,45 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
     match e {
         E::Invalid(msg) | E::WorkflowNotFound(msg) => invalid_params(msg),
         E::StepNotFound { .. } | E::PhaseMissing => invalid_params(e.to_string()),
+        // A denial of authority over a row (the chain edge, the step claim),
+        // not a server fault and not a parameter the caller can fix: the same
+        // INVALID_REQUEST `db_caller_error` gives migration 105's refusals.
+        E::ChainRewireRefused { .. } | E::StepNotWritable { .. } => McpError {
+            code: rmcp::model::ErrorCode::INVALID_REQUEST,
+            message: std::borrow::Cow::from(e.to_string()),
+            data: None,
+        },
         // Migration 105's personal-group refusal (the step claim's owner
         // declaration): a denial, as on every other write tool.
         E::Repo(db) if db.is_personal_group_refusal() => crate::errors::db_caller_error(db),
         E::Executor(x) => crate::errors::executor_caller_error("executor error", x),
         E::Db(_) | E::Repo(_) => internal_error(e.to_string()),
     }
+}
+
+/// The caller's authority over the head of `canonical_name` (batch H-b, H3;
+/// see `tools::workflow_authority`). An unknown name is left to the executor,
+/// which reports it as not found. Returns the head and the grant, so an admin
+/// write can be audited on the same transaction once it has been made.
+async fn require_authority_over(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
+    canonical_name: &str,
+    tool_name: &'static str,
+) -> Result<Option<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)>, McpError> {
+    let Some(head) = epigraph_db::WorkflowRepository::head_by_canonical(&mut *conn, canonical_name)
+        .await
+        .map_err(|e| internal_error(format!("{tool_name}: could not resolve the workflow: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let grant = crate::tools::workflow_authority::require_workflow_authority(
+        server, conn, auth, caller, head, tool_name,
+    )
+    .await?;
+    Ok(Some((head, grant)))
 }
 
 /// Append or middle-insert a step under an existing workflow.
@@ -86,10 +119,24 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
 /// and the INSERT carries `ON CONFLICT (id) DO NOTHING`.
 pub async fn add_step(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: AddStepParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    let caller = server.write_identity(auth, viewer).await?;
     let (_system_agent_id, mut tx) =
         crate::claim_helper::begin_system_ingest_stamped_tx(server, "add_step").await?;
+    // H3 (batch H-b): the CALLER's authority over the workflow, before the
+    // system-stamped write. The stamp stays the system agent's.
+    let authority = require_authority_over(
+        server,
+        &mut tx,
+        auth,
+        caller,
+        &params.canonical_name,
+        "add_step",
+    )
+    .await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
         &params.canonical_name,
@@ -98,6 +145,24 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
+    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
+        crate::tools::workflow_authority::audit_admin_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            "add_step",
+            head,
+            grant.owner,
+            serde_json::json!({
+                "canonical_name": params.canonical_name,
+                "step_claim_id": r.step_claim_id,
+                "step_lineage_id": r.step_lineage_id,
+                "step_index": r.step_index,
+                "already_present": r.already_present,
+            }),
+        )
+        .await?;
+    }
     tx.commit()
         .await
         .map_err(|e| internal_error(format!("add_step: could not commit: {e}")))?;
@@ -132,14 +197,44 @@ pub async fn add_step(
 /// on a clean migrate.
 pub async fn delete_step(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DeleteStepParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let lineage = parse_uuid(&params.step_lineage_id)?;
+    let caller = server.write_identity(auth, viewer).await?;
     let (_system_agent_id, mut tx) =
         crate::claim_helper::begin_system_ingest_stamped_tx(server, "delete_step").await?;
+    // H3 (batch H-b); see `add_step`.
+    let authority = require_authority_over(
+        server,
+        &mut tx,
+        auth,
+        caller,
+        &params.canonical_name,
+        "delete_step",
+    )
+    .await?;
     let r = epigraph_ingest_executor::delete_step(&mut tx, &params.canonical_name, lineage)
         .await
         .map_err(map_step_err)?;
+    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
+        crate::tools::workflow_authority::audit_admin_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            "delete_step",
+            head,
+            grant.owner,
+            serde_json::json!({
+                "canonical_name": params.canonical_name,
+                "step_claim_id": r.step_claim_id,
+                "step_lineage_id": r.step_lineage_id,
+                "truth_value_after": r.truth_value,
+            }),
+        )
+        .await?;
+    }
     tx.commit()
         .await
         .map_err(|e| internal_error(format!("delete_step: could not commit: {e}")))?;

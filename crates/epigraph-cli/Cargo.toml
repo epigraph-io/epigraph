@@ -126,8 +126,20 @@ path = "tests/recompute_betp_cohort.rs"
 required-features = ["db"]
 
 [[test]]
+name = "operator_reown"
+path = "tests/operator_reown.rs"
+required-features = ["db"]
+
+[[test]]
 name = "recompute_betp_run"
 path = "tests/recompute_betp_run.rs"
+required-features = ["db"]
+
+# Runs most of this crate's `db`-gated binaries' `--help`; without `db` their
+# `CARGO_BIN_EXE_*` do not exist and the test would not compile.
+[[test]]
+name = "help_hides_env_values"
+path = "tests/help_hides_env_values.rs"
 required-features = ["db"]
 
 [[bin]]
@@ -148,6 +160,21 @@ required-features = ["db"]
 [[bin]]
 name = "retire_match_candidates"
 path = "src/bin/retire_match_candidates.rs"
+required-features = ["db"]
+
+# Migration 117 (batch W10): replay deferred administrative cascades on the
+# maintenance connection.
+[[bin]]
+name = "replay_deferred_cascades"
+path = "src/bin/replay_deferred_cascades.rs"
+required-features = ["db"]
+
+# Operator decision D9 (batch W12a): the semantic-duplicate sweep, moved off the
+# MCP server (whose tool now answers MOVED) onto the maintenance connection,
+# with every collapse audited through the administrative cascade.
+[[bin]]
+name = "sweep_semantic_duplicates"
+path = "src/bin/sweep_semantic_duplicates.rs"
 required-features = ["db"]
 
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
@@ -193,6 +220,15 @@ required-features = ["db"]
 # dependencies are per-crate, not per-target, so the compiled artifact carries
 # them. "Never linked into the server" is a property of where the key material
 # goes, not something this manifest can enforce.
+# `epigraph-operator`: the one-time operator ownership backfill (retired links,
+# claim re-own, and its manifest-driven reversal). Same convention as its
+# siblings: a snake_case path with a kebab-case `name`. `required-features =
+# ["db"]` because every subcommand opens a maintenance pool.
+[[bin]]
+name = "epigraph-operator"
+path = "src/bin/operator.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "epigraph-group"
 path = "src/bin/group.rs"

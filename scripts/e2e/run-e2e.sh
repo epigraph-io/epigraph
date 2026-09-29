@@ -52,7 +52,7 @@ SU="$E2E_SU_DSN"
 DSN="$E2E_APP_DSN"
 H=(-H Content-Type:application/json -H Accept:application/json,text/event-stream)
 
-q() { PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
+q() { PGPASSWORD="$E2E_SU_PW" psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
 
 echo "### binary: $BIN"
 
@@ -67,7 +67,7 @@ echo "### binary: $BIN"
 LOCKFIFO="$E2E/.lock.$LABEL"
 rm -f "$LOCKFIFO"; mkfifo "$LOCKFIFO"
 PGPASSWORD="$E2E_SU_PW" \
-  psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
+  psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
   -c "SELECT pg_advisory_lock(918273645);" -f "$LOCKFIFO" >/dev/null 2>&1 &
 LOCKPID=$!
 exec 9>"$LOCKFIFO"          # holds the psql (and thus the lock) open
@@ -82,7 +82,7 @@ q "TRUNCATE claims, evidence, edges, reasoning_traces, mass_functions, claim_fra
 rm -f "$SOCK"
 DATABASE_URL="$DSN" RUST_LOG=warn "$BIN" \
   --agent-key "$E2E_AGENT_KEY" \
-  --listen "unix:$SOCK" --allow-unauthenticated-http > "$E2E/mcp.$LABEL.log" 2>&1 &
+  --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} > "$E2E/mcp.$LABEL.log" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; release_lock' EXIT
 for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 1; done

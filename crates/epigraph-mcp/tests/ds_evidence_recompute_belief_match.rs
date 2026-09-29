@@ -113,6 +113,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
             evidence_type: None,
             locality_tag: None,
         },
+        None,
     )
     .await
     .expect("submit_ds_evidence");
@@ -133,7 +134,11 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
     // same number from the exact same stored BBA rows.
     let recompute_out = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -230,6 +235,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
                 evidence_type: None,
                 locality_tag: None,
             },
+            None,
         )
         .await
         .expect("submit_ds_evidence");
@@ -246,7 +252,11 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
 
     let recompute_out = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,

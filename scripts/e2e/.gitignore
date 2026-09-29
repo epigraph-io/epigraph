@@ -21,3 +21,17 @@ dh.*
 dsn
 .uelock.*
 ueh.*
+.bhlock.*
+bhh.*
+.hwlock.*
+.hw.*
+.hllock.*
+.hl.*
+.oplock.*
+op.*.err
+op.*.out
+.hidlock.*
+hidh.*
+hid.agents.*
+hid.claims.*
+hid.manifest.*

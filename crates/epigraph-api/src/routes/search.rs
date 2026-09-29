@@ -596,8 +596,8 @@ pub async fn semantic_search(
         // `epigraph_db::ScopedPoolOptions::default()` — cited rather than
         // transcribed so a sizing change invalidates the citation instead of
         // silently invalidating this comment. (An earlier revision wrote "8",
-        // which is the background JOB pool; see `bin/server.rs`'s connection
-        // budget.) Bounded regardless: at most six statements on one handle, no
+        // which was the background JOB pool; since operator decision D9 that
+        // pool lives in `bin/drain_jobs.rs`, not in this process.) Bounded regardless: at most six statements on one handle, no
         // per-node loop, no unbounded N. `detect_voids` in `routes/voids.rs` is
         // the shape in this shard that is NOT bounded; its own doc says so.
         // This shard does NOT discharge

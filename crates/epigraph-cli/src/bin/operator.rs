@@ -1,0 +1,362 @@
+//! `epigraph-operator` — the one-time operator ownership backfill.
+//!
+//! See `epigraph_cli::operator` for what each subcommand does and why. This
+//! file is argument parsing and exit codes only.
+//!
+//! Every subcommand is a DRY RUN unless `--apply` is given (the two scope
+//! commands take exactly one of `--dry-run` / `--apply`, and refuse neither),
+//! and every subcommand connects on `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` alone
+//! and refuses a session user that is not a member of `epigraph_maintenance`.
+//!
+//! Exit codes: 0 success; 1 refused or failed before writing (for
+//! `hide-evidence --apply`, also an invariant violation, rolled back); 2 a
+//! batch violated an invariant and was rolled back (under `--apply` the run
+//! stops there); 3 `link-retired` refused at least one id, or `reown-reverse`
+//! HELD at least one claim or hidden row (it is not fully restored).
+//!
+//! Usage:
+//!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
+//!         [--attest-shared-signer <uuid,...>] [--apply]
+//!     epigraph-operator reown-claims --claims-file claims.txt --operator <uuid> \
+//!         --derived follow-claim --manifest-out reown-1.jsonl [--apply]
+//!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl [--apply]
+//!     epigraph-operator hide-evidence --claims-file claims.txt --operator <uuid> \
+//!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
+//!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
+//!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
+//!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
+//!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
+
+use clap::{Parser, Subcommand};
+use epigraph_cli::operator::{self, client_scope, hide, link, reown, reverse};
+use std::path::PathBuf;
+use uuid::Uuid;
+
+#[derive(Parser)]
+#[command(
+    name = "epigraph-operator",
+    about = "Operator ownership backfill (retired links, claim re-own, and its reversal) and \
+             audited admin-only scope grants on human OAuth clients"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Record a RETIRED operator link for each agent id in a file.
+    LinkRetired {
+        /// One agent UUID per line; `#` comments and blank lines ignored.
+        #[arg(long)]
+        agents_file: PathBuf,
+        /// The operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// Retire FORMER shared HTTP signers (batch HTTP-id, migration 116):
+        /// the principals, besides the operator, that the listed agents'
+        /// OPERATED_BY auth-lineage names and whose every write through them
+        /// the operator attests is its own (comma-separated; may be empty).
+        /// Without this flag each id goes through 107's retire, which refuses
+        /// a shared signer. With it, `--agents-file` must list exactly one id.
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        attest_shared_signer: Option<Vec<Uuid>>,
+        /// Perform the calls. Without it, every call runs in a transaction that
+        /// is rolled back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Move the listed claims, and the rows they carry, into the operator's
+    /// personal group.
+    ReownClaims {
+        /// One claim UUID per line; only these claims are ever touched.
+        #[arg(long)]
+        claims_file: PathBuf,
+        /// The operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// What a derived row written by an agent NOT linked to the operator
+        /// does. Required: it is a policy decision, so there is no default.
+        #[arg(long, value_enum)]
+        derived: reown::DerivedMode,
+        /// Where to write the undo manifest. Must not exist. Written and
+        /// fsynced before the first write under `--apply`.
+        #[arg(long)]
+        manifest_out: PathBuf,
+        /// Perform the writes. Without it, every batch runs in its own
+        /// transaction that is rolled back when the batch ends.
+        #[arg(long)]
+        apply: bool,
+        /// Claims per transaction.
+        #[arg(long, default_value_t = 200)]
+        batch_size: usize,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+        /// Opt-in evidence hiding. With none of these the run is unchanged.
+        #[command(flatten)]
+        hide: hide::HideArgs,
+    },
+    /// Report, and with `--apply` hide and pin, selected evidence on the
+    /// operator's claims. Reversed by `reown-reverse --manifest`.
+    HideEvidence {
+        /// One claim UUID per line: the claims whose evidence is in scope.
+        #[arg(long)]
+        claims_file: PathBuf,
+        /// The operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        #[command(flatten)]
+        hide: hide::HideArgs,
+        /// Hide the selected rows. Needs `--confirm-hide <N>` and
+        /// `--manifest-out`, and the kernel pin guard (migration 110).
+        #[arg(long)]
+        apply: bool,
+        /// Where to write the undo manifest under `--apply`. Must not exist.
+        /// Written and fsynced before the write.
+        #[arg(long)]
+        manifest_out: Option<PathBuf>,
+        /// Recorded on every pin.
+        #[arg(
+            long,
+            default_value = "hidden by the operator (epigraph-operator hide-evidence)"
+        )]
+        reason: String,
+        /// `lock_timeout` for the write (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+    },
+    /// Grant ONE admin-only scope to a HUMAN's own OAuth client, in both
+    /// `allowed_scopes` and `granted_scopes`, with a `security_events` row.
+    GrantClientScope(ScopeArgs),
+    /// Revoke ONE admin-only scope from a HUMAN's own OAuth client, from both
+    /// arrays, with a `security_events` row. A live access token keeps the
+    /// scope until it expires; the next refresh drops it.
+    RevokeClientScope(ScopeArgs),
+    /// Restore every row a manifest's run moved to the owner it recorded.
+    ReownReverse {
+        /// A manifest to reverse. Repeatable: several are applied newest-first
+        /// by their header `created_at`, whatever order they are given in.
+        #[arg(long, required = true)]
+        manifest: Vec<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, default_value_t = 200)]
+        batch_size: usize,
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+    },
+}
+
+/// The arguments of `grant-client-scope` and `revoke-client-scope`.
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("mode").required(true).args(["dry_run", "apply"])))]
+struct ScopeArgs {
+    /// The client's `oauth_clients.id` (a UUID; not the `client_id` string).
+    client: Uuid,
+    /// An admin-only scope (`epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES`).
+    scope: String,
+    /// Run everything, the audit row included, in a transaction that is rolled
+    /// back, and print what would change.
+    #[arg(long)]
+    dry_run: bool,
+    /// Commit the change and its audit row.
+    #[arg(long)]
+    apply: bool,
+    /// Recorded in the audit row.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+async fn main_inner() -> anyhow::Result<i32> {
+    let cli = Cli::parse();
+    // Refuse a non-admin-only scope before any connection is made.
+    if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
+        client_scope::validate_scope(&a.scope)?;
+    }
+    if let Command::ReownClaims { batch_size, .. } | Command::ReownReverse { batch_size, .. } =
+        &cli.command
+    {
+        if *batch_size == 0 {
+            anyhow::bail!("--batch-size must be at least 1");
+        }
+    }
+    let db = operator::connect().await?;
+    eprintln!(
+        "epigraph-operator: connected as {} (member of epigraph_maintenance)",
+        db.session_user
+    );
+    let mut conn = db.pool().acquire().await?;
+    let mut stdout = std::io::stdout();
+    match cli.command {
+        Command::LinkRetired {
+            agents_file,
+            operator: op,
+            attest_shared_signer,
+            apply,
+        } => {
+            let agents = operator::read_ids_file(&agents_file)?;
+            if agents.is_empty() {
+                anyhow::bail!("no agent ids in {}", agents_file.display());
+            }
+            // An attestation covers ONE former signer: the principals it names
+            // are the ones THAT signer carried. Applied to several ids, one set
+            // would be recorded as attested for every signer in the file.
+            if attest_shared_signer.is_some() && agents.len() > 1 {
+                anyhow::bail!(
+                    "--attest-shared-signer attests the principals of ONE former shared signer, \
+                     but {} lists {} agent ids; run it once per signer with a one-id file",
+                    agents_file.display(),
+                    agents.len()
+                );
+            }
+            println!(
+                "link-retired: operator={op} agents={} mode={}{}",
+                agents.len(),
+                if apply { "APPLY" } else { "DRY-RUN" },
+                match &attest_shared_signer {
+                    Some(p) => format!(" shared-signer attested={p:?}"),
+                    None => String::new(),
+                }
+            );
+            let results = link::run(
+                &mut conn,
+                &agents,
+                op,
+                attest_shared_signer.as_deref(),
+                apply,
+            )
+            .await?;
+            let mut refused = 0;
+            for (a, s) in &results {
+                if s.is_refusal() {
+                    refused += 1;
+                }
+                println!("{}", link::describe(*a, s));
+            }
+            if !apply {
+                println!("DRY RUN: every call above ran and was rolled back.");
+            }
+            Ok(if refused > 0 { 3 } else { 0 })
+        }
+        Command::ReownClaims {
+            claims_file,
+            operator: op,
+            derived,
+            manifest_out,
+            apply,
+            batch_size,
+            lock_timeout,
+            hide,
+        } => {
+            let ids = operator::read_ids_file(&claims_file)?;
+            if ids.is_empty() {
+                anyhow::bail!("no claim ids in {}", claims_file.display());
+            }
+            let opts = reown::Options {
+                operator: op,
+                mode: derived,
+                manifest_out,
+                apply,
+                batch_size,
+                lock_timeout,
+                hide,
+            };
+            reown::validate(&opts)?;
+            let report = reown::run(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(if report.batch_failures.is_empty() {
+                0
+            } else {
+                2
+            })
+        }
+        Command::HideEvidence {
+            claims_file,
+            operator: op,
+            hide,
+            apply,
+            manifest_out,
+            reason,
+            lock_timeout,
+        } => {
+            let ids = operator::read_ids_file(&claims_file)?;
+            if ids.is_empty() {
+                anyhow::bail!("no claim ids in {}", claims_file.display());
+            }
+            let opts = hide::Standalone {
+                operator: op,
+                args: hide,
+                apply,
+                manifest_out,
+                reason,
+                lock_timeout,
+            };
+            hide::run_standalone(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(0)
+        }
+        Command::GrantClientScope(a) | Command::RevokeClientScope(a) if !a.dry_run && !a.apply => {
+            // Unreachable through clap (the `mode` group is required); kept so
+            // a refactor that drops the group cannot turn a bare invocation
+            // into a write.
+            anyhow::bail!("exactly one of --dry-run or --apply is required")
+        }
+        cmd @ (Command::GrantClientScope(_) | Command::RevokeClientScope(_)) => {
+            let (op, a) = match cmd {
+                Command::GrantClientScope(a) => (client_scope::ScopeOp::Grant, a),
+                Command::RevokeClientScope(a) => (client_scope::ScopeOp::Revoke, a),
+                _ => unreachable!("matched above"),
+            };
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome = client_scope::run(
+                &mut conn,
+                op,
+                a.client,
+                &a.scope,
+                a.apply,
+                a.reason.as_deref(),
+                &who,
+            )
+            .await?;
+            println!("{}", client_scope::describe(&outcome));
+            Ok(0)
+        }
+        Command::ReownReverse {
+            manifest,
+            apply,
+            batch_size,
+            lock_timeout,
+        } => {
+            let opts = reverse::Options {
+                manifests: manifest,
+                apply,
+                batch_size,
+                lock_timeout,
+            };
+            let report = reverse::run(&mut conn, &opts, &mut stdout).await?;
+            Ok(if !report.batch_failures.is_empty() {
+                2
+            } else if !report.held.is_empty() {
+                3
+            } else {
+                0
+            })
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    match main_inner().await {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("epigraph-operator: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}

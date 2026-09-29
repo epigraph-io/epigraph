@@ -57,7 +57,10 @@ use std::path::{Path, PathBuf};
 ///   PR-11 removed two names, and the "(18)" this doc previously carried was a
 ///   pre-existing miscount — the base array held 17 write-group entries. The
 ///   array length is what the test asserts, so nothing was broken by it; it is
-///   corrected here rather than silently absorbed. Converting one needs write
+///   corrected here rather than silently absorbed. (Batch W10's revision
+///   removed `retire_match_candidate`, which now acquires a viewer; the array
+///   holds 10 write-group entries after it. The array, not this number, is
+///   what the test asserts.) Converting one needs write
 ///   authority —
 ///   member-with-write-role, not merely member-who-can-read. That mechanism
 ///   turned out to **already exist**: `Viewer::resolve` has split `writable`
@@ -101,23 +104,22 @@ use std::path::{Path, PathBuf};
 ///     `claim_themes` `tenancy_exempt` residual **without its stated control**;
 ///     that is the single largest thing PR-09 does not deliver.
 const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
+    // Batch H-b removed `challenge_claim`, `create_perspective`,
+    // `ingest_document_spine` and `retire_match_candidate`: each now authors or
+    // records its acting agent as the request's principal
+    // (`EpiGraphMcpFull::write_identity`), which is read off the viewer. It
+    // also removed `add_step` and `delete_step`, which now check the caller's
+    // authority over the workflow (H3).
     // write / decide — PR-16 owns the SQL write-side predicate for these.
     // `assign_ownership` and `update_partition` left this list in PR-11: they
     // now acquire a viewer, spend its `writable_groups()`/principal on
     // `epigraph_authz::GroupPolicyGate`, and refuse a caller who is neither the
     // node's owner nor a writer in its owning group.
-    "add_step",
-    "challenge_claim",
+    // The batch H-b review removed `publish_event` (over HTTP its actor must be
+    // the request's principal, read off the viewer) and
+    // `set_source_reliability` (read, owned and written as that principal).
     "create_frame",
-    "create_perspective",
-    "delete_edge",
-    "delete_step",
-    "ingest_document_spine",
-    "patch_edge",
-    "publish_event",
     "report_hierarchical_outcome",
-    "retire_match_candidate",
-    "set_source_reliability",
     "structure_source",
     // pure-CPU, no DB
     "list_mcp_tools",
@@ -134,6 +136,13 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
 /// `epigraph-db/tests/viewer_ratchet.rs`. Listed here so the three-way
 /// partition below is total and a tool cannot move between categories
 /// unnoticed.
+///
+/// `retire_match_candidate` is not here. W11 (migration 118) listed it when
+/// its dispatch body minted the maintenance session itself; its body now
+/// acquires the request's viewer (the retirement is recorded under the
+/// caller's write identity, batch H-b), and the administrative half runs on
+/// `maintenance::admin_cascade_session` or is deferred to the replay timer
+/// (batches W10 and W12a), never on a bypass-viewer lease.
 const EXPECTED_MAINTENANCE_TOOLS: &[&str] = &[
     "backfill_embeddings",
     "recompute_beliefs",
@@ -229,7 +238,11 @@ fn tools(src: &str) -> Vec<(String, Acquisition)> {
 
         let acq = if body.contains("request_viewer(") {
             Acquisition::Request
-        } else if body.contains("maintenance_viewer(") {
+        } else if body.contains("maintenance_viewer(") || body.contains("maintenance_tool_session(")
+        {
+            // `maintenance_tool_session` (operator decision D9, batch W12a) is
+            // the three tools' entry: it answers MOVED with no maintenance pool
+            // and otherwise mints the same bypass through `maintenance_viewer`.
             Acquisition::Maintenance
         } else {
             Acquisition::None

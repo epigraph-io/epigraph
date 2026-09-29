@@ -1,9 +1,44 @@
 #![cfg(feature = "db")]
 mod common;
 
-/// claims:write-only token must NOT pass the claims:admin gate on dedup.
+/// The dedup route's SCOPE is `claims:write` since batch OA1 (operator decision
+/// D1: marking a duplicate is the caller's own act; the cascade is the
+/// administrative part). A `claims:read`-only token is still refused at the
+/// scope check.
 #[tokio::test(flavor = "multi_thread")]
-async fn dedup_with_claims_write_returns_403() {
+async fn dedup_with_claims_read_only_returns_403() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let token = common::test_bearer_token_with_scopes(&["claims:read"]);
+    let dup = uuid::Uuid::new_v4();
+    let canonical = uuid::Uuid::new_v4();
+    let body = serde_json::json!({ "canonical_id": canonical, "reason": "test" });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/claims/{dup}/dedup"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 403,
+        "expected 403 (claims:read does not satisfy claims:write); body={text}"
+    );
+    assert!(
+        text.contains("claims:write"),
+        "the refusal names the scope it needs: {text}"
+    );
+}
+
+/// A `claims:write` token passes the scope check (it answered 403 here before
+/// OA1) and reaches the per-claim rule, which reads the duplicate through the
+/// caller's viewer first: a claim that does not exist is 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn dedup_with_claims_write_passes_the_scope_and_a_missing_claim_is_404() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let (addr, _shutdown) = common::spawn_app(&url).await;
 
@@ -21,8 +56,8 @@ async fn dedup_with_claims_write_returns_403() {
 
     assert_eq!(
         resp.status(),
-        403,
-        "expected 403 (claims:write should not satisfy claims:admin); got {} — body={}",
+        404,
+        "expected 404 (claims:write reaches the per-claim rule); got {} — body={}",
         resp.status(),
         resp.text().await.unwrap_or_default()
     );

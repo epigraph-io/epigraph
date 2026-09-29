@@ -43,6 +43,7 @@ async fn deprecate_workflow_diamond_dag_no_duplicates(pool: PgPool) {
             reason: "diamond test".into(),
             cascade: Some(true),
         },
+        None,
     )
     .await
     .unwrap();

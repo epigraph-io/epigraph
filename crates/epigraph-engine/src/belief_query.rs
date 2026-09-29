@@ -128,7 +128,10 @@ pub async fn get_belief(
 
         let assignment =
             FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
-        let hypothesis_index = assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
+        let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
+            assignment.and_then(|a| a.hypothesis_index),
+            frame.hypothesis_count(),
+        );
 
         let all_bbas =
             MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
@@ -239,7 +242,10 @@ pub async fn get_perspective_belief(
 
     let assignment =
         FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
-    let hypothesis_index = assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
+    let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
+        assignment.and_then(|a| a.hypothesis_index),
+        frame.hypothesis_count(),
+    );
 
     let all_bbas =
         MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
@@ -514,7 +520,10 @@ async fn perspective_belief_for_claim(
 ) -> Result<BeliefInterval, BeliefQueryError> {
     let assignment =
         FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
-    let hypothesis_index = assignment.and_then(|a| a.hypothesis_index).unwrap_or(0) as usize;
+    let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
+        assignment.and_then(|a| a.hypothesis_index),
+        frame.hypothesis_count(),
+    );
 
     let all_bbas =
         MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;

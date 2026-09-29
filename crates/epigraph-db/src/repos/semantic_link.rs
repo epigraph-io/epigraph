@@ -389,21 +389,31 @@ impl SemanticLinkRepository {
         // matching note in `EvidenceRepository::delete`.
         let uuid: Uuid = id.into();
 
-        let result = sqlx::query(
+        // Checked: migration 117's owner-scoped UPDATE on `edges` matches no
+        // row it refuses and reports success; an in-force link this session
+        // can read but not retract is a refusal, not "not found".
+        let counts: (i64, i64) = sqlx::query_as(
             r#"
-            UPDATE edges
-               SET valid_to = now()
-            WHERE id = $1
-              AND source_type = 'claim'
-              AND target_type = 'claim'
-              AND valid_to IS NULL
+            WITH seen AS (
+                    SELECT 1 FROM edges
+                     WHERE id = $1 AND source_type = 'claim' AND target_type = 'claim'
+                       AND valid_to IS NULL),
+                 done AS (
+                    UPDATE edges
+                       SET valid_to = now()
+                    WHERE id = $1
+                      AND source_type = 'claim'
+                      AND target_type = 'claim'
+                      AND valid_to IS NULL
+                    RETURNING 1)
+            SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )
         .bind(uuid)
-        .execute(executor)
+        .fetch_one(executor)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(super::require_all_changed("semantic link", uuid, "retract", counts)? > 0)
     }
 
     /// List semantic links with pagination

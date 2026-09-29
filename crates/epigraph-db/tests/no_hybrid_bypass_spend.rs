@@ -70,39 +70,32 @@
 //! pool, that assumption dies and this paragraph is the thing to re-measure.
 //!
 //! **(b) A MINT AND A SPEND IN DIFFERENT FUNCTIONS — OR DIFFERENT FILES — ARE
-//! INVISIBLE TO THIS SCANNER, AND THAT IS WHERE THE LARGEST RESIDUAL LIVES.**
-//! [`scan`] keys on one function-sized region containing BOTH a [`MINTS`]
-//! spelling and a [`FOREIGN_POOLS`] one. A function that mints and hands the
-//! `&Viewer` to a callee that runs the statements elsewhere matches neither
-//! half anywhere. **Measured instance:** `epigraph-mcp/src/server.rs`'s three
-//! maintenance tools mint through `maintenance_viewer(` and pass the viewer
-//! into `crates/epigraph-mcp/src/tools/`, whose statements run on
-//! `server.pool`. No file under `crates/epigraph-mcp/src` that names
-//! `server.pool` also carries a [`MINTS`] spelling, so the `"server.pool"` entry
-//! in [`FOREIGN_POOLS`] contributes **zero** detections today and a reader of
-//! this file alone would wrongly conclude that surface is covered.
+//! INVISIBLE TO THIS SCANNER.** [`scan`] keys on one function-sized region
+//! containing BOTH a [`MINTS`] spelling and a [`FOREIGN_POOLS`] one. A function
+//! that mints and hands the `&Viewer` to a callee that runs the statements
+//! elsewhere matches neither half anywhere. **Measured instance, now closed by
+//! a different control:** `epigraph-mcp/src/server.rs`'s three maintenance tools
+//! mint through `maintenance_viewer(` and hand the result into
+//! `crates/epigraph-mcp/src/tools/`. No file under `crates/epigraph-mcp/src` that
+//! names `server.pool` also carries a [`MINTS`] spelling, so the `"server.pool"`
+//! entry in [`FOREIGN_POOLS`] contributes **zero** detections, and a reader of
+//! this file alone would wrongly conclude that surface is covered by it.
 //!
-//! Those three sites are NOT in [`EXPECTED_HYBRIDS`], deliberately: [`scan`]
-//! cannot find them, so registering them would put them in the `fixed` set and
-//! fail the second assertion of
-//! `no_function_mints_a_bypass_and_names_a_foreign_pool` — a register can only
-//! hold rows this scanner can confirm. Owner for closing the gap:
+//! **What covers those three sites now (batch H1), so this paragraph does not
+//! read as an open hole.** They used to spend the viewer on `server.pool` and
+//! were kept fail-closed by a hard-coded `false` gate in
+//! `epigraph-mcp/src/maintenance.rs`. They now take the whole
+//! `MaintenanceSession` (connection + viewer as one value) and run every
+//! statement on its connection. Two controls outside this scanner pin that.
+//! `crates/epigraph-mcp/tests/maintenance_tools_spend_only_the_session.rs` is a
+//! source ratchet: each tool's body takes the session, calls `session.split()`,
+//! and names no server pool. `maintenance_viewer` refuses to hand a session out
+//! unless a maintenance pool is attached AND the leased connection passes
+//! `MaintenanceSession::assert_privileged`, a runtime probe of that exact
+//! connection. The sites stay out of [`EXPECTED_HYBRIDS`], deliberately:
+//! [`scan`] cannot find them, and a register can only hold rows this scanner can
+//! confirm. Owner for a general cross-file scanner is still
 //! `D-PR17-hybrid-shape-lint`.
-//!
-//! **WHAT KEEPS THOSE THREE SITES FAIL-CLOSED CHANGED, AND THIS PARAGRAPH IS THE
-//! REASON A READER WOULD OTHERWISE BELIEVE A FALSE PREMISE.** It used to be an
-//! accident: `EpiGraphMcpFull::with_scoped_pool` had no production caller, so
-//! `maintenance_viewer` could not mint a lease at all, and
-//! `no_unmaintained_dsn.rs` carried `epigraph-mcp/src/main.rs` in its EXEMPT
-//! register on exactly that reasoning. Both of those facts are now gone:
-//! `main.rs` builds a `ScopedPool` and attaches it on every transport, because
-//! the MCP WRITE path cannot stamp a connection otherwise, and that register
-//! entry has been removed. The control is now explicit and local —
-//! `epigraph-mcp/src/maintenance.rs::maintenance_tools_run_on_the_maintenance_connection`
-//! returns `false` and `maintenance_viewer` checks it BEFORE it looks at the
-//! pool, so attaching a `ScopedPool` cannot un-gate the three tools as a side
-//! effect. `maintenance.rs`'s own test module pins that, which is the control
-//! this scanner cannot supply.
 //!
 //! **(b2) A STRING LITERAL naming a foreign pool is indistinguishable from a
 //! use, and the stripper cannot help.** Comments are stripped; string literals
