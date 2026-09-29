@@ -1092,6 +1092,34 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // Deferred for 107's reason, and fails CLOSED the same way under a
     // non-member owner: the tenancy policies refuse its link and audit writes.
     ("epigraph_link_retired_shared_signer", 116),
+    // 117, the cascade deferral (D9; redefined by 120, which re-owns it again).
+    // Every deferred cascade on the application role goes through it. Under a
+    // non-member owner it fails CLOSED: its `cascade.*` security_events INSERT
+    // is refused by 117's restrictive `security_events_cascade_privileged`
+    // (the definer bypass is false), so every request that must defer its
+    // cascade (supersede, dedup, consolidate, match-candidate retire) errors
+    // with nothing recorded. The stake is those write paths OFF.
+    ("epigraph_record_cascade_deferral", 117),
+    // 118, the credential-table definers (W11). 118 revokes the application
+    // role's direct UPDATE / DELETE on the credential tables, so these bodies
+    // are the only way the request path rotates, revokes or consumes a
+    // credential. Under an APP-owned body they fail CLOSED with 42501 (a login
+    // and token outage, loud); under the migration runner's superuser they
+    // keep working with more authority than intended, as 083's entry
+    // describes, and nothing but this check reports it.
+    ("epigraph_refresh_token_on_reuse", 118),
+    ("epigraph_refresh_token_check", 118),
+    ("epigraph_refresh_token_rotate", 118),
+    ("epigraph_refresh_token_revoke", 118),
+    ("epigraph_refresh_token_revoke_by_hash", 118),
+    ("epigraph_refresh_token_revoke_client", 118),
+    ("epigraph_oauth_code_consume", 118),
+    ("epigraph_oauth_session_to_consent", 118),
+    ("epigraph_oauth_session_take", 118),
+    ("epigraph_oauth_client_lock_for_link", 118),
+    ("epigraph_oauth_client_link_agent", 118),
+    ("epigraph_oauth_client_approve", 118),
+    ("epigraph_agent_key_set_status", 118),
     // 120, writer-owned edges (D8). The scope predicate is IMMUTABLE SQL and
     // reads no table, so its owner changes no answer; it is registered because
     // the tenancy trigger (a maintenance-owned definer) must hold EXECUTE on
