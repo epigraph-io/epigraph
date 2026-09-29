@@ -12,7 +12,8 @@ use common::*;
 mod fixture;
 
 async fn stored_step_truth(pool: &PgPool, confidence: Option<f64>) -> f64 {
-    let server = build_test_server(pool.clone());
+    // Stamped: the workflow ingest path refuses a server with no ScopedPool.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(pool).await);
     let viewer = fixture::public_viewer(pool).await;
     let step = format!("confidence probe step {}", Uuid::new_v4());
     epigraph_mcp::tools::workflows::store_workflow(
@@ -26,6 +27,7 @@ async fn stored_step_truth(pool: &PgPool, confidence: Option<f64>) -> f64 {
             confidence,
             tags: None,
         },
+        None,
     )
     .await
     .expect("store_workflow");
