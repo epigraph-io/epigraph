@@ -15,14 +15,24 @@ use std::sync::Arc;
 
 const KEY: i64 = 770_001;
 
-/// Count sessions currently holding the advisory lock for `KEY`.
+/// Count sessions currently holding the advisory lock for `KEY` IN THIS
+/// TEST'S DATABASE.
 /// For a single-bigint `pg_advisory_lock(v)` with `v < 2^31`, pg_locks
 /// records classid=0, objid=v, objsubid=1.
+///
+/// An advisory lock is scoped to its database (its lock tag carries the
+/// database oid, so a holder in another database never contends with
+/// `run_serialized` here), but `pg_locks` lists every database on the cluster.
+/// Each `#[sqlx::test]` runs in its own database, so without the `database`
+/// filter this count also saw `skips_when_lock_already_held`'s holder, or any
+/// other process on the shared cluster holding the same key, and the release
+/// assertions below failed under `--test-threads=4` though nothing had leaked.
 async fn advisory_holders(pool: &PgPool, key: i64) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*)::int8 FROM pg_locks \
-         WHERE locktype = 'advisory' AND classid::int8 = 0 \
-           AND objid::int8 = $1 AND objsubid = 1",
+         WHERE locktype = 'advisory' AND granted \
+           AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+           AND classid::int8 = 0 AND objid::int8 = $1 AND objsubid = 1",
     )
     .bind(key)
     .fetch_one(pool)
