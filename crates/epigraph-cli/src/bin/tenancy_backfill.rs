@@ -1674,7 +1674,8 @@ async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
 ///   a deferred entry names a migration that does not re-own it;
 /// * an exemption is stale, overlaps the register, or no longer holds its
 ///   reason (an "invoker" is now `SECURITY DEFINER`; a "pre-register" definer is
-///   re-owned again by a migration after 110; a "dropped" body is not dropped).
+///   re-owned again by a migration after 110, or was added to the frozen
+///   baseline; a "dropped" body is not dropped).
 ///
 /// The static scan matches on a NORMALISED text (comments stripped, lowercased,
 /// whitespace collapsed), so `owner to`, `OWNER  TO` and a line-broken
@@ -1716,6 +1717,27 @@ mod definer_register_tests {
     /// as soon as a migration after 110 re-owns one of them again, which forces
     /// that judgement at the point the body changes.
     const PRE_REGISTER_DEFINERS: &[&str] = &[
+        // Keep in step with PRE_REGISTER_BASELINE: an entry may be removed from
+        // both, never added to either.
+        "epigraph_derived_require_tenancy",
+        "epigraph_root_require_tenancy",
+        "epigraph_is_group_admin",
+        "epigraph_live_memberships",
+        "epigraph_is_group_creator",
+        "epigraph_ensure_personal_group",
+        "epigraph_provision_oauth_agent",
+        "epigraph_community_add_member",
+        "epigraph_community_remove_member",
+    ];
+
+    /// [`PRE_REGISTER_DEFINERS`] as it stood when the ratchet landed (nine
+    /// names). NEVER ADD TO THIS LIST. It exists so the "may only shrink" rule
+    /// is enforced rather than documented: moving a registered definer out of
+    /// [`DEFERRED_DEFINER_FUNCTIONS`] into [`PRE_REGISTER_DEFINERS`] leaves the
+    /// union of all lists unchanged (so neither the static scan nor the catalog
+    /// test notices), and silently drops that body from `verify`'s pre-flight.
+    /// `pre_register_definers_only_shrink` fails on any name not listed here.
+    const PRE_REGISTER_BASELINE: [&str; 9] = [
         "epigraph_derived_require_tenancy",
         "epigraph_root_require_tenancy",
         "epigraph_is_group_admin",
@@ -2151,6 +2173,19 @@ mod definer_register_tests {
              {definer_exempt:?}; register each in DEFERRED_DEFINER_FUNCTIONS with its stake and \
              drop it from INVOKER_EXEMPT"
         );
+    }
+
+    #[test]
+    fn pre_register_definers_only_shrink() {
+        for name in PRE_REGISTER_DEFINERS {
+            assert!(
+                PRE_REGISTER_BASELINE.contains(name),
+                "public.{name} was added to PRE_REGISTER_DEFINERS, which may only shrink. A \
+                 definer re-owned after the register existed must be registered in \
+                 DEFERRED_DEFINER_FUNCTIONS with its stake; moving it into the baseline \
+                 removes it from verify's ownership pre-flight"
+            );
+        }
     }
 
     #[test]
