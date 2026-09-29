@@ -1659,7 +1659,14 @@ async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
 /// re-owns a new `SECURITY DEFINER` body to `epigraph_maintenance` inside a
 /// guarded `DO` block, and is never added to the register, can silently no-op
 /// its `OWNER TO` (see [`verify_definer_ownership`]) with nothing reporting it.
-/// These tests read `migrations/*.sql` (static, no database) and fail when:
+/// Two layers. The static tests read `migrations/*.sql` (no database) and
+/// attribute each re-own to the migration that makes it; the catalog test
+/// (`register_matches_the_maintenance_owned_catalog`) migrates a fresh database
+/// to head and diffs the functions `epigraph_maintenance` actually owns against
+/// the register, so a re-own spelled in a way the static scan cannot parse (a
+/// name list DECLAREd in another statement, a public definer not named
+/// `epigraph_*`, an `ALTER FUNCTION .. SECURITY DEFINER` without a CREATE) still
+/// fails. Together they fail when:
 ///
 /// * a function some migration re-owns to `epigraph_maintenance` is in neither
 ///   the register nor one of the named exemption lists below;
@@ -1668,6 +1675,11 @@ async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
 /// * an exemption is stale, overlaps the register, or no longer holds its
 ///   reason (an "invoker" is now `SECURITY DEFINER`; a "pre-register" definer is
 ///   re-owned again by a migration after 110; a "dropped" body is not dropped).
+///
+/// The static scan matches on a NORMALISED text (comments stripped, lowercased,
+/// whitespace collapsed), so `owner to`, `OWNER  TO` and a line-broken
+/// `OWNER\n TO` are one spelling, and it accepts a function named `public.<f>(`
+/// or an unqualified `epigraph_<f>(` (resolved on `search_path` public).
 #[cfg(test)]
 mod definer_register_tests {
     use super::{DEFERRED_DEFINER_FUNCTIONS, DEFINER_FUNCTIONS};
@@ -1727,8 +1739,33 @@ mod definer_register_tests {
     struct Migration {
         version: i64,
         file: String,
-        /// The file with every `--` line comment removed.
+        /// The file with every `--` line comment and `/* .. */` block comment
+        /// removed, lowercased, and every whitespace run collapsed to one space.
+        /// Every needle matched against it is lowercase.
         sql: String,
+    }
+
+    /// Strip comments, lowercase, collapse whitespace. Unquoted SQL identifiers
+    /// and keywords are case-insensitive, so this loses nothing the scan needs.
+    fn normalise(raw: &str) -> String {
+        let no_line_comments = raw
+            .lines()
+            .map(|l| l.find("--").map_or(l, |i| &l[..i]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut no_comments = String::with_capacity(no_line_comments.len());
+        let mut rest = no_line_comments.as_str();
+        while let Some(i) = rest.find("/*") {
+            no_comments.push_str(&rest[..i]);
+            no_comments.push(' ');
+            rest = rest[i..].find("*/").map_or("", |j| &rest[i + j + 2..]);
+        }
+        no_comments.push_str(rest);
+        no_comments
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn migrations() -> Vec<Migration> {
@@ -1749,11 +1786,7 @@ mod definer_register_tests {
                 continue;
             };
             let raw = std::fs::read_to_string(&path).expect("read migration");
-            let sql = raw
-                .lines()
-                .map(|l| l.find("--").map_or(l, |i| &l[..i]))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let sql = normalise(&raw);
             out.push(Migration { version, file, sql });
         }
         out.sort_by_key(|m| m.version);
@@ -1766,23 +1799,57 @@ mod definer_register_tests {
         out
     }
 
-    /// Every `public.<name>(` in `text` whose name starts `epigraph_`.
-    fn public_function_names(text: &str) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut rest = text;
-        while let Some(i) = rest.find("public.epigraph_") {
-            let after = &rest[i + "public.".len()..];
-            let name: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            let tail = &after[name.len()..];
-            if tail.trim_start().starts_with('(') {
-                names.push(name);
+    fn is_ident(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
+    /// Every function-shaped reference in normalised `text`: `(byte offset,
+    /// name)` for each `public.<name>(` (any name) and each unqualified
+    /// `epigraph_<name>(`. A name qualified by any other schema
+    /// (`pg_catalog.format(`) and an unqualified non-`epigraph_` call
+    /// (`format(`, `to_regprocedure(`) are not function names of ours.
+    fn function_refs(text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < text.len() {
+            let c = text[i..].chars().next().expect("char at a char boundary");
+            let starts_ident = is_ident(c)
+                && !text[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|p| is_ident(p) || p == '.');
+            if !starts_ident {
+                i += c.len_utf8();
+                continue;
             }
-            rest = tail;
+            let first: String = text[i..].chars().take_while(|c| is_ident(*c)).collect();
+            let mut end = i + first.len();
+            let (qualifier, name) = if text[end..].starts_with('.') {
+                let second: String = text[end + 1..]
+                    .chars()
+                    .take_while(|c| is_ident(*c))
+                    .collect();
+                end += 1 + second.len();
+                (Some(first), second)
+            } else {
+                (None, first)
+            };
+            let ours = match qualifier.as_deref() {
+                Some("public") => !name.is_empty(),
+                Some(_) => false,
+                None => name.starts_with("epigraph_"),
+            };
+            if ours && text[end..].trim_start().starts_with('(') {
+                out.push((i, name));
+            }
+            i = end.max(i + 1);
         }
-        names
+        out
+    }
+
+    /// The names of [`function_refs`].
+    fn public_function_names(text: &str) -> Vec<String> {
+        function_refs(text).into_iter().map(|(_, n)| n).collect()
     }
 
     /// `function name -> versions of the migrations that re-own it to
@@ -1797,18 +1864,35 @@ mod definer_register_tests {
     /// format('ALTER FUNCTION %s OWNER TO epigraph_maintenance', f)`). A
     /// `GRANT ... TO epigraph_maintenance` does not match, and prose mentioning
     /// `OWNER TO` is in the comments [`migrations`] strips.
+    ///
+    /// A re-own statement that yields NO function name fails the scan: its
+    /// names live somewhere this parser does not look (a list DECLAREd in an
+    /// earlier statement, a name built by string concatenation), so the scan
+    /// would otherwise under-count silently.
     fn reowned(migs: &[Migration]) -> BTreeMap<String, BTreeSet<i64>> {
         let mut out: BTreeMap<String, BTreeSet<i64>> = BTreeMap::new();
+        let mut nameless = Vec::new();
         for m in migs {
             for stmt in m.sql.split(';') {
-                if !stmt.contains("OWNER TO epigraph_maintenance") {
+                if !stmt.contains("owner to epigraph_maintenance") {
                     continue;
                 }
-                for name in public_function_names(stmt) {
+                let names = public_function_names(stmt);
+                if names.is_empty() {
+                    nameless.push(format!("{}: {}", m.file, stmt.trim()));
+                }
+                for name in names {
                     out.entry(name).or_default().insert(m.version);
                 }
             }
         }
+        assert!(
+            nameless.is_empty(),
+            "these statements re-own something to epigraph_maintenance but name no \
+             function the scan can read (e.g. the names are DECLAREd in another statement); \
+             inline the ARRAY[...] into the FOREACH, or name the function in the statement: \
+             {nameless:#?}"
+        );
         // Calibration, so the scan cannot pass vacuously: names from the loop
         // form, the literal form, and literals split mid-signature.
         for (name, version) in [
@@ -1835,21 +1919,33 @@ mod definer_register_tests {
             .collect()
     }
 
-    /// `(file, header)` of the LAST migration's `CREATE [OR REPLACE] FUNCTION
-    /// public.<name>(`, the header running up to the body's ` AS `.
-    fn latest_definition_header(migs: &[Migration], name: &str) -> Option<(String, String)> {
-        let needle = format!("FUNCTION public.{name}(");
+    /// The LAST statement, across the migrations in order, that decides whether
+    /// `public.<name>` is `SECURITY DEFINER`: `(file, text)`, where the text is
+    /// either a `CREATE [OR REPLACE] FUNCTION` header (up to the body's ` as `)
+    /// or an `ALTER FUNCTION <name>(..) .. SECURITY {DEFINER|INVOKER}` (up to
+    /// its `;`). An `ALTER FUNCTION` that sets neither (an `OWNER TO`, a
+    /// `SET search_path`) decides nothing and is skipped.
+    fn latest_security_decider(migs: &[Migration], name: &str) -> Option<(String, String)> {
         let mut found = None;
         for m in migs {
-            let mut rest = m.sql.as_str();
-            while let Some(i) = rest.find(&needle) {
-                let before = rest[..i].trim_end();
-                let tail = &rest[i..];
-                if before.ends_with("CREATE OR REPLACE") || before.ends_with("CREATE") {
-                    let end = tail.find(" AS ").unwrap_or(tail.len());
-                    found = Some((m.file.clone(), tail[..end].to_string()));
+            for (i, n) in function_refs(&m.sql) {
+                if n != name {
+                    continue;
                 }
-                rest = &tail[needle.len()..];
+                let before = m.sql[..i].trim_end();
+                let tail = &m.sql[i..];
+                if before.ends_with("create or replace function")
+                    || before.ends_with("create function")
+                {
+                    let end = tail.find(" as ").unwrap_or(tail.len());
+                    found = Some((m.file.clone(), tail[..end].to_string()));
+                } else if before.ends_with("alter function") {
+                    let end = tail.find(';').unwrap_or(tail.len());
+                    let stmt = &tail[..end];
+                    if stmt.contains("security definer") || stmt.contains("security invoker") {
+                        found = Some((m.file.clone(), stmt.to_string()));
+                    }
+                }
             }
         }
         found
@@ -1939,13 +2035,14 @@ mod definer_register_tests {
     fn invoker_exemptions_are_still_security_invoker() {
         let migs = migrations();
         for name in INVOKER_EXEMPT {
-            let (file, header) = latest_definition_header(&migs, name)
+            let (file, header) = latest_security_decider(&migs, name)
                 .unwrap_or_else(|| panic!("no migration creates public.{name}"));
             assert!(
-                header.contains("SECURITY INVOKER") && !header.contains("SECURITY DEFINER"),
+                header.contains("security invoker") && !header.contains("security definer"),
                 "public.{name} is exempt as a SECURITY INVOKER body, but its latest definition \
-                 ({file}) does not declare SECURITY INVOKER; if it is now a definer, register \
-                 it in DEFERRED_DEFINER_FUNCTIONS with its stake and drop it from INVOKER_EXEMPT"
+                 or ALTER ({file}: {header:?}) does not declare SECURITY INVOKER; if it is now a \
+                 definer, register it in DEFERRED_DEFINER_FUNCTIONS with its stake and drop it \
+                 from INVOKER_EXEMPT"
             );
         }
     }
@@ -1973,6 +2070,89 @@ mod definer_register_tests {
         }
     }
 
+    /// The catalog is the ground truth the static scan approximates. Migrate a
+    /// fresh database to head and require the set of function names
+    /// `epigraph_maintenance` owns to EQUAL the register plus the exemptions
+    /// (an equality, not a subset, in both directions):
+    ///
+    /// * an owned function in no list is a re-own nobody registered, however
+    ///   the migration spelled it (unqualified, lowercase, a DECLAREd name
+    ///   list, a name not starting `epigraph_`);
+    /// * a listed function that is NOT maintenance-owned means an `OWNER TO`
+    ///   silently no-opped at migrate time (the migrator was not a member of
+    ///   the role, so the guarded `DO` block skipped it), which also stops this
+    ///   test from passing vacuously on a cluster where no re-own applied;
+    /// * an `INVOKER_EXEMPT` body the catalog shows as `SECURITY DEFINER` (e.g.
+    ///   flipped by `ALTER FUNCTION .. SECURITY DEFINER`) has lost its reason.
+    ///
+    /// `DROPPED` names are expected to be absent. Needs `DATABASE_URL` (a
+    /// superuser, or a role that is a member of `epigraph_maintenance`, as CI's
+    /// service container is).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn register_matches_the_maintenance_owned_catalog(pool: sqlx::PgPool) {
+        let rows: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT n.nspname::text, p.proname::text, p.prosecdef \
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE pg_get_userbyid(p.proowner) = 'epigraph_maintenance'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("list the functions epigraph_maintenance owns");
+
+        let outside_public: Vec<String> = rows
+            .iter()
+            .filter(|(schema, _, _)| schema != "public")
+            .map(|(schema, name, _)| format!("{schema}.{name}"))
+            .collect();
+        assert!(
+            outside_public.is_empty(),
+            "epigraph_maintenance owns functions outside public, which verify's pre-flight \
+             (public.<name> only) cannot check: {outside_public:?}"
+        );
+
+        let owned: BTreeSet<&str> = rows.iter().map(|(_, n, _)| n.as_str()).collect();
+        let listed: BTreeSet<&str> = register()
+            .into_iter()
+            .chain(INVOKER_EXEMPT.iter().copied())
+            .chain(PRE_REGISTER_DEFINERS.iter().copied())
+            .collect();
+        let unlisted: Vec<&&str> = owned.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "epigraph_maintenance owns these public functions at head, but neither the \
+             register nor an exemption names them, so verify's ownership pre-flight never \
+             checks them: {unlisted:?}. Register each SECURITY DEFINER body in \
+             DEFERRED_DEFINER_FUNCTIONS with a note on what a non-member owner breaks, or put a \
+             SECURITY INVOKER body in INVOKER_EXEMPT"
+        );
+        let not_owned: Vec<&&str> = listed.difference(&owned).collect();
+        assert!(
+            not_owned.is_empty(),
+            "these functions are listed but epigraph_maintenance does not own them at head: \
+             {not_owned:?}. Either the entry is dead, or a guarded OWNER TO silently no-opped \
+             because the migrating role is not a member of epigraph_maintenance (run this test \
+             as a superuser or a member)"
+        );
+        for (name, _) in DROPPED {
+            assert!(
+                !owned.contains(name),
+                "DROPPED says public.{name} is gone, but epigraph_maintenance owns it at head"
+            );
+        }
+
+        let definer_exempt: Vec<&str> = rows
+            .iter()
+            .filter(|(_, n, secdef)| *secdef && INVOKER_EXEMPT.contains(&n.as_str()))
+            .map(|(_, n, _)| n.as_str())
+            .collect();
+        assert!(
+            definer_exempt.is_empty(),
+            "exempt as SECURITY INVOKER, but SECURITY DEFINER in the catalog at head: \
+             {definer_exempt:?}; register each in DEFERRED_DEFINER_FUNCTIONS with its stake and \
+             drop it from INVOKER_EXEMPT"
+        );
+    }
+
     #[test]
     fn dropped_exemptions_are_dropped() {
         let migs = migrations();
@@ -1983,15 +2163,19 @@ mod definer_register_tests {
                 .unwrap_or_else(|| panic!("no migration {version}"));
             assert!(
                 m.sql
-                    .contains(&format!("DROP FUNCTION IF EXISTS public.{name}("))
-                    || m.sql.contains(&format!("DROP FUNCTION public.{name}(")),
+                    .contains(&format!("drop function if exists public.{name}("))
+                    || m.sql.contains(&format!("drop function public.{name}(")),
                 "DROPPED says migration {version} drops public.{name}, but {} does not",
                 m.file
             );
             let recreated: Vec<&str> = migs
                 .iter()
                 .filter(|later| later.version > *version)
-                .filter(|later| later.sql.contains(&format!("FUNCTION public.{name}(")))
+                .filter(|later| {
+                    function_refs(&later.sql)
+                        .iter()
+                        .any(|(_, n)| n.as_str() == *name)
+                })
                 .map(|later| later.file.as_str())
                 .collect();
             assert!(
