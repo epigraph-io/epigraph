@@ -105,17 +105,33 @@ impl EvidenceEncryptionRepository {
     /// Delete encryption metadata for an evidence record
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::WriteRefused` when a row this session can read was not
+    /// deleted (row security refused it); `DbError::QueryFailed` if the
+    /// database query fails.
     #[instrument(skip(pool))]
     pub async fn delete_by_evidence_id(pool: &PgPool, evidence_id: Uuid) -> Result<(), DbError> {
-        sqlx::query(
+        // Checked: 115's owner-scoped DELETE matches no row it refuses, and
+        // reports success; a sealed row this session can read but not delete
+        // is a refusal, not a deleted row (`require_all_changed`). In a
+        // transaction, so a refusal also undoes the rows it could delete.
+        let mut tx = pool.begin().await?;
+        let counts: (i64, i64) = sqlx::query_as(
             r#"
-            DELETE FROM evidence_encryption WHERE evidence_id = $1
+            WITH seen AS (SELECT 1 FROM evidence_encryption WHERE evidence_id = $1),
+                 done AS (DELETE FROM evidence_encryption WHERE evidence_id = $1 RETURNING 1)
+            SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )
         .bind(evidence_id)
-        .execute(pool)
+        .fetch_one(&mut *tx)
         .await?;
+        super::require_all_changed(
+            "evidence_encryption of evidence",
+            evidence_id,
+            "delete",
+            counts,
+        )?;
+        tx.commit().await?;
 
         Ok(())
     }

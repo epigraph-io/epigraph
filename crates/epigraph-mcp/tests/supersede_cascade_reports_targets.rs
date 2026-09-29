@@ -73,7 +73,12 @@ async fn supersede_reports_the_downstream_target_it_repaired(pool: PgPool) {
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
@@ -171,7 +176,12 @@ async fn sole_supporter_retraction_is_reported_as_unbacked_not_as_nothing_to_do(
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim(&pool, "sole-supported claim B", 0.5).await;
@@ -225,7 +235,12 @@ async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
@@ -280,7 +295,12 @@ async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
     let dup = seed_claim(&pool, "duplicate claim", 0.5).await;
@@ -338,9 +358,12 @@ async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
     );
 }
 
-/// Batch H-b: the cascade now runs on ONE transaction stamped from the
-/// retracting caller, so a downstream target the stamp cannot write (on a clean
-/// schema, a `42501`) must fail ALONE. The refusal is injected with a trigger
+/// Batch H-b: the cascade runs on ONE transaction, so a downstream target it
+/// cannot write (on a clean schema, a `42501`) must fail ALONE. Since batch
+/// W10 (operator decision D1) that transaction is the administrative cascade's
+/// on the maintenance connection, not the caller's stamp; the engine's
+/// per-edge savepoints are what isolate the failure either way, so the server
+/// here carries a maintenance pool and the cascade is applied in-process. The refusal is injected with a trigger
 /// (this harness is BYPASSRLS, so no policy refuses anything): deleting D's
 /// stale BBA raises. B, the other target, must still be repaired and
 /// committed; D's stale BBA must survive (rolled back, not deleted with nothing
@@ -352,7 +375,12 @@ async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_refused_downstream_target_fails_alone_on_the_stamped_cascade(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;

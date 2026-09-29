@@ -281,6 +281,30 @@ impl SecurityEventRepository {
         Ok(row.count)
     }
 
+    /// Where THIS connection comes from, as the server sees it, for an audit
+    /// row written on it: `(inet_client_addr(), application_name)`.
+    ///
+    /// `inet_client_addr()` is `NULL` on a Unix-socket connection, so the
+    /// address is optional; `application_name` is whatever the client set
+    /// (empty is returned as `None`). Both are recorded beside the login, not
+    /// instead of it: neither is an identity, but together with the login and
+    /// the OS uid they narrow down who ran an operator command.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn connection_origin_conn(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<(Option<String>, Option<String>), DbError> {
+        let (addr, app): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT host(inet_client_addr()), \
+                    NULLIF(current_setting('application_name', true), '')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| DbError::QueryFailed { source: e })?;
+        Ok((addr, app))
+    }
+
     /// Append a security event on a CALLER-SUPPLIED connection.
     ///
     /// [`Self::log`] takes a `&PgPool` and is right for the two call sites that

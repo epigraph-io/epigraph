@@ -123,6 +123,23 @@ pub enum DbError {
     #[error("Conflict: {reason}")]
     Conflict { reason: String },
 
+    /// A write that row security let the session SEE but not CHANGE: the
+    /// statement matched fewer rows than the session can read, so a row it had
+    /// to change was left as it was. Maps to HTTP **403**.
+    ///
+    /// Migrations 115 and 117 made DELETE (every tier-A table) and UPDATE
+    /// (`edges` and the registries) owner-scoped with RESTRICTIVE USING
+    /// clauses. Under row security a USING clause that refuses a row does not
+    /// raise: the statement matches zero rows and reports success. A caller
+    /// that must change a row compares what it could see with what it changed
+    /// and raises this instead of reporting a write that did not happen.
+    #[error("{action} of {entity} {id} was refused: this session may read it but not {action} it; nothing was changed")]
+    WriteRefused {
+        entity: String,
+        id: Uuid,
+        action: String,
+    },
+
     /// The agent's personal-group membership is REVOKED, and the provisioning
     /// function refused to restore it (SQLSTATE [`PERSONAL_MEMBERSHIP_REVOKED`],
     /// migration 105).

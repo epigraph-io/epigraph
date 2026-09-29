@@ -172,6 +172,35 @@ impl EntityTypeRepository {
         }
     }
 
+    /// [`Self::get_by_name`] on a connection the caller owns: the HTTP edge
+    /// create route runs its read-through on its viewer-stamped write
+    /// transaction (migration 120 converted it onto `ScopedPool::begin_as`).
+    /// `entity_types` is an instance-wide registry with no tenancy, so the
+    /// stamp changes no answer; the connection is shared so the handler runs on
+    /// one.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any query fails.
+    #[instrument(skip(conn))]
+    pub async fn get_by_name_conn(
+        conn: &mut sqlx::PgConnection,
+        type_name: &str,
+    ) -> Result<Option<(String, EntityTypeEntry)>, DbError> {
+        let row: Option<EntityTypeRow> = sqlx::query_as::<_, EntityTypeRow>(
+            "SELECT type_name, schema_name, table_name, id_column, is_optional, is_core, \
+                    tenancy_tier \
+             FROM entity_types WHERE type_name = $1",
+        )
+        .bind(type_name)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(Self::resolve_row(&mut *conn, row).await?)),
+            None => Ok(None),
+        }
+    }
+
     /// Return `Some(is_core)` for a registered type, or `None` if unregistered.
     /// Used by the admin endpoint's hijack guard before an upsert.
     ///
@@ -253,8 +282,8 @@ impl EntityTypeRepository {
     /// presence via `to_regclass`. The `schema.table` value is bound as a TEXT
     /// param to `to_regclass($1)` (a value, never interpolated) — the registry
     /// CHECK regexes already constrain the identifier shape at rest.
-    async fn resolve_row(
-        pool: &PgPool,
+    async fn resolve_row<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         row: EntityTypeRow,
     ) -> Result<(String, EntityTypeEntry), DbError> {
         let table_present = match row.table_name.as_deref() {
@@ -262,7 +291,7 @@ impl EntityTypeRepository {
                 let qualified = format!("{}.{}", row.schema_name, table);
                 let regclass: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
                     .bind(&qualified)
-                    .fetch_one(pool)
+                    .fetch_one(executor)
                     .await?;
                 regclass.is_some()
             }

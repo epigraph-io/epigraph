@@ -1310,6 +1310,10 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
         // Listing the helper is what lets a future arm spell the bound without
         // that neighbour and still be recognised instead of false-flagged.
         "epigraph_group_roster_admits_principal",
+        // 115's writability predicate for the world-owned `edges` DELETE arm.
+        // Its body compares the node's owner with `epigraph_writable_groups()`,
+        // i.e. the CALLER's writable set, so an arm naming it is session-derived.
+        "epigraph_session_writes_node",
     ];
     // ARMS — not policies — that are row-only BY DESIGN, each with the reason.
     //
@@ -1334,23 +1338,11 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              namespace, whose only writer is the definer mint. Creating an ordinary signer row \
              is a route-authorized capability gated above the database.",
         ),
-        (
-            "jobs_app",
-            "privatization_apply",
-            "The `job_type NOT IN ('privatization_*')` arm is row-only. Its instruction here used \
-             to be 'delete it or key it on the session when PR-18 adds the job types it names'. \
-             PR-18's apply slice ADDS THEM — `epigraph_jobs::privatization::APPLY_JOB_TYPE` and \
-             `REVERT_JOB_TYPE` are these literals, pinned by a unit test in that module — and the \
-             arm is KEPT rather than deleted or rewritten. Deleting it would remove the only thing \
-             that distinguishes privatization work from ordinary work on an INSERT, and this is an \
-             INSERT arm: `WITH CHECK` is evaluated for a non-bypass role even though `jobs_app`'s \
-             `USING` is bypass-only, because a plain INSERT reads no existing row. Rewriting it to \
-             name a session helper would change what it means, not how it is spelled — the \
-             predicate is about the WORK, and the session identity is already covered by the two \
-             disjuncts above it. The production enqueue is \
-             `PrivatizationRepository::enqueue_job_conn` on the maintenance connection, which the \
-             first disjunct admits.",
-        ),
+        // `jobs_app`'s row-only `job_type NOT IN ('privatization_*')` arm was
+        // listed here until migration 119 (batch W12a, D9) removed it: the
+        // queue's consumer is now a privileged timer, so the WITH CHECK admits
+        // only the two session predicates and an application session enqueues
+        // nothing (`maintenance_timer_only.rs`).
         (
             "security_events_append",
             "agent_id IS NULL",
@@ -1369,6 +1361,16 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              non-`oauth.` row still needs 077's attribution arms; an `oauth.*` row needs one of \
              the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
              i.e. the maintenance session or one of 118's definers.",
+        ),
+        (
+            "security_events_cascade_privileged",
+            "cascade.",
+            "117's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 8) <> \
+             'cascade.'`) says WHICH rows the restriction applies to, and grants nothing. A \
+             restrictive policy is AND-ed with the permissive `security_events_append`, so every \
+             non-cascade row still needs 077's attribution arms; a `cascade.*` row needs one of \
+             the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
+             i.e. the maintenance session or the deferral definer.",
         ),
     ];
 
@@ -1785,7 +1787,7 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 ///
 /// | Site | Table | Pool | Disposition |
 /// |---|---|---|---|
-/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (`bin/server.rs` builds `job_pool` from `maintenance_url`; both `PostgresJobQueue::new` sites take it) | `epigraph_bypass()` is true, guard intact |
+/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (since D9 the only queue is `bin/drain_jobs.rs`'s, on the configured maintenance DSN; 119 lets no application session enqueue) | `epigraph_bypass()` is true, guard intact |
 /// | `edge.rs::create_symmetric_if_absent` | `edges` | app | **CORRECTED — see below.** Constraint-backed from migration 090 |
 /// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | ditto; `alternative_of` additionally carries `edges_alternative_of_symmetric_uniq`, whose predicate 091 narrowed to rows in force |
 /// | `graph_view.rs` (**3** sites, in 2 functions) | `edges` | app | already-decomposed claims reappear as undecomposed |
@@ -1854,26 +1856,38 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 /// This test pins the ONE property that is enforceable here and now: the job
 /// queue, the only guard site whose widening would let an app connection
 /// dispatch work that later runs with `epigraph_bypass()` TRUE, is on the
-/// maintenance pool.
+/// maintenance pool. Since operator decision D9 (batch W12a) the queue lives
+/// only in the `drain_jobs` timer binary, whose one pool is built on the
+/// CONFIGURED maintenance DSN (the fallback to `DATABASE_URL` is refused), and
+/// migration 119 lets no application session enqueue at all
+/// (`maintenance_timer_only.rs`).
 #[test]
 fn guard_subquery_sites_are_enumerated() {
+    let drain = include_str!("../../epigraph-api/src/bin/drain_jobs.rs");
+    assert!(
+        drain.contains("PostgresJobQueue::new(scoped.inner().clone())"),
+        "the job queue must be built on the drain's maintenance pool"
+    );
+    let pool_decl = drain
+        .split("let scoped = ")
+        .nth(1)
+        .expect("the drain's pool must be constructed in drain_jobs.rs");
+    assert!(
+        pool_decl.starts_with(
+            "epigraph_db::ScopedPool::connect_with_options(\n        &maintenance_url"
+        ),
+        "the drain's pool must be built from maintenance_url. If it moves to the app DSN, \
+         `enqueue_unique_pending`'s `WHERE NOT EXISTS` guard becomes an unconditional insert \
+         under RLS — no error, duplicate jobs."
+    );
+    assert!(
+        drain.contains("source != epigraph_db::MaintenanceDsnSource::Configured"),
+        "drain_jobs must refuse the fallback to the application DSN"
+    );
     let server = include_str!("../../epigraph-api/src/bin/server.rs");
     assert!(
-        server.contains("PostgresJobQueue::new(job_pool"),
-        "the job queue must be built on job_pool"
-    );
-    let job_pool_decl = server
-        .split("let job_scoped = ")
-        .nth(1)
-        .expect("job_scoped must be constructed in server.rs");
-    assert!(
-        job_pool_decl.starts_with(
-            "epigraph_db::ScopedPool::connect_with_options(\n            &maintenance_url"
-        ),
-        "job_pool must be built from maintenance_url. If it moves to the app DSN, \
-         `enqueue_unique_pending`'s `WHERE NOT EXISTS` guard becomes an unconditional insert \
-         under RLS — no error, duplicate jobs — and `jobs_app`'s job_type exclusion becomes the \
-         only thing standing between an app connection and a bypass-running job."
+        !server.contains("PostgresJobQueue::new("),
+        "bin/server.rs builds a job queue again; under D9 the queue is the drain timer's"
     );
 }
 

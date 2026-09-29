@@ -8,7 +8,12 @@ use common::*;
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_claim_marks_old_and_links_new(pool: PgPool) {
     let old = seed_claim(&pool, "v1", 0.5).await;
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
     let (auth, admin_viewer) = common::server_admin(&server).await;
 
     let result = epigraph_mcp::tools::supersede::supersede_claim(
@@ -93,7 +98,12 @@ async fn supersede_claim_nulls_embedding_on_superseded_claim(pool: PgPool) {
     .await
     .unwrap();
 
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
     let (auth, admin_viewer) = common::server_admin(&server).await;
 
     // Call the MCP supersede handler. If the handler fails to null the

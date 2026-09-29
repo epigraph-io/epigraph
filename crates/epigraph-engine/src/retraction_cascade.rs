@@ -220,6 +220,39 @@ pub async fn cascade_after_supersede(
     report
 }
 
+/// Repair belief on the claims whose edge-keyed BBAs a withdrawn edge's
+/// administrative cleanup removed (migration 120, cause `edge_retract`).
+///
+/// `claims` are the targets the removed BBAs lived on, plus the claims whose
+/// own edge-keyed BBAs the edge's owner deleted in its act; `invalidated` is
+/// how many the administrative removal deleted (recorded in the report, not
+/// re-derived). Each target is
+/// recomputed from its surviving BBAs, or has its cache cleared when none
+/// remain. Never fails: see the module docs on best-effort semantics.
+pub async fn cascade_after_edge_withdrawal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claims: &[Uuid],
+    invalidated: u64,
+) -> CascadeReport {
+    let mut report = CascadeReport {
+        invalidated_bbas: invalidated,
+        ..CascadeReport::default()
+    };
+    if claims.is_empty() {
+        return report;
+    }
+    let frame_id = match ensure_binary_frame(&mut *conn, viewer).await {
+        Ok(id) => id,
+        Err(e) => {
+            report.note_error("ensure_binary_frame", e);
+            return report;
+        }
+    };
+    repair_targets(&mut *conn, viewer, frame_id, claims, &mut report).await;
+    report
+}
+
 /// Repair belief downstream of
 /// [`ClaimRepository::mark_duplicate_with_repair`].
 ///

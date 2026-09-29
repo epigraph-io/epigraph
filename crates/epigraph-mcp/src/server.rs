@@ -174,6 +174,41 @@ impl EpiGraphMcpFull {
         ))
     }
 
+    /// The ONE way an authenticated caller acts under this server's own
+    /// agent's stamp (batch OA1 on top of batch H-b).
+    ///
+    /// OA1 lets a `claims:admin` caller supersede or dedup a claim in a group
+    /// it does not write by acting on a transaction stamped from this server's
+    /// agent, as those tools did before OA1 when `claims:admin` was their scope
+    /// (`tools::supersede::begin_claim_act`). No other admission may borrow
+    /// that stamp: it would hand a `claims:write` caller the server agent's
+    /// write authority. Since batch H-b a tool module cannot construct a
+    /// [`crate::write_identity::WriteIdentity`] itself
+    /// (`tests/write_identity_ratchet.rs`), so the scope check that licenses the
+    /// borrow lives here, beside [`Self::write_identity`], and is re-checked on
+    /// every call rather than trusted from the caller.
+    ///
+    /// # Errors
+    ///
+    /// An MCP invalid-request error when `auth` does not carry `claims:admin`,
+    /// and whatever [`Self::agent_id`] returns.
+    pub(crate) async fn admin_borrowed_server_identity(
+        &self,
+        auth: &epigraph_auth::AuthContext,
+    ) -> Result<crate::write_identity::WriteIdentity, McpError> {
+        if !auth.has_scope("claims:admin") {
+            return Err(McpError::invalid_request(
+                "only a claims:admin caller may act under this server's own agent's stamp; \
+                 nothing was written"
+                    .to_string(),
+                None,
+            ));
+        }
+        Ok(crate::write_identity::WriteIdentity::from_resolved(
+            self.agent_id().await?,
+        ))
+    }
+
     /// The agent whose key SIGNS this server's digests: the server's own agent,
     /// whatever the author.
     ///
@@ -917,7 +952,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Add new evidence to an existing claim and run a Dempster-Shafer belief update. Returns the before/after truth values plus belief_wired. The call is ATOMIC: the evidence row, its BBA, the truth_value update and any label merge commit together in one transaction or not at all. On success belief_wired and bba_stored are always true (both fields are retained for client compatibility). If the belief update fails, the call returns an error naming the failing step (e.g. `assign_claim: ...`) and writes nothing, so re-submitting the identical evidence_data once the cause is fixed is safe and is the recovery."
+        description = "Add new evidence to an existing claim and run a Dempster-Shafer belief update. Returns the before/after truth values plus belief_wired. The call is ATOMIC: the evidence row, its BBA, the truth_value update and any label merge commit together in one transaction or not at all. On success belief_wired and bba_stored are always true (both fields are retained for client compatibility). If the belief update fails, the call returns an error naming the failing step (e.g. `assign_claim: ...`) and writes nothing, so re-submitting the identical evidence_data once the cause is fixed is safe and is the recovery. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write (most public claims are owned by the shared world group), the evidence row and its BBA are owned by the calling agent's own group (its operator's group for an operated agent) and stay public; the claim's cached Dempster-Shafer belief (belief / plausibility / pignistic_prob) is recombined over every writer's BBAs through an audited path when the cache already carries binary_truth or the claim has no cache at all (otherwise cache_written=false, the response's belief values are this call's combination, and warning says so); but the claim ROW stays its owner's: truth_value is not written (truth_written=false, truth_after=truth_before, evidence_owner=\"writer\") and a call that carries labels is refused with nothing written. On a claim you can write, evidence_owner=\"claim_owner\", truth_written=true and cache_written=true, as before. A group-private claim you cannot read is reported as not found; one you can read but not write is refused. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
     )]
     async fn update_with_evidence(
         &self,
@@ -931,7 +966,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. The read, the retirement and the new claim commit together on one transaction stamped from the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio): a claim the caller cannot read is reported as not found, and one owned by a group the calling agent cannot write is refused with nothing written (a claims:admin token does not lend write authority into such a group). Who may: the claim's author; on stdio also an agent linked to the same operator as the author; over HTTP also the author's operator, or a claims:admin token. Anyone else is refused with nothing written. The downstream belief cascade (belief_cascade) runs with the calling agent's write authority, one downstream claim at a time: a downstream claim it cannot write is left exactly as it was (the retracted supporter's edge factor is NOT invalidated for it, so its belief still matches its evidence) and is named in belief_cascade.errors, while the others are repaired. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
+        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. WHO MAY: scope claims:write, and the caller must WRITE the group that owns the claim (admin or writer membership; being its author is not enough), or hold claims:admin (which admits any claim it can read). A claim the caller cannot read is reported as not found, exactly like a missing one; one it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The retirement and the new claim commit together on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a claim it does not write acts with this server's agent's authority instead. The database refuses a row the stamp cannot write. The follow-on cascade (moving other writers' edges onto the replacement, invalidating their frozen BBAs) is administrative: it is reported as cascade.status=\"deferred\" and applied by the replay timer. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
     )]
     async fn supersede_claim(
         &self,
@@ -945,7 +980,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical untouched. The gate read, the dedup and its belief repair commit together on one transaction stamped from the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio): a duplicate you cannot read is reported as not found, and one owned by a group the calling agent cannot write is refused with nothing written. Who may: the claim's author; on stdio also an agent linked to the same operator as the author; over HTTP also the author's operator, or a claims:admin token. Anyone else is refused with nothing written. The downstream belief cascade (belief_cascade) runs with the calling agent's write authority, one downstream claim at a time: a downstream claim it cannot write is left exactly as it was (the retracted supporter's edge factor is NOT invalidated for it, so its belief still matches its evidence) and is named in belief_cascade.errors, while the others are repaired. Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
+        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical's own row untouched. WHO MAY: scope claims:write, and the caller must WRITE the group that owns the DUPLICATE (admin or writer membership; being its author is not enough), or hold claims:admin; the caller must likewise write the group that owns the CANONICAL (or hold claims:admin), because the cascade moves other writers' edges and mass functions onto it; a canonical it can read but not write is refused the same way, naming the canonical. The act commits on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a duplicate it does not write acts with this server's agent's authority instead. A duplicate or canonical the caller cannot read is reported as not found, exactly like a missing one; a duplicate it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The follow-on cascade is administrative and reported as cascade.status=\"deferred\" (the replay timer applies it): the duplicate's edges move to the canonical and their edge-keyed mass functions move with them; when the canonical is a PUBLIC claim the caller cannot write (reachable with claims:admin only), the moved mass functions are owned by their writers' groups (public) and the canonical's frame assignments are created through an audited path (a duplicate bound to binary_truth at a non-zero hypothesis_index cannot pass that binding to such a canonical: the call is refused with nothing written). Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
     )]
     async fn mark_duplicate(
         &self,
@@ -1066,9 +1101,13 @@ impl EpiGraphMcpFull {
     #[tool(
         description = "Consolidate 2..=20 near-duplicate claims into ONE caller-synthesized \
                        claim. Each source is retired with a forwarding pointer to the merged \
-                       claim, its edges migrated (cross-source duplicates collapsed so \
-                       Dempster-Shafer mass is not double-counted), and lineage recorded as \
-                       supersedes edges plus properties.merge. The caller supplies \
+                       claim and lineage recorded as supersedes edges plus properties.merge. \
+                       The sources' live edges are then migrated onto the merged claim \
+                       (cross-source duplicates retracted so Dempster-Shafer mass is not \
+                       double-counted) by the server's administrative cascade on its \
+                       maintenance connection, audited; the result's `cascade` says applied, \
+                       deferred (no maintenance connection: the merge committed and the edge \
+                       migration is recorded for replay) or failed. The caller supplies \
                        merged_content; the server never calls an LLM. ALL-OR-NOTHING: on any \
                        error no merged claim is written and no source is retired, so retrying \
                        a failed call is safe. The merged claim is authored by the calling agent \
@@ -1098,19 +1137,20 @@ impl EpiGraphMcpFull {
                        earliest wins ties). DRY RUN BY DEFAULT. Exact restatements are \
                        collapsed via mark_duplicate when dry_run=false; clusters that merely \
                        resemble each other are returned as merge_candidates for \
-                       consolidate_claims so no wording is discarded. Resumable via offset. The sweep sees every tenant's claims, so it can pair a duplicate that spans two groups. Requires scope claims:admin over HTTP (it reads and writes across every tenant). Requires this server to have a privileged maintenance connection: start it with MAINTENANCE_DATABASE_URL explicitly set to a role that is a member of epigraph_maintenance; the application DSN is never used for this, even when it could bypass row-level security. Without one the call is refused with nothing written, and the boot log says why; it never reports a successful no-op."
+                       consolidate_claims so no wording is discarded. Resumable via offset. The sweep sees every tenant's claims, so it can pair a duplicate that spans two groups. Requires scope claims:admin over HTTP (it reads and writes across every tenant). MOVED (operator decision D9): a request-serving MCP server holds no maintenance connection, so the call is refused with nothing written (JSON-RPC -32600, data.status=moved, not retryable) and names the operator CLI that runs it on the maintenance DSN: sweep_semantic_duplicates."
     )]
     async fn sweep_semantic_duplicates(
         &self,
         Parameters(params): Parameters<crate::types::SweepSemanticDuplicatesParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        let mut session = crate::maintenance::maintenance_viewer(
+        let mut session = crate::maintenance::maintenance_tool_session(
             self,
-            epigraph_db::visibility::SystemReason::DedupSweep,
+            crate::maintenance::MaintenanceTool::SweepSemanticDuplicates,
         )
         .await?;
-        tools::dedup_sweep::sweep_semantic_duplicates(self, &mut session, params).await
+        let acting_agent = self.server_agent_id().await?;
+        tools::dedup_sweep::sweep_semantic_duplicates(&mut session, params, acting_agent).await
     }
 
     // ── Alternative-set candidate finder (1 tool) ──
@@ -1284,7 +1324,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it); cites is also accepted as a structural edge that moves no belief. Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write). target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with the calling agent's write authority. An endpoint in a group-private claim owned by a group the calling agent cannot write is refused with nothing written. Belief wiring into a target the calling agent cannot write moves no belief (belief_wired=false) and the edge still lands."
+        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it); cites is also accepted as a structural edge that moves no belief. Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write). target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with the calling agent's write authority. An endpoint in a group-private claim owned by a group the calling agent cannot write is refused with nothing written. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the edge's mass function is owned by the calling agent's own group (its operator's group for an operated agent) and stays public, and belief_wired=true once that mass function is stored and the target's combination recomputed; the target's CACHED belief is updated from that combination through an audited path only when the cache already carries binary_truth or the target has no cache at all, and target_belief always reports the cache as stored (so it may be unchanged); the target claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
     )]
     async fn link_epistemic(
         &self,
@@ -1378,16 +1418,16 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path. Each claim's cache is recomputed in its own transaction; claims_recomputed and frame_writes count only claims whose cached belief columns (belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, belief_frame_id) were actually written and committed, and a per-claim failure is rolled back and listed in errors. Requires scope claims:admin over HTTP (it reads and writes across every tenant). Requires this server to have a privileged maintenance connection: start it with MAINTENANCE_DATABASE_URL explicitly set to a role that is a member of epigraph_maintenance; the application DSN is never used for this, even when it could bypass row-level security. Without one the call is refused with nothing written, and the boot log says why; it never reports a successful no-op."
+        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path. Each claim's cache is recomputed in its own transaction; claims_recomputed and frame_writes count only claims whose cached belief columns (belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, belief_frame_id) were actually written and committed, and a per-claim failure is rolled back and listed in errors. Requires scope claims:admin over HTTP (it reads and writes across every tenant). MOVED (operator decision D9): a request-serving MCP server holds no maintenance connection, so the call is refused with nothing written (JSON-RPC -32600, data.status=moved, not retryable) and names the operator CLI that runs it on the maintenance DSN: recompute_claim_belief."
     )]
     async fn recompute_beliefs(
         &self,
         Parameters(params): Parameters<RecomputeBeliefsParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        let mut session = crate::maintenance::maintenance_viewer(
+        let mut session = crate::maintenance::maintenance_tool_session(
             self,
-            epigraph_db::visibility::SystemReason::BeliefRecomputation,
+            crate::maintenance::MaintenanceTool::RecomputeBeliefs,
         )
         .await?;
         tools::cdst_maintenance::recompute_beliefs(self, &mut session, params).await
@@ -1460,7 +1500,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record what actually happened when you used a workflow. For a workflows-table id (what `store_workflow` / `ingest_workflow` return) it delegates to `report_hierarchical_outcome` and has that tool's response and semantics: counters plus per-step rows, no evidence, no belief change, NOT idempotent, and execution_log[].step_index mapped to the steps in original plan order. Legacy flat workflow claim IDs are still supported: there the run is recorded as evidence plus a Dempster-Shafer truth update, all-or-nothing (an error writes nothing, so an identical retry is safe), and it is refused for a workflow claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write."
+        description = "Record what actually happened when you used a workflow. For a workflows-table id (what `store_workflow` / `ingest_workflow` return) it delegates to `report_hierarchical_outcome` and has that tool's response and semantics: counters plus per-step rows, no evidence, no belief change, NOT idempotent, and execution_log[].step_index mapped to the steps in original plan order. Legacy flat workflow claim IDs are still supported: there the run is recorded as evidence plus a Dempster-Shafer truth update, all-or-nothing (an error writes nothing, so an identical retry is safe). On a PUBLIC flat workflow claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write (most shared workflows), the outcome evidence and its BBA are owned by the calling agent's own group (its operator's group for an operated agent) and stay public, the claim's cached belief is recombined through an audited path when it carries binary_truth or has no cache (cache_written; warning otherwise), and the claim's truth_value is NOT written (truth_written=false, truth_after=truth_before). A group-private workflow claim the calling agent cannot write is refused."
     )]
     async fn report_workflow_outcome(
         &self,
@@ -1781,7 +1821,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief: both are DEPRECATED, and sending a combination_method other than Dempster, or any gamma, adds an entry to the response's warnings array (omitted when empty). An evidence_type the recompute cannot resolve to a calibrated weight (not a calibration.toml [evidence_type_weights] key or [evidence_type_aliases] alias, nor in the frame's own evidence_type_weights override) is accepted and combined at the 0.5 unknown-type reliability, and is returned in unknown_keys with an explanatory entry in warnings: a warning, never a refusal."
+        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief: both are DEPRECATED, and sending a combination_method other than Dempster, or any gamma, adds an entry to the response's warnings array (omitted when empty). An evidence_type the recompute cannot resolve to a calibrated weight (not a calibration.toml [evidence_type_weights] key or [evidence_type_aliases] alias, nor in the frame's own evidence_type_weights override) is accepted and combined at the 0.5 unknown-type reliability, and is returned in unknown_keys with an explanatory entry in warnings: a warning, never a refusal. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the BBA is owned by the calling agent's own group (its operator's group for an operated agent) and stays public; the claim's frame assignment stays owned by the claim's group (created if missing, never changed: an existing hypothesis_index is kept; a missing binary_truth assignment can be created only at hypothesis_index 0, i.e. TRUE, and any other index is refused with nothing written) and its cached belief is recombined over every writer's BBAs through an audited path only on the frame the cache already carries, or on binary_truth when the claim has no cache at all (a warning says when it was not); the claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
     )]
     async fn submit_ds_evidence(
         &self,
@@ -1918,16 +1958,16 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Covers every tenant's claims. A claim sealed or superseded between selection and store is not given a vector and is counted in failed. Requires scope claims:admin over HTTP (it reads and writes across every tenant). Requires this server to have a privileged maintenance connection: start it with MAINTENANCE_DATABASE_URL explicitly set to a role that is a member of epigraph_maintenance; the application DSN is never used for this, even when it could bypass row-level security. Without one the call is refused with nothing written, and the boot log says why; it never reports a successful no-op."
+        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Covers every tenant's claims. A claim sealed or superseded between selection and store is not given a vector and is counted in failed. Requires scope claims:admin over HTTP (it reads and writes across every tenant). MOVED (operator decision D9): a request-serving MCP server holds no maintenance connection, so the call is refused with nothing written (JSON-RPC -32600, data.status=moved, not retryable) and names the operator CLI that runs it on the maintenance DSN: embed_backfill."
     )]
     async fn backfill_embeddings(
         &self,
         Parameters(params): Parameters<crate::tools::embeddings::BackfillEmbeddingsParams>,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        let mut session = crate::maintenance::maintenance_viewer(
+        let mut session = crate::maintenance::maintenance_tool_session(
             self,
-            epigraph_db::visibility::SystemReason::EmbeddingBackfill,
+            crate::maintenance::MaintenanceTool::BackfillEmbeddings,
         )
         .await?;
         crate::tools::embeddings::backfill_embeddings(self, &mut session, params).await
@@ -2055,7 +2095,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
+        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. Retirement is administrative end to end: the flip, the edge retraction and the derived-row deletes run together on the server's maintenance connection and are audited. Without one nothing changes and the retirement is recorded as a deferred request for the operator's replay (the result's `retired` and `cascade` say which: applied, deferred or failed). Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
     )]
     // `pub` so `tests/matching_tools_smoke.rs` can drive this dispatch body,
     // not just the tool function under it: the maintenance-connection choice
@@ -2067,38 +2107,9 @@ impl EpiGraphMcpFull {
         Parameters(params): Parameters<RetireMatchCandidateParams>,
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        // A viewer since batch H-b, for its principal: the retiring agent
-        // recorded on the candidate.
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        // Migration 118: `stale` is an administrative state that
-        // `match_candidates_stale_guard` refuses on a non-privileged session,
-        // and the retirement's cascade deletes derived rows that are not the
-        // caller's. So the retirement runs on the MAINTENANCE connection
-        // whenever one is attached, as the HTTP route does. Without one it runs
-        // on the server's own pool, exactly as before 118, and the database
-        // decides: a privileged DSN retires, an application-role DSN is
-        // refused with MC01 (mapped to an error naming the fix). Refusing
-        // outright without a maintenance pool, as the three corpus-wide
-        // maintenance tools do, would take retirement away from a process on a
-        // privileged DSN that never needed one.
-        //
-        // The reason is `BeliefRecomputation`: the retirement deletes the
-        // matcher edge's derived belief rows (factors, bp_messages, its BBAs).
-        // `SystemReason` is a closed, monotone-decreasing register
-        // (`viewer_ratchet.rs`), so a dedicated retirement variant is not added.
-        let mut session = match self.scoped.as_ref() {
-            Some(scoped) if scoped.has_maintenance_pool() => Some(
-                crate::maintenance::maintenance_viewer(
-                    self,
-                    epigraph_db::visibility::SystemReason::BeliefRecomputation,
-                )
-                .await?,
-            ),
-            _ => None,
-        };
-        let conn = session.as_mut().map(epigraph_db::MaintenanceSession::conn);
-        tools::matching::retire_match_candidate(self, viewer, conn, params, auth).await
+        tools::matching::retire_match_candidate(self, viewer, params, auth).await
     }
 
     // ── Meta (1 tool) ──
@@ -2392,14 +2403,14 @@ mod scope_guard_tests {
     #[test]
     fn scope_guard_allows_matching_scope() {
         let auth = auth_with_scopes(&["claims:admin"]);
-        assert!(EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "mark_duplicate").is_ok());
+        assert!(EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "delete_edge").is_ok());
     }
 
     #[test]
     fn scope_guard_rejects_missing_scope() {
-        let auth = auth_with_scopes(&["claims:read"]);
-        let err = EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "mark_duplicate")
-            .expect_err("read-only token must NOT be allowed to mark_duplicate");
+        let auth = auth_with_scopes(&["claims:write"]);
+        let err = EpiGraphMcpFull::enforce_tool_scope(Some(&auth), "delete_edge")
+            .expect_err("a claims:write token must NOT be allowed to delete_edge");
         // Error message should mention the required scope name so callers can
         // debug a 403 without reading the source.
         assert!(

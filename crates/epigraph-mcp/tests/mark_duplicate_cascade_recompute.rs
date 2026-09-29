@@ -217,7 +217,12 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
     let dup = seed_claim(&pool, "duplicate claim", 0.5).await;
@@ -334,7 +339,12 @@ async fn resourced_outgoing_edge_bba_is_re_derived_from_canonical(pool: PgPool) 
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     // `canonical` earns a HIGH interval from its own supporter W, so it is a
     // real (BBA-backed) interval rather than a hand-planted column value.
@@ -420,7 +430,12 @@ async fn target_of_both_a_collision_delete_and_a_resourced_edge_is_recomputed_la
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     // Factorless canonical: NULL belief/plausibility, exactly as
     // `ClaimRepository::supersede` and a plain `submit_claim` leave a claim.
@@ -512,7 +527,12 @@ async fn bba_free_dedup_leaves_the_survivors_derived_columns_alone(pool: PgPool)
     // `link_epistemic`'s belief wiring now REFUSES on a server with no
     // `ScopedPool` rather than falling back to the unstamped pool, so this
     // fixture's `belief_wired` precondition needs the scoped variant.
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
 
     let canonical = seed_claim(&pool, "canonical claim", 0.5).await;
     let dup = seed_claim(&pool, "duplicate claim", 0.5).await;

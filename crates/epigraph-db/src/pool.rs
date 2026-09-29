@@ -123,6 +123,43 @@ pub async fn create_pool_from_options(
 /// use once RLS is FORCEd (PR-17).
 pub const MAINTENANCE_DATABASE_URL: &str = "MAINTENANCE_DATABASE_URL";
 
+/// The refusal a REQUEST-SERVING process (`server`, `epigraph-mcp-full` on any
+/// transport) prints when [`MAINTENANCE_DATABASE_URL`] is set in its
+/// environment (operator decision D9, batch W12a).
+pub const REQUEST_UNIT_HOLDS_MAINTENANCE_DSN: &str =
+    "MAINTENANCE_DATABASE_URL is set; a request-serving process never holds the maintenance DSN \
+     (operator decision D9). Remove it from this unit's EnvironmentFile; cascades are applied by \
+     epigraph-cascade-replay.timer.";
+
+/// The one INFO line a request-serving process logs (target
+/// `tenancy.maintenance`) when it starts without a maintenance DSN, which is the
+/// only state D9 supports.
+pub const MAINTENANCE_SURFACE_NOT_SERVED: &str =
+    "maintenance surface not served by this unit (D9); cascades defer to \
+     epigraph-cascade-replay.timer, jobs run on epigraph-jobs-drain.timer";
+
+/// Whether a REQUEST-SERVING process may start, given the value of
+/// [`MAINTENANCE_DATABASE_URL`] in its environment (operator decision D9).
+///
+/// The maintenance DSN is held only by the timers (`replay_deferred_cascades`,
+/// `drain_jobs`) and the operator's CLIs. A request-serving process that finds
+/// the variable set is exactly the misconfiguration D9 forbids, and would
+/// otherwise silently re-arm in-process cascades, so it refuses to start: one
+/// code path, every environment, no override.
+///
+/// An exported-but-EMPTY (or whitespace) value is treated as unset, the same
+/// rule [`resolve_maintenance_url`] applies: it carries no credential, so the
+/// process holds nothing D9 removes.
+///
+/// # Errors
+/// [`REQUEST_UNIT_HOLDS_MAINTENANCE_DSN`] when the variable carries a value.
+pub fn request_unit_maintenance_dsn_check(configured: Option<&str>) -> Result<(), &'static str> {
+    match configured {
+        Some(v) if !v.trim().is_empty() => Err(REQUEST_UNIT_HOLDS_MAINTENANCE_DSN),
+        _ => Ok(()),
+    }
+}
+
 /// Where [`maintenance_database_url`] got its answer.
 ///
 /// Carried rather than discarded because the two cases have different
@@ -772,12 +809,64 @@ impl ScopedPool {
         mode: SessionGucMode,
         options: ScopedPoolOptions,
     ) -> Result<Self, DbError> {
+        Self::connect_inner(database_url, mode, options, None).await
+    }
+
+    /// TEST SUPPORT ONLY (the `test-support` feature, which only
+    /// dev-dependencies enable): [`Self::connect`] whose every connection is
+    /// DOWNGRADED to `role` with `SET SESSION AUTHORIZATION` right after it
+    /// connects, before any checkout.
+    ///
+    /// Why: `#[sqlx::test]` hands out a superuser DSN, and a superuser session
+    /// bypasses every RLS policy and counts as privileged everywhere
+    /// (`epigraph_bypass()` reads `session_user`, so `SET ROLE` is not enough).
+    /// A tool test driven through a `ScopedPool` on that DSN therefore cannot
+    /// observe what the application role is refused. `SET SESSION
+    /// AUTHORIZATION` changes `session_user` as well, exactly as the
+    /// `downgraded_pool` test fixture does for a plain pool; this is the same
+    /// move for the pool that carries the release scrub. The connecting role
+    /// must be a superuser, which is why no production DSN can use it.
+    ///
+    /// # Errors
+    /// `DbError::ConnectionFailed` if the pool cannot be established, or
+    /// `DbError::QueryFailed` for a `role` that is not a plain lower-case
+    /// identifier (it is spliced into a statement that takes no bind).
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn connect_downgraded_for_tests(
+        database_url: &str,
+        mode: SessionGucMode,
+        role: &'static str,
+    ) -> Result<Self, DbError> {
+        if role.is_empty()
+            || !role
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
+        {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!("not a plain role identifier: {role}")),
+            });
+        }
+        Self::connect_inner(database_url, mode, ScopedPoolOptions::default(), Some(role)).await
+    }
+
+    async fn connect_inner(
+        database_url: &str,
+        mode: SessionGucMode,
+        options: ScopedPoolOptions,
+        downgrade_to: Option<&'static str>,
+    ) -> Result<Self, DbError> {
         let statement_timeout = options.statement_timeout;
         let inner = PgPoolOptions::new()
             .max_connections(options.max_connections)
             .acquire_timeout(options.acquire_timeout)
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
+                    if let Some(role) = downgrade_to {
+                        use sqlx::Executor;
+                        conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+                            .await?;
+                    }
                     if let Some(t) = statement_timeout {
                         apply_statement_timeout(conn, t).await?;
                     }

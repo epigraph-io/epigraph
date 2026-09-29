@@ -13,7 +13,7 @@
 //!
 //! | source | target | edge |
 //! |---|---|---|
-//! | public | public | `('public', world, co = NULL)` |
+//! | public | public | `('public', W_g, co = NULL)` for a writer W (migration 120, D8); `('public', world)` without one |
 //! | public | group G | `('group', G, co = NULL)` |
 //! | group G | group G | `('group', G, co = NULL)` |
 //! | group G | group H | `('group', G, co = H)` ← migration 072 |
@@ -239,18 +239,78 @@ async fn visible(pool: &PgPool, viewer: &Viewer, id: Uuid) -> bool {
 // 1 — the four endpoint combinations
 // ===========================================================================
 
-/// **public × public → `('public', world, co = NULL)`, visible to everyone.**
+/// **public × public → the WRITER's, `('public', W_g, co = NULL)`, visible to
+/// everyone** (migration 120, operator decision D8).
+///
+/// Before 120 the meet stamped every public × public edge `('public', world)`.
+/// Now a session that carries a principal with a writable group owns its edge
+/// between two public claims (the harness connection is privileged; 120's arm
+/// (i) applies to privileged sessions with a principal too). The edge is still
+/// public: a stranger reads it. A principal-less insert (this file's
+/// `seed_edge` on the bare harness connection) is still the world's.
 #[sqlx::test(migrations = "../../migrations")]
-async fn both_endpoints_public_meets_at_public_and_is_visible_to_a_stranger(pool: PgPool) {
+async fn both_endpoints_public_is_the_writers_and_is_visible_to_a_stranger(pool: PgPool) {
     let c = corpus(&pool).await;
-    let edge = seed_edge(&pool, c.public_a, c.public_b).await;
+    let (writer, writer_g) = fixture::seed_agent_with_group(&pool, "edge writer").await;
+    let edge = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let v = Viewer::resolve(&pool, writer)
+            .await
+            .expect("resolve the writer");
+        let csv = |ids: &[Uuid]| {
+            ids.iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', $1, false), \
+                    set_config('epigraph.writable_group_ids', $2, false), \
+                    set_config('epigraph.principal_id', $3, false)",
+        )
+        .bind(csv(v.group_bind().expect("scoped")))
+        .bind(csv(v.writable_groups()))
+        .bind(writer.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the writer");
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                                properties) \
+             VALUES ($1, 'claim', $2, 'claim', 'supports', \
+                     jsonb_build_object('created_by', $3::text, 'strength', 0.7)) \
+             RETURNING id",
+        )
+        .bind(c.public_a)
+        .bind(c.public_b)
+        .bind(writer.to_string())
+        .fetch_one(&mut *conn)
+        .await
+        .expect("insert the writer's edge");
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', '', false), \
+                    set_config('epigraph.writable_group_ids', '', false), \
+                    set_config('epigraph.principal_id', '', false)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("unstamp");
+        id
+    };
+    let principal_less = seed_edge(&pool, c.public_a, c.public_b).await;
 
     assert_eq!(
         edge_tenancy(&pool, edge).await,
+        (writer_g, "public".to_string(), None)
+    );
+    assert_eq!(
+        edge_tenancy(&pool, principal_less).await,
         (WORLD, "public".to_string(), None)
     );
-    assert!(visible(&pool, &c.stranger, edge).await);
-    assert!(visible(&pool, &c.in_both, edge).await);
+    for e in [edge, principal_less] {
+        assert!(visible(&pool, &c.stranger, e).await);
+        assert!(visible(&pool, &c.in_both, e).await);
+    }
 }
 
 /// **public × group G → `('group', G, co = NULL)`.**

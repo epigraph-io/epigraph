@@ -502,8 +502,103 @@ Current reservation:
   `origin/*` ref carries a `112`. **Applied to a throwaway database only, NOT to
   any deployed database.**
 
-- **113–115**: claimed by open pull requests (113 batch R2, HELD; 114 W-own,
-  115 W9). Their entries land with them.
+- **113**: HELD for batch R2 (`origin/fix/batch-r2-superuser-dsn-escape`,
+  PR #511). Its entry lands with it; a database at a later head without it
+  applies it later in version order.
+
+- **114**: public `writer_owned_derived_rows` — a row an agent ATTACHES to a
+  PUBLIC claim it cannot write is owned by the WRITER's group and stays public
+  (operator decision 2026-09-26, batch W-own). `evidence`, `mass_functions` and
+  `reasoning_traces` gain `writer_owned boolean NOT NULL DEFAULT false` and a
+  BEFORE INSERT trigger `<table>_attach_writer` (SECURITY INVOKER; sorts before
+  `<table>_require_tenancy`) that, for a non-privileged session with a principal
+  that can READ a public claim whose owner it cannot WRITE, owns the row by
+  `epigraph_writer_group()` (#503's rule: the acting operator's personal group,
+  else the principal's own personal group, only when writable; never minted),
+  with `writer_owned = true`, decided on the claim row locked `FOR NO KEY
+  UPDATE` (`epigraph_lock_public_claim_for_attach`) so an attach and a
+  privatization serialise. Every other case is left to 074 exactly as before.
+  A BEFORE UPDATE guard `<table>_writer_owner_guard` refuses a change of
+  `owner_group_id` / `writer_owned`, and of a writer-owned row's `claim_id` /
+  `visibility`, from a non-maintenance session (077 alone admitted moving any
+  public derived row into one's own group). Arm (c)
+  (`epigraph_inherit_tenancy_stmt`) skips writer-owned rows as it skips pinned
+  evidence; arm (d) (`epigraph_propagate_tenancy`) never moves their owner while
+  the claim stays public, and hands them to the claim (owner, visibility, flag
+  cleared) when it narrows; the `derived text[]` literal is 072's byte for
+  byte. Per-claim aggregates
+  (`claim_frames`, the `claims` DS cache columns) stay CLAIM-owned and a
+  non-owner reaches them only through four audited definers
+  (`epigraph_foreign_claim_frame`, `_belief_cache`, `_claim_classification`,
+  `_belief_clear`; one `security_events` row per effective write,
+  `event_type = 'claims.foreign_aggregate_write'`), which never write
+  `truth_value`, `labels` or `content`, never RE-POINT the cache to another
+  frame (a non-owner refreshes the combination on the frame the claim's cache
+  carries, and seeds one only on `binary_truth` when every cache column is
+  NULL, so an older frameless cache is never overwritten), never create a
+  `binary_truth` assignment at an index other than 0, and require the writer to
+  hold a writable group of its own; the repo layer
+  (`repos/foreign_attach.rs`) routes to them with the same statement, so an
+  owner / admin / maintenance write is unchanged. `epigraph_dedup_move_bbas`
+  moves a dedup's edge-keyed BBAs for a non-privileged session (writer-owned on
+  a public canonical it cannot write). `epigraph_reown_legacy_writer_bbas`
+  (maintenance only, NOT run by the migration) re-owns BBAs stored before 114 by
+  a privileged session to their source agent's group, so the agent can replace
+  them once on the application role: **run it immediately before the agents
+  move to the application role**. Replaces NO function 113
+  replaces, so 113 and 114 apply in either order. Registered with
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Behaviour in
+  `epigraph-db/tests/writer_owned_derived_rows.rs` (all arms as
+  `epigraph_app`). **Deploy order: apply 114 BEFORE any binary built with it
+  serves** -- the repo layer calls `epigraph_session_is_privileged_writer()` on
+  every aggregate write, owners' included, and no server refuses to boot on a
+  lower database head. **No undo runbook ships**: undo is in the file's header.
+  **Applied to throwaway databases only (5433, with 113), NOT to any deployed
+  database.**
+
+- **115**: public `owner_scoped_delete` (batch W9) — DELETE is owner-scoped on
+  every tier-A table. 077's FOR ALL policies used the READ predicate as DELETE's
+  USING, so the rows a session could remove were the rows it could read. One
+  RESTRICTIVE, FOR DELETE policy per table (`<table>_delete_owner`, 24 tables:
+  every relation carrying both tenancy columns bar the principal-keyed
+  `recall_events`) now also requires the row's owner in the session's writable
+  set; on `edges` the owner or the co-owner, or, for an edge between two public
+  endpoints (world-owned by 070's trigger), a writer of the edge's SOURCE node
+  (`epigraph_session_writes_node`, a caller-bound boolean definer). Privileged
+  sessions (`epigraph_bypass()`, `epigraph_definer_bypass()`) are unchanged.
+  The three code paths that invalidate other writers' edge-keyed BBAs (the
+  dedup's retracted collision edges, the retraction cascade's re-sourced edges,
+  the match-candidate retirement, now reordered to retract first) call
+  `epigraph_cascade_delete_edge_bbas(edge_ids, cause)` for a non-privileged
+  session: it admits a readable row that is the session's own, that belongs to
+  a retracted edge, or whose edge's source claim (or a retired duplicate of it
+  authored by the row's source agent) the session writes; refuses the whole call
+  (CD02, 42501) otherwise; and appends one `security_events` row
+  (`derived.cascade_bba_delete`) per call that deleted anything. The dedup's
+  canonical-side collision pre-delete stays a plain (now owner-scoped)
+  statement; a residual collision is resolved inside `epigraph_dedup_move_bbas`
+  (redefined, same signature) by dropping the duplicate's copy. The
+  `claims` / `evidence` / `reasoning_traces` `_cascade_edges` triggers run
+  `epigraph_cascade_delete_node_edges()`, 001's statement in a maintenance-owned
+  definer, so deleting a node one may delete still removes every edge pointing
+  at it. `epigraph_maintenance` gains DELETE on `mass_functions` and `edges`.
+  The DELETE rule reads `owner_group_id`, so it depends on that column being
+  immutable to a non-privileged UPDATE: a `<table>_owner_immutable` BEFORE
+  UPDATE OF `owner_group_id` trigger (`epigraph_owner_immutable_guard`; on
+  `edges` also `co_owner_group_id`) refuses (42501) a re-own on the 21 tables
+  114's `<table>_writer_owner_guard` does not already cover. Outside tier A,
+  the four group-keyed sealed-content tables and `group_key_epochs` get a
+  RESTRICTIVE, FOR DELETE `<table>_delete_writer` policy (the row's `group_id`
+  in the writable set; on `group_key_epochs` also the group's creator), so a
+  read-only member cannot delete them. 089's fragment stamp
+  (`epigraph_inherit_fragment_tenancy_stmt`, redefined with CREATE OR REPLACE,
+  same signature) now runs only when `epigraph_bypass()` holds, so a
+  provenance INSERT cannot hand a non-privileged session ownership of a
+  sentinel-owned fragment it could then delete. Registered with `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Behaviour
+  in `epigraph-db/tests/owner_scoped_delete.rs` (arms as `epigraph_app`).
+  **Deploy order: apply 115 BEFORE any binary built with it serves.** Undo is in
+  the file's header. **Applied to throwaway databases only (5433, with 113 and
+  114), NOT to any deployed database.**
 
 - **116**: public `link_retired_shared_signer` — the ATTESTED retire of a
   FORMER shared HTTP signer (batch HTTP-id). One SECURITY DEFINER,
@@ -534,7 +629,48 @@ Current reservation:
   a link it recorded is permanent like 107's. **Applied to a throwaway database
   only, NOT to any deployed database.**
 
-- **117**: claimed by an open pull request (W10). Its entry lands with it.
+- **117**: public `admin_cascade_owner_scoped_update` (batch W10) — UPDATE of
+  an edge, or of an instance-wide registry row, is owner-scoped, and the
+  retraction cascade is an administrative act. One RESTRICTIVE, FOR UPDATE
+  policy `<table>_update_owner` on `edges` (owner or co-owner in the writable
+  set) and on `frames`, `contexts`, `perspectives`, `communities` (owner),
+  USING and WITH CHECK both, plus the bypass arms: 077's world WITH CHECK arm no
+  longer lets any session retract, relabel or re-point a row nobody owns, and
+  070/072's endpoint restamp can no longer be driven by a non-owner. The set is
+  the catalog's (world-admitting UPDATE WITH CHECK, or a BEFORE UPDATE owner
+  restamp), pinned by `owner_scoped_update.rs`'s two ratchets.
+  `epigraph_cascade_delete_edge_bbas` is redefined (CREATE OR REPLACE) to its
+  owner arm only; 115's `retracted_edge` and `source_writer` arms are gone.
+  `epigraph_dedup_move_bbas` is revoked from `epigraph_app`.
+  `epigraph_maintenance` gains DELETE on `factors` and `bp_messages`. A
+  BEFORE UPDATE trigger `edges_repoint_unsign` clears an edge's signature
+  columns when a non-privileged session changes its endpoints. The
+  application splits supersede, dedup and consolidation into the caller's act
+  (its own stamped transaction) and a repair that runs on the maintenance
+  connection (`epigraph_engine::admin_cascade`); a match-candidate retirement
+  runs whole (the flip to `stale` included, which 118 reserves to a privileged
+  session) on the maintenance connection, or is recorded as a deferred request
+  with the candidate's status as the replay's precondition. Each repair is
+  committed together with its `cascade.admin_applied` row, or recorded as
+  `cascade.deferred` (in the act's transaction) when the process has no usable
+  maintenance DSN; `replay_deferred_cascades` replays those (fewest failed
+  attempts first; a cascade that keeps failing is held out as stuck until an
+  operator retires it with a `cascade.retired` row). The rows the replay acts
+  on are the server's: a RESTRICTIVE INSERT policy
+  `security_events_cascade_privileged` refuses any `cascade.*` row from a
+  non-privileged session, a deferral is written only by the definer
+  `epigraph_record_cascade_deferral` (attributed to the session principal,
+  and only for an act the session made), and trigger `claims_supersedes_guard`
+  refuses a non-privileged UPDATE pointing `claims.supersedes` at a claim that
+  is neither public nor written by the session. 115's source-writer
+  DELETE arm on `edges` is unchanged and recorded in the header as a pending
+  decision. Behaviour in
+  `epigraph-db/tests/owner_scoped_update.rs`, `owner_scoped_delete.rs` and
+  `epigraph-mcp/tests/writer_owned_attach_app_role.rs` (arms as `epigraph_app`).
+  **Deploy order: apply 117 BEFORE any binary built with it serves, and set the
+  maintenance DSN on each server process first.** Undo is in the file's header.
+  **Applied to throwaway databases only (5433, with 113, 114 and 115), NOT to
+  any deployed database.**
 
 - **118**: public `app_role_table_lockdown` (batch W11). The application role
   no longer holds UPDATE/DELETE on credential and ledger tables. REVOKEs
@@ -573,9 +709,58 @@ Current reservation:
   merge `main` (with 118) before it deploys. **Undo:** the GRANTs are listed at
   the end of the file. **Applied to a throwaway database only.**
 
-- **119+**: public next
+- **119**: public `maintenance_timer_only` (batch W12a, operator decision D9) —
+  the maintenance DSN lives only in timers and operator CLIs, never in a
+  request-serving process. `epigraph_maintenance` gains DELETE on `jobs`,
+  `graph_cluster_runs`, `graph_clusters`, `cluster_edges`,
+  `claim_cluster_membership` and `claim_themes` (the tables a job handler
+  deletes from; the drain timer runs them on a non-superuser maintenance
+  login). The sealed-content tables are deliberately not granted. `jobs_app`'s
+  WITH CHECK becomes the two session predicates only (`epigraph_bypass()` /
+  `epigraph_definer_bypass()`): 077's denylist let any application session
+  enqueue any non-privatization job, which after D9 a privileged timer runs.
+  Carries `SET LOCAL lock_timeout = '3s'`. Behaviour in
+  `epigraph-db/tests/maintenance_timer_only.rs` (arms as `epigraph_app` and
+  `epigraph_maintenance`). Undo is in the file's header. **Applied to
+  throwaway databases only (5433, with 113), NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `119` or
+- **120**: public `writer_owned_edges` (batch W12b, operator decision D8) — an
+  edge between two public claims is owned by its WRITER's group and stays
+  public. `edges.writer_group_id` (nullable, no default, no FK) records the
+  writing session's group (`epigraph_writer_group()`) on every INSERT, whatever
+  the caller bound; it is never recomputed, `edges_owner_immutable` now watches
+  it, and only the privatization revert reads it.
+  `epigraph_edge_writer_scope(src_type, tgt_type)` (IMMUTABLE) is D8's scope:
+  both endpoints `claim` / `evidence`, or a `synthesis` source. In scope and
+  both endpoints public, `epigraph_edges_tenancy()` owns the edge by the
+  writer's group (world when the session has no principal or no writable
+  group; this applies to privileged sessions that carry a principal too, a
+  deliberate difference from 114 section 2(b)); a re-point of a public edge
+  keeps its owner (arm (u)); every other public-meet edge (agent, paper,
+  workflow, trace ... endpoints) stays `('public', world)`, administrative; 072's
+  no-widening arm and four meet arms are unchanged.
+  `epigraph_propagate_tenancy()` is 114's body plus one conjunct (`m.v =
+  'group'`): a public-to-public owner change of an endpoint never rewrites a
+  public edge. `edges_delete_owner` loses 115's source-writer arm (owner and
+  co-owner only). `epigraph_record_cascade_deferral` accepts cause
+  `edge_retract` (an edge owner's retract or delete of an edge now out of
+  force; the replay removes other writers' edge-keyed BBAs and re-derives the
+  belief of those claims and of the claims the owner's own deleted BBAs lived
+  on, which the deferral carries as its sources). `epigraph_reown_legacy_edges_to_signer(p_limit,
+  p_exclude_signers)` (maintenance only, NOT run by the migration; the
+  exclusion list is mandatory) re-owns a legacy world edge to a signer that
+  resolves to an operator or personal group. 077's `edges_tenancy` WITH CHECK
+  world arm is kept (principal-less and out-of-scope inserts). Carries `SET
+  LOCAL lock_timeout = '3s'` (the column add takes ACCESS EXCLUSIVE; apply in a
+  maintenance window, re-run on a timeout). Behaviour in
+  `epigraph-db/tests/writer_owned_edges.rs`. **Deploy order: apply 120 only
+  once per-caller HTTP identity serves, and BEFORE any binary built with it
+  serves.** Undo is in the file's header. **Applied to throwaway databases only
+  (5433, with 113), NOT to any deployed database.**
+
+- **121+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `121` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

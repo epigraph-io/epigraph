@@ -563,7 +563,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 274;
+const HIGH_WATER: usize = 267;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -615,6 +615,15 @@ const HIGH_WATER: usize = 274;
 /// on the converted tree. Dropping `PATCH /claims/:id/labels`' author-stamp
 /// arm removed its `Viewer::resolve(&state.db_pool, ..)`: `routes/claims.rs`
 /// 20 -> 19, `HIGH_WATER` 275 -> 274.
+/// Batch W10 (migration 117) moved `mark_duplicate`'s dedup onto a
+/// caller-stamped transaction and both cascades onto the maintenance
+/// connection: `routes/versioning.rs` 4 -> 2, `HIGH_WATER` 274 -> 272, the file
+/// keeping 2 sites, read off `the_scanner_is_not_vacuous`'s own failure.
+/// Batch W12b (migration 120) moved the HTTP edge write handlers onto
+/// caller-stamped transactions: `routes/edges.rs` 10 -> 5, `HIGH_WATER` 272 ->
+/// 267, the file keeping 5 post-commit side-effect sites, read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
+/// (`recorded 10, measured 5`).
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
@@ -721,7 +730,15 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `AppState::read_as`. Every one of the thirty-six that remain sits in a
     // WRITE handler; this is the densest write-blocked file in the series.
     ("routes/crud.rs", 31),
-    ("routes/edges.rs", 10),
+    // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
+    // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
+    // and the two helpers `create_edge` reaches (`is_valid_entity_type`,
+    // `entity_exists`) onto `AppState::write_as`. The five that remain are the
+    // post-commit side effects of those handlers (the DS recomputation and
+    // provenance of `create_edge`, its factor INSERT, and the provenance rows of
+    // `delete_edge`, `patch_edge` and `relate_claims`), which run after the
+    // commit on the raw pool exactly as before.
+    ("routes/edges.rs", 5),
     ("routes/embeddings.rs", 2),
     // 8 before conversion shard 7, and the largest single-file drop in that
     // shard. `entity_neighborhood` (2 sites) is category A. `query_triples`
@@ -840,7 +857,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // viewer (F-write-authz-reads-unfiltered). Five `supersede_claim` sites and
     // two `mark_duplicate` sites remain, all write. Read off this test's
     // failure output.
-    ("routes/versioning.rs", 4),
+    //
+    // 4 -> 2 (batch W10, migration 117): `mark_duplicate`'s dedup moved onto a
+    // transaction stamped with the caller's viewer (`AppState::write_as`), and
+    // both cascades moved onto the maintenance connection
+    // (`AppState::admin_cascade_session`). What remains is `supersede_claim`'s
+    // detached factor-query spawn and `mark_duplicate`'s best-effort provenance
+    // append. Read off this test's failure output.
+    ("routes/versioning.rs", 2),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is

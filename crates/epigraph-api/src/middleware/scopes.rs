@@ -36,6 +36,33 @@ pub fn require_owner_or_admin(
     })
 }
 
+/// The authority gate for a claim-retiring ACT, `supersede` and
+/// `mark_duplicate` (batch OA1, operator decision D1; the rule itself is
+/// [`epigraph_auth::claim_act::claim_act_arm`], shared with MCP).
+///
+/// The caller must already have read `target` THROUGH ITS OWN VIEWER and
+/// answered a claim it cannot read with 404; this gate is only ever asked about
+/// a claim the caller can see. `viewer_principal` and `writable_groups` are
+/// that viewer's. A refusal is [`ApiError::ClaimNotWritable`] (`403`,
+/// `not_owner`, rule `not_claim_writer`).
+///
+/// # Errors
+/// [`ApiError::ClaimNotWritable`] when no arm admits the caller.
+pub fn require_claim_act_authority(
+    auth: &AuthContext,
+    viewer_principal: Option<uuid::Uuid>,
+    writable_groups: &[uuid::Uuid],
+    target: epigraph_auth::claim_act::ClaimActTarget,
+    claim_id: uuid::Uuid,
+    action: &str,
+) -> Result<epigraph_auth::claim_act::ClaimActArm, ApiError> {
+    epigraph_auth::claim_act::claim_act_arm(auth, viewer_principal, writable_groups, target)
+        .ok_or_else(|| ApiError::ClaimNotWritable {
+            claim_id,
+            message: epigraph_auth::claim_act::not_claim_writer_message(claim_id, action),
+        })
+}
+
 /// Middleware: check that the request has a specific scope.
 /// Use with `axum::middleware::from_fn`.
 pub async fn require_scope(

@@ -236,7 +236,95 @@ pub enum ApiError {
     /// only a status that says "this specific thing has expired" carries that.
     #[error("Gone: {reason}")]
     Gone { reason: String },
+
+    /// `501 Not Implemented`, MOVED (operator decision D9, batch W12a): the
+    /// route is a MAINTENANCE surface, and a request-serving process holds no
+    /// maintenance connection. Structured and non-retryable; nothing was
+    /// written. `runs_on` names where the work runs instead (an operator CLI),
+    /// or `kind: "none"` when nothing serves it yet.
+    ///
+    /// Not 503 (transient, which invites retries) and not 403 (the caller's
+    /// authority is not in question).
+    #[error("Not served on this unit (operator decision D9): {surface} runs on {runs_on_kind} `{runs_on_name}`")]
+    MaintenanceSurfaceNotServed {
+        surface: String,
+        runs_on_kind: &'static str,
+        runs_on_name: String,
+    },
+
+    /// `403`, `not_owner` (migrations 115/117/120, operator decision D8): the
+    /// caller can READ the edge but may not patch, retract or delete it,
+    /// because it is another writer's (`rule = "owned_by_another_writer"`) or
+    /// administrative (`rule = "administrative_edge"`: world-owned, admin-only).
+    /// Nothing was written. An edge the caller cannot read answers `404`
+    /// instead, so this is no existence oracle.
+    #[error("{message}")]
+    EdgeNotOwned {
+        edge_id: uuid::Uuid,
+        rule: &'static str,
+        message: String,
+    },
+
+    /// `403`, `not_owner` with `rule = "not_claim_writer"` (batch OA1,
+    /// operator decision D1): the caller can READ the claim but may not
+    /// supersede it or mark it a duplicate, because it holds no
+    /// `admin`/`writer` membership in the group that owns it (authorship alone
+    /// is not write authority) and lacks `claims:admin`
+    /// (`epigraph_auth::claim_act`). Nothing was
+    /// written. A claim the caller cannot read answers `404` instead, exactly
+    /// like a missing one, so this is no existence oracle.
+    #[error("{message}")]
+    ClaimNotWritable {
+        claim_id: uuid::Uuid,
+        message: String,
+    },
 }
+
+impl ApiError {
+    /// The MOVED answer for a maintenance route whose work an operator CLI runs
+    /// on the maintenance DSN (operator decision D9).
+    #[must_use]
+    pub fn moved_to_cli(surface: &str, cli: &str) -> Self {
+        Self::MaintenanceSurfaceNotServed {
+            surface: surface.to_string(),
+            runs_on_kind: "cli",
+            runs_on_name: cli.to_string(),
+        }
+    }
+
+    /// The `not_owner` refusal for a write on a visible edge (see
+    /// [`ApiError::EdgeNotOwned`]).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn edge_not_owned(
+        refusal: epigraph_db::EdgeRefusal,
+        edge_id: uuid::Uuid,
+        action: &str,
+    ) -> Self {
+        Self::EdgeNotOwned {
+            edge_id,
+            rule: refusal.rule(),
+            message: refusal.message(edge_id, action),
+        }
+    }
+
+    /// The MOVED answer for every privatization lifecycle route (operator
+    /// decision D9): the lifecycle has no serving unit until it has its own
+    /// design (an authenticated two-person approval without a DB-holding
+    /// request process).
+    #[must_use]
+    pub fn privatization_lifecycle_not_served(surface: &str) -> Self {
+        Self::MaintenanceSurfaceNotServed {
+            surface: surface.to_string(),
+            runs_on_kind: "none",
+            runs_on_name: PRIVATIZATION_LIFECYCLE_NOT_SERVED.to_string(),
+        }
+    }
+}
+
+/// `runs_on.name` for the privatization lifecycle routes under D9.
+pub const PRIVATIZATION_LIFECYCLE_NOT_SERVED: &str =
+    "privatization lifecycle unavailable under D9: see operator";
 
 /// JSON error response structure
 #[derive(Serialize)]
@@ -249,6 +337,61 @@ struct ErrorResponse {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // The MOVED contract (operator decision D9) has its own body, keyed for
+        // machines: `error`, `runs_on`, `retryable`, `decision`.
+        if let ApiError::MaintenanceSurfaceNotServed {
+            surface,
+            runs_on_kind,
+            runs_on_name,
+        } = &self
+        {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({
+                    "error": "maintenance_surface_not_served",
+                    "message": self.to_string(),
+                    "surface": surface,
+                    "runs_on": {"kind": runs_on_kind, "name": runs_on_name},
+                    "retryable": false,
+                    "decision": "D9",
+                })),
+            )
+                .into_response();
+        }
+        // The `not_owner` contract (migration 120, D8): machine-keyed like MOVED.
+        if let ApiError::EdgeNotOwned {
+            edge_id,
+            rule,
+            message,
+        } = &self
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "not_owner",
+                    "message": message,
+                    "edge_id": edge_id,
+                    "rule": rule,
+                    "retryable": false,
+                })),
+            )
+                .into_response();
+        }
+        // The claim-act refusal (batch OA1): the same machine keys as the edge
+        // contract above, with the claim's id and its own rule.
+        if let ApiError::ClaimNotWritable { claim_id, message } = &self {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "not_owner",
+                    "message": message,
+                    "claim_id": claim_id,
+                    "rule": epigraph_auth::claim_act::NOT_CLAIM_WRITER_RULE,
+                    "retryable": false,
+                })),
+            )
+                .into_response();
+        }
         let (status, error_type, details) = match &self {
             ApiError::BadRequest { message } => (
                 StatusCode::BAD_REQUEST,
@@ -334,6 +477,16 @@ impl IntoResponse for ApiError {
                 "Gone",
                 Some(serde_json::json!({ "reason": reason })),
             ),
+            // Answered above with its own body; kept here so the match stays
+            // exhaustive.
+            ApiError::MaintenanceSurfaceNotServed { .. } => (
+                StatusCode::NOT_IMPLEMENTED,
+                "maintenance_surface_not_served",
+                None,
+            ),
+            ApiError::EdgeNotOwned { .. } | ApiError::ClaimNotWritable { .. } => {
+                (StatusCode::FORBIDDEN, "not_owner", None)
+            }
         };
 
         // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a
@@ -431,6 +584,11 @@ impl From<DbError> for ApiError {
                 message: format!("{} already exists", entity),
             },
             DbError::Conflict { reason } => ApiError::Conflict { reason },
+            // Row security let the caller read the row but not change it
+            // (migrations 115/117): a denial, not a fault and not a 404.
+            e @ DbError::WriteRefused { .. } => ApiError::Forbidden {
+                reason: e.to_string(),
+            },
             // Migration 105's refusal to restore a revoked personal-group
             // membership. A denial, not a fault: 403 on the EXISTING variant
             // (a new `ApiError` variant would land in the no-db build with no

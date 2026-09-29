@@ -302,62 +302,88 @@ pub async fn decide_match_candidate(
 /// A SEPARATE tool from [`decide_match_candidate`] on purpose. `SCOPE_MAP` holds
 /// one scope per tool, and this is not the same kind of act as promote/reject:
 /// those are additive and take `claims:write` (the scope that files a challenge),
-/// while this withdraws an assertion another principal made and takes
-/// `claims:admin` (the scope that supersedes). Keeping them in one tool would
-/// force one of the two to carry the wrong scope, and 50 of 825 production
-/// oauth_clients hold `claims:write`.
+/// while this withdraws an assertion the MATCHER made, never the caller's own,
+/// and takes `claims:admin`: withdrawing another principal's assertion is an
+/// administrative act. (Supersession shared that scope until batch OA1; it is
+/// now the caller's own act on a claim it writes, at `claims:write`, so it is
+/// no longer the justification here.) Keeping them in one tool would force one
+/// of the two to carry the wrong scope, and `claims:write` is widely held.
 ///
 /// The edge is RETRACTED (`valid_to` closed), not deleted, so the promotion's
 /// provenance — `properties.decided_by` in particular — survives; see
 /// `MatchCandidateRepo::retire`. The derived rows ARE deleted, because they are
 /// materializations that regenerate from live edges.
-///
-/// # Migration 118: which connection
-///
-/// `maintenance` is the server's maintenance connection when one is attached
-/// (`server.rs` mints it). Without one the retirement runs on the server's
-/// pool, where `match_candidates_stale_guard` admits a privileged DSN and
-/// refuses an application-role one with `MC01`; that refusal is returned as an
-/// error naming `MAINTENANCE_DATABASE_URL`, and nothing is written (the
-/// retirement is one transaction).
 pub async fn retire_match_candidate(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
-    maintenance: Option<&mut sqlx::PgConnection>,
     params: RetireMatchCandidateParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    use epigraph_engine::admin_cascade::{self, CascadeCause, CascadeTrigger};
+
     server.reject_if_read_only()?;
     let candidate_id = parse_uuid(&params.candidate_id)?;
+    // The acting agent is the CALLER (batch H-b, D1): the deferral and the
+    // audit row name the principal that asked for the retirement.
+    let acting = server.write_identity(auth, viewer).await?;
+    let acting_agent = acting.agent_id();
     let repo = MatchCandidateRepo::new(server.pool.clone());
-    let acting_agent = server.write_identity(auth, viewer).await?.agent_id();
+    // `match_candidates` carries no tenancy; a missing id is the caller's
+    // error, reported before anything is written or deferred.
+    let before = repo.get(candidate_id).await.map_err(|e| match e {
+        sqlx::Error::RowNotFound => {
+            invalid_params(format!("match candidate {candidate_id} not found"))
+        }
+        e => internal_error(e),
+    })?;
 
-    let outcome = match maintenance {
-        Some(conn) => MatchCandidateRepo::retire_conn(conn, candidate_id, Some(acting_agent)).await,
-        None => repo.retire(candidate_id, Some(acting_agent)).await,
-    }
-    .map_err(retire_error)?;
+    // Migrations 117 and 118: the retirement is ADMINISTRATIVE end to end.
+    // The flip to `stale` is refused on a non-privileged session (118's
+    // `match_candidates_stale_guard`), and the matcher edge it retracts is
+    // owned by nobody when both claims are public (117). So the flip, the
+    // retraction and the derived-row deletes run together, in one transaction,
+    // on the maintenance connection, audited under this caller; the status the
+    // caller saw is the precondition, so a candidate decided again meanwhile is
+    // refused rather than retired.
+    let mut trigger = CascadeTrigger::new(
+        CascadeCause::MatchRetire,
+        Some(acting_agent),
+        crate::tools::supersede::oauth_principal(auth),
+        candidate_id,
+        None,
+    );
+    trigger.candidate_status = Some(before.status.clone());
+    let (cascade, retirement) = match crate::maintenance::admin_cascade_session(server).await {
+        Ok(mut session) => {
+            admin_cascade::apply_match_retire(session.conn(), viewer, &trigger, candidate_id).await
+        }
+        // No maintenance connection: nothing about the candidate changes. The
+        // whole retirement is recorded as a deferred request, on a transaction
+        // stamped from the acting agent (117's definer attributes the row to
+        // the session principal and records the candidate's status itself),
+        // for the operator's replay to carry out.
+        Err(reason) => {
+            let mut tx = crate::claim_helper::begin_author_stamped_tx(
+                server,
+                acting,
+                "retire_match_candidate",
+            )
+            .await?;
+            let status = admin_cascade::record_deferral(&mut *tx, &trigger, &reason)
+                .await
+                .map_err(internal_error)?;
+            tx.commit().await.map_err(internal_error)?;
+            (status, None)
+        }
+    };
+
     let updated = repo.get(candidate_id).await.map_err(internal_error)?;
+    let retired = retirement.is_some();
     success_json(&serde_json::json!({
         "candidate": row_to_out(updated),
-        "retirement": outcome,
+        "previous_status": before.status,
+        "retired": retired,
+        "cascade": cascade,
+        "retirement": retirement,
     }))
-}
-
-/// A retirement refused by migration 118's stale guard (`MC01`) is a
-/// configuration problem, not an internal fault: say which one.
-fn retire_error(e: sqlx::Error) -> McpError {
-    let refused_by_guard = e
-        .as_database_error()
-        .is_some_and(|d| d.message().contains("MC01"));
-    if refused_by_guard {
-        internal_error(format!(
-            "retire_match_candidate needs a privileged database connection: this MCP server's \
-             own connection is the application role, which may not retire a match candidate, \
-             and no maintenance connection is attached. Set MAINTENANCE_DATABASE_URL to a role \
-             that is a member of epigraph_maintenance and restart. Nothing was changed. ({e})"
-        ))
-    } else {
-        internal_error(e)
-    }
 }

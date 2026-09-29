@@ -16,6 +16,7 @@
 //! A high-reputation agent making an unsupported claim gets low truth value.
 //! This prevents the "Appeal to Authority" fallacy.
 
+pub mod admin_cascade;
 pub mod agent_assessment;
 pub mod bayesian;
 pub mod bba;

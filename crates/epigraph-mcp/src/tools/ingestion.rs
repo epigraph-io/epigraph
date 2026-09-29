@@ -881,7 +881,7 @@ pub async fn do_ingest_document(
                 .map_err(internal_error)?;
             created.id.into()
         };
-        let (_row, _was_created) = EdgeRepository::create_if_not_exists_conn(
+        let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
             &mut tx,
             agent_uuid,
             "agent",
@@ -977,7 +977,7 @@ pub async fn do_ingest_document(
             .map_err(internal_error)?;
         }
         if resolved_to_existing {
-            let (_row, _was_created) = EdgeRepository::create_if_not_exists_conn(
+            let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
                 &mut tx,
                 paper_id,
                 "paper",
@@ -1051,7 +1051,7 @@ pub async fn do_ingest_document(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _was_created) = EdgeRepository::create_if_not_exists_conn(
+        let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
             &mut tx,
             paper_id,
             "paper",
@@ -1120,7 +1120,7 @@ pub async fn do_ingest_document(
             continue;
         }
 
-        let (row, was_created) = EdgeRepository::create_if_not_exists_conn(
+        let (row, was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
             &mut tx,
             src,
             &src_type,
@@ -1720,7 +1720,7 @@ pub async fn do_ingest_document_spine(
                 .id
                 .into()
         };
-        let (_row, _) = EdgeRepository::create_if_not_exists_conn(
+        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_conn(
             &mut tx,
             agent_uuid,
             "agent",
@@ -1809,7 +1809,7 @@ pub async fn do_ingest_document_spine(
         }
 
         if resolved_to_existing {
-            let (_row, _) = EdgeRepository::create_if_not_exists_conn(
+            let (_row, _) = EdgeRepository::create_if_absent_including_retracted_conn(
                 &mut tx,
                 paper_id,
                 "paper",
@@ -1881,7 +1881,7 @@ pub async fn do_ingest_document_spine(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _) = EdgeRepository::create_if_not_exists_conn(
+        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_conn(
             &mut tx,
             paper_id,
             "paper",
@@ -1937,7 +1937,7 @@ pub async fn do_ingest_document_spine(
             continue;
         }
 
-        let (_row, _) = EdgeRepository::create_if_not_exists_conn(
+        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_conn(
             &mut tx,
             src,
             &src_type,

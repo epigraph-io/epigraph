@@ -36,8 +36,9 @@
 //!   the same transaction.
 //!
 //! A table with no writer column, or a row whose writer is NULL, FOLLOWS the
-//! claim in both modes (see `tables::WRITER_COLUMNS`). Edges take the trigger's
-//! meet of their endpoints, which for two public endpoints is `world`.
+//! claim in both modes (see `tables::WRITER_COLUMNS`). Edges are not rewritten
+//! at all (migration 120): a public edge keeps its owner, its writer's group
+//! or the world.
 //!
 //! KEEP-WRITER IS NOT DURABLE ON ITS OWN. Migration 070's insert arm
 //! (`epigraph_inherit_tenancy_stmt`) re-syncs EVERY row of a table to its claim
@@ -58,11 +59,15 @@
 //! (fsynced) BEFORE writing; then one `UPDATE claims`, the keep-writer
 //! restores, and the invariants. Any violation rolls the batch back.
 //!
-//! `edges` is not locked: its tenancy trigger (`epigraph_edges_tenancy`, 070/072)
-//! is a BEFORE row trigger that sets only the NEW row, from its endpoints, and
-//! for two public endpoints (the only kind this tool moves) the result is
-//! `(world, public)` whoever owns the claims — a concurrent edge INSERT can
-//! neither land stale nor rewrite a moved row.
+//! `edges` is not locked, and since migration 120 (operator decision D8) a
+//! re-own does not write it at all: propagation rewrites an edge only where
+//! its recomputed meet is non-public, and this tool moves public claims only,
+//! so every public edge keeps its owner (its writer's group, or the world for a
+//! legacy or structural edge). Its tenancy trigger (`epigraph_edges_tenancy`,
+//! 120) is a BEFORE row trigger that sets only the NEW row, from its endpoints
+//! and its writer, so a concurrent edge INSERT can neither land stale nor
+//! rewrite a moved row. The invariants below require the edges xact delta to
+//! be zero.
 //!
 //! The invariants:
 //!
@@ -95,7 +100,7 @@ use super::tables::{
     writer_is_linked, xact_counters, Attached, ClaimRow, Kind, RowKey, Snapshot, TableSpec,
     Tenancy,
 };
-use super::{authors_personal_group, operator_group, operator_of_author, owner_is_takeable, WORLD};
+use super::{authors_personal_group, operator_group, operator_of_author, owner_is_takeable};
 use anyhow::{bail, Context};
 use serde_json::json;
 use sqlx::PgConnection;
@@ -382,12 +387,11 @@ fn expected(a: &Attached, specs: &[TableSpec], target: Uuid, keep: &BTreeSet<Row
         return a.tenancy.clone();
     }
     match spec_of(specs, &a.table).kind {
-        // The trigger's meet of two public endpoints.
-        Kind::Edges => Tenancy {
-            owner: WORLD,
-            visibility: "public".into(),
-            co_owner: None,
-        },
+        // Migration 120 (D8): a public-to-public owner change of an endpoint
+        // never rewrites a public edge (propagation writes an edge only where
+        // its new meet is non-public, and this tool moves public claims only).
+        // A writer-owned edge stays its writer's, a world edge stays world.
+        Kind::Edges => a.tenancy.clone(),
         _ => Tenancy {
             owner: target,
             visibility: "public".into(),
@@ -431,8 +435,8 @@ pub struct Spill {
     /// Fragments that are also the provenance of a claim not being moved.
     pub shared_fragments: usize,
     /// Per eligible claim: edges whose OTHER endpoint is a claim that is not
-    /// moving (held, or not listed). The trigger recomputes their owner as
-    /// the meet, so a held claim's neighbourhood is rewritten too.
+    /// moving (held, or not listed). Reported for the operator; since
+    /// migration 120 a public edge is not rewritten by the re-own.
     pub neighbour_edges: BTreeMap<Uuid, usize>,
 }
 
@@ -866,12 +870,25 @@ pub async fn run_batch(
             "rows moved per table {actual:?} differ from rows planned {planned:?}"
         ));
     }
+    // Migration 120: the edges xact delta is ZERO. A re-own that rewrote an
+    // edge is a violation in its own right (named here), and edges are left out
+    // of the trigger-observed expectation below, so the counter check also
+    // refuses any edge write.
+    if let Some(n) = trigger_changed.get("edges") {
+        v.push(format!(
+            "the re-own rewrote {n} edge row(s); a public-to-public owner change must leave every \
+             edge unchanged (migration 120)"
+        ));
+    }
     let mut expect_counts: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
     expect_counts.insert(
         "claims".into(),
         (0, i64::try_from(claim_ids.len()).unwrap_or(i64::MAX), 0),
     );
-    for (t, n) in &trigger_changed {
+    for (t, n) in trigger_changed
+        .iter()
+        .filter(|(t, _)| t.as_str() != "edges")
+    {
         expect_counts.entry(t.clone()).or_default().1 += n;
     }
     for (t, n) in &restored {
@@ -1078,8 +1095,8 @@ pub async fn run(
     writeln!(
         out,
         "RULE: rows with no writer of record (no writer column, or NULL) follow the claim in both \
-         --derived modes; edges take the trigger's meet of their endpoints (world, for two public \
-         endpoints)"
+         --derived modes; edges are not rewritten (migration 120: a public edge keeps its owner, \
+         its writer's group or the world)"
     )?;
     for (t, n) in &report.spill.unattributed {
         writeln!(out, "UNATTRIBUTED\t{t}\t{n}")?;
@@ -1110,9 +1127,9 @@ pub async fn run(
     for (c, n) in &report.spill.neighbour_edges {
         writeln!(
             out,
-            "NEIGHBOUR-EDGES\t{c}\t{n}\t(edges to a claim that is NOT moving: the trigger \
-             recomputes their owner as the meet of their endpoints, so that claim's \
-             neighbourhood is rewritten too; they stay public, and the manifest records them)"
+            "NEIGHBOUR-EDGES\t{c}\t{n}\t(edges to a claim that is NOT moving: since migration \
+             120 a public edge is not rewritten by the re-own, so they keep their owner; they \
+             stay public, and the manifest records them)"
         )?;
     }
 

@@ -23,13 +23,6 @@
 //! already counted by `crates/epigraph-db/tests/viewer_ratchet.rs` and is a
 //! visible enum diff if a fourth is ever added.
 //!
-//! A fourth CALLER, not a fourth reason: since migration 118,
-//! `retire_match_candidate` takes a session here when (and only when) a
-//! maintenance pool is attached, and spends only its connection, because the
-//! database refuses a retirement on an application-role session. It reuses
-//! `SystemReason::BeliefRecomputation` (the retirement deletes derived belief
-//! rows). `tests/tool_viewer_coverage.rs` lists it with the other three.
-//!
 //! # Why this is not lint-laundering
 //!
 //! A reviewer will and should ask whether moving `Viewer::system` one directory
@@ -52,36 +45,118 @@
 //! that is the abuse, and the fix is `tools::viewer::request_viewer`.
 
 use epigraph_db::visibility::SystemReason;
-use epigraph_db::{MaintenanceDsnSource, MaintenancePrivilege, MaintenanceSession};
+use epigraph_db::MaintenanceSession;
 use rmcp::model::ErrorData as McpError;
 
 use crate::server::EpiGraphMcpFull;
 
-/// Whether `main` may attach a probed maintenance pool, which is what makes the
-/// three maintenance tools callable at all.
+/// The three MCP maintenance tools, and the operator CLI each one MOVED to
+/// under operator decision D9 (batch W12a).
 ///
-/// Two conditions, both required:
+/// # Why they answer MOVED rather than running
 ///
-/// 1. the pool's role satisfies `epigraph_bypass()`. Without it a bypass viewer
-///    reads and writes zero rows with no error;
-/// 2. the DSN was CONFIGURED through `MAINTENANCE_DATABASE_URL`, not reached by
-///    the documented fallback to the application DSN.
-///
-/// The second condition is an authorization decision, not a hygiene one. These
-/// tools enumerate and retire rows across every tenant, so enabling them must be
-/// an operator's explicit act. Before this function, an MCP unit whose
-/// application DSN happened to bypass RLS (a superuser DSN, common on stdio
-/// deployments) enabled them with no configuration change at all, and a
-/// `claims:write` bearer could then list other tenants' private claim ids with
-/// `sweep_semantic_duplicates` (measured by the batch H-a review on config A).
-/// The scope half of that fix is `scope_map`'s `claims:admin`; this is the
-/// configuration half.
+/// Each one runs across every tenant on a privileged maintenance connection.
+/// D9 removes that connection from every request-serving process: `main`
+/// refuses to start when `MAINTENANCE_DATABASE_URL` is set and attaches no
+/// maintenance pool, so on a real `epigraph-mcp-full` these tools can never
+/// run. Before D9 a tool with no pool answered an internal error telling the
+/// operator to set the variable, which now refuses boot. They answer a
+/// structured, non-retryable refusal naming the CLI instead
+/// ([`maintenance_tool_session`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceTool {
+    /// `recompute_beliefs` -> the `recompute_claim_belief` CLI.
+    RecomputeBeliefs,
+    /// `backfill_embeddings` -> the `embed_backfill` CLI.
+    BackfillEmbeddings,
+    /// `sweep_semantic_duplicates` -> the `sweep_semantic_duplicates` CLI.
+    SweepSemanticDuplicates,
+}
+
+impl MaintenanceTool {
+    /// Every tool, for tests that must cover all three.
+    pub const ALL: [Self; 3] = [
+        Self::RecomputeBeliefs,
+        Self::BackfillEmbeddings,
+        Self::SweepSemanticDuplicates,
+    ];
+
+    /// The MCP tool name.
+    #[must_use]
+    pub const fn tool(self) -> &'static str {
+        match self {
+            Self::RecomputeBeliefs => "recompute_beliefs",
+            Self::BackfillEmbeddings => "backfill_embeddings",
+            Self::SweepSemanticDuplicates => "sweep_semantic_duplicates",
+        }
+    }
+
+    /// The operator CLI that runs it on the maintenance DSN.
+    #[must_use]
+    pub const fn cli(self) -> &'static str {
+        match self {
+            Self::RecomputeBeliefs => "recompute_claim_belief",
+            Self::BackfillEmbeddings => "embed_backfill",
+            Self::SweepSemanticDuplicates => "sweep_semantic_duplicates",
+        }
+    }
+
+    /// The enumerated bypass reason its session is minted under.
+    #[must_use]
+    pub const fn reason(self) -> SystemReason {
+        match self {
+            Self::RecomputeBeliefs => SystemReason::BeliefRecomputation,
+            Self::BackfillEmbeddings => SystemReason::EmbeddingBackfill,
+            Self::SweepSemanticDuplicates => SystemReason::DedupSweep,
+        }
+    }
+}
+
+/// The MOVED refusal (operator decision D9): JSON-RPC `INVALID_REQUEST`
+/// (-32600), the caller-error class, so an agent does not retry it as it would
+/// an internal error. Nothing was written. `data` carries the machine-readable
+/// contract: `{"status":"moved","surface":<tool>,"runs_on":{"kind":"cli",
+/// "name":<cli>},"retryable":false,"decision":"D9"}`.
 #[must_use]
-pub fn may_attach_maintenance_pool(
-    privilege: MaintenancePrivilege,
-    source: MaintenanceDsnSource,
-) -> bool {
-    privilege.bypass && source == MaintenanceDsnSource::Configured
+pub fn moved(tool: MaintenanceTool) -> McpError {
+    McpError::invalid_request(
+        format!(
+            "{} is a corpus-wide maintenance job and does not run on a request-serving MCP \
+             server (operator decision D9: the maintenance connection lives only in timers and \
+             operator CLIs). An operator runs it as the `{}` CLI on the maintenance DSN. \
+             Nothing was written; do not retry.",
+            tool.tool(),
+            tool.cli()
+        ),
+        Some(serde_json::json!({
+            "status": "moved",
+            "surface": tool.tool(),
+            "runs_on": {"kind": "cli", "name": tool.cli()},
+            "retryable": false,
+            "decision": "D9",
+        })),
+    )
+}
+
+/// The session one of the three maintenance tools runs on, or the MOVED
+/// refusal when this server holds no maintenance pool (which, under D9, is
+/// every production server; only a test harness attaches one).
+///
+/// # Errors
+/// [`moved`] when no maintenance pool is attached; otherwise
+/// [`maintenance_viewer`]'s errors.
+pub(crate) async fn maintenance_tool_session(
+    server: &EpiGraphMcpFull,
+    tool: MaintenanceTool,
+) -> Result<MaintenanceSession<'_>, McpError> {
+    if !server
+        .scoped
+        .as_ref()
+        .is_some_and(epigraph_db::ScopedPool::has_maintenance_pool)
+    {
+        return Err(moved(tool));
+    }
+    maintenance_viewer(server, tool.reason()).await
 }
 
 /// A bypass viewer plus the maintenance connection it is inseparable from, for
@@ -105,10 +180,10 @@ pub fn may_attach_maintenance_pool(
 /// privileged-viewer / ordinary-pool hybrid. So two refusals come before the
 /// session is handed out:
 ///
-/// 1. no maintenance pool is attached. `main` attaches one only when
-///    `MAINTENANCE_DATABASE_URL` is SET (the fallback to the application DSN
-///    never attaches, see [`may_attach_maintenance_pool`]) AND the boot probe
-///    found it privileged, so "unset" and "misconfigured" both land here;
+/// 1. no maintenance pool is attached. Under operator decision D9 `main` never
+///    attaches one (it refuses to start when `MAINTENANCE_DATABASE_URL` is
+///    set), so on a real server this is every call; the three tools reach it
+///    only through [`maintenance_tool_session`], which answers MOVED first;
 /// 2. the leased connection itself fails `MaintenanceSession::assert_privileged`.
 ///    This is the per-call half. It does not trust the boot probe or whoever
 ///    attached the pool, and it asks the connection the statements will run on.
@@ -125,8 +200,9 @@ pub fn may_attach_maintenance_pool(
 /// `ScopedPool::maintenance_session`, shared with the CLI and API wrappers.
 ///
 /// ```ignore
-/// let mut session = maintenance::maintenance_viewer(self, SystemReason::DedupSweep).await?;
-/// tools::dedup_sweep::sweep_semantic_duplicates(self, &mut session, params).await
+/// let mut session =
+///     maintenance::maintenance_tool_session(self, MaintenanceTool::SweepSemanticDuplicates).await?;
+/// tools::dedup_sweep::sweep_semantic_duplicates(&mut session, params, acting_agent).await
 /// ```
 ///
 /// # Errors
@@ -158,11 +234,10 @@ pub(crate) async fn maintenance_viewer(
     })?;
     if !scoped.has_maintenance_pool() {
         return Err(McpError::internal_error(
-            "this MCP tool is a corpus-wide maintenance job and this server has no privileged \
-             maintenance connection attached. Set MAINTENANCE_DATABASE_URL to a role that is a \
-             member of epigraph_maintenance and restart; the boot log names why none was \
-             attached. Refusing rather than running on the server's own application pool, where \
-             a bypass viewer is filtered by RLS into ZERO rows with no error.",
+            "this server has no privileged maintenance connection attached (operator decision \
+             D9: request-serving processes hold none). Refusing rather than running on the \
+             server's own application pool, where a bypass viewer is filtered by RLS into ZERO \
+             rows with no error.",
             None,
         ));
     }
@@ -186,6 +261,56 @@ pub(crate) async fn maintenance_viewer(
         )
     })?;
     Ok(session)
+}
+
+/// Whether this server can run the ADMINISTRATIVE CASCADE (migration 117) at
+/// all: a privileged maintenance pool is attached. Under operator decision D9
+/// `main` never attaches one, so every cascade a real server triggers is
+/// deferred (recorded in the act's transaction) and applied by the replay
+/// timer; only a test harness that attaches a pool runs it in-process.
+#[must_use]
+pub(crate) fn admin_cascade_configured(server: &EpiGraphMcpFull) -> bool {
+    server
+        .scoped
+        .as_ref()
+        .is_some_and(epigraph_db::ScopedPool::has_maintenance_pool)
+}
+
+/// The maintenance session the administrative cascade that follows a
+/// supersede, a dedup, a consolidation or a match-candidate retirement runs on
+/// (migration 117, batch W10). A request path acquires it BEFORE committing the
+/// caller's act, so a server that cannot run the cascade records the deferral
+/// in the act's own transaction.
+///
+/// # Why a request path may reach the bypass here
+///
+/// Not to read content on the caller's behalf, which is the abuse this module's
+/// header names. The caller's own act has already committed on its own stamped
+/// transaction; what remains is re-pointing and invalidating rows OTHER writers
+/// own, which the operator decided is an administrative function (it runs
+/// with the server's authority, not the caller's, and writes a
+/// `security_events` row naming the caller). The session comes from the same
+/// mint and the same two refusals as [`maintenance_viewer`], with
+/// `SystemReason::BeliefRecomputation`: the cascade is belief invalidation and
+/// re-derivation, and the reason set only shrinks.
+///
+/// # Errors
+/// A human-readable reason the cascade is deferred.
+pub(crate) async fn admin_cascade_session(
+    server: &EpiGraphMcpFull,
+) -> Result<MaintenanceSession<'_>, String> {
+    if !admin_cascade_configured(server) {
+        return Err(epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED.to_string());
+    }
+    maintenance_viewer(server, SystemReason::BeliefRecomputation)
+        .await
+        .map_err(|e| {
+            format!(
+                "the administrative (maintenance) connection could not be used, so the \
+                 cascade is deferred: {}",
+                e.message
+            )
+        })
 }
 
 #[cfg(test)]
@@ -238,40 +363,42 @@ mod tests {
             .expect("ScopedPool::connect over the ephemeral test database")
     }
 
-    /// The attach decision, over every combination of its two inputs.
-    ///
-    /// The fallback-with-bypass case is the one that matters: an MCP unit whose
-    /// application DSN is a superuser must NOT enable corpus-wide maintenance
-    /// tools just because nobody set `MAINTENANCE_DATABASE_URL`.
+    /// The MOVED contract, per tool: JSON-RPC `INVALID_REQUEST` (-32600, the
+    /// caller-error class, NOT `INTERNAL_ERROR`, which agents retry), with the
+    /// structured `data` naming the CLI. The mapping is the one the operator
+    /// decided: recompute -> `recompute_claim_belief`, backfill ->
+    /// `embed_backfill`, sweep -> `sweep_semantic_duplicates`.
     #[test]
-    fn only_a_configured_bypassing_dsn_enables_the_maintenance_tools() {
-        let p = |bypass, rls_active| MaintenancePrivilege { bypass, rls_active };
-        assert!(may_attach_maintenance_pool(
-            p(true, true),
-            MaintenanceDsnSource::Configured
-        ));
-        assert!(
-            !may_attach_maintenance_pool(
-                p(true, true),
-                MaintenanceDsnSource::FellBackToApplicationDsn
-            ),
-            "an application DSN that happens to bypass RLS enabled the corpus-wide maintenance \
-             tools with no operator configuration"
-        );
-        assert!(!may_attach_maintenance_pool(
-            p(true, false),
-            MaintenanceDsnSource::FellBackToApplicationDsn
-        ));
-        for source in [
-            MaintenanceDsnSource::Configured,
-            MaintenanceDsnSource::FellBackToApplicationDsn,
-        ] {
-            for rls in [true, false] {
-                assert!(
-                    !may_attach_maintenance_pool(p(false, rls), source),
-                    "an unprivileged pool was attached ({source:?}, rls_active={rls})"
-                );
-            }
+    fn the_moved_refusal_is_a_non_retryable_caller_error_naming_the_cli() {
+        let expected = [
+            ("recompute_beliefs", "recompute_claim_belief"),
+            ("backfill_embeddings", "embed_backfill"),
+            ("sweep_semantic_duplicates", "sweep_semantic_duplicates"),
+        ];
+        for (tool, (name, cli)) in MaintenanceTool::ALL.into_iter().zip(expected) {
+            let err = moved(tool);
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_REQUEST,
+                "{tool:?}"
+            );
+            assert_eq!(err.code.0, -32600);
+            assert_eq!(
+                err.data,
+                Some(serde_json::json!({
+                    "status": "moved",
+                    "surface": name,
+                    "runs_on": {"kind": "cli", "name": cli},
+                    "retryable": false,
+                    "decision": "D9",
+                })),
+                "{tool:?}"
+            );
+            assert!(
+                err.message.contains(cli) && err.message.contains("D9"),
+                "the message does not name the CLI and the decision: {}",
+                err.message
+            );
         }
     }
 
@@ -279,15 +406,16 @@ mod tests {
     ///
     /// Attaching a `ScopedPool` is process-wide, and the write path needs one.
     /// The three maintenance tools must NOT be enabled by that alone. With no
-    /// maintenance pool attached, `ScopedPool::maintenance_session` falls back
-    /// to the application pool, where a bypass viewer is filtered by RLS into
-    /// zero rows with **no error**: a silent no-op replacing a loud failure.
+    /// maintenance pool attached (every real server, under D9),
+    /// `ScopedPool::maintenance_session` would fall back to the application
+    /// pool, where a bypass viewer is filtered by RLS into zero rows with **no
+    /// error**. The tools answer MOVED instead.
     ///
-    /// The assertion is deliberately about the REASON and not just the failure:
-    /// a `None` scoped pool also refuses, and a test that accepted either error
-    /// would pass on a tree where the attachment check had been deleted.
+    /// The assertion is about the CONTRACT and not just the failure: a `None`
+    /// scoped pool also refuses (as an internal error), and a test that
+    /// accepted any error would pass on a tree where the gate had been deleted.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn attaching_a_scoped_pool_does_not_enable_the_maintenance_tools(pool: PgPool) {
+    async fn without_a_maintenance_pool_the_three_tools_answer_moved(pool: PgPool) {
         let scoped = scoped_pool_over(&pool).await;
         let signer = AgentSigner::from_bytes(&[0x5au8; 32]).expect("signer");
         let embedder = McpEmbedder::new(pool.clone(), None);
@@ -302,37 +430,26 @@ mod tests {
              the gate — it would pass on the `None` arm alone"
         );
 
-        for reason in [
-            SystemReason::DedupSweep,
-            SystemReason::EmbeddingBackfill,
-            SystemReason::BeliefRecomputation,
-        ] {
-            let err = maintenance_viewer(&server, reason)
+        for tool in MaintenanceTool::ALL {
+            let err = maintenance_tool_session(&server, tool)
                 .await
                 .err()
                 .unwrap_or_else(|| {
                     panic!(
-                        "maintenance_viewer({reason:?}) SUCCEEDED on a server with no maintenance \
-                         pool attached. `maintenance_session` would then lease from the \
-                         application pool and spend a bypass viewer there: zero rows, no error."
+                        "{tool:?} got a maintenance session on a server with no maintenance \
+                         pool attached; `maintenance_session` would then lease from the \
+                         application pool and spend a bypass viewer there: zero rows, no error"
                     )
                 });
-            let msg = err.message.to_string();
-            assert!(
-                msg.contains("no privileged maintenance connection attached"),
-                "maintenance_viewer({reason:?}) was refused for the WRONG reason: {msg}. \
-                 Expected the missing-maintenance-pool arm, not the missing-ScopedPool one."
-            );
+            assert_eq!(err, moved(tool), "{tool:?} was refused, but not as MOVED");
         }
     }
 
-    /// The positive arm: with a maintenance pool attached on a connection that
-    /// satisfies `epigraph_bypass()`, the three tools get a session, and it is a
-    /// bypass session on that pool. `#[sqlx::test]` connects as a superuser, for
-    /// whom `epigraph_bypass()` is true, so this is the privileged case. The
-    /// UNprivileged case cannot be built in this harness (every role it has
-    /// bypasses) and is measured by `scripts/e2e/probe-batch-h.sh maintenance`
-    /// with `MAINTENANCE_DATABASE_URL` set to the app login.
+    /// The positive arm (a test harness only; `main` never attaches a pool):
+    /// with a maintenance pool attached on a connection that satisfies
+    /// `epigraph_bypass()`, the three tools get a bypass session on that pool.
+    /// `#[sqlx::test]` connects as a superuser, for whom `epigraph_bypass()` is
+    /// true, so this is the privileged case.
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_privileged_maintenance_pool_enables_them(pool: PgPool) {
         let scoped = scoped_pool_over(&pool)
@@ -342,19 +459,13 @@ mod tests {
         let embedder = McpEmbedder::new(pool.clone(), None);
         let server =
             EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped);
-        for reason in [
-            SystemReason::DedupSweep,
-            SystemReason::EmbeddingBackfill,
-            SystemReason::BeliefRecomputation,
-        ] {
-            let session = maintenance_viewer(&server, reason)
+        for tool in MaintenanceTool::ALL {
+            let session = maintenance_tool_session(&server, tool)
                 .await
-                .unwrap_or_else(|e| {
-                    panic!("maintenance_viewer({reason:?}) refused a privileged pool: {e:?}")
-                });
+                .unwrap_or_else(|e| panic!("{tool:?} refused a privileged pool: {e:?}"));
             assert!(
                 session.viewer().is_bypass(),
-                "maintenance_viewer({reason:?}) must hand out the bypass viewer"
+                "{tool:?} must hand out the bypass viewer"
             );
         }
     }

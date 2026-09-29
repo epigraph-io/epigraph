@@ -19,7 +19,9 @@ async fn dedup_nonexistent_dup_returns_404() {
     let canonical = common::seed_claim(&pool, "canonical for 404 test").await;
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
-    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:admin"]).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
 
     let nonexistent_dup = uuid::Uuid::new_v4();
     let body = serde_json::json!({
@@ -70,7 +72,9 @@ async fn dedup_already_superseded_dup_returns_409() {
         .expect("set up already-superseded claim");
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
-    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:admin"]).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
 
     let body = serde_json::json!({
         "canonical_id": canonical,
@@ -106,7 +110,9 @@ async fn dedup_self_dedup_returns_400() {
     let claim = common::seed_claim(&pool, "self-dedup test claim").await;
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
-    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:admin"]).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
 
     let body = serde_json::json!({
         "canonical_id": claim,

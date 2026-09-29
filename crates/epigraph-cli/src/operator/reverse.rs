@@ -22,8 +22,10 @@
 //! measured the failure it prevents: two manifests M1, M2 whose runs shared
 //! rows, reversed oldest-first, left those rows on neither their original
 //! owner nor anything the operator chose, and every run printed "invariants:
-//! all held". The rows alone cannot show it — a public–public edge is `(world,
-//! public)` after either run, and the shared fragment was already on the
+//! all held". The rows alone cannot show it — a public–public edge is
+//! unchanged by either run (since migration 120 a re-own or a reversal never
+//! rewrites a public edge; it keeps its writer's group, or the world), and the
+//! shared fragment was already on the
 //! target before M2 ran — but M2 moved a claim M1 recorded as a neighbour. So
 //! M1 reversed on its own HOLDS and names the cause, and reversing M2 then M1
 //! restores every row. Pass every manifest to ONE invocation and it applies

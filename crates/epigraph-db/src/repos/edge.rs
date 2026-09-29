@@ -81,6 +81,108 @@ pub struct EdgeRow {
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Why a session that can READ an edge was refused a patch, retract or delete
+/// of it (migrations 115/117/120: edge writes are owner / co-owner scoped).
+///
+/// A refusal is named, never reported as "not found": the caller can see the
+/// edge, so "not found" would misreport a denial as absence. An edge the caller
+/// cannot see keeps the not-found answer, so this is no existence oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeRefusal {
+    /// The edge is owned by a group this session cannot write (another
+    /// writer's edge, or a group-private edge the session only reads).
+    OwnedByAnotherWriter,
+    /// The edge is world-owned: a legacy edge with no attributable author, an
+    /// edge written without a principal, or a structural edge outside operator
+    /// decision D8's scope. Only the administrative (maintenance) path changes
+    /// it.
+    Administrative,
+}
+
+impl EdgeRefusal {
+    /// The machine-readable rule, as the refusal bodies carry it.
+    #[must_use]
+    pub const fn rule(self) -> &'static str {
+        match self {
+            Self::OwnedByAnotherWriter => "owned_by_another_writer",
+            Self::Administrative => "administrative_edge",
+        }
+    }
+
+    /// The caller-facing text, naming the rule. `action` is what was refused
+    /// ("patch", "retract", "delete").
+    #[must_use]
+    pub fn message(self, id: Uuid, action: &str) -> String {
+        match self {
+            Self::OwnedByAnotherWriter => format!(
+                "edge {id} is owned by another writer: only its owner (or co-owner) may {action} \
+                 it; nothing was written"
+            ),
+            Self::Administrative => format!(
+                "edge {id} is an administrative (world-owned) edge; admin-only: no application \
+                 session may {action} it; nothing was written"
+            ),
+        }
+    }
+}
+
+/// The reason an `edge_retract` deferral records (the server's own text; it
+/// names no row and reaches the edge's owner).
+pub const EDGE_RETRACT_DEFERRAL_REASON: &str =
+    "the edge's owner withdrew it; any other writer's BBAs keyed on it are removed, and the \
+     affected beliefs re-derived, by the maintenance replay (operator decision D1)";
+
+/// How an application act left an edge, for [`EdgeRepository::withdraw_edge_bbas_conn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeWithdrawal {
+    /// The act set `valid_to` (a retract, or a patch that closed the window).
+    /// Only a `valid_to <= now()` counts: a FUTURE-dated retraction withdraws
+    /// nothing yet and records nothing (its cleanup once it passes is a
+    /// follow-up).
+    Retracted,
+    /// The act is about to DELETE the row (the workflow step rewire). Call the
+    /// cleanup BEFORE the DELETE: the deferral's act check reads the row. The
+    /// cleanup closes the row's window (`valid_to = now()`) first, since the
+    /// definer admits only an edge out of force.
+    BeingDeleted,
+}
+
+/// What [`EdgeRepository::withdraw_edge_bbas_conn`] did in the caller's act.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BbaCleanup {
+    /// The caller's OWN edge-keyed BBAs deleted in its act.
+    pub deleted: u64,
+    /// The `cascade.deferred` row (cause `edge_retract`) that hands every
+    /// other writer's BBAs keyed on the edge to the administrative replay;
+    /// `None` when the edge carries no edge-factor perspective (so no BBA can
+    /// be keyed on it) or the retraction is future-dated.
+    pub deferral_event_id: Option<Uuid>,
+}
+
+/// What [`EdgeRepository::remove_withdrawn_edge_bbas_conn`] did on the
+/// maintenance connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WithdrawnEdgeBbas {
+    /// Whether the edge was absent or out of force at the time of the call
+    /// (the state the removal requires). `false`: nothing was removed.
+    pub withdrawn: bool,
+    /// Edge-keyed BBAs removed.
+    pub deleted: u64,
+    /// The distinct claims those BBAs lived on (their belief is re-derived).
+    pub claims: Vec<Uuid>,
+}
+
+/// Which existing rows the create-or-get dedup probe counts as "present".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupProbe {
+    /// Only an in-force row ([`EDGE_IN_FORCE`]): a retracted link re-asserted
+    /// is a new edge.
+    InForce,
+    /// Any row, retracted included: an idempotent re-run never resurrects a
+    /// retracted edge.
+    AnyState,
+}
+
 /// Outcome of [`EdgeRepository::create_symmetric_if_absent_oriented`].
 ///
 /// `source_id` / `target_id` are the endpoints AS RECORDED on the surviving
@@ -243,6 +345,18 @@ impl EdgeRepository {
     /// `#[tool_router]`'s boxed `dyn Future + Send` an `Acquire<'a>` bound fails
     /// to prove `for<'x> &'x mut PgConnection: Acquire<'x>`.
     ///
+    /// # The probe matches IN-FORCE rows only (migration 120, D8)
+    ///
+    /// An edge's writer may now retract its own edge. If the probe also matched
+    /// a RETRACTED row, a writer that retracts a link and then re-asserts the
+    /// same `(source, target, relationship)` would get the retracted row back
+    /// with `was_created = false`: a silent no-op that reports success and
+    /// leaves no link in force. So a retracted row is not a duplicate here, and
+    /// the re-assertion inserts a new in-force edge. A caller whose RE-RUN must
+    /// never resurrect a retracted edge (an idempotent ingestion re-run, where
+    /// the retraction was an owner's or the administrative cascade's decision)
+    /// uses [`Self::create_if_absent_including_retracted_conn`] instead.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database operation fails.
     #[allow(clippy::too_many_arguments)]
@@ -257,43 +371,198 @@ impl EdgeRepository {
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(EdgeRow, bool), DbError> {
+        Self::create_if_absent_conn(
+            conn,
+            DedupProbe::InForce,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// [`Self::create_if_absent_including_retracted_conn`] on a pool.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database operation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_absent_including_retracted(
+        pool: &PgPool,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_if_absent_including_retracted_conn(
+            &mut conn,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_if_not_exists_conn`], but a RETRACTED row with the
+    /// same `(source, target, relationship)` also counts as present: nothing is
+    /// inserted and that row is returned with `was_created = false`.
+    ///
+    /// For an idempotent RE-RUN of a structural writer (document and workflow
+    /// ingestion, claim decomposition) whose edge may since have been retracted
+    /// by its owner or by the administrative cascade (a dedup collision, a
+    /// supersede migration): re-running the ingestion must not resurrect that
+    /// decision. It is the behaviour every caller had before migration 120.
+    /// Never use it for a caller's own ASSERTION (a link tool, the HTTP create
+    /// route): there it turns "retract, then link again" into a silent no-op.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database operation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_absent_including_retracted_conn(
+        conn: &mut sqlx::PgConnection,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        Self::create_if_absent_conn(
+            conn,
+            DedupProbe::AnyState,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// Does the SESSION own edge `id` (its owner or co-owner is in the
+    /// session's writable set)? The `owned_by_caller` a link tool or the HTTP
+    /// create route reports next to a created or re-asserted edge: after
+    /// migration 120 a re-assertion of another writer's edge returns THEIR edge,
+    /// which this caller can neither patch, retract nor delete.
+    ///
+    /// Run it on the same stamped connection as the write. An unstamped or
+    /// bypass session has an empty writable set and gets `false`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn owned_by_session<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "-- VISIBILITY-EXEMPT: an ownership test, not a read. It answers only \
+             whether the SESSION's writable set holds the edge's owner or \
+             co-owner, and a writable group is always a readable one, so it says \
+             nothing about an edge this session cannot already see.\n\
+             SELECT EXISTS (SELECT 1 FROM edges e \
+                             WHERE e.id = $1 \
+                               AND (e.owner_group_id = ANY (public.epigraph_writable_groups()) \
+                                    OR e.co_owner_group_id \
+                                       = ANY (public.epigraph_writable_groups())))",
+        )
+        .bind(id)
+        .fetch_one(executor)
+        .await?)
+    }
+
+    /// The one dedup probe + INSERT behind [`Self::create_if_not_exists_conn`]
+    /// and [`Self::create_if_absent_including_retracted_conn`].
+    #[allow(clippy::too_many_arguments)]
+    async fn create_if_absent_conn(
+        conn: &mut sqlx::PgConnection,
+        probe: DedupProbe,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
         use sqlx::Acquire;
         let mut tx = conn.begin().await?;
 
-        let existing = sqlx::query!(
-            r#"
-            -- VISIBILITY-EXEMPT: dedup probe inside a WRITE path
-            -- (`create_or_get`). It must see an existing edge regardless of who
-            -- is asking, or the "get" half silently becomes "create" and the
-            -- table grows a duplicate every time a caller without read access
-            -- re-asserts a link that is already there. PR-16 owns the
-            -- write-side authorization that decides whether the caller may
-            -- create the edge at all.
-            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
-            FROM edges
-            WHERE source_id = $1 AND target_id = $2 AND relationship = $3
-            LIMIT 1
-            "#,
-            source_id,
-            target_id,
-            relationship,
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
+        // VISIBILITY-EXEMPT (both spellings): dedup probe inside a WRITE path
+        // (`create_or_get`). It must see an existing edge regardless of who is
+        // asking, or the "get" half silently becomes "create" and the table
+        // grows a duplicate every time a caller without read access re-asserts
+        // a link that is already there. PR-16 owns the write-side authorization
+        // that decides whether the caller may create the edge at all.
+        let sql = match probe {
+            DedupProbe::InForce => format!(
+                "-- VISIBILITY-EXEMPT: dedup probe inside a WRITE path (in-force rows).\n\
+                 SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
+                        e.relationship, e.properties, e.valid_from, e.valid_to \
+                   FROM edges e \
+                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3 \
+                    AND {EDGE_IN_FORCE} \
+                  LIMIT 1"
+            ),
+            DedupProbe::AnyState => "-- VISIBILITY-EXEMPT: dedup probe inside a WRITE path \
+                 (retracted rows included).\n\
+                 SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
+                        e.relationship, e.properties, e.valid_from, e.valid_to \
+                   FROM edges e \
+                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3 \
+                  LIMIT 1"
+                .to_string(),
+        };
+        #[allow(clippy::type_complexity)]
+        let existing: Option<(
+            Uuid,
+            Uuid,
+            String,
+            Uuid,
+            String,
+            String,
+            serde_json::Value,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )> = sqlx::query_as(&sql)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relationship)
+            .fetch_optional(&mut *tx)
+            .await?;
 
         if let Some(row) = existing {
             tx.commit().await?;
             return Ok((
                 EdgeRow {
-                    id: row.id,
-                    source_id: row.source_id,
-                    source_type: row.source_type,
-                    target_id: row.target_id,
-                    target_type: row.target_type,
-                    relationship: row.relationship,
-                    properties: row.properties,
-                    valid_from: row.valid_from,
-                    valid_to: row.valid_to,
+                    id: row.0,
+                    source_id: row.1,
+                    source_type: row.2,
+                    target_id: row.3,
+                    target_type: row.4,
+                    relationship: row.5,
+                    properties: row.6,
+                    valid_from: row.7,
+                    valid_to: row.8,
                 },
                 false,
             ));
@@ -418,6 +687,13 @@ impl EdgeRepository {
     /// canonicalize).
     ///
     /// Returns `true` when a new row was inserted, `false` on a dedup hit.
+    ///
+    /// The probe matches a row in ANY state, a retracted one included: a
+    /// matcher promotion over a pair whose matcher edge was retracted stays a
+    /// dedup hit, as the matcher's retirement path expects. The link tools'
+    /// forms ([`Self::create_symmetric_if_absent_returning_conn`],
+    /// [`Self::create_symmetric_if_absent_oriented_conn`]) match rows in force
+    /// only (migration 120), so a writer's retract-then-relink is a new edge.
     ///
     /// Single-statement `INSERT … SELECT … WHERE NOT EXISTS`, with
     /// `ON CONFLICT DO NOTHING` behind it.
@@ -557,7 +833,11 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<(Uuid, bool), DbError> {
-        let inserted: Option<Uuid> = sqlx::query_scalar(
+        // In force only (migration 120): a retracted link asserted again is a
+        // new edge, never a silent `false` onto the retracted row. 091's
+        // `edges_alternative_of_symmetric_uniq` covers `valid_to IS NULL` rows
+        // only, so the new row does not conflict with the retracted one.
+        let insert = format!(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
              SELECT $1, 'claim', $2, 'claim', $3, $4
@@ -566,36 +846,40 @@ impl EdgeRepository {
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
                    AND relationship = $3
+                   AND {EDGE_IN_FORCE_UNALIASED}
              )
              ON CONFLICT DO NOTHING
-             RETURNING id",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .bind(Json(properties))
-        .fetch_optional(&mut *conn)
-        .await?;
+             RETURNING id"
+        );
+        let inserted: Option<Uuid> = sqlx::query_scalar(&insert)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .bind(Json(properties))
+            .fetch_optional(&mut *conn)
+            .await?;
 
         if let Some(id) = inserted {
             return Ok((id, true));
         }
 
-        // Dedup hit — surface the id of the existing symmetric edge.
-        let existing: Uuid = sqlx::query_scalar(
+        // Dedup hit — surface the id of the existing symmetric edge in force.
+        let probe = format!(
             "-- VISIBILITY-EXEMPT: symmetric-dedup probe inside a WRITE path;
              -- same reasoning as `create_or_get`'s.
              SELECT id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
                AND relationship = $3
-             LIMIT 1",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .fetch_one(&mut *conn)
-        .await?;
+               AND {EDGE_IN_FORCE_UNALIASED}
+             LIMIT 1"
+        );
+        let existing: Uuid = sqlx::query_scalar(&probe)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .fetch_one(&mut *conn)
+            .await?;
 
         Ok((existing, false))
     }
@@ -651,7 +935,13 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<SymmetricEdgeUpsert, DbError> {
-        let inserted: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+        // In force only (migration 120), as `create_symmetric_if_absent_returning_conn`:
+        // a retracted link asserted again is a new edge (and the belief wiring
+        // keyed on it attaches to a row in force), never a silent
+        // `was_created = false` onto the retracted row. 090's
+        // `edges_symmetric_relationship_uniq` covers matcher-sourced
+        // `valid_to IS NULL` rows only, so the new row does not conflict.
+        let insert = format!(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
              SELECT $1, 'claim', $2, 'claim', $3, $4
@@ -660,15 +950,17 @@ impl EdgeRepository {
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
                    AND relationship = $3
+                   AND {EDGE_IN_FORCE_UNALIASED}
              )
-             RETURNING id, source_id, target_id",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .bind(Json(properties))
-        .fetch_optional(&mut *conn)
-        .await?;
+             RETURNING id, source_id, target_id"
+        );
+        let inserted: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(&insert)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .bind(Json(properties))
+            .fetch_optional(&mut *conn)
+            .await?;
 
         if let Some((edge_id, source_id, target_id)) = inserted {
             return Ok(SymmetricEdgeUpsert {
@@ -679,20 +971,22 @@ impl EdgeRepository {
             });
         }
 
-        // Dedup hit — surface the existing row AS STORED, which may be the
-        // reverse of the caller's (a, b).
-        let (edge_id, source_id, target_id): (Uuid, Uuid, Uuid) = sqlx::query_as(
+        // Dedup hit — surface the existing row in force AS STORED, which may be
+        // the reverse of the caller's (a, b).
+        let probe = format!(
             "SELECT id, source_id, target_id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
                AND relationship = $3
-             LIMIT 1",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .fetch_one(&mut *conn)
-        .await?;
+               AND {EDGE_IN_FORCE_UNALIASED}
+             LIMIT 1"
+        );
+        let (edge_id, source_id, target_id): (Uuid, Uuid, Uuid) = sqlx::query_as(&probe)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .fetch_one(&mut *conn)
+            .await?;
 
         Ok(SymmetricEdgeUpsert {
             edge_id,
@@ -901,29 +1195,237 @@ impl EdgeRepository {
         Ok(q.fetch_one(executor).await?)
     }
 
-    /// The `(source_type, source_id)` of edge `id`, read through `viewer`, or
-    /// `None` when the edge does not exist or the viewer cannot see it (batch
-    /// H-b review: MCP `patch_edge`'s ownership check keys on the edge's SOURCE,
-    /// whose author asserted it). Run it on the same transaction as the write.
+    /// The edge-keyed BBA cleanup every application act that withdraws an edge
+    /// runs, in the act's own transaction (migration 120; D1 names edge-keyed
+    /// BBA deletes an administrative cascade).
+    ///
+    /// When the edge carries an edge-factor perspective (`perspectives.id =
+    /// edge`, `perspective_type = 'edge'`: every BBA keyed on the edge hangs off
+    /// it, by FK) and the act withdrew it (see [`EdgeWithdrawal`]):
+    ///
+    /// * (b) it FIRST records a `cause = 'edge_retract'` deferral through
+    ///   120's `epigraph_record_cascade_deferral` (the session must own or
+    ///   co-own the edge, and the edge must be out of force; the row names the
+    ///   session principal). The DEFINER derives the deferral's `sources` from
+    ///   state, as the claims of the session's own BBA rows keyed on the edge,
+    ///   so it runs before (a) deletes them; no caller names a claim to
+    ///   re-derive. The caller cannot re-derive a belief cache it does not own,
+    ///   so the administrative replay re-derives those claims, together with
+    ///   the claims of every OTHER writer's BBA keyed on the edge, which it
+    ///   removes. Recorded even when only the caller's own BBAs existed, so
+    ///   their claims are re-derived.
+    /// * (a) it then deletes the caller's OWN edge-keyed BBAs, scoped
+    ///   explicitly to the session's writable set (the same set the definer
+    ///   read), so a privileged stamped session is held to the same owner
+    ///   scope as the application role.
+    ///
+    /// [`EdgeWithdrawal::BeingDeleted`] first closes the row's window
+    /// (`valid_to = now()`, the transaction's start, so `valid_to <= now()`
+    /// holds for the rest of the act): the deferral definer admits only an edge
+    /// out of force, and the row is deleted by the caller right after.
+    ///
+    /// A future-dated retraction, or an edge no BBA can be keyed on, does
+    /// nothing.
+    ///
+    /// # Errors
+    /// The deferral definer's refusal or any query error; the caller's act
+    /// rolls back with it.
+    #[instrument(skip(conn, oauth))]
+    pub async fn withdraw_edge_bbas_conn(
+        conn: &mut sqlx::PgConnection,
+        edge_id: Uuid,
+        withdrawal: EdgeWithdrawal,
+        oauth: Option<&serde_json::Value>,
+        reason: &str,
+    ) -> Result<BbaCleanup, DbError> {
+        // Reads only whether an edge-factor perspective exists for the edge the
+        // caller's act touches, the edge's own `valid_to`, and whether the
+        // session owns it. An edge the session does not own is left alone: the
+        // act itself is refused by row security (and rolls back), and the
+        // deferral definer would refuse it anyway.
+        let (keyed, withdrawn, owned): (bool, bool, bool) = sqlx::query_as(
+            "-- VISIBILITY-EXEMPT: the state of an edge the caller's act touches.\n\
+             SELECT EXISTS (SELECT 1 FROM perspectives p \
+                             WHERE p.id = $1 AND p.perspective_type = 'edge'), \
+                    COALESCE((SELECT CASE WHEN $2 THEN true \
+                                          ELSE e.valid_to IS NOT NULL AND e.valid_to <= now() END \
+                                FROM edges e WHERE e.id = $1), false), \
+                    COALESCE((SELECT public.epigraph_bypass() \
+                                     OR e.owner_group_id = ANY (public.epigraph_writable_groups()) \
+                                     OR e.co_owner_group_id \
+                                        = ANY (public.epigraph_writable_groups()) \
+                                FROM edges e WHERE e.id = $1), false)",
+        )
+        .bind(edge_id)
+        .bind(withdrawal == EdgeWithdrawal::BeingDeleted)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !keyed || !withdrawn || !owned {
+            return Ok(BbaCleanup::default());
+        }
+        if withdrawal == EdgeWithdrawal::BeingDeleted {
+            // The row is deleted right after this returns; close its window
+            // first so the deferral definer sees an edge out of force (it
+            // admits no edge in force, so no deferral names a live edge).
+            sqlx::query(
+                "UPDATE edges SET valid_to = now() \
+                  WHERE id = $1 AND (valid_to IS NULL OR valid_to > now())",
+            )
+            .bind(edge_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        // (b) The deferral, BEFORE (a): the definer reads the caller's own
+        // rows keyed on the edge as the claims to re-derive (the caller names
+        // none), and hands every other writer's rows to the replay.
+        let principal: Option<Uuid> = sqlx::query_scalar("SELECT public.epigraph_principal_id()")
+            .fetch_one(&mut *conn)
+            .await?;
+        let deferral = crate::repos::admin_cascade::record_deferral(
+            &mut *conn,
+            "edge_retract",
+            principal,
+            edge_id,
+            None,
+            &[],
+            oauth,
+            reason,
+        )
+        .await?;
+        // (a) The caller's own rows.
+        let deleted = sqlx::query(
+            "DELETE FROM mass_functions \
+              WHERE perspective_id = $1 \
+                AND owner_group_id = ANY (public.epigraph_writable_groups())",
+        )
+        .bind(edge_id)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        Ok(BbaCleanup {
+            deleted,
+            deferral_event_id: Some(deferral),
+        })
+    }
+
+    /// The administrative half of an `edge_retract` cascade, on the
+    /// MAINTENANCE connection: remove every BBA keyed on the edge (keyed on
+    /// `perspective_type = 'edge'`, so a genuine perspective's BBAs are never
+    /// touched) and return the claims they lived on.
+    ///
+    /// STATE-DERIVED: it acts only while the edge row is absent or out of force
+    /// (`valid_to <= now()`). An edge in force at the time of the call (its
+    /// owner un-retracted it, or the deferral was stale) removes nothing and
+    /// reports `withdrawn = false`, so a deferral can never make it do what the
+    /// edge's state does not justify. It first locks the edge row (`FOR
+    /// UPDATE`), so an act in flight on the edge commits before it reads.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if a query fails.
+    #[instrument(skip(conn))]
+    pub async fn remove_withdrawn_edge_bbas_conn(
+        conn: &mut sqlx::PgConnection,
+        edge_id: Uuid,
+    ) -> Result<WithdrawnEdgeBbas, DbError> {
+        // Lock the row (when it exists) before reading its state: an owner's
+        // act on the edge holds the row until it commits, so its deferral is
+        // committed, and visible to the caller's next read, once this returns.
+        let in_force: Option<bool> = sqlx::query_scalar(
+            "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
+             SELECT e.valid_to IS NULL OR e.valid_to > now() \
+               FROM edges e WHERE e.id = $1 FOR UPDATE",
+        )
+        .bind(edge_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let withdrawn = !in_force.unwrap_or(false);
+        if !withdrawn {
+            return Ok(WithdrawnEdgeBbas::default());
+        }
+        let claims: Vec<Uuid> = sqlx::query_scalar(
+            "WITH gone AS ( \
+                 DELETE FROM mass_functions mf \
+                  USING perspectives p \
+                  WHERE p.id = mf.perspective_id \
+                    AND p.id = $1 \
+                    AND p.perspective_type = 'edge' \
+                 RETURNING mf.claim_id) \
+             SELECT claim_id FROM gone",
+        )
+        .bind(edge_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let deleted = claims.len() as u64;
+        let mut distinct: Vec<Uuid> = claims;
+        distinct.sort_unstable();
+        distinct.dedup();
+        Ok(WithdrawnEdgeBbas {
+            withdrawn: true,
+            deleted,
+            claims: distinct,
+        })
+    }
+
+    /// The edges whose BBAs outlived them: an edge-factor perspective
+    /// (`perspective_type = 'edge'`) with BBAs keyed on it whose edge is absent
+    /// or out of force. The one-shot legacy sweep
+    /// (`replay_deferred_cascades --sweep-withdrawn-edge-bbas`) removes their
+    /// BBAs through the same administrative path as an `edge_retract` replay.
+    /// Maintenance connection only.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(conn))]
+    pub async fn withdrawn_edges_with_bbas_conn(
+        conn: &mut sqlx::PgConnection,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, DbError> {
+        Ok(sqlx::query_scalar(
+            "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
+             SELECT p.id FROM perspectives p \
+              WHERE p.perspective_type = 'edge' \
+                AND EXISTS (SELECT 1 FROM mass_functions mf WHERE mf.perspective_id = p.id) \
+                AND NOT EXISTS (SELECT 1 FROM edges e \
+                                 WHERE e.id = p.id \
+                                   AND (e.valid_to IS NULL OR e.valid_to > now())) \
+              ORDER BY p.id \
+              LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?)
+    }
+
+    /// Why a write this session was just refused on edge `id` was refused:
+    /// the edge is world-owned (administrative) or another writer's. `None`
+    /// when `viewer` cannot read the edge (the caller then answers "not
+    /// found", as before). Run it on the same transaction as the refused write,
+    /// after [`DbError::WriteRefused`].
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
-    pub async fn source_of<'e, E: sqlx::PgExecutor<'e>>(
+    pub async fn refusal_for<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
         id: Uuid,
-    ) -> Result<Option<(String, Uuid)>, DbError> {
+    ) -> Result<Option<EdgeRefusal>, DbError> {
         let sql = viewer.splice(
-            "SELECT e.source_type::text, e.source_id FROM edges e \
-              WHERE e.id = $1 /* {EDGE_VISIBILITY:e} */",
+            "SELECT e.owner_group_id = '00000000-0000-0000-0000-000000000000'::uuid \
+               FROM edges e WHERE e.id = $1 /* {EDGE_VISIBILITY:e} */",
             2,
         );
-        let mut q = sqlx::query_as::<_, (String, Uuid)>(&sql).bind(id);
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_optional(executor).await?)
+        Ok(q.fetch_optional(executor).await?.map(|world| {
+            if world {
+                EdgeRefusal::Administrative
+            } else {
+                EdgeRefusal::OwnedByAnotherWriter
+            }
+        }))
     }
 
     /// Retract edges by closing their validity interval instead of deleting them.
@@ -945,24 +1447,40 @@ impl EdgeRepository {
     /// invalidation, not data loss, and they regenerate from live edges.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::WriteRefused` (and nothing retracted) when an in-force edge
+    /// this session can read was not closed: migration 117's owner-scoped
+    /// UPDATE matches no row it refuses and reports success.
+    /// `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn retract(pool: &PgPool, edge_ids: &[Uuid]) -> Result<Vec<Uuid>, DbError> {
         if edge_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let closed: Vec<Uuid> = sqlx::query_scalar(
+        let mut tx = pool.begin().await?;
+        let (closed, refused): (Vec<Uuid>, Option<Uuid>) = sqlx::query_as(
             r#"
-            UPDATE edges
-               SET valid_to = now()
-             WHERE id = ANY($1)
-               AND valid_to IS NULL
-            RETURNING id
+            WITH seen AS (SELECT id FROM edges WHERE id = ANY($1) AND valid_to IS NULL),
+                 done AS (
+                    UPDATE edges
+                       SET valid_to = now()
+                     WHERE id = ANY($1)
+                       AND valid_to IS NULL
+                    RETURNING id)
+            SELECT COALESCE((SELECT array_agg(id) FROM done), ARRAY[]::uuid[]),
+                   (SELECT id FROM seen EXCEPT SELECT id FROM done LIMIT 1)
             "#,
         )
         .bind(edge_ids)
-        .fetch_all(pool)
+        .fetch_one(&mut *tx)
         .await?;
+        if let Some(id) = refused {
+            return Err(DbError::WriteRefused {
+                entity: "edge".to_string(),
+                id,
+                action: "retract".to_string(),
+            });
+        }
+        tx.commit().await?;
         Ok(closed)
     }
 
@@ -1363,39 +1881,79 @@ impl EdgeRepository {
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
         properties_merge: Option<serde_json::Value>,
     ) -> Result<EdgeRow, DbError> {
+        // Migration 117 made UPDATE on `edges` owner-scoped with a RESTRICTIVE
+        // USING clause, so an edge this session can READ but not update (a
+        // world-owned edge between two public claims, another group's edge)
+        // matches zero rows WITHOUT an error. `seen` reads the row under the
+        // statement's snapshot, so the one statement tells "no such edge"
+        // (`NotFound`) from "refused" (`WriteRefused`) instead of reporting a
+        // refused patch as a missing edge.
         let row = sqlx::query!(
             r#"
-            UPDATE edges
-            SET valid_to = COALESCE($2, valid_to),
-                properties = CASE
-                    WHEN $3::jsonb IS NULL THEN properties
-                    ELSE properties || $3::jsonb
-                END
-            WHERE id = $1
-            RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            WITH seen AS (SELECT 1 FROM edges WHERE id = $1),
+                 upd AS (
+                    UPDATE edges
+                    SET valid_to = COALESCE($2, valid_to),
+                        properties = CASE
+                            WHEN $3::jsonb IS NULL THEN properties
+                            ELSE properties || $3::jsonb
+                        END
+                    WHERE id = $1
+                    RETURNING id, source_id, source_type, target_id, target_type, relationship,
+                              properties, valid_from, valid_to)
+            SELECT upd.id AS "id?", upd.source_id AS "source_id?",
+                   upd.source_type AS "source_type?", upd.target_id AS "target_id?",
+                   upd.target_type AS "target_type?", upd.relationship AS "relationship?",
+                   upd.properties AS "properties?", upd.valid_from AS "valid_from?",
+                   upd.valid_to AS "valid_to?",
+                   EXISTS (SELECT 1 FROM seen) AS "visible!"
+              FROM (SELECT 1) AS one LEFT JOIN upd ON true
             "#,
             id,
             valid_to,
             properties_merge,
         )
-        .fetch_optional(executor)
-        .await?
-        .ok_or(DbError::NotFound {
-            entity: "edge".to_string(),
-            id,
-        })?;
+        .fetch_one(executor)
+        .await?;
 
-        Ok(EdgeRow {
-            id: row.id,
-            source_id: row.source_id,
-            source_type: row.source_type,
-            target_id: row.target_id,
-            target_type: row.target_type,
-            relationship: row.relationship,
-            properties: row.properties,
-            valid_from: row.valid_from,
-            valid_to: row.valid_to,
-        })
+        match (
+            row.id,
+            row.source_id,
+            row.source_type,
+            row.target_id,
+            row.target_type,
+            row.relationship,
+            row.properties,
+        ) {
+            (
+                Some(id),
+                Some(source_id),
+                Some(source_type),
+                Some(target_id),
+                Some(target_type),
+                Some(relationship),
+                Some(properties),
+            ) => Ok(EdgeRow {
+                id,
+                source_id,
+                source_type,
+                target_id,
+                target_type,
+                relationship,
+                properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            }),
+            _ if row.visible => Err(DbError::WriteRefused {
+                entity: "edge".to_string(),
+                id,
+                action: "update".to_string(),
+            }),
+            _ => Err(DbError::NotFound {
+                entity: "edge".to_string(),
+                id,
+            }),
+        }
     }
 
     /// Delete an edge by ID
@@ -1421,23 +1979,41 @@ impl EdgeRepository {
     /// Generic over the executor for the same reason as
     /// [`Self::update_valid_to_and_properties`]: the MCP `delete_edge` tool runs
     /// it on an author-stamped transaction. The SQL is byte-identical.
+    ///
+    /// # Errors
+    /// `DbError::WriteRefused` when the edge is in force and readable by this
+    /// session but row security refused the retraction (migration 117's
+    /// owner-scoped UPDATE matches zero rows without an error; `open` reads the
+    /// row under the statement's snapshot to tell the two apart).
     pub async fn retract_by_id<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
     ) -> Result<bool, DbError> {
-        let result = sqlx::query!(
+        let r = sqlx::query!(
             r#"
-            UPDATE edges
-               SET valid_to = now()
-             WHERE id = $1
-               AND valid_to IS NULL
+            WITH open AS (SELECT 1 FROM edges WHERE id = $1 AND valid_to IS NULL),
+                 upd AS (
+                    UPDATE edges
+                       SET valid_to = now()
+                     WHERE id = $1
+                       AND valid_to IS NULL
+                    RETURNING 1)
+            SELECT (SELECT count(*) FROM open) AS "open!", (SELECT count(*) FROM upd) AS "closed!"
             "#,
             id
         )
-        .execute(executor)
+        .fetch_one(executor)
         .await?;
+        let (open, closed) = (r.open, r.closed);
 
-        Ok(result.rows_affected() > 0)
+        if closed < open {
+            return Err(DbError::WriteRefused {
+                entity: "edge".to_string(),
+                id,
+                action: "retract".to_string(),
+            });
+        }
+        Ok(closed > 0)
     }
 
     /// Delete all edges between two entities
@@ -1460,23 +2036,36 @@ impl EdgeRepository {
         target_id: Uuid,
         target_type: &str,
     ) -> Result<u64, DbError> {
-        let result = sqlx::query!(
+        // Checked, in a transaction: an in-force edge this session can read
+        // but not retract (migration 117) refuses the whole call.
+        let mut tx = pool.begin().await?;
+        let r = sqlx::query!(
             r#"
-            UPDATE edges
-               SET valid_to = now()
-            WHERE source_id = $1 AND source_type = $2
-              AND target_id = $3 AND target_type = $4
-              AND valid_to IS NULL
+            WITH seen AS (
+                    SELECT 1 FROM edges
+                     WHERE source_id = $1 AND source_type = $2
+                       AND target_id = $3 AND target_type = $4
+                       AND valid_to IS NULL),
+                 done AS (
+                    UPDATE edges
+                       SET valid_to = now()
+                    WHERE source_id = $1 AND source_type = $2
+                      AND target_id = $3 AND target_type = $4
+                      AND valid_to IS NULL
+                    RETURNING 1)
+            SELECT (SELECT count(*) FROM seen) AS "seen!", (SELECT count(*) FROM done) AS "done!"
             "#,
             source_id,
             source_type,
             target_id,
             target_type
         )
-        .execute(pool)
+        .fetch_one(&mut *tx)
         .await?;
-
-        Ok(result.rows_affected())
+        let changed =
+            super::require_all_changed("edge from", source_id, "retract", (r.seen, r.done))?;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Count edges for an entity (as either source or target)

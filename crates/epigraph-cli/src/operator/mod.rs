@@ -18,6 +18,14 @@
 //!   claims (Amendment 2; migration 110's `evidence_visibility_pins` keeps
 //!   them hidden), under the guards and manifest `hide`'s module doc lists.
 //!
+//! And, beside the backfill, two audited scope commands (batch OA1), which take
+//! exactly one of `--dry-run` / `--apply`:
+//!
+//! * `grant-client-scope` / `revoke-client-scope <client-id> <scope>` — add or
+//!   remove ONE admin-only scope on a HUMAN's own OAuth client, in both
+//!   `allowed_scopes` and `granted_scopes`, with one `security_events` row per
+//!   `--apply` (see [`client_scope`]).
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.
@@ -46,6 +54,7 @@
 //! is stricter than `epigraph_db::assert_maintenance_privilege` (which is
 //! conditioned on row security being active): it is unconditional.
 
+pub mod client_scope;
 pub mod hide;
 pub mod link;
 pub mod manifest;

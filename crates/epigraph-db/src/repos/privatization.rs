@@ -2701,6 +2701,28 @@ impl PrivatizationRepository {
     /// `paper` or `task` has no tenancy, contributes `public` to the meet, and
     /// must never BLOCK a privatization.
     ///
+    /// # Two public endpoints: the WRITER's edge again, or the world's (migration 120)
+    ///
+    /// Operator decision D8 owns an edge between two public claims by its
+    /// writer's group, and migration 120's `epigraph_edges_tenancy()` stamps it
+    /// so at INSERT, recording the writer in `edges.writer_group_id`. The apply
+    /// direction narrows such an edge to the meet (one endpoint is now private),
+    /// and the writer is not in the meet. So on the way back, when both
+    /// endpoints are public again, the owner is the RECORDED writer's group, as
+    /// the INSERT stamped it: `epigraph_edge_writer_scope` holds for the
+    /// endpoint types (the same predicate the trigger uses), the author record
+    /// is set, and that group still exists (the column has no foreign key).
+    /// Otherwise the owner is the world, as before: a legacy edge (no author
+    /// record) and an out-of-scope edge (an agent, paper ... endpoint, which the
+    /// trigger stamps world even when it records a writer) come back
+    /// `('public', world)`. So apply then revert restores every one of these
+    /// tuples exactly. `writer_group_id` is read ONLY here: a re-point never
+    /// recomputes an owner from it.
+    ///
+    /// NOT fixed here: an edge DECLARED `('group', H)` between two public
+    /// claims widens on revert, as before (the declaration is not recorded).
+    /// It blocks re-enabling the privatization lifecycle, not this change.
+    ///
     /// # Errors
     ///
     /// [`DbError`] for a query fault.
@@ -2718,7 +2740,11 @@ impl PrivatizationRepository {
                      COALESCE(s.v, 'public')::text AS sv,
                      COALESCE(s.g, '00000000-0000-0000-0000-000000000000'::uuid) AS sg,
                      COALESCE(t.v, 'public')::text AS tv,
-                     COALESCE(t.g, '00000000-0000-0000-0000-000000000000'::uuid) AS tg
+                     COALESCE(t.g, '00000000-0000-0000-0000-000000000000'::uuid) AS tg,
+                     CASE WHEN public.epigraph_edge_writer_scope(e.source_type, e.target_type)
+                               AND EXISTS (SELECT 1 FROM public.groups wg
+                                            WHERE wg.id = e.writer_group_id)
+                          THEN e.writer_group_id END AS wg
                 FROM public.edges e
                 CROSS JOIN LATERAL public.epigraph_node_tenancy(e.source_id, e.source_type) s
                 CROSS JOIN LATERAL public.epigraph_node_tenancy(e.target_id, e.target_type) t
@@ -2729,7 +2755,8 @@ impl PrivatizationRepository {
                      (CASE WHEN ep.sv = 'public' AND ep.tv = 'public'
                            THEN 'public' ELSE 'group' END)::varchar(16) AS v,
                      CASE WHEN ep.sv = 'public' AND ep.tv = 'public'
-                               THEN '00000000-0000-0000-0000-000000000000'::uuid
+                               THEN COALESCE(ep.wg,
+                                             '00000000-0000-0000-0000-000000000000'::uuid)
                           WHEN ep.sv = 'public' THEN ep.tg
                           ELSE ep.sg END AS g,
                      CASE WHEN ep.sv = 'group' AND ep.tv = 'group' AND ep.sg <> ep.tg

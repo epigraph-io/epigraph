@@ -18,6 +18,21 @@
 //!
 //! The operator's HTTP principal is a stand-in agent, not the production
 //! operator's id: this repository is public.
+//!
+//! # HTTP retirement is driven through `resolve_backlog_item`
+//!
+//! Since batch OA1, an authenticated `supersede_claim` / `mark_duplicate` is
+//! decided by `epigraph_auth::claim_act` (the caller's own write authority
+//! over the claim's owning group, or `claims:admin`) and no longer consults
+//! this operator arm: the act runs on the caller's own stamp, and the operator
+//! arm would otherwise have lent a `claims:write` caller the MCP server
+//! agent's stamp. Before OA1 the tool's scope was `claims:admin`, so on any
+//! deployment the operator arm could only ever run for a caller that already
+//! held `claims:admin` and was never the arm that decided an HTTP supersede. The
+//! HTTP halves below therefore exercise the arm through `resolve_backlog_item`,
+//! which still runs it, and
+//! `the_operators_http_principal_may_retire_and_patch_its_agents_claims` pins
+//! the supersede side of the split.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -151,6 +166,34 @@ async fn supersede(
     .map_err(|e| e.message.to_string())
 }
 
+/// `resolve_backlog_item` on `target`: a retirement that still runs
+/// `require_owner_or_admin`'s operator arm over HTTP.
+async fn resolve(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    target: Uuid,
+    auth: Option<&AuthContext>,
+) -> Result<(), String> {
+    resolve_backlog_item(
+        server,
+        &viewer_for(pool, auth).await,
+        ResolveBacklogItemParams {
+            original_id: target.to_string(),
+            resolution_content: format!("resolved {target}"),
+            methodology: None,
+            basis_claim_ids: Vec::new(),
+        },
+        auth,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.message.to_string())
+}
+
+async fn is_resolved(pool: &PgPool, claim: Uuid) -> bool {
+    labels(pool, claim).await.contains(&"resolved".to_string())
+}
+
 async fn is_current(pool: &PgPool, claim: Uuid) -> bool {
     sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
         .bind(claim)
@@ -206,8 +249,14 @@ async fn a_sibling_agent_under_the_same_operator_may_retire_its_claims(pool: PgP
 }
 
 /// The operator's own HTTP principal (`auth.agent_id` = the operator; no
-/// `claims:admin`; `owner_id` a different login id) may retire AND patch the
-/// retirement label on its agents' claims.
+/// `claims:admin`; `owner_id` a different login id) may retire (resolve) AND
+/// patch the retirement label on its agents' claims.
+///
+/// Batch OA1: it may NOT supersede an agent's claim in a group it does not
+/// write with `claims:write` alone. The claim act is decided by the caller's
+/// own write authority (`epigraph_auth::claim_act`), not by this arm, so the
+/// refusal is by name and nothing is written; with `claims:admin` (the tool's
+/// only scope before OA1) the same supersede lands.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_operators_http_principal_may_retire_and_patch_its_agents_claims(pool: PgPool) {
     let operator = agent(&pool, "operator").await;
@@ -217,10 +266,26 @@ async fn the_operators_http_principal_may_retire_and_patch_its_agents_claims(poo
     let auth = http_auth(Some(operator));
 
     let c1 = own_claim(&pool, operated).await;
-    supersede(&server, &pool, c1, Some(&auth))
+    resolve(&server, &pool, c1, Some(&auth))
         .await
-        .expect("the operator's HTTP principal must be able to supersede its agent's claim");
-    assert!(!is_current(&pool, c1).await);
+        .expect("the operator's HTTP principal must be able to resolve its agent's claim");
+    assert!(is_resolved(&pool, c1).await);
+
+    let c3 = own_claim(&pool, operated).await;
+    let err = supersede(&server, &pool, c3, Some(&auth))
+        .await
+        .expect_err("claims:write does not lend the operator a write it does not hold");
+    assert!(
+        err.contains("holds no admin or writer membership"),
+        "the claim-act refusal, by name: {err}"
+    );
+    assert!(is_current(&pool, c3).await, "the refused supersede wrote");
+    let mut admin = http_auth(Some(operator));
+    admin.scopes.push("claims:admin".to_string());
+    supersede(&server, &pool, c3, Some(&admin))
+        .await
+        .expect("with claims:admin the operator's HTTP principal supersedes, as before OA1");
+    assert!(!is_current(&pool, c3).await);
 
     let c2 = own_claim(&pool, operated).await;
     patch_claim(
@@ -300,10 +365,10 @@ async fn the_operator_and_an_actor_sibling_own_a_retired_agents_claims(pool: PgP
 
     let own = own_claim(&pool, retired).await;
     let (other_server, _) = server_with_seed(&pool, 0x5C).await;
-    supersede(&other_server, &pool, own, Some(&http_auth(Some(operator))))
+    resolve(&other_server, &pool, own, Some(&http_auth(Some(operator))))
         .await
         .expect("the operator must own its retired agent's claims");
-    assert!(!is_current(&pool, own).await);
+    assert!(is_resolved(&pool, own).await);
 }
 
 /// A2: a RETIRED identity can never act for its operator — not over a sibling
@@ -381,15 +446,29 @@ async fn submit_claim_from_an_operated_agent_is_owned_by_the_operator(pool: PgPo
         "an operated agent's claim must be OWNED by the operator's personal group"
     );
 
+    // Over HTTP the operator's request carries ITS OWN viewer (as
+    // `request_viewer` resolves it), which writes the operator's personal
+    // group: that write authority is what admits the supersede (batch OA1's
+    // claim-act rule), and the act runs on the operator's own stamp.
     let (other_server, _) = server_with_seed(&pool, 0x56).await;
-    supersede(
+    let operator_viewer = epigraph_db::visibility::Viewer::resolve(&pool, operator)
+        .await
+        .expect("the operator's viewer");
+    assert!(operator_viewer.writable_groups().contains(&owner));
+    supersede_claim(
         &other_server,
-        &pool,
-        claim_id,
+        &operator_viewer,
+        SupersedeClaimParams {
+            claim_id: claim_id.to_string(),
+            content: format!("replacement for {claim_id}"),
+            truth_value: 0.7,
+            reason: "operator-ownership test".to_string(),
+        },
         Some(&http_auth(Some(operator))),
     )
     .await
-    .expect("the operator may retire what its agent wrote");
+    .expect("the operator may retire what its agent wrote into the operator's group");
+    assert!(!is_current(&pool, claim_id).await);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -436,12 +515,13 @@ async fn a_different_operator_is_refused(pool: PgPool) {
     assert!(err.contains("declared signer identity"), "{err}");
 
     for http_caller in [op_k, k_http_agent] {
-        let err = supersede(&server, &pool, c, Some(&http_auth(Some(http_caller))))
+        let err = resolve(&server, &pool, c, Some(&http_auth(Some(http_caller))))
             .await
             .expect_err("an HTTP caller under a different operator must be refused");
         assert!(err.contains("claims:admin"), "{err}");
     }
     assert!(is_current(&pool, c).await);
+    assert!(!is_resolved(&pool, c).await);
 }
 
 /// World-owned claims do NOT become ownable. The rule is keyed on AUTHORS, and
@@ -460,11 +540,12 @@ async fn world_owned_claims_do_not_become_ownable(pool: PgPool) {
         .await
         .expect_err("an operated agent must not own a world-owned claim");
     assert!(err.contains("declared signer identity"), "{err}");
-    let err = supersede(&server, &pool, c, Some(&http_auth(Some(operator))))
+    let err = resolve(&server, &pool, c, Some(&http_auth(Some(operator))))
         .await
         .expect_err("the operator must not own a world-owned claim it did not author");
     assert!(err.contains("claims:admin"), "{err}");
     assert!(is_current(&pool, c).await);
+    assert!(!is_resolved(&pool, c).await);
 }
 
 /// A revoked link grants nothing: the operator revokes the agent's writer
@@ -494,10 +575,10 @@ async fn a_revoked_link_grants_nothing(pool: PgPool) {
     // the target side reads the author record, not the membership.
     let mine = claim(&pool, me, fixture::world_group(&pool).await).await;
     let (other_server, _) = server_with_seed(&pool, 0x5E).await;
-    supersede(&other_server, &pool, mine, Some(&http_auth(Some(operator))))
+    resolve(&other_server, &pool, mine, Some(&http_auth(Some(operator))))
         .await
         .expect("revoking an agent must not take its claims away from the operator");
-    assert!(!is_current(&pool, mine).await);
+    assert!(is_resolved(&pool, mine).await);
 }
 
 /// Review finding F12: on stdio the pre-107 undeclared-signer arm (warn and
@@ -561,14 +642,14 @@ async fn an_operated_agent_has_no_operator_authority_over_http(pool: PgPool) {
     let (http_server, _) = server_with_seed(&pool, 0x5F).await;
 
     let c = own_claim(&pool, sibling).await;
-    let err = supersede(&http_server, &pool, c, Some(&http_auth(Some(actor))))
+    let err = resolve(&http_server, &pool, c, Some(&http_auth(Some(actor))))
         .await
         .expect_err(
             "an operated agent's HTTP principal was granted the actor arm: a token minted before \
              its link would carry the operator's authority onto HTTP",
         );
     assert!(err.contains("claims:admin"), "{err}");
-    assert!(is_current(&pool, c).await, "the refused supersede wrote");
+    assert!(!is_resolved(&pool, c).await, "the refused retirement wrote");
 
     let refused =
         epigraph_mcp::tools::viewer::request_viewer(&http_server, Some(&http_auth(Some(actor))))
@@ -600,9 +681,10 @@ async fn an_operated_agent_has_no_operator_authority_over_http(pool: PgPool) {
         .await
         .expect("CALIBRATION: the actor over stdio acts for the operator");
     let c2 = own_claim(&pool, sibling).await;
-    supersede(&http_server, &pool, c2, Some(&http_auth(Some(operator))))
+    resolve(&http_server, &pool, c2, Some(&http_auth(Some(operator))))
         .await
         .expect("CALIBRATION: the operator's own HTTP principal is admitted");
+    assert!(is_resolved(&pool, c2).await);
     epigraph_mcp::tools::viewer::request_viewer(&http_server, Some(&http_auth(Some(operator))))
         .await
         .expect("CALIBRATION: the operator's HTTP principal gets a viewer");

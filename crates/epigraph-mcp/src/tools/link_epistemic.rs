@@ -67,8 +67,9 @@ use epigraph_engine::edge_factor::{auto_wire_edge_if_epistemic, EdgeFactorOutcom
 /// **non-Neutral** `RestrictionKind`, which is what actually moves belief.
 ///
 /// `supersedes` is excluded on purpose: it has dedicated semantics
-/// (`supersede_claim`, scope `claims:admin`, flips `is_current=false` + nulls
-/// the superseded claim's embedding). Letting any `claims:write` agent write a
+/// (`supersede_claim`: scope `claims:write` plus write authority over the
+/// claim's owning group, or `claims:admin`, since batch OA1; it flips
+/// `is_current=false` + nulls the superseded claim's embedding). Letting any `claims:write` agent write a
 /// bare `supersedes` edge here would create an inconsistent state.
 pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "supports",
@@ -437,11 +438,18 @@ pub async fn do_link_epistemic(
         }
     };
 
+    // Migration 120 (D8): a re-assertion of another writer's edge returns THEIR
+    // edge, which this session can neither patch, retract nor delete. Say so.
+    let owned_by_caller = EdgeRepository::owned_by_session(&mut *tx, edge_id)
+        .await
+        .map_err(internal_error)?;
+
     tx.commit().await.map_err(internal_error)?;
 
     success_json(&LinkEpistemicResponse {
         edge_id: edge_id.to_string(),
         was_created,
+        owned_by_caller,
         relationship: params.relationship,
         belief_wired,
         belief_target_claim_id: wire_target.to_string(),

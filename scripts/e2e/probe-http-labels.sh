@@ -51,15 +51,13 @@
 #   E2E_APP_DSN  the least-privilege application DSN the server connects as.
 #                MUST be a role with rolbypassrls=false, or every arm is vacuous.
 # Optional:
-#   E2E_MAINT_DSN  the server's MAINTENANCE_DATABASE_URL (its job pool refuses a
-#                  non-bypassing one). Defaults to E2E_SU_DSN.
+#   (No maintenance DSN: under operator decision D9 the API server refuses to
+#   start when MAINTENANCE_DATABASE_URL is set, so this probe unsets it.)
 #   E2E_HTTP_PORT  port for the server under test. Default 18097.
 : "${E2E_SU_DSN:?set E2E_SU_DSN (superuser DSN for the throwaway e2e database)}"
 : "${E2E_APP_DSN:?set E2E_APP_DSN (least-privilege app DSN; rolbypassrls MUST be false)}"
-E2E_MAINT_DSN="${E2E_MAINT_DSN:-$E2E_SU_DSN}"
 # shellcheck source=dsn-guard.sh
 . "$(cd "$(dirname "$0")" && pwd)/dsn-guard.sh"
-e2e_guard_dsn E2E_MAINT_DSN
 E2E_SU_PW="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*://[^:]+:([^@]*)@.*#\1#')"
 E2E_SU_USER="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*://([^:]+):.*#\1#')"
 E2E_DB="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*/([^/?]+)$#\1#')"
@@ -144,9 +142,9 @@ done
 SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 : > "$PROVIDERS"
 : > "$LOG"
-env -u EPIGRAPH_ALLOW_INSECURE_SECRET \
-  DATABASE_URL="$E2E_APP_DSN" MAINTENANCE_DATABASE_URL="$E2E_MAINT_DSN" \
-  EPIGRAPH_JWT_SECRET="$SECRET" EPIGRAPH_ENV=test EPIGRAPH_DISABLE_JOBS=1 \
+env -u EPIGRAPH_ALLOW_INSECURE_SECRET -u MAINTENANCE_DATABASE_URL \
+  DATABASE_URL="$E2E_APP_DSN" \
+  EPIGRAPH_JWT_SECRET="$SECRET" EPIGRAPH_ENV=test \
   EPIGRAPH_PROVIDERS_CONFIG="$PROVIDERS" EPIGRAPH_PORT="$PORT" EPIGRAPH_METRICS_ADDR=127.0.0.1:0 \
   OPENAI_API_KEY= RUST_LOG=warn "$BIN" >> "$LOG" 2>&1 &
 PID=$!

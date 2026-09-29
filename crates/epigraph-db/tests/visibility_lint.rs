@@ -472,6 +472,29 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "maintenance_lock.rs",
+        "try_take",
+        "NO TABLE. `SELECT pg_try_advisory_lock($1)` on the maintenance timer's own connection \
+         (operator decision D9, batch W12a): it reads and writes no row of any table, so there \
+         is nothing a viewer could filter. The connection is the timer's, held for its run.",
+    ),
+    (
+        "maintenance_lock.rs",
+        "release",
+        "NO TABLE. `SELECT pg_advisory_unlock($1)`, the inverse of `try_take`; it touches no \
+         row of any table.",
+    ),
+    (
+        "foreign_attach.rs",
+        "is_foreign_public_claim",
+        "ROUTING QUESTION, not a disclosure (migration 114). Returns one boolean: whether the \
+         STAMPED session would attach to this claim as a non-owner. Its read of `claims` is the \
+         session's own RLS-filtered read (the answer for a claim the session cannot see is \
+         `false`, the same as for a missing one), it projects no column, and every caller \
+         (`update_with_evidence`, `submit_ds_evidence`, `report_workflow_outcome`) asks it on the \
+         same stamped transaction on which the claim is read through the caller's viewer.",
+    ),
+    (
         "claim.rs",
         "supersede_conn",
         "WRITE. The body of `supersede`, moved onto a caller-owned connection so the HTTP route \
@@ -537,6 +560,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "insert_conn",
         "WRITE. Writes the encryption row for a claim created in the same transaction; the row's \
          tenancy is the parent claim's, established by the INSERT that precedes it.",
+    ),
+    (
+        "entity_type.rs",
+        "get_by_name_conn",
+        "READ of the `entity_types` registry by name, plus its `to_regclass` probe. The \
+         registry is instance-wide and carries no tenancy, so a viewer would filter nothing. \
+         Connection-taking since batch W12b (migration 120) so the HTTP edge create route's \
+         read-through rides its caller-stamped write transaction, under a SAVEPOINT.",
     ),
     (
         "event.rs",
@@ -922,6 +953,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "security_event.rs",
+        "connection_origin_conn",
+        "READ of no table at all: `host(inet_client_addr())` and the session's \
+         `application_name`, the server's view of the CONNECTION it runs on. There is nothing to \
+         filter, so no viewer. Its only caller is `epigraph-operator grant-client-scope` / \
+         `revoke-client-scope` (batch OA1), which records the two values beside the login and the \
+         kernel uid in the `security_events` row it writes on the same transaction.",
+    ),
+    (
+        "security_event.rs",
         "correlation_is_attributed_to_conn",
         "READ of `security_events`, returning a BOOLEAN and no rows. It is the machine form of \
          FINAL-PLAN §6.5.5's sixth condition. MUST be the maintenance connection: migration 077's \
@@ -1123,13 +1163,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          and membership decisions made under the old identity.",
     ),
     (
-        "match_candidate.rs",
-        "retire_conn",
-        "ADMINISTRATIVE WRITE on the maintenance connection (migration 118). The body is the old \
-         `retire`'s, moved behind a connection parameter so the HTTP route can run it on the \
-         maintenance session: `match_candidates` carries no tenancy, and the flip to `stale` is \
-         refused on any non-privileged session by `match_candidates_stale_guard`, so the \
-         connection, not a viewer, is the control. The route's `claims:admin` scope authorizes it.",
+        "oauth_client.rs",
+        "lock_by_id_conn",
+        "READ, `FOR UPDATE`, of one `oauth_clients` row: the table has no tenancy at all, the \
+         same absent-column argument as `get_by_id_conn` above. Its only caller is \
+         `epigraph-operator grant-client-scope` / `revoke-client-scope` (batch OA1), which runs \
+         on the maintenance DSN alone and refuses a login outside `epigraph_maintenance`; the \
+         row lock is what makes the scope change it computes a compare-and-swap.",
+    ),
+    (
+        "oauth_client.rs",
+        "set_scopes_conn",
+        "WRITE of `allowed_scopes` and `granted_scopes` on one `oauth_clients` row, a table with \
+         no tenancy (see `get_by_id_conn`). The authority is the caller's, not a row predicate: \
+         `epigraph-operator`'s scope commands (batch OA1) reach it only on the maintenance DSN, \
+         only for a HUMAN client and only for an admin-only scope, and write their \
+         `security_events` row on the same transaction.",
     ),
     (
         "privatization.rs",
@@ -1200,12 +1249,151 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `update_labels_conn`: authorised by claims_tenancy's WITH CHECK on the stamped \
          connection, not by a read predicate.",
     ),
+    // ── Batch W10 (migration 117): the retraction cascade split into the
+    // caller's ACT (on its own stamped transaction; authorised by the table's
+    // WITH CHECK against that stamp) and the ADMINISTRATIVE repair (on the
+    // privileged maintenance connection, which each refuses to run without).
+    // Their reads are existence / lock / verification probes of the rows they
+    // are about to mutate; none is a disclosure to a caller.
+    (
+        "claim.rs",
+        "supersede_act_conn",
+        "WRITE. The supersession's act (retire, insert the replacement and the `supersedes` \
+         edge) on the caller's stamped transaction; authorised by claims_tenancy's / \
+         edges_tenancy's WITH CHECK. Its one read is the old claim's lock probe.",
+    ),
+    (
+        "claim.rs",
+        "migrate_superseded_edges_conn",
+        "WRITE, privileged only (refuses otherwise). Re-points the retired claim's edges onto the \
+         replacement on the maintenance connection; its read verifies the committed act.",
+    ),
+    (
+        "claim.rs",
+        "migrate_superseded_edges",
+        "WRITE. The two edge-migration statements, unchecked; called only after the caller \
+         established the privilege and the supersession.",
+    ),
+    (
+        "claim.rs",
+        "consolidate_act_conn",
+        "WRITE. The consolidation's act (lock the sources, insert the merged claim, retire the \
+         sources, insert the `supersedes` edges) on the caller's stamped transaction; authorised \
+         by claims_tenancy's / edges_tenancy's WITH CHECK. Its reads are the sources' FOR UPDATE \
+         lock, the membership check and the idempotency probe, all of rows it is about to write.",
+    ),
+    (
+        "claim.rs",
+        "migrate_consolidated_edges_conn",
+        "WRITE, privileged only (refuses otherwise). Re-points the retired sources' live edges \
+         onto the merged claim on the maintenance connection; its read verifies the committed \
+         act.",
+    ),
+    (
+        "claim.rs",
+        "migrate_consolidated_edges",
+        "WRITE. The consolidation's edge-migration statements, unchecked; called only after the \
+         caller established the privilege and the committed merge.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_act_conn",
+        "WRITE. The dedup's act (mark the duplicate) on the caller's stamped transaction; \
+         authorised by claims_tenancy's WITH CHECK. Its reads are the two claims' existence / \
+         lock probes and the FA07 binding probe, which projects only a boolean.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_act",
+        "WRITE. The act's checks and single claims UPDATE; the caller owns the stamped \
+         transaction, and claims_tenancy's WITH CHECK authorises it.",
+    ),
+    (
+        "claim.rs",
+        "repair_marked_duplicate_conn",
+        "WRITE, privileged only (refuses otherwise). The dedup's repair on the maintenance \
+         connection; its read verifies the committed act.",
+    ),
+    (
+        "claim.rs",
+        "repair_marked_duplicate",
+        "WRITE. The dedup repair's statements, unchecked; called only after the caller \
+         established the privilege and the act.",
+    ),
+    (
+        "claim.rs",
+        "require_privileged_session",
+        "Reads no table and filters nothing: it asks the session one boolean, \
+         `epigraph_session_is_privileged_writer()`, before a privileged-only write.",
+    ),
+    (
+        "match_candidate.rs",
+        "retire_conn",
+        "WRITE, privileged only (refuses otherwise). The whole retirement (the flip to stale and \
+         its cascade) on the maintenance connection; migration 118 reserves the flip to a \
+         privileged session.",
+    ),
+    (
+        "match_candidate.rs",
+        "mark_retired_on",
+        "WRITE. `retire_conn`'s act: lock, check the requested status and flip one \
+         `match_candidates` row, a table with no tenancy columns to filter on; called only on a \
+         privileged session.",
+    ),
+    (
+        "match_candidate.rs",
+        "retract_candidate_edges",
+        "WRITE. The cascade's statements, unchecked; called only on a privileged session, \
+         after its caller verified the privilege.",
+    ),
+    (
+        "match_candidate.rs",
+        "require_privileged",
+        "Reads no table and filters nothing: it asks the session one boolean, \
+         `epigraph_session_is_privileged_writer()`, before a privileged-only write.",
+    ),
     (
         "claim.rs",
         "mark_duplicate_with_repair_conn",
         "WRITE. `mark_duplicate_with_repair`'s body on a caller's connection; `begin()` inside it \
          is a SAVEPOINT there. Its reads are the existence/lock probes of the two claims it is \
          about to mutate, authorised by claims_tenancy on the caller's stamped connection.",
+    ),
+    (
+        "edge.rs",
+        "create_if_absent_conn",
+        "WRITE. The one dedup probe + INSERT behind create_if_not_exists_conn (in-force rows, \
+         migration 120) and create_if_absent_including_retracted_conn (any row). The probe is \
+         the VISIBILITY-EXEMPT write-path read `create_or_get` documents (it must see an \
+         existing edge regardless of who asks, or the get half becomes a duplicate create); the \
+         INSERT is authorised by edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "edge.rs",
+        "create_if_absent_including_retracted_conn",
+        "WRITE. create_if_absent_conn with a retracted row counting as present, for an \
+         idempotent ingestion / decomposition RE-RUN that must never resurrect an edge its owner \
+         or the administrative cascade retracted. Same exempt probe, same WITH CHECK.",
+    ),
+    (
+        "edge.rs",
+        "withdraw_edge_bbas_conn",
+        "WRITE (batch W12b, migration 120): an edge owner's withdrawal of its own edge. Reads only \
+         the edge-factor perspective's existence and the edge's own `valid_to` / owner for the \
+         edge the caller's act just wrote; records the `edge_retract` deferral through 120's \
+         definer and deletes the session's OWN edge-keyed BBAs (session write predicate).",
+    ),
+    (
+        "edge.rs",
+        "remove_withdrawn_edge_bbas_conn",
+        "WRITE on the MAINTENANCE connection only (the `edge_retract` replay and the one-shot \
+         sweep): administrative by design, so it filters nothing; state-derived.",
+    ),
+    (
+        "edge.rs",
+        "withdrawn_edges_with_bbas_conn",
+        "READ on the MAINTENANCE connection only: the one-shot legacy sweep's candidates across \
+         every owner, which a viewer would hide from it.",
     ),
     (
         "edge.rs",
@@ -1428,6 +1616,60 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── Batch W10 (migration 117): the administrative cascade's audit row.
+    (
+        "admin_cascade.rs",
+        "open_edge_retract_sources",
+        "READ of `security_events`: the claim ids the open `edge_retract` deferrals of one edge \
+         recorded (the `open` set of the one `PENDING_CTE`), for the replay's re-derivation \
+         (migration 120). Maintenance connection only; it returns ids from audit rows the \
+         deferral definer wrote from the session's own BBA rows, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "pending_replays",
+        "READ of `security_events` for the operator's replay of deferred administrative cascades \
+         (migration 117). Runs on the maintenance connection only (an application session cannot \
+         read other principals' audit rows); it returns audit rows, not tenant content, so there \
+         is no viewer predicate to splice.",
+    ),
+    (
+        "admin_cascade.rs",
+        "pending_summary",
+        "READ of `security_events`: counts and the oldest age over the same pending set as \
+         `pending_replays` / `stuck_replays` (one `PENDING_CTE`), for the replay's read-only \
+         `--report-only` staleness check (operator decision D9). Maintenance connection only; it \
+         returns two counts and an age, no row and no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "record",
+        "INSERT INTO `security_events` (append-only; 077's security_events_append admits a row \
+         attributed to the session principal, or any row on the maintenance connection; 117 \
+         refuses a `cascade.*` row from any other session). Reads nothing back: the id is \
+         minted client-side.",
+    ),
+    (
+        "admin_cascade.rs",
+        "record_deferral",
+        "Calls 117's `epigraph_record_cascade_deferral` definer on the CALLER's session: an \
+         audit-row write whose control is the definer's own (attribution to the session \
+         principal, the act must be the session's). Returns the new row's id, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "retire_pending",
+        "INSERT INTO `security_events` of a `cascade.retired` row copied from a pending cascade \
+         row, on the maintenance connection only (117 refuses a `cascade.*` row from any other \
+         session). Returns the new id, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "stuck_replays",
+        "READ of `security_events` for the operator's replay, the complement of \
+         `pending_replays` (the cascades held out after repeated failures). Maintenance \
+         connection only; audit rows, not tenant content.",
+    ),
     // ── Batch H-a: writes whose executor widened so a route or the theme
     // clusterer can put them in ONE transaction. Same argument as
     // `trace.rs::create` below: the control on a write is the table's
@@ -1693,6 +1935,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          still passes `&PgPool`, which satisfies `E: PgExecutor<'e>`, and was not edited.",
     ),
     (
+        "entity_type.rs",
+        "resolve_row",
+        "The `to_regclass` probe that folds `table_present` into a registry row (private). \
+         Reads the catalog, not a tenant table. Executor-generic since batch W12b so \
+         `get_by_name_conn` can run it on the caller's connection; the `&PgPool` callers \
+         (`get_by_name`, `list_all`) are unchanged.",
+    ),
+    (
         "entity.rs",
         "find_by_name_and_type",
         "Resolves a caller-supplied `(canonical_name, type_top)` pair to an entity id, \
@@ -1805,6 +2055,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "owned_by_session",
+        "READ of one `edges` row by primary key, returning only whether its owner or co-owner \
+         is in the SESSION's writable set (migration 120's `owned_by_caller`). A writable group \
+         is always a readable one, so it answers true only for an edge this session can \
+         already see, and false says nothing about an edge it cannot.",
+    ),
+    (
+        "edge.rs",
         "is_in_force",
         "READ of one `edges` row by primary key, returning only whether it is in force. Its \
          callers are the DS edge-factor wiring deciding whether to fire on an edge the SAME \
@@ -1864,9 +2122,21 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "mass_function.rs",
+        "delete_edge_bbas",
+        "WRITE: DELETE of the `mass_functions` rows keyed on the given edges, the cascade half of \
+         a dedup, a retraction or a match-candidate retirement. Nothing to filter by viewer: a \
+         privileged session runs the plain DELETE, and any other session goes through migration \
+         115's `epigraph_cascade_delete_edge_bbas`, which reads the SESSION's own groups and \
+         writable set, admits only the rows it may delete, refuses the whole call (CD02) \
+         otherwise, and audits each call that deleted anything.",
+    ),
+    (
+        "mass_function.rs",
         "delete_for_perspective",
         "WRITE: DELETE from `mass_functions` for one perspective, the retraction half of a \
-         re-combination. Authorised by the table's policy on the caller's stamped connection.",
+         re-combination. Delegates to `delete_edge_bbas` (cause `retraction_cascade`), so it is \
+         authorised by migration 115's cascade definer on the caller's connection, not by a \
+         viewer.",
     ),
     (
         "mass_function.rs",

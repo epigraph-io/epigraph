@@ -2088,6 +2088,9 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
             message: "workflow has no level-1 phase claim".into(),
         },
         E::Invalid(msg) => ApiError::BadRequest { message: msg },
+        e @ (E::ChainRewireRefused { .. } | E::StepNotWritable { .. }) => ApiError::Forbidden {
+            reason: e.to_string(),
+        },
         E::Repo(db) if db.is_personal_group_refusal() => ApiError::from(db),
         E::Executor(epigraph_ingest_executor::IngestExecutorError::Repository(db))
             if db.is_personal_group_refusal() =>

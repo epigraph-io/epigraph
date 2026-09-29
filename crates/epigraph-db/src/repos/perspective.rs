@@ -162,24 +162,39 @@ impl PerspectiveRepository {
         map: &std::collections::HashMap<String, f64>,
     ) -> Result<u64, DbError> {
         let value = serde_json::to_value(map).unwrap_or(serde_json::Value::Null);
-        let done = sqlx::query(
+        // Migration 117: UPDATE of a registry row is owner-scoped, so a world
+        // perspective (nobody's) matches no row for a non-privileged session,
+        // without an error. `seen` reads it under the statement's snapshot, so
+        // a missing perspective (`NotFound`) and a refused one
+        // (`WriteRefused`) are told apart instead of either reading as done.
+        let counts: (i64, i64) = sqlx::query_as(
             r#"
-            UPDATE perspectives
-            SET properties = jsonb_set(
-                COALESCE(properties, '{}'::jsonb),
-                ARRAY[$2]::text[],
-                $3::jsonb,
-                true
-            )
-            WHERE id = $1
+            WITH seen AS (SELECT 1 FROM perspectives WHERE id = $1),
+                 done AS (
+                    UPDATE perspectives
+                    SET properties = jsonb_set(
+                        COALESCE(properties, '{}'::jsonb),
+                        ARRAY[$2]::text[],
+                        $3::jsonb,
+                        true
+                    )
+                    WHERE id = $1
+                    RETURNING 1)
+            SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )
         .bind(id)
         .bind(field)
         .bind(value)
-        .execute(executor)
+        .fetch_one(executor)
         .await?;
-        Ok(done.rows_affected())
+        if counts == (0, 0) {
+            return Err(DbError::NotFound {
+                entity: "Perspective".to_string(),
+                id,
+            });
+        }
+        super::require_all_changed("perspective", id, "update", counts)
     }
 
     /// Set this perspective's source-reliability map (evidence-type tag → α ∈
@@ -211,7 +226,9 @@ impl PerspectiveRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the UPDATE fails (a `42501` from
-    /// `WITH CHECK` included).
+    /// `WITH CHECK` included); `DbError::NotFound` for a perspective the
+    /// caller cannot see and `DbError::WriteRefused` for one it can see but
+    /// not update (migration 117's owner-scoped UPDATE).
     pub async fn set_source_reliability_conn(
         conn: &mut sqlx::PgConnection,
         id: Uuid,

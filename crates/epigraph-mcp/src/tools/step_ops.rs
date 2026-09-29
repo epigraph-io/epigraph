@@ -58,6 +58,14 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
     match e {
         E::Invalid(msg) | E::WorkflowNotFound(msg) => invalid_params(msg),
         E::StepNotFound { .. } | E::PhaseMissing => invalid_params(e.to_string()),
+        // A denial of authority over a row (the chain edge, the step claim),
+        // not a server fault and not a parameter the caller can fix: the same
+        // INVALID_REQUEST `db_caller_error` gives migration 105's refusals.
+        E::ChainRewireRefused { .. } | E::StepNotWritable { .. } => McpError {
+            code: rmcp::model::ErrorCode::INVALID_REQUEST,
+            message: std::borrow::Cow::from(e.to_string()),
+            data: None,
+        },
         // Migration 105's personal-group refusal (the step claim's owner
         // declaration): a denial, as on every other write tool.
         E::Repo(db) if db.is_personal_group_refusal() => crate::errors::db_caller_error(db),

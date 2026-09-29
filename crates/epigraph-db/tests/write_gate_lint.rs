@@ -153,13 +153,17 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     ("challenge.rs::update_state", "caller-supplied id"),
     ("claim.rs::batch_update_truth_values", "caller-supplied ids"),
     ("claim.rs::evolve_step", "caller-supplied id"),
-    (
-        "claim.rs::mark_duplicate_with_repair_conn",
-        "caller-supplied ids (the body moved here from `mark_duplicate_with_repair`, which now delegates; not a new write)",
-    ),
+
     ("claim.rs::merge_properties", "caller-supplied id"),
     ("claim.rs::patch_claim_atomic_conn", "caller-supplied id"),
-    ("claim.rs::supersede_conn", "caller-supplied id"),
+    (
+        "claim.rs::supersede_act_conn",
+        "caller-supplied id (the act half of `supersede_conn`, split by batch W10; not a new write)",
+    ),
+    (
+        "claim.rs::migrate_superseded_edges",
+        "caller-supplied ids, privileged session only (the edge half of `supersede_conn`, split by batch W10; not a new write)",
+    ),
     ("claim.rs::update_trace_id_conn", "caller-supplied id"),
     ("claim.rs::update_truth_value_conn", "caller-supplied id"),
     ("edge.rs::retract", "caller-supplied id"),
@@ -180,8 +184,19 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
         "derived from claim id",
     ),
     (
-        "mass_function.rs::delete_for_perspective",
-        "derived from perspective id",
+        "mass_function.rs::delete_edge_bbas",
+        "derived from edge ids (the body moved here from `delete_for_perspective`, which now \
+         delegates; not a new write. The plain DELETE runs only for a privileged session; any \
+         other goes through migration 115's `epigraph_cascade_delete_edge_bbas`)",
+    ),
+    (
+        "edge.rs::withdraw_edge_bbas_conn",
+        "derived from edge id (batch W12b, migration 120: an edge owner's retract deletes its OWN \
+         edge-keyed BBAs). The DELETE carries the SESSION's write predicate inline \
+         (`owner_group_id = ANY (epigraph_writable_groups())`), which is the stamp's authority; a \
+         spliced `{WRITABLE}` marker would bind the CALLER's viewer, which on the MCP transport is \
+         not the stamped principal. Row security's owner-scoped DELETE backs it on the \
+         application role",
     ),
     (
         "mass_function.rs::update_claim_belief",
@@ -221,9 +236,16 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
         "evidence.rs::store_embedding",
         "embedding backfill, corpus-wide",
     ),
-    // The statements moved from `retire` into `retire_conn` (migration 118), so
-    // the HTTP route runs them on the maintenance connection.
-    ("match_candidate.rs::retire_conn", "dedup sweep, corpus-wide"),
+    (
+        "edge.rs::remove_withdrawn_edge_bbas_conn",
+        "the `edge_retract` administrative cascade (batch W12b, migration 120), on the \
+         maintenance connection only: the replay and the one-shot legacy sweep; state-derived \
+         (acts only on an absent or out-of-force edge)",
+    ),
+    (
+        "match_candidate.rs::retract_candidate_edges",
+        "dedup sweep, corpus-wide; privileged session only (the cascade half of `retire`, split by batch W10; not a new write)",
+    ),
     // ── privatization: selection must be unfiltered to be correct ───────────
     // Filtering these would silently skip the rows they exist to find, which is
     // the argument `SystemReason::PrivatizationSelection` already records. They

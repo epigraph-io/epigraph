@@ -221,6 +221,20 @@ impl FrameRepository {
     /// migration 074's BEFORE-row trigger and re-stamped by 070 arm (c), so the
     /// group the session must be able to write is the claim's, not the caller's.
     ///
+    /// # A non-owner on a public claim (migration 114)
+    ///
+    /// The assignment is a PER-CLAIM aggregate (primary key `(claim_id,
+    /// frame_id)`), so it stays owned by the claim's group even when a non-owner
+    /// creates it — a row owned by whoever attached first would take the frame
+    /// assignment of the claim out of its owner's hands. When the session is not
+    /// privileged, can read the claim, the claim is public and its owner is not
+    /// writable ([`crate::repos::foreign_attach`]), the SAME statement calls
+    /// `epigraph_foreign_claim_frame` instead of inserting: it creates the
+    /// claim-owned row if none exists, never changes an existing one (a
+    /// differing `hypothesis_index` is kept as the owner set it), and writes a
+    /// `claims.foreign_aggregate_write` audit event. In every other case the
+    /// INSERT below runs exactly as before.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor))]
@@ -230,19 +244,29 @@ impl FrameRepository {
         frame_id: Uuid,
         hypothesis_index: Option<i32>,
     ) -> Result<(), DbError> {
-        sqlx::query(
+        let sql = format!(
             r#"
-            INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (claim_id, frame_id) DO UPDATE
-            SET hypothesis_index = EXCLUDED.hypothesis_index
+            WITH acc AS (SELECT {foreign} AS foreign_public),
+            own AS (
+                INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
+                SELECT $1, $2, $3 FROM acc WHERE NOT acc.foreign_public
+                ON CONFLICT (claim_id, frame_id) DO UPDATE
+                SET hypothesis_index = EXCLUDED.hypothesis_index
+                RETURNING 1
+            )
+            SELECT CASE WHEN acc.foreign_public
+                        THEN public.epigraph_foreign_claim_frame($1, $2, $3)
+                   END
+              FROM acc
             "#,
-        )
-        .bind(claim_id)
-        .bind(frame_id)
-        .bind(hypothesis_index)
-        .execute(executor)
-        .await?;
+            foreign = crate::repos::foreign_attach::foreign_public_claim("$1"),
+        );
+        sqlx::query(&sql)
+            .bind(claim_id)
+            .bind(frame_id)
+            .bind(hypothesis_index)
+            .execute(executor)
+            .await?;
 
         Ok(())
     }
@@ -464,7 +488,9 @@ impl FrameRepository {
     /// Uses `||` (JSONB merge) so existing keys are preserved.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::NotFound` for a frame this session cannot read,
+    /// `DbError::WriteRefused` for one it can read but not update (migration
+    /// 117), `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool, value))]
     pub async fn set_property(
         pool: &PgPool,
@@ -472,18 +498,31 @@ impl FrameRepository {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<(), DbError> {
-        sqlx::query(
+        // Checked: migration 117's owner-scoped UPDATE on `frames` matches no
+        // row it refuses (a world frame is nobody's) and reports success.
+        let counts: (i64, i64) = sqlx::query_as(
             r#"
-            UPDATE frames
-               SET properties = properties || jsonb_build_object($2::text, $3::jsonb)
-             WHERE id = $1
+            WITH seen AS (SELECT 1 FROM frames WHERE id = $1),
+                 done AS (
+                    UPDATE frames
+                       SET properties = properties || jsonb_build_object($2::text, $3::jsonb)
+                     WHERE id = $1
+                    RETURNING 1)
+            SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )
         .bind(frame_id)
         .bind(key)
         .bind(value)
-        .execute(pool)
+        .fetch_one(pool)
         .await?;
+        if counts == (0, 0) {
+            return Err(DbError::NotFound {
+                entity: "frame".to_string(),
+                id: frame_id,
+            });
+        }
+        super::require_all_changed("frame", frame_id, "update", counts)?;
         Ok(())
     }
 

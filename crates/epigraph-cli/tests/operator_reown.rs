@@ -17,7 +17,9 @@
 //!   writer-less rows (`reasoning_traces`, `claim_frames` — a composite key —
 //!   `harvester_claim_provenance`), a harvester fragment shared with a held
 //!   claim, and edges (one signed by the non-linked agent, one whose prior
-//!   owner differs from both endpoints');
+//!   owner differs from both endpoints', and one the non-linked agent WROTE,
+//!   which migration 120 owns by its writer's group); since 120 a re-own
+//!   rewrites none of them;
 //! * a derived row whose prior owner DIFFERS from its claim's, so reversal must
 //!   restore that row's own owner rather than re-propagate the claim's;
 //! * a `recall_events` row, which is principal-scoped and must stay untouched.
@@ -137,6 +139,7 @@ struct Fx {
     edge_plain: Uuid,
     edge_w: Uuid,
     edge_prior: Uuid,
+    edge_writer: Uuid,
     recall: Uuid,
 }
 
@@ -344,6 +347,49 @@ async fn seed(pool: &PgPool) -> Fx {
     let edge_w = signed_edge(pool, c_world, c_actor, stranger).await;
     let edge_prior =
         fixture::seed_edge_owned_by(pool, c_world, c_third, "public", retired_group).await;
+    // Migration 120: an edge the STRANGER wrote between two public claims is
+    // the stranger's (written on a session stamped as the stranger).
+    let edge_writer = {
+        let v = epigraph_db::visibility::Viewer::resolve(pool, stranger)
+            .await
+            .expect("resolve the stranger");
+        let csv = |ids: &[Uuid]| {
+            ids.iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut conn = pool.acquire().await.expect("acquire");
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', $1, false), \
+                    set_config('epigraph.writable_group_ids', $2, false), \
+                    set_config('epigraph.principal_id', $3, false)",
+        )
+        .bind(csv(v.group_bind().expect("scoped")))
+        .bind(csv(v.writable_groups()))
+        .bind(stranger.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the stranger");
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'claim', $2, 'claim', 'refutes') RETURNING id",
+        )
+        .bind(c_actor)
+        .bind(c_world)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the stranger's edge");
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', '', false), \
+                    set_config('epigraph.writable_group_ids', '', false), \
+                    set_config('epigraph.principal_id', '', false)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("unstamp");
+        id
+    };
 
     let recall: Uuid = sqlx::query_scalar(
         "INSERT INTO recall_events (agent_id, tool, query_text, returned_claim_ids, \
@@ -403,6 +449,7 @@ async fn seed(pool: &PgPool) -> Fx {
         edge_plain,
         edge_w,
         edge_prior,
+        edge_writer,
         recall,
     }
 }
@@ -692,6 +739,7 @@ async fn a_dry_run_writes_nothing_and_reports_the_plan(pool: PgPool) {
 async fn apply_follow_claim_gives_exact_owners(pool: PgPool) {
     let fx = seed(&pool).await;
     let dir = scratch_dir();
+    let edges_before = snapshot(&pool, true).await["edges"].clone();
     let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", true).await;
     assert_eq!(r.code, 0, "{}", r.show());
     let t = fx.target;
@@ -732,10 +780,27 @@ async fn apply_follow_claim_gives_exact_owners(pool: PgPool) {
         .await,
         public(WORLD)
     );
-    // Edges take the trigger's meet: two public endpoints => world.
-    for e in [fx.edge_plain, fx.edge_w, fx.edge_prior] {
+    // Migration 120 (deliberately rewritten: this used to assert every edge
+    // re-met to world): a public-to-public re-own never rewrites a public
+    // edge. The world edges stay world, the edge whose prior owner was
+    // neither endpoint's keeps it, and the stranger's writer-owned edge stays
+    // the stranger's.
+    for e in [fx.edge_plain, fx.edge_w] {
         assert_eq!(tenancy(&pool, "edges", e).await, public(WORLD));
     }
+    assert_eq!(
+        tenancy(&pool, "edges", fx.edge_prior).await,
+        public(fx.retired_group)
+    );
+    assert_eq!(
+        tenancy(&pool, "edges", fx.edge_writer).await,
+        public(fx.stranger_group)
+    );
+    assert_eq!(
+        snapshot(&pool, true).await["edges"],
+        edges_before,
+        "every edge row is byte-identical after the re-own"
+    );
     assert_held_untouched(&pool, &fx).await;
     assert!(r.stdout.contains("claims moved: 3"), "{}", r.show());
 }
@@ -781,8 +846,12 @@ async fn apply_keep_writer_keeps_non_linked_rows(pool: PgPool) {
         tenancy(&pool, "reasoning_traces", fx.trace).await,
         public(t)
     );
-    // The stranger-signed edge's prior owner was world, which the meet also gives.
+    // Migration 120: edges are not rewritten by a re-own in either mode.
     assert_eq!(tenancy(&pool, "edges", fx.edge_w).await, public(WORLD));
+    assert_eq!(
+        tenancy(&pool, "edges", fx.edge_writer).await,
+        public(fx.stranger_group)
+    );
     assert_held_untouched(&pool, &fx).await;
     assert!(
         r.stdout
@@ -1395,8 +1464,10 @@ async fn a_row_changed_by_another_writer_since_the_plan_holds_its_claim(pool: Pg
 
 /// The other direction: a shared row THIS run changed in an earlier batch is
 /// expected, not "changed since the plan". Batch 1 (`c_world`) moves the shared
-/// fragment and recomputes the shared edge's meet; batch 2 (`c_personal`) must
-/// still move, and a reversal must restore every row byte-for-byte.
+/// fragment; batch 2 (`c_personal`) must still move, and a reversal must
+/// restore every row byte-for-byte. Since migration 120 the shared EDGE is not
+/// rewritten by either batch (deliberately rewritten: this used to assert its
+/// meet changed), so the shared fragment is the row this arm exercises.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_row_this_run_moved_in_an_earlier_batch_is_not_a_false_hold(pool: PgPool) {
     let (fx, e) = shared_rows_fixture(&pool).await;
@@ -1419,10 +1490,10 @@ async fn a_row_this_run_moved_in_an_earlier_batch_is_not_a_false_hold(pool: PgPo
         r.show()
     );
     assert!(r.stdout.contains("claims moved: 2"), "{}", r.show());
-    assert_ne!(
+    assert_eq!(
         tenancy(&pool, "edges", e).await,
         prior_edge,
-        "PREMISE: the shared edge's tenancy changed during the run"
+        "migration 120: a public-to-public re-own leaves the shared edge unchanged"
     );
     let r = reverse(&pool, &mf, true).await;
     assert_eq!(r.code, 0, "{}", r.show());

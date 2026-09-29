@@ -14,7 +14,7 @@
 //! now the module-wide default and an exception would be the thing worth
 //! annotating.
 //!
-//! # Tenancy: 7 of this file's 17 raw-pool sites are converted
+//! # Tenancy: the read handlers (shard 6) and the write handlers (W12b) are converted
 //!
 //! Conversion shard 6. `list_edges`, `claim_neighborhood`, `graph_edges`,
 //! `graph_full`, `get_evidence`, `claim_provenance` and `evidence_by_relationship`
@@ -45,18 +45,38 @@
 //! takes `&mut PgConnection`. Both take a connection whose stamping they cannot
 //! verify, and both say so.
 //!
-//! NOT converted (10 sites), blocker named per handler:
-//! * `create_edge`, `create_hierarchical_edge`, `patch_edge`, `relate_claims`,
-//!   `delete_edge` — WRITE. [`AppState::read_as`] is read-only and a write
-//!   routed through a `ScopedRead` is rolled back on drop under
-//!   `SessionGucMode::Transaction` while still type-checking; the owner is
-//!   `ScopedPool::begin_as` plus `Viewer::splice_write`.
-//! * `is_valid_entity_type`, `entity_exists` — reached only from `create_edge`,
-//!   as above.
+//! # The write handlers are stamped too (batch W12b, migration 120)
 //!
-//! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES` and
-//! `AUTH_OPTIONAL_PROVENANCE_SITES` rows for this file all sit in those write
-//! handlers and are unchanged.
+//! `create_edge`, `create_hierarchical_edge`, `patch_edge`, `delete_edge` and
+//! `relate_claims`, and the two helpers `create_edge` reaches
+//! (`is_valid_entity_type`, `entity_exists`), each run their reads and their
+//! write on ONE transaction stamped with the caller's viewer
+//! ([`AppState::write_as`], i.e. `ScopedPool::begin_as`). Operator decision D8
+//! owns an edge between two public claims by its WRITER's group, and on the
+//! unstamped pool there was no writer: every HTTP-created public edge was
+//! world-owned (administrative from birth), and on the application role the
+//! owner's own patch and retract matched zero rows. Stamped, the caller owns
+//! its edge, a mixed or private edge is decided by the caller's writable set
+//! (42501 -> 403), and a patch or retract of a VISIBLE edge the caller does not
+//! own answers `403 not_owner` naming the rule ([`ApiError::EdgeNotOwned`]).
+//! An invisible edge still answers 404.
+//!
+//! NOT converted (5 sites, `no_unscoped_pool.rs`): the post-commit side
+//! effects of those handlers, which run on the raw pool after the commit as
+//! they did before: `create_edge`'s DS recomputation, provenance row and factor
+//! INSERT, and the provenance rows of `delete_edge`, `patch_edge` and
+//! `relate_claims`. Stamping them is follow-up work.
+//!
+//! The five converted handlers take `ViewerExtractor`, which refuses a request
+//! with no `AuthContext`; their `edges:write` scope check and their provenance
+//! blocks are therefore unconditional (`let Some(..) = auth_ctx else { return
+//! Err(Unauthorized) }`), and this file has no row left in
+//! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES` or
+//! `AUTH_OPTIONAL_PROVENANCE_SITES`. The routes sit behind
+//! `bearer_auth_middleware` either way, so this is not an auth-posture change.
+//!
+//! [`ApiError::EdgeNotOwned`]: crate::errors::ApiError::EdgeNotOwned
+//! [`AppState::write_as`]: crate::AppState::write_as
 //!
 //! `claim_provenance` carries an open finding, `F-SEC14-A`. Converting its
 //! executor does NOT discharge it — that entry's remedy is a different change to
@@ -175,8 +195,19 @@ const VALID_RELATIONSHIPS: &[&str] = &[
 /// (which runs first) would 400 an A-registered type on B before
 /// `entity_exists` is ever reached, making its read-through dead code for that
 /// path. Hence this is `async`.
+///
+/// `conn` is the caller's connection: `create_edge`'s viewer-stamped write
+/// transaction (migration 120 converted the handler onto
+/// `ScopedPool::begin_as`). The registry read runs under a SAVEPOINT, because
+/// its failure is swallowed (`false`) and an unsavepointed failure would abort
+/// the enclosing transaction.
 #[cfg(feature = "db")]
-pub async fn is_valid_entity_type(state: &AppState, s: &str) -> bool {
+pub async fn is_valid_entity_type(
+    state: &AppState,
+    conn: &mut sqlx::PgConnection,
+    s: &str,
+) -> bool {
+    use sqlx::Acquire as _;
     // Fast path: sync cache hit.
     if state
         .entity_type_cache
@@ -189,7 +220,21 @@ pub async fn is_valid_entity_type(state: &AppState, s: &str) -> bool {
 
     // Miss: read-through from the registry and populate the cache on hit, so the
     // subsequent `entity_exists` gets a cache hit rather than a second lookup.
-    match epigraph_db::EntityTypeRepository::get_by_name(&state.db_pool, s).await {
+    let Ok(mut sp) = conn.begin().await else {
+        tracing::error!(entity_type = %s, "could not open a savepoint for the registry read");
+        return false;
+    };
+    let read = epigraph_db::EntityTypeRepository::get_by_name_conn(&mut sp, s).await;
+    let released = if read.is_ok() {
+        sp.commit().await
+    } else {
+        sp.rollback().await
+    };
+    if let Err(e) = released {
+        tracing::error!(entity_type = %s, error = %e, "registry read savepoint did not close");
+        return false;
+    }
+    match read {
         Ok(Some((name, fetched))) => {
             if let Ok(mut cache) = state.entity_type_cache.write() {
                 cache.entry(name).or_insert(fetched);
@@ -537,6 +582,22 @@ pub struct EdgeResponse {
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Response body for `POST /api/v1/edges`: the stored edge plus whether the
+/// CALLER owns it.
+///
+/// `owned_by_caller` is `true` when the edge's owner or co-owner is in the
+/// caller's writable set, so the caller may patch, retract or delete it. Under
+/// migration 120 (operator decision D8) an edge the caller writes between two
+/// public claims is its own; an `if_not_exists` dedup hit on ANOTHER writer's
+/// edge returns their edge with `owned_by_caller = false`, and a structural
+/// edge (an agent, paper ... endpoint) is administrative.
+#[derive(Debug, Serialize)]
+pub struct CreateEdgeResponse {
+    #[serde(flatten)]
+    pub edge: EdgeResponse,
+    pub owned_by_caller: bool,
+}
+
 /// Request body for `PATCH /api/v1/edges/:id`.
 ///
 /// Both fields are optional but at least one must be provided. `valid_to`
@@ -595,14 +656,27 @@ pub async fn create_edge(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateEdgeRequest>,
-) -> Result<(StatusCode, Json<EdgeResponse>), ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+) -> Result<(StatusCode, Json<CreateEdgeResponse>), ApiError> {
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+
+    // ONE transaction stamped with the CALLER's viewer (migration 120, D8):
+    // the validation reads, the existence probes and the INSERT. Unstamped, an
+    // edge between two public claims landed world-owned (administrative from
+    // birth) and, on the application role, every mixed or private edge was
+    // refused. Stamped, the edge is the caller's writer group's, and the
+    // database decides a mixed or private edge by the caller's writable set
+    // (42501 -> 403, nothing written).
+    let mut tx = state.write_as(&viewer, "create_edge").await?;
 
     // Validate entity types against the registry cache (single source of truth).
-    if !is_valid_entity_type(&state, &request.source_type).await {
+    if !is_valid_entity_type(&state, &mut tx, &request.source_type).await {
         return Err(ApiError::ValidationError {
             field: "source_type".to_string(),
             reason: format!(
@@ -612,7 +686,7 @@ pub async fn create_edge(
             ),
         });
     }
-    if !is_valid_entity_type(&state, &request.target_type).await {
+    if !is_valid_entity_type(&state, &mut tx, &request.target_type).await {
         return Err(ApiError::ValidationError {
             field: "target_type".to_string(),
             reason: format!(
@@ -644,17 +718,15 @@ pub async fn create_edge(
         });
     }
 
-    let pool = &state.db_pool;
-
-    // Verify source entity exists
-    if !entity_exists(&state, request.source_id, &request.source_type).await? {
+    // Verify source entity exists (as the caller sees it).
+    if !entity_exists(&state, &mut tx, request.source_id, &request.source_type).await? {
         return Err(ApiError::NotFound {
             entity: request.source_type.clone(),
             id: request.source_id.to_string(),
         });
     }
     // Verify target entity exists
-    if !entity_exists(&state, request.target_id, &request.target_type).await? {
+    if !entity_exists(&state, &mut tx, request.target_id, &request.target_type).await? {
         return Err(ApiError::NotFound {
             entity: request.target_type.clone(),
             id: request.target_id.to_string(),
@@ -671,9 +743,22 @@ pub async fn create_edge(
     // STORED row with a 200 OK so retried drainer batches don't double-fire
     // events or write redundant provenance entries. Mirrors the claims
     // pattern in `routes/claims.rs::create_claim`.
+    let refused = |e: epigraph_db::DbError| {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "create_edge",
+                error = %e,
+                "the database refused the edge"
+            );
+            crate::errors::write_refused("edge")
+        } else {
+            ApiError::from(e)
+        }
+    };
     let (edge_row, was_created) = if request.if_not_exists {
-        EdgeRepository::create_if_not_exists(
-            pool,
+        EdgeRepository::create_if_not_exists_conn(
+            &mut tx,
             request.source_id,
             &request.source_type,
             request.target_id,
@@ -683,10 +768,11 @@ pub async fn create_edge(
             request.valid_from,
             request.valid_to,
         )
-        .await?
+        .await
+        .map_err(refused)?
     } else {
         let id = EdgeRepository::create(
-            pool,
+            &mut *tx,
             request.source_id,
             &request.source_type,
             request.target_id,
@@ -696,7 +782,8 @@ pub async fn create_edge(
             request.valid_from,
             request.valid_to,
         )
-        .await?;
+        .await
+        .map_err(refused)?;
         // Synthesize an EdgeRow from the request so the response shape
         // matches the if_not_exists path. The default path always inserts,
         // so the request fields ARE the stored fields (no read-back needed).
@@ -715,6 +802,22 @@ pub async fn create_edge(
     };
 
     let edge_id = edge_row.id;
+
+    // Migration 120 (D8): a dedup hit on another writer's edge returns THEIR
+    // edge, which this caller can neither patch, retract nor delete. Say so.
+    let owned_by_caller = EdgeRepository::owned_by_session(&mut *tx, edge_id).await?;
+
+    // COMMIT before the side effects below: each acquires its own connection
+    // and could not see an uncommitted edge.
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the edge: {e}"),
+    })?;
+
+    // UNSCOPED, deliberately and counted (`no_unscoped_pool.rs`): the DS
+    // recomputation, the provenance row and the factor INSERT below run after
+    // the commit on the raw pool, as they did before the write moved onto the
+    // stamped transaction. Stamping them is follow-up work.
+    let pool = &state.db_pool;
 
     // Build the response from the STORED row. On a dedup hit (was_created=false)
     // the request.properties / valid_from / valid_to may differ from what's in
@@ -776,8 +879,8 @@ pub async fn create_edge(
     // whole purpose of if_not_exists for drainer retries. DS recomputation
     // (above) is the one exception — see its comment for why.
     if was_created {
-        // Record provenance when OAuth2-authenticated
-        if let Some(axum::Extension(ref auth)) = auth_ctx {
+        // Record provenance (always authenticated here: see the scope check).
+        {
             let hash_input = format!(
                 "{}:{}:{}",
                 request.source_id, request.relationship, request.target_id
@@ -877,7 +980,13 @@ pub async fn create_edge(
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(response)))
+    Ok((
+        status,
+        Json(CreateEdgeResponse {
+            edge: response,
+            owned_by_caller,
+        }),
+    ))
 }
 
 // =============================================================================
@@ -888,19 +997,41 @@ pub async fn create_edge(
 ///
 /// DELETE /api/v1/edges/:id
 ///
-/// Hard-deletes the edge. Returns 204 No Content on success, 404 if not found.
+/// RETRACTS the edge (`valid_to = now()`; the row survives). Returns 204 No
+/// Content on success, 404 when the caller cannot see the edge (or it is
+/// already retracted), and 403 `not_owner` when the caller can see it but it is
+/// another writer's or an administrative edge (migration 120, D8).
 #[cfg(feature = "db")]
 pub async fn delete_edge(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
-    let deleted = EdgeRepository::retract_by_id(&state.db_pool, id).await?;
+    // Stamped with the CALLER's viewer (migration 120): the edge's owner or
+    // co-owner retracts it; anybody else who can read it is refused by name.
+    let mut tx = state.write_as(&viewer, "delete_edge").await?;
+    let deleted = match EdgeRepository::retract_by_id(&mut *tx, id).await {
+        Ok(deleted) => deleted,
+        Err(e @ epigraph_db::DbError::WriteRefused { .. }) => {
+            return Err(
+                match EdgeRepository::refusal_for(&mut *tx, &viewer, id).await? {
+                    Some(refusal) => ApiError::edge_not_owned(refusal, id, "delete"),
+                    None => ApiError::from(e),
+                },
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     if !deleted {
         return Err(ApiError::NotFound {
@@ -908,9 +1039,23 @@ pub async fn delete_edge(
             id: id.to_string(),
         });
     }
+    // The retraction withdraws the edge: the caller's own edge-keyed BBAs go
+    // now and every other writer's are deferred to the maintenance replay
+    // (cause `edge_retract`), in this transaction (migration 120, D1).
+    EdgeRepository::withdraw_edge_bbas_conn(
+        &mut tx,
+        id,
+        epigraph_db::EdgeWithdrawal::Retracted,
+        None,
+        epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+    )
+    .await?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the retraction: {e}"),
+    })?;
 
-    // Record provenance when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    // Record provenance (always authenticated here: see the scope check).
+    {
         let content_hash = blake3::hash(id.as_bytes());
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
@@ -999,6 +1144,9 @@ pub struct LinkHierarchicalRequest {
 pub struct LinkHierarchicalResponse {
     pub edge_id: Uuid,
     pub created: bool,
+    /// Whether the caller owns the returned edge (see
+    /// [`CreateEdgeResponse::owned_by_caller`]).
+    pub owned_by_caller: bool,
 }
 
 /// Create a cross-tier hierarchical structural edge between two claims.
@@ -1024,10 +1172,14 @@ pub async fn create_hierarchical_edge(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<LinkHierarchicalRequest>,
 ) -> Result<(StatusCode, Json<LinkHierarchicalResponse>), ApiError> {
-    // Enforce scope when OAuth2-authenticated (mirrors generic POST /api/v1/edges).
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     // Tight relationship allow-list — narrower than VALID_RELATIONSHIPS by design.
     if !is_hierarchical_relationship(&request.relationship) {
@@ -1049,13 +1201,17 @@ pub async fn create_hierarchical_edge(
         });
     }
 
-    let pool = &state.db_pool;
+    // ONE transaction stamped with the CALLER's viewer (migration 120, D8): the
+    // two reads and the write. The edge between two public claims is the
+    // caller's writer group's; a mixed or private one is decided by the
+    // caller's writable set (42501 -> 403).
+    let mut tx = state.write_as(&viewer, "create_hierarchical_edge").await?;
 
     // Verify both claims exist via the repo layer (no inline SQL — CLAUDE.md
     // requires SQL stays in epigraph-db). Disambiguate which side is missing
     // so callers can fix the right end of the link.
     if epigraph_db::ClaimRepository::get_by_id(
-        pool,
+        &mut *tx,
         &viewer,
         epigraph_core::ClaimId::from_uuid(request.source_claim_id),
     )
@@ -1068,7 +1224,7 @@ pub async fn create_hierarchical_edge(
         });
     }
     if epigraph_db::ClaimRepository::get_by_id(
-        pool,
+        &mut *tx,
         &viewer,
         epigraph_core::ClaimId::from_uuid(request.target_claim_id),
     )
@@ -1083,8 +1239,8 @@ pub async fn create_hierarchical_edge(
 
     // Idempotent on (source, target, relationship) so per-chapter wire-ups
     // can re-run safely. source_type / target_type are always "claim" here.
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
-        pool,
+    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_conn(
+        &mut tx,
         request.source_claim_id,
         "claim",
         request.target_claim_id,
@@ -1094,13 +1250,25 @@ pub async fn create_hierarchical_edge(
         None,
         None,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            crate::errors::write_refused("edge")
+        } else {
+            ApiError::from(e)
+        }
+    })?;
+    let owned_by_caller = EdgeRepository::owned_by_session(&mut *tx, edge_row.id).await?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the edge: {e}"),
+    })?;
 
     Ok((
         StatusCode::OK,
         Json(LinkHierarchicalResponse {
             edge_id: edge_row.id,
             created: was_created,
+            owned_by_caller,
         }),
     ))
 }
@@ -1133,15 +1301,20 @@ pub async fn create_hierarchical_edge(
 /// edge required DELETE + POST, which loses audit. PATCH closes that gap.
 #[cfg(feature = "db")]
 pub async fn patch_edge(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Json(request): Json<PatchEdgeRequest>,
 ) -> Result<Json<EdgeResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated (mirrors create_edge / delete_edge).
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     if request.is_empty() {
         return Err(ApiError::ValidationError {
@@ -1172,16 +1345,49 @@ pub async fn patch_edge(
         "properties": request.properties,
     });
 
-    let pool = &state.db_pool;
-    // `?` maps DbError::NotFound → ApiError::NotFound via the From impl in
-    // crates/epigraph-api/src/errors.rs (entity is propagated as "edge").
-    let updated = EdgeRepository::update_valid_to_and_properties(
-        pool,
+    // Stamped with the CALLER's viewer (migration 120): the edge's owner or
+    // co-owner patches it; anybody else who can read it is refused by name.
+    // `DbError::NotFound` (an edge the caller cannot see) maps to 404 through
+    // the From impl in crates/epigraph-api/src/errors.rs.
+    let mut tx = state.write_as(&viewer, "patch_edge").await?;
+    let updated = match EdgeRepository::update_valid_to_and_properties(
+        &mut *tx,
         id,
         request.valid_to,
         request.properties,
     )
-    .await?;
+    .await
+    {
+        Ok(updated) => updated,
+        Err(e @ epigraph_db::DbError::WriteRefused { .. }) => {
+            return Err(
+                match EdgeRepository::refusal_for(&mut *tx, &viewer, id).await? {
+                    Some(refusal) => ApiError::edge_not_owned(refusal, id, "patch"),
+                    None => ApiError::from(e),
+                },
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // A patch that took the edge out of force withdraws it (migration 120);
+    // a future-dated `valid_to` withdraws nothing yet and records nothing.
+    if request.valid_to.is_some() {
+        EdgeRepository::withdraw_edge_bbas_conn(
+            &mut tx,
+            id,
+            epigraph_db::EdgeWithdrawal::Retracted,
+            None,
+            epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+        )
+        .await?;
+    }
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the patch: {e}"),
+    })?;
+
+    // UNSCOPED, counted (`no_unscoped_pool.rs`): the provenance row below runs
+    // after the commit on the raw pool, as before.
+    let pool = &state.db_pool;
 
     // Record provenance when OAuth2-authenticated.
     //
@@ -1189,8 +1395,8 @@ pub async fn patch_edge(
     // blake3(id.as_bytes()) and patch_payload was None — same edge always
     // produced the same hash no matter what changed. The provenance log was
     // reduced to "this edge was patched at some point," losing all diff
-    // information.
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    // information. Always authenticated here: see the scope check.
+    {
         let diff_bytes = serde_json::to_vec(&diff).unwrap_or_default();
         let content_hash = blake3::hash(&diff_bytes);
         if let Err(e) = crate::middleware::provenance::record_provenance(
@@ -1289,15 +1495,20 @@ pub struct RelateClaimsRequest {
 /// Creates two edges: source→target and target→source (undirected semantic link).
 #[cfg(feature = "db")]
 pub async fn relate_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(source_id): Path<Uuid>,
     Json(request): Json<RelateClaimsRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    // The scope check is unconditional: `ViewerExtractor` has already refused a
+    // request with no `AuthContext`, so there is always one to check (W12b).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     if source_id == request.target_claim_id {
         return Err(ApiError::ValidationError {
@@ -1306,42 +1517,39 @@ pub async fn relate_claims(
         });
     }
 
-    let pool = &state.db_pool;
+    // ONE transaction stamped with the CALLER's viewer (migration 120, D8):
+    // both existence reads (through the caller's viewer) and both edges, which
+    // commit together or not at all.
+    let mut tx = state.write_as(&viewer, "relate_claims").await?;
 
-    // Verify both claims exist
-    let source_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
-            .bind(source_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: e.to_string(),
-            })?;
-    if !source_exists {
-        return Err(ApiError::NotFound {
-            entity: "claim".to_string(),
-            id: source_id.to_string(),
-        });
+    // Verify both claims exist, as the caller sees them.
+    for (id, which) in [(source_id, "source"), (request.target_claim_id, "target")] {
+        if epigraph_db::ClaimRepository::get_by_id(
+            &mut *tx,
+            &viewer,
+            epigraph_core::ClaimId::from_uuid(id),
+        )
+        .await?
+        .is_none()
+        {
+            tracing::debug!(claim = %id, which, "relate_claims: endpoint not visible");
+            return Err(ApiError::NotFound {
+                entity: "claim".to_string(),
+                id: id.to_string(),
+            });
+        }
     }
 
-    let target_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
-            .bind(request.target_claim_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: e.to_string(),
-            })?;
-    if !target_exists {
-        return Err(ApiError::NotFound {
-            entity: "claim".to_string(),
-            id: request.target_claim_id.to_string(),
-        });
-    }
-
+    let refused = |e: epigraph_db::DbError| {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            crate::errors::write_refused("edge")
+        } else {
+            ApiError::from(e)
+        }
+    };
     // Create bidirectional edges
     let edge1 = EdgeRepository::create(
-        pool,
+        &mut *tx,
         source_id,
         "claim",
         request.target_claim_id,
@@ -1351,10 +1559,11 @@ pub async fn relate_claims(
         None,
         None,
     )
-    .await?;
+    .await
+    .map_err(refused)?;
 
     let edge2 = EdgeRepository::create(
-        pool,
+        &mut *tx,
         request.target_claim_id,
         "claim",
         source_id,
@@ -1364,10 +1573,19 @@ pub async fn relate_claims(
         None,
         None,
     )
-    .await?;
+    .await
+    .map_err(refused)?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the relation: {e}"),
+    })?;
 
-    // Record provenance for both edges
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    // UNSCOPED, counted (`no_unscoped_pool.rs`): the provenance rows below run
+    // after the commit on the raw pool, as before.
+    let pool = &state.db_pool;
+
+    // Record provenance for both edges (always authenticated here: see the
+    // scope check).
+    {
         for eid in [edge1, edge2] {
             let hash_input = format!("{}:RELATES_TO:{}", source_id, request.target_claim_id);
             let content_hash = blake3::hash(hash_input.as_bytes());
@@ -1420,8 +1638,20 @@ pub async fn relate_claims(
 /// registered on replica A resolves on replica B without a restart. A confirmed
 /// miss is negative-cached only implicitly (it returns `Ok(false)` and the
 /// upstream validity gate rejects unknown types anyway).
+///
+/// `conn` is `create_edge`'s viewer-stamped write transaction (migration 120),
+/// so the existence probe is the caller's own READ: an endpoint row the caller
+/// cannot see answers "does not exist". The probe runs under a SAVEPOINT,
+/// because an optional table's query error is swallowed (`Ok(false)`) and an
+/// unsavepointed failure would abort the enclosing transaction.
 #[cfg(feature = "db")]
-async fn entity_exists(state: &AppState, id: Uuid, entity_type: &str) -> Result<bool, ApiError> {
+async fn entity_exists(
+    state: &AppState,
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+    entity_type: &str,
+) -> Result<bool, ApiError> {
+    use sqlx::Acquire as _;
     // 1. Cache lookup (sync read).
     let mut entry = state
         .entity_type_cache
@@ -1429,9 +1659,10 @@ async fn entity_exists(state: &AppState, id: Uuid, entity_type: &str) -> Result<
         .ok()
         .and_then(|cache| cache.get(entity_type).cloned());
 
-    // 1b. Read-through-on-miss: re-fetch from the registry and populate.
+    // 1b. Read-through-on-miss: re-fetch from the registry and populate. A
+    // failure here is returned, so the transaction it aborts is dropped anyway.
     if entry.is_none() {
-        match epigraph_db::EntityTypeRepository::get_by_name(&state.db_pool, entity_type).await {
+        match epigraph_db::EntityTypeRepository::get_by_name_conn(&mut *conn, entity_type).await {
             Ok(Some((name, fetched))) => {
                 if let Ok(mut cache) = state.entity_type_cache.write() {
                     // Double-check: another writer may have inserted meanwhile.
@@ -1505,11 +1736,22 @@ async fn entity_exists(state: &AppState, id: Uuid, entity_type: &str) -> Result<
         "SELECT EXISTS(SELECT 1 FROM \"{}\".\"{}\" WHERE \"{}\" = $1)",
         entry.schema, table, entry.id_column
     );
-    match sqlx::query_scalar::<_, bool>(&sql)
+    let mut sp = conn.begin().await.map_err(|e| ApiError::InternalError {
+        message: format!("entity existence check: could not open a savepoint: {e}"),
+    })?;
+    let probed = sqlx::query_scalar::<_, bool>(&sql)
         .bind(id)
-        .fetch_one(&state.db_pool)
-        .await
-    {
+        .fetch_one(&mut *sp)
+        .await;
+    let released = if probed.is_ok() {
+        sp.commit().await
+    } else {
+        sp.rollback().await
+    };
+    released.map_err(|e| ApiError::InternalError {
+        message: format!("entity existence check: the savepoint did not close: {e}"),
+    })?;
+    match probed {
         Ok(exists) => Ok(exists),
         Err(e) => {
             if entry.is_optional {
@@ -2655,7 +2897,7 @@ pub async fn contradicting_evidence(
 pub async fn create_edge(
     State(_state): State<AppState>,
     Json(_request): Json<CreateEdgeRequest>,
-) -> Result<(StatusCode, Json<EdgeResponse>), ApiError> {
+) -> Result<(StatusCode, Json<CreateEdgeResponse>), ApiError> {
     Err(ApiError::ServiceUnavailable {
         service: "database".to_string(),
     })
@@ -3485,13 +3727,10 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        // A `ScopedPool`-built state: since migration 120 the create route
+        // writes on a caller-stamped transaction (`AppState::write_as`), which
+        // refuses a state with no `ScopedPool`.
+        let state = test_state(pool.clone()).await;
         let router = edges_router_with_auth(state, auth_ctx(client_id));
 
         let make_body = || {
@@ -3629,13 +3868,9 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        // A `ScopedPool`-built state: the patch route writes on a
+        // caller-stamped transaction since migration 120.
+        let state = test_state(pool.clone()).await;
         let router = edges_router_with_auth(state, auth_ctx(client_id));
 
         // First PATCH: bumps weight.
@@ -3872,7 +4107,8 @@ mod db_tests {
     /// the ex-`edges_validation.rs::synthesis_entity_type_is_valid` coverage.
     #[sqlx::test(migrations = "../../migrations")]
     async fn is_valid_entity_type_covers_all_seeded_types(pool: PgPool) {
-        let state = test_state(pool).await;
+        let state = test_state(pool.clone()).await;
+        let mut conn = pool.acquire().await.expect("acquire");
         // The 6 DB-only types + synthesis (ex-external test) + a core sample.
         for t in [
             "source_artifact",
@@ -3893,14 +4129,17 @@ mod db_tests {
             // was refused.
             "method",
         ] {
-            assert!(is_valid_entity_type(&state, t).await, "{t} should be valid");
+            assert!(
+                is_valid_entity_type(&state, &mut conn, t).await,
+                "{t} should be valid"
+            );
         }
         // Exactly the 24 seeded rows (23 from migration 054 + `method` from 094).
         assert_eq!(valid_entity_type_names(&state).len(), 24);
         // Rejections.
         for bad in ["invalid", "", "CLAIM", "public.claims"] {
             assert!(
-                !is_valid_entity_type(&state, bad).await,
+                !is_valid_entity_type(&state, &mut conn, bad).await,
                 "{bad:?} must be invalid"
             );
         }
@@ -3909,11 +4148,12 @@ mod db_tests {
     /// Single-source-of-truth: every cached key is `is_valid_entity_type==true`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn every_cached_key_is_valid(pool: PgPool) {
-        let state = test_state(pool).await;
+        let state = test_state(pool.clone()).await;
+        let mut conn = pool.acquire().await.expect("acquire");
         let keys = valid_entity_type_names(&state);
         assert!(!keys.is_empty());
         for k in keys {
-            assert!(is_valid_entity_type(&state, &k).await);
+            assert!(is_valid_entity_type(&state, &mut conn, &k).await);
         }
     }
 
@@ -4007,13 +4247,14 @@ mod db_tests {
         }
 
         // Supplement: the internal existence helper resolves each real row.
+        let mut conn = pool.acquire().await.expect("acquire");
         for (ttype, tid) in [
             ("frame", frame),
             ("perspective", perspective),
             ("analysis", analysis),
             ("experiment_result", exp_result),
         ] {
-            let ok = entity_exists(&state, tid, ttype).await.unwrap();
+            let ok = entity_exists(&state, &mut conn, tid, ttype).await.unwrap();
             assert!(ok, "entity_exists({ttype}) against a real row must be true");
         }
     }
@@ -4023,8 +4264,9 @@ mod db_tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn optional_table_absent_returns_ok_false(pool: PgPool) {
         // syntheses does not exist in epigraph migrations.
-        let state = test_state(pool).await;
-        let got = entity_exists(&state, Uuid::new_v4(), "synthesis").await;
+        let state = test_state(pool.clone()).await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        let got = entity_exists(&state, &mut conn, Uuid::new_v4(), "synthesis").await;
         assert!(
             matches!(got, Ok(false)),
             "optional absent -> Ok(false); got {got:?}"
@@ -4044,8 +4286,9 @@ mod db_tests {
         .execute(&pool)
         .await
         .unwrap();
-        let state = test_state(pool).await;
-        let got = entity_exists(&state, Uuid::new_v4(), "phantom_owned").await;
+        let state = test_state(pool.clone()).await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        let got = entity_exists(&state, &mut conn, Uuid::new_v4(), "phantom_owned").await;
         assert!(
             matches!(got, Err(ApiError::InternalError { .. })),
             "owned absent -> InternalError; got {got:?}"
@@ -4076,7 +4319,8 @@ mod db_tests {
     /// yields Ok(false) via is_pg_ident — SQL is never built.
     #[sqlx::test(migrations = "../../migrations")]
     async fn injection_doctored_cache_entry_never_builds_sql(pool: PgPool) {
-        let state = test_state(pool).await;
+        let state = test_state(pool.clone()).await;
+        let mut conn = pool.acquire().await.expect("acquire");
         // Bypass the DB CHECK by poking the in-memory cache directly.
         {
             let mut cache = state.entity_type_cache.write().unwrap();
@@ -4093,7 +4337,7 @@ mod db_tests {
                 },
             );
         }
-        let got = entity_exists(&state, Uuid::new_v4(), "evil").await;
+        let got = entity_exists(&state, &mut conn, Uuid::new_v4(), "evil").await;
         assert!(
             matches!(got, Ok(false)),
             "bad identifier must short-circuit to Ok(false); got {got:?}"

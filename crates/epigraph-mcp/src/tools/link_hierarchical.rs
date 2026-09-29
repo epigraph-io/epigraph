@@ -145,10 +145,14 @@ pub async fn do_link_hierarchical(
     )
     .await
     .map_err(internal_error)?;
+    let owned_by_caller = EdgeRepository::owned_by_session(&mut *tx, edge_row.id)
+        .await
+        .map_err(internal_error)?;
     tx.commit().await.map_err(internal_error)?;
 
     success_json(&LinkHierarchicalResponse {
         edge_id: edge_row.id.to_string(),
         created: was_created,
+        owned_by_caller,
     })
 }

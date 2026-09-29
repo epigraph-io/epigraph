@@ -15,12 +15,12 @@
 #                 with a public, an own-private and a foreign-private basis, and
 #                 an injected mid-call refusal of the justifies edge
 #   submit_ds     submit_claim's DS wiring commits with the claim
-#   maintenance   recompute_beliefs, sweep_semantic_duplicates and
-#                 backfill_embeddings under four server configurations:
-#                 MAINTENANCE_DATABASE_URL unset, set to the app login, set
-#                 to E2E_MAINT_DSN (a role that satisfies epigraph_bypass()),
-#                 and unset with the APPLICATION DSN itself bypass-capable
-#                 (the fallback, which must never enable them)
+#   maintenance   operator decision D9 (batch W12a): the server REFUSES TO
+#                 START with MAINTENANCE_DATABASE_URL set (to the app login or
+#                 to E2E_MAINT_DSN); with it unset, recompute_beliefs,
+#                 sweep_semantic_duplicates and backfill_embeddings answer
+#                 MOVED (JSON-RPC -32600, data.status=moved) and change no row,
+#                 also when the APPLICATION DSN is itself bypass-capable
 #   supersede     supersede_claim on own-public / own-private / foreign-private /
 #                 foreign-public claims (fresh rows, so no other arm sees them)
 #   theme         theme_cluster (wipe_first=true) over public claims the server
@@ -29,7 +29,8 @@
 #   maint_auth    the same tools over AUTHENTICATED HTTP (--jwt-secret, a
 #                 random per-run secret that is never written to disk): a
 #                 claims:write-only bearer with no membership must be refused
-#                 before the tool body runs; a claims:admin bearer is admitted
+#                 before the tool body runs; a claims:admin bearer passes the
+#                 scope gate and gets MOVED (D9), with nothing retired
 #   caller_auth   batch H-b over AUTHENTICATED HTTP, with a caller that is NOT
 #                 the server's signer: submit_claim is authored, owned and
 #                 signed as D1 says (verify_claim valid), the caller's own
@@ -52,7 +53,9 @@
 #                 resolved), resolve_backlog_item and add_step; D2 refuses all
 #   cascade       supersede_claim whose downstream includes a FOREIGN public
 #                 claim: it must keep its edge BBA and belief (and be reported)
-#                 on A, and be repaired on B
+#                 on A, and be repaired on B. Since batch W10 the cascade is
+#                 administrative: on a request process (no maintenance DSN,
+#                 D9) it is reported deferred and the replay timer applies it
 #
 # WHY THIS PROBE EXISTS. Every other arm in this directory seeds its claims
 # through submit_claim, and submit_claim writes PUBLIC claims. An edge between
@@ -76,9 +79,9 @@
 #   E2E_APP_DSN  the least-privilege application DSN the server connects as.
 #                MUST be a role with rolbypassrls=false, or every arm is vacuous.
 # Optional:
-#   E2E_MAINT_DSN   the maintenance DSN for the `maintenance` arm's third
-#                   configuration. Defaults to E2E_SU_DSN (a superuser satisfies
-#                   epigraph_bypass()). Must be on the test cluster.
+#   E2E_MAINT_DSN   a maintenance DSN the `maintenance` arm hands the server to
+#                   show it refuses to start with one (D9). Defaults to
+#                   E2E_SU_DSN. Must be on the test cluster.
 #   OPENAI_API_KEY  the `maintenance` arm's backfill case REFUSES to report a
 #                   verdict without it (trap 4 in README.md).
 #   E2E_AGENT_KEY   32-byte hex Ed25519 seed for the server's own agent. Defaults
@@ -133,7 +136,9 @@ q "TRUNCATE claims, evidence, edges, reasoning_traces, mass_functions, claim_fra
            recall_events, challenges, events, workflows, papers CASCADE;" >/dev/null 2>&1
 
 PID=""
-# $1 = maintenance mode: none | app | maint | fallback_bypass | auth
+# $1 = maintenance mode: none | fallback_bypass | auth. Under operator
+# decision D9 no mode sets MAINTENANCE_DATABASE_URL: the binary refuses to
+# start with it (see `expect_d9_refusal`).
 start_server() {
   local mode="${1:-none}"
   rm -f "$SOCK"
@@ -143,17 +148,11 @@ start_server() {
     fallback_bypass) env -u MAINTENANCE_DATABASE_URL DATABASE_URL="$E2E_MAINT_DSN" RUST_LOG=warn "$BIN" \
              --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} \
              >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
-    # Authenticated HTTP with a configured, bypass-capable maintenance DSN.
-    auth)  EPIGRAPH_JWT_SECRET="$JWT_SECRET" MAINTENANCE_DATABASE_URL="$E2E_MAINT_DSN" DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
+    # Authenticated HTTP (no maintenance DSN: D9).
+    auth)  env -u MAINTENANCE_DATABASE_URL EPIGRAPH_JWT_SECRET="$JWT_SECRET" DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
              --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" \
              >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
     none)  env -u MAINTENANCE_DATABASE_URL DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
-             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} \
-             >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
-    app)   MAINTENANCE_DATABASE_URL="$E2E_APP_DSN" DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
-             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} \
-             >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
-    maint) MAINTENANCE_DATABASE_URL="$E2E_MAINT_DSN" DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
              --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} \
              >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
   esac
@@ -180,6 +179,16 @@ verdict() {
     if .error then "ERR: " + (.error.message // "" | .[0:170])
     elif .result.isError then "TOOLERR: " + ((.result.content[0].text // "") | .[0:170])
     else "OK" end' 2>/dev/null || echo "UNPARSEABLE: ${1:0:120}"
+}
+# The MOVED contract (D9): the JSON-RPC error code and data.status, or "-".
+moved() { printf '%s' "$1" | jq -r '"code=" + ((.error.code // "-")|tostring) + " status=" + (.error.data.status // "-") + " runs_on=" + (.error.data.runs_on.name // "-")' 2>/dev/null || echo "UNPARSEABLE"; }
+# D9: the binary must refuse to start holding a maintenance DSN ($1), exit 1,
+# on stderr, before any connection. Prints the verdict.
+expect_d9_refusal() {
+  local out rc
+  out="$(MAINTENANCE_DATABASE_URL="$1" DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn timeout 30 "$BIN" \
+          --agent-key "$E2E_AGENT_KEY" </dev/null 2>&1 >/dev/null)"; rc=$?
+  if [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'operator decision D9'; then echo "REFUSED(exit 1, D9)"; else echo "FAIL: rc=$rc"; fi
 }
 # A field out of a successful tool response's JSON text.
 field() { printf '%s' "$1" | jq -r ".result.content[0].text | fromjson | .$2 | if . == null then empty else tostring end" 2>/dev/null; }
@@ -398,28 +407,24 @@ if want maintenance; then
   if [ -z "$OPENAI_API_KEY" ]; then
     echo "   NOTE: OPENAI_API_KEY is unset, so the backfill case below measures the absence of a key, not the write path (README trap 4). Its verdict is not reported."
   fi
-  for mode in none app maint fallback_bypass; do
+  echo "--- MAINTENANCE_DATABASE_URL = the app login (expect: refuses to start): $(expect_d9_refusal "$E2E_APP_DSN")"
+  echo "--- MAINTENANCE_DATABASE_URL = a bypass-capable role (expect: refuses to start): $(expect_d9_refusal "$E2E_MAINT_DSN")"
+  for mode in none fallback_bypass; do
     stop_server
     start_server "$mode"
     reset_stale
     q "UPDATE claims SET embedding=NULL WHERE id='$C_EMB'" >/dev/null
     q "UPDATE claims SET is_current=true, supersedes=NULL WHERE id IN ('$D1','$D2')" >/dev/null
     case "$mode" in
-      none)  echo "--- MAINTENANCE_DATABASE_URL unset (expect: all three refuse loudly, rows unchanged)";;
-      app)   echo "--- MAINTENANCE_DATABASE_URL = the app login (expect: all three refuse loudly, rows unchanged; this is the zero-row hybrid)";;
-      maint) echo "--- MAINTENANCE_DATABASE_URL = a bypass-capable role (expect: all three work on FOREIGN rows)";;
-      fallback_bypass) echo "--- MAINTENANCE_DATABASE_URL unset, APPLICATION DSN bypass-capable (expect: all three refuse loudly, rows unchanged; the fallback never enables them)";;
+      none)  echo "--- MAINTENANCE_DATABASE_URL unset (expect: all three MOVED code=-32600, rows unchanged)";;
+      fallback_bypass) echo "--- MAINTENANCE_DATABASE_URL unset, APPLICATION DSN bypass-capable (expect: all three MOVED, rows unchanged; nothing enables them in a request process)";;
     esac
     R=$(tool recompute_beliefs "{\"claim_ids\":[\"$CR\"]}")
-    echo "   recompute_beliefs: $(verdict "$R") claims_recomputed=$(field "$R" claims_recomputed) frame_writes=$(field "$R" frame_writes) | $(maint_rows)"
+    echo "   recompute_beliefs: $(moved "$R") | $(maint_rows)"
     R=$(tool sweep_semantic_duplicates '{"dry_run":false,"labels_scope":["bh-dup"],"similarity_threshold":0.05}')
-    echo "   sweep_semantic_duplicates: $(verdict "$R") scanned=$(field "$R" scanned) pairs_marked=$(field "$R" pairs_marked) | $(maint_rows)"
+    echo "   sweep_semantic_duplicates: $(moved "$R") | $(maint_rows)"
     R=$(tool backfill_embeddings '{"limit":50}')
-    if [ -n "$OPENAI_API_KEY" ]; then
-      echo "   backfill_embeddings: $(verdict "$R") candidates=$(field "$R" candidates) embedded=$(field "$R" embedded) | $(maint_rows)"
-    else
-      echo "   backfill_embeddings: (no OPENAI_API_KEY; not reported)"
-    fi
+    echo "   backfill_embeddings: $(moved "$R") | $(maint_rows)"
   done
 fi
 
@@ -466,16 +471,16 @@ PY
     q "UPDATE claims SET is_current=true, supersedes=NULL WHERE id IN ('$A1','$A2')" >/dev/null
     case "$who" in
       peer)  echo "--- claims:write-only bearer, no membership (expect: every call Forbidden, no ids listed, nothing retired)";;
-      admin) echo "--- claims:admin bearer (expect: admitted; the dry run lists the pair, the live run retires one)";;
+      admin) echo "--- claims:admin bearer (expect: past the scope gate, then MOVED code=-32600 under D9; nothing retired)";;
     esac
     R=$(tool sweep_semantic_duplicates '{"dry_run":true,"labels_scope":["bh-authdup"],"similarity_threshold":0.05}')
-    echo "   sweep dry_run: $(verdict "$R") scanned=$(field "$R" scanned) exact_clusters=$(field "$R" 'clusters | length') | $(auth_rows)"
+    echo "   sweep dry_run: $(verdict "$R") $(moved "$R") | $(auth_rows)"
     R=$(tool sweep_semantic_duplicates '{"dry_run":false,"labels_scope":["bh-authdup"],"similarity_threshold":0.05}')
-    echo "   sweep live:    $(verdict "$R") pairs_marked=$(field "$R" pairs_marked) exact_clusters=$(field "$R" 'clusters | length') failures=$(field "$R" failures) | $(auth_rows)"
+    echo "   sweep live:    $(verdict "$R") $(moved "$R") | $(auth_rows)"
     R=$(tool recompute_beliefs '{"claim_ids":[]}')
-    echo "   recompute_beliefs: $(verdict "$R")"
+    echo "   recompute_beliefs: $(verdict "$R") $(moved "$R")"
     R=$(tool backfill_embeddings '{"limit":1,"dry_run":true}')
-    echo "   backfill_embeddings dry_run: $(verdict "$R")"
+    echo "   backfill_embeddings dry_run: $(verdict "$R") $(moved "$R")"
   done
   stop_server
   BEARER=""

@@ -5,6 +5,19 @@ use crate::server::EpiGraphMcpFull;
 use crate::types::{MarkDuplicateParams, SupersedeClaimParams};
 use epigraph_core::{ClaimId, TruthValue};
 use epigraph_db::ClaimRepository;
+use epigraph_engine::admin_cascade::{
+    self, CascadeCause, CascadeStatus, CascadeTrigger, OauthPrincipal,
+};
+use epigraph_engine::retraction_cascade::CascadeReport;
+
+/// The OAuth principal behind an authenticated call, for the cascade's audit row.
+pub(crate) fn oauth_principal(auth: Option<&epigraph_auth::AuthContext>) -> Option<OauthPrincipal> {
+    auth.map(|a| OauthPrincipal {
+        client_id: Some(a.client_id),
+        owner_id: a.owner_id,
+        agent_id: a.agent_id,
+    })
+}
 
 pub async fn supersede_claim(
     server: &EpiGraphMcpFull,
@@ -15,37 +28,27 @@ pub async fn supersede_claim(
     let old = parse_uuid(&params.claim_id)?;
     let old_claim_id = ClaimId::from_uuid(old);
 
-    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP,
-    // the server's own agent on stdio; batch H-b D1), for the gate read and the
-    // supersession, the same construction as `patch_claim` and `update_labels`.
-    //
-    // This was `get_by_id(&server.pool, ..)` then `supersede(&server.pool, ..)`:
-    // unstamped, so on a schema without the orphan `*_privacy` policies (config
-    // A) the server agent's OWN public claim was refused with 42501 and its own
-    // group-private claim read as "not found" (MEASURED, batch H-a review). The
-    // stamp admits the claims the CALLER's groups own — for an operated stdio
-    // agent that includes its operator's group, which is where a same-operator
-    // sibling's claims live (#503, backlog 6d42f494). A claim in a group the
-    // caller cannot write is refused loudly, and nothing commits: a
-    // `claims:admin` caller superseding into a group it cannot write is NOT
-    // lent anyone's stamp (the audited admin path covers labels and patches,
-    // not supersession; see `tools::admin_write`).
-    let caller = server.write_identity(auth, viewer).await?;
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, caller, "supersede_claim").await?;
+    // The gate read, the authority decision and the stamped transaction the
+    // act runs on (batch OA1): see [`begin_claim_act`]. `actor` is the
+    // principal that transaction is stamped as, which the cascade's audit row
+    // names.
+    let (mut tx, actor) = begin_claim_act(
+        server,
+        viewer,
+        auth,
+        old,
+        None,
+        "supersede_claim",
+        "supersede",
+    )
+    .await?;
 
-    // Per-resource ownership check: only the claim's author or a
-    // claims:admin token holder may supersede it. The read is the CALLER's,
-    // through its viewer, on the same transaction.
-    let existing = ClaimRepository::get_by_id(&mut *tx, viewer, old_claim_id)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("claim {} not found", old)))?;
-    crate::tools::claims::require_owner_or_admin(server, auth, caller, existing.agent_id.as_uuid())
-        .await?;
-
+    // THE ACT (migration 117): retire the claim, insert the replacement and the
+    // `supersedes` edge. It does NOT migrate the old claim's other edges: an
+    // incoming edge is its source writer's assertion, and re-pointing another
+    // writer's edge is the administrative cascade's job below.
     let truth = TruthValue::clamped(params.truth_value);
-    let (new_id, old_id) = ClaimRepository::supersede_conn(
+    let (new_id, old_id) = ClaimRepository::supersede_act_conn(
         &mut tx,
         old_claim_id,
         &params.content,
@@ -54,81 +57,208 @@ pub async fn supersede_claim(
     )
     .await
     .map_err(internal_error)?;
+
+    let trigger = CascadeTrigger::new(
+        CascadeCause::Supersede,
+        Some(actor),
+        oauth_principal(auth),
+        old_id,
+        Some(new_id),
+    );
+    // The administrative connection is acquired BEFORE the act commits. With
+    // none (not configured, or unusable), the deferral is recorded in the act's
+    // own transaction, attributed to the principal it is stamped with, so the
+    // act and its audit row commit together (or neither does).
+    let (mut session, deferred) = admin_session_or_deferral(server, &mut tx, &trigger).await?;
     tx.commit().await.map_err(internal_error)?;
 
-    // Retraction cascade (backlog 20e9ed83): the supporters this claim was
-    // feeding hold BBAs frozen from ITS interval at wire time, so without an
-    // explicit invalidation pass they keep believing a retracted claim
-    // forever. Best-effort by construction — the supersede transaction has
-    // already committed, and failing the call here would hand the caller an
-    // error for a write that succeeded (the retry then hits "already been
-    // superseded"). Enumerated from the REPLACEMENT id: supersede re-points
-    // outgoing edges onto it inside the transaction.
-    //
-    // Reported rather than silent so a caller reading a downstream claim
-    // straight after this call can see exactly what was repaired.
-    //
-    // STAMPED FROM THE CALLER (batch H-b). It ran on the unstamped pool, where a
-    // clean schema (config A) refuses every downstream write, so the cascade
-    // repaired nothing there and reported errors for every target. The walk's
-    // targets are owned by arbitrary groups, so no single stamp covers all of
-    // them — which is why it runs on ONE transaction stamped with the authority
-    // that performed the retraction, and the engine takes a SAVEPOINT per edge
-    // and per target: a target the caller cannot write fails ALONE, is rolled
-    // back (its stale BBA is kept, not deleted with no re-derivation), and is
-    // named in `belief_cascade.errors`, while every target the caller can
-    // write is repaired. A downstream owner that is not the caller keeps the
-    // retracted supporter until it, or an admin, re-asserts the edge.
-    let cascade = supersede_cascade_stamped(server, viewer, caller, new_id).await;
+    // THE CASCADE (backlog 20e9ed83; migration 117): migrate the retired
+    // claim's edges onto the replacement, then invalidate the BBAs its
+    // supporters froze from ITS interval and re-derive them. It runs with
+    // ADMINISTRATIVE authority, on the server's maintenance connection and its
+    // bypass viewer, because the edges and BBAs it rewrites belong to other
+    // writers; the repair and its `security_events` row naming this caller
+    // commit together. What comes back is filtered to the CALLER's viewer.
+    // Best-effort by construction: the act has committed, and failing the call
+    // here would hand the caller an error for a write that succeeded (the retry
+    // then hits "already been superseded").
+    let (cascade, belief_cascade) = match (session.as_mut(), deferred) {
+        (Some(session), _) => {
+            let (conn, v) = session.split();
+            admin_cascade::apply_after_supersede(conn, v, viewer, &trigger, old_id, new_id).await
+        }
+        (None, status) => (status, CascadeReport::default()),
+    };
 
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "new_claim_id": new_id,
             "superseded_claim_id": old_id,
             "reason": params.reason,
-            "belief_cascade": cascade,
+            "cascade": cascade,
+            "belief_cascade": belief_cascade,
         }))
         .map_err(internal_error)?,
     )]))
 }
 
-/// Run [`epigraph_engine::retraction_cascade::cascade_after_supersede`] on ONE
-/// transaction stamped from `caller`, committing what it repaired.
+/// Acquire the administrative (maintenance) session BEFORE the caller's act
+/// commits. When there is none -- not configured, or not usable -- record the
+/// deferral inside the act's own transaction `tx`, so the act and its audit row
+/// commit together, and return that status.
 ///
-/// Never fails, as the cascade never does: a stamp or commit failure is
-/// reported in the returned report's `errors`, because the supersession it
-/// follows has already committed.
-async fn supersede_cascade_stamped(
-    server: &EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
-    caller: crate::write_identity::WriteIdentity,
-    new_id: uuid::Uuid,
-) -> epigraph_engine::retraction_cascade::CascadeReport {
-    let mut tx = match crate::claim_helper::begin_author_stamped_tx(
-        server,
-        caller,
-        "supersede_claim_cascade",
-    )
-    .await
-    {
-        Ok(tx) => tx,
-        Err(e) => {
-            let mut report = epigraph_engine::retraction_cascade::CascadeReport::default();
-            report.errors.push(format!(
-                "could not stamp the retraction cascade: {}",
-                e.message
-            ));
-            return report;
+/// # Errors
+/// The deferral INSERT's error: the caller propagates it and nothing commits.
+pub(crate) async fn admin_session_or_deferral<'s>(
+    server: &'s EpiGraphMcpFull,
+    tx: &mut sqlx::PgConnection,
+    trigger: &CascadeTrigger,
+) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
+    match crate::maintenance::admin_cascade_session(server).await {
+        Ok(session) => Ok((Some(session), CascadeStatus::default())),
+        Err(reason) => {
+            let status = admin_cascade::record_deferral(&mut *tx, trigger, &reason)
+                .await
+                .map_err(internal_error)?;
+            Ok((None, status))
         }
-    };
-    let mut report =
-        epigraph_engine::retraction_cascade::cascade_after_supersede(&mut tx, viewer, new_id).await;
-    if let Err(e) = tx.commit().await {
-        report.errors.push(format!(
-            "the retraction cascade could not commit, so none of its repairs landed: {e}"
-        ));
     }
-    report
+}
+
+/// The gate read, the authority decision and the stamped transaction a claim
+/// act (`supersede_claim`, `mark_duplicate`) runs on. Returns that transaction
+/// and the principal it is stamped as.
+///
+/// # Authenticated callers (batch OA1, operator decision D1)
+///
+/// The scope is `claims:write` (`scope_map`); this is the per-claim rule.
+///
+/// 1. `claim` (and `canonical`, the dedup's target) are read through the
+///    CALLER's viewer on a transaction stamped with that viewer. A claim it
+///    cannot read is `claim <id> not found`, the same text a missing id gets,
+///    so nothing here is an existence oracle. Both are read before either is
+///    judged, so a refusal never concerns a claim the caller cannot see.
+/// 2. [`epigraph_auth::claim_act::claim_act_arm`] (shared with HTTP): a
+///    `claims:admin` holder, or a caller whose viewer WRITES the claim's owning
+///    group (its author or not). Authorship alone admits nothing, and no
+///    transport-specific arm is added here. Otherwise the named refusal
+///    [`crate::errors::claim_not_writer`]. The same rule is then applied to
+///    `canonical`: brief (a) asks write authority over the target claim(s),
+///    and the cascade that follows re-points OTHER writers' edges and BBAs
+///    onto the canonical with administrative authority, so a `claims:write`
+///    caller may only choose a canonical it could write itself.
+/// 3. THE STAMP. Every non-admin act runs on the caller's own stamped
+///    transaction, the one step 1 read on (D1: "the act keeps the CALLER's
+///    authority"), so the authority read and the write see the same state,
+///    and the cascade deferral is attributed to the caller. A `claims:admin`
+///    caller that writes the owning group does the same. Only a `claims:admin`
+///    caller on a claim it does NOT write acts on a transaction stamped from
+///    this server's own agent: that is how the tool worked before batch OA1,
+///    when `claims:admin` was its scope. No other admission may borrow the
+///    server agent's stamp, because that would hand a `claims:write` caller
+///    the server agent's write authority over the group; the borrow is
+///    granted only by `EpiGraphMcpFull::admin_borrowed_server_identity`, which
+///    re-checks `claims:admin`. Either way the database decides the write: a
+///    stamp that cannot write the row is refused and nothing commits.
+///
+/// The caller's own stamp is its WRITE IDENTITY (batch H-b, D1):
+/// `EpiGraphMcpFull::write_identity(auth, viewer)`, which also refuses a
+/// principal-less caller the listener did not opt in to writes (batch HTTP-id)
+/// and a viewer whose principal is not the token's.
+///
+/// # stdio (no `AuthContext`)
+///
+/// The write identity's stdio answer (the server agent), the read through
+/// `viewer`, and `require_owner_or_admin`'s stdio arms.
+async fn begin_claim_act<'p>(
+    server: &'p EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    claim: uuid::Uuid,
+    canonical: Option<uuid::Uuid>,
+    tool: &'static str,
+    action: &str,
+) -> Result<(epigraph_db::ScopedTx<'p>, uuid::Uuid), McpError> {
+    let not_found = |id: uuid::Uuid| invalid_params(format!("claim {id} not found"));
+
+    // The write identity (batch H-b, D1): the caller's own agent over HTTP,
+    // refused for a principal-less caller without write scopes; the server's
+    // own agent on stdio.
+    let caller = server.write_identity(auth, viewer).await?;
+
+    let Some(token) = auth else {
+        let mut tx = crate::claim_helper::begin_author_stamped_tx(server, caller, tool).await?;
+        let (claim_author, _) = ClaimRepository::write_target_of(&mut *tx, viewer, claim)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| not_found(claim))?;
+        crate::tools::claims::require_owner_or_admin(server, auth, caller, claim_author).await?;
+        return Ok((tx, caller.agent_id()));
+    };
+
+    let mut caller_tx = crate::claim_helper::begin_author_stamped_tx(server, caller, tool).await?;
+    let (author, owner_group) = ClaimRepository::write_target_of(&mut *caller_tx, viewer, claim)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(claim))?;
+    let canonical_target = match canonical {
+        Some(other) => Some((
+            other,
+            ClaimRepository::write_target_of(&mut *caller_tx, viewer, other)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| not_found(other))?,
+        )),
+        None => None,
+    };
+
+    let target = epigraph_auth::claim_act::ClaimActTarget {
+        author,
+        owner_group,
+    };
+    let Some(arm) = epigraph_auth::claim_act::claim_act_arm(
+        token,
+        viewer.principal(),
+        viewer.writable_groups(),
+        target,
+    ) else {
+        return Err(crate::errors::claim_not_writer(claim, action));
+    };
+    if let Some((other, (other_author, other_group))) = canonical_target {
+        let other_target = epigraph_auth::claim_act::ClaimActTarget {
+            author: other_author,
+            owner_group: other_group,
+        };
+        if epigraph_auth::claim_act::claim_act_arm(
+            token,
+            viewer.principal(),
+            viewer.writable_groups(),
+            other_target,
+        )
+        .is_none()
+        {
+            return Err(crate::errors::claim_not_writer(
+                other,
+                "mark a duplicate onto",
+            ));
+        }
+    }
+    tracing::info!(tool, claim = %claim, arm = arm.as_str(), "claim act admitted");
+
+    if viewer.writable_groups().contains(&owner_group) {
+        return Ok((caller_tx, caller.agent_id()));
+    }
+    if arm != epigraph_auth::claim_act::ClaimActArm::Admin {
+        // Not reachable through `claim_act_arm` (a non-admin arm requires the
+        // owning group in a Scoped viewer's writable set). Refused rather than falling through to the server
+        // agent's stamp below, which only `claims:admin` may borrow.
+        return Err(crate::errors::claim_not_writer(claim, action));
+    }
+    // Rolled back: it read, and wrote nothing.
+    drop(caller_tx);
+    let server_agent = server.admin_borrowed_server_identity(token).await?;
+    let tx = crate::claim_helper::begin_author_stamped_tx(server, server_agent, tool).await?;
+    Ok((tx, server_agent.agent_id()))
 }
 
 pub async fn mark_duplicate(
@@ -140,118 +270,61 @@ pub async fn mark_duplicate(
     let dup = parse_uuid(&params.claim_id)?;
     let canon = parse_uuid(&params.canonical_id)?;
     let dup_claim_id = ClaimId::from_uuid(dup);
-    let caller = server.write_identity(auth, viewer).await?;
 
-    // ONE TRANSACTION, STAMPED FROM THE CALLER (batch H-b): the gate read, the
-    // dedup and its cascade. The dedup used to run on the unstamped pool, where
-    // a clean schema (config A) read the caller's own group-private duplicate as
-    // "not found" and refused its own public one with 42501.
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, caller, "mark_duplicate").await?;
-
-    // Per-resource ownership check: the duplicate's author, an agent acting for
-    // its operator, or a claims:admin token holder may mark it as a duplicate.
-    let dup_claim = ClaimRepository::get_by_id(&mut *tx, viewer, dup_claim_id)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("claim {} not found", dup)))?;
-    crate::tools::claims::require_owner_or_admin(
+    // THE ACT's gate and stamp (batch OA1), as `supersede_claim` above: the
+    // caller must be able to write BOTH the duplicate and the canonical (or
+    // hold claims:admin). The act writes the duplicate's row alone, but the
+    // cascade re-points other writers' edges and BBAs onto the canonical, so
+    // the canonical is the caller's choice to make only where it could write
+    // itself. Either one the caller cannot read is reported as not found,
+    // exactly like a missing claim.
+    let (mut tx, actor) = begin_claim_act(
         server,
+        viewer,
         auth,
-        caller,
-        dup_claim.agent_id.as_uuid(),
+        dup,
+        Some(canon),
+        "mark_duplicate",
+        "mark as a duplicate",
     )
     .await?;
 
-    // Dedup repairs the derived-record layer (orphaned + stranded edge-factor
-    // BBAs) and hands back what still has to be re-derived through the DS
-    // pipeline. Same best-effort contract as supersede: the dedup's own failure
-    // is an error and rolls everything back; the cascade's is reported, one
-    // savepoint per edge and per target (see `supersede_claim`).
-    let cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-        &mut tx,
-        viewer,
-        dup_claim_id.into(),
-        canon,
-    )
-    .await
-    .map_err(internal_error)?;
+    ClaimRepository::mark_duplicate_act_conn(&mut tx, dup_claim_id, ClaimId::from_uuid(canon))
+        .await
+        .map_err(internal_error)?;
+
+    let trigger = CascadeTrigger::new(
+        CascadeCause::Dedup,
+        Some(actor),
+        oauth_principal(auth),
+        dup,
+        Some(canon),
+    );
+    let (mut session, deferred) = admin_session_or_deferral(server, &mut tx, &trigger).await?;
     tx.commit().await.map_err(internal_error)?;
+
+    // THE CASCADE (migration 117), with administrative authority on the
+    // maintenance connection: retract the duplicate's colliding edges and drop
+    // their BBAs, re-point every other edge onto the canonical, move the BBAs
+    // that follow them, and re-derive what changed. Same contract as
+    // supersede: audited atomically, filtered to the caller, best-effort (the
+    // act's own failure is an error, the cascade's is reported).
+    let (cascade, belief_cascade) = match (session.as_mut(), deferred) {
+        (Some(session), _) => {
+            let (conn, v) = session.split();
+            admin_cascade::apply_after_dedup(conn, v, viewer, &trigger, dup, canon).await
+        }
+        (None, status) => (status, CascadeReport::default()),
+    };
 
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "duplicate_id": dup,
             "canonical_id": canon,
             "mode": "mark_duplicate",
-            "belief_cascade": cascade,
+            "cascade": cascade,
+            "belief_cascade": belief_cascade,
         }))
         .map_err(internal_error)?,
     )]))
-}
-
-#[cfg(test)]
-mod tests {
-    use epigraph_auth::{AuthContext, ClientType};
-    use uuid::Uuid;
-
-    fn make_auth(caller_id: Uuid, scopes: &[&str]) -> AuthContext {
-        AuthContext {
-            client_id: caller_id,
-            agent_id: None,
-            owner_id: Some(caller_id),
-            client_type: ClientType::Service,
-            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
-            jti: Uuid::new_v4(),
-        }
-    }
-
-    /// Mirrors the ownership gate used by `supersede_claim` and `mark_duplicate`.
-    ///
-    /// We cannot spin up a pool here; tests exercise the auth-branch logic
-    /// (auth = Some(_)) which never touches the pool.
-    fn check_ownership(auth: &AuthContext, claim_agent_id: Uuid) -> Result<(), String> {
-        if auth.has_scope("claims:admin") {
-            return Ok(());
-        }
-        let principal = auth.owner_id.unwrap_or(auth.client_id);
-        if principal == claim_agent_id {
-            Ok(())
-        } else {
-            Err(format!(
-                "claim owned by {claim_agent_id}; caller {principal} denied"
-            ))
-        }
-    }
-
-    #[test]
-    fn non_owner_without_admin_is_rejected() {
-        let claim_agent_id = Uuid::new_v4();
-        let caller_id = Uuid::new_v4(); // different from claim owner
-        let auth = make_auth(caller_id, &["claims:write"]);
-        assert!(
-            check_ownership(&auth, claim_agent_id).is_err(),
-            "non-owner without claims:admin must be rejected"
-        );
-    }
-
-    #[test]
-    fn admin_scope_allows_cross_agent_supersede() {
-        let claim_agent_id = Uuid::new_v4();
-        let caller_id = Uuid::new_v4(); // different from claim owner
-        let auth = make_auth(caller_id, &["claims:admin", "claims:write"]);
-        assert!(
-            check_ownership(&auth, claim_agent_id).is_ok(),
-            "claims:admin holder must be allowed regardless of ownership"
-        );
-    }
-
-    #[test]
-    fn owner_without_admin_is_allowed() {
-        let claim_agent_id = Uuid::new_v4();
-        let auth = make_auth(claim_agent_id, &["claims:write"]); // caller IS the owner
-        assert!(
-            check_ownership(&auth, claim_agent_id).is_ok(),
-            "the claim's own author must always be allowed"
-        );
-    }
 }
