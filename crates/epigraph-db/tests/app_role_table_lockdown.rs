@@ -1302,14 +1302,27 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
         .expect("decide on the application role");
     assert_eq!(status_of(&pool, id).await, "promoted");
 
-    // Retirement does not, by any route, and each refusal is the stale
-    // guard's own (MC01), not some other 42501 on the way (a lost EXECUTE on a
-    // privilege helper, a missing table grant in the cascade).
+    // Retirement does not, by any route. The repo's own retire refuses in
+    // Rust before any statement runs (retire_conn's require_privileged: the
+    // flip is administrative, so it needs a privileged session), which is a
+    // protocol error naming the maintenance connection, not a database error.
+    // The statement-level routes below never pass that check, so they are what
+    // pin 118's guard: each refusal is the stale guard's own (MC01), not some
+    // other 42501 on the way (a lost EXECUTE on a privilege helper, a missing
+    // table grant in the cascade).
     let e = repo
         .retire(id, None)
         .await
         .expect_err("retire on the application role");
-    assert_mc01(&e, "retire");
+    assert!(
+        e.as_database_error().is_none(),
+        "retire: expected the application-level refusal, got a database error: {e}"
+    );
+    assert!(
+        e.to_string()
+            .contains("runs only on a privileged (maintenance) connection"),
+        "retire: refused, but not by the privileged-connection check: {e}"
+    );
     let e = repo
         .set_status(id, "stale", None)
         .await
