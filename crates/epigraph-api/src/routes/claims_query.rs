@@ -43,6 +43,7 @@ const VALID_METHODOLOGIES: &[&str] = &[
     "abductive",
     "analogical",
     "statistical",
+    "observational",
 ];
 
 /// Valid evidence type values (mirrors DB CHECK constraint on evidence + later migrations)
@@ -1489,6 +1490,7 @@ mod tests {
             "abductive",
             "analogical",
             "statistical",
+            "observational",
         ] {
             let state = AppState::new(ApiConfig::default());
             let router = test_router(state);
