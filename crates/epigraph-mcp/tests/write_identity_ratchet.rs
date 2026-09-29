@@ -29,6 +29,9 @@
 //! 6. **Every write body forwards `auth`, or is listed with its reason** ("scan
 //!    2b", batch H-b review): scan 2 sees only a literal `None`, so a body that
 //!    forgot the token entirely was invisible.
+//! 7. **Only `begin_claim_act` borrows the server agent's stamp** (batch OA1
+//!    merge review): `admin_borrowed_server_identity` is `pub(crate)`, and scan 4
+//!    cannot see a second caller because the constructor stays in `server.rs`.
 //!
 //! Verified load-bearing by reverting: re-adding `let agent_id =
 //! server.agent_id().await?;` to `tools/memory.rs` fails scan 1, and changing
@@ -250,15 +253,68 @@ fn only_the_resolver_constructs_a_write_identity() {
         .iter()
         .find(|(rel, _)| rel == "server.rs")
         .map_or(0, |(_, t)| t.matches("from_resolved(").count());
-    assert!(
-        in_server >= 1,
-        "calibration: the resolver in server.rs must be found"
+    // EXACTLY three (batch OA1 merge review): `write_identity`'s stdio arm and
+    // its HTTP arm, and `admin_borrowed_server_identity`. A fourth constructor
+    // in server.rs would be a new way to mint an identity that none of the
+    // scans here pins; add it only with a scan of its own.
+    assert_eq!(
+        in_server, 3,
+        "server.rs constructs a WriteIdentity in a place this ratchet does not know"
     );
     assert!(
         offenders.is_empty(),
         "a module constructs a WriteIdentity itself instead of through \
          EpiGraphMcpFull::write_identity(auth, viewer):\n{}",
         offenders.join("\n")
+    );
+}
+
+/// Scan 7 (batch OA1 merge review). `EpiGraphMcpFull::admin_borrowed_server_identity`
+/// hands a `claims:admin` caller the server agent's write stamp. It is
+/// `pub(crate)`, so any module could call it and borrow that stamp for a tool
+/// OA1 never licensed, and scan 4 would not notice (the constructor stays in
+/// server.rs). The ONE sanctioned caller is `tools/supersede.rs`
+/// (`begin_claim_act`, for `supersede_claim` and `mark_duplicate` on a claim
+/// the admin does not write), exactly once; server.rs only defines it.
+///
+/// Verified load-bearing by planting: a reference to the borrow added to
+/// `tools/claims.rs` fails this scan (the file appears in the call list).
+#[test]
+fn only_begin_claim_act_borrows_the_server_stamp() {
+    const NEEDLE: &str = "admin_borrowed_server_identity(";
+    let files = src_files();
+    let mut calls: Vec<(String, usize)> = files
+        .iter()
+        .map(|(rel, text)| (rel.clone(), text.matches(NEEDLE).count()))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    calls.sort();
+    assert_eq!(
+        calls,
+        vec![
+            ("server.rs".to_string(), 1),
+            ("tools/supersede.rs".to_string(), 1)
+        ],
+        "admin_borrowed_server_identity may be defined in server.rs and called only from \
+         tools/supersede.rs::begin_claim_act; a new borrower of the server agent's stamp \
+         needs its own review"
+    );
+    let supersede = &files
+        .iter()
+        .find(|(rel, _)| rel == "tools/supersede.rs")
+        .expect("tools/supersede.rs")
+        .1;
+    let body_at = supersede
+        .find("async fn begin_claim_act")
+        .expect("calibration: begin_claim_act must be found");
+    // The body ends at the first closing brace in column 0 (rustfmt layout).
+    let body_end = supersede[body_at..]
+        .find("\n}\n")
+        .map(|i| body_at + i)
+        .expect("calibration: begin_claim_act's closing brace must be found");
+    assert!(
+        supersede[body_at..body_end].contains(NEEDLE),
+        "the one call in tools/supersede.rs must be inside begin_claim_act"
     );
 }
 
