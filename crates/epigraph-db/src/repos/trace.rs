@@ -673,10 +673,11 @@ mod tests {
         .expect("observational must satisfy reasoning_type_valid");
 
         let viewer = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
-        let by_id = ReasoningTraceRepository::get_by_id(&pool, &viewer, TraceId::from_uuid(trace_id))
-            .await
-            .expect("get_by_id must not error on observational")
-            .expect("trace exists");
+        let by_id =
+            ReasoningTraceRepository::get_by_id(&pool, &viewer, TraceId::from_uuid(trace_id))
+                .await
+                .expect("get_by_id must not error on observational")
+                .expect("trace exists");
         assert_eq!(by_id.methodology, Methodology::Instrumental);
 
         let by_claim =

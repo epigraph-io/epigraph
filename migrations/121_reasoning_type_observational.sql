@@ -1,4 +1,4 @@
--- Migration 102: allow `observational` in reasoning_traces.reasoning_type (ADDITIVE).
+-- Migration 121: allow `observational` in reasoning_traces.reasoning_type (ADDITIVE).
 --
 -- EVIDENCE
 -- `reasoning_type_valid` (migration 001) permits only deductive, inductive,

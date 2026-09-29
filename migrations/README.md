@@ -234,13 +234,18 @@ Current reservation:
   `100` was: it has never been applied to a deployed database — production is at
   59.
 
-- **102**: public `reasoning_type_observational` — widens the
+- **102–120**: allocated or claimed elsewhere at the time `121` was written
+  (on `main` or by open pull requests). Not allocated by this file.
+- **121**: public `reasoning_type_observational` — widens the
   `reasoning_type_valid` CHECK on `reasoning_traces` to additionally allow
   `'observational'` (read back as `Methodology::Instrumental`). No backfill.
+  First written as `102`, a hole below the deployed head; renumbered to the
+  next free version so no database at head sees a version below its head
+  arrive late. Checked before claiming: no open PR branch carries a `121`.
 
-- **103+**: public next
+- **122+**: public next
 
-Next public migration **outside both reserved tenancy ranges** must be `103` or
+Next public migration **outside both reserved tenancy ranges** must be `122` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
