@@ -502,9 +502,38 @@ Current reservation:
   `origin/*` ref carries a `112`. **Applied to a throwaway database only, NOT to
   any deployed database.**
 
-- **113+**: public next
+- **116**: public `link_retired_shared_signer` — the ATTESTED retire of a
+  FORMER shared HTTP signer (batch HTTP-id). One SECURITY DEFINER,
+  `epigraph_link_retired_shared_signer(agent, operator, attested uuid[])`,
+  owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and
+  `epigraph_app`, granted to `epigraph_maintenance`. It is 107's
+  `epigraph_link_retired_agent` written out again with ONE change: instead of
+  refusing an agent whose OPERATED_BY auth-lineage names more than one
+  principal (107 section 9), it refuses only a lineage principal, other than
+  the agent itself and the operator, that is not in `attested`, and records
+  the attestation (always a `security_events` row
+  `operator.shared_signer_retired`; also the OPERATED_BY edge's properties, but
+  only when it records that edge itself, which it does not for a signer that
+  already has the edge as lineage). A NULL element in `attested` refuses
+  (22004). Every other refusal, the operator-side
+  fingerprint included, is 107's; the link is retired with no membership. The
+  lineage check is a sanity check (edges exist only since lineage recording
+  shipped, and are forgeable only in the direction that refuses more); the
+  maintenance caller's attestation is the authority. Called by
+  `epigraph-operator link-retired --attest-shared-signer`. Registered in
+  `schema_contract.rs::migration_116_shared_signer_retire_is_owned_and_not_app_executable`,
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` and
+  `verify_operator_function_grants`, and
+  `personal_group_mint_ratchet.rs::GUARDED_DEFINERS`. `113`–`115` are claimed
+  by open PRs (R2, W-own, W9) and were listed on every open branch and on
+  `origin/main` before claiming `116`. **No undo runbook ships**: undo is
+  `DROP FUNCTION public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])`;
+  a link it recorded is permanent like 107's. **Applied to a throwaway database
+  only, NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `113` or
+- **117+**: public next (113–115 are claimed by open PRs)
+
+Next public migration **outside both reserved tenancy ranges** must be `117` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

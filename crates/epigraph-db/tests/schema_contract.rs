@@ -1348,3 +1348,51 @@ async fn migration_112_admin_audit_definer_is_owned_and_granted(pool: PgPool) {
         assert_eq!(can, expected, "{role} EXECUTE on the admin audit definer");
     }
 }
+
+/// Migration 116 (batch HTTP-id): the attested retire of a former shared HTTP
+/// signer is a LINK function, so it is 107's template: a SECURITY DEFINER owned
+/// by `epigraph_maintenance` (whose membership `epigraph_definer_bypass()`
+/// tests inside the frame), VOLATILE, an explicit ACL, and EXECUTE-able by
+/// neither PUBLIC nor `epigraph_app` (the request DSN must never record links).
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_116_shared_signer_retire_is_owned_and_not_app_executable(pool: PgPool) {
+    let signature = "public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])";
+    let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+           FROM pg_proc p \
+           JOIN pg_namespace n ON n.oid = p.pronamespace \
+           JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_link_retired_shared_signer'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, owner, vol, acl) =
+        meta.expect("public.epigraph_link_retired_shared_signer must exist (migration 116)");
+    assert!(
+        secdef,
+        "the shared-signer retire must stay SECURITY DEFINER"
+    );
+    assert_eq!(
+        owner, "epigraph_maintenance",
+        "the shared-signer retire's owner"
+    );
+    assert_eq!(vol, "v", "the shared-signer retire writes: VOLATILE");
+    assert!(
+        acl.is_some(),
+        "an explicit ACL, never the default (PUBLIC EXECUTE)"
+    );
+    for (role, expected) in [
+        ("public", false),
+        ("epigraph_app", false),
+        ("epigraph_maintenance", true),
+    ] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(role)
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on the shared-signer retire");
+    }
+}

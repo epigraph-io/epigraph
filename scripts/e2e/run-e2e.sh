@@ -82,7 +82,7 @@ q "TRUNCATE claims, evidence, edges, reasoning_traces, mass_functions, claim_fra
 rm -f "$SOCK"
 DATABASE_URL="$DSN" RUST_LOG=warn "$BIN" \
   --agent-key "$E2E_AGENT_KEY" \
-  --listen "unix:$SOCK" --allow-unauthenticated-http > "$E2E/mcp.$LABEL.log" 2>&1 &
+  --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} > "$E2E/mcp.$LABEL.log" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; release_lock' EXIT
 for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 1; done

@@ -1049,6 +1049,10 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // fails CLOSED: `security_events_append` refuses the row and the admin
     // write rolls back with it.
     ("epigraph_admin_audit_write", 112),
+    // 116, the attested retire of a former shared HTTP signer (batch HTTP-id).
+    // Deferred for 107's reason, and fails CLOSED the same way under a
+    // non-member owner: the tenancy policies refuse its link and audit writes.
+    ("epigraph_link_retired_shared_signer", 116),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -1238,8 +1242,9 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
 ///   `epigraph_operates_agents`, is refusal-only, and the HTTP listener's guard
 ///   calls it on every tool call and fails CLOSED, so a missing grant there
 ///   refuses every HTTP call: the same class of outage.
-/// * the two LINK functions (`epigraph_link_operator`,
-///   `epigraph_link_retired_agent`) must NOT be. A grant there lets the request
+/// * the LINK functions (`epigraph_link_operator`,
+///   `epigraph_link_retired_agent`, 116's `epigraph_link_retired_shared_signer`)
+///   must NOT be. A grant there lets the request
 ///   DSN record operator links, which is the whole of 107's trust basis.
 ///
 /// Each function is checked only when it exists (the same deferral as
@@ -1271,6 +1276,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_link_retired_agent",
             "public.epigraph_link_retired_agent(uuid, uuid)",
+            false,
+        ),
+        // 116 (batch HTTP-id): the attested retire of a former shared signer
+        // is a link function too, so the request DSN must not call it.
+        (
+            "epigraph_link_retired_shared_signer",
+            "public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])",
             false,
         ),
     ];

@@ -42,6 +42,19 @@
 //! nil-principal public viewer). Both are stdio-shaped callers with no token,
 //! and `None` gives them exactly the pre-H-b author, the server's own agent.
 //!
+//! # The principal-less listener (batch HTTP-id)
+//!
+//! The `--allow-unauthenticated-http` listener injects a context naming the
+//! listener's own signer (`auth::unauthenticated_context`). Measured at the
+//! batch H-b tip (`scripts/e2e/probe-httpid.sh`, `unauth` arm), every write
+//! there was authored by that signer and owned by its personal group: an
+//! agent that belongs to no human. Since batch HTTP-id that context is
+//! read-only by default, and [`crate::server::EpiGraphMcpFull::write_identity`]
+//! refuses it without a write scope, so an HTTP write is authored only by an
+//! authenticated caller's own agent. `--allow-unauthenticated-writes` restores
+//! signer-authored writes for a trusted local socket; the listener gates keep
+//! that signer unlinked, so it never carries a human's authority.
+//!
 //! # The ratchet
 //!
 //! [`WriteIdentity`] has a private field and one constructor,
@@ -99,6 +112,25 @@ pub(crate) fn no_agent_principal_refusal() -> McpError {
         "token carries no agent principal, so this write has no author (see plan D3). \
          Re-mint the token through /oauth/token, which attaches an agents.id to every \
          principal. Nothing was written."
+            .to_string(),
+        None,
+    )
+}
+
+/// A principal-less caller (the `--allow-unauthenticated-http` listener's
+/// injected context, `auth::is_principal_less`) without a write scope has no
+/// author that belongs to a human, so it writes nothing (batch HTTP-id; see
+/// `auth::UnauthenticatedWrites`). The per-tool scope gate refuses the same
+/// calls first; this is a second layer for the AUTHOR-STAMPED writes only,
+/// keyed on the resolver every author-stamped transaction goes through. A
+/// write tool that never calls `write_identity` is covered by the scope gate
+/// alone (see `auth::UnauthenticatedWrites`).
+pub(crate) fn principal_less_write_refusal() -> McpError {
+    McpError::invalid_request(
+        "this listener serves callers with no authenticated principal, and such a caller \
+         cannot write: an HTTP write is authored by the calling human's agent, and no human \
+         is named here. Call this tool through an authenticated (OAuth bearer) listener, \
+         where the write is authored as your own agent. Nothing was written."
             .to_string(),
         None,
     )

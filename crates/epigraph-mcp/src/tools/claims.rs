@@ -1384,11 +1384,13 @@ pub async fn update_with_evidence(
 ///   `AuthContext` and perform no ownership check at all, so arbitrary
 ///   cross-agent label/property mutation is already available on this
 ///   transport.
-/// - The strictly *looser* deployment already permits it: a
-///   `--listen unix:… --allow-unauthenticated-http` listener gets
-///   `auth::unauthenticated_context()`, which carries every scope in
-///   `SCOPE_MAP` including `claims:admin`. Refusing stdio while allowing
-///   an unauthenticated socket inverts the two postures.
+/// - (Historical, before batch HTTP-id.) A `--listen unix:…
+///   --allow-unauthenticated-http` listener got `auth::unauthenticated_context()`
+///   with every scope in `SCOPE_MAP`, `claims:admin` included, so refusing
+///   stdio while allowing that socket inverted the two postures. Since batch
+///   HTTP-id that context is read-only unless `--allow-unauthenticated-writes`
+///   is given, and even then its `claims:admin` reaches a foreign claim only
+///   through the audited admin path, which refuses it (no client record).
 /// - No remotely reachable path arrives here with `auth = None`:
 ///   `main::check_listen_auth_mode` refuses a TCP listener that has
 ///   neither `--jwt-secret` nor (unix-only) `--allow-unauthenticated-http`.

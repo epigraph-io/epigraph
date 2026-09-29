@@ -81,7 +81,7 @@ start_server() {
   rm -f "$SOCK"
   DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
     --agent-key "$E2E_AGENT_KEY" \
-    --listen "unix:$SOCK" --allow-unauthenticated-http >> "$E2E/ue.$LABEL.log" 2>&1 &
+    --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} >> "$E2E/ue.$LABEL.log" 2>&1 &
   PID=$!
   for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 1; done
   [ -S "$SOCK" ] || { echo "FAIL: socket never appeared"; tail -20 "$E2E/ue.$LABEL.log"; exit 1; }

@@ -3061,3 +3061,158 @@ async fn a_squatted_target_group_is_refused(pool: PgPool) {
     assert!(!dir.join("m.jsonl").exists(), "refused before the manifest");
     assert_same(&before, &snapshot(&pool, false).await, "squatted target");
 }
+
+/// Batch HTTP-id, migration 116: `--attest-shared-signer` retires a FORMER
+/// shared HTTP signer that 107's retire refuses.
+///
+/// * without the flag the id is REFUSED (the shared-signer fingerprint) and
+///   the run exits 3;
+/// * with the flag naming only the operator, the other lineage principal is
+///   unattested: REFUSED, exit 3, nothing written;
+/// * with it attested: the dry run prints LINKED-RETIRED and writes nothing;
+///   `--apply` records a retired link with no membership and exits 0.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_retired_attest_shared_signer_retires_a_former_shared_signer(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let (signer, _) = fixture::seed_agent_with_group(&pool, "former-shared-signer").await;
+    let (principal, _) = fixture::seed_agent_with_group(&pool, "other-principal").await;
+    for target in [fx.operator, principal] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+        )
+        .bind(signer)
+        .bind(target)
+        .execute(&pool)
+        .await
+        .expect("auth-lineage edge");
+    }
+    let agents = dir.join("agents.txt");
+    std::fs::write(&agents, format!("{signer}\n")).unwrap();
+    let agents = agents.to_str().unwrap().to_string();
+    let op = fx.operator.to_string();
+    let run = |extra: Vec<String>| {
+        let pool = pool.clone();
+        let mut a = vec![
+            "link-retired".to_string(),
+            "--agents-file".into(),
+            agents.clone(),
+            "--operator".into(),
+            op.clone(),
+        ];
+        a.extend(extra);
+        async move { run_op(&pool, &a.iter().map(String::as_str).collect::<Vec<_>>()).await }
+    };
+    let links = || async {
+        sqlx::query_as::<_, (Uuid, bool)>(
+            "SELECT operator_id, retired FROM operator_links WHERE agent_id = $1",
+        )
+        .bind(signer)
+        .fetch_all(&pool)
+        .await
+        .expect("links")
+    };
+
+    let r = run(vec!["--apply".into()]).await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert!(r.stdout.contains("shared HTTP signer"), "{}", r.show());
+    assert!(links().await.is_empty());
+
+    let r = run(vec![
+        "--attest-shared-signer".into(),
+        op.clone(),
+        "--apply".into(),
+    ])
+    .await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert!(
+        r.stdout.contains("not attested") && r.stdout.contains(&principal.to_string()),
+        "{}",
+        r.show()
+    );
+    assert!(links().await.is_empty());
+
+    let r = run(vec!["--attest-shared-signer".into(), principal.to_string()]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains(&format!("{signer}\tLINKED-RETIRED")),
+        "{}",
+        r.show()
+    );
+    assert!(links().await.is_empty(), "a dry run writes nothing");
+
+    let r = run(vec![
+        "--attest-shared-signer".into(),
+        principal.to_string(),
+        "--apply".into(),
+    ])
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(links().await, vec![(fx.operator, true)]);
+    let memberships: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(fx.target)
+    .bind(signer)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(memberships, 0, "a retired link creates no membership");
+}
+
+/// `--attest-shared-signer` names the principals of ONE former signer, so an
+/// agents file with more than one id is refused before any call: otherwise the
+/// same attested set would be recorded for every signer in the file. Nothing
+/// is written, for either id, even with `--apply`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_retired_attest_shared_signer_refuses_a_multi_id_agents_file(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let (principal, _) = fixture::seed_agent_with_group(&pool, "attested-principal").await;
+    let mut signers = Vec::new();
+    for name in ["former-signer-a", "former-signer-b"] {
+        let (signer, _) = fixture::seed_agent_with_group(&pool, name).await;
+        for target in [fx.operator, principal] {
+            sqlx::query(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+                 VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+            )
+            .bind(signer)
+            .bind(target)
+            .execute(&pool)
+            .await
+            .expect("auth-lineage edge");
+        }
+        signers.push(signer);
+    }
+    let agents = dir.join("agents.txt");
+    std::fs::write(&agents, format!("{}\n{}\n", signers[0], signers[1])).unwrap();
+    let r = run_op(
+        &pool,
+        &[
+            "link-retired",
+            "--agents-file",
+            agents.to_str().unwrap(),
+            "--operator",
+            &fx.operator.to_string(),
+            "--attest-shared-signer",
+            &principal.to_string(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_ne!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stderr.contains("ONE former shared signer") && r.stderr.contains("2 agent ids"),
+        "{}",
+        r.show()
+    );
+    let links: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM operator_links WHERE agent_id = ANY($1)")
+            .bind(&signers)
+            .fetch_one(&pool)
+            .await
+            .expect("links");
+    assert_eq!(links, 0, "refused before any retire call");
+}

@@ -14,7 +14,8 @@
 //! HELD at least one claim or hidden row (it is not fully restored).
 //!
 //! Usage:
-//!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> [--apply]
+//!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
+//!         [--attest-shared-signer <uuid,...>] [--apply]
 //!     epigraph-operator reown-claims --claims-file claims.txt --operator <uuid> \
 //!         --derived follow-claim --manifest-out reown-1.jsonl [--apply]
 //!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl [--apply]
@@ -48,6 +49,14 @@ enum Command {
         /// The operator's agent id.
         #[arg(long)]
         operator: Uuid,
+        /// Retire FORMER shared HTTP signers (batch HTTP-id, migration 116):
+        /// the principals, besides the operator, that the listed agents'
+        /// OPERATED_BY auth-lineage names and whose every write through them
+        /// the operator attests is its own (comma-separated; may be empty).
+        /// Without this flag each id goes through 107's retire, which refuses
+        /// a shared signer. With it, `--agents-file` must list exactly one id.
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        attest_shared_signer: Option<Vec<Uuid>>,
         /// Perform the calls. Without it, every call runs in a transaction that
         /// is rolled back.
         #[arg(long)]
@@ -148,18 +157,41 @@ async fn main_inner() -> anyhow::Result<i32> {
         Command::LinkRetired {
             agents_file,
             operator: op,
+            attest_shared_signer,
             apply,
         } => {
             let agents = operator::read_ids_file(&agents_file)?;
             if agents.is_empty() {
                 anyhow::bail!("no agent ids in {}", agents_file.display());
             }
+            // An attestation covers ONE former signer: the principals it names
+            // are the ones THAT signer carried. Applied to several ids, one set
+            // would be recorded as attested for every signer in the file.
+            if attest_shared_signer.is_some() && agents.len() > 1 {
+                anyhow::bail!(
+                    "--attest-shared-signer attests the principals of ONE former shared signer, \
+                     but {} lists {} agent ids; run it once per signer with a one-id file",
+                    agents_file.display(),
+                    agents.len()
+                );
+            }
             println!(
-                "link-retired: operator={op} agents={} mode={}",
+                "link-retired: operator={op} agents={} mode={}{}",
                 agents.len(),
-                if apply { "APPLY" } else { "DRY-RUN" }
+                if apply { "APPLY" } else { "DRY-RUN" },
+                match &attest_shared_signer {
+                    Some(p) => format!(" shared-signer attested={p:?}"),
+                    None => String::new(),
+                }
             );
-            let results = link::run(&mut conn, &agents, op, apply).await?;
+            let results = link::run(
+                &mut conn,
+                &agents,
+                op,
+                attest_shared_signer.as_deref(),
+                apply,
+            )
+            .await?;
             let mut refused = 0;
             for (a, s) in &results {
                 if s.is_refusal() {

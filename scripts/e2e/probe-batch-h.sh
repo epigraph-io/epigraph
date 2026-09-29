@@ -141,20 +141,20 @@ start_server() {
     # MAINTENANCE_DATABASE_URL unset and the application DSN is itself able to
     # bypass RLS: the documented fallback must NOT attach it.
     fallback_bypass) env -u MAINTENANCE_DATABASE_URL DATABASE_URL="$E2E_MAINT_DSN" RUST_LOG=warn "$BIN" \
-             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http \
+             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} \
              >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
     # Authenticated HTTP with a configured, bypass-capable maintenance DSN.
     auth)  EPIGRAPH_JWT_SECRET="$JWT_SECRET" MAINTENANCE_DATABASE_URL="$E2E_MAINT_DSN" DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
              --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" \
              >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
     none)  env -u MAINTENANCE_DATABASE_URL DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
-             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http \
+             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} \
              >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
     app)   MAINTENANCE_DATABASE_URL="$E2E_APP_DSN" DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
-             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http \
+             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} \
              >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
     maint) MAINTENANCE_DATABASE_URL="$E2E_MAINT_DSN" DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
-             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http \
+             --agent-key "$E2E_AGENT_KEY" --listen "unix:$SOCK" --allow-unauthenticated-http ${E2E_UNAUTH_WRITES---allow-unauthenticated-writes} \
              >> "$E2E/bh.$LABEL.log" 2>&1 & ;;
   esac
   PID=$!

@@ -1007,6 +1007,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "link_retired_shared_signer",
+        "WRITE through migration 116's `epigraph_link_retired_shared_signer` SECURITY DEFINER \
+         function (batch HTTP-id), EXECUTE-able by epigraph_maintenance only, exactly as \
+         `link_retired_agent`: the CONNECTION's privilege is the authorisation, so there is \
+         nothing for a Viewer to filter. Returns only the outcome of the named (agent, operator) \
+         retired link.",
+    ),
+    (
+        "agent.rs",
         "public_key_if_signer",
         "READ of `agents`, projecting `public_key` for one id already held by the caller, and only \
          where `key_kind = 'ed25519'`. `agents` is deliberately not tenancy-partitioned — \
