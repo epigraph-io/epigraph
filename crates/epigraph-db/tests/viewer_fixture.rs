@@ -514,14 +514,15 @@ pub async fn seed_group(pool: &PgPool) -> Uuid {
 ///
 /// # Why `SET SESSION AUTHORIZATION` and not `SET ROLE`
 ///
-/// Migration 074's seed escape hatch is
-/// `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`, keyed on
-/// `session_user` and not `current_user` because inside a `SECURITY DEFINER`
+/// Migration 074's seed escape hatch is keyed on `session_user` (since
+/// migration 113, `epigraph_session_is_seed()`: an explicit grant of
+/// `epigraph_seed`; before it, `pg_has_role(session_user, 'epigraph_seed',
+/// 'MEMBER')`), not on `current_user`, because inside a `SECURITY DEFINER`
 /// frame `current_user` is the function owner. `SET ROLE` changes only
 /// `current_user`, so **it does not reach the arm at all** — measured: an
 /// undeclared `INSERT INTO claims` under `SET ROLE epigraph_app` still takes
-/// arm 4 and succeeds, because the session is still the superuser the test
-/// harness connected as.
+/// arm 4 and succeeds, because the session is still the harness role the test
+/// connected as.
 ///
 /// `SET SESSION AUTHORIZATION` changes both, is available to a superuser, and
 /// is the only way a test on this harness can produce the `23502` that

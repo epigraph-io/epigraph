@@ -131,6 +131,11 @@ path = "tests/operator_reown.rs"
 required-features = ["db"]
 
 [[test]]
+name = "operator_repair"
+path = "tests/operator_repair.rs"
+required-features = ["db"]
+
+[[test]]
 name = "recompute_betp_run"
 path = "tests/recompute_betp_run.rs"
 required-features = ["db"]

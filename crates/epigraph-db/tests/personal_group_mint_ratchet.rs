@@ -359,6 +359,17 @@ const GUARDED_DEFINERS: &[(&str, usize, &[&str])] = &[
         0,
         &["public.epigraph_ensure_personal_group(p_operator)"],
     ),
+    // Migration 113's claims body is a third SQL call site of the mint: a
+    // SUPERUSER session that is not an explicit seed gets its author's personal
+    // group through 105's definer (backlog 0512ca33). The marker pins that call
+    // (a re-inlined group + admin-row mint would drop it) and 0 pins that the
+    // body revives nothing; RVK01 / RVK02 from the call refuse the INSERT
+    // (`tenancy_required.rs::superuser_undeclared_claim_by_a_revoked_author_is_refused`).
+    (
+        "epigraph_claims_require_tenancy",
+        0,
+        &["public.epigraph_ensure_personal_group(new.agent_id)"],
+    ),
 ];
 
 /// Functions the LIVE database may hold whose source matches

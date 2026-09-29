@@ -336,7 +336,8 @@ async fn seed_typed_edge(
 /// Declared and not left to the insert trigger ON PURPOSE. `communities` has
 /// `visibility` and `owner_group_id` NOT NULL with no DEFAULT (D1), and migration
 /// 074's seed escape hatch stamps an undeclared insert made by a member of the
-/// `epigraph_seed` role — which the `#[sqlx::test]` superuser is. So an
+/// `epigraph_seed` role — which the `#[sqlx::test]` harness role is, because
+/// CI grants it (migration 113). So an
 /// undeclared insert here would land on the SEED group, invisible to the viewer
 /// these arms resolve, and every count below would be zero for the wrong reason.
 async fn seed_community(pool: &PgPool, name: &str, visibility: &str, group: Uuid) -> Uuid {

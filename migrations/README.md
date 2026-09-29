@@ -447,9 +447,90 @@ Current reservation:
   ref and no open PR carries a `110`. **Applied to a throwaway database only,
   NOT to any deployed database.**
 
-- **111+**: public next
+- **111–112**: HELD for batch H-b (`origin/fix/batch-h-b-authority` carries
+  `111_admin_claim_write.sql`; its `112_admin_audit_write.sql` was in flight
+  when 113 was claimed). Not allocated by anything else. If that branch lands
+  with different numbers, these stay a gap, which sqlx accepts.
 
-Next public migration **outside both reserved tenancy ranges** must be `111` or
+- **113**: public `seed_escape_explicit_membership` (backlog 0512ca33, batch
+  R2). Migration 074's seed escape hatch asked
+  `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`, which is TRUE FOR
+  EVERY SUPERUSER without any grant, so every write over a superuser DSN that
+  named no tenancy was stamped `('public', <seed group>)` — a group with no
+  members (measured on a deployed database 2026-09-22: 56 `claims`, 46
+  `evidence`). 113 adds the invoker function
+  `epigraph_session_is_seed()` (a walk over `pg_auth_members` from
+  `session_user` along edges that confer the role, `inherit_option OR
+  set_option`, so an ADMIN-only grant is not a seed; no `pg_has_role`, no
+  `rolsuper`; EXECUTE left to PUBLIC like `epigraph_bypass()`; requires
+  PostgreSQL 16), keys the seed arm of all three `*_require_tenancy`
+  bodies on it, and gives `epigraph_claims_require_tenancy` one new arm: a
+  SUPERUSER session that is not an explicit seed gets its author's own
+  declaration — `('public', <acting operator's personal group>)` through
+  `epigraph_operator_actor`, else `('public', <author's personal group>)`
+  through `epigraph_ensure_personal_group` — which is exactly what
+  `ClaimRepository::default_decl_for_author` gives the same write on the
+  application path (105's RVK01/RVK02 refusals propagate). The author's group
+  is resolved only when the writer left `owner_group_id` NULL; a writer that
+  named the owner keeps it, and no personal group is minted for a row that
+  does not use it. The API's boot posture probes ask the same question through
+  `epigraph_db::repos::seed_posture`. A non-seed
+  superuser's undeclared ROOT row (frames, contexts, perspectives,
+  communities, harvester_fragments, recall_events) now RAISES 23502 like any
+  other non-seed writer's: those tables have no author to derive from. The
+  bodies keep their owner (`epigraph_maintenance`) and ACL; `CREATE OR
+  REPLACE` preserves both. `epigraph_bypass()` and `epigraph_definer_bypass()`
+  are deliberately left superuser-inclusive (the file's section 2 says why).
+  Behaviour in `epigraph-db/tests/tenancy_required.rs` (`superuser_*`);
+  structure in `locked_decisions.rs::d1_the_stamping_trigger_is_the_final_form`.
+  **Test-harness precondition:** `#[sqlx::test]` connects as a superuser and
+  many fixtures insert undeclared claims and root rows; they now need the
+  grant the tenancy plan always named. CI runs `GRANT epigraph_seed TO
+  epigraph` after migrating; on any other cluster run it once, and
+  `tenancy_required.rs::the_harness_role_can_take_the_seed_escape_hatch` names
+  it when missing. **Deploy note:** before applying, (1) confirm no SERVICE
+  login reaches `epigraph_seed`, directly OR through intermediate roles, with
+  the same recursive walk `epigraph_session_is_seed()` makes:
+
+  ```sql
+  WITH RECURSIVE e(member, confers, depth) AS (
+      SELECT a.member, a.inherit_option OR a.set_option, 1
+        FROM pg_auth_members a JOIN pg_roles r ON r.oid = a.roleid
+       WHERE r.rolname = 'epigraph_seed'
+      UNION
+      SELECT a.member, e.confers AND (a.inherit_option OR a.set_option), e.depth + 1
+        FROM pg_auth_members a JOIN e ON a.roleid = e.member
+  )
+  SELECT m.rolname, m.rolcanlogin, m.rolsuper, bool_or(e.confers) AS is_seed,
+         min(e.depth) AS hops
+    FROM e JOIN pg_roles m ON m.oid = e.member
+   GROUP BY 1, 2, 3 ORDER BY 4 DESC, 1;
+  ```
+
+  No row with `rolcanlogin AND is_seed` may be a service login. A row with
+  `is_seed = false` holds only ADMIN-only edges on its path: it is NOT a
+  seed, but it can grant itself the role, so it belongs in the audit.
+  Superusers appear here only if granted; a superuser with no row is not a
+  seed after 113 (`SELECT public.epigraph_session_is_seed()` on its session
+  says so once 113 is applied). Needs PostgreSQL 16 (`inherit_option`,
+  `set_option`), as 113 itself does. (2) Measure whether any superuser-DSN writer relies on the hatch
+  for a ROOT row: `SELECT count(*) FROM <root> WHERE owner_group_id =
+  '00000000-0000-0000-0000-00000000dead'` for each of the six roots, grouped
+  by `created_at` after the tenancy migrations; a non-zero recent count names
+  a writer that 113 turns into a 23502 until it declares or moves off the
+  superuser DSN. Rows already on the seed group are repaired by
+  `epigraph-operator reown-seed` (dry-run by default, reversed by
+  `reown-reverse`). **No undo runbook ships**: undo is 074's three bodies
+  re-run from `migrations/074_tenancy_required.sql` sections 1–3 (their
+  `CREATE OR REPLACE` statements only) and `DROP FUNCTION
+  public.epigraph_session_is_seed()`, in that order. Checked before claiming:
+  `origin/*` carries a `111` (batch H-b) and a local batch H-b worktree a
+  `112`; no ref carries a `113`. Above internal's `060–112` overlap. **Applied
+  to a throwaway database only, NOT to any deployed database.**
+
+- **114+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `114` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

@@ -1796,9 +1796,21 @@ async fn d1_the_stamping_trigger_is_the_final_form(pool: PgPool) {
          actionable."
     );
     assert!(
-        src.contains("epigraph_seed"),
-        "arm 4 (the seed escape hatch) must survive. Without it every undeclared \
-         test fixture in the workspace raises."
+        src.contains("public.epigraph_session_is_seed()"),
+        "arm 4 (the seed escape hatch) must survive, keyed on migration 113's \
+         explicit-membership test. Without it every undeclared test fixture in the \
+         workspace raises."
+    );
+    // Migration 113 (backlog 0512ca33): `pg_has_role` is true of every
+    // superuser, so a body that asks it lets every superuser-DSN write take the
+    // hatch and stamps the row onto the memberless seed group. The body must
+    // not ask it at all; a comment mentioning it would be prose, so this reads
+    // the call spelling.
+    assert!(
+        !src.contains("pg_has_role("),
+        "epigraph_claims_require_tenancy calls pg_has_role again. A superuser \
+         satisfies pg_has_role for every role, so that re-opens the seed escape \
+         hatch to every superuser session (migration 113)."
     );
 
     // Ordering, read structurally: the predecessor arm must appear BEFORE the

@@ -143,6 +143,23 @@ jobs:
         # (sqlx::migrate!("../../migrations") in epigraph-api/src/lib.rs) so no
         # external sqlx-cli is needed — just run the already-built binary.
         run: ./target/debug/epigraph-migrate
+      - name: Grant the test harness the seed role
+        # Migration 113 (backlog 0512ca33): migration 074's seed escape hatch
+        # used to be taken by ANY superuser, because pg_has_role() implies every
+        # role for a superuser. That is how production rows written over a
+        # superuser DSN ended up owned by the memberless seed group. 113 makes
+        # the hatch require an EXPLICIT grant. The #[sqlx::test] harness
+        # connects as this superuser and its fixtures insert undeclared claims
+        # and root rows, so it needs the grant the tenancy plan always named
+        # ("epigraph_seed granted to the test harness pools"). The role exists
+        # once the step above has run migration 060; the grant is cluster-wide,
+        # so every per-test database inherits it.
+        # tenancy_required.rs::the_harness_role_can_take_the_seed_escape_hatch
+        # fails with this remedy named if the grant is missing.
+        run: >-
+          docker exec ${{ job.services.postgres.id }}
+          psql -v ON_ERROR_STOP=1 -U epigraph -d epigraph
+          -c 'GRANT epigraph_seed TO epigraph'
       - name: Test (non-DB packages, parallel)
         # Packages without DB tests can run fully in parallel.
         # Crates with #[sqlx::test] integration tests (or live DB usage) are

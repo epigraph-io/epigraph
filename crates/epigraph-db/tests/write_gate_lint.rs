@@ -222,6 +222,23 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
         "embedding backfill, corpus-wide",
     ),
     ("match_candidate.rs::retire", "dedup sweep, corpus-wide"),
+    // Batch R2 (backlog f6310444). Called ONLY by `epigraph-operator
+    // strip-label` / `strip-label-reverse`, on the tool's maintenance DSN
+    // (`epigraph_cli::operator::connect` refuses any other session). A
+    // corpus-wide repair of a label value the write path itself refuses; the
+    // SQL is here because CLAUDE.md puts all SQL in the repo layer, and the
+    // operator tool holds no `Viewer` to splice (a bypass viewer would need a
+    // new `SystemReason`, which `viewer_ratchet.rs` forbids). A request-
+    // reachable caller of either is exactly the diff this register exists to
+    // surface.
+    (
+        "operator_repair.rs::restore_labels_conn",
+        "operator CLI only (strip-label-reverse), maintenance DSN; CAS on the whole array",
+    ),
+    (
+        "operator_repair.rs::strip_label_conn",
+        "operator CLI only (strip-label), maintenance DSN; removes one refused label value",
+    ),
     // ── privatization: selection must be unfiltered to be correct ───────────
     // Filtering these would silently skip the rows they exist to find, which is
     // the argument `SystemReason::PrivatizationSelection` already records. They

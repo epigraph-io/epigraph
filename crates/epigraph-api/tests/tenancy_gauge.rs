@@ -72,9 +72,10 @@ fn series_lines(body: &str) -> Vec<&str> {
 /// * arm (a)'s counting limb no longer exists. 074 `CREATE OR REPLACE`s
 ///   `epigraph_claims_require_tenancy` with the final form, whose undeclared
 ///   arm RAISES instead of counting.
-/// * on the harness (superuser) connection an undeclared insert takes arm 4 —
-///   `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')` is true of a
-///   superuser — and is silently STAMPED, so nothing is counted.
+/// * on the harness connection an undeclared insert takes arm 4 — the harness
+///   role, which CI grants `epigraph_seed` (migration 113; before 113 a
+///   superuser took the arm through `pg_has_role` implication), is a seed —
+///   and is silently STAMPED, so nothing is counted.
 /// * under `SET SESSION AUTHORIZATION epigraph_app` it raises `23502`, so
 ///   nothing is counted there either.
 ///

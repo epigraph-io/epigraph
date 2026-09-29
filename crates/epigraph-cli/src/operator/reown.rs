@@ -95,7 +95,9 @@ use super::tables::{
     writer_is_linked, xact_counters, Attached, ClaimRow, Kind, RowKey, Snapshot, TableSpec,
     Tenancy,
 };
-use super::{authors_personal_group, operator_group, operator_of_author, owner_is_takeable, WORLD};
+use super::{
+    authors_personal_group, operator_group, operator_of_author, owner_is_takeable, SEED, WORLD,
+};
 use anyhow::{bail, Context};
 use serde_json::json;
 use sqlx::PgConnection;
@@ -122,6 +124,22 @@ impl DerivedMode {
             Self::KeepWriter => "keep-writer",
         }
     }
+}
+
+/// Which claims a batch may move, and why.
+///
+/// The batch machinery (lock, re-classify under the lock, manifest first,
+/// one `UPDATE claims`, invariants) is shared; only the eligibility test
+/// differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rule {
+    /// `reown-claims`: a claim whose author is linked to THIS operator, owned
+    /// by `world` or by the author's own personal group.
+    Operator(Uuid),
+    /// `reown-seed` (backlog 0512ca33): a claim owned by migration 074's seed
+    /// group whose re-derived owner ([`super::seed::derive_owner`]) is the
+    /// batch's target.
+    Seed,
 }
 
 /// Everything `reown-claims` was told.
@@ -158,6 +176,21 @@ pub enum Hold {
     EdgeEndpointNotPublic {
         edges: usize,
     },
+    /// `reown-seed`: the claim is not owned by the seed group.
+    NotSeedOwned {
+        owner: Uuid,
+    },
+    /// `reown-seed`: no owner can be derived for the claim's author; the
+    /// string says why. Nothing is provisioned to make one.
+    NoDerivedOwner {
+        author: Uuid,
+        reason: String,
+    },
+    /// `reown-seed`: the author's derived owner is not this batch's target
+    /// (it changed between the plan and the batch).
+    DerivedOwnerElsewhere {
+        derived: Uuid,
+    },
     /// A row (or the claim) is not in the state this run last knew it in —
     /// the plan's reading, or an earlier batch's result — so another writer
     /// changed it after the plan recorded its prior state.
@@ -178,6 +211,16 @@ impl fmt::Display for Hold {
             Self::OwnerNotEligible { owner } => write!(
                 f,
                 "owned by group {owner}, which is neither world nor the author's own personal group"
+            ),
+            Self::NotSeedOwned { owner } => {
+                write!(f, "owned by group {owner}, not by the seed group")
+            }
+            Self::NoDerivedOwner { author, reason } => {
+                write!(f, "no owner can be derived for author {author}: {reason}")
+            }
+            Self::DerivedOwnerElsewhere { derived } => write!(
+                f,
+                "the author's derived owner is now {derived}, not this batch's target"
             ),
             Self::ClaimNotPublic { visibility } => {
                 write!(f, "claim visibility is {visibility}, not public")
@@ -219,6 +262,8 @@ pub struct Caches {
     pub operator_of: BTreeMap<Uuid, Option<Uuid>>,
     pub personal: BTreeMap<Uuid, Option<Uuid>>,
     pub linked_writer: BTreeMap<Uuid, bool>,
+    /// `reown-seed`: author → derived owner, or why there is none.
+    pub derived: BTreeMap<Uuid, Result<Uuid, String>>,
 }
 
 /// The state this run last knew each row and claim to be in: the plan's
@@ -276,7 +321,7 @@ pub async fn classify(
     specs: &[TableSpec],
     requested: &[Uuid],
     rows: &[ClaimRow],
-    operator: Uuid,
+    rule: Rule,
     target: Uuid,
     caches: &mut Caches,
 ) -> anyhow::Result<Classified> {
@@ -292,35 +337,12 @@ pub async fn classify(
             out.already.push(c.id);
             continue;
         }
-        let op = match caches.operator_of.get(&c.author) {
-            Some(v) => *v,
-            None => {
-                let v = operator_of_author(conn, c.author).await?;
-                caches.operator_of.insert(c.author, v);
-                v
-            }
+        let eligible = match rule {
+            Rule::Operator(operator) => operator_rule(conn, c, operator, caches).await?,
+            Rule::Seed => seed_rule(conn, c, target, caches).await?,
         };
-        if op != Some(operator) {
-            out.held.push((
-                c.id,
-                Hold::AuthorNotLinked {
-                    author: c.author,
-                    operator: op,
-                },
-            ));
-            continue;
-        }
-        let personal = match caches.personal.get(&c.author) {
-            Some(v) => *v,
-            None => {
-                let v = authors_personal_group(conn, c.author).await?;
-                caches.personal.insert(c.author, v);
-                v
-            }
-        };
-        if !owner_is_takeable(c.owner, personal) {
-            out.held
-                .push((c.id, Hold::OwnerNotEligible { owner: c.owner }));
+        if let Some(h) = eligible {
+            out.held.push((c.id, h));
             continue;
         }
         if c.visibility != "public" {
@@ -372,6 +394,64 @@ pub async fn classify(
     Ok(out)
 }
 
+/// `reown-claims`' eligibility: the author is linked to `operator`, and the
+/// claim is owned by world or by the author's own personal group. `None` when
+/// eligible.
+async fn operator_rule(
+    conn: &mut PgConnection,
+    c: &ClaimRow,
+    operator: Uuid,
+    caches: &mut Caches,
+) -> anyhow::Result<Option<Hold>> {
+    let op = match caches.operator_of.get(&c.author) {
+        Some(v) => *v,
+        None => {
+            let v = operator_of_author(conn, c.author).await?;
+            caches.operator_of.insert(c.author, v);
+            v
+        }
+    };
+    if op != Some(operator) {
+        return Ok(Some(Hold::AuthorNotLinked {
+            author: c.author,
+            operator: op,
+        }));
+    }
+    let personal = match caches.personal.get(&c.author) {
+        Some(v) => *v,
+        None => {
+            let v = authors_personal_group(conn, c.author).await?;
+            caches.personal.insert(c.author, v);
+            v
+        }
+    };
+    if !owner_is_takeable(c.owner, personal) {
+        return Ok(Some(Hold::OwnerNotEligible { owner: c.owner }));
+    }
+    Ok(None)
+}
+
+/// `reown-seed`'s eligibility: the claim is owned by the seed group and its
+/// author's derived owner is `target`. `None` when eligible.
+async fn seed_rule(
+    conn: &mut PgConnection,
+    c: &ClaimRow,
+    target: Uuid,
+    caches: &mut Caches,
+) -> anyhow::Result<Option<Hold>> {
+    if c.owner != SEED {
+        return Ok(Some(Hold::NotSeedOwned { owner: c.owner }));
+    }
+    match super::seed::derive_owner_cached(conn, c.author, caches).await? {
+        Err(reason) => Ok(Some(Hold::NoDerivedOwner {
+            author: c.author,
+            reason,
+        })),
+        Ok(derived) if derived != target => Ok(Some(Hold::DerivedOwnerElsewhere { derived })),
+        Ok(_) => Ok(None),
+    }
+}
+
 fn spec_of<'a>(specs: &'a [TableSpec], table: &str) -> &'a TableSpec {
     tables::spec(specs, table).expect("attached rows come only from specs")
 }
@@ -402,10 +482,16 @@ async fn kept_rows(
     conn: &mut PgConnection,
     attached: &Snapshot,
     mode: DerivedMode,
-    operator: Uuid,
+    rule: Rule,
     caches: &mut Caches,
 ) -> anyhow::Result<BTreeSet<RowKey>> {
     let mut out = BTreeSet::new();
+    // `reown-seed` always follows the claim: a derived row of a seed-owned
+    // claim inherited the seed group from it, and keeping it there is the
+    // defect being repaired.
+    let Rule::Operator(operator) = rule else {
+        return Ok(out);
+    };
     if mode != DerivedMode::KeepWriter {
         return Ok(out);
     }
@@ -632,7 +718,7 @@ pub struct Ctx<'a> {
     pub specs: &'a [TableSpec],
     /// Cascade tables with no immediate key to `claims`, locked per batch.
     pub unkeyed: &'a [String],
-    pub operator: Uuid,
+    pub rule: Rule,
     pub target: Uuid,
     pub mode: DerivedMode,
     pub lock_timeout: &'a str,
@@ -699,13 +785,7 @@ pub async fn run_batch(
     let locked = fetch_claims(conn, batch, true).await?;
     tables::lock_unkeyed_tables(conn, ctx.unkeyed).await?;
     let c = classify(
-        conn,
-        ctx.specs,
-        batch,
-        &locked,
-        ctx.operator,
-        ctx.target,
-        caches,
+        conn, ctx.specs, batch, &locked, ctx.rule, ctx.target, caches,
     )
     .await?;
     out.held = c.held;
@@ -759,7 +839,7 @@ pub async fn run_batch(
     // before the write that moves it.
     out.newly_recorded = sink.record(&records_for(&eligible, &s0, ctx.specs))?;
 
-    let keep = kept_rows(conn, &s0, ctx.mode, ctx.operator, caches).await?;
+    let keep = kept_rows(conn, &s0, ctx.mode, ctx.rule, caches).await?;
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let readable_before = app_readable(conn, ctx.specs, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
@@ -937,7 +1017,7 @@ pub struct RunReport {
 
 /// Fold one batch's result into the report and print it. Returns `false` when
 /// the run must stop (a failed batch under `--apply`).
-fn tally(
+pub(super) fn tally(
     report: &mut RunReport,
     out: &mut dyn std::io::Write,
     n: usize,
@@ -1020,7 +1100,7 @@ pub async fn run(
             &specs,
             chunk,
             &rows,
-            opts.operator,
+            Rule::Operator(opts.operator),
             target,
             &mut caches,
         )
@@ -1179,7 +1259,7 @@ pub async fn run(
     let ctx = Ctx {
         specs: &specs,
         unkeyed: &unkeyed,
-        operator: opts.operator,
+        rule: Rule::Operator(opts.operator),
         target,
         mode: opts.mode,
         lock_timeout: &opts.lock_timeout,
