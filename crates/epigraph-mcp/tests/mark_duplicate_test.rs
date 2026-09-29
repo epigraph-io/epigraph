@@ -15,7 +15,7 @@ async fn mark_duplicate_marks_dup_only(pool: PgPool) {
             .await
             .with_maintenance_pool(pool.clone()),
     );
-    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
 
     epigraph_mcp::tools::supersede::mark_duplicate(
         &server,

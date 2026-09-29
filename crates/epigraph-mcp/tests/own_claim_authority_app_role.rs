@@ -171,6 +171,14 @@ async fn edge_target(pool: &PgPool, edge: Uuid) -> Uuid {
         .expect("edge")
 }
 
+/// How many `cascade.deferred` rows exist.
+async fn cascade_deferrals(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM security_events WHERE event_type = 'cascade.deferred'")
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
 /// The `cascade.deferred` row a result names: `(agent_id, cause)`.
 async fn deferral(pool: &PgPool, body: &serde_json::Value) -> (Option<Uuid>, String) {
     assert_eq!(body["cascade"]["status"], "deferred", "{body}");
@@ -697,14 +705,13 @@ async fn claims_admin_admits_a_claim_the_caller_neither_wrote_nor_writes(pool: P
     .expect_err("without claims:admin the caller is a bystander");
     assert_not_claim_writer(&err, c);
 
-    let r = supersede_claim(
-        &server,
-        &av,
-        supersede_params(c),
-        Some(&human(a, &["claims:write", "claims:admin"])),
-    )
-    .await
-    .expect("claims:admin admits it");
+    // The borrow needs a LIVE grant on the token's client record, as the
+    // admin token endpoint mints it (migration 111's ADM02 predicate).
+    let admin_token = human(a, &["claims:write", "claims:admin"]);
+    seed_admin_grant(&pool, &admin_token).await;
+    let r = supersede_claim(&server, &av, supersede_params(c), Some(&admin_token))
+        .await
+        .expect("claims:admin admits it");
     assert!(!is_current(&pool, c).await, "the act landed");
     let (who, _) = deferral(&pool, &first_text(&r)).await;
     assert_eq!(
@@ -712,4 +719,79 @@ async fn claims_admin_admits_a_claim_the_caller_neither_wrote_nor_writes(pool: P
         Some(server_agent),
         "a caller that cannot write the group acts on the server agent's stamp"
     );
+}
+
+/// The server-stamp borrow re-checks the token's client record, not only the
+/// token's scope: MCP does not check revocation, so a still-unexpired
+/// `claims:admin` token whose client was de-scoped (`revoke-client-scope`) or
+/// revoked is refused at once (ADM02), with nothing written and no cascade
+/// recorded, for both tools that borrow. The same token lands once the grant
+/// is live again, so the refusal is the grant check and nothing else.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claims_admin_token_without_a_live_grant_cannot_borrow_the_server_stamp(pool: PgPool) {
+    let (server, server_agent) = app_role_server(&pool).await;
+    let server_group = personal_group_of(&pool, server_agent).await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "oa1-author-x").await;
+    let (a, ag) = fixture::seed_agent_with_group(&pool, "oa1-admin").await;
+    let c = claim_of(&pool, x, server_group, "public", "X's claim, server group").await;
+    let canon = claim_of(&pool, a, ag, "public", "the admin's canonical").await;
+    let av = viewer(&pool, a).await;
+    let token = human(a, &["claims:write", "claims:admin"]);
+    seed_admin_grant(&pool, &token).await;
+
+    let assert_adm02 = |err: &epigraph_mcp::errors::McpError, what: &str| {
+        assert!(
+            err.message.contains("ADM02") && err.message.contains("nothing was written"),
+            "{what}: refused, but not by the live-grant check: {err:?}"
+        );
+    };
+
+    for (label, revoke_sql) in [
+        (
+            "de-scoped",
+            "UPDATE oauth_clients SET granted_scopes = array_remove(granted_scopes, \
+             'claims:admin') WHERE id = $1",
+        ),
+        (
+            "revoked",
+            "UPDATE oauth_clients SET status = 'revoked' WHERE id = $1",
+        ),
+    ] {
+        sqlx::query(revoke_sql)
+            .bind(token.client_id)
+            .execute(&pool)
+            .await
+            .expect(label);
+        let err = supersede_claim(&server, &av, supersede_params(c), Some(&token))
+            .await
+            .expect_err("supersede without a live grant");
+        assert_adm02(&err, &format!("supersede, {label}"));
+        let err = mark_duplicate(&server, &av, dedup_params(c, canon), Some(&token))
+            .await
+            .expect_err("dedup without a live grant");
+        assert_adm02(&err, &format!("dedup, {label}"));
+        assert!(is_current(&pool, c).await, "{label}: nothing was written");
+        assert_eq!(successors(&pool, c).await, 0, "{label}: no successor");
+        assert_eq!(
+            cascade_deferrals(&pool).await,
+            0,
+            "{label}: no cascade recorded"
+        );
+        sqlx::query(
+            "UPDATE oauth_clients SET status = 'active', granted_scopes = ARRAY['claims:admin'] \
+             WHERE id = $1",
+        )
+        .bind(token.client_id)
+        .execute(&pool)
+        .await
+        .expect("restore the grant");
+    }
+
+    // CALIBRATION: the identical token with its grant live again lands.
+    let r = supersede_claim(&server, &av, supersede_params(c), Some(&token))
+        .await
+        .expect("a live grant admits the borrow");
+    assert!(!is_current(&pool, c).await, "the act landed");
+    let (who, _) = deferral(&pool, &first_text(&r)).await;
+    assert_eq!(who, Some(server_agent));
 }

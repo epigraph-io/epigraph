@@ -106,12 +106,13 @@ fn body(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 }
 
 async fn dedup(
+    pool: &PgPool,
     server: &epigraph_mcp::server::EpiGraphMcpFull,
     _viewer: &epigraph_db::visibility::Viewer,
     dup: Uuid,
     canonical: Uuid,
 ) -> serde_json::Value {
-    let (auth, admin_viewer) = common::server_admin(server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(server, pool).await;
     let result = mark_duplicate(
         server,
         &admin_viewer,
@@ -250,7 +251,7 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
          live on the edge's TARGET)"
     );
 
-    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
     mark_duplicate(
         &server,
         &admin_viewer,
@@ -362,7 +363,7 @@ async fn resourced_outgoing_edge_bba_is_re_derived_from_canonical(pool: PgPool) 
         .await
         .expect("fixture: dup --supports--> V carries a BBA on V");
 
-    let json = dedup(&server, &viewer, dup, canonical).await;
+    let json = dedup(&pool, &server, &viewer, dup, canonical).await;
 
     // The edge itself moved to `canonical`...
     let (edge_after, masses_after) = edge_bba(&pool, canonical, v, "supports")
@@ -460,7 +461,7 @@ async fn target_of_both_a_collision_delete_and_a_resourced_edge_is_recomputed_la
         "fixture: V starts with a cached BetP derived from dup's BBAs"
     );
 
-    let json = dedup(&server, &viewer, dup, canonical).await;
+    let json = dedup(&pool, &server, &viewer, dup, canonical).await;
 
     assert_eq!(orphaned_bba_count(&pool).await, 0);
     assert_eq!(stranded_bba_count(&pool).await, 0);
@@ -566,7 +567,7 @@ async fn bba_free_dedup_leaves_the_survivors_derived_columns_alone(pool: PgPool)
          exactly why an unconditional clear is a mutation"
     );
 
-    let json = dedup(&server, &viewer, dup, canonical).await;
+    let json = dedup(&pool, &server, &viewer, dup, canonical).await;
 
     let after = read(canonical, pool.clone()).await;
     assert_eq!(

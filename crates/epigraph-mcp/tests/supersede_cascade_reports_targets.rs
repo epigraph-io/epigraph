@@ -88,7 +88,7 @@ async fn supersede_reports_the_downstream_target_it_repaired(pool: PgPool) {
 
     // The enumeration the proposal sketched, run here to prove it is a trap:
     // after the commit, nothing outgoing is still sourced at the retracted id.
-    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
     let result = supersede_claim(
         &server,
         &admin_viewer,
@@ -187,7 +187,7 @@ async fn sole_supporter_retraction_is_reported_as_unbacked_not_as_nothing_to_do(
     let b = seed_claim(&pool, "sole-supported claim B", 0.5).await;
     wire_supports(&server, &viewer, a, b).await;
 
-    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
     let result = supersede_claim(
         &server,
         &admin_viewer,
@@ -258,7 +258,7 @@ async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
     .await
     .expect("corrupt surviving BBA");
 
-    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
     let result = supersede_claim(
         &server,
         &admin_viewer,
@@ -307,7 +307,7 @@ async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
     let u = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
     wire_supports(&server, &viewer, u, dup).await;
 
-    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
     let result = mark_duplicate(
         &server,
         &admin_viewer,
@@ -407,7 +407,7 @@ async fn a_refused_downstream_target_fails_alone_on_the_stamped_cascade(pool: Pg
     .await
     .expect("inject trigger");
 
-    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
     let result = supersede_claim(
         &server,
         &admin_viewer,

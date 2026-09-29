@@ -14,7 +14,7 @@ async fn supersede_claim_marks_old_and_links_new(pool: PgPool) {
             .await
             .with_maintenance_pool(pool.clone()),
     );
-    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
 
     let result = epigraph_mcp::tools::supersede::supersede_claim(
         &server,
@@ -104,7 +104,7 @@ async fn supersede_claim_nulls_embedding_on_superseded_claim(pool: PgPool) {
             .await
             .with_maintenance_pool(pool.clone()),
     );
-    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
 
     // Call the MCP supersede handler. If the handler fails to null the
     // embedding before flipping is_current=false this will surface as a

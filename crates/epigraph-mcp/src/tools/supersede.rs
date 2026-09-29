@@ -158,7 +158,8 @@ pub(crate) async fn admin_session_or_deferral<'s>(
 ///    server agent's stamp, because that would hand a `claims:write` caller
 ///    the server agent's write authority over the group; the borrow is
 ///    granted only by `EpiGraphMcpFull::admin_borrowed_server_identity`, which
-///    re-checks `claims:admin`. Either way the database decides the write: a
+///    re-checks `claims:admin` on the token AND a live `claims:admin` grant on
+///    the token's client record (migration 111's `ADM02` predicate). Either way the database decides the write: a
 ///    stamp that cannot write the row is refused and nothing commits.
 ///
 /// The caller's own stamp is its WRITE IDENTITY (batch H-b, D1):
@@ -254,9 +255,13 @@ async fn begin_claim_act<'p>(
         // agent's stamp below, which only `claims:admin` may borrow.
         return Err(crate::errors::claim_not_writer(claim, action));
     }
-    // Rolled back: it read, and wrote nothing.
+    // The borrow re-checks the token's client record (111's ADM02 predicate)
+    // on the caller's own transaction, then that transaction is rolled back:
+    // it read, and wrote nothing.
+    let server_agent = server
+        .admin_borrowed_server_identity(token, &mut caller_tx)
+        .await?;
     drop(caller_tx);
-    let server_agent = server.admin_borrowed_server_identity(token).await?;
     let tx = crate::claim_helper::begin_author_stamped_tx(server, server_agent, tool).await?;
     Ok((tx, server_agent.agent_id()))
 }

@@ -282,6 +282,10 @@ async fn the_operators_http_principal_may_retire_and_patch_its_agents_claims(poo
     assert!(is_current(&pool, c3).await, "the refused supersede wrote");
     let mut admin = http_auth(Some(operator));
     admin.scopes.push("claims:admin".to_string());
+    // A live grant on the token's client record, as the token endpoint mints
+    // an admin token: the admin act on a group the operator does not write
+    // borrows the server agent's stamp, which re-checks it (ADM02).
+    common::seed_admin_grant(&pool, &admin).await;
     supersede(&server, &pool, c3, Some(&admin))
         .await
         .expect("with claims:admin the operator's HTTP principal supersedes, as before OA1");

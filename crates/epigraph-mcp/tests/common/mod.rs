@@ -558,6 +558,21 @@ pub async fn seed_admin_grant(pool: &PgPool, token: &AuthContext) {
     .expect("seed the admin token's client record");
 }
 
+/// [`server_admin`] whose token's client record GRANTS `claims:admin`
+/// ([`seed_admin_grant`]), as a token minted by `oauth/token.rs` from a live
+/// admin client is. Needed wherever the admin acts on a claim it does not write:
+/// `supersede_claim` / `mark_duplicate` then borrow the server agent's stamp,
+/// and that borrow re-checks the live grant (migration 111's ADM02 predicate).
+/// Use plain [`server_admin`] for the grantless case.
+pub async fn granted_server_admin(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    pool: &PgPool,
+) -> (AuthContext, epigraph_db::visibility::Viewer) {
+    let (auth, viewer) = server_admin(server).await;
+    seed_admin_grant(pool, &auth).await;
+    (auth, viewer)
+}
+
 /// A real agent with a live personal group, a `claims:write`-style token that
 /// names it the way `oauth/token.rs` does (`sub`/`owner_id` are
 /// `oauth_clients` ids, only `agent_id` is an `agents.id`), and its viewer.

@@ -184,23 +184,61 @@ impl EpiGraphMcpFull {
     /// that stamp: it would hand a `claims:write` caller the server agent's
     /// write authority. Since batch H-b a tool module cannot construct a
     /// [`crate::write_identity::WriteIdentity`] itself
-    /// (`tests/write_identity_ratchet.rs`), so the scope check that licenses the
+    /// (`tests/write_identity_ratchet.rs`), so the check that licenses the
     /// borrow lives here, beside [`Self::write_identity`], and is re-checked on
     /// every call rather than trusted from the caller.
+    ///
+    /// The token's `claims:admin` SCOPE is necessary, not sufficient. MCP
+    /// verifies a token's signature and expiry but not its revocation, so the
+    /// token's client record must still grant `claims:admin` to this principal:
+    /// migration 111's `ADM02` predicate, re-read on `conn` (the caller's own
+    /// stamped transaction) through
+    /// `SecurityEventRepository::admin_grant_is_live`, exactly as the audited
+    /// admin paths of `patch_claim` (111) and the workflow step ops do. A
+    /// de-scoped or revoked client's still-unexpired token is refused here at
+    /// once instead of borrowing the server agent's stamp until it expires. The
+    /// only caller is `tools::supersede::begin_claim_act`; the ratchet in
+    /// `tests/write_identity_ratchet.rs` pins that.
     ///
     /// # Errors
     ///
     /// An MCP invalid-request error when `auth` does not carry `claims:admin`,
-    /// and whatever [`Self::agent_id`] returns.
+    /// names no agent principal, or its client record grants no live
+    /// `claims:admin` to that principal (`ADM02`); an internal error when the
+    /// grant cannot be read; and whatever [`Self::agent_id`] returns.
     pub(crate) async fn admin_borrowed_server_identity(
         &self,
         auth: &epigraph_auth::AuthContext,
+        conn: &mut sqlx::PgConnection,
     ) -> Result<crate::write_identity::WriteIdentity, McpError> {
         if !auth.has_scope("claims:admin") {
             return Err(McpError::invalid_request(
                 "only a claims:admin caller may act under this server's own agent's stamp; \
                  nothing was written"
                     .to_string(),
+                None,
+            ));
+        }
+        let principal = auth
+            .agent_id
+            .ok_or_else(crate::write_identity::no_agent_principal_refusal)?;
+        let live = epigraph_db::SecurityEventRepository::admin_grant_is_live(
+            &mut *conn,
+            auth.client_id,
+            principal,
+        )
+        .await
+        .map_err(|e| {
+            crate::errors::internal_error(format!("could not re-check the admin grant: {e}"))
+        })?;
+        if !live {
+            return Err(McpError::invalid_request(
+                format!(
+                    "caller agent {principal} holds claims:admin in its token, but the token's \
+                     client record ({}) grants it no live claims:admin, so it may not act under \
+                     this server's own agent's stamp (ADM02); nothing was written",
+                    auth.client_id
+                ),
                 None,
             ));
         }
@@ -966,7 +1004,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. WHO MAY: scope claims:write, and the caller must WRITE the group that owns the claim (admin or writer membership; being its author is not enough), or hold claims:admin (which admits any claim it can read). A claim the caller cannot read is reported as not found, exactly like a missing one; one it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The retirement and the new claim commit together on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a claim it does not write acts with this server's agent's authority instead. The database refuses a row the stamp cannot write. The follow-on cascade (moving other writers' edges onto the replacement, invalidating their frozen BBAs) is administrative: it is reported as cascade.status=\"deferred\" and applied by the replay timer. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
+        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. WHO MAY: scope claims:write, and the caller must WRITE the group that owns the claim (admin or writer membership; being its author is not enough), or hold claims:admin (which admits any claim it can read). A claim the caller cannot read is reported as not found, exactly like a missing one; one it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The retirement and the new claim commit together on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a claim it does not write acts with this server's agent's authority instead, and only while its token's own client record still grants claims:admin (a de-scoped or revoked client's token, and the injected context of an --allow-unauthenticated-http listener, which has no client record, are refused there with ADM02 and nothing written). The database refuses a row the stamp cannot write. The follow-on cascade (moving other writers' edges onto the replacement, invalidating their frozen BBAs) is administrative: it is reported as cascade.status=\"deferred\" and applied by the replay timer. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
     )]
     async fn supersede_claim(
         &self,
@@ -980,7 +1018,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical's own row untouched. WHO MAY: scope claims:write, and the caller must WRITE the group that owns the DUPLICATE (admin or writer membership; being its author is not enough), or hold claims:admin; the caller must likewise write the group that owns the CANONICAL (or hold claims:admin), because the cascade moves other writers' edges and mass functions onto it; a canonical it can read but not write is refused the same way, naming the canonical. The act commits on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a duplicate it does not write acts with this server's agent's authority instead. A duplicate or canonical the caller cannot read is reported as not found, exactly like a missing one; a duplicate it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The follow-on cascade is administrative and reported as cascade.status=\"deferred\" (the replay timer applies it): the duplicate's edges move to the canonical and their edge-keyed mass functions move with them; when the canonical is a PUBLIC claim the caller cannot write (reachable with claims:admin only), the moved mass functions are owned by their writers' groups (public) and the canonical's frame assignments are created through an audited path (a duplicate bound to binary_truth at a non-zero hypothesis_index cannot pass that binding to such a canonical: the call is refused with nothing written). Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
+        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical's own row untouched. WHO MAY: scope claims:write, and the caller must WRITE the group that owns the DUPLICATE (admin or writer membership; being its author is not enough), or hold claims:admin; the caller must likewise write the group that owns the CANONICAL (or hold claims:admin), because the cascade moves other writers' edges and mass functions onto it; a canonical it can read but not write is refused the same way, naming the canonical. The act commits on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a duplicate it does not write acts with this server's agent's authority instead, and only while its token's own client record still grants claims:admin (a de-scoped or revoked client's token, and the injected context of an --allow-unauthenticated-http listener, which has no client record, are refused there with ADM02 and nothing written). A duplicate or canonical the caller cannot read is reported as not found, exactly like a missing one; a duplicate it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The follow-on cascade is administrative and reported as cascade.status=\"deferred\" (the replay timer applies it): the duplicate's edges move to the canonical and their edge-keyed mass functions move with them; when the canonical is a PUBLIC claim the caller cannot write (reachable with claims:admin only), the moved mass functions are owned by their writers' groups (public) and the canonical's frame assignments are created through an audited path (a duplicate bound to binary_truth at a non-zero hypothesis_index cannot pass that binding to such a canonical: the call is refused with nothing written). Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
     )]
     async fn mark_duplicate(
         &self,

@@ -110,11 +110,12 @@ async fn wire_supports(
 }
 
 async fn supersede(
+    pool: &PgPool,
     server: &epigraph_mcp::server::EpiGraphMcpFull,
     _viewer: &epigraph_db::visibility::Viewer,
     old: Uuid,
 ) -> Result<rmcp::model::CallToolResult, epigraph_mcp::errors::McpError> {
-    let (auth, admin_viewer) = common::server_admin(server).await;
+    let (auth, admin_viewer) = common::granted_server_admin(server, pool).await;
     supersede_claim(
         server,
         &admin_viewer,
@@ -185,7 +186,7 @@ async fn downstream_cache_drops_retracted_supporter(pool: PgPool) {
 
     let betp_before = read_betp(&pool, b).await.expect("B has a cached BetP");
 
-    supersede(&server, &viewer, a)
+    supersede(&pool, &server, &viewer, a)
         .await
         .expect("supersede_claim succeeds");
 
@@ -271,7 +272,7 @@ async fn cascade_does_not_touch_unrelated_bbas_or_claims(pool: PgPool) {
             .await
             .expect("read D updated_at");
 
-    supersede(&server, &viewer, a)
+    supersede(&pool, &server, &viewer, a)
         .await
         .expect("supersede_claim succeeds");
 
@@ -340,7 +341,7 @@ async fn sole_supporter_retraction_does_not_leave_frozen_belief(pool: PgPool) {
             .expect("count B BBAs");
     assert_eq!(bba_count_before, 1, "fixture: A->B must be B's only BBA");
 
-    supersede(&server, &viewer, a)
+    supersede(&pool, &server, &viewer, a)
         .await
         .expect("supersede_claim succeeds");
 
@@ -417,7 +418,7 @@ async fn cyclic_support_terminates(pool: PgPool) {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        supersede(&server, &viewer, a),
+        supersede(&pool, &server, &viewer, a),
     )
     .await
     .expect("cascade must terminate on a mutually-supporting pair, not loop");
@@ -492,7 +493,7 @@ async fn cascade_failure_does_not_fail_the_write(pool: PgPool) {
     .await
     .expect("corrupt surviving BBA");
 
-    let result = supersede(&server, &viewer, a).await;
+    let result = supersede(&pool, &server, &viewer, a).await;
     assert!(
         result.is_ok(),
         "supersede must still report success when the belief subsystem cannot \
@@ -576,7 +577,7 @@ async fn second_hop_downstream_of_the_retraction_is_not_touched(pool: PgPool) {
             .await
             .expect("read C updated_at");
 
-    supersede(&server, &viewer, a)
+    supersede(&pool, &server, &viewer, a)
         .await
         .expect("supersede_claim succeeds");
 
