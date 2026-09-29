@@ -764,6 +764,9 @@ Current reservation:
   First written as `102`, a hole below the deployed head; renumbered to the
   next free version so no database at head sees a version below its head
   arrive late. Checked before claiming: no open PR branch carries a `121`.
+  Sets `lock_timeout = '3s'` like 111-120 (its CHECK rebuild validates every
+  row under ACCESS EXCLUSIVE); added in place before 121 was applied to any
+  deployed database.
 
 - **122+**: public next
 
