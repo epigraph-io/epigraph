@@ -7,7 +7,8 @@
 # formatting or lint failure slip through to CI. KEEP THIS IN SYNC WITH ci.yml.
 #
 # Usage:
-#   ./scripts/verify.sh            # fmt + clippy + build (+ workspace tests if DATABASE_URL is set)
+#   ./scripts/verify.sh            # fmt + clippy + build (+ workspace tests if DATABASE_URL is set),
+#                                  # then the standalone services/explorer crate (always)
 #   DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/<testdb> ./scripts/verify.sh
 #
 # The DB-backed (#[sqlx::test]) tests require a reachable Postgres; they are run
@@ -52,5 +53,23 @@ if [ -n "${DATABASE_URL:-}" ]; then
 else
   step "SKIP tests — set DATABASE_URL to run the workspace + DB-backed suites"
 fi
+
+# services/explorer is a standalone crate (its own [workspace], Cargo.lock and
+# target/), so none of the --workspace commands above reach it. Mirrors the
+# `test` job in .github/workflows/explorer.yml — KEEP THIS IN SYNC WITH IT TOO.
+# Its tests stub the API with wiremock and need no database, so they always run.
+explorer() { (cd services/explorer && "$@"); }
+
+step "services/explorer: cargo fmt --check"
+explorer cargo fmt --check
+
+step "services/explorer: cargo clippy --all-targets --locked -- -D warnings"
+explorer cargo clippy --all-targets --locked -- -D warnings
+
+step "services/explorer: cargo test --locked"
+explorer cargo test --locked
+
+step "services/explorer: cargo build --release --locked"
+explorer cargo build --release --locked
 
 printf '\n\xE2\x9C\x85 verify passed\n'

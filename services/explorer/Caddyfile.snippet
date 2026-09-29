@@ -1,0 +1,61 @@
+# EpiGraph Explorer — append inside the public site block of the VM Caddyfile,
+# next to the existing epigraph-api stanzas (same pattern as services/nli).
+# Assumes the explorer listens on 127.0.0.1:8096 on the same host: either the
+# systemd unit (epigraph-explorer.service.example) or a --network host
+# container. The binary binds loopback only, so Caddy is the public edge.
+#
+# PREFIX STRIPPING. `handle_path` strips the matched `/explorer` prefix before
+# proxying, so the explorer receives `/claim/<id>`, not
+# `/explorer/claim/<id>`. It cannot recover the prefix from the request, so
+# EPIGRAPH_EXPLORER_PUBLIC_BASE_URL must carry it, e.g.
+#   EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com/explorer
+# Every link, redirect, og:url, the cookie Path and the OAuth redirect_uri
+# (`.../explorer/auth/callback`, which must match the oauth_clients row
+# byte for byte) are generated from it. The explorer also answers on the
+# unstripped paths, so `handle /explorer* { ... }` works too; pick one.
+#
+# /oauth/* MUST STAY BROWSER-REACHABLE. Sign-in is the API's own OAuth
+# authorization server, and the browser navigates to it directly:
+#   GET  /oauth/authorize            (explorer -> API, with PKCE)
+#   GET  /oauth/callback             (Google -> API)
+#   POST /oauth/authorize/consent    (the consent form's root-relative action)
+# These live at the root of the API's EPIGRAPH_PUBLIC_BASE_URL and are
+# already exposed for the claude.ai connector. Do not move them behind this
+# prefix, and do not let a broader matcher here shadow them. Point
+# EPIGRAPH_OAUTH_BASE_URL at that browser-facing API origin. Only /api/v1 can
+# stay hidden behind the explorer (it reaches the API on loopback via
+# EPIGRAPH_API_URL). The explorer's own sign-in routes are /explorer/auth/*,
+# which are distinct from the API's /oauth/*.
+#
+# RATE LIMITING /explorer/auth/login. Every anonymous GET of that path
+# stores a pending login in the explorer's process-local map (10-minute TTL,
+# 10 000 entries). The explorer keeps the map bounded by evicting its oldest
+# entries rather than refusing, so a flood can no longer lock anyone out of
+# sign-in — but it can still evict other people's in-flight attempts, which
+# makes them retry. An edge rate limit on that one path removes even that.
+# Caddy has no rate limiter in the standard build; with the
+# `caddy-ratelimit` module built in, add inside the handle_path block:
+#
+#   @login path /auth/login
+#   rate_limit @login {
+#       zone explorer_login {
+#           key    {remote_host}
+#           events 30
+#           window 1m
+#       }
+#   }
+#
+# (`handle_path` has already stripped `/explorer`, so the matcher is
+# `/auth/login`.) Do not rate-limit `/auth/callback`: one slow sign-in behind
+# a shared NAT would then fail at the last step.
+#
+# HEADERS. The explorer sets its own Content-Security-Policy, including
+# `frame-ancestors` (the Notion embed depends on it), X-Content-Type-Options
+# and Referrer-Policy. Do not add X-Frame-Options or a second CSP for this
+# path in Caddy: a site-wide `X-Frame-Options: DENY` breaks the embed. Do not
+# strip the Origin request header (Caddy forwards it by default): POST
+# /auth/logout compares it with the public origin.
+
+handle_path /explorer* {
+    reverse_proxy 127.0.0.1:8096
+}
