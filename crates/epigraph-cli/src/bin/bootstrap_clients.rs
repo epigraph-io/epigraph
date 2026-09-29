@@ -28,7 +28,7 @@ use epigraph_cli::bootstrap::{bootstrap_canonical_clients, ClientOutcome};
 )]
 struct Args {
     /// Postgres connection string. Falls back to $DATABASE_URL.
-    #[arg(long, env = "DATABASE_URL")]
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
     /// Legal entity name. Required by the `services_must_have_legal_entity`

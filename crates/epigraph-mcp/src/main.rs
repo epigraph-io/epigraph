@@ -44,7 +44,7 @@ use epigraph_mcp::EpiGraphMcpFull;
 )]
 struct Cli {
     /// PostgreSQL connection URL
-    #[arg(long, env = "DATABASE_URL")]
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
     /// Ed25519 secret key (64 hex chars). If omitted, generates a new keypair.
@@ -57,7 +57,7 @@ struct Cli {
     agent_key: Option<String>,
 
     /// OpenAI API key for embedding generation. If omitted, uses mock embeddings.
-    #[arg(long, env = "OPENAI_API_KEY")]
+    #[arg(long, env = "OPENAI_API_KEY", hide_env_values = true)]
     openai_api_key: Option<String>,
 
     /// Listen on HTTP. Accepts either `host:port` (TCP) or `unix:/abs/path` (Unix socket).
@@ -76,7 +76,7 @@ struct Cli {
     /// set. Must be at least 32 bytes. The same secret signs and verifies tokens
     /// across both `epigraph-api` and `epigraph-mcp` — when rotating, restart
     /// both processes with the new value.
-    #[arg(long, env = "EPIGRAPH_JWT_SECRET")]
+    #[arg(long, env = "EPIGRAPH_JWT_SECRET", hide_env_values = true)]
     jwt_secret: Option<String>,
 
     /// Acknowledge that HTTP transport exposes all MCP tools without authentication.
@@ -119,6 +119,7 @@ struct Cli {
     #[arg(
         long = "allowed-host",
         env = "EPIGRAPH_MCP_ALLOWED_HOSTS",
+        hide_env_values = true,
         value_delimiter = ','
     )]
     allowed_host: Vec<String>,
@@ -140,12 +141,16 @@ struct Cli {
     /// stdio only, with a declared identity (`--agent-model` / `--agent-key`).
     /// Refused with `--listen`, and an HTTP listener whose signer already has a
     /// link refuses to start.
-    #[arg(long = "operator-id", env = "EPIGRAPH_OPERATOR_ID")]
+    #[arg(
+        long = "operator-id",
+        env = "EPIGRAPH_OPERATOR_ID",
+        hide_env_values = true
+    )]
     operator_id: Option<uuid::Uuid>,
 
     /// Absolute URL of the protected-resource metadata document, advertised in 401
     /// WWW-Authenticate challenges so MCP clients can discover the auth server.
-    #[arg(long, env = "EPIGRAPH_RESOURCE_METADATA_URL")]
+    #[arg(long, env = "EPIGRAPH_RESOURCE_METADATA_URL", hide_env_values = true)]
     resource_metadata_url: Option<String>,
 
     /// Provider model identifier for LLM-agent identity derivation (e.g.
@@ -153,7 +158,7 @@ struct Cli {
     /// the agent keypair is derived deterministically from `(model, prompt)` so
     /// identical configurations collapse to ONE agent. Absent -> unchanged
     /// behavior (a fresh keypair per process).
-    #[arg(long, env = "EPIGRAPH_AGENT_MODEL")]
+    #[arg(long, env = "EPIGRAPH_AGENT_MODEL", hide_env_values = true)]
     agent_model: Option<String>,
 
     /// Raw system prompt for LLM-agent identity derivation. Hashed internally
@@ -161,7 +166,7 @@ struct Cli {
     /// Prefer `--agent-system-prompt-hash` when the prompt should not be
     /// materialized in this process's argv/env at all. Ignored unless
     /// `--agent-model` is also set.
-    #[arg(long, env = "EPIGRAPH_AGENT_SYSTEM_PROMPT")]
+    #[arg(long, env = "EPIGRAPH_AGENT_SYSTEM_PROMPT", hide_env_values = true)]
     agent_system_prompt: Option<String>,
 
     /// Pre-computed BLAKE3 lowercase-hex digest of the system prompt. Lets the
@@ -169,7 +174,11 @@ struct Cli {
     /// putting the raw prompt in this process. Takes precedence over
     /// `--agent-system-prompt` when both are set. Ignored unless `--agent-model`
     /// is also set.
-    #[arg(long, env = "EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH")]
+    #[arg(
+        long,
+        env = "EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH",
+        hide_env_values = true
+    )]
     agent_system_prompt_hash: Option<String>,
 }
 
