@@ -1034,7 +1034,6 @@ async fn retire_route_on_the_app_role_under_118_runs_on_the_maintenance_pool_or_
     let (w, _) = viewer_fixture::seed_agent_with_group(&pool, "w10-retirer").await;
     let token = admin_bearer_token(w, Some(w), "agent");
     let promote = decide_bearer_token(w, Some(w), "agent");
-    viewer_fixture::apply_migration_118_stale_guard(&pool).await;
 
     for admin in [true, false] {
         let a = insert_claim(&pool, w).await;
@@ -1113,7 +1112,6 @@ async fn d9_every_cascading_route_defers_on_the_app_role_without_a_maintenance_p
     let write = decide_bearer_token(w, Some(w), "agent");
     let admin = admin_bearer_token(w, Some(w), "agent");
     let reason = epigraph_engine::admin_cascade::REASON_NOT_CONFIGURED;
-    viewer_fixture::apply_migration_118_stale_guard(&pool).await;
 
     // Supersede.
     let old = public_claim_owned_by(&pool, w, w_group, "d9 superseded").await;

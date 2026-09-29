@@ -1692,7 +1692,6 @@ async fn retire_tool_under_118_runs_on_the_admin_path_and_defers_without_one(poo
     let (server, agent2, _, viewer2) = app_role_server(&pool).await;
     let auth = non_admin_owner(agent);
     let auth2 = non_admin_owner(agent2);
-    fixture::apply_migration_118_stale_guard(&pool).await;
 
     // D9: the request path records the whole retirement as deferred; the
     // replay's admin path carries it out under the requester's name.

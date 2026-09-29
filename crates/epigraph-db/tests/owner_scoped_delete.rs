@@ -918,7 +918,8 @@ async fn a_dedup_collision_with_another_writers_row_keeps_the_canonicals(pool: P
 /// against a status the candidate no longer has is refused with nothing
 /// changed; one requested against its current status lands, and a replay of
 /// it is harmless.
-async fn retirement_is_administrative_end_to_end(pool: PgPool, with_118: bool) {
+#[sqlx::test(migrations = "../../migrations")]
+async fn match_candidate_retirement_is_administrative_end_to_end(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (x, _) = fixture::seed_agent_with_group(&pool, "wirer-x").await;
     let c1 = fixture::seed_public_claim(&pool, author, "match side one").await;
@@ -953,10 +954,7 @@ async fn retirement_is_administrative_end_to_end(pool: PgPool, with_118: bool) {
         .await
         .expect("candidate");
     assert_app_role_does_not_bypass(&pool).await;
-    if with_118 {
-        fixture::apply_migration_118_stale_guard(&pool).await;
-        fixture::assert_stale_guard_refuses_the_app_role(&pool, cand.id).await;
-    }
+    fixture::assert_stale_guard_refuses_the_app_role(&pool, cand.id).await;
 
     let p = pool.clone();
     let bba = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
@@ -1051,17 +1049,6 @@ async fn retirement_is_administrative_end_to_end(pool: PgPool, with_118: bool) {
         cascade_audit(&pool).await.is_empty(),
         "no definer, no definer audit"
     );
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn match_candidate_retirement_is_administrative_end_to_end(pool: PgPool) {
-    retirement_is_administrative_end_to_end(pool, false).await;
-}
-
-/// The same, with migration 118's stale guard applied (W11, #518).
-#[sqlx::test(migrations = "../../migrations")]
-async fn match_candidate_retirement_is_administrative_end_to_end_under_118(pool: PgPool) {
-    retirement_is_administrative_end_to_end(pool, true).await;
 }
 
 /// Maintenance and the superuser are unchanged: both remove another writer's
