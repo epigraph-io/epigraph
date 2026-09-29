@@ -2244,13 +2244,14 @@ async fn a_reader_cannot_delete_its_groups_sealed_rows(pool: PgPool) {
 /// 115 section 1). A new pair fails here until it is gated or listed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_unscoped_fk_cascade_into_tier_a_is_listed(pool: PgPool) {
-    const ACCEPTED: &[(&str, &str)] = &[
-        ("experiment_entities", "experiment_entity_mentions"),
-        ("experiment_entities", "experiment_triples"),
-        ("graph_clusters", "claim_cluster_membership"),
-        ("graph_neighborhoods", "claim_neighborhood_membership"),
-        ("harvester_sources", "harvester_fragments"),
-    ];
+    // Migration 118 section 6 closed four former entries by revoking the
+    // application role's DELETE on the parent (graph_neighborhoods) or every
+    // write on it (experiment_entities, harvester_sources):
+    // experiment_entities -> experiment_entity_mentions / experiment_triples,
+    // graph_neighborhoods -> claim_neighborhood_membership, and
+    // harvester_sources -> harvester_fragments. Only the cluster
+    // materialization remains reachable.
+    const ACCEPTED: &[(&str, &str)] = &[("graph_clusters", "claim_cluster_membership")];
     let pairs: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT pc.relname::text, cc.relname::text \
            FROM pg_constraint k \
