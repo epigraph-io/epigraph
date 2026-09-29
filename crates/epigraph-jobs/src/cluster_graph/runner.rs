@@ -371,6 +371,13 @@ async fn gc_old_runs(pool: &PgPool, retain: u32) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    // ZERO ROWS IS FINE HERE (W10 sweep): this runs on the job runner's
+    // maintenance pool (the `drain_jobs` timer since operator decision D9,
+    // `MAINTENANCE_DATABASE_URL`; migration 119 grants it this DELETE), which
+    // bypasses row security, so a row it does not delete is a row that does
+    // not exist. It is idempotent cleanup either way: the `graph_clusters`
+    // DELETE below cascades the same memberships through
+    // `claim_cluster_membership_cluster_id_fkey`.
     sqlx::query(
         "DELETE FROM claim_cluster_membership WHERE run_id NOT IN (SELECT run_id FROM graph_cluster_runs)",
     )

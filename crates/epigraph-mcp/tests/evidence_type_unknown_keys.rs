@@ -64,7 +64,7 @@ async fn submit(
     }))
     .unwrap();
     first_text(
-        &tools::ds::submit_ds_evidence(server, viewer, p)
+        &tools::ds::submit_ds_evidence(server, viewer, p, None)
             .await
             .expect("an unknown evidence_type is accepted, not refused"),
     )
@@ -137,12 +137,13 @@ async fn a_frame_override_key_is_not_reported_unknown(pool: PgPool) {
 async fn set_source_reliability_reports_keys_the_lens_can_never_match(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    let _ = viewer;
 
     let created = first_text(
         &tools::perspectives::create_perspective(
             &server,
+            &viewer,
             serde_json::from_value(serde_json::json!({"name": "g12 lens"})).unwrap(),
+            None,
         )
         .await
         .expect("create perspective"),
@@ -152,11 +153,13 @@ async fn set_source_reliability_reports_keys_the_lens_can_never_match(pool: PgPo
     let clean = first_text(
         &tools::perspectives::set_source_reliability(
             &server,
+            &viewer,
             serde_json::from_value(serde_json::json!({
                 "perspective_id": pid,
                 "source_reliability": {"empirical": 0.9, "supports": 0.7},
             }))
             .unwrap(),
+            None,
         )
         .await
         .unwrap(),
@@ -166,11 +169,13 @@ async fn set_source_reliability_reports_keys_the_lens_can_never_match(pool: PgPo
     let dirty = first_text(
         &tools::perspectives::set_source_reliability(
             &server,
+            &viewer,
             serde_json::from_value(serde_json::json!({
                 "perspective_id": pid,
                 "source_reliability": {"empirical": 0.9, "Testimonial": 0.4, "made_up": 0.5},
             }))
             .unwrap(),
+            None,
         )
         .await
         .expect("unknown keys are a warning, not a refusal"),
@@ -230,7 +235,9 @@ async fn a_lowercase_unknown_key_still_weights_a_bba_carrying_it(pool: PgPool) {
     let created = first_text(
         &tools::perspectives::create_perspective(
             &server,
+            &viewer,
             serde_json::from_value(serde_json::json!({"name": "g12 review lens"})).unwrap(),
+            None,
         )
         .await
         .expect("create perspective"),
@@ -242,11 +249,13 @@ async fn a_lowercase_unknown_key_still_weights_a_bba_carrying_it(pool: PgPool) {
         let set = first_text(
             &tools::perspectives::set_source_reliability(
                 &server,
+                &viewer,
                 serde_json::from_value(serde_json::json!({
                     "perspective_id": pid,
                     "source_reliability": {"anecdote": alpha},
                 }))
                 .unwrap(),
+                None,
             )
             .await
             .unwrap(),

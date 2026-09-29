@@ -36,18 +36,24 @@
 //!
 //! # Tenancy
 //!
-//! Both mutations run on ONE transaction stamped from the MCP server's own
-//! agent (`claim_helper::begin_author_stamped_tx`), with their events on the
-//! same transaction. WRITE authority is the server agent's, as for every other
-//! MCP write. READ authority is the CALLER's: before either write, the edge is
+//! Both mutations run on ONE transaction stamped from the write identity (the
+//! caller over HTTP, the server's own agent on stdio; batch H-b D1, via
+//! `claim_helper::begin_author_stamped_tx`), with their events on the same
+//! transaction. READ authority is the CALLER's: before either write, the edge is
 //! read through the caller's viewer on that transaction
 //! (`EdgeRepository::visible_to`), and an edge the caller cannot see is
 //! reported as "not found" with nothing written. Before that gate (batch H-a
 //! review) neither tool took a viewer, so any `claims:write` caller could
 //! retire or relabel an edge touching a server-group-private claim it could not
-//! read. Whether the caller should also need OWNERSHIP of the edge (edges carry
-//! no author column; the candidates are its endpoints' authors) is the
-//! cross-agent authority question (H-b, #374), not this gate's.
+//! read.
+//!
+//! WRITE authority is the edge's OWNER (migrations 117/120, operator decision
+//! D8): an edge between two public claims is owned by its writer's group, so
+//! the writing session patches, retracts and deletes its own edge and nobody
+//! else's; a world-owned edge (legacy, principal-less, or structural) is
+//! administrative. A write the database refuses on an edge the caller CAN read
+//! answers the explicit `not_owner` refusal naming the rule
+//! (`errors::edge_not_owner`), never "not found".
 //!
 //! # `valid_to: "now"`
 //!
@@ -65,17 +71,19 @@
 //!   already documents per-edge provenance as deferred for MCP writes; these
 //!   tools follow that precedent rather than inventing a second provenance
 //!   path.
-//! * **BBA invalidation.** Neither the HTTP routes nor these wrappers touch
-//!   the `perspective_id = edge_id` mass function that
-//!   `edge_factor::auto_wire_ds_for_edge` stored when an epistemic edge was
-//!   created. Retiring or deleting the edge therefore leaves the target's
-//!   combined belief still carrying the retracted edge's contribution — the
-//!   exact invalidation-vs-recombination problem
-//!   `epigraph_engine::retraction_cascade` was written for. Wiring that
-//!   cascade into the edge-mutation path is a belief-semantics decision with
-//!   its own design surface (cross-frame BBAs, the unbacked/`clear_claim_belief`
-//!   rule) and is intentionally NOT bundled into a wrapper that claims REST
-//!   parity.
+//!
+//! # BBA cleanup on withdrawal (migration 120)
+//!
+//! A retract (`delete_edge`), or a patch whose `valid_to` takes the edge out
+//! of force, runs `EdgeRepository::withdraw_edge_bbas_conn` in the same
+//! transaction: a `cause = 'edge_retract'` deferral (whose re-derivation set
+//! the database derives from the caller's own rows) hands every other writer's
+//! `perspective_id = edge_id` BBAs to the maintenance replay, which removes
+//! them and re-derives the affected beliefs (D1: the cross-owner half is
+//! administrative), and then the caller's OWN are deleted
+//! (`bba_cleanup.deleted`). Before
+//! this, a retracted edge's BBA kept moving its target's belief. A future-dated
+//! `valid_to` withdraws nothing yet and records nothing.
 
 use chrono::{DateTime, Utc};
 use rmcp::model::*;
@@ -114,6 +122,7 @@ fn resolve_valid_to(raw: Option<&str>) -> Result<Option<DateTime<Utc>>, McpError
 fn map_edge_err(e: DbError) -> McpError {
     match e {
         DbError::NotFound { id, .. } => invalid_params(format!("edge {id} not found")),
+        e @ DbError::WriteRefused { .. } => crate::errors::db_caller_error(e),
         other => internal_error(other),
     }
 }
@@ -122,8 +131,30 @@ pub async fn patch_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_patch_edge(server, viewer, params).await
+    do_patch_edge(server, viewer, params, auth).await
+}
+
+/// Map a refused write on a VISIBLE edge to the explicit `not_owner` refusal
+/// (the rule named: another writer's edge, or an administrative one), and every
+/// other repo error through [`map_edge_err`]. Reads the edge's owner on the
+/// same transaction, through the caller's viewer.
+async fn refuse_or_map(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    edge_id: uuid::Uuid,
+    action: &str,
+    e: DbError,
+) -> McpError {
+    if !matches!(e, DbError::WriteRefused { .. }) {
+        return map_edge_err(e);
+    }
+    match EdgeRepository::refusal_for(&mut *conn, viewer, edge_id).await {
+        Ok(Some(refusal)) => crate::errors::edge_not_owner(refusal, edge_id, action),
+        Ok(None) => invalid_params(format!("edge {edge_id} not found")),
+        Err(read) => internal_error(read),
+    }
 }
 
 /// The caller-read gate both tools apply, on the write transaction.
@@ -149,6 +180,7 @@ pub async fn do_patch_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
 
@@ -168,7 +200,7 @@ pub async fn do_patch_edge(
 
     let valid_to = resolve_valid_to(params.valid_to.as_deref())?;
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT: the UPDATE and
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1): the UPDATE and
     // both events.
     //
     // The UPDATE used to run on the unstamped pool. `edges_tenancy` then let it
@@ -186,18 +218,38 @@ pub async fn do_patch_edge(
     // UPDATE. They now ride the UPDATE's transaction, each SAVEPOINT-wrapped
     // inside `publish_or_log_conn`: a refused event cannot abort the patch, and
     // no `edge.updated` is emitted for a patch that was rolled back.
-    let actor_id = server.agent_id().await?;
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "patch_edge").await?;
+    let actor = server.write_identity(auth, viewer).await?;
+    let actor_id = actor.agent_id();
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, actor, "patch_edge").await?;
     require_visible_edge(&mut tx, viewer, edge_id).await?;
-    let updated = EdgeRepository::update_valid_to_and_properties(
+    let updated = match EdgeRepository::update_valid_to_and_properties(
         &mut *tx,
         edge_id,
         valid_to,
         params.properties,
     )
     .await
-    .map_err(map_edge_err)?;
+    {
+        Ok(updated) => updated,
+        Err(e) => return Err(refuse_or_map(&mut tx, viewer, edge_id, "patch", e).await),
+    };
+    // A patch that took the edge out of force withdraws it: its edge-keyed
+    // BBAs are cleaned up in this transaction (migration 120). A future-dated
+    // `valid_to` withdraws nothing yet, and the helper records nothing.
+    let bba_cleanup = if valid_to.is_some() {
+        let cleanup = EdgeRepository::withdraw_edge_bbas_conn(
+            &mut tx,
+            edge_id,
+            epigraph_db::EdgeWithdrawal::Retracted,
+            None,
+            epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+        )
+        .await
+        .map_err(crate::errors::db_caller_error)?;
+        cleanup.deferral_event_id.map(|_| cleanup)
+    } else {
+        None
+    };
 
     // Best-effort durable events, mirroring the HTTP route's pair.
     let _ = EventRepository::publish_or_log_conn(
@@ -242,6 +294,7 @@ pub async fn do_patch_edge(
         valid_from: updated.valid_from.map(|t| t.to_rfc3339()),
         valid_to: updated.valid_to.map(|t| t.to_rfc3339()),
         retired: valid_to.is_some(),
+        bba_cleanup,
     })
 }
 
@@ -249,8 +302,9 @@ pub async fn delete_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_delete_edge(server, viewer, params).await
+    do_delete_edge(server, viewer, params, auth).await
 }
 
 /// Core logic factored out for direct test invocation (see `do_patch_edge`).
@@ -258,29 +312,44 @@ pub async fn do_delete_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT: the retraction
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1): the retraction
     // and its event. Same reasoning as `do_patch_edge`. On the unstamped pool
     // only a public, world-owned edge was retractable on a cleanly-migrated
     // schema. Stamped, the server agent's own group's edges are too, and an edge
     // in another agent's private group still reports "not found" with nothing
     // written (#374 owns whether it should).
-    let actor_id = server.agent_id().await?;
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "delete_edge").await?;
+    let actor = server.write_identity(auth, viewer).await?;
+    let actor_id = actor.agent_id();
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, actor, "delete_edge").await?;
     require_visible_edge(&mut tx, viewer, edge_id).await?;
 
     // `EdgeRepository::delete` reports absence as `Ok(false)`, not
     // `DbError::NotFound`, so the 404-equivalent is raised here. Returning
     // before COMMIT drops `tx`, which rolls back; nothing was written anyway.
-    let deleted = EdgeRepository::retract_by_id(&mut *tx, edge_id)
-        .await
-        .map_err(map_edge_err)?;
+    let deleted = match EdgeRepository::retract_by_id(&mut *tx, edge_id).await {
+        Ok(deleted) => deleted,
+        Err(e) => return Err(refuse_or_map(&mut tx, viewer, edge_id, "delete", e).await),
+    };
     if !deleted {
         return Err(invalid_params(format!("edge {edge_id} not found")));
     }
+    // The owner's retraction withdraws the edge: (a) its own edge-keyed BBAs
+    // go now, (b) every other writer's go through the maintenance replay
+    // (cause `edge_retract`), both recorded in this transaction (migration
+    // 120; D1 makes the cross-owner half administrative).
+    let bba_cleanup = EdgeRepository::withdraw_edge_bbas_conn(
+        &mut tx,
+        edge_id,
+        epigraph_db::EdgeWithdrawal::Retracted,
+        None,
+        epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+    )
+    .await
+    .map_err(crate::errors::db_caller_error)?;
 
     // SAVEPOINT-wrapped inside `publish_or_log_conn`: a refused event cannot
     // abort the retraction, and it shares the retraction's fate.
@@ -296,6 +365,7 @@ pub async fn do_delete_edge(
     success_json(&DeleteEdgeResponse {
         edge_id: edge_id.to_string(),
         deleted: true,
+        bba_cleanup,
     })
 }
 

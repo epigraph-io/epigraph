@@ -115,6 +115,7 @@ async fn report_outcome_attributes_each_step_index_to_its_planned_step(pool: PgP
             confidence: None,
             tags: None,
         },
+        None,
     )
     .await
     .expect("store_workflow");
@@ -144,6 +145,7 @@ async fn report_outcome_attributes_each_step_index_to_its_planned_step(pool: PgP
             quality: None,
             goal_text: None,
         },
+        None,
     )
     .await
     .expect("report_workflow_outcome");
@@ -197,6 +199,7 @@ async fn batched_head_resolution_assigns_step_index_in_plan_order(pool: PgPool) 
             confidence: None,
             tags: None,
         },
+        None,
     )
     .await
     .expect("store_workflow");

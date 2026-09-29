@@ -25,6 +25,32 @@ pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) 
     (addr, tx)
 }
 
+/// [`spawn_app`] with the administrative cascade enabled (migration 117): the
+/// retraction cascade after a supersede, a dedup or a match-candidate
+/// retirement runs on a maintenance pool, as on a server configured with
+/// `MAINTENANCE_DATABASE_URL`. Plain [`spawn_app`] has none, so it defers.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: only the cascade binaries use it"
+)]
+pub async fn spawn_app_with_admin_cascade(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) {
+    let app = epigraph_api::build_app_for_tests_with_admin_cascade(database_url)
+        .await
+        .expect("app builds for tests");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (addr, tx)
+}
+
 /// [`spawn_app`] with a caller-chosen webhook-registration egress guard, for
 /// tests that need particular DNS answers (a name that resolves to loopback,
 /// one that does not resolve). No real DNS: pass a guard over a `StubResolver`.
@@ -368,6 +394,55 @@ pub async fn seed_claim_with_agent(pool: &PgPool, content: &str, agent_id: Uuid)
     id
 }
 
+/// A public claim the token minted by [`test_bearer_token_with_seeded_client`]
+/// for `client_row_id` may WRITE: authored by that client's graph agent
+/// (`oauth_clients.agent_id`, the one `ensure_for_client` linked) and owned by
+/// that agent's personal group, of which it is an admin.
+///
+/// Use this, not [`seed_claim_with_agent`] with the client id, for a claim the
+/// caller must be able to supersede or dedup at `claims:write` (batch OA1):
+/// the claim-act rule admits a non-admin caller only through write authority
+/// over the claim's owning group, and never by comparing the token's
+/// `oauth_clients.id` with the claim's `agents.id` author.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub async fn seed_claim_writable_by_client(
+    pool: &PgPool,
+    content: &str,
+    client_row_id: Uuid,
+) -> Uuid {
+    let agent: Uuid = sqlx::query_scalar(
+        "SELECT agent_id FROM oauth_clients WHERE id = $1 AND agent_id IS NOT NULL",
+    )
+    .bind(client_row_id)
+    .fetch_one(pool)
+    .await
+    .expect("the seeded client is linked to an agent");
+    let group: Uuid = sqlx::query_scalar("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("the agent's personal group");
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             labels, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], 'public', $5)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed a claim writable by the client's agent");
+    id
+}
+
 /// Like [`seed_claim_with_agent`], but the claim also carries a unique
 /// `properties` key so a Cypher `WHERE` can select exactly this row.
 ///
@@ -461,6 +536,22 @@ pub async fn test_bearer_token_with_seeded_client(
     let agent_id = epigraph_db::AgentRepository::ensure_for_client(&mut conn, client_id)
         .await
         .expect("ensure agent for seeded client");
+    // GRANT the scopes the token will carry, as `oauth/token.rs` only mints
+    // scopes a client was granted. Batch H-b's audited admin path (migration
+    // 111) re-checks `claims:admin` against this record, so a hand-minted
+    // admin token whose client was never granted it is (correctly) refused.
+    let scope_vec: Vec<String> = scopes.iter().map(|s| (*s).to_string()).collect();
+    sqlx::query(
+        "UPDATE oauth_clients \
+            SET granted_scopes = ARRAY(SELECT DISTINCT unnest(granted_scopes || $2::text[])), \
+                allowed_scopes = ARRAY(SELECT DISTINCT unnest(allowed_scopes || $2::text[])) \
+          WHERE id = $1",
+    )
+    .bind(client_id)
+    .bind(&scope_vec)
+    .execute(&mut *conn)
+    .await
+    .expect("grant the token's scopes to its client");
     drop(conn);
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());

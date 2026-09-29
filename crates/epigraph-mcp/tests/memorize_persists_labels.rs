@@ -57,7 +57,7 @@ async fn memorize_with_tags_populates_claims_labels() {
         novelty_threshold: None,
     };
 
-    tools::memory::memorize(&server, &viewer, params)
+    tools::memory::memorize(&server, &viewer, params, None)
         .await
         .expect("memorize");
 
@@ -104,6 +104,7 @@ async fn memorize_resubmit_accumulates_labels() {
             tags: Some(vec!["one".to_string()]),
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .expect("first memorize");
@@ -118,6 +119,7 @@ async fn memorize_resubmit_accumulates_labels() {
             tags: Some(vec!["two".to_string()]),
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .expect("second memorize");
@@ -159,6 +161,7 @@ async fn memorize_without_tags_leaves_labels_empty() {
             tags: None,
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .expect("memorize");

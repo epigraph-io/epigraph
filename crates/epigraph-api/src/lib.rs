@@ -1,6 +1,8 @@
 pub mod embedding_restore;
 pub mod errors;
 pub mod extractors;
+#[cfg(feature = "db")]
+pub mod jobs_drain;
 pub mod metrics;
 pub mod middleware;
 #[cfg(feature = "db")]
@@ -161,6 +163,38 @@ pub async fn build_app_for_tests_with_webhook_egress(
     let state =
         crate::state::AppState::with_scoped_pool(scoped, crate::state::ApiConfig::default())
             .with_webhook_egress(webhook_egress);
+    Ok(crate::routes::create_router(state))
+}
+
+/// [`build_app_for_tests`] with the ADMINISTRATIVE CASCADE enabled (migration
+/// 117): the test DSN's own pool is attached as the maintenance pool, the shape
+/// `bin/server.rs` builds for an explicitly configured, privileged
+/// `MAINTENANCE_DATABASE_URL`. Test DSNs are the superuser, which bypasses row
+/// security, so the cascade runs as it would on a maintenance login.
+///
+/// # Errors
+/// As [`build_app_for_tests`].
+#[cfg(feature = "db")]
+pub async fn build_app_for_tests_with_admin_cascade(
+    database_url: &str,
+) -> Result<axum::Router, sqlx::Error> {
+    let scoped = epigraph_db::ScopedPool::connect_with_options(
+        database_url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
+    let maintenance = scoped.inner().clone();
+    let state = crate::state::AppState::with_scoped_pool(
+        scoped.with_maintenance_pool(maintenance),
+        crate::state::ApiConfig::default(),
+    )
+    .with_webhook_egress(test_webhook_egress())
+    .with_admin_cascade(true);
     Ok(crate::routes::create_router(state))
 }
 

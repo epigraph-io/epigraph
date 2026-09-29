@@ -349,19 +349,29 @@ pub async fn forget_convention(
     );
     epigraph_db::EvidenceRepository::create(pool, &evidence).await?;
 
-    // Materialize evidence --REFUTES--> claim edge
-    let _ = epigraph_db::EdgeRepository::create(
-        pool,
-        evidence.id.as_uuid(),
-        "evidence",
-        claim_id,
-        "claim",
-        "REFUTES",
-        None,
-        None,
-        None,
-    )
-    .await;
+    // Materialize evidence --REFUTES--> claim edge, on a transaction stamped
+    // with the CALLER's viewer (migration 120, D8): the caller writes the edge,
+    // so between two public claims it owns it. Every other statement of this
+    // handler autocommits on the raw pool, so this splits no transaction.
+    // Best-effort, as before.
+    if let Ok(mut tx) = state.write_as(&viewer, "forget_convention").await {
+        if epigraph_db::EdgeRepository::create(
+            &mut *tx,
+            evidence.id.as_uuid(),
+            "evidence",
+            claim_id,
+            "claim",
+            "REFUTES",
+            None,
+            None,
+            None,
+        )
+        .await
+        .is_ok()
+        {
+            let _ = tx.commit().await;
+        }
+    }
 
     // Drive truth to near-zero via Bayesian refutation
     // TODO: migrate to CDST pignistic probability (BayesianUpdater is deprecated)
@@ -499,9 +509,14 @@ pub async fn share_skill(
             message: e.to_string(),
         })?;
 
-    // Create SHARED_BY edge from shared → original
+    // Create SHARED_BY edge from shared → original, on a transaction stamped
+    // with the CALLER's viewer (migration 120, D8): the caller who shares
+    // writes the edge and, between two public claims, owns it. Every other
+    // statement of this handler autocommits on the raw pool, so this splits no
+    // transaction.
+    let mut tx = state.write_as(&viewer, "share_skill").await?;
     let edge_id = epigraph_db::EdgeRepository::create(
-        pool,
+        &mut *tx,
         shared_claim.id.as_uuid(),
         "claim",
         request.workflow_id,
@@ -512,6 +527,9 @@ pub async fn share_skill(
         None,
     )
     .await?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to commit the SHARED_BY edge: {e}"),
+    })?;
 
     Ok((
         StatusCode::CREATED,

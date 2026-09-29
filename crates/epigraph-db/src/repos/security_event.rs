@@ -118,6 +118,72 @@ impl SecurityEventRepository {
         Ok(row)
     }
 
+    /// Whether `client_id` (a token's `sub`) is an ACTIVE `oauth_clients` row
+    /// that GRANTS `claims:admin` and is bound to `agent_id`: the exact
+    /// predicate migration 111's `epigraph_admin_patch_claim` re-checks
+    /// (`ADM02`), for admin writes that do not go through that definer.
+    ///
+    /// Batch H-b review: the workflow step ops accepted `claims:admin` from the
+    /// token's SCOPE alone, so a token whose client record grants nothing (or
+    /// whose client was de-scoped after the mint) kept cross-owner workflow
+    /// mutation while the same token was refused on `update_labels`.
+    /// `oauth_clients` has no row security (077 section 9 keeps it policy-free
+    /// so the token mint can update it), so the application login reads it
+    /// directly; nothing here needs a viewer.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the SELECT fails.
+    pub async fn admin_grant_is_live<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        client_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM oauth_clients c \
+                             WHERE c.id = $1 AND c.agent_id = $2 AND c.status = 'active' \
+                               AND 'claims:admin' = ANY (c.granted_scopes))",
+        )
+        .bind(client_id)
+        .bind(agent_id)
+        .fetch_one(executor)
+        .await?;
+        Ok(live)
+    }
+
+    /// Write an admin audit row through migration 112's SECURITY DEFINER
+    /// `epigraph_admin_audit_write`, on the CALLER's transaction, so it commits
+    /// or rolls back with the admin write it records.
+    ///
+    /// For an admin write whose rows need no definer of their own (the workflow
+    /// admin arm: its rows are written on the system stamp). A plain INSERT is
+    /// refused there by `security_events_append`, which admits an attributed
+    /// row only for the SESSION principal (the system agent, not the admin);
+    /// measured on config A. The definer re-checks the token's client record
+    /// with migration 111's predicate (`ADM02`) and records `admin` as the
+    /// event's agent. `event_type` must be one the function lists (`ADM03`).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` carrying the definer's `42501` (`ADM01` /
+    /// `ADM02`) or `22023` (`ADM03`) refusal; nothing is written then.
+    pub async fn admin_audit_write(
+        conn: &mut sqlx::PgConnection,
+        client_id: Uuid,
+        token_jti: Uuid,
+        admin: Uuid,
+        event_type: &str,
+        details: &JsonValue,
+    ) -> Result<(), DbError> {
+        sqlx::query("SELECT public.epigraph_admin_audit_write($1, $2, $3, $4, $5)")
+            .bind(client_id)
+            .bind(token_jti)
+            .bind(admin)
+            .bind(event_type)
+            .bind(details)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
     /// Query security events matching optional filter criteria.
     ///
     /// Results are ordered by `created_at DESC` (most recent first).
@@ -213,6 +279,30 @@ impl SecurityEventRepository {
         .map_err(DbError::from)?;
 
         Ok(row.count)
+    }
+
+    /// Where THIS connection comes from, as the server sees it, for an audit
+    /// row written on it: `(inet_client_addr(), application_name)`.
+    ///
+    /// `inet_client_addr()` is `NULL` on a Unix-socket connection, so the
+    /// address is optional; `application_name` is whatever the client set
+    /// (empty is returned as `None`). Both are recorded beside the login, not
+    /// instead of it: neither is an identity, but together with the login and
+    /// the OS uid they narrow down who ran an operator command.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn connection_origin_conn(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<(Option<String>, Option<String>), DbError> {
+        let (addr, app): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT host(inet_client_addr()), \
+                    NULLIF(current_setting('application_name', true), '')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| DbError::QueryFailed { source: e })?;
+        Ok((addr, app))
     }
 
     /// Append a security event on a CALLER-SUPPLIED connection.

@@ -282,3 +282,246 @@ async fn an_acting_link_recorded_after_startup_refuses_the_next_http_call(pool: 
 async fn a_retired_link_recorded_after_startup_refuses_the_next_http_call(pool: PgPool) {
     a_link_recorded_after_startup_refuses_the_next_call(pool, LinkKind::Retired).await;
 }
+
+// ─── Batch HTTP-id: a principal-less listener on a RETIRED-linked signer ───
+//
+// The dangerous shape behind goal 2: a principal-less caller on a listener
+// whose signer carries a retired link to a HUMAN (the post-retire state, if a
+// former shared signer's key were ever run again). Every principal-less caller
+// IS the signer, and the human then owns the signer's claims, so the listener
+// must refuse before any tool runs. Driven through the real `call_tool` (the
+// `inject_unauthenticated_context` router `main` builds for
+// `--allow-unauthenticated-http`), so `refuse_linked_http_signer` is in the
+// path; the tool-layer test in `principal_less_http_writes.rs` bypasses it.
+
+/// The router `main` builds for `--listen --allow-unauthenticated-http`, over
+/// `pool`, signing as `signer`, with `writes` from
+/// `--allow-unauthenticated-writes`.
+async fn spawn_principal_less_listener(
+    pool: PgPool,
+    signer: AgentSigner,
+    writes: epigraph_mcp::auth::UnauthenticatedWrites,
+) -> String {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+    let signer = Arc::new(signer);
+    let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
+    let probe = Arc::new(epigraph_mcp::EpiGraphMcpFull::new_shared(
+        pool.clone(),
+        signer.clone(),
+        embedder.clone(),
+        false,
+    ));
+    let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
+        probe as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
+    )
+    .with_writes(writes);
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(epigraph_mcp::EpiGraphMcpFull::new_shared(
+                pool.clone(),
+                signer.clone(),
+                embedder.clone(),
+                false,
+            ))
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(
+            principal,
+            epigraph_mcp::auth::inject_unauthenticated_context,
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    format!("http://{addr}/mcp")
+}
+
+async fn call_named(
+    client: &reqwest::Client,
+    url: &str,
+    session: &str,
+    id: u32,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> String {
+    let mut resp = post(
+        client,
+        url,
+        "unused-no-bearer",
+        Some(session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}
+        }),
+    )
+    .await;
+    read_sse_data(&mut resp).await
+}
+
+async fn principal_less_caller_on_a_retired_signer_cannot_retire_the_humans_item(
+    pool: PgPool,
+    writes: epigraph_mcp::auth::UnauthenticatedWrites,
+    seed: u8,
+) {
+    use epigraph_mcp::auth::UnauthenticatedWrites;
+    let (human, _) = fixture::seed_agent_with_group(&pool, "httpid-retired-signer-human").await;
+    let item: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels) \
+         VALUES (gen_random_uuid(), 'HTTP-id: the human''s open item', \
+                 decode(md5(random()::text) || md5(random()::text), 'hex'), 0.6, $1, \
+                 ARRAY['backlog']) RETURNING id",
+    )
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .expect("the human's backlog item");
+
+    let signer = AgentSigner::from_bytes(&[seed; 32]).expect("signer");
+    let public_key = signer.public_key();
+    let url = spawn_principal_less_listener(pool.clone(), signer, writes).await;
+    let client = reqwest::Client::new();
+    let session = handshake(&client, &url, "unused-no-bearer").await;
+
+    // CALIBRATION: an unlinked signer's read is served (this also registers
+    // the signer agent).
+    let before = call_named(
+        &client,
+        &url,
+        &session,
+        2,
+        "get_claim",
+        serde_json::json!({"claim_id": item.to_string()}),
+    )
+    .await;
+    assert!(
+        before.contains("data:")
+            && before.contains("the human's open item")
+            && !before.contains(REFUSAL)
+            && !before.contains("Forbidden"),
+        "CALIBRATION: an unlinked signer's read must be served, claim content included:\n{before}"
+    );
+
+    // The signer is RETIRED-linked to the human who owns the item.
+    let signer_agent: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE public_key = $1")
+        .bind(public_key.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("the listener registered its signer agent");
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_retired_agent(&mut conn, signer_agent, human)
+        .await
+        .expect("retired link to the human");
+    drop(conn);
+
+    // A READ, which the scope gate admits on BOTH listener kinds, so this is
+    // the call that reaches `refuse_linked_http_signer` on the default
+    // (read-only) listener too. The signer is still that listener's READ
+    // principal: a group membership that predates the retire would widen what
+    // its callers read, so the linked-signer gate must refuse reads as well,
+    // naming the human, and must not serve the claim.
+    let read_after_link = call_named(
+        &client,
+        &url,
+        &session,
+        10,
+        "get_claim",
+        serde_json::json!({"claim_id": item.to_string()}),
+    )
+    .await;
+    assert!(
+        read_after_link.contains(REFUSAL)
+            && read_after_link.contains(&human.to_string())
+            && !read_after_link.contains("the human's open item"),
+        "a principal-less READ on a signer retired-linked to a human must be refused by the \
+         linked-signer gate, naming the link, and must not serve the claim:\n{read_after_link}"
+    );
+
+    let calls = [
+        (
+            "resolve_backlog_item",
+            serde_json::json!({"original_id": item.to_string(),
+                               "resolution_content": "not the human"}),
+        ),
+        (
+            "update_labels",
+            serde_json::json!({"claim_id": item.to_string(), "add": ["resolved"],
+                               "remove": []}),
+        ),
+    ];
+    for (i, (tool, args)) in calls.into_iter().enumerate() {
+        let body = call_named(&client, &url, &session, 3 + i as u32, tool, args).await;
+        match writes {
+            // Refused first by the scope gate, which runs BEFORE the linked
+            // signer gate: these WRITE tools do not reach
+            // `refuse_linked_http_signer` on this listener (the `get_claim`
+            // read above does).
+            UnauthenticatedWrites::Refused => assert!(
+                body.contains("requires scope 'claims:write'")
+                    && body.contains("no authenticated principal"),
+                "{tool}: the default listener refuses at the scope gate:\n{body}"
+            ),
+            // The opt-in passes the scope gate, so the refusal must be the
+            // linked-signer gate's, naming the human.
+            UnauthenticatedWrites::AsListenerSigner => assert!(
+                body.contains(REFUSAL) && body.contains(&human.to_string()),
+                "{tool}: a principal-less caller on a signer linked to a human must be refused \
+                 by the linked-signer gate, naming the link:\n{body}"
+            ),
+        }
+    }
+
+    let labelled: bool =
+        sqlx::query_scalar("SELECT 'resolved' = ANY(labels) FROM claims WHERE id = $1")
+            .bind(item)
+            .fetch_one(&pool)
+            .await
+            .expect("labels");
+    assert!(!labelled, "the human's item is still open");
+    let resolutions: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content LIKE $1")
+        .bind(format!("Resolves {item}:%"))
+        .fetch_one(&pool)
+        .await
+        .expect("resolutions");
+    assert_eq!(resolutions, 0, "no resolution was written");
+}
+
+/// Default (read-only) principal-less listener on a retired-linked signer:
+/// a read reaches the linked-signer gate and is refused, naming the human;
+/// both write tools are refused (at the scope gate) and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_principal_less_caller_on_a_retired_linked_signer_cannot_retire_the_humans_item(
+    pool: PgPool,
+) {
+    principal_less_caller_on_a_retired_signer_cannot_retire_the_humans_item(
+        pool,
+        epigraph_mcp::auth::UnauthenticatedWrites::Refused,
+        0x75,
+    )
+    .await;
+}
+
+/// Opted-in (`--allow-unauthenticated-writes`) listener on a retired-linked
+/// signer: the scope gate admits the write tools, and the linked-signer gate
+/// refuses them, naming the human; nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_opted_in_principal_less_caller_on_a_retired_linked_signer_is_refused_by_the_link_gate(
+    pool: PgPool,
+) {
+    principal_less_caller_on_a_retired_signer_cannot_retire_the_humans_item(
+        pool,
+        epigraph_mcp::auth::UnauthenticatedWrites::AsListenerSigner,
+        0x76,
+    )
+    .await;
+}

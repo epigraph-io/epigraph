@@ -121,16 +121,15 @@ impl OAuthClientRepository {
         id: Uuid,
         agent_id: Uuid,
     ) -> Result<bool, DbError> {
-        let result = sqlx::query(
-            "UPDATE oauth_clients SET agent_id = $2, updated_at = now() \
-             WHERE id = $1 AND agent_id IS NULL",
-        )
-        .bind(id)
-        .bind(agent_id)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| DbError::QueryFailed { source: e })?;
-        Ok(result.rows_affected() > 0)
+        // Migration 118: `epigraph_oauth_client_link_agent` runs the same
+        // write-once UPDATE as a SECURITY DEFINER (and refuses an agent that
+        // does not exist); the application role holds no UPDATE here.
+        sqlx::query_scalar("SELECT public.epigraph_oauth_client_link_agent($1, $2)")
+            .bind(id)
+            .bind(agent_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| DbError::QueryFailed { source: e })
     }
 
     /// Look up a client by `client_name` (status-agnostic), oldest first.
@@ -241,6 +240,66 @@ impl OAuthClientRepository {
         Ok(row)
     }
 
+    /// Read one client row and hold its row lock (`FOR UPDATE`) for the rest
+    /// of the caller's transaction, so a scope change computed from it cannot
+    /// race another writer of the same row.
+    ///
+    /// Used by `epigraph-operator grant-client-scope` / `revoke-client-scope`
+    /// (batch OA1), on the maintenance connection. `oauth_clients` carries no
+    /// row-security policy (migration 077 leaves it out on purpose).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(conn))]
+    pub async fn lock_by_id_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+    ) -> Result<Option<OAuthClientRow>, DbError> {
+        let row = sqlx::query_as::<_, OAuthClientRow>(
+            "SELECT * FROM oauth_clients WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| DbError::QueryFailed { source: e })?;
+        Ok(row)
+    }
+
+    /// Write both scope arrays of one client, as computed by the caller.
+    ///
+    /// Assignment of exactly what the caller passes: the operator command that
+    /// calls this adds or removes ONE scope and hands back every other element
+    /// in its original order, so nothing else about the client changes.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the update fails, and
+    /// `DbError::NotFound` if no row has `id`.
+    #[instrument(skip(conn))]
+    pub async fn set_scopes_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        allowed_scopes: &[String],
+        granted_scopes: &[String],
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "UPDATE oauth_clients SET allowed_scopes = $2, granted_scopes = $3, \
+             updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(allowed_scopes)
+        .bind(granted_scopes)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| DbError::QueryFailed { source: e })?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound {
+                entity: "OAuthClient".to_string(),
+                id,
+            });
+        }
+        Ok(())
+    }
+
     #[instrument(skip(pool))]
     pub async fn update_status(pool: &PgPool, id: Uuid, status: &str) -> Result<(), DbError> {
         sqlx::query("UPDATE oauth_clients SET status = $2, updated_at = now() WHERE id = $1")
@@ -259,15 +318,16 @@ impl OAuthClientRepository {
         granted_scopes: &[String],
         approved_by: Uuid,
     ) -> Result<(), DbError> {
-        sqlx::query(
-            r#"UPDATE oauth_clients SET granted_scopes = $2, status = 'active', created_by = $3, updated_at = now() WHERE id = $1"#,
-        )
-        .bind(id)
-        .bind(granted_scopes)
-        .bind(approved_by)
-        .execute(pool)
-        .await
-        .map_err(|e| DbError::QueryFailed { source: e })?;
+        // Migration 118: the same UPDATE, in `epigraph_oauth_client_approve`
+        // (a SECURITY DEFINER that also writes an `oauth.client_approved`
+        // security event); the application role holds no UPDATE here.
+        sqlx::query("SELECT public.epigraph_oauth_client_approve($1, $2, $3)")
+            .bind(id)
+            .bind(granted_scopes)
+            .bind(approved_by)
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::QueryFailed { source: e })?;
         Ok(())
     }
 

@@ -135,6 +135,13 @@ name = "recompute_betp_run"
 path = "tests/recompute_betp_run.rs"
 required-features = ["db"]
 
+# Runs most of this crate's `db`-gated binaries' `--help`; without `db` their
+# `CARGO_BIN_EXE_*` do not exist and the test would not compile.
+[[test]]
+name = "help_hides_env_values"
+path = "tests/help_hides_env_values.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "bootstrap_clients"
 path = "src/bin/bootstrap_clients.rs"
@@ -153,6 +160,21 @@ required-features = ["db"]
 [[bin]]
 name = "retire_match_candidates"
 path = "src/bin/retire_match_candidates.rs"
+required-features = ["db"]
+
+# Migration 117 (batch W10): replay deferred administrative cascades on the
+# maintenance connection.
+[[bin]]
+name = "replay_deferred_cascades"
+path = "src/bin/replay_deferred_cascades.rs"
+required-features = ["db"]
+
+# Operator decision D9 (batch W12a): the semantic-duplicate sweep, moved off the
+# MCP server (whose tool now answers MOVED) onto the maintenance connection,
+# with every collapse audited through the administrative cascade.
+[[bin]]
+name = "sweep_semantic_duplicates"
+path = "src/bin/sweep_semantic_duplicates.rs"
 required-features = ["db"]
 
 # PR-12's tenancy backfill. A [[bin]] here rather than a new

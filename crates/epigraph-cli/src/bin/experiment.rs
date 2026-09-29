@@ -25,7 +25,7 @@ enum Command {
         /// Hypothesis claim UUID
         hypothesis_id: Uuid,
         /// Agent UUID
-        #[arg(long, env = "EPIGRAPH_AGENT_ID")]
+        #[arg(long, env = "EPIGRAPH_AGENT_ID", hide_env_values = true)]
         agent_id: Uuid,
         /// Method UUIDs (comma-separated)
         #[arg(long, value_delimiter = ',')]
@@ -80,7 +80,7 @@ enum Command {
         #[arg(long)]
         direction: String,
         /// Agent UUID
-        #[arg(long, env = "EPIGRAPH_AGENT_ID")]
+        #[arg(long, env = "EPIGRAPH_AGENT_ID", hide_env_values = true)]
         agent_id: Uuid,
         /// Scope limitations (comma-separated)
         #[arg(long, value_delimiter = ',')]

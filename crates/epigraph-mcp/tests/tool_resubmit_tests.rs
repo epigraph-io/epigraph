@@ -69,10 +69,10 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         novelty_threshold: None,
     };
 
-    tools::claims::submit_claim(&server, &viewer, params1)
+    tools::claims::submit_claim(&server, &viewer, params1, None)
         .await
         .expect("first submit_claim");
-    tools::claims::submit_claim(&server, &viewer, params2)
+    tools::claims::submit_claim(&server, &viewer, params2, None)
         .await
         .expect("second submit_claim");
 
@@ -293,10 +293,10 @@ async fn memorize_resubmit_option_a_skip() {
         novelty_threshold: None,
     };
 
-    tools::memory::memorize(&server, &viewer, make_params())
+    tools::memory::memorize(&server, &viewer, make_params(), None)
         .await
         .expect("first memorize");
-    tools::memory::memorize(&server, &viewer, make_params())
+    tools::memory::memorize(&server, &viewer, make_params(), None)
         .await
         .expect("second memorize");
 
@@ -339,10 +339,10 @@ async fn store_workflow_resubmit_is_idempotent_at_workflow_row() {
         tags: Some(vec!["s3a-test".to_string()]),
     };
 
-    tools::workflows::store_workflow(&server, &viewer, make_params())
+    tools::workflows::store_workflow(&server, &viewer, make_params(), None)
         .await
         .expect("first store_workflow");
-    tools::workflows::store_workflow(&server, &viewer, make_params())
+    tools::workflows::store_workflow(&server, &viewer, make_params(), None)
         .await
         .expect("second store_workflow");
 

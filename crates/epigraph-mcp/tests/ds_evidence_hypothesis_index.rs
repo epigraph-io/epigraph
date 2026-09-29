@@ -67,6 +67,7 @@ async fn submitted_and_read_beliefs_agree_and_a_bad_index_is_warned(pool: PgPool
                     "evidence_type": "empirical",
                 }))
                 .unwrap(),
+                None,
             )
             .await
             .expect("accepted"),

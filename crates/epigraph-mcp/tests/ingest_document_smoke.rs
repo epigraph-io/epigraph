@@ -66,7 +66,7 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
-    let result = do_ingest_document(&server, &viewer, &extraction)
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
         .await
         .expect("ingest_document succeeds");
 
@@ -174,7 +174,7 @@ async fn ingested_claims_carry_doi_label_for_recompute(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
-    do_ingest_document(&server, &viewer, &extraction)
+    do_ingest_document(&server, &viewer, &extraction, None)
         .await
         .expect("ingest_document succeeds");
 
@@ -225,10 +225,10 @@ async fn re_ingest_same_paper_dedup_detected(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
-    let _first = do_ingest_document(&server, &viewer, &extraction)
+    let _first = do_ingest_document(&server, &viewer, &extraction, None)
         .await
         .expect("first ingest");
-    let second = do_ingest_document(&server, &viewer, &extraction)
+    let second = do_ingest_document(&server, &viewer, &extraction, None)
         .await
         .expect("second ingest");
 
@@ -278,14 +278,14 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
         serde_json::from_str(&json).expect("fixture parses")
     };
 
-    let ch1 = do_ingest_document(&server, &viewer, &make_chapter(1))
+    let ch1 = do_ingest_document(&server, &viewer, &make_chapter(1), None)
         .await
         .expect("ch1 ingest");
     let ch1_json: serde_json::Value = serde_json::from_str(&result_text(&ch1)).unwrap();
     assert_eq!(ch1_json["already_ingested"], serde_json::json!(false));
     let paper_id = uuid::Uuid::parse_str(ch1_json["paper_id"].as_str().unwrap()).unwrap();
 
-    let ch2 = do_ingest_document(&server, &viewer, &make_chapter(2))
+    let ch2 = do_ingest_document(&server, &viewer, &make_chapter(2), None)
         .await
         .expect("ch2 ingest");
     let ch2_json: serde_json::Value = serde_json::from_str(&result_text(&ch2)).unwrap();
@@ -299,7 +299,7 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
         "same paper row reused"
     );
 
-    let ch2_repeat = do_ingest_document(&server, &viewer, &make_chapter(2))
+    let ch2_repeat = do_ingest_document(&server, &viewer, &make_chapter(2), None)
         .await
         .expect("ch2 re-ingest");
     let repeat_json: serde_json::Value = serde_json::from_str(&result_text(&ch2_repeat)).unwrap();
@@ -365,10 +365,10 @@ async fn cross_paper_atom_and_author_converge(pool: PgPool) {
     let first: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
     let second: DocumentExtraction = serde_json::from_str(FIXTURE_OVERLAP).expect("fixture parses");
 
-    let _ = do_ingest_document(&server, &viewer, &first)
+    let _ = do_ingest_document(&server, &viewer, &first, None)
         .await
         .expect("first ingest");
-    let res = do_ingest_document(&server, &viewer, &second)
+    let res = do_ingest_document(&server, &viewer, &second, None)
         .await
         .expect("second ingest");
 
@@ -435,7 +435,7 @@ async fn ingest_document_persists_planned_properties(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
-    do_ingest_document(&server, &viewer, &extraction)
+    do_ingest_document(&server, &viewer, &extraction, None)
         .await
         .expect("ingest succeeds");
 
@@ -497,7 +497,7 @@ async fn ingest_document_handles_compound_equals_atom(pool: sqlx::PgPool) {
         serde_json::from_value(extraction_json).expect("fixture parses");
 
     // Must not panic and must not return Err with a CHECK violation.
-    let result = do_ingest_document(&server, &viewer, &extraction).await;
+    let result = do_ingest_document(&server, &viewer, &extraction, None).await;
     assert!(
         result.is_ok(),
         "expected ingest to succeed, got: {result:?}"
@@ -552,7 +552,7 @@ async fn ingest_tags_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
     let extraction: epigraph_ingest::schema::DocumentExtraction =
         serde_json::from_value(extraction_json).expect("fixture parses");
 
-    do_ingest_document(&server, &viewer, &extraction)
+    do_ingest_document(&server, &viewer, &extraction, None)
         .await
         .expect("ingest succeeds");
 
@@ -697,7 +697,7 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
     let params = IngestDocumentInlineParams { extraction };
 
-    let result = ingest_document_inline(&server, &viewer, params)
+    let result = ingest_document_inline(&server, &viewer, params, None)
         .await
         .expect("inline ingest succeeds");
 
@@ -765,7 +765,7 @@ async fn writer_rejects_span_text_drift(pool: PgPool) {
     }))
     .unwrap();
 
-    let err = do_ingest_document(&server, &viewer, &extraction).await;
+    let err = do_ingest_document(&server, &viewer, &extraction, None).await;
     let err = err.expect_err("drift between span and source_text must be rejected");
     assert!(
         err.message.contains("verbatim guard"),

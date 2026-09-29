@@ -114,6 +114,7 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
             labels: vec!["backlog".into()],
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .expect("submit_claim");
@@ -163,17 +164,20 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
 /// `a4cc08a6`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_random_agent(&pool).await;
     let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
 
-    let admin_auth = make_auth(&["claims:admin"], Uuid::new_v4(), None);
+    let (admin_auth, admin_viewer) = common::server_admin(&server).await;
+    // A live claims:admin grant on the token's client record: the foreign
+    // claim's group is not the admin's, so the write takes the audited admin
+    // path (batch H-b, D2), which re-checks exactly this record.
+    common::seed_admin_grant(&pool, &admin_auth).await;
 
     let result = resolve_backlog_item(
         &server,
-        &viewer,
+        &admin_viewer,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "retired by admin token".to_string(),
@@ -203,18 +207,22 @@ async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) 
 /// HTTP `require_owner_or_admin` semantics.
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_matching_principal_passes_without_admin(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let agent = seed_random_agent(&pool).await;
     let claim = seed_claim_with_agent(&pool, agent, &["backlog"]).await;
 
-    // Caller is `claims:write`-only but their owner_id == claim.agent_id.
-    let auth = make_auth(&["claims:write"], Uuid::new_v4(), Some(agent));
+    // Caller is `claims:write`-only and IS the claim's author (`auth.agent_id`
+    // == claim.agent_id). The author writes the resolution into its own group.
+    common::personal_group_of(&pool, agent).await;
+    let auth = make_auth(&["claims:write"], agent);
+    let author_viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("author viewer");
 
     let result = resolve_backlog_item(
         &server,
-        &viewer,
+        &author_viewer,
         ResolveBacklogItemParams {
             original_id: claim.as_uuid().to_string(),
             resolution_content: "retired by owning principal".to_string(),
@@ -250,12 +258,12 @@ async fn resolve_backlog_item_foreign_principal_without_admin_denied(pool: PgPoo
     let foreign_agent = seed_random_agent(&pool).await;
     let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
 
-    // Caller's principal is some other UUID — neither admin nor owner.
-    let auth = make_auth(&["claims:write"], Uuid::new_v4(), Some(Uuid::new_v4()));
+    // Caller is some other real agent — neither admin nor owner.
+    let (_caller, auth, caller_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
 
     let err = resolve_backlog_item(
         &server,
-        &viewer,
+        &caller_viewer,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "should be rejected".to_string(),
@@ -282,11 +290,15 @@ async fn resolve_backlog_item_foreign_principal_without_admin_denied(pool: PgPoo
     );
 }
 
-fn make_auth(scopes: &[&str], client_id: Uuid, owner_id: Option<Uuid>) -> AuthContext {
+/// A token for `agent` as `oauth/token.rs` mints one since PR-02: `agent_id` is
+/// the `agents.id`. Batch H-b's D1 authors every write as `auth.agent_id` and
+/// refuses a token without one, so a token with no agent (this helper's shape
+/// before H-b) now has no write authority at all.
+fn make_auth(scopes: &[&str], agent: Uuid) -> AuthContext {
     AuthContext {
-        client_id,
-        agent_id: None,
-        owner_id,
+        client_id: Uuid::new_v4(),
+        agent_id: Some(agent),
+        owner_id: Some(Uuid::new_v4()),
         client_type: ClientType::Service,
         scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
         jti: Uuid::new_v4(),
@@ -323,6 +335,7 @@ async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &P
             labels: vec![],
             novelty_threshold: None,
         },
+        None,
     )
     .await
     .expect("bootstrap submit_claim");

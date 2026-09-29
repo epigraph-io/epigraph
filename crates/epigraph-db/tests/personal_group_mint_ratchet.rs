@@ -359,6 +359,14 @@ const GUARDED_DEFINERS: &[(&str, usize, &[&str])] = &[
         0,
         &["public.epigraph_ensure_personal_group(p_operator)"],
     ),
+    // Migration 116's attested retire of a former shared signer (batch HTTP-id)
+    // is 107's retire written out again, so it carries the same call and the
+    // same no-revival contract.
+    (
+        "epigraph_link_retired_shared_signer",
+        0,
+        &["public.epigraph_ensure_personal_group(p_operator)"],
+    ),
 ];
 
 /// Functions the LIVE database may hold whose source matches

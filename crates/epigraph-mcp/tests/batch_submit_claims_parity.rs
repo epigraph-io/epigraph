@@ -120,6 +120,7 @@ async fn batch_entries_pass_every_field_through_and_return_full_responses(pool: 
                 "novelty_threshold": 0.0,
             }]
         })),
+        None,
     )
     .await
     .expect("batch call succeeds");
@@ -202,6 +203,7 @@ async fn a_batch_entry_without_methodology_keeps_the_old_default(pool: PgPool) {
                 "evidence_type": "logical",
             }]
         })),
+        None,
     )
     .await
     .expect("batch call succeeds");
@@ -240,6 +242,7 @@ async fn an_invalid_methodology_refuses_only_its_own_entry(pool: PgPool) {
                 {"content": good_b, "evidence_data": "ev", "evidence_type": "logical"},
             ]
         })),
+        None,
     )
     .await
     .expect("batch call itself succeeds; per-entry failures are reported");

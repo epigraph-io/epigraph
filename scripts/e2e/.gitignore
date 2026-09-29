@@ -29,3 +29,9 @@ bhh.*
 .hl.*
 .oplock.*
 op.*.err
+op.*.out
+.hidlock.*
+hidh.*
+hid.agents.*
+hid.claims.*
+hid.manifest.*

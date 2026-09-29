@@ -75,7 +75,12 @@ const REGISTER: &[(&str, usize)] = &[
     ("claims.rs", 3),
     ("community.rs", 1),
     ("conflicts.rs", 2),
-    ("conventions.rs", 5),
+    // 5 before batch W12b moved `forget_convention`'s REFUTES edge onto the
+    // caller-stamped transaction. That write is STILL best-effort (`if let
+    // Ok(tx)` / `.is_ok()` before `let _ = tx.commit()`), a form this register
+    // does not see (module doc): lowered because the `let _ =` write is gone,
+    // not because the error now propagates.
+    ("conventions.rs", 4),
     ("crud.rs", 2),
     ("gaps.rs", 1),
     ("perspective.rs", 1),

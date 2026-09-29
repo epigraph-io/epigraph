@@ -92,7 +92,7 @@ fn extraction() -> DocumentExtraction {
 async fn freshly_ingested_spine_rows_are_not_accused_of_tampering(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    do_ingest_document(&server, &viewer, &extraction())
+    do_ingest_document(&server, &viewer, &extraction(), None)
         .await
         .expect("document ingests");
 
@@ -138,9 +138,14 @@ async fn freshly_ingested_spine_rows_are_not_accused_of_tampering(pool: PgPool) 
 async fn spine_ingest_rows_are_not_accused_of_tampering(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    do_ingest_document_spine(&server, &extraction())
-        .await
-        .expect("spine ingests");
+    do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction(),
+        None,
+    )
+    .await
+    .expect("spine ingests");
 
     for (label, content) in [
         ("thesis (level 0)", THESIS),
@@ -170,9 +175,14 @@ async fn spine_ingest_rows_are_not_accused_of_tampering(pool: PgPool) {
 async fn a_tampered_spine_row_is_reported_undecided_not_clean(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    do_ingest_document_spine(&server, &extraction())
-        .await
-        .expect("spine ingests");
+    do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction(),
+        None,
+    )
+    .await
+    .expect("spine ingests");
 
     let id = only_claim_with_content(&pool, PARAGRAPH).await;
     sqlx::query("UPDATE claims SET content = $2 WHERE id = $1")

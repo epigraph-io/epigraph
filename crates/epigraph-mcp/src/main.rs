@@ -44,15 +44,20 @@ use epigraph_mcp::EpiGraphMcpFull;
 )]
 struct Cli {
     /// PostgreSQL connection URL
-    #[arg(long, env = "DATABASE_URL")]
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
     /// Ed25519 secret key (64 hex chars). If omitted, generates a new keypair.
-    #[arg(long)]
+    ///
+    /// Also read from `EPIGRAPH_MCP_AGENT_KEY` (batch HTTP-id), so a service
+    /// can keep the key in a 0600 environment file instead of its command
+    /// line, which any local user can read (`ps`, `systemctl show`). The value
+    /// is never printed by `--help`.
+    #[arg(long, env = "EPIGRAPH_MCP_AGENT_KEY", hide_env_values = true)]
     agent_key: Option<String>,
 
     /// OpenAI API key for embedding generation. If omitted, uses mock embeddings.
-    #[arg(long, env = "OPENAI_API_KEY")]
+    #[arg(long, env = "OPENAI_API_KEY", hide_env_values = true)]
     openai_api_key: Option<String>,
 
     /// Listen on HTTP. Accepts either `host:port` (TCP) or `unix:/abs/path` (Unix socket).
@@ -71,7 +76,7 @@ struct Cli {
     /// set. Must be at least 32 bytes. The same secret signs and verifies tokens
     /// across both `epigraph-api` and `epigraph-mcp` — when rotating, restart
     /// both processes with the new value.
-    #[arg(long, env = "EPIGRAPH_JWT_SECRET")]
+    #[arg(long, env = "EPIGRAPH_JWT_SECRET", hide_env_values = true)]
     jwt_secret: Option<String>,
 
     /// Acknowledge that HTTP transport exposes all MCP tools without authentication.
@@ -87,6 +92,20 @@ struct Cli {
     #[arg(long)]
     allow_unauthenticated_http: bool,
 
+    /// Let callers of an `--allow-unauthenticated-http` listener WRITE, authored
+    /// by this listener's own signer agent.
+    ///
+    /// Off by default (batch HTTP-id): such a caller presents no credential, so
+    /// no human is named, and an HTTP write is authored by the calling human's
+    /// agent. Without this flag that listener is read-only for its callers
+    /// (every write tool is refused by the scope gate). With it, writes are
+    /// authored by the signer, which the listener's start-up and per-call gates
+    /// keep unlinked from any operator, so it carries no human's authority.
+    /// Meant for a trusted local socket (e.g. the e2e harness), not for a
+    /// listener any remote caller can reach. Requires `--allow-unauthenticated-http`.
+    #[arg(long)]
+    allow_unauthenticated_writes: bool,
+
     /// Additional `Host` / `Origin` authority to accept on the HTTP listener
     /// (repeatable; comma-separated in the env var).
     ///
@@ -100,6 +119,7 @@ struct Cli {
     #[arg(
         long = "allowed-host",
         env = "EPIGRAPH_MCP_ALLOWED_HOSTS",
+        hide_env_values = true,
         value_delimiter = ','
     )]
     allowed_host: Vec<String>,
@@ -121,12 +141,16 @@ struct Cli {
     /// stdio only, with a declared identity (`--agent-model` / `--agent-key`).
     /// Refused with `--listen`, and an HTTP listener whose signer already has a
     /// link refuses to start.
-    #[arg(long = "operator-id", env = "EPIGRAPH_OPERATOR_ID")]
+    #[arg(
+        long = "operator-id",
+        env = "EPIGRAPH_OPERATOR_ID",
+        hide_env_values = true
+    )]
     operator_id: Option<uuid::Uuid>,
 
     /// Absolute URL of the protected-resource metadata document, advertised in 401
     /// WWW-Authenticate challenges so MCP clients can discover the auth server.
-    #[arg(long, env = "EPIGRAPH_RESOURCE_METADATA_URL")]
+    #[arg(long, env = "EPIGRAPH_RESOURCE_METADATA_URL", hide_env_values = true)]
     resource_metadata_url: Option<String>,
 
     /// Provider model identifier for LLM-agent identity derivation (e.g.
@@ -134,7 +158,7 @@ struct Cli {
     /// the agent keypair is derived deterministically from `(model, prompt)` so
     /// identical configurations collapse to ONE agent. Absent -> unchanged
     /// behavior (a fresh keypair per process).
-    #[arg(long, env = "EPIGRAPH_AGENT_MODEL")]
+    #[arg(long, env = "EPIGRAPH_AGENT_MODEL", hide_env_values = true)]
     agent_model: Option<String>,
 
     /// Raw system prompt for LLM-agent identity derivation. Hashed internally
@@ -142,7 +166,7 @@ struct Cli {
     /// Prefer `--agent-system-prompt-hash` when the prompt should not be
     /// materialized in this process's argv/env at all. Ignored unless
     /// `--agent-model` is also set.
-    #[arg(long, env = "EPIGRAPH_AGENT_SYSTEM_PROMPT")]
+    #[arg(long, env = "EPIGRAPH_AGENT_SYSTEM_PROMPT", hide_env_values = true)]
     agent_system_prompt: Option<String>,
 
     /// Pre-computed BLAKE3 lowercase-hex digest of the system prompt. Lets the
@@ -150,7 +174,11 @@ struct Cli {
     /// putting the raw prompt in this process. Takes precedence over
     /// `--agent-system-prompt` when both are set. Ignored unless `--agent-model`
     /// is also set.
-    #[arg(long, env = "EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH")]
+    #[arg(
+        long,
+        env = "EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH",
+        hide_env_values = true
+    )]
     agent_system_prompt_hash: Option<String>,
 }
 
@@ -230,14 +258,7 @@ fn select_signer(
 
     // (3) explicit 32-byte key, no LLM identity.
     if let Some(key_hex) = agent_key {
-        let bytes = (0..key_hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-            .map_err(|e| format!("invalid agent-key hex: {e}"))?;
-        let key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "agent-key must be exactly 32 bytes (64 hex chars)".to_string())?;
+        let key = parse_agent_key(key_hex)?;
         let signer = AgentSigner::from_bytes(&key).map_err(|e| format!("agent-key: {e}"))?;
         return Ok(SelectedSigner {
             signer,
@@ -252,6 +273,43 @@ fn select_signer(
         llm_identity: None,
         identity_declared: false,
     })
+}
+
+/// Parse an `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` value into its 32 bytes.
+///
+/// Surrounding whitespace is trimmed first: a value read from an environment
+/// file or a shell export can carry a trailing space, CR or newline. What is
+/// left must be exactly 64 ASCII hex characters. Every other input is a named
+/// error, never a panic (the old byte-pair slicing panicked on an odd length
+/// or a multi-byte character) and never the `generate()` fallback, because the
+/// operator asked for one specific key. No error message echoes any part of
+/// the value: it is a secret, and `main` prints the error.
+fn parse_agent_key(raw: &str) -> Result<[u8; 32], String> {
+    const EXPECTED: &str = "expected exactly 64 hex chars (32 bytes); the value is not shown";
+    let key_hex = raw.trim();
+    if !key_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid agent-key: it contains a non-hex character; {EXPECTED}"
+        ));
+    }
+    if key_hex.len() % 2 != 0 {
+        return Err(format!(
+            "invalid agent-key: odd number of hex chars ({}); {EXPECTED}",
+            key_hex.len()
+        ));
+    }
+    if key_hex.len() != 64 {
+        return Err(format!(
+            "agent-key must be exactly 32 bytes: got {} hex chars; {EXPECTED}",
+            key_hex.len()
+        ));
+    }
+    let mut key = [0u8; 32];
+    // Cannot fail after the checks above; map the error to a fixed string
+    // anyway, because `FromHexError`'s Display names the offending character.
+    hex::decode_to_slice(key_hex, &mut key)
+        .map_err(|_| format!("invalid agent-key hex; {EXPECTED}"))?;
+    Ok(key)
 }
 
 /// Validate the `(--listen, --jwt-secret, --allow-unauthenticated-http)`
@@ -304,145 +362,32 @@ fn check_listen_auth_mode(
     }
 }
 
-/// Attach the privileged pool the three MCP maintenance tools lease from, when
-/// one can be vouched for. Otherwise attach NOTHING: the tools then refuse
-/// loudly, and the rest of the server serves normally.
+/// Validate `--allow-unauthenticated-writes` (batch HTTP-id) and turn it into
+/// the injected context's write setting.
 ///
-/// # Why a misconfiguration does not refuse to boot here, unlike `epigraph-api`
-///
-/// `epigraph-api/src/bin/server.rs` `.expect()`s this path. Its background
-/// writers are the process's job, and booting "healthy" while they write
-/// nowhere is the failure it exists to prevent. Here the maintenance surface
-/// is three tools out of the whole MCP surface, and this binary also runs as a
-/// per-client stdio process that is handed only `--database-url`. A boot
-/// refusal would take every tool down to protect three, and each of those three
-/// already refuses on its own call, naming the fix
-/// (`maintenance::maintenance_viewer`). So every failure below is an ERROR log
-/// and no pool:
-///
-/// * `MAINTENANCE_DATABASE_URL` names a different database than the app DSN
-///   (`maintenance_database_url`'s refusal): a maintenance connection there
-///   reads zero rows and writes nowhere;
-/// * the pool cannot be built;
-/// * the boot probe finds the role unprivileged while row security is active;
-/// * `MAINTENANCE_DATABASE_URL` is unset. The documented fallback to the
-///   application DSN is NEVER attached, even when that role can bypass RLS
-///   (`epigraph_mcp::maintenance::may_attach_maintenance_pool`): the three tools
-///   read and retire rows across every tenant, so enabling them is an explicit
-///   operator act, not a side effect of a superuser application DSN.
-///
-/// Sized at 2 connections (a maintenance tool call holds one for its duration),
-/// with the same 5 s acquire timeout as the app pool. `docs/deploy.md` §1c-bis
-/// counts it per MCP process.
-async fn attach_maintenance_pool(
-    scoped: epigraph_db::ScopedPool,
-    database_url: &str,
-    guc_mode: epigraph_db::SessionGucMode,
-) -> epigraph_db::ScopedPool {
-    let (url, source) = match epigraph_db::maintenance_database_url(database_url) {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            tracing::error!(
-                target: "tenancy.maintenance",
-                error = %e,
-                "MAINTENANCE_DATABASE_URL is unusable; the three maintenance tools \
-                 (recompute_beliefs, sweep_semantic_duplicates, backfill_embeddings) will refuse"
-            );
-            return scoped;
-        }
-    };
-    let maintenance = match epigraph_db::ScopedPool::connect_with_options(
-        &url,
-        guc_mode,
-        epigraph_db::ScopedPoolOptions {
-            max_connections: 2,
-            acquire_timeout: std::time::Duration::from_secs(5),
-            statement_timeout: None,
-        },
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(
-                target: "tenancy.maintenance",
-                dsn_source = source.as_str(),
-                error = %e,
-                "could not connect the maintenance pool; the three maintenance tools will refuse"
-            );
-            return scoped;
-        }
-    };
-    match epigraph_db::probe_maintenance_privilege(maintenance.inner()).await {
-        Ok(privilege) => match epigraph_db::maintenance_verdict(privilege, source) {
-            Ok(_) if epigraph_mcp::maintenance::may_attach_maintenance_pool(privilege, source) => {
-                tracing::info!(
-                    target: "tenancy.maintenance",
-                    dsn_source = source.as_str(),
-                    "maintenance pool attached (satisfies epigraph_bypass()); the three \
-                     maintenance tools are available"
-                );
-                scoped.with_maintenance_pool(maintenance.inner().clone())
-            }
-            // Unprivileged but no table has row security: a bypass viewer would
-            // still see the corpus. Still not attached. This binary has no
-            // pre-077 deployment to serve, and attaching an unprivileged pool
-            // would make the per-call check the only guard.
-            // WARN when the variable was simply not set (the documented fallback
-            // to the app DSN, which on a least-privilege deployment is never
-            // privileged, and a normal state for a per-client stdio process),
-            // ERROR when an operator CONFIGURED a maintenance DSN that cannot
-            // bypass. Measured on the e2e harness: every server started without
-            // the variable logged this line at ERROR, which is noise that trains
-            // operators to ignore the configured case.
-            Ok(_) | Err(_) => {
-                if source == epigraph_db::MaintenanceDsnSource::FellBackToApplicationDsn
-                    && privilege.bypass
-                {
-                    // The application DSN CAN bypass RLS, and that is exactly why
-                    // it is not attached: enabling three cross-tenant tools must be
-                    // an operator's explicit act (`may_attach_maintenance_pool`).
-                    tracing::warn!(
-                        target: "tenancy.maintenance",
-                        dsn_source = source.as_str(),
-                        "MAINTENANCE_DATABASE_URL is not set; the application DSN bypasses RLS \
-                         but is NOT attached as the maintenance pool, because the three \
-                         cross-tenant maintenance tools are enabled only by an explicitly \
-                         configured MAINTENANCE_DATABASE_URL. They will refuse."
-                    );
-                } else if source == epigraph_db::MaintenanceDsnSource::FellBackToApplicationDsn {
-                    tracing::warn!(
-                        target: "tenancy.maintenance",
-                        dsn_source = source.as_str(),
-                        rls_active = privilege.rls_active,
-                        "MAINTENANCE_DATABASE_URL is not set and the application DSN cannot \
-                         bypass RLS; no maintenance pool attached. The three maintenance tools \
-                         will refuse until MAINTENANCE_DATABASE_URL names a member of \
-                         epigraph_maintenance."
-                    );
-                } else {
-                    tracing::error!(
-                        target: "tenancy.maintenance",
-                        dsn_source = source.as_str(),
-                        rls_active = privilege.rls_active,
-                        "the maintenance DSN's role does not satisfy epigraph_bypass(); not \
-                         attaching it. The three maintenance tools will refuse. Set \
-                         MAINTENANCE_DATABASE_URL to a role that is a member of \
-                         epigraph_maintenance."
-                    );
-                }
-                scoped
-            }
-        },
-        Err(e) => {
-            tracing::error!(
-                target: "tenancy.maintenance",
-                error = %e,
-                "could not probe the maintenance pool's privilege; not attaching it"
-            );
-            scoped
-        }
+/// The flag only means something on the listener that injects a principal-less
+/// context, so it is refused anywhere else rather than silently ignored: an
+/// operator who passes it on a `--jwt-secret` listener or on stdio has a wrong
+/// picture of what their callers can do.
+fn unauthenticated_writes(
+    listen: Option<&str>,
+    allow_unauthenticated_http: bool,
+    allow_unauthenticated_writes: bool,
+) -> Result<epigraph_mcp::auth::UnauthenticatedWrites, String> {
+    use epigraph_mcp::auth::UnauthenticatedWrites;
+    if !allow_unauthenticated_writes {
+        return Ok(UnauthenticatedWrites::Refused);
     }
+    if listen.is_none() || !allow_unauthenticated_http {
+        return Err(
+            "--allow-unauthenticated-writes applies only to an --allow-unauthenticated-http \
+             listener (--listen unix:/abs/path --allow-unauthenticated-http). An authenticated \
+             listener authors every write as the caller's own agent, and stdio as this \
+             process's agent; neither has a principal-less caller to let write."
+                .to_string(),
+        );
+    }
+    Ok(UnauthenticatedWrites::AsListenerSigner)
 }
 
 #[tokio::main]
@@ -451,12 +396,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "epigraph_mcp=info".parse().unwrap()),
+                // `tenancy=info` so the default filter carries the D9 boot line
+                // below (target `tenancy.maintenance`), which is what an
+                // operator greps the journal for after a deploy.
+                .unwrap_or_else(|_| "epigraph_mcp=info,tenancy=info".parse().unwrap()),
         )
         .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
+
+    // Operator decision D9: a request-serving process never holds the
+    // maintenance DSN, and this binary is one on every transport (`--listen`
+    // for the HTTP units, stdio for agent containers and operator configs).
+    // Checked before every other gate and before any connection, so it is the
+    // first and only thing a misconfigured unit reports; one code path, every
+    // environment, no override flag. The refusal goes to stderr: on stdio,
+    // stdout is the JSON-RPC stream.
+    if let Err(refusal) = epigraph_db::request_unit_maintenance_dsn_check(
+        std::env::var(epigraph_db::MAINTENANCE_DATABASE_URL)
+            .ok()
+            .as_deref(),
+    ) {
+        eprintln!("ERROR: {refusal}");
+        std::process::exit(1);
+    }
 
     // Safety gate for the HTTP transport (see `check_listen_auth_mode`). Runs
     // before the DB connect so a misconfiguration surfaces immediately rather
@@ -471,6 +435,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
+    let unauthenticated_writes = match unauthenticated_writes(
+        cli.listen.as_deref(),
+        cli.allow_unauthenticated_http,
+        cli.allow_unauthenticated_writes,
+    ) {
+        Ok(writes) => writes,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
+        }
+    };
 
     // Operator gate (see `epigraph_mcp::operator`). Signer SELECTION is pure, so
     // it runs here, before the DB connect, and only its side effects (printing a
@@ -527,12 +502,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `server.pool` is `scoped.inner().clone()` — the SAME pool, not a second
     // one. Building both would double the connection count.
     //
-    // THE THREE MAINTENANCE TOOLS ARE NOT ENABLED BY THIS. They run every
-    // statement on a connection leased from a SEPARATE, privileged maintenance
-    // pool, attached below by `attach_maintenance_pool` only when
-    // `MAINTENANCE_DATABASE_URL` resolves and its boot probe passes.
-    // `maintenance::maintenance_viewer` refuses them when no such pool is
-    // attached, and re-checks the leased connection's privilege on every call.
+    // THE THREE MAINTENANCE TOOLS ARE NOT ENABLED BY THIS, and after operator
+    // decision D9 nothing in this binary enables them: no maintenance pool is
+    // ever attached, so `maintenance::maintenance_viewer` answers MOVED (the
+    // tools run as operator CLIs on the maintenance DSN instead).
     tracing::info!("Connecting to database...");
     let guc_mode = epigraph_db::SessionGucMode::from_env(
         std::env::var("EPIGRAPH_SESSION_GUC_MODE")
@@ -584,7 +557,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let pool = scoped.inner().clone();
     tracing::info!("Database connected");
-    let scoped = attach_maintenance_pool(scoped, &cli.database_url, guc_mode).await;
+    // Operator decision D9: no maintenance pool is attached, ever (the refusal
+    // above guarantees the variable is absent). The three maintenance tools
+    // therefore answer MOVED, naming the operator CLI that runs them, and every
+    // cascade a tool triggers is deferred and applied by the replay timer.
+    tracing::info!(
+        target: "tenancy.maintenance",
+        "{}",
+        epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
+    );
 
     // Create or restore agent signer. Precedence lives in `select_signer`
     // (unit-tested); here we only handle the side effects (secret-key print for
@@ -785,7 +766,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let probe = Arc::new(sessions.session());
                 let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
                     probe.clone() as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
-                );
+                )
+                .with_writes(unauthenticated_writes);
+                // Batch HTTP-id: say at boot which one this listener is.
+                match unauthenticated_writes {
+                    epigraph_mcp::auth::UnauthenticatedWrites::Refused => tracing::info!(
+                        "--allow-unauthenticated-http listener is READ-ONLY for its callers \
+                         (no authenticated principal, so no author): write tools are refused. \
+                         Writes go through an authenticated (--jwt-secret) listener."
+                    ),
+                    epigraph_mcp::auth::UnauthenticatedWrites::AsListenerSigner => {
+                        tracing::warn!(
+                            "--allow-unauthenticated-writes: callers of this listener write as its \
+                             own signer agent, which no human owns. Use it only on a trusted local \
+                             socket."
+                        );
+                    }
+                }
                 match probe.server_agent_id().await {
                     Ok(id) => principal.warmed_with(id),
                     Err(e) => {
@@ -1022,6 +1019,46 @@ mod listen_auth_gate_tests {
 }
 
 #[cfg(test)]
+mod unauthenticated_writes_gate_tests {
+    use super::unauthenticated_writes;
+    use epigraph_mcp::auth::UnauthenticatedWrites;
+
+    const UNIX: &str = "unix:/run/epigraph-mcp.sock";
+
+    /// Batch HTTP-id: without the flag the principal-less listener is
+    /// read-only, on every transport.
+    #[test]
+    fn writes_are_refused_unless_the_flag_is_given() {
+        for (listen, unauth) in [(Some(UNIX), true), (Some(UNIX), false), (None, false)] {
+            assert_eq!(
+                unauthenticated_writes(listen, unauth, false),
+                Ok(UnauthenticatedWrites::Refused)
+            );
+        }
+    }
+
+    /// The flag opts the principal-less listener into signer-authored writes.
+    #[test]
+    fn the_flag_on_an_unauthenticated_listener_allows_signer_writes() {
+        assert_eq!(
+            unauthenticated_writes(Some(UNIX), true, true),
+            Ok(UnauthenticatedWrites::AsListenerSigner)
+        );
+    }
+
+    /// Anywhere else the flag is refused, not ignored: an authenticated
+    /// listener has no principal-less caller, and neither does stdio.
+    #[test]
+    fn the_flag_without_an_unauthenticated_listener_is_refused() {
+        for (listen, unauth) in [(Some(UNIX), false), (None, false), (None, true)] {
+            let err = unauthenticated_writes(listen, unauth, true)
+                .expect_err("the flag must be refused without an unauthenticated listener");
+            assert!(err.contains("--allow-unauthenticated-http"), "got: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod signer_selection_tests {
     use super::{select_signer, SelectedSigner};
 
@@ -1181,5 +1218,88 @@ mod signer_selection_tests {
     #[test]
     fn malformed_agent_key_is_an_error() {
         assert!(select_signer(None, None, None, Some("zz")).is_err());
+    }
+
+    /// A key read from an env file or a shell export can carry surrounding
+    /// whitespace (a trailing space, CR or newline). It is trimmed, and the
+    /// signer is the SAME one the clean key gives: not merely `Ok`, which a
+    /// silent `generate()` would also be.
+    #[test]
+    fn agent_key_with_surrounding_whitespace_is_the_same_signer() {
+        let clean = select_signer(None, None, None, Some(KEY_HEX))
+            .unwrap()
+            .signer
+            .public_key();
+        for padded in [
+            format!("{KEY_HEX} "),
+            format!("{KEY_HEX}\r"),
+            format!("{KEY_HEX}\n"),
+            format!("{KEY_HEX}\r\n"),
+            format!(" \t{KEY_HEX}"),
+        ] {
+            let selected = select_signer(None, None, None, Some(&padded))
+                .unwrap_or_else(|e| panic!("{padded:?} must parse after trimming: {e}"));
+            assert_eq!(
+                selected.signer.public_key(),
+                clean,
+                "{padded:?} must give the clean key's signer"
+            );
+            assert!(selected.identity_declared);
+        }
+    }
+
+    /// Inputs the old byte-pair slicing PANICKED on (odd length, a multi-byte
+    /// character inside 64 bytes), plus the other malformed shapes, are each a
+    /// clean `Err`: no panic, and never the `generate()` fallback. A value that
+    /// trims to empty fails closed too.
+    #[test]
+    fn malformed_agent_key_values_are_errors_not_panics_or_fallbacks() {
+        let odd = &KEY_HEX[..63];
+        let multibyte = format!("{}\u{e9}", &KEY_HEX[..62]); // 64 bytes, 63 chars
+        assert_eq!(multibyte.len(), 64);
+        let internal_space = format!("{} {}", &KEY_HEX[..32], &KEY_HEX[33..]);
+        let short = &KEY_HEX[..62];
+        let long = format!("{KEY_HEX}01");
+        for bad in [
+            odd,
+            multibyte.as_str(),
+            internal_space.as_str(),
+            short,
+            long.as_str(),
+            "",
+            "   ",
+            "\r\n",
+        ] {
+            let outcome = std::panic::catch_unwind(|| select_signer(None, None, None, Some(bad)));
+            let result = outcome.unwrap_or_else(|_| panic!("{bad:?} must not panic"));
+            assert!(result.is_err(), "{bad:?} must be refused, not generate()d");
+        }
+    }
+
+    /// No error message echoes any part of the key: it is a secret, and `main`
+    /// prints the error. A non-hex LAST char, an odd length and a wrong length
+    /// are each checked for a 16-char run of the value.
+    #[test]
+    fn agent_key_errors_never_echo_the_value() {
+        let secret = "0123456789abcdef".repeat(4);
+        let non_hex = format!("{}g", &secret[..63]);
+        let odd = secret[..63].to_string();
+        let wrong_len = secret[..62].to_string();
+        for bad in [non_hex, odd, wrong_len] {
+            let Err(msg) = select_signer(None, None, None, Some(&bad)) else {
+                panic!("{bad:?} must be refused");
+            };
+            for window in bad.as_bytes().windows(16) {
+                let run = std::str::from_utf8(window).unwrap();
+                assert!(
+                    !msg.contains(run),
+                    "the error must not echo the key (found {run:?}): {msg}"
+                );
+            }
+            assert!(
+                !msg.contains("'g'"),
+                "the error must not name the bad char: {msg}"
+            );
+        }
     }
 }

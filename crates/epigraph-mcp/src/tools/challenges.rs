@@ -53,7 +53,9 @@ const VALID_CHALLENGE_TYPES: &[&str] = &[
 /// change.
 pub async fn challenge_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ChallengeclaimParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
 
@@ -69,10 +71,13 @@ pub async fn challenge_claim(
         return Err(invalid_params("explanation cannot be empty"));
     }
 
-    let agent_id = server.agent_id().await?;
+    // The challenger is the request's principal (batch H-b, D1): the caller
+    // over HTTP, this server's agent on stdio.
+    let challenger = server.write_identity(auth, viewer).await?;
+    let agent_id = challenger.agent_id();
 
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "challenge_claim").await?;
+        crate::claim_helper::begin_author_stamped_tx(server, challenger, "challenge_claim").await?;
 
     let challenge_id = ChallengeRepository::create(
         &mut *tx,

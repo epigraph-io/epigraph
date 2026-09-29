@@ -114,6 +114,7 @@ async fn supports_raises_target_belief_and_is_idempotent(pool: PgPool) {
             relationship: "supports".to_string(),
             properties: Some(serde_json::json!({"note": "evidence A"})),
         },
+        None,
     )
     .await
     .expect("supports wire succeeds");
@@ -175,6 +176,7 @@ async fn supports_raises_target_belief_and_is_idempotent(pool: PgPool) {
             relationship: "supports".to_string(),
             properties: Some(serde_json::json!({"note": "evidence A"})),
         },
+        None,
     )
     .await
     .expect("idempotent re-run succeeds");
@@ -226,6 +228,7 @@ async fn contradicts_lowers_target_belief(pool: PgPool) {
                 relationship: "contradicts".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("contradicts wire succeeds"),
@@ -285,6 +288,7 @@ async fn factorless_source_writes_durable_edge_without_wiring(pool: PgPool) {
                 relationship: "supports".to_string(),
                 properties: Some(serde_json::json!({"note": "no source belief"})),
             },
+            None,
         )
         .await
         .expect("link must succeed even when the source has no belief interval"),
@@ -372,6 +376,7 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
                 relationship: "supports".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("factorless link must still succeed"),
@@ -406,6 +411,7 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
                 relationship: "supports".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("re-assert of the existing edge must succeed"),
@@ -464,6 +470,7 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
                 relationship: "supports".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("third re-assert must succeed"),
@@ -516,6 +523,7 @@ async fn structural_relationship_is_rejected(pool: PgPool) {
             relationship: "decomposes_to".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("decomposes_to must be rejected by the epistemic allow-list");
@@ -569,6 +577,7 @@ async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
             relationship: "cites".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("cites must be accepted by link_epistemic");
@@ -602,6 +611,7 @@ async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
             relationship: "cites".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("re-hit must succeed (idempotent)");
@@ -638,6 +648,7 @@ async fn supersedes_is_rejected(pool: PgPool) {
             relationship: "supersedes".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("supersedes must be rejected — it has dedicated semantics in supersede_claim");
@@ -673,6 +684,7 @@ async fn self_loop_is_rejected(pool: PgPool) {
             relationship: "supports".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("self-loops must be rejected");
@@ -704,6 +716,7 @@ async fn missing_target_claim_is_rejected(pool: PgPool) {
             relationship: "supports".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("missing target claim must error");
@@ -762,6 +775,7 @@ async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
                 relationship: "contradicts".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("A contradicts B"),
@@ -784,6 +798,7 @@ async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
                 relationship: "contradicts".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("B contradicts A"),
@@ -834,6 +849,7 @@ async fn corroborates_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
                 relationship: "corroborates".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("corroborates link");
@@ -880,6 +896,7 @@ async fn supports_filed_in_both_orders_stays_two_directional_edges(pool: PgPool)
                     relationship: "supports".to_string(),
                     properties: None,
                 },
+                None,
             )
             .await
             .expect("supports link"),
@@ -935,6 +952,7 @@ async fn reverse_order_rehit_wires_the_stored_orientation(pool: PgPool) {
                 relationship: "contradicts".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("A contradicts B"),
@@ -969,6 +987,7 @@ async fn reverse_order_rehit_wires_the_stored_orientation(pool: PgPool) {
                 relationship: "contradicts".to_string(),
                 properties: None,
             },
+            None,
         )
         .await
         .expect("B contradicts A"),

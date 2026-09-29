@@ -57,6 +57,16 @@ async fn wire_supports(pool: &sqlx::PgPool, agent: Uuid, source: Uuid, target: U
     );
 }
 
+/// The claim's author (`claims.agent_id`), for attributing the BBA the edge
+/// factor wires from it.
+async fn author_of(pool: &sqlx::PgPool, claim_id: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await
+        .expect("read the claim's author")
+}
+
 async fn betp(pool: &sqlx::PgPool, claim_id: Uuid) -> Option<f64> {
     sqlx::query_scalar::<_, Option<f64>>("SELECT pignistic_prob FROM claims WHERE id = $1")
         .bind(claim_id)
@@ -93,17 +103,21 @@ async fn supersede_route_reports_and_applies_the_belief_cascade() {
         .await
         .unwrap();
 
-    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (addr, _shutdown) = common::spawn_app_with_admin_cascade(&url).await;
     let (token, client_id) =
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
 
     let tag = Uuid::new_v4();
-    let a =
-        common::seed_claim_with_agent(&pool, &format!("http cascade supporter {tag}"), client_id)
-            .await;
+    // A claim the token's agent writes (batch OA1's claim-act rule).
+    let a = common::seed_claim_writable_by_client(
+        &pool,
+        &format!("http cascade supporter {tag}"),
+        client_id,
+    )
+    .await;
     plant_interval(&pool, a).await;
     let b = common::seed_claim(&pool, &format!("http cascade downstream {tag}")).await;
-    wire_supports(&pool, client_id, a, b).await;
+    wire_supports(&pool, author_of(&pool, a).await, a, b).await;
 
     assert!(
         betp(&pool, b).await.is_some(),
@@ -134,6 +148,29 @@ async fn supersede_route_reports_and_applies_the_belief_cascade() {
     assert_eq!(
         json["superseded_claim_id"].as_str(),
         Some(a.to_string()).as_deref()
+    );
+
+    // Migration 117: the cascade ran with administrative authority, audited.
+    assert_eq!(json["cascade"]["status"], "applied", "body={text}");
+    let event: Uuid = json["cascade"]["audit_event_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("the applied cascade names its audit row");
+    let (et, cause, owner): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT event_type::text, details->>'cause', details#>>'{trigger,oauth,client_id}' \
+           FROM security_events WHERE id = $1",
+    )
+    .bind(event)
+    .fetch_one(&pool)
+    .await
+    .expect("audit row");
+    assert_eq!(
+        (et.as_str(), cause.as_str(), owner),
+        (
+            "cascade.admin_applied",
+            "supersede",
+            Some(client_id.to_string())
+        )
     );
 
     // C1(b) + C4: the cascade is reported over HTTP, and it found B.
@@ -174,9 +211,10 @@ async fn dedup_route_reports_and_applies_the_belief_cascade() {
         .await
         .unwrap();
 
-    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (addr, _shutdown) = common::spawn_app_with_admin_cascade(&url).await;
     let (token, client_id) =
-        common::test_bearer_token_with_seeded_client(&pool, &["claims:admin"]).await;
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:admin"])
+            .await;
 
     let tag = Uuid::new_v4();
     let canonical = common::seed_claim(&pool, &format!("http dedup canonical {tag}")).await;
@@ -211,6 +249,7 @@ async fn dedup_route_reports_and_applies_the_belief_cascade() {
         Some(canonical.to_string()).as_deref()
     );
     assert_eq!(json["mode"].as_str(), Some("mark_duplicate"));
+    assert_eq!(json["cascade"]["status"], "applied", "body={text}");
 
     let cascade = &json["belief_cascade"];
     assert!(
@@ -255,5 +294,85 @@ async fn dedup_route_reports_and_applies_the_belief_cascade() {
         None,
         "the duplicate's supporter moved to canonical; its cached BetP is a \
          derived record with nothing behind it"
+    );
+}
+
+/// Migration 117: a server with NO administrative connection (plain
+/// `spawn_app`) still commits the supersession, reports the cascade as
+/// deferred with its `security_events` row, and repairs nothing downstream.
+#[tokio::test(flavor = "multi_thread")]
+async fn supersede_route_without_an_admin_connection_defers_the_cascade() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, client_id) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+
+    let tag = Uuid::new_v4();
+    // A claim the token's agent writes (batch OA1's claim-act rule).
+    let a = common::seed_claim_writable_by_client(
+        &pool,
+        &format!("http deferred supporter {tag}"),
+        client_id,
+    )
+    .await;
+    plant_interval(&pool, a).await;
+    let b = common::seed_claim(&pool, &format!("http deferred downstream {tag}")).await;
+    wire_supports(&pool, author_of(&pool, a).await, a, b).await;
+    let before = betp(&pool, b).await;
+    assert!(
+        before.is_some(),
+        "fixture: B carries a cached BetP derived from A"
+    );
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/claims/{a}/supersede"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "content": format!("replacement for {a}"),
+            "truth_value": 0.5,
+            "reason": "http deferred fixture",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(
+        status == 200 || status == 201,
+        "the act commits; got {status} body={text}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&text).expect("response json");
+    assert_eq!(json["cascade"]["status"], "deferred", "body={text}");
+    let event: Uuid = json["cascade"]["audit_event_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("the deferral names its audit row");
+    let (et, cause): (String, String) = sqlx::query_as(
+        "SELECT event_type::text, details->>'cause' FROM security_events WHERE id = $1",
+    )
+    .bind(event)
+    .fetch_one(&pool)
+    .await
+    .expect("deferral row");
+    assert_eq!(
+        (et.as_str(), cause.as_str()),
+        ("cascade.deferred", "supersede")
+    );
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!current, "the supersession committed");
+    assert_eq!(
+        betp(&pool, b).await,
+        before,
+        "nothing downstream was repaired"
     );
 }

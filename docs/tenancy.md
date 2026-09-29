@@ -86,7 +86,7 @@ back. Migration 062 forbids that pairing outright with
 | A claim-derived row (`evidence`, `triples`, …) | inherited from the parent claim by 070 arm (c), at insert |
 | A visibility change on a claim | propagated to 17 derived tables, `harvester_fragments` and `edges` by 070 arm (d), in the same transaction |
 | A `harvester_fragments` row whose provenance row arrives later | stamped from the cited claim by **089**, when the `harvester_claim_provenance` row linking them is inserted — but only if the fragment is still unstamped. See the note below the table. |
-| An edge | the **meet** of its two endpoints, 070 arm (b) |
+| An edge | the **meet** of its two endpoints, 070 arm (b); since **120** (operator decision D8) an edge between two public claims (or evidence, or from a `synthesis` source) is owned by its **writer's group** and stays public, and every other public-meet edge (an agent, paper, workflow, trace ... endpoint) stays `('public', world)`. See "Edges between public claims are their writer's (120)" below. |
 | A row with no derivable owner (`frames`, `contexts`, `perspectives`, `communities`, `recall_events`) | **must be declared by the writer.** Before 074 these landed on `('public', world)`; after 074 there is no default to land on. See the next section. `harvester_fragments` is in this set too, with one qualification — see below. |
 
 **`harvester_fragments` is the one table in two rows of that table, and the
@@ -111,6 +111,15 @@ by a bypassing or `epigraph_seed`-member session — today's connection regime, 
 the `#[sqlx::test]` harness — plus everything already on disk. **Declare both
 columns at the fragment's own insert site.** 089 is a backstop for the rows that
 predate a declaration, not a default to lean on.
+
+**Since migration 115 the stamp also runs only for a privileged session**
+(`epigraph_bypass()`: a maintenance-member or superuser `session_user`). A
+provenance INSERT from any other session leaves a sentinel-owned fragment
+exactly as it was. Such a session cannot write a sentinel-owned fragment in the
+first place (the `WITH CHECK` above), so the only fragments it could have
+stamped were somebody else's, and owning one would have let it DELETE the
+fragment and, through the FK cascade, every other claim's provenance row for
+it. The unstamped fragment was already public and stays so.
 
 One consequence worth knowing before you rely on it: a still-unstamped fragment
 cited by **both** a public claim and a group-private one becomes group-private the
@@ -164,7 +173,7 @@ over restating, because restating invites an accidental downgrade.
 | `claims` | `supersedes` | 074 arm 1 |
 | `claims` | `step_lineage_id` | 074 arm 2 |
 | the 17 claim-derived tables (`evidence`, `triples`, `claim_versions`, …) | `claim_id` | 074's `epigraph_derived_require_tenancy` |
-| `edges` | `source_id` / `target_id` | 072's `epigraph_edges_tenancy` (the endpoint meet) |
+| `edges` | `source_id` / `target_id` | 120's `epigraph_edges_tenancy` (the endpoint meet, or the writer's group between two public claims) |
 
 **Inheritance is checked even when you also declare.** The parent arms run
 *before* the "fully declared" arm, so binding `supersedes` to a group-private
@@ -373,6 +382,155 @@ The corollary is what makes the migrations safe to land ahead of the credential
 split: while `DATABASE_URL` still names the owning superuser, **all three
 migrations are observably inert**. The risk lives in deploy step 11d, not in
 the schema change.
+
+### DELETE and UPDATE of a row you do not own (115, 117)
+
+077's policies are FOR ALL with the READ predicate as their USING, so for DELETE
+and UPDATE they admitted what a session could read. Two later migrations narrow
+that for a non-privileged session:
+
+* **DELETE is owner-scoped (115, 120)** on every tier-A table: the row's owner
+  (on `edges`, the owner or co-owner) must be in the session's writable set.
+  115 also admitted, for an edge nobody owned, the writer of its SOURCE node;
+  120 removed that arm (operator decision D8), so a non-privileged DELETE is
+  strictly owner or co-owner scoped.
+* **UPDATE of an edge or of an instance-wide registry row is owner-scoped
+  (117).** `edges` (owner or co-owner) and `frames`, `contexts`, `perspectives`,
+  `communities` (owner): both the row as it was and the row as it will be,
+  after `edges_tenancy` has restamped a re-pointed edge. A row nobody owns (a
+  world-owned edge, a shared frame) is therefore not updatable by any
+  application session; its retraction, relabelling or re-pointing is a
+  privileged act. The other tier-A tables already refuse a non-owner's UPDATE
+  through their writable-set WITH CHECK and 115's owner-immutability guard.
+  A re-point by a non-privileged session (the owner, or a co-owner moving the
+  edge off the owner's endpoint) clears the edge's `signature`, `signer_id` and
+  `content_hash`: the signed content named the old endpoints.
+
+### Edges between public claims are their writer's (120)
+
+Operator decision D8. `edges.writer_group_id` records the writing session's
+group (`epigraph_writer_group()`: the acting operator's personal group, else the
+principal's own) on every INSERT, whatever the caller bound; it is never
+recomputed and a non-privileged session cannot change it. When both endpoints
+are public AND both are epistemic nodes (`claim` or `evidence`; a `synthesis`
+source too), the edge is owned by that group and stays public: its writer
+patches, retracts and deletes it, and nobody else does. This applies to a
+privileged session that carries a principal too; a session with no principal
+(a maintenance login, a backfill) writes a world edge. Every other public-meet
+edge stays `('public', world)`. A re-point keeps a public edge's owner (the
+administrative cascade re-points other writers' edges, and they stay theirs);
+mixed and private endpoints keep the meet; an explicit `('group', G)`
+declaration between public endpoints is still kept. A public-to-public owner
+change of an endpoint (the operator re-own) no longer rewrites any edge; a
+narrowing takes the meet, and the privatization revert restores the writer from
+`writer_group_id`.
+
+Edges written before 120 carry no attributable author (`signer_id`, where set,
+is a bulk attestation key), so they stay world-owned: administrative. A write
+refused on an edge the caller can read answers `not_owner` naming the rule
+(another writer's, or administrative), never "not found". When an edge's owner
+retracts or deletes it, its own edge-keyed BBAs are deleted in the act and every
+other writer's are removed by the maintenance replay (cause `edge_retract`); the
+replay also re-derives the belief of the claims the owner's own BBAs lived on,
+since the owner cannot write another owner's cache. The deferral definer derives
+those claims itself, from the session's own BBA rows keyed on the edge, before
+the act deletes them; a caller names none. So the replay re-derives only claims
+that carried a BBA keyed on the edge. A re-derivation recomputes a claim's
+belief from the rows it has, and clears a cache that no surviving row backs.
+Two acts on one edge before one replay are both re-derived: the replay reads the
+claims of every open deferral of the edge, not only the oldest one's. A
+deferral names only an edge out of force (an act that deletes the row closes
+its window first). The owner-only rule is row security: it is enforced for
+sessions on the application role, and a privileged session bypasses it.
+
+**The retraction cascade is an administrative act (117).** A supersede, a dedup
+or a consolidation is the caller's act, written with the caller's authority on
+its own stamped transaction. Since batch OA1 the two claim acts need only
+`claims:write` plus write authority over the claim: `admin`/`writer`
+membership in its owning group (authorship alone admits nothing; for a dedup
+the canonical is judged the same way), or `claims:admin`
+(`epigraph_auth::claim_act`, shared by HTTP and MCP). The one exception to
+"the caller's own stamp" is a `claims:admin` caller over MCP on a claim it does
+not write, which acts with the MCP server agent's stamp, as before OA1. A claim the caller cannot
+read is answered like a missing one; a readable one it may not retire is
+refused as `not_owner` / `not_claim_writer`. What follows it --
+re-pointing and retracting other writers' edges, moving and invalidating their
+edge-keyed BBAs, re-deriving belief -- runs on the server's maintenance
+connection (`epigraph_engine::admin_cascade`). Each repair commits in ONE
+transaction with its `security_events` row (`cascade.admin_applied`) naming the
+caller, the cause and what it touched; a failed repair rolls back and is
+recorded as `cascade.admin_failed`; the belief re-derivation that follows writes
+`cascade.belief_rederived`. **Under operator decision D9 (batch W12a) no
+request-serving process holds that connection**: the API `server` and
+`epigraph-mcp-full` (every transport) refuse to start when
+`MAINTENANCE_DATABASE_URL` is set, and attach no maintenance pool. So on a
+request path the act commits and the cascade is ALWAYS reported
+(`"cascade": {"status": "deferred"}`) and recorded (`cascade.deferred`) in the
+act's own transaction; the replay timer (`epigraph-cascade-replay.timer`,
+below) applies it, normally within about two minutes. The in-process applied
+arm (`apply_after_*` on a maintenance connection the request path holds)
+remains only in test harnesses; the replay runs the same functions.
+
+A match-candidate retirement has no caller's act: its flip to `stale` is
+administrative too (migration 118's `match_candidates_stale_guard` refuses it on
+a non-privileged session). The flip, the matcher-edge retraction and the
+derived-row deletes run together, in one transaction, on the maintenance
+connection, with one `cascade.admin_applied` row naming the caller. Without the
+connection nothing about the candidate changes: the whole retirement is recorded
+as a deferred request, with the candidate's status at that moment, and the
+replay carries it out only while the candidate still has that status (a
+candidate decided again in between fails loudly and stays pending).
+
+What the caller is told is filtered to what it may read: `cascade.touched` is
+counts only, and the belief report keeps only claims the caller's viewer can
+read. The ids live in the audit rows.
+
+Two rules keep the administrative repair from carrying a decision the caller
+could not make: a dedup onto a non-public canonical requires write authority
+over the canonical (the repair would move the duplicate's derived rows into the
+canonical's group), and a duplicate bound FALSE on `binary_truth` does not hand
+that binding to a canonical the caller cannot write.
+
+Every repair re-verifies the committed act and is idempotent, so the
+`replay_deferred_cascades` CLI, run on the maintenance DSN (it refuses the
+fallback to `DATABASE_URL`), replays every deferred or failed cascade with no
+later `cascade.admin_applied` (or `cascade.retired`) row, naming the original
+caller and the deferral. The window takes cascades with fewer failed attempts
+first; one that has failed `--max-failures` times (default 5; the timer passes
+20, about 30 minutes at its 90-second period) is held out and reported as stuck
+(the CLI exits 2) until an operator retires it with
+`--retire <event id> --reason <text>`. Under D9 it runs on
+`epigraph-cascade-replay.timer` as a non-superuser maintenance login, takes its
+own advisory lock (a concurrent run does nothing), and
+`--report-only` prints `{"pending","stuck","oldest_age_s"}` read-only for the
+staleness alert.
+
+**Maintenance work lives in timers and operator CLIs (D9).** Besides the
+replay: the job queue is drained by `drain_jobs` (`epigraph-jobs-drain.timer`);
+the corpus-wide sweep, belief recompute and embedding backfill are the
+`sweep_semantic_duplicates`, `recompute_claim_belief` and `embed_backfill`
+CLIs (their MCP tools answer MOVED, JSON-RPC `-32600`); the embedding worklist
+route and the whole privatization lifecycle answer HTTP `501` MOVED. The
+sweep CLI collapses each pair through the act and `apply_after_dedup`, so
+every collapse has a `cascade.admin_applied` row naming `--acting-agent`
+(cause `dedup`). Migration 119 lets no application session enqueue a job and
+grants the maintenance role the job handlers' DELETEs; `maintenance_timer_only.rs`
+pins both, and `maintenance_surface_register.rs` pins that the request crates
+acquire no maintenance authority outside the drain.
+
+The replay acts on `security_events` rows, so 117 makes those rows the
+server's: a non-privileged session cannot write any `cascade.*` row itself (a
+RESTRICTIVE INSERT policy), and a request path records its deferral through the
+definer `epigraph_record_cascade_deferral`, which attributes the row to the
+session principal and admits it only for an act that session made (write
+authority over the retired claim and its successor for a supersede; over the
+duplicate, onto a canonical that is public or written by the session, for a
+dedup; over every source for a consolidation; an existing candidate for a
+match-candidate retirement request, whose table has no tenancy -- the request
+paths gate it on `claims:admin`, and the definer records the candidate's status
+as the replay's precondition). A non-privileged
+UPDATE may point `claims.supersedes` only at a claim that is public or written
+by the session.
 
 ### The kill switch
 

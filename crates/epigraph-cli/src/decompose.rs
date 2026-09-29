@@ -489,7 +489,7 @@ mod db_writes {
         let mut tx = pool.begin().await?;
         let mut edges = 0usize;
         for (&atom_id, &gen) in atom_ids.iter().zip(gens.iter()) {
-            let (_row, was_created) = EdgeRepository::create_if_not_exists_conn(
+            let (_row, was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
                 &mut tx,
                 parent_id,
                 "claim",

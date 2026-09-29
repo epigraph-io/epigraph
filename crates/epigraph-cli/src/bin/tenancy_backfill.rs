@@ -935,8 +935,15 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 const DEFINER_FUNCTIONS: &[&str] = &[
     "epigraph_claims_require_tenancy",
     "epigraph_node_tenancy",
+    // Last redefined by migration 120 (writer-owned edges: CREATE OR REPLACE,
+    // re-owned in its section 9). Kept HERE, unconditional, rather than moved
+    // to `DEFERRED_DEFINER_FUNCTIONS` at 120: both exist since 070, and the
+    // deferred register is presence-gated, so moving them would turn "a
+    // missing 070 body is a finding" into "skipped".
     "epigraph_edges_tenancy",
     "epigraph_inherit_tenancy_stmt",
+    // Last redefined by migration 120 (114's body plus the `m.v = 'group'`
+    // conjunct on the edges statement); see the note above.
     "epigraph_propagate_tenancy",
     // `epigraph_ownership_transcribe` (071) was the sixth entry until PR-22.
     // Migration 084 drops the function with the table it wrote through, so an
@@ -1039,6 +1046,89 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_operates_agents", 107),
     ("epigraph_link_operator", 107),
     ("epigraph_link_retired_agent", 107),
+    // 111, the audited admin claim write (batch H-b, D2). Deferred for the
+    // same structural reason. Under a non-member, NON-bypassing owner it fails
+    // CLOSED — its UPDATE of the FORCEd `claims` is RLS-filtered and it raises
+    // "not found" — so the stake is the admin path silently OFF.
+    ("epigraph_admin_patch_claim", 111),
+    // 112, the admin audit row for a write that needs no definer of its own
+    // (batch H-b review, the workflow admin arm). Under a non-bypassing owner it
+    // fails CLOSED: `security_events_append` refuses the row and the admin
+    // write rolls back with it.
+    ("epigraph_admin_audit_write", 112),
+    // 114, writer-owned derived rows. All fail CLOSED under a non-member owner:
+    // `epigraph_writer_group` reads no operator link and no personal group
+    // (the attach trigger then leaves the row to 074 and 077 refuses it, as
+    // before 114), and the aggregate definers' `claims` / `claim_frames` /
+    // `security_events` writes are refused by the tenancy policies. The stake is
+    // a non-owner's attachment silently refused again, which a green pre-flight
+    // must not hide.
+    ("epigraph_writer_group", 114),
+    ("epigraph_foreign_aggregate_target", 114),
+    ("epigraph_foreign_aggregate_audit", 114),
+    ("epigraph_foreign_claim_frame", 114),
+    ("epigraph_foreign_belief_cache", 114),
+    ("epigraph_foreign_claim_classification", 114),
+    ("epigraph_foreign_belief_clear", 114),
+    // The attach lock returns (and locks) a PUBLIC claim only: under a
+    // non-member owner its RLS read finds nothing and the attach falls back to
+    // 074 and 077's refusal. The dedup move's `mass_functions` UPDATE and the
+    // legacy re-own's UPDATE are refused by the tenancy policies the same way.
+    ("epigraph_lock_public_claim_for_attach", 114),
+    ("epigraph_dedup_move_bbas", 114),
+    ("epigraph_reown_legacy_writer_bbas", 114),
+    // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
+    // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
+    // the session cannot see answers false, which it would anyway), and the
+    // cascade definer's DELETE is refused by the restrictive policies, so the
+    // cascade reports CD02-shaped failures instead of invalidating. The third
+    // does NOT fail loudly: the node-delete edge trigger's DELETE is filtered,
+    // so an owner deleting its own claim silently leaves world-owned edges
+    // pointing at the deleted row. That is the stake this entry reports.
+    ("epigraph_session_writes_node", 115),
+    ("epigraph_cascade_delete_edge_bbas", 115),
+    ("epigraph_cascade_delete_node_edges", 115),
+    // 116, the attested retire of a former shared HTTP signer (batch HTTP-id).
+    // Deferred for 107's reason, and fails CLOSED the same way under a
+    // non-member owner: the tenancy policies refuse its link and audit writes.
+    ("epigraph_link_retired_shared_signer", 116),
+    // 117, the cascade deferral (D9; redefined by 120, which re-owns it again).
+    // Every deferred cascade on the application role goes through it. Under a
+    // non-member owner it fails CLOSED: its `cascade.*` security_events INSERT
+    // is refused by 117's restrictive `security_events_cascade_privileged`
+    // (the definer bypass is false), so every request that must defer its
+    // cascade (supersede, dedup, consolidate, match-candidate retire) errors
+    // with nothing recorded. The stake is those write paths OFF.
+    ("epigraph_record_cascade_deferral", 117),
+    // 118, the credential-table definers (W11). 118 revokes the application
+    // role's direct UPDATE / DELETE on the credential tables, so these bodies
+    // are the only way the request path rotates, revokes or consumes a
+    // credential. Under an APP-owned body they fail CLOSED with 42501 (a login
+    // and token outage, loud); under the migration runner's superuser they
+    // keep working with more authority than intended, as 083's entry
+    // describes, and nothing but this check reports it.
+    ("epigraph_refresh_token_on_reuse", 118),
+    ("epigraph_refresh_token_check", 118),
+    ("epigraph_refresh_token_rotate", 118),
+    ("epigraph_refresh_token_revoke", 118),
+    ("epigraph_refresh_token_revoke_by_hash", 118),
+    ("epigraph_refresh_token_revoke_client", 118),
+    ("epigraph_oauth_code_consume", 118),
+    ("epigraph_oauth_session_to_consent", 118),
+    ("epigraph_oauth_session_take", 118),
+    ("epigraph_oauth_client_lock_for_link", 118),
+    ("epigraph_oauth_client_link_agent", 118),
+    ("epigraph_oauth_client_approve", 118),
+    ("epigraph_agent_key_set_status", 118),
+    // 120, writer-owned edges (D8). The scope predicate is IMMUTABLE SQL and
+    // reads no table, so its owner changes no answer; it is registered because
+    // the tenancy trigger (a maintenance-owned definer) must hold EXECUTE on
+    // it, which the migration grants to the maintenance role. The legacy
+    // re-own fails CLOSED under a non-member owner: its `edges` UPDATE is
+    // refused by 117's owner-scoped policy, so it re-owns nothing with an
+    // error, which a green pre-flight must not hide.
+    ("epigraph_edge_writer_scope", 120),
+    ("epigraph_reown_legacy_edges_to_signer", 120),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -1228,8 +1318,9 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
 ///   `epigraph_operates_agents`, is refusal-only, and the HTTP listener's guard
 ///   calls it on every tool call and fails CLOSED, so a missing grant there
 ///   refuses every HTTP call: the same class of outage.
-/// * the two LINK functions (`epigraph_link_operator`,
-///   `epigraph_link_retired_agent`) must NOT be. A grant there lets the request
+/// * the LINK functions (`epigraph_link_operator`,
+///   `epigraph_link_retired_agent`, 116's `epigraph_link_retired_shared_signer`)
+///   must NOT be. A grant there lets the request
 ///   DSN record operator links, which is the whole of 107's trust basis.
 ///
 /// Each function is checked only when it exists (the same deferral as
@@ -1261,6 +1352,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_link_retired_agent",
             "public.epigraph_link_retired_agent(uuid, uuid)",
+            false,
+        ),
+        // 116 (batch HTTP-id): the attested retire of a former shared signer
+        // is a link function too, so the request DSN must not call it.
+        (
+            "epigraph_link_retired_shared_signer",
+            "public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])",
             false,
         ),
     ];

@@ -1621,17 +1621,18 @@ async fn a_sealed_claim_is_refused_a_vector_by_both_halves_of_the_restore(pool: 
     );
 }
 
-/// The runner actually registers the handler — asserted against the binary's
-/// own source.
+/// The runner actually registers the handler — asserted against the source of
+/// the one registration function and of the binary that calls it.
 ///
 /// # Why a source-text assertion
 ///
-/// `bin/server.rs` is a `[[bin]]`, so its wiring is reachable from no test. The
-/// defect this batch closes was not a broken handler; it was a correct handler
+/// The defect this pins was not a broken handler; it was a correct handler
 /// that nothing registered, and every test that drives the handler directly —
 /// including the two above — would pass just as well with the registration
-/// deleted. `resource_metadata_challenge.rs` reads the same file for the same
-/// reason.
+/// deleted. Since operator decision D9 (batch W12a) the registration lives in
+/// `src/jobs_drain.rs::build_job_runner` and only the `drain_jobs` timer binary
+/// calls it (`bin/server.rs` runs no job runner at all); the drain's own suite
+/// (`drain_jobs.rs`) drives the registration's provider gate behaviourally.
 ///
 /// # Scope, stated so this is not mistaken for a parity ratchet
 ///
@@ -1639,22 +1640,27 @@ async fn a_sealed_claim_is_refused_a_vector_by_both_halves_of_the_restore(pool: 
 /// has a registered handler; that broader property is not true today and
 /// establishing it is a separate decision with its own owner.
 #[test]
-fn the_server_binary_registers_a_handler_for_the_job_the_unseal_enqueues() {
-    const SERVER_BIN: &str = include_str!("../src/bin/server.rs");
+fn the_drain_registers_a_handler_for_the_job_the_unseal_enqueues() {
+    const REGISTRATION: &str = include_str!("../src/jobs_drain.rs");
+    const DRAIN_BIN: &str = include_str!("../src/bin/drain_jobs.rs");
     assert!(
-        SERVER_BIN.contains("ConfigurableEmbeddingHandler::new"),
-        "bin/server.rs no longer constructs the embedding handler; the job unseal-commit \
+        REGISTRATION.contains("ConfigurableEmbeddingHandler::new"),
+        "jobs_drain.rs no longer constructs the embedding handler; the job unseal-commit \
          enqueues would go back to being a marker nothing drains"
     );
     assert!(
-        SERVER_BIN.contains("ClaimEmbeddingJobService::new"),
-        "bin/server.rs no longer installs the production EmbeddingJobService; the handler is \
+        REGISTRATION.contains("ClaimEmbeddingJobService::new"),
+        "jobs_drain.rs no longer installs the production EmbeddingJobService; the handler is \
          generic and a different service would restore something else"
     );
     assert!(
-        SERVER_BIN.contains("may_restore_claim_embeddings"),
+        REGISTRATION.contains("may_restore_claim_embeddings"),
         "the registration is no longer gated on the provider; an unconditional one would let a \
          development-fallback embedder write the live vector column"
+    );
+    assert!(
+        DRAIN_BIN.contains("jobs_drain::build_job_runner("),
+        "the drain_jobs binary no longer calls the registration; the timer would drain nothing"
     );
 }
 

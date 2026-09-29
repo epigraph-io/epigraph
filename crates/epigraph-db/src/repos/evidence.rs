@@ -602,10 +602,12 @@ impl EvidenceRepository {
     /// Delete evidence by ID
     ///
     /// # Returns
-    /// Returns `true` if the evidence was deleted, `false` if it didn't exist.
+    /// Returns `true` if the evidence was deleted, `false` if this session
+    /// cannot read it.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::WriteRefused` when it is readable but row security refused
+    /// the delete; `DbError::QueryFailed` if the database query fails.
     /// Takes a viewer it does not yet use: WRITE path, PR-16 owns the
     /// write-side predicate. The parameter exists so the hook is already at
     /// every call site.
@@ -622,17 +624,21 @@ impl EvidenceRepository {
         // there, so adding a third one is a visible diff.
         let uuid: Uuid = id.into();
 
-        let result = sqlx::query!(
+        // Checked: migration 115's owner-scoped DELETE matches no row it
+        // refuses and reports success. Evidence this session can read but not
+        // delete (another writer's, 114) is a refusal, not "did not exist".
+        let r = sqlx::query!(
             r#"
-            DELETE FROM evidence
-            WHERE id = $1
+            WITH seen AS (SELECT 1 FROM evidence WHERE id = $1),
+                 done AS (DELETE FROM evidence WHERE id = $1 RETURNING 1)
+            SELECT (SELECT count(*) FROM seen) AS "seen!", (SELECT count(*) FROM done) AS "done!"
             "#,
             uuid
         )
-        .execute(executor)
+        .fetch_one(executor)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(super::require_all_changed("evidence", uuid, "delete", (r.seen, r.done))? > 0)
     }
 
     /// Shared `WHERE` clause for [`Self::list_filtered`] and

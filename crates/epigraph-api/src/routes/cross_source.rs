@@ -382,12 +382,65 @@ pub async fn decide_candidate(
 
     match req.verdict.as_str() {
         "retire" => {
-            let outcome =
-                repo.retire(id, decided_by)
-                    .await
-                    .map_err(|e| ApiError::DatabaseError {
-                        message: e.to_string(),
-                    })?;
+            use epigraph_engine::admin_cascade::{self, CascadeCause, CascadeTrigger};
+            // Migrations 117 and 118: the retirement is ADMINISTRATIVE end to
+            // end. The flip to `stale` is refused on a non-privileged session
+            // (118's `match_candidates_stale_guard`), and the matcher edge it
+            // retracts is owned by nobody when both claims are public (117).
+            // So the flip, the retraction and the derived-row deletes run
+            // together, in one transaction, on the maintenance connection,
+            // audited under this caller. The status read above is the
+            // precondition: a candidate decided again meanwhile is refused.
+            let mut trigger = CascadeTrigger::new(
+                CascadeCause::MatchRetire,
+                viewer.principal(),
+                Some(crate::routes::versioning::oauth_principal(&auth)),
+                id,
+                None,
+            );
+            trigger.candidate_status = Some(row.status.clone());
+            let db_err = |e: String| ApiError::DatabaseError { message: e };
+            let (cascade, outcome) = match state.admin_cascade_session().await {
+                Ok(mut session) => {
+                    admin_cascade::apply_match_retire(session.conn(), &viewer, &trigger, id).await
+                }
+                // No maintenance connection: nothing about the candidate
+                // changes. The whole retirement is recorded as a deferred
+                // request, on a transaction stamped with the CALLER's viewer
+                // (117's definer attributes the row to the session principal
+                // and records the candidate's status itself), for the
+                // operator's replay to carry out.
+                Err(reason) => {
+                    let mut tx = state.write_as(&viewer, "decide_candidate.retire").await?;
+                    let status = admin_cascade::record_deferral(&mut *tx, &trigger, &reason)
+                        .await
+                        .map_err(|e| {
+                            db_err(format!("Failed to record the deferred retirement: {e}"))
+                        })?;
+                    tx.commit().await.map_err(|e| db_err(e.to_string()))?;
+                    (status, None)
+                }
+            };
+            // Not retired (deferred, or refused on the maintenance connection):
+            // the candidate is as it was, and the response says so rather than
+            // reporting a retirement that did not happen.
+            let Some(outcome) = outcome else {
+                let now = map_sqlx(repo.get(id).await)?;
+                return Ok(Json(serde_json::json!({
+                    "id": id.to_string(),
+                    "status": now.status,
+                    "previous_status": row.status,
+                    "retired": false,
+                    "cascade": cascade,
+                    "edges_retracted": 0,
+                    "factors_deleted": 0,
+                    "bp_messages_deleted": 0,
+                    "bbas_invalidated": 0,
+                    "affected_claims": Vec::<String>::new(),
+                    "retracted_edges": Vec::<serde_json::Value>::new(),
+                })));
+            };
+            let previous_status = outcome.previous_status.clone();
 
             // Deliberately NOT followed by `recompute_claim_belief_binary`.
             // That entry point recombines `mass_functions`, and a matcher
@@ -405,7 +458,9 @@ pub async fn decide_candidate(
             return Ok(Json(serde_json::json!({
                 "id": id.to_string(),
                 "status": "stale",
-                "previous_status": outcome.previous_status,
+                "previous_status": previous_status,
+                "retired": true,
+                "cascade": cascade,
                 "edges_retracted": outcome.edges_retracted,
                 "factors_deleted": outcome.factors_deleted,
                 "bp_messages_deleted": outcome.bp_messages_deleted,

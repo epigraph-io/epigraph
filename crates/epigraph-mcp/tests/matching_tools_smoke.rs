@@ -18,10 +18,52 @@ use sqlx::types::Json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// A server with NO maintenance pool, the only shape a request-serving MCP
+/// server has under operator decision D9 (batch W12a): the retirement's
+/// administrative cascade (migrations 117/118) is recorded as a deferred
+/// request, and [`replay`] -- the replay timer's function, on a maintenance
+/// connection -- carries it out.
 async fn build_server(pool: PgPool, read_only: bool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool).await;
+    build_server_with(pool, read_only, scoped)
+}
+
+/// Run the deferred-cascade replay once, as `epigraph-cascade-replay.timer`
+/// does: `replay_deferred` on a connection that runs as
+/// `epigraph_maintenance` (not a superuser).
+async fn replay(pool: &PgPool) -> epigraph_engine::admin_cascade::ReplayReport {
+    let maintenance = fixture::downgraded_pool(pool, "epigraph_maintenance").await;
+    let scoped = fixture::scoped_pool(pool)
+        .await
+        .with_maintenance_pool(maintenance);
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    session
+        .assert_privileged()
+        .await
+        .expect("the replay's connection is privileged");
+    let (conn, viewer) = session.split();
+    epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        viewer,
+        "w12a-test",
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("replay")
+}
+
+fn build_server_with(
+    pool: PgPool,
+    read_only: bool,
+    scoped: epigraph_db::ScopedPool,
+) -> EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&[0x19u8; 32]).expect("signer");
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, read_only)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, read_only).with_scoped_pool(scoped)
 }
 
 async fn insert_claim(pool: &PgPool, agent: Uuid) -> Uuid {
@@ -253,6 +295,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("decide");
@@ -290,6 +333,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("a second promote must be refused as already decided");
@@ -326,6 +370,7 @@ async fn decide_match_candidate_reject_marks_status_and_skips_edge(pool: PgPool)
             candidate_id: cand.to_string(),
             verdict: "reject".into(),
         },
+        None,
     )
     .await
     .expect("decide");
@@ -364,6 +409,7 @@ async fn decide_match_candidate_rejected_in_read_only_mode(pool: PgPool) {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("read-only must refuse writes");
@@ -395,6 +441,7 @@ async fn decide_match_candidate_promote_blocked_when_endpoint_not_current(pool: 
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("promote must be refused when an endpoint is not current");
@@ -449,6 +496,7 @@ async fn decide_match_candidate_promote_contradicts_writes_contradicts_edge(pool
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promoting a contradicts candidate must succeed");
@@ -492,6 +540,7 @@ async fn decide_match_candidate_promote_distinct_is_refused_and_writes_no_edge(p
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("promoting a 'distinct' candidate must be refused");
@@ -534,6 +583,7 @@ async fn decide_match_candidate_promote_paraphrase_still_writes_corroborates(poo
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
@@ -562,6 +612,7 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
@@ -582,17 +633,57 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
 
     let out = tools::matching::retire_match_candidate(
         &server,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
+        None,
     )
     .await
     .expect("retire");
     let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
-    assert_eq!(body["candidate"]["status"], "stale");
-    assert_eq!(body["retirement"]["previous_status"], "promoted");
-    assert_eq!(body["retirement"]["edges_retracted"], 1);
-    assert_eq!(body["retirement"]["factors_deleted"], 1);
+    // D9: the request-serving server defers the whole retirement...
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    assert_eq!(body["candidate"]["status"], "promoted", "{body}");
+    assert_eq!(
+        edge_relationships(&pool, a, b).await,
+        vec!["CORROBORATES".to_string()],
+        "nothing is retracted before the replay"
+    );
+    // ...and the replay, on the maintenance connection, carries it out.
+    let report = replay(&pool).await;
+    assert_eq!(
+        (report.pending, report.applied, report.failed),
+        (1, 1, 0),
+        "{report:?}"
+    );
+    let (applied_counts, replay_of): (serde_json::Value, Option<String>) = sqlx::query_as(
+        "SELECT details->'touched', details#>>'{replay_of,deferred_event_id}' \
+           FROM security_events \
+          WHERE event_type = 'cascade.admin_applied' \
+            AND details#>>'{trigger,subject_id}' = $1::text",
+    )
+    .bind(cand)
+    .fetch_one(&pool)
+    .await
+    .expect("the replay's applied row");
+    assert_eq!(
+        replay_of.as_deref(),
+        body["cascade"]["audit_event_id"].as_str(),
+        "the applied row names the deferral it replays"
+    );
+    assert_eq!(applied_counts["edges_retracted_now"], 1, "{applied_counts}");
+    assert_eq!(applied_counts["factors_deleted"], 1, "{applied_counts}");
+    assert_eq!(
+        applied_counts["previous_status"], "promoted",
+        "{applied_counts}"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "stale");
 
     assert!(
         edge_relationships(&pool, a, b).await.is_empty(),
@@ -642,6 +733,7 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
@@ -649,9 +741,11 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
     let read_only = build_server(pool.clone(), true).await;
     tools::matching::retire_match_candidate(
         &read_only,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
+        None,
     )
     .await
     .expect_err("retire must be refused in read-only mode");
@@ -695,6 +789,7 @@ async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgP
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
@@ -711,6 +806,7 @@ async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgP
             candidate_id: cand.to_string(),
             verdict: "reject".into(),
         },
+        None,
     )
     .await
     .expect_err("reject on a promoted row must be refused");
@@ -765,17 +861,24 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
     tools::matching::retire_match_candidate(
         &server,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
+        None,
     )
     .await
     .expect("retire");
+    // D9: the retirement is deferred on the request server and carried out by
+    // the replay on the maintenance connection.
+    let report = replay(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
     assert!(
         edge_relationships(&pool, a, b).await.is_empty(),
         "precondition: retirement took the edge out of force"
@@ -788,6 +891,7 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("promote on a retired row must be refused");
@@ -824,6 +928,7 @@ async fn decide_match_candidate_unknown_verdict_points_at_the_retire_tool(pool: 
             candidate_id: cand.to_string(),
             verdict: "retire".into(),
         },
+        None,
     )
     .await
     .expect_err("`retire` is not a decide verdict");
@@ -982,5 +1087,74 @@ async fn find_cross_source_matches_omits_sweep_coverage_for_an_invisible_claim(p
         json["candidates"],
         serde_json::json!([]),
         "the pre-existing non-leaking shape is preserved: {json}"
+    );
+}
+
+/// Migrations 117 and 118: with NO administrative connection nothing about the
+/// candidate changes -- it stays `promoted`, the matcher edge stays in force --
+/// and the whole retirement is recorded as a deferred request under the acting
+/// agent, carrying the status it was requested against.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_without_an_admin_connection_defers_the_whole_retirement(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    tools::matching::decide_match_candidate(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+        None,
+    )
+    .await
+    .expect("promote");
+
+    let out = tools::matching::retire_match_candidate(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        RetireMatchCandidateParams {
+            candidate_id: cand.to_string(),
+        },
+        None,
+    )
+    .await
+    .expect("the request is recorded");
+    let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
+    assert_eq!(body["candidate"]["status"], "promoted", "{body}");
+    assert_eq!(body["retired"], false, "{body}");
+    assert!(body["retirement"].is_null(), "{body}");
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let event = body["cascade"]["audit_event_id"]
+        .as_str()
+        .expect("a deferral carries its audit row id")
+        .to_string();
+    assert_eq!(
+        edge_relationships(&pool, a, b).await,
+        vec!["CORROBORATES".to_string()],
+        "the deferred cascade retracted nothing"
+    );
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let (et, who, cause, requested): (String, Option<Uuid>, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT event_type::text, agent_id, details->>'cause', \
+                    details#>>'{trigger,candidate_status}' \
+               FROM security_events WHERE id = $1::uuid",
+        )
+        .bind(&event)
+        .fetch_one(&pool)
+        .await
+        .expect("the deferral row");
+    assert_eq!(
+        (et.as_str(), who, cause.as_str(), requested.as_deref()),
+        (
+            "cascade.deferred",
+            Some(server_agent),
+            "match_retire",
+            Some("promoted")
+        )
     );
 }

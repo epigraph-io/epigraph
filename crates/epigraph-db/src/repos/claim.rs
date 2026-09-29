@@ -448,6 +448,117 @@ pub struct DedupRepair {
     /// BBAs moved from `dup` to `canonical` because their edge was re-pointed
     /// (stranding repair).
     pub moved_bbas: u64,
+    /// Edges the collision guards retracted (their BBAs are in `deleted_bbas`).
+    pub retracted_edges: Vec<Uuid>,
+    /// Edges re-pointed from `dup` onto `canonical` as their TARGET.
+    pub retargeted_edges: Vec<Uuid>,
+    /// The duplicate's copies of a BBA the canonical already carried under the
+    /// same (frame, source agent, edge) key: dropped, so the canonical keeps
+    /// its own row (migration 115 section 4's rule, now the only rule).
+    pub dropped_duplicate_copies: u64,
+    /// `binary_truth` bindings at a non-zero index that were NOT copied onto a
+    /// canonical owned by another group (review finding W2's rule, FA07).
+    pub skipped_false_bindings: u64,
+}
+
+/// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SupersedeEdgeMigration {
+    /// Edges re-pointed from the retired claim onto the replacement as their
+    /// TARGET (other writers' assertions about the superseded claim).
+    pub retargeted: Vec<Uuid>,
+    /// Edges re-pointed from the retired claim onto the replacement as their
+    /// SOURCE.
+    pub resourced: Vec<Uuid>,
+}
+
+/// Refuse a non-privileged session, naming `what` needs the privilege.
+///
+/// "Privileged" is migration 114's `epigraph_session_is_privileged_writer()`: a
+/// superuser or BYPASSRLS role, a maintenance login, or a body running as the
+/// maintenance role. The functions that call this re-point or remove rows
+/// other writers own; since migration 117 a non-privileged session's
+/// statements would match only its own rows and leave the rest behind with no
+/// error, so they refuse instead of doing part of the job.
+async fn require_privileged_session(
+    conn: &mut sqlx::PgConnection,
+    what: &str,
+) -> Result<(), DbError> {
+    let privileged: bool =
+        sqlx::query_scalar("SELECT public.epigraph_session_is_privileged_writer()")
+            .fetch_one(&mut *conn)
+            .await?;
+    if privileged {
+        return Ok(());
+    }
+    Err(DbError::InvalidData {
+        reason: format!(
+            "{what} runs only on a privileged (maintenance) connection: it re-points or removes \
+             rows other writers own, which a non-privileged session cannot touch (migration 117). \
+             Run the caller's act on its own stamped transaction and this on the maintenance \
+             connection (epigraph_engine::admin_cascade)."
+        ),
+    })
+}
+
+/// The two edge-migration statements of a supersession, unchecked: the
+/// callers ([`ClaimRepository::supersede_conn`],
+/// [`ClaimRepository::migrate_superseded_edges_conn`]) establish the privilege
+/// and the supersession first.
+///
+/// Both directions carry the STRENGTHENING relationships forward and leave the
+/// WEAKENING ones (`crate::repos::edge::WEAKENING_RELATIONSHIPS` — `refutes`,
+/// `contradicts`) attached to the claim they were filed against or by; see the
+/// "Edge migration policy" section of [`ClaimRepository::supersede`]'s doc
+/// comment for why (issue #398).
+async fn migrate_superseded_edges(
+    conn: &mut sqlx::PgConnection,
+    old_uuid: Uuid,
+    new_uuid: Uuid,
+) -> Result<SupersedeEdgeMigration, DbError> {
+    let weakening: Vec<String> = crate::repos::edge::WEAKENING_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    // Migrate incoming edges: redirect edges pointing TO old claim to point
+    // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
+    // mark_duplicate's self-loop guard, carried over so the two replacement
+    // paths share one rule; see the doc comment for the one shape that
+    // reaches it here.
+    let retargeted: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE edges SET target_id = $1 \
+         WHERE target_id = $2 AND target_type = 'claim' \
+           AND relationship != 'supersedes' \
+           AND NOT (relationship = ANY($3)) \
+           AND NOT (source_type = 'claim' AND source_id = $1) \
+         RETURNING id",
+    )
+    .bind(new_uuid)
+    .bind(old_uuid)
+    .bind(&weakening)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    // Migrate outgoing edges: redirect edges FROM old claim to come from new claim
+    let resourced: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE edges SET source_id = $1 \
+         WHERE source_id = $2 AND source_type = 'claim' \
+           AND relationship != 'supersedes' \
+           AND NOT (relationship = ANY($3)) \
+           AND NOT (target_type = 'claim' AND target_id = $1) \
+         RETURNING id",
+    )
+    .bind(new_uuid)
+    .bind(old_uuid)
+    .bind(&weakening)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    Ok(SupersedeEdgeMigration {
+        retargeted,
+        resourced,
+    })
 }
 
 /// Input for [`ClaimRepository::patch_claim_atomic_conn`].
@@ -457,6 +568,52 @@ pub struct PatchClaimInput {
     pub properties: Option<serde_json::Value>,
     pub add_labels: Vec<String>,
     pub remove_labels: Vec<String>,
+}
+
+/// Which audited admin write [`ClaimRepository::admin_patch_claim_conn`] records.
+///
+/// A closed set, because it is written into the `security_events` audit row
+/// and migration 111's function refuses anything else (`ADM03`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminClaimAction {
+    /// MCP `update_labels` / HTTP `PATCH /api/v1/claims/:id/labels`.
+    UpdateLabels,
+    /// MCP `patch_claim`.
+    PatchClaim,
+    /// The original's `resolved` label in MCP `resolve_backlog_item`.
+    ResolveBacklogItem,
+}
+
+impl AdminClaimAction {
+    /// The `action` string migration 111 records and accepts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UpdateLabels => "update_labels",
+            Self::PatchClaim => "patch_claim",
+            Self::ResolveBacklogItem => "resolve_backlog_item",
+        }
+    }
+}
+
+/// What [`ClaimRepository::admin_patch_claim_conn`] wrote: the row's labels,
+/// properties and trace after the write, and before it.
+#[derive(Debug, Clone)]
+pub struct AdminClaimWrite {
+    pub labels: Vec<String>,
+    pub properties: serde_json::Value,
+    pub trace_id: Option<Uuid>,
+    pub before_labels: Vec<String>,
+    pub before_properties: serde_json::Value,
+    pub before_trace_id: Option<Uuid>,
+}
+
+/// The token facts the audited admin path re-checks and records: the token's
+/// `sub` (an `oauth_clients.id`) and its `jti`.
+#[derive(Debug, Clone, Copy)]
+pub struct AdminToken {
+    pub client_id: Uuid,
+    pub jti: Uuid,
 }
 
 /// Diff produced by [`ClaimRepository::patch_claim_atomic_conn`].
@@ -559,9 +716,10 @@ fn claim_from_row(
 /// `claims.signer_id`.
 ///
 /// `signer_public_key` is `Option` because the join that supplies it MUST be a
-/// `LEFT JOIN` — `signer_id` is NULL on every claim written by today's
-/// `create*` methods (none of them insert `signature`/`signer_id`), so an inner
-/// join would turn every single-claim read into "not found".
+/// `LEFT JOIN` — `signer_id` is NULL on every claim written by the `create*`
+/// methods other than [`ClaimRepository::create_strict_signed`] (batch H-b's
+/// MCP submission path), so an inner join would turn every single-claim read of
+/// an unsigned row into "not found".
 struct RowCryptoColumns {
     content_hash: Vec<u8>,
     signature: Option<Vec<u8>>,
@@ -3334,25 +3492,30 @@ impl ClaimRepository {
     /// Delete a claim by ID
     ///
     /// # Returns
-    /// Returns `true` if the claim was deleted, `false` if it didn't exist.
+    /// Returns `true` if the claim was deleted, `false` if this session cannot
+    /// read it (it does not exist, or is invisible).
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// `DbError::WriteRefused` when the claim is readable but migration 115's
+    /// owner-scoped DELETE refused it (a refused DELETE matches no row and
+    /// reports success, so the one statement compares what it saw with what it
+    /// deleted); `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn delete(pool: &PgPool, id: ClaimId) -> Result<bool, DbError> {
         let uuid: Uuid = id.into();
 
-        let result = sqlx::query!(
+        let r = sqlx::query!(
             r#"
-            DELETE FROM claims
-            WHERE id = $1
+            WITH seen AS (SELECT 1 FROM claims WHERE id = $1),
+                 done AS (DELETE FROM claims WHERE id = $1 RETURNING 1)
+            SELECT (SELECT count(*) FROM seen) AS "seen!", (SELECT count(*) FROM done) AS "done!"
             "#,
             uuid
         )
-        .execute(pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(super::require_all_changed("claim", uuid, "delete", (r.seen, r.done))? > 0)
     }
 
     /// Get a claim by ID on a caller-supplied connection.
@@ -4180,6 +4343,39 @@ impl ClaimRepository {
         Ok(q.fetch_all(executor).await?.into_iter().collect())
     }
 
+    /// The subset of `ids` that are claims `viewer` may read.
+    ///
+    /// The positive twin of [`Self::hidden_claim_ids`], over the same definer
+    /// (`epigraph_claim_tenancy_by_ids`), so it answers the same on any
+    /// connection: a caller's RLS-filtered session, or the privileged
+    /// maintenance connection a request path's administrative cascade runs on.
+    /// Every id that is not a claim the viewer can read -- a hidden claim, a
+    /// missing one, an edge id -- is absent. That makes it the filter for what
+    /// an administrative act may report back to the caller that triggered it
+    /// (migration 117): an id outside this set is not the caller's to learn.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn visible_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashSet<uuid::Uuid>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let sql = viewer.splice(
+            "SELECT c.id FROM public.epigraph_claim_tenancy_by_ids($1) c \
+              WHERE true /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, uuid::Uuid>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
+    }
+
     /// Fetch `labels` for a batch of claim ids in one round-trip.
     ///
     /// Batch companion to [`Self::get_labels`], used by MCP `query_claims` to
@@ -4886,11 +5082,57 @@ impl ClaimRepository {
     /// writable set covers. The caller must run this in a transaction: it issues
     /// several statements that must land together, and it does not begin one.
     ///
+    /// # Migration 117: a PRIVILEGED session only
+    ///
+    /// The edge migration re-points edges whatever their owner: an incoming
+    /// edge is its SOURCE's writer's assertion, not the superseder's. Since 117
+    /// a non-privileged session's UPDATE of an edge it does not own matches no
+    /// row, so on such a session this would retire the claim and silently
+    /// leave other writers' edges on it. It therefore refuses a non-privileged
+    /// session outright. A request path runs [`Self::supersede_act_conn`] on
+    /// the caller's stamped transaction and [`Self::migrate_superseded_edges_conn`]
+    /// on the maintenance connection (`epigraph_engine::admin_cascade`).
+    ///
     /// # Errors
     /// As [`Self::supersede`]: `DbError::NotFound` for a missing (or, on a
     /// filtered session, invisible) claim, `DbError::QueryFailed` for an
-    /// already-superseded one or any refused statement.
+    /// already-superseded one or any refused statement, `DbError::InvalidData`
+    /// on a non-privileged session.
     pub async fn supersede_conn(
+        conn: &mut sqlx::PgConnection,
+        old_claim_id: ClaimId,
+        new_content: &str,
+        new_truth: TruthValue,
+        reason: &str,
+    ) -> Result<(Uuid, Uuid), DbError> {
+        require_privileged_session(
+            &mut *conn,
+            "supersede_conn (its edge migration re-points other writers' edges)",
+        )
+        .await?;
+        let (new_uuid, old_uuid) =
+            Self::supersede_act_conn(&mut *conn, old_claim_id, new_content, new_truth, reason)
+                .await?;
+        migrate_superseded_edges(&mut *conn, old_uuid, new_uuid).await?;
+        Ok((new_uuid, old_uuid))
+    }
+
+    /// The supersession's own act, and nothing else: retire `old_claim_id`,
+    /// insert its replacement and the `supersedes` edge between them. Returns
+    /// `(new_id, old_id)`.
+    ///
+    /// Every row it writes is a row the superseder authors (its own claim, the
+    /// replacement, which inherits the old claim's tenancy, and the edge
+    /// between the two), so it runs on the CALLER's stamped transaction and
+    /// the database decides write authority exactly as before. It does NOT
+    /// migrate the old claim's other edges: those belong to whoever asserted
+    /// them, and moving them is the administrative cascade's job
+    /// ([`Self::migrate_superseded_edges_conn`], migration 117). The caller
+    /// must run this in a transaction.
+    ///
+    /// # Errors
+    /// As [`Self::supersede_conn`], without its privilege requirement.
+    pub async fn supersede_act_conn(
         conn: &mut sqlx::PgConnection,
         old_claim_id: ClaimId,
         new_content: &str,
@@ -4980,50 +5222,58 @@ impl ClaimRepository {
         .execute(&mut *conn)
         .await?;
 
-        // Edge migration. Both directions carry the STRENGTHENING relationships
-        // forward and leave the WEAKENING ones
-        // (`crate::repos::edge::WEAKENING_RELATIONSHIPS` — `refutes`,
-        // `contradicts`) attached to the claim they were filed against or by.
-        // See the "Edge migration policy" section of this function's doc comment
-        // for why (issue #398).
-        let weakening: Vec<String> = crate::repos::edge::WEAKENING_RELATIONSHIPS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-
-        // Migrate incoming edges: redirect edges pointing TO old claim to point
-        // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
-        // mark_duplicate's self-loop guard, carried over so the two replacement
-        // paths share one rule; see the doc comment for the one shape that
-        // reaches it here.
-        sqlx::query(
-            "UPDATE edges SET target_id = $1 \
-             WHERE target_id = $2 AND target_type = 'claim' \
-               AND relationship != 'supersedes' \
-               AND NOT (relationship = ANY($3)) \
-               AND NOT (source_type = 'claim' AND source_id = $1)",
-        )
-        .bind(new_uuid)
-        .bind(old_uuid)
-        .bind(&weakening)
-        .execute(&mut *conn)
-        .await?;
-
-        // Migrate outgoing edges: redirect edges FROM old claim to come from new claim
-        sqlx::query(
-            "UPDATE edges SET source_id = $1 \
-             WHERE source_id = $2 AND source_type = 'claim' \
-               AND relationship != 'supersedes' \
-               AND NOT (relationship = ANY($3)) \
-               AND NOT (target_type = 'claim' AND target_id = $1)",
-        )
-        .bind(new_uuid)
-        .bind(old_uuid)
-        .bind(&weakening)
-        .execute(&mut *conn)
-        .await?;
-
         Ok((new_uuid, old_uuid))
+    }
+
+    /// The supersession's edge migration, as the administrative cascade runs it
+    /// after the caller's [`Self::supersede_act_conn`] committed.
+    ///
+    /// Re-verifies the committed act first (`new_id` supersedes `old_id`, and
+    /// `old_id` is retired), so it acts only on a supersession that happened,
+    /// and it is idempotent: a second run finds no edge left on `old_id` to
+    /// move. That makes it the replay of a deferred cascade too. Runs in its
+    /// own transaction (a SAVEPOINT when the connection is already in one).
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` on a non-privileged session, or when the claims
+    /// do not record `new_id` superseding a retired `old_id`;
+    /// `DbError::QueryFailed` on any failed statement.
+    pub async fn migrate_superseded_edges_conn(
+        conn: &mut sqlx::PgConnection,
+        old_id: Uuid,
+        new_id: Uuid,
+    ) -> Result<SupersedeEdgeMigration, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "migrate_superseded_edges_conn (it re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let recorded: Option<(Option<Uuid>, bool)> = sqlx::query_as(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read verifies the act the mutation follows.
+            SELECT n.supersedes, COALESCE(o.is_current, true)
+              FROM claims n LEFT JOIN claims o ON o.id = $2
+             WHERE n.id = $1"#,
+        )
+        .bind(new_id)
+        .bind(old_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match recorded {
+            Some((Some(sup), false)) if sup == old_id => {}
+            _ => {
+                return Err(DbError::InvalidData {
+                    reason: format!(
+                        "claim {new_id} does not supersede a retired claim {old_id}; \
+                         refusing to migrate its edges"
+                    ),
+                })
+            }
+        }
+        let migration = migrate_superseded_edges(&mut tx, old_id, new_id).await?;
+        tx.commit().await?;
+        Ok(migration)
     }
 
     // ============================================================
@@ -5106,6 +5356,45 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
+        Self::create_strict_signed(conn, claim, decl, None).await
+    }
+
+    /// [`Self::create_strict`], additionally persisting the claim's Ed25519
+    /// signature with `signer_id` as its SIGNER (batch H-b, D1-sig).
+    ///
+    /// # Why the signer is recorded apart from the author
+    ///
+    /// `claims.agent_id` is the AUTHOR. Since D1 an authenticated MCP write
+    /// authors as the caller, while the digest is still signed with the MCP
+    /// server's key, so the two are different agents and often the author has no
+    /// private key at all (an OAuth principal's `derived` agent). `verify_claim`
+    /// already verifies against `claims.signer_id -> agents.public_key`, never
+    /// against the author's key (`post_fix_crypto_columns`), so recording the
+    /// signer is what lets a caller-authored claim verify, without weakening the
+    /// check.
+    ///
+    /// # What is persisted, and when nothing is
+    ///
+    /// The signature and `signer_id` are written together or not at all (the
+    /// `claims_signature_requires_signer` CHECK), and ONLY when the signature
+    /// verifies under `claim.public_key` over the digest this INSERT stores
+    /// (`blake3(content)`). A signature over a different digest (the ingest
+    /// planner's seed-scoped compound hash) or one that does not verify is not
+    /// stored: an unverifiable signature on a row would read as tampering. The
+    /// caller vouches that `signer_id` is the agent whose registered key is
+    /// `claim.public_key`; `verify_claim` re-checks that pairing on every read.
+    ///
+    /// `signer_id = None` is exactly [`Self::create_strict`]: every existing row
+    /// keeps `signature = NULL` and reports `signed: false`, unchanged.
+    ///
+    /// # Errors
+    /// As [`Self::create_strict`].
+    pub async fn create_strict_signed(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<Claim, DbError> {
         use sqlx::Row;
 
         let id: Uuid = claim.id.into();
@@ -5116,9 +5405,24 @@ impl ClaimRepository {
         let updated_at = claim.updated_at;
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
+        let (signature, signer_id): (Option<Vec<u8>>, Option<Uuid>) =
+            match (signer_id, claim.signature) {
+                (Some(signer), Some(sig))
+                    if epigraph_crypto::SignatureVerifier::verify(
+                        &claim.public_key,
+                        &content_hash,
+                        &sig,
+                    )
+                    .unwrap_or(false) =>
+                {
+                    (Some(sig.to_vec()), Some(signer))
+                }
+                _ => (None, None),
+            };
+
         let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id, signature, signer_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
         )
         .bind(id)
@@ -5131,6 +5435,8 @@ impl ClaimRepository {
         .bind(updated_at)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
+        .bind(signature)
+        .bind(signer_id)
         .fetch_one(&mut *conn)
         .await?;
 
@@ -5235,6 +5541,23 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<(Claim, bool), DbError> {
+        Self::create_or_get_signed(conn, viewer, claim, decl, None).await
+    }
+
+    /// [`Self::create_or_get`], persisting the claim's signature with
+    /// `signer_id` as its signer on the INSERT branch; see
+    /// [`Self::create_strict_signed`]. A found row is returned as it is: its
+    /// signature (or its absence) is never rewritten.
+    ///
+    /// # Errors
+    /// As [`Self::create_or_get`].
+    pub async fn create_or_get_signed(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<(Claim, bool), DbError> {
         use sqlx::Acquire;
 
         let agent_id: Uuid = claim.agent_id.into();
@@ -5256,7 +5579,7 @@ impl ClaimRepository {
                 .begin()
                 .await
                 .map_err(|source| DbError::QueryFailed { source })?;
-            match Self::create_strict(&mut sp, claim, decl).await {
+            match Self::create_strict_signed(&mut sp, claim, decl, signer_id).await {
                 Ok(c) => {
                     sp.commit()
                         .await
@@ -6351,7 +6674,9 @@ impl ClaimRepository {
         Self::mark_duplicate_with_repair_conn(&mut conn, dup, canonical).await
     }
 
-    /// [`Self::mark_duplicate_with_repair`] on a connection the caller owns.
+    /// [`Self::mark_duplicate_with_repair`] on a connection the caller owns: the
+    /// dedup's act ([`Self::mark_duplicate_act_conn`]) and its repair
+    /// ([`Self::repair_marked_duplicate_conn`]) in ONE transaction.
     ///
     /// The pool-taking wrapper above delegates here, so there is one
     /// implementation. `begin()` below opens a real transaction when this
@@ -6361,342 +6686,192 @@ impl ClaimRepository {
     /// A concrete `&mut PgConnection` rather than a generic `Acquire` for the
     /// reason recorded on [`Self::create_with_id_if_absent_conn`].
     ///
+    /// # Migration 117: a PRIVILEGED session only
+    ///
+    /// The repair retracts and re-points edges and moves BBAs whoever owns
+    /// them. Since 117 a non-privileged session's UPDATE of an edge it does not
+    /// own matches no row, so on such a session this would retire the
+    /// duplicate and silently leave most of the repair undone. It therefore
+    /// refuses one outright. The semantic-duplicate sweep runs it on the
+    /// maintenance connection; a request path runs the act on the caller's
+    /// stamped transaction and the repair on the maintenance connection
+    /// (`epigraph_engine::admin_cascade`).
+    ///
     /// # Errors
-    /// As [`Self::mark_duplicate_with_repair`].
+    /// As [`Self::mark_duplicate_with_repair`], and `DbError::InvalidData` on a
+    /// non-privileged session.
     pub async fn mark_duplicate_with_repair_conn(
         conn: &mut sqlx::PgConnection,
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<DedupRepair, DbError> {
         use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "mark_duplicate_with_repair_conn (its repair re-points other writers' edges)",
+        )
+        .await?;
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
-        if dup_uuid == canon_uuid {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
-            });
-        }
         let mut tx = conn.begin().await?;
-        let canon_exists: bool =
-            sqlx::query_scalar(
-                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-                SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)"#,
-            )
-                .bind(canon_uuid)
-                .fetch_one(&mut *tx)
-                .await?;
-        if !canon_exists {
-            return Err(DbError::NotFound {
-                entity: "Claim".into(),
-                id: canon_uuid,
-            });
-        }
-        let row: Option<(Option<Uuid>,)> =
-            sqlx::query_as(
-                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-                SELECT supersedes FROM claims WHERE id = $1 FOR UPDATE"#,
-            )
-                .bind(dup_uuid)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((existing,)) = row else {
-            return Err(DbError::NotFound {
-                entity: "Claim".into(),
-                id: dup_uuid,
-            });
-        };
-        if existing.is_some() {
+        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid).await?;
+        let repair = repair_marked_duplicate(&mut tx, dup_uuid, canon_uuid).await?;
+        tx.commit().await?;
+        Ok(repair)
+    }
+
+    /// The dedup's own act, and nothing else: mark `dup` a duplicate of
+    /// `canonical` (`supersedes = canonical`, `is_current = false`, embeddings
+    /// NULL, in one statement).
+    ///
+    /// The one row it writes is the duplicate, which the caller must be able to
+    /// write, so it runs on the CALLER's stamped transaction and the database
+    /// decides write authority. Everything the old single transaction also did
+    /// -- retracting colliding edges, re-pointing other writers' edges onto the
+    /// canonical, moving their BBAs -- is the administrative cascade's
+    /// ([`Self::repair_marked_duplicate_conn`], migration 117).
+    ///
+    /// It keeps one refusal of that repair, because the repair runs with
+    /// administrative authority and must not carry a content decision the
+    /// caller could not make itself: a duplicate bound to `binary_truth` at a
+    /// non-zero index (FALSE) does not hand that binding to a canonical the
+    /// caller cannot write and that has none (FA07, review finding W2). The
+    /// repair also skips such a copy; refusing here keeps the act and the
+    /// repair from diverging when the caller can see the edge that would move
+    /// it.
+    ///
+    /// And it keeps 114's attach rule for the canonical (FA04: a non-owner may
+    /// attach only to a PUBLIC claim). The repair moves the duplicate's
+    /// edge-keyed BBAs and copies its frame bindings onto the canonical with
+    /// administrative authority, and on a non-public canonical those rows take
+    /// the canonical's owner: a session that may only READ that canonical would
+    /// be writing into its group through the repair. So a non-privileged
+    /// session may dedup onto a non-public canonical only when it writes that
+    /// canonical. The refusal is unconditional (it does not ask whether there
+    /// is anything to move), because the caller cannot see every edge the
+    /// repair will move.
+    ///
+    /// # Errors
+    /// `DbError::NotFound` for a missing canonical or duplicate,
+    /// `DbError::QueryFailed` for a duplicate already superseded, for
+    /// `dup == canonical`, for the FA04 and FA07 refusals and for any refused
+    /// statement.
+    pub async fn mark_duplicate_act_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<(), DbError> {
+        use sqlx::Acquire;
+        let dup_uuid: Uuid = dup.into();
+        let canon_uuid: Uuid = canonical.into();
+        let mut tx = conn.begin().await?;
+        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid).await?;
+        let foreign_private_canonical: bool = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+            SELECT NOT public.epigraph_session_is_privileged_writer()
+               AND c.visibility::text <> 'public'
+               AND NOT public.epigraph_session_writes_node(c.id, 'claim')
+              FROM claims c WHERE c.id = $1"#,
+        )
+        .bind(canon_uuid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if foreign_private_canonical {
             return Err(DbError::QueryFailed {
                 source: sqlx::Error::Protocol(format!(
-                    "Claim {dup_uuid} already superseded; refusing to overwrite"
+                    "FA04: canonical {canon_uuid} is not public and this session cannot write \
+                     it; a dedup would move the duplicate's derived rows into its owner's \
+                     group, and a non-owner may attach only to a PUBLIC claim; nothing was \
+                     written"
                 )),
             });
         }
-        // Null both embedding columns in the same statement as is_current=false
-        // so the CHECK constraint chk_deprecated_no_embedding (migration 052)
-        // is not violated mid-transaction. Dropping it from semantic search is
-        // the same invariant as supersede() and deprecate_claim().
-        sqlx::query(
-            "UPDATE claims \
-             SET supersedes = $1, is_current = false, embedding = NULL, \
-                 embedding_3072 = NULL, updated_at = NOW() \
-             WHERE id = $2",
-        )
-        .bind(canon_uuid)
-        .bind(dup_uuid)
-        .execute(&mut *tx)
-        .await?;
-
-        // Migrate edges off the now-non-current duplicate onto the canonical
-        // claim, mirroring supersede()'s edge migration — otherwise edges to/from
-        // third claims dangle at a claim that no longer surfaces. Unlike supersede
-        // (which targets a freshly-minted claim with no pre-existing edges), the
-        // canonical here already exists, so we must guard against two collision
-        // classes before running the UPDATEs:
-        //
-        //   1. Self-loops: `dup→canonical` or `canonical→dup` edges that would
-        //      become `canonical→canonical` after migration (handled by the
-        //      `AND NOT (... = $1)` filters in the UPDATE clauses below).
-        //
-        //   2. Diamond duplicates: a third claim T that has edges to *both* dup
-        //      and canonical with the same relationship — e.g.
-        //      `T→[CORROBORATES]→dup` AND `T→[CORROBORATES]→canonical`.
-        //      Migrating the dup edge to point at canonical would produce a
-        //      second `T→[CORROBORATES]→canonical` triple, tripping the partial
-        //      unique index `idx_edges_unique_triple_non_authored`
-        //      (migration 017, covers all relationship types except AUTHORED)
-        //      and rolling back the whole transaction before `is_current` is
-        //      flipped.  Pre-delete the redundant dup edges so the UPDATE only
-        //      touches survivors.  AUTHORED edges are excluded because the
-        //      partial index does not cover them, and they are meant to
-        //      accumulate (migration 017 explicitly allows multiple AUTHORED
-        //      edges per triple).
-        //
-        // The 'supersedes' edges (dedup/lineage trail) are preserved throughout.
-
-        // Drop incoming dup-edges whose migrated triple already exists on canonical.
-        // Alias the outer table as `e` so the correlated subquery references
-        // `e.source_id`, `e.source_type`, `e.relationship` unambiguously.
-        // Without the alias, unqualified column names inside the EXISTS bind to
-        // `edges e2` (innermost scope in PostgreSQL), making the predicate
-        // tautological and causing false-positive deletions of edges that should
-        // be migrated.
-        // `RETURNING id, target_id` (here and on the two pre-deletes below) is
-        // the only addition to these statements: the edge rows are about to be
-        // gone, and their `perspective_id = id` BBAs — which live on
-        // `target_id` — have to be deleted with them, so the ids must be
-        // captured before the DELETE commits.
-        let mut deleted_edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        let false_binding: bool = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             UPDATE edges AS e SET valid_to = now()
-             WHERE e.target_id = $2 AND e.target_type = 'claim'
-             AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
-             AND e.source_type = 'claim' AND e.source_id != $1
-             AND e.valid_to IS NULL
-             AND EXISTS (
-             SELECT 1 FROM edges e2
-             WHERE e2.source_id = e.source_id
-             AND e2.source_type = e.source_type
-             AND e2.target_id = $1
-             AND e2.target_type = 'claim'
-             AND e2.relationship = e.relationship
-             AND (e2.valid_to IS NULL OR e2.valid_to > now())
-             )
-             RETURNING e.id, e.target_id"#,
+            SELECT NOT public.epigraph_session_is_privileged_writer()
+               AND NOT public.epigraph_session_writes_node($2, 'claim')
+               AND EXISTS (
+                   SELECT 1 FROM claim_frames cf
+                     JOIN frames f ON f.id = cf.frame_id AND f.name = 'binary_truth'
+                    WHERE cf.claim_id = $1
+                      AND cf.hypothesis_index IS DISTINCT FROM 0
+                      AND NOT EXISTS (SELECT 1 FROM claim_frames c2
+                                       WHERE c2.claim_id = $2 AND c2.frame_id = cf.frame_id))
+               AND EXISTS (
+                   SELECT 1 FROM edges e
+                    WHERE e.target_id = $1 AND e.target_type = 'claim'
+                      AND e.relationship != 'supersedes' AND e.valid_to IS NULL
+                      AND NOT (e.source_type = 'claim' AND e.source_id = $2))"#,
         )
-        .bind(canon_uuid)
         .bind(dup_uuid)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        // Drop outgoing dup-edges whose migrated triple already exists on canonical.
-        // Same aliasing discipline: `e.target_id`, `e.target_type`, `e.relationship`
-        // must refer to the outer (being-deleted) row, not the subquery table.
-        deleted_edges.extend(
-            sqlx::query_as::<_, (Uuid, Uuid)>(
-                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-                 UPDATE edges AS e SET valid_to = now()
-                 WHERE e.source_id = $2 AND e.source_type = 'claim'
-                 AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
-                 AND e.target_type = 'claim' AND e.target_id != $1
-                 AND e.valid_to IS NULL
-                 AND EXISTS (
-                 SELECT 1 FROM edges e2
-                 WHERE e2.source_id = $1
-                 AND e2.source_type = 'claim'
-                 AND e2.target_id = e.target_id
-                 AND e2.target_type = e.target_type
-                 AND e2.relationship = e.relationship
-                 AND (e2.valid_to IS NULL OR e2.valid_to > now())
-                 )
-                 RETURNING e.id, e.target_id"#,
-            )
-            .bind(canon_uuid)
-            .bind(dup_uuid)
-            .fetch_all(&mut *tx)
-            .await?,
-        );
-
-        // Symmetric-collision guard for `alternative_of` (migration 042).
-        //
-        // That relationship is governed by `edges_alternative_of_symmetric_uniq`,
-        // a UNIQUE index on `(LEAST(source_id,target_id), GREATEST(source_id,target_id))`
-        // — so the pair {A,B} is unique *regardless of direction*.  The two
-        // directional pre-deletes above only recognise same-`(source,target,
-        // relationship)` triples, so they miss the case where `dup` and
-        // `canonical` are joined to a common third claim T by `alternative_of`
-        // edges of *opposite* orientation (e.g. `dup→T` and `T→canonical`).
-        // Migrating `dup→canonical` would then rewrite `dup→T` into `canonical→T`,
-        // whose symmetric key {canonical,T} collides with the existing `T→canonical`
-        // edge, tripping the unique index and rolling the whole transaction back
-        // before `is_current` is flipped (backlog 2905150e / issue #286).
-        //
-        // Pre-delete the redundant dup-side `alternative_of` edge whenever
-        // `canonical` already shares a symmetric `alternative_of` edge with the
-        // same third claim.  Edges where `canonical` is itself an endpoint are
-        // left for the self-loop guards in the migration UPDATEs below.
-        deleted_edges.extend(
-            sqlx::query_as::<_, (Uuid, Uuid)>(
-                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-                 UPDATE edges AS e SET valid_to = now()
-                 WHERE e.relationship = 'alternative_of'
-                 AND e.valid_to IS NULL
-                 AND e.source_type = 'claim' AND e.target_type = 'claim'
-                 AND (e.source_id = $2 OR e.target_id = $2)
-                 AND e.source_id != $1 AND e.target_id != $1
-                 AND EXISTS (
-                 SELECT 1 FROM edges e2
-                 WHERE e2.relationship = 'alternative_of'
-                 AND e2.source_type = 'claim' AND e2.target_type = 'claim'
-                 AND e2.id <> e.id
-                 AND (e2.valid_to IS NULL OR e2.valid_to > now())
-                 AND LEAST(e2.source_id, e2.target_id) =
-                 LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END)
-                 AND GREATEST(e2.source_id, e2.target_id) =
-                 GREATEST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END)
-                 )
-                 RETURNING e.id, e.target_id"#,
-            )
-            .bind(canon_uuid)
-            .bind(dup_uuid)
-            .fetch_all(&mut *tx)
-            .await?,
-        );
-
-        // ── Derived-record repair, part 1: no ORPHANS ────────────────────────
-        // Every edge the three guards just dropped takes its edge-factor BBA
-        // with it. Without this, the BBA outlives its edge (nothing cascades
-        // from `edges` to `mass_functions`) and keeps being combined into the
-        // target's belief forever.
-        let deleted_edge_ids: Vec<Uuid> = deleted_edges.iter().map(|(id, _)| *id).collect();
-        let deleted_bbas = if deleted_edge_ids.is_empty() {
-            0
-        } else {
-            sqlx::query("DELETE FROM mass_functions WHERE perspective_id = ANY($1)")
-                .bind(&deleted_edge_ids)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected()
-        };
-
-        let retargeted: Vec<(Uuid,)> = sqlx::query_as(
-            "UPDATE edges SET target_id = $1 \
-             WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
-               AND valid_to IS NULL \
-               -- Retracted edges do NOT migrate. A withdrawn assertion was made
-               -- ABOUT the duplicate; re-pointing it at the canonical claim would
-               -- rewrite history, and it would also leave two rows for the same
-               -- pair (one live, one retracted) where callers expect one.
-               AND NOT (source_type = 'claim' AND source_id = $1) \
-             RETURNING id",
-        )
         .bind(canon_uuid)
-        .bind(dup_uuid)
-        .fetch_all(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-
-        // ── Derived-record repair, part 2: no STRANDINGS ─────────────────────
-        // Those edges now point at `canonical`, but their BBAs still sit on
-        // `dup`. Move them, so `canonical` counts the supporters its edges say
-        // it has.
-        let retargeted_ids: Vec<Uuid> = retargeted.into_iter().map(|(id,)| id).collect();
-        let mut moved_bbas = 0_u64;
-        if !retargeted_ids.is_empty() {
-            // `canonical` must be assigned to every frame whose BBAs it is
-            // about to inherit, or the frame-scoped read paths
-            // (`claim_frames.hypothesis_index`) would not see them.
-            sqlx::query(
-                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-                 INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
-                 SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf 
-                 WHERE cf.claim_id = $2 
-                 ON CONFLICT (claim_id, frame_id) DO NOTHING"#,
-            )
-            .bind(canon_uuid)
-            .bind(dup_uuid)
-            .execute(&mut *tx)
-            .await?;
-
-            // Guard `mass_functions_unique_per_perspective`
-            // (claim_id, frame_id, source_agent_id, perspective_id, NULLS NOT
-            // DISTINCT — migration 034): if `canonical` somehow already holds
-            // a row for an incoming perspective, the move would raise and roll
-            // the whole dedup back, i.e. an existing caller would acquire a
-            // brand-new failure mode. Drop the canonical-side duplicate first;
-            // the row arriving from `dup` is the one whose edge survived.
-            sqlx::query(
-                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-                 DELETE FROM mass_functions mf
-                 WHERE mf.claim_id = $1 AND mf.perspective_id = ANY($3) 
-                   AND EXISTS ( 
-                       SELECT 1 FROM mass_functions m2 
-                       WHERE m2.claim_id = $2 
-                         AND m2.perspective_id = mf.perspective_id 
-                         AND m2.frame_id = mf.frame_id 
-                         AND m2.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id 
-                   )"#,
-            )
-            .bind(canon_uuid)
-            .bind(dup_uuid)
-            .bind(&retargeted_ids)
-            .execute(&mut *tx)
-            .await?;
-
-            moved_bbas = sqlx::query(
-                "UPDATE mass_functions SET claim_id = $1 \
-                 WHERE claim_id = $2 AND perspective_id = ANY($3)",
-            )
-            .bind(canon_uuid)
-            .bind(dup_uuid)
-            .bind(&retargeted_ids)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        if false_binding {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "FA07: duplicate {dup_uuid} is bound to binary_truth at a non-zero index, and \
+                     canonical {canon_uuid} (which this session cannot write) has no binding: a \
+                     dedup may not hand it one; nothing was written"
+                )),
+            });
         }
-
-        // Outgoing edges are re-sourced at `canonical`. Their BBAs live on the
-        // far end and are unmoved, but their *content* was frozen from `dup`'s
-        // interval at wire time, so they now misattribute. They cannot be
-        // fixed by recombination — the caller re-derives them (see
-        // `DedupRepair::resourced_edges`).
-        let resourced_rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
-            "UPDATE edges SET source_id = $1 \
-             WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
-               AND valid_to IS NULL \
-               -- Retracted edges do NOT migrate. A withdrawn assertion was made
-               -- ABOUT the duplicate; re-pointing it at the canonical claim would
-               -- rewrite history, and it would also leave two rows for the same
-               -- pair (one live, one retracted) where callers expect one.
-               AND NOT (target_type = 'claim' AND target_id = $1) \
-             RETURNING id, target_id, relationship, target_type",
-        )
-        .bind(canon_uuid)
-        .bind(dup_uuid)
-        .fetch_all(&mut *tx)
-        .await?;
-        let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
-            .into_iter()
-            .filter(|(_, _, _, target_type)| target_type == "claim")
-            .map(|(id, target_id, relationship, _)| (id, target_id, relationship))
-            .collect();
-
         tx.commit().await?;
+        Ok(())
+    }
 
-        // Claims whose cached scalars no longer match their BBA set: the two
-        // dedup endpoints, plus every third claim that lost a BBA above.
-        let mut stale_claims = vec![canon_uuid, dup_uuid];
-        for (_, target) in &deleted_edges {
-            if !stale_claims.contains(target) {
-                stale_claims.push(*target);
+    /// The dedup's repair, as the administrative cascade runs it after the
+    /// caller's [`Self::mark_duplicate_act_conn`] committed: retract the
+    /// duplicate's colliding edges and drop their BBAs, re-point every other
+    /// edge onto the canonical, and move (or, on a key collision, drop) the
+    /// BBAs of the edges that now target it. Returns what the belief cascade
+    /// must re-derive.
+    ///
+    /// Re-verifies the committed act first (`dup` supersedes `canonical` and
+    /// is retired), so it acts only on a dedup that happened, and it is
+    /// idempotent: a second run finds nothing left on `dup` to move. That makes
+    /// it the replay of a deferred cascade too.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` on a non-privileged session, or when `dup` is
+    /// not a retired duplicate of `canonical`; `DbError::QueryFailed` on any
+    /// failed statement.
+    pub async fn repair_marked_duplicate_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<DedupRepair, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "repair_marked_duplicate_conn (it re-points other writers' edges)",
+        )
+        .await?;
+        let dup_uuid: Uuid = dup.into();
+        let canon_uuid: Uuid = canonical.into();
+        let mut tx = conn.begin().await?;
+        let recorded: Option<(Option<Uuid>, bool)> = sqlx::query_as(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read verifies the act the mutation follows.
+            SELECT supersedes, COALESCE(is_current, true) FROM claims WHERE id = $1 FOR UPDATE"#,
+        )
+        .bind(dup_uuid)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match recorded {
+            Some((Some(sup), false)) if sup == canon_uuid => {}
+            _ => {
+                return Err(DbError::InvalidData {
+                    reason: format!(
+                        "claim {dup_uuid} is not a retired duplicate of {canon_uuid}; refusing to \
+                         repair its edges"
+                    ),
+                })
             }
         }
-
-        Ok(DedupRepair {
-            stale_claims,
-            resourced_edges,
-            deleted_bbas,
-            moved_bbas,
-        })
+        let repair = repair_marked_duplicate(&mut tx, dup_uuid, canon_uuid).await?;
+        tx.commit().await?;
+        Ok(repair)
     }
 
     /// Apply a patch atomically on the supplied connection. Returns a diff so
@@ -7957,6 +8132,79 @@ impl ClaimRepository {
         }
     }
 
+    /// The AUDITED admin path for a `claims:admin` write into a claim whose
+    /// owning group the admin cannot write (batch H-b, D2; migration 111).
+    ///
+    /// Calls `public.epigraph_admin_patch_claim`, a SECURITY DEFINER owned by
+    /// `epigraph_maintenance`, which in one step re-checks the token's client
+    /// record (`oauth_clients`: active, `claims:admin` granted, bound to the
+    /// session principal), applies the label add/remove, the shallow properties
+    /// merge and the trace relink with exactly the semantics of
+    /// [`Self::update_labels_conn`] and [`Self::patch_claim_atomic_conn`], and
+    /// writes a `security_events` row (`claims.admin_write`) naming the admin,
+    /// the token, the action, the target and the before/after state. The write
+    /// and its audit row commit with the caller's transaction or not at all.
+    ///
+    /// The ADMIN is read from the session's `epigraph.principal_id`, so `conn`
+    /// must be a transaction stamped from the admin's OWN viewer (never the
+    /// claim author's). A NULL principal is refused.
+    ///
+    /// # Errors
+    /// * `DbError::InvalidData` if an added label carries unexpanded shell
+    ///   syntax (checked before the call, as the ordinary path checks it).
+    /// * `DbError::QueryFailed` with SQLSTATE `42501` when the function refuses
+    ///   the admin (`ADM01` no principal, `ADM02` no live `claims:admin` grant),
+    ///   `P0002` when the claim does not exist (`ADM04`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admin_patch_claim_conn(
+        conn: &mut sqlx::PgConnection,
+        token: AdminToken,
+        claim_id: Uuid,
+        action: AdminClaimAction,
+        add_labels: &[String],
+        remove_labels: &[String],
+        properties: Option<&serde_json::Value>,
+        trace_id: Option<Uuid>,
+    ) -> Result<AdminClaimWrite, DbError> {
+        crate::label_validation::reject_unexpanded_labels(add_labels)?;
+        let out: serde_json::Value = sqlx::query_scalar(
+            "SELECT public.epigraph_admin_patch_claim($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(token.client_id)
+        .bind(token.jti)
+        .bind(claim_id)
+        .bind(action.as_str())
+        .bind(add_labels)
+        .bind(remove_labels)
+        .bind(properties)
+        .bind(trace_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        let labels = |key: &str| -> Vec<String> {
+            out.get(key)
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let trace = |key: &str| -> Option<Uuid> {
+            out.get(key)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
+        Ok(AdminClaimWrite {
+            labels: labels("labels"),
+            properties: out.get("properties").cloned().unwrap_or_default(),
+            trace_id: trace("trace_id"),
+            before_labels: labels("before_labels"),
+            before_properties: out.get("before_properties").cloned().unwrap_or_default(),
+            before_trace_id: trace("before_trace_id"),
+        })
+    }
+
     /// The two facts a write gate decides on for one claim, read through
     /// `viewer`: its author (`claims.agent_id`) and its owning group
     /// (`claims.owner_group_id`).
@@ -8472,10 +8720,73 @@ impl ClaimRepository {
     /// (migration 105) returns a live group without writing and refuses a
     /// revoked one, so the answer no longer depends on the stamp.
     ///
+    /// # Migration 117: a PRIVILEGED session only
+    ///
+    /// The edge migration re-points and retracts edges whatever their owner (an
+    /// edge into a source is its SOURCE's writer's assertion). Since 117 a
+    /// non-privileged session's UPDATE of an edge it does not own matches no
+    /// row, so on such a session this would merge and silently leave other
+    /// writers' edges on the retired sources. It therefore refuses a
+    /// non-privileged session outright. A request path runs
+    /// [`Self::consolidate_act_conn`] on the caller's stamped transaction and
+    /// [`Self::migrate_consolidated_edges_conn`] on the maintenance connection
+    /// (`epigraph_engine::admin_cascade`).
+    ///
+    /// # Errors
+    /// As [`Self::consolidate`], plus `DbError::InvalidData` on a
+    /// non-privileged session.
+    pub async fn consolidate_conn(
+        conn: &mut sqlx::PgConnection,
+        source_ids: &[Uuid],
+        merged_content: &str,
+        merged_truth: f64,
+        mode: ConsolidateMode,
+        reason: &str,
+        acting_agent_id: Uuid,
+    ) -> Result<ConsolidateResult, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "consolidate_conn (its edge migration re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let mut result = Self::consolidate_act_conn(
+            &mut tx,
+            source_ids,
+            merged_content,
+            merged_truth,
+            mode,
+            reason,
+            acting_agent_id,
+        )
+        .await?;
+        if !result.already_existed {
+            let m = migrate_consolidated_edges(&mut tx, result.merged_id, source_ids).await?;
+            result.edges_migrated = m.migrated.len() as u64;
+            result.edges_deduped = m.retracted.len() as u64;
+        }
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// The consolidation's own act, and nothing else: validate and lock the
+    /// sources, insert the merged claim, retire every source (`supersedes =
+    /// merged`) and insert the `supersedes` edges merged → source.
+    ///
+    /// Every row it writes is one the consolidating caller authors or must be
+    /// able to write (the merged claim, its own sources, the edges between
+    /// them), so it runs on the CALLER's stamped transaction and the database
+    /// decides write authority. It does NOT migrate the sources' other edges:
+    /// those belong to whoever asserted them, and moving them is the
+    /// administrative cascade's job
+    /// ([`Self::migrate_consolidated_edges_conn`], migration 117). The
+    /// returned counts of migrated and deduped edges are therefore zero.
+    ///
     /// # Errors
     /// As [`Self::consolidate`].
     #[allow(clippy::too_many_lines)]
-    pub async fn consolidate_conn(
+    pub async fn consolidate_act_conn(
         conn: &mut sqlx::PgConnection,
         source_ids: &[Uuid],
         merged_content: &str,
@@ -8745,117 +9056,6 @@ impl ClaimRepository {
         .fetch_one(&mut *tx)
         .await?;
 
-        // ── Edge migration ──
-        //
-        // Collect every non-supersedes edge touching a source, dropping those
-        // interior to the merge (both endpoints inside the source set) — those
-        // would collapse to merged→merged self-loops.
-        let candidates = sqlx::query!(
-            r#"
-            -- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-            SELECT id, source_id, target_id, source_type, target_type,
-                   relationship, created_at
-            FROM edges
-            WHERE relationship != 'supersedes'
-              AND ( (source_id = ANY($1) AND source_type = 'claim')
-                 OR (target_id = ANY($1) AND target_type = 'claim') )
-            ORDER BY created_at, id
-            "#,
-            source_ids,
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-
-        let src_set: &std::collections::HashSet<Uuid> = &unique;
-        let mut to_delete: Vec<Uuid> = Vec::new();
-        let mut survivors: Vec<Uuid> = Vec::new();
-        let mut seen: std::collections::HashSet<(Uuid, String, String, i8)> =
-            std::collections::HashSet::new();
-
-        for e in &candidates {
-            let src_in = e.source_type == "claim" && src_set.contains(&e.source_id);
-            let tgt_in = e.target_type == "claim" && src_set.contains(&e.target_id);
-
-            if src_in && tgt_in {
-                // Interior to the merge: would become merged→merged.
-                to_delete.push(e.id);
-                continue;
-            }
-            // AUTHORED is allowed to accumulate (migration 017) — migrate, never dedupe.
-            if e.relationship == "AUTHORED" {
-                survivors.push(e.id);
-                continue;
-            }
-
-            let (other, other_type) = if src_in {
-                (e.target_id, e.target_type.clone())
-            } else {
-                (e.source_id, e.source_type.clone())
-            };
-            // alternative_of's unique index is keyed on (LEAST, GREATEST) and
-            // is therefore direction-agnostic; every other relationship
-            // duplicates per-direction.
-            let direction = if e.relationship == "alternative_of" {
-                0
-            } else if src_in {
-                1
-            } else {
-                -1
-            };
-            let key = (other, other_type, e.relationship.clone(), direction);
-            if seen.insert(key) {
-                survivors.push(e.id);
-            } else {
-                // Earliest edge already claimed this slot (ORDER BY created_at, id).
-                to_delete.push(e.id);
-            }
-        }
-
-        let mut edges_deduped = 0_u64;
-        if !to_delete.is_empty() {
-            // `survivors` keeps the earliest edge per slot and `to_delete` holds only
-            // the redundant later copies, so retracting them leaves the assertion in
-            // force on the survivor. Retraction rather than deletion keeps the
-            // duplicates auditable — you can still see that the graph once carried
-            // two copies and when the redundancy was resolved.
-            edges_deduped = sqlx::query!(
-                "UPDATE edges SET valid_to = now() WHERE id = ANY($1) AND valid_to IS NULL",
-                &to_delete[..]
-            )
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        }
-
-        let mut edges_migrated = 0_u64;
-        if !survivors.is_empty() {
-            edges_migrated += sqlx::query!(
-                r#"
-                UPDATE edges SET source_id = $1
-                WHERE id = ANY($2) AND source_type = 'claim' AND source_id = ANY($3)
-                "#,
-                merged_id,
-                &survivors[..],
-                source_ids,
-            )
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-
-            edges_migrated += sqlx::query!(
-                r#"
-                UPDATE edges SET target_id = $1
-                WHERE id = ANY($2) AND target_type = 'claim' AND target_id = ANY($3)
-                "#,
-                merged_id,
-                &survivors[..],
-                source_ids,
-            )
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        }
-
         // Retire sources. One statement: chk_deprecated_no_embedding (migration
         // 052) is a per-statement CHECK, so is_current=false and both
         // embedding=NULL / embedding_3072=NULL must land together.
@@ -8896,11 +9096,192 @@ impl ClaimRepository {
         Ok(ConsolidateResult {
             merged_id,
             superseded: source_ids.to_vec(),
-            edges_migrated,
-            edges_deduped,
+            edges_migrated: 0,
+            edges_deduped: 0,
             already_existed: false,
         })
     }
+
+    /// The consolidation's edge migration, as the administrative cascade runs it
+    /// after the caller's [`Self::consolidate_act_conn`] committed (migration
+    /// 117): re-point every live edge on a retired source onto the merged
+    /// claim, and retract the redundant copies the merge creates.
+    ///
+    /// Re-verifies the committed act first (every source is retired with
+    /// `supersedes = merged_id`), so it acts only on a merge that happened, and
+    /// it is idempotent: it considers LIVE edges only (`valid_to IS NULL`), and
+    /// a second run finds none left on the sources. That makes it the replay
+    /// of a deferred cascade too. Runs in its own transaction (a SAVEPOINT when
+    /// the connection is already in one).
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` on a non-privileged session, or when the claims
+    /// do not record `merged_id` replacing every retired source;
+    /// `DbError::QueryFailed` on any failed statement.
+    pub async fn migrate_consolidated_edges_conn(
+        conn: &mut sqlx::PgConnection,
+        merged_id: Uuid,
+        source_ids: &[Uuid],
+    ) -> Result<ConsolidateEdgeMigration, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "migrate_consolidated_edges_conn (it re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let merged: Vec<(Uuid, Option<Uuid>, bool)> = sqlx::query_as(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read verifies the act the mutation follows.
+            SELECT id, supersedes, COALESCE(is_current, true)
+              FROM claims WHERE id = ANY($1) FOR UPDATE"#,
+        )
+        .bind(source_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
+        let verified = !source_ids.is_empty()
+            && unique.len() == source_ids.len()
+            && merged.len() == source_ids.len()
+            && merged
+                .iter()
+                .all(|(_, sup, current)| *sup == Some(merged_id) && !*current);
+        if !verified {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "claim {merged_id} does not replace every retired source of this \
+                     consolidation; refusing to migrate their edges"
+                ),
+            });
+        }
+        let migration = migrate_consolidated_edges(&mut tx, merged_id, source_ids).await?;
+        tx.commit().await?;
+        Ok(migration)
+    }
+}
+
+/// What [`ClaimRepository::migrate_consolidated_edges_conn`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsolidateEdgeMigration {
+    /// Live edges re-pointed from a retired source onto the merged claim.
+    pub migrated: Vec<Uuid>,
+    /// Live edges retracted: interior to the merge (both endpoints were
+    /// sources) or a redundant later copy of a surviving edge.
+    pub retracted: Vec<Uuid>,
+}
+
+/// The consolidation's edge migration, unchecked: the callers
+/// ([`ClaimRepository::consolidate_conn`],
+/// [`ClaimRepository::migrate_consolidated_edges_conn`]) establish the
+/// privilege and the committed act first.
+async fn migrate_consolidated_edges(
+    tx: &mut sqlx::PgConnection,
+    merged_id: Uuid,
+    source_ids: &[Uuid],
+) -> Result<ConsolidateEdgeMigration, DbError> {
+    let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
+    // Collect every LIVE non-supersedes edge touching a source, dropping those
+    // interior to the merge (both endpoints inside the source set) — those
+    // would collapse to merged→merged self-loops. A retracted edge stays where
+    // it is: it is history, and leaving it makes a second run a no-op.
+    let candidates: Vec<(Uuid, Uuid, Uuid, String, String, String)> = sqlx::query_as(
+        r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+        SELECT id, source_id, target_id, source_type, target_type, relationship
+        FROM edges
+        WHERE relationship != 'supersedes'
+          AND valid_to IS NULL
+          AND ( (source_id = ANY($1) AND source_type = 'claim')
+             OR (target_id = ANY($1) AND target_type = 'claim') )
+        ORDER BY created_at, id"#,
+    )
+    .bind(source_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut to_delete: Vec<Uuid> = Vec::new();
+    let mut survivors: Vec<Uuid> = Vec::new();
+    let mut seen: std::collections::HashSet<(Uuid, String, String, i8)> =
+        std::collections::HashSet::new();
+
+    for (id, source_id, target_id, source_type, target_type, relationship) in &candidates {
+        let src_in = source_type == "claim" && unique.contains(source_id);
+        let tgt_in = target_type == "claim" && unique.contains(target_id);
+
+        if src_in && tgt_in {
+            // Interior to the merge: would become merged→merged.
+            to_delete.push(*id);
+            continue;
+        }
+        // AUTHORED is allowed to accumulate (migration 017) — migrate, never dedupe.
+        if relationship == "AUTHORED" {
+            survivors.push(*id);
+            continue;
+        }
+
+        let (other, other_type) = if src_in {
+            (*target_id, target_type.clone())
+        } else {
+            (*source_id, source_type.clone())
+        };
+        // alternative_of's unique index is keyed on (LEAST, GREATEST) and
+        // is therefore direction-agnostic; every other relationship
+        // duplicates per-direction.
+        let direction = if relationship == "alternative_of" {
+            0
+        } else if src_in {
+            1
+        } else {
+            -1
+        };
+        let key = (other, other_type, relationship.clone(), direction);
+        if seen.insert(key) {
+            survivors.push(*id);
+        } else {
+            // Earliest edge already claimed this slot (ORDER BY created_at, id).
+            to_delete.push(*id);
+        }
+    }
+
+    let mut out = ConsolidateEdgeMigration::default();
+    if !to_delete.is_empty() {
+        // `survivors` keeps the earliest edge per slot and `to_delete` holds only
+        // the redundant later copies, so retracting them leaves the assertion in
+        // force on the survivor. Retraction rather than deletion keeps the
+        // duplicates auditable — you can still see that the graph once carried
+        // two copies and when the redundancy was resolved.
+        out.retracted = sqlx::query_scalar(
+            "UPDATE edges SET valid_to = now() WHERE id = ANY($1) AND valid_to IS NULL \
+             RETURNING id",
+        )
+        .bind(&to_delete[..])
+        .fetch_all(&mut *tx)
+        .await?;
+    }
+
+    if !survivors.is_empty() {
+        let resourced: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE edges SET source_id = $1 \
+             WHERE id = ANY($2) AND source_type = 'claim' AND source_id = ANY($3) \
+             RETURNING id",
+        )
+        .bind(merged_id)
+        .bind(&survivors[..])
+        .bind(source_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        let retargeted: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE edges SET target_id = $1 \
+             WHERE id = ANY($2) AND target_type = 'claim' AND target_id = ANY($3) \
+             RETURNING id",
+        )
+        .bind(merged_id)
+        .bind(&survivors[..])
+        .bind(source_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        out.migrated = resourced;
+        out.migrated.extend(retargeted);
+    }
+    Ok(out)
 }
 
 /// One grounded neighbour of a query vector, as
@@ -9102,4 +9483,406 @@ impl ClaimRepository {
         .await?;
         Ok(rows.into_iter().map(|r| (r.id, r.content_hash)).collect())
     }
+}
+
+/// The checks and the one `claims` UPDATE of a dedup's act. The callers
+/// ([`ClaimRepository::mark_duplicate_act_conn`],
+/// [`ClaimRepository::mark_duplicate_with_repair_conn`]) own the transaction.
+async fn mark_duplicate_act(
+    conn: &mut sqlx::PgConnection,
+    dup_uuid: Uuid,
+    canon_uuid: Uuid,
+) -> Result<(), DbError> {
+    if dup_uuid == canon_uuid {
+        return Err(DbError::QueryFailed {
+            source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
+        });
+    }
+    let canon_exists: bool = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+        SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)"#,
+    )
+    .bind(canon_uuid)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !canon_exists {
+        return Err(DbError::NotFound {
+            entity: "Claim".into(),
+            id: canon_uuid,
+        });
+    }
+    let row: Option<(Option<Uuid>,)> = sqlx::query_as(
+        r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+        SELECT supersedes FROM claims WHERE id = $1 FOR UPDATE"#,
+    )
+    .bind(dup_uuid)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((existing,)) = row else {
+        return Err(DbError::NotFound {
+            entity: "Claim".into(),
+            id: dup_uuid,
+        });
+    };
+    if existing.is_some() {
+        return Err(DbError::QueryFailed {
+            source: sqlx::Error::Protocol(format!(
+                "Claim {dup_uuid} already superseded; refusing to overwrite"
+            )),
+        });
+    }
+    // Null both embedding columns in the same statement as is_current=false
+    // so the CHECK constraint chk_deprecated_no_embedding (migration 052)
+    // is not violated mid-transaction. Dropping it from semantic search is
+    // the same invariant as supersede() and deprecate_claim().
+    sqlx::query(
+        "UPDATE claims \
+         SET supersedes = $1, is_current = false, embedding = NULL, \
+             embedding_3072 = NULL, updated_at = NOW() \
+         WHERE id = $2",
+    )
+    .bind(canon_uuid)
+    .bind(dup_uuid)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The dedup's repair of the edge and derived-record layers, unchecked: the
+/// callers establish the privilege and the committed (or same-transaction)
+/// act first, and own the transaction.
+///
+/// # Why the edge migration alone corrupts belief
+/// See [`ClaimRepository::mark_duplicate_with_repair`]: without the two
+/// derived-record repairs below, the collision guards ORPHAN BBAs and the
+/// retarget STRANDS them.
+async fn repair_marked_duplicate(
+    conn: &mut sqlx::PgConnection,
+    dup_uuid: Uuid,
+    canon_uuid: Uuid,
+) -> Result<DedupRepair, DbError> {
+    // Migrate edges off the now-non-current duplicate onto the canonical
+    // claim, mirroring supersede()'s edge migration — otherwise edges to/from
+    // third claims dangle at a claim that no longer surfaces. Unlike supersede
+    // (which targets a freshly-minted claim with no pre-existing edges), the
+    // canonical here already exists, so we must guard against two collision
+    // classes before running the UPDATEs:
+    //
+    //   1. Self-loops: `dup→canonical` or `canonical→dup` edges that would
+    //      become `canonical→canonical` after migration (handled by the
+    //      `AND NOT (... = $1)` filters in the UPDATE clauses below).
+    //
+    //   2. Diamond duplicates: a third claim T that has edges to *both* dup
+    //      and canonical with the same relationship — e.g.
+    //      `T→[CORROBORATES]→dup` AND `T→[CORROBORATES]→canonical`.
+    //      Migrating the dup edge to point at canonical would produce a
+    //      second `T→[CORROBORATES]→canonical` triple, tripping the partial
+    //      unique index `idx_edges_unique_triple_non_authored`
+    //      (migration 017, covers all relationship types except AUTHORED)
+    //      and rolling back the whole transaction before `is_current` is
+    //      flipped.  Pre-delete the redundant dup edges so the UPDATE only
+    //      touches survivors.  AUTHORED edges are excluded because the
+    //      partial index does not cover them, and they are meant to
+    //      accumulate (migration 017 explicitly allows multiple AUTHORED
+    //      edges per triple).
+    //
+    // The 'supersedes' edges (dedup/lineage trail) are preserved throughout.
+
+    // Drop incoming dup-edges whose migrated triple already exists on canonical.
+    // Alias the outer table as `e` so the correlated subquery references
+    // `e.source_id`, `e.source_type`, `e.relationship` unambiguously.
+    // Without the alias, unqualified column names inside the EXISTS bind to
+    // `edges e2` (innermost scope in PostgreSQL), making the predicate
+    // tautological and causing false-positive deletions of edges that should
+    // be migrated.
+    // `RETURNING id, target_id` (here and on the two pre-deletes below) is
+    // the only addition to these statements: the edge rows are about to be
+    // gone, and their `perspective_id = id` BBAs — which live on
+    // `target_id` — have to be deleted with them, so the ids must be
+    // captured before the DELETE commits.
+    let mut deleted_edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+         UPDATE edges AS e SET valid_to = now()
+         WHERE e.target_id = $2 AND e.target_type = 'claim'
+         AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+         AND e.source_type = 'claim' AND e.source_id != $1
+         AND e.valid_to IS NULL
+         AND EXISTS (
+         SELECT 1 FROM edges e2
+         WHERE e2.source_id = e.source_id
+         AND e2.source_type = e.source_type
+         AND e2.target_id = $1
+         AND e2.target_type = 'claim'
+         AND e2.relationship = e.relationship
+         AND (e2.valid_to IS NULL OR e2.valid_to > now())
+         )
+         RETURNING e.id, e.target_id"#,
+    )
+    .bind(canon_uuid)
+    .bind(dup_uuid)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    // Drop outgoing dup-edges whose migrated triple already exists on canonical.
+    // Same aliasing discipline: `e.target_id`, `e.target_type`, `e.relationship`
+    // must refer to the outer (being-deleted) row, not the subquery table.
+    deleted_edges.extend(
+        sqlx::query_as::<_, (Uuid, Uuid)>(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+             UPDATE edges AS e SET valid_to = now()
+             WHERE e.source_id = $2 AND e.source_type = 'claim'
+             AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+             AND e.target_type = 'claim' AND e.target_id != $1
+             AND e.valid_to IS NULL
+             AND EXISTS (
+             SELECT 1 FROM edges e2
+             WHERE e2.source_id = $1
+             AND e2.source_type = 'claim'
+             AND e2.target_id = e.target_id
+             AND e2.target_type = e.target_type
+             AND e2.relationship = e.relationship
+             AND (e2.valid_to IS NULL OR e2.valid_to > now())
+             )
+             RETURNING e.id, e.target_id"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .fetch_all(&mut *conn)
+        .await?,
+    );
+
+    // Symmetric-collision guard for `alternative_of` (migration 042).
+    //
+    // That relationship is governed by `edges_alternative_of_symmetric_uniq`,
+    // a UNIQUE index on `(LEAST(source_id,target_id), GREATEST(source_id,target_id))`
+    // — so the pair {A,B} is unique *regardless of direction*.  The two
+    // directional pre-deletes above only recognise same-`(source,target,
+    // relationship)` triples, so they miss the case where `dup` and
+    // `canonical` are joined to a common third claim T by `alternative_of`
+    // edges of *opposite* orientation (e.g. `dup→T` and `T→canonical`).
+    // Migrating `dup→canonical` would then rewrite `dup→T` into `canonical→T`,
+    // whose symmetric key {canonical,T} collides with the existing `T→canonical`
+    // edge, tripping the unique index and rolling the whole transaction back
+    // before `is_current` is flipped (backlog 2905150e / issue #286).
+    //
+    // Pre-delete the redundant dup-side `alternative_of` edge whenever
+    // `canonical` already shares a symmetric `alternative_of` edge with the
+    // same third claim.  Edges where `canonical` is itself an endpoint are
+    // left for the self-loop guards in the migration UPDATEs below.
+    deleted_edges.extend(
+        sqlx::query_as::<_, (Uuid, Uuid)>(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+             UPDATE edges AS e SET valid_to = now()
+             WHERE e.relationship = 'alternative_of'
+             AND e.valid_to IS NULL
+             AND e.source_type = 'claim' AND e.target_type = 'claim'
+             AND (e.source_id = $2 OR e.target_id = $2)
+             AND e.source_id != $1 AND e.target_id != $1
+             AND EXISTS (
+             SELECT 1 FROM edges e2
+             WHERE e2.relationship = 'alternative_of'
+             AND e2.source_type = 'claim' AND e2.target_type = 'claim'
+             AND e2.id <> e.id
+             AND (e2.valid_to IS NULL OR e2.valid_to > now())
+             AND LEAST(e2.source_id, e2.target_id) =
+             LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END)
+             AND GREATEST(e2.source_id, e2.target_id) =
+             GREATEST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END)
+             )
+             RETURNING e.id, e.target_id"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .fetch_all(&mut *conn)
+        .await?,
+    );
+
+    // ── Derived-record repair, part 1: no ORPHANS ────────────────────────
+    // Every edge the three guards just retracted takes its edge-factor BBA
+    // with it. Without this, the BBA outlives its edge (nothing cascades from
+    // `edges` to `mass_functions`) and keeps being combined into the target's
+    // belief forever. These BBAs are routinely other writers' rows; this runs
+    // on a privileged session (the caller's precondition), so it is the plain
+    // statement (migration 117).
+    let deleted_edge_ids: Vec<Uuid> = deleted_edges.iter().map(|(id, _)| *id).collect();
+    let deleted_bbas = crate::repos::mass_function::delete_edge_bbas(
+        &mut *conn,
+        &deleted_edge_ids,
+        crate::repos::mass_function::EdgeBbaCascade::DedupRetractedEdge,
+    )
+    .await?;
+
+    let retargeted: Vec<(Uuid,)> = sqlx::query_as(
+        "UPDATE edges SET target_id = $1 \
+         WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
+           AND valid_to IS NULL \
+           -- Retracted edges do NOT migrate. A withdrawn assertion was made
+           -- ABOUT the duplicate; re-pointing it at the canonical claim would
+           -- rewrite history, and it would also leave two rows for the same
+           -- pair (one live, one retracted) where callers expect one.
+           AND NOT (source_type = 'claim' AND source_id = $1) \
+         RETURNING id",
+    )
+    .bind(canon_uuid)
+    .bind(dup_uuid)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    // ── Derived-record repair, part 2: no STRANDINGS ─────────────────────
+    // Those edges now point at `canonical`, but their BBAs still sit on
+    // `dup`. Move them, so `canonical` counts the supporters its edges say it
+    // has.
+    let retargeted_ids: Vec<Uuid> = retargeted.into_iter().map(|(id,)| id).collect();
+    let mut moved_bbas = 0_u64;
+    let mut dropped_duplicate_copies = 0_u64;
+    let mut skipped_false_bindings = 0_u64;
+    if !retargeted_ids.is_empty() {
+        // `canonical` must be assigned to every frame whose BBAs it is about
+        // to inherit, or the frame-scoped read paths
+        // (`claim_frames.hypothesis_index`) would not see them. The copy is
+        // the claim's own row (a privileged insert inherits the claim's
+        // tenancy), and it never overwrites an existing assignment.
+        //
+        // One exception, which the administrative authority this runs with
+        // must not erase: a `binary_truth` binding at a non-zero index (FALSE)
+        // is not copied onto a canonical owned by a different group than the
+        // duplicate. That index is what every reader takes as the claim's own
+        // truth, and a dedup by the duplicate's writer is no licence to set it
+        // on somebody else's claim (FA07, review finding W2; the caller's act
+        // refuses the case it can see).
+        skipped_false_bindings = sqlx::query_scalar::<_, i64>(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             SELECT count(*) FROM claim_frames cf
+               JOIN frames f ON f.id = cf.frame_id
+               JOIN claims d ON d.id = $2
+               JOIN claims c ON c.id = $1
+              WHERE cf.claim_id = $2
+                AND f.name = 'binary_truth' AND cf.hypothesis_index IS DISTINCT FROM 0
+                AND c.owner_group_id IS DISTINCT FROM d.owner_group_id
+                AND NOT EXISTS (SELECT 1 FROM claim_frames c2
+                                 WHERE c2.claim_id = $1 AND c2.frame_id = cf.frame_id)"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .fetch_one(&mut *conn)
+        .await
+        .map(|n| u64::try_from(n).unwrap_or(0))?;
+        sqlx::query(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
+             SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf
+               JOIN frames f ON f.id = cf.frame_id
+               JOIN claims d ON d.id = $2
+               JOIN claims c ON c.id = $1
+              WHERE cf.claim_id = $2
+                AND NOT (f.name = 'binary_truth' AND cf.hypothesis_index IS DISTINCT FROM 0
+                         AND c.owner_group_id IS DISTINCT FROM d.owner_group_id)
+             ON CONFLICT (claim_id, frame_id) DO NOTHING"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .execute(&mut *conn)
+        .await?;
+
+        // Guard `mass_functions_unique_per_perspective` (claim_id, frame_id,
+        // source_agent_id, perspective_id, NULLS NOT DISTINCT -- migration
+        // 034): when `canonical` already holds a row for an incoming
+        // perspective, the DUPLICATE's copy is dropped and the canonical keeps
+        // its own. Both carry the same edge, frame and source agent; only the
+        // moment their masses were frozen differs, and the canonical's row may
+        // be another writer's contribution, which a dedup does not destroy
+        // (migration 115 section 4's rule, now the only one).
+        dropped_duplicate_copies = sqlx::query(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             DELETE FROM mass_functions d
+              WHERE d.claim_id = $2 AND d.perspective_id = ANY($3)
+                AND EXISTS (
+                    SELECT 1 FROM mass_functions c
+                     WHERE c.claim_id = $1
+                       AND c.perspective_id = d.perspective_id
+                       AND c.frame_id = d.frame_id
+                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id)"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .bind(&retargeted_ids)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+
+        // The move keeps "a writer's contribution is the writer's" (migration
+        // 114). Onto a PUBLIC canonical, a row keeps its owner and comes out
+        // writer-owned whenever that owner is not the canonical's (so a later
+        // insert on the canonical does not re-stamp it to the canonical's
+        // owner); onto a group-private canonical it becomes the claim's own
+        // row, as every derived row of a private claim is.
+        let moved = sqlx::query(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             UPDATE mass_functions mf
+                SET claim_id       = c.id,
+                    owner_group_id = CASE WHEN c.visibility = 'public' THEN mf.owner_group_id
+                                          ELSE c.owner_group_id END,
+                    visibility     = c.visibility,
+                    writer_owned   = CASE
+                                       WHEN c.visibility IS DISTINCT FROM 'public' THEN false
+                                       WHEN mf.owner_group_id IS DISTINCT FROM c.owner_group_id
+                                            THEN true
+                                       ELSE mf.writer_owned END
+               FROM claims c
+              WHERE c.id = $1
+                AND mf.claim_id = $2 AND mf.perspective_id = ANY($3)"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .bind(&retargeted_ids)
+        .execute(&mut *conn)
+        .await?;
+        moved_bbas = moved.rows_affected();
+    }
+
+    // Outgoing edges are re-sourced at `canonical`. Their BBAs live on the
+    // far end and are unmoved, but their *content* was frozen from `dup`'s
+    // interval at wire time, so they now misattribute. They cannot be fixed
+    // by recombination -- the caller re-derives them (see
+    // `DedupRepair::resourced_edges`).
+    let resourced_rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+        "UPDATE edges SET source_id = $1 \
+         WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
+           AND valid_to IS NULL \
+           -- Retracted edges do NOT migrate. A withdrawn assertion was made
+           -- ABOUT the duplicate; re-pointing it at the canonical claim would
+           -- rewrite history, and it would also leave two rows for the same
+           -- pair (one live, one retracted) where callers expect one.
+           AND NOT (target_type = 'claim' AND target_id = $1) \
+         RETURNING id, target_id, relationship, target_type",
+    )
+    .bind(canon_uuid)
+    .bind(dup_uuid)
+    .fetch_all(&mut *conn)
+    .await?;
+    let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
+        .into_iter()
+        .filter(|(_, _, _, target_type)| target_type == "claim")
+        .map(|(id, target_id, relationship, _)| (id, target_id, relationship))
+        .collect();
+
+    // Claims whose cached scalars no longer match their BBA set: the two
+    // dedup endpoints, plus every third claim that lost a BBA above.
+    let mut stale_claims = vec![canon_uuid, dup_uuid];
+    for (_, target) in &deleted_edges {
+        if !stale_claims.contains(target) {
+            stale_claims.push(*target);
+        }
+    }
+
+    Ok(DedupRepair {
+        stale_claims,
+        resourced_edges,
+        deleted_bbas,
+        moved_bbas,
+        retracted_edges: deleted_edge_ids,
+        retargeted_edges: retargeted_ids,
+        dropped_duplicate_copies,
+        skipped_false_bindings,
+    })
 }

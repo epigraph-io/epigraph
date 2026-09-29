@@ -50,6 +50,7 @@ async fn store(
             confidence: None,
             tags: None,
         },
+        None,
     )
     .await
     .expect("store_workflow");

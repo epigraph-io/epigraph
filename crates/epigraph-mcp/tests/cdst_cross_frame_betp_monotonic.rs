@@ -162,6 +162,7 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
             strength: 0.9,
             labels: vec![],
         },
+        None,
     )
     .await;
     assert!(res.is_ok(), "update_with_evidence failed: {res:?}");

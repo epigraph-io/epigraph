@@ -375,9 +375,18 @@ pub async fn run_revert(
 /// The same shape `privatization_routes.rs::split_state` builds, and for the
 /// same reason: it is the only `AppState` in the test suite on which `read_as`
 /// and `maintenance_viewer` do not refuse.
+///
+/// The superuser pool is ATTACHED as the maintenance pool. Under operator
+/// decision D9 (batch W12a) `bin/server.rs` attaches none, so on a real server
+/// every privatization lifecycle route answers 501 MOVED
+/// (`privatization_routes.rs::the_lifecycle_is_not_served_without_a_maintenance_pool`);
+/// these suites exercise the lifecycle's handlers behind that gate, for the
+/// design that brings it back.
 pub async fn split_state(pool: &PgPool) -> epigraph_api::AppState {
     let raw = viewer_fixture::downgraded_pool(pool, "epigraph_app").await;
-    let scoped = viewer_fixture::scoped_pool(pool).await;
+    let scoped = viewer_fixture::scoped_pool(pool)
+        .await
+        .with_maintenance_pool(pool.clone());
     let mut state = epigraph_api::AppState::with_db(raw, epigraph_api::ApiConfig::default());
     state.scoped = Some(scoped);
     assert!(

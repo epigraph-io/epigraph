@@ -74,7 +74,11 @@ async fn supersede_matching_owner_returns_success() {
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let (token, client_id) =
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
-    let claim_id = common::seed_claim_with_agent(&pool, "supersede owner match", client_id).await;
+    // Authored by the token's graph agent, in a group that agent writes (batch
+    // OA1: the claim act is decided by write authority, never by comparing the
+    // token's `oauth_clients.id` with the claim's author).
+    let claim_id =
+        common::seed_claim_writable_by_client(&pool, "supersede owner match", client_id).await;
 
     let body = serde_json::json!({
         "content": "superseded content",

@@ -68,7 +68,7 @@ struct Args {
     apply: bool,
 
     /// Path to calibration.toml; defaults to the workspace root.
-    #[arg(long, env = "EPIGRAPH_CALIBRATION_PATH")]
+    #[arg(long, env = "EPIGRAPH_CALIBRATION_PATH", hide_env_values = true)]
     calibration: Option<std::path::PathBuf>,
 
     /// Skip the LLM verifier — every mid-band pair is reported as "no answer"

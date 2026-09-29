@@ -79,3 +79,45 @@ fn rejects_unauthenticated_tcp_listener() {
         "stderr must explain that the flag is unix-socket-only; got: {stderr}"
     );
 }
+
+/// Batch HTTP-id: `--allow-unauthenticated-writes` means something only on an
+/// `--allow-unauthenticated-http` listener, so `main` refuses it anywhere
+/// else instead of ignoring it: on an authenticated (`--jwt-secret`) unix
+/// listener, and on stdio. Asserted on the flag's own refusal text, so the
+/// bogus database URL (what a missing gate would reach) cannot pass.
+#[test]
+fn rejects_unauthenticated_writes_without_an_unauthenticated_listener() {
+    let socket = std::env::temp_dir().join(format!("httpid-gate-{}.sock", std::process::id()));
+    let listen = format!("unix:{}", socket.display());
+    for args in [
+        vec![
+            "--listen",
+            listen.as_str(),
+            "--jwt-secret",
+            "a-real-production-secret-of-at-least-32-bytes",
+            "--allow-unauthenticated-writes",
+        ],
+        vec!["--allow-unauthenticated-writes"],
+    ] {
+        let out = Command::new(mcp_bin())
+            .args([
+                "--database-url",
+                "postgres://invalid:invalid@127.0.0.1:1/nope",
+            ])
+            .args(&args)
+            .env_remove("EPIGRAPH_JWT_SECRET")
+            .output()
+            .expect("run mcp bin");
+        assert!(
+            !out.status.success(),
+            "{args:?}: the writes opt-in must be refused"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--allow-unauthenticated-writes applies only to an")
+                && stderr.contains("--allow-unauthenticated-http"),
+            "{args:?}: stderr must name the flag's scope; got: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_file(&socket);
+}

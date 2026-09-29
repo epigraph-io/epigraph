@@ -92,13 +92,18 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 /// A fresh spine returns all paragraphs as new, in document order.
 #[sqlx::test(migrations = "../../migrations")]
 async fn spine_fresh_paper_returns_new_paragraph_paths(pool: PgPool) {
-    let server = make_server(pool).await;
+    let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction =
         serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
 
-    let result = do_ingest_document_spine(&server, &extraction)
-        .await
-        .expect("spine ingest succeeds");
+    let result = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction,
+        None,
+    )
+    .await
+    .expect("spine ingest succeeds");
 
     let json: serde_json::Value =
         serde_json::from_str(&result_text(&result)).expect("response JSON");
@@ -125,16 +130,21 @@ async fn spine_fresh_paper_returns_new_paragraph_paths(pool: PgPool) {
 /// the new body paragraphs appear in `new_paragraph_paths`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn abstract_then_full_paper_abstract_paras_deduped(pool: PgPool) {
-    let server = make_server(pool).await;
+    let server = make_server(pool.clone()).await;
     let abstract_extraction: DocumentExtraction =
         serde_json::from_str(ABSTRACT_FIXTURE).expect("abstract fixture parses");
     let full_extraction: DocumentExtraction =
         serde_json::from_str(SPINE_FIXTURE).expect("full fixture parses");
 
     // Phase 1: ingest the abstract.
-    let first = do_ingest_document_spine(&server, &abstract_extraction)
-        .await
-        .expect("abstract spine ingest succeeds");
+    let first = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &abstract_extraction,
+        None,
+    )
+    .await
+    .expect("abstract spine ingest succeeds");
     let first_json: serde_json::Value =
         serde_json::from_str(&result_text(&first)).expect("response JSON");
     assert_eq!(first_json["paragraphs_new"].as_u64().unwrap(), 2);
@@ -142,9 +152,14 @@ async fn abstract_then_full_paper_abstract_paras_deduped(pool: PgPool) {
 
     // Phase 2: ingest the full paper — abstract paragraphs are deduped,
     // the Methods paragraph is genuinely new.
-    let second = do_ingest_document_spine(&server, &full_extraction)
-        .await
-        .expect("full spine ingest succeeds");
+    let second = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &full_extraction,
+        None,
+    )
+    .await
+    .expect("full spine ingest succeeds");
     let json: serde_json::Value =
         serde_json::from_str(&result_text(&second)).expect("response JSON");
 
@@ -174,16 +189,26 @@ async fn abstract_then_full_paper_abstract_paras_deduped(pool: PgPool) {
 /// with no new paragraph paths.
 #[sqlx::test(migrations = "../../migrations")]
 async fn full_reingest_returns_already_ingested(pool: PgPool) {
-    let server = make_server(pool).await;
+    let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction =
         serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
 
-    let _first = do_ingest_document_spine(&server, &extraction)
-        .await
-        .expect("first spine ingest");
-    let second = do_ingest_document_spine(&server, &extraction)
-        .await
-        .expect("second spine ingest");
+    let _first = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction,
+        None,
+    )
+    .await
+    .expect("first spine ingest");
+    let second = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction,
+        None,
+    )
+    .await
+    .expect("second spine ingest");
 
     let json: serde_json::Value =
         serde_json::from_str(&result_text(&second)).expect("response JSON");

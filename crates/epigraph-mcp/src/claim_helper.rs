@@ -100,14 +100,22 @@ async fn author_write_authority<'p>(
 /// Begin the ONE transaction an MCP submission runs in, stamped from the
 /// **author's** viewer.
 ///
-/// # Why the author's viewer and not the caller's
+/// # Whose viewer: the author's, which since batch H-b IS the caller's
 ///
-/// `submit_claim` and `memorize` author as `server.agent_id()` — the MCP
-/// process's own agent — not as the HTTP principal on the bearer token. The rows
-/// they write therefore inherit `owner_group_id` from the AUTHOR's personal
-/// group, and migration 077's `WITH CHECK` on every claim-derived table asks
-/// `owner_group_id = ANY(epigraph_writable_groups())`. Stamping the caller's
-/// writable set would answer a question nothing asked and refuse the write.
+/// The author is a [`crate::write_identity::WriteIdentity`], which only
+/// `EpiGraphMcpFull::write_identity` constructs: the principal of the request's
+/// own viewer, i.e. `auth.agent_id` over HTTP and the server's own agent on
+/// stdio. Taking the newtype rather than a bare `Uuid` is the ratchet: no tool
+/// can stamp from an agent it picked itself, and the compiler enumerates every
+/// site. Before batch H-b every tool passed `server.agent_id()` here whatever
+/// the transport, so an authenticated caller's writes were authored and stamped
+/// as the shared server signer (#505 F5).
+///
+/// The rows a submission writes inherit `owner_group_id` from the AUTHOR
+/// (`default_decl_for_author`: the author's personal group, or its operator's
+/// for an operated agent), and migration 077's `WITH CHECK` on every
+/// claim-derived table asks `owner_group_id = ANY(epigraph_writable_groups())`,
+/// so the stamp must be the author's writable set.
 /// `epigraph-db/tests/rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`
 /// is the pin: its arm 3 stamps the author's group and succeeds, its arm 4
 /// stamps a *different* real group and is still refused.
@@ -181,9 +189,10 @@ async fn author_write_authority<'p>(
 ///   that viewer has no writable group, or if `BEGIN` / the GUC stamp fails.
 pub async fn begin_author_stamped_tx<'p>(
     server: &'p EpiGraphMcpFull,
-    author_agent_id: uuid::Uuid,
+    author: crate::write_identity::WriteIdentity,
     tool_name: &'static str,
 ) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
+    let author_agent_id = author.agent_id();
     let (scoped, author_viewer) = author_write_authority(
         server.scoped.as_ref(),
         &server.pool,
@@ -229,25 +238,23 @@ pub async fn begin_author_stamped_tx<'p>(
 /// would render a `{WRITABLE:c}` predicate no row satisfies.
 ///
 ///
-/// # RESIDUAL, stated so the R3 policy drop is not read as closing it
+/// # The caller's authority is checked at the call sites (batch H-b, H3)
 ///
-/// This stamps the transaction with the SYSTEM agent's authority, and nothing on
-/// this path asks whether the CALLER has any authority over the workflow it
-/// names. `add_step`, `delete_step`, `ingest_workflow` and
-/// `improve_workflow_hierarchy` (MCP), and `POST /api/v1/workflows/steps` and
-/// `/steps/delete` (HTTP, gated only by the `claims:write` scope) reach this on
-/// caller-supplied input (`canonical_name`, `step_lineage_id`). So any
-/// `claims:write` caller can mutate any system-owned workflow — the harness's
-/// `delete_step` arm drives a step's truth to 0.05 with no ownership relation
-/// between caller and workflow. MEASURED by review; not a regression: config B
-/// (production today) admits the same writes through the orphan `*_privacy`
-/// policies, and main behaves the same there.
-///
-/// What it means for R3: dropping the orphan policies does NOT tighten workflow
-/// mutation at all, because these writes no longer depend on them. Tightening
-/// needs a caller-side check against the TARGET workflow before the stamp, and
-/// a decision about who "owns" a workflow the system agent authored — neither
-/// of which is a mechanical conversion. Tracked as open work, not fixed here.
+/// This stamps the transaction with the SYSTEM agent's authority, which says
+/// nothing about the CALLER. Before batch H-b nothing on this path asked, so any
+/// `claims:write` caller could mutate any system-owned workflow (the harness's
+/// `delete_step` arm drove a step's truth to 0.05 with no relation between
+/// caller and workflow). The check now runs at every call site that mutates an
+/// EXISTING workflow, on this same transaction and before the plan walk:
+/// `add_step` / `delete_step` (MCP `tools::step_ops`, HTTP
+/// `/api/v1/workflows/steps` and `/steps/delete`) and a variant ingest
+/// (`improve_workflow_hierarchy`, or any extraction naming a parent). The rule,
+/// forward-only because `workflows` recorded no owner before, is
+/// `tools::workflow_authority`'s: a workflow created since H-b records its
+/// submitter, and only the submitter, its operator, or `claims:admin` may change
+/// it; a workflow with no record stays open, with a WARN, pending an operator
+/// decision on legacy workflows. The system-agent stamp is unchanged for the
+/// rows these writes make.
 ///
 /// # Errors
 /// * `McpError::internal_error` if the system agent has no write authority (see
@@ -725,6 +732,7 @@ pub async fn create_claim_idempotent(
     conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim: &Claim,
+    signer_agent_id: Option<uuid::Uuid>,
     tool_name: &'static str,
 ) -> Result<(Claim, bool), McpError> {
     // Tenancy declaration (PR-16). Every MCP writer that reaches this helper
@@ -741,9 +749,14 @@ pub async fn create_claim_idempotent(
     let decl = ClaimRepository::default_decl_for_author(&mut *conn, claim.agent_id.into())
         .await
         .map_err(crate::errors::db_caller_error)?;
-    let (claim, was_created) = ClaimRepository::create_or_get(&mut *conn, viewer, claim, decl)
-        .await
-        .map_err(internal_error)?;
+    // The signature is persisted with its SIGNER (batch H-b, D1-sig): the author
+    // is `claim.agent_id`, the signer is `signer_agent_id`, and since D1 they
+    // differ for every authenticated caller. `verify_claim` checks the stored
+    // signature against the signer's key. `None` stores no signature, as before.
+    let (claim, was_created) =
+        ClaimRepository::create_or_get_signed(&mut *conn, viewer, claim, decl, signer_agent_id)
+            .await
+            .map_err(internal_error)?;
 
     emit_verb_edge_best_effort(
         &mut *conn,

@@ -645,25 +645,86 @@ someone remembered to set a flag is not a security control.
   (`owner_group_id` defaults to the world group, so the partial predicate
   matches every row) and the backfill empties it without reclaiming the pages.
 
-### 1c-bis. `MAINTENANCE_DATABASE_URL` (PR-15)
+### 1c-bis. `MAINTENANCE_DATABASE_URL` (PR-15; operator decision D9, batch W12a)
 
 **What it is.** The DSN every background writer connects on: the CLI binaries,
-the API's job pool and its `AppState::maintenance_viewer` pool, and the operator
-scripts under `scripts/`. It should differ from `DATABASE_URL` **only in the
-role** — a role that is a member of `epigraph_maintenance`, so
-`epigraph_bypass()` is true on it.
+the two maintenance timers (`replay_deferred_cascades` on
+`epigraph-cascade-replay.timer`, `drain_jobs` on `epigraph-jobs-drain.timer`),
+and the operator scripts under `scripts/`. It should differ from
+`DATABASE_URL` **only in the role**: a non-superuser LOGIN that is a member of
+`epigraph_maintenance`, so `epigraph_bypass()` is true on it.
 
-**If it is unset**, every one of those falls back to `DATABASE_URL` and logs a
-WARN. That is correct today and only today: no table in `public` has row
-security at head 91, so a bypass viewer on an ordinary connection still sees
-everything. Once PR-17's policies land it would see nothing — and
-`epigraph_db::assert_maintenance_privilege` refuses to start rather than let
-that happen, so the refusal arms itself with no second deploy step. The refusal
-is deliberately *not* an unconditional `epigraph_bypass()` assertion: migration
-060 downgrades `insufficient_privilege` on its `CREATE ROLE` to a NOTICE, so on
-a managed cluster where that fired the role may not exist at all, and an
-unconditional assertion would take the whole fleet down to prevent a failure
-that cannot yet occur.
+**A request-serving process never holds it (D9).** The API `server` and
+`epigraph-mcp-full` on every transport (`--listen` for the HTTP units, stdio for
+agent containers and operator configs) **refuse to start, exit 1, when the
+variable is set**, in every environment, with no override:
+
+```
+ERROR: MAINTENANCE_DATABASE_URL is set; a request-serving process never holds the maintenance DSN (operator decision D9). Remove it from this unit's EnvironmentFile; cascades are applied by epigraph-cascade-replay.timer.
+```
+
+An exported-but-empty value carries no credential and counts as unset. Unset is
+the only supported state for these units; each logs one INFO line on the
+`tenancy.maintenance` target at boot:
+
+```
+maintenance surface not served by this unit (D9); cascades defer to epigraph-cascade-replay.timer, jobs run on epigraph-jobs-drain.timer
+```
+
+What that means for callers:
+
+* **Cascades defer.** Every supersede, dedup, consolidation and match-candidate
+  retirement commits the caller's act and returns its normal status (HTTP
+  200/201, MCP success) with `cascade = {status: "deferred", reason,
+  audit_event_id}`; a `cascade.deferred` row is written in the act's own
+  transaction. The replay timer applies it, normally within about two
+  minutes. Clients must not retry the act.
+* **The maintenance surface answers MOVED** (structured, non-retryable, nothing
+  written). HTTP: `501` with `{"error":"maintenance_surface_not_served",
+  "runs_on":{...},"retryable":false,"decision":"D9"}` for
+  `GET /api/v1/claims/needing-embeddings` (`runs_on` names `embed_backfill`)
+  and for EVERY privatization lifecycle route, the GETs included (`runs_on`
+  kind `none`: the lifecycle needs its own design before it can return). MCP:
+  JSON-RPC `-32600` with `data.status = "moved"` for `recompute_beliefs`
+  (-> `recompute_claim_belief`), `backfill_embeddings` (-> `embed_backfill`)
+  and `sweep_semantic_duplicates` (-> the `sweep_semantic_duplicates` CLI).
+* **No job runs in the server.** It builds no job pool and no maintenance pool,
+  starts no job runner and no stale-job reaper. The queue is drained by
+  `drain_jobs`.
+
+**Connection budget.** The api process opens its application pool only:
+**10** connections per replica (it was API(10) + jobs(8) + maintenance(4) = 22
+before D9). Each `epigraph-mcp-full` process opens app(**10**) (it was 12, with
+a 2-connection maintenance pool). The timers add, while they run:
+`replay_deferred_cascades` up to 11 (the `MaintenancePool` cap, see below) and
+`drain_jobs` up to 4 plus the one connection that holds its advisory lock.
+
+**The timers refuse the fallback.** `replay_deferred_cascades`, `drain_jobs` and
+the `sweep_semantic_duplicates` CLI require `MAINTENANCE_DATABASE_URL` to be SET:
+the documented fallback to `DATABASE_URL` is refused, so the application DSN
+never runs maintenance work. `drain_jobs` also refuses a connection that does
+not satisfy `epigraph_bypass()`, whether or not row security is active yet.
+Each takes its own session advisory lock, so a hand-run beside the timer does
+nothing (`{"locked": true}`, exit 0). `replay_deferred_cascades --report-only`
+prints `{"pending","stuck","oldest_age_s"}` in a read-only transaction and
+takes no lock (the staleness check).
+
+**The maintenance role's grants.** Migration 119 grants `epigraph_maintenance`
+DELETE on the tables the job handlers delete from (`jobs`,
+`graph_cluster_runs`, `graph_clusters`, `cluster_edges`,
+`claim_cluster_membership`, `claim_themes`); 115/117/118 grant the cascade's.
+The sealed-content tables are deliberately not granted. 119 also removes the
+application role's ability to enqueue any job (`jobs_app`'s WITH CHECK admits
+only a privileged session).
+
+**If it is unset on a CLI binary**, the binary falls back to `DATABASE_URL` and
+logs a WARN (the operator's `DATABASE_URL` is itself an explicit act there).
+`epigraph_db::assert_maintenance_privilege` refuses to start once row security
+is active on a protected table and the connection cannot bypass it, so the
+refusal arms itself with no second deploy step. The refusal is deliberately
+*not* an unconditional `epigraph_bypass()` assertion: migration 060 downgrades
+`insufficient_privilege` on its `CREATE ROLE` to a NOTICE, so on a managed
+cluster where that fired the role may not exist at all.
 
 **The arming signal is `ENABLE`, not `FORCE`.** The probe keys on
 `relrowsecurity OR relforcerowsecurity`. A policy filters every role except the
@@ -700,85 +761,11 @@ staging beside a production `DATABASE_URL` names the same database `epigraph` on
 a different cluster, and produces a warning naming both endpoints, not a
 refusal. **Read that warning.**
 
-**A bad value now blocks the whole api process, not just background work.** The
-resolution and the privilege probe run before the router is built, so an
-unusable `MAINTENANCE_DATABASE_URL` takes `/health` and the openapi document
-down with it. That is deliberate: the alternative is an API that reports healthy
-while every background write silently lands nowhere. Treat this variable as a
-boot-critical setting and change it the way you would change `DATABASE_URL`.
-
-**The role needs more than `epigraph_maintenance` membership.** The api's
-background job pool — `PostgresJobQueue`, the stale-job reaper,
-`ClusterGraphHandler`, `ThemeClusterRebuildHandler` — now connects on this DSN
-instead of `DATABASE_URL`. `assert_maintenance_privilege` probes bypass and row
-security; it does **not** probe table grants, and CI connects as the superuser,
-so the role dimension is not exercised by any test. Whatever role you point
-`MAINTENANCE_DATABASE_URL` at must hold the API's full job-path INSERT/UPDATE
-grants, not merely membership of `epigraph_maintenance`. Enumerate them
-alongside the `GRANT` below before the first non-superuser deploy.
-
-**Connection budget.** The api process now opens API(10) + jobs(8) +
-maintenance(4) = **22** connections at boot. The maintenance pool is separate
-from the job pool on purpose: sharing it would give the request-path maintenance
-read the job pool's 45-minute `statement_timeout`. Every consumer runs its
-statement *on the connection it leases from the pool*, which is what makes the
-pool load-bearing rather than decorative.
-
-**Why the maintenance pool went from 2 to 4, in PR-18's apply slice.** It was
-sized at 2 when it had one consumer — `GET /api/v1/claims/needing-embeddings`,
-an occasional operator-triggered read. It now also serves the whole D4 admin
-surface: plan creation, and the FINAL-PLAN §6.6 authority check that
-`GET /plans/:id`, `GET /plans/:id/items`, `approve`, `apply`, `abort`, `revert`
-and `GET /audit` each perform. That is a change of KIND as well as of number —
-an operator-triggered read became a caller-facing route.
-
-Two properties bound what the resize has to cover, and both are held in code
-rather than assumed:
-
-* **No request pins more than one of these connections at a time.** Every D4
-  handler commits its application-pool transaction before acquiring here, and
-  the state-changing routes release the authority-check connection before
-  acquiring the one their transaction runs on.
-* **The job handlers do NOT draw from this pool.** They take the job pool
-  (`ScopedPool`, 8 connections, its own statement timeout), so a running
-  privatization consumes none of the four.
-
-So four connections admit four concurrent admin requests, where two admitted
-two. This is a deliberate, reviewed availability change to the request path and
-not a side effect: an operator running an approval while a colleague walks a
-plan's item pages and the embedding enumerator is mid-sweep was previously one
-request away from an acquire-timeout. If you are tuning `max_connections` on the
-server, the api process's share is now 22 per replica.
-
-**`epigraph-mcp` reads it too (batch H1), and treats it differently.** Its three
-maintenance tools (`recompute_beliefs`, `sweep_semantic_duplicates`,
-`backfill_embeddings`) run on a connection leased from a separate maintenance
-pool that `epigraph-mcp` builds from this variable, falling back to
-`--database-url` as above. Each `epigraph-mcp` process therefore opens
-app(10) + **maintenance(2)** = **12** connections. That includes every listening
-service AND every per-client stdio process, because each one is its own process
-with its own pools. Count each one when tuning `max_connections`.
-
-Unlike the api, **a bad value does not stop `epigraph-mcp` from booting.** When
-the variable names a different database, cannot connect, or names a role that
-does not satisfy `epigraph_bypass()` while row security is active, the pool is
-NOT attached. The boot log records why on the `tenancy.maintenance` target, and
-the three tools refuse each call by name with nothing written. Everything else
-serves normally. The asymmetry is deliberate: here maintenance is three tools
-out of the whole surface, not the process's job. On a least-privilege
-deployment the documented fallback (unset, so `--database-url`, so
-`epigraph_app`) is therefore a refusal, not a zero-row no-op. **The fallback is
-never attached at all, even when `--database-url` could bypass RLS** (a
-superuser DSN): the three tools read and retire rows across every tenant, so
-enabling them is an explicit operator act, not a side effect of how the
-application DSN happens to be provisioned. **To enable the three tools, set
-`MAINTENANCE_DATABASE_URL` in the `epigraph-mcp` units' environment to a role
-that is a member of `epigraph_maintenance`.** Over HTTP they also require the
-`claims:admin` scope (`scope_map.rs`); a `claims:write` bearer is refused before
-the tool body runs. Each tool
-call also re-probes the connection it leased (`MaintenanceSession::assert_privileged`),
-so a role whose membership is revoked after boot is refused on its next call,
-not trusted on the strength of the boot probe.
+**History, superseded by D9.** From PR-15 to batch W10 the api process built a
+job pool and a maintenance pool on this DSN (a bad value blocked its boot), and
+`epigraph-mcp` attached a 2-connection maintenance pool when the variable was
+set to a privileged login, enabling its three maintenance tools. Both are gone;
+the refusal above replaces them.
 
 **Fleet-wide pool sizing changed.** `MaintenancePool` uses one cap of 11 (10 for
 work, 1 for the connection the bypass lease holds) for every converted CLI
@@ -1263,3 +1250,123 @@ redirects or proxies. Nothing in this repository wires
 `ConfigurableWebhookHandler` into a runner yet; when something does, it should
 pass `PinnedHttpClient`. The `HttpClient` trait stays open for test mocks, so a
 second production implementation is a review red flag, not a compile error.
+
+## Batch OA1 — own-claim authority, and audited admin-only scope grants
+
+Operator decision D1 says a supersede or a dedup is the CALLER's act (its own
+write to its own claim) and only the cascade after it is administrative. Batch
+W10 split the two; OA1 makes the scopes agree with that split.
+
+### 1. `supersede` and `mark_duplicate` need `claims:write`, not `claims:admin`
+
+| Surface | Before | After |
+|---|---|---|
+| MCP `supersede_claim`, `mark_duplicate` | `claims:admin` | `claims:write` |
+| `POST /api/v1/claims/:id/supersede` | `claims:write` + author/admin | `claims:write` + the rule below |
+| `POST /api/v1/claims/:id/dedup` | `claims:admin` | `claims:write` + the rule below |
+
+The per-claim rule, shared by both transports (`epigraph_auth::claim_act`):
+the caller may perform the act when its viewer **writes the group that owns the
+claim** (`admin` or `writer` membership, live), or it holds **`claims:admin`**
+(any claim it can read). For a dedup, the **canonical** is judged by the same
+rule as the duplicate: the cascade re-points other writers' edges and BBAs onto
+it, so a `claims:write` caller may only choose a canonical it could write.
+
+* **Authorship alone admits nothing.** An author whose membership in the
+  owning group was revoked, or downgraded to `reader`, can no longer retire or
+  rewrite that claim at `claims:write`. (The non-admin rule is exactly
+  `claims_tenancy`'s `WITH CHECK`, so it refuses by name what the database
+  would refuse anyway.)
+* The pre-OA1 comparison of the token's owner/client id (an `oauth_clients.id`)
+  with the claim's author (an `agents.id`) is gone. MCP's operator-link arm no
+  longer admits a claim act: before OA1 the tools' scope was `claims:admin`, so
+  on any deployment the arm could only ever run for a caller that already held
+  `claims:admin`, and removing it takes nothing away. `resolve_backlog_item`
+  and `patch_claim` keep it. Claims an operated agent submits AFTER the operator link are owned
+  by the operator's personal group, which the operator writes, so the operator
+  is admitted by the rule above on its own stamp. Claims still owned by the
+  agent's own personal group (written before the link, or by a write path that
+  does not re-own) are NOT: the operator needs `claims:admin` for those, or
+  must first move them with `epigraph-operator reown-claims`.
+
+**Which claims that reaches.** A claim written through an MCP server is authored
+by that server's signer agent and owned by the signer's group, not by the human
+behind the OAuth token. For such a claim a `claims:write` caller is admitted
+only if it writes the signer's group, so retiring it over OAuth otherwise still
+needs `claims:admin`. Before withdrawing an administrative grant from a human
+client, check which groups own the claims that human retires, and whether the
+human writes them.
+
+* A claim the caller cannot read answers exactly like a missing one (HTTP
+  `404`; MCP `claim <id> not found`). For a dedup this holds for the duplicate
+  AND the canonical.
+* A claim the caller can read but may not retire (or a canonical it may not
+  choose) is refused by name: HTTP `403` with `{"error": "not_owner", "rule":
+  "not_claim_writer", "claim_id": ..., "retryable": false}`, `claim_id` naming
+  the claim refused; MCP `-32600` with the same keys in `data`. Nothing is
+  written.
+* The act runs on a transaction stamped with the CALLER's own authority, the
+  one the authority read ran on. The single exception: over MCP, a
+  `claims:admin` caller on a claim it does not write acts with the MCP server
+  agent's stamp, exactly as every call did before OA1 (when `claims:admin` was
+  the tools' scope). No other admission borrows the server agent's stamp. Over
+  HTTP the database still decides a `claims:admin` write, so an admin whose
+  stamp cannot write the row's group is refused (`403`, nothing written) on an
+  application-role deployment; that residual is unchanged by OA1.
+* The cascade is unchanged: reported `{"status": "deferred"}` and applied by the
+  replay timer on the maintenance DSN (D9).
+
+Clients that relied on a `claims:write` token being REFUSED at the MCP scope
+check for these two tools now reach the per-claim rule instead. Conversely, a
+token holding `claims:admin` WITHOUT `claims:write` no longer reaches them (the
+HTTP supersede route already required `claims:write`): an administrative client
+should hold both, as `epigraph-admin` does.
+
+### 2. `epigraph-operator grant-client-scope` / `revoke-client-scope`
+
+```
+EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... \
+  epigraph-operator grant-client-scope <oauth_clients.id> <scope> --dry-run
+EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... \
+  epigraph-operator grant-client-scope <oauth_clients.id> <scope> --apply --reason "..."
+```
+
+The audited replacement for a raw `UPDATE oauth_clients` when an operator gives
+a HUMAN's own client an admin-only scope:
+
+* maintenance DSN only (the dedicated variable; no fallback to `DATABASE_URL`
+  or `MAINTENANCE_DATABASE_URL`; a login outside `epigraph_maintenance` is
+  refused);
+* scopes from `ADMIN_ONLY_SCOPES` only, checked before connecting;
+* `client_type = 'human'` only: service clients (`bootstrap_clients`) and agent
+  clients (the approval route) are refused;
+* a GRANT only to a client whose `status` is `active` (a revoked, suspended or
+  pending client would carry the scope once reactivated or approved); a revoke
+  works on any status; every run prints the status;
+* the scope is added to, or removed from, BOTH `allowed_scopes` and
+  `granted_scopes`; every other element of each array is kept in order;
+* idempotent; exactly one of `--dry-run` / `--apply` is required;
+* every `--apply` writes one `security_events` row
+  (`oauth.client_scope_granted` / `oauth.client_scope_revoked`, `agent_id` = the
+  client's agent) whose `details` hold the operator, the client (with its
+  status), the scope, `changed`, and both arrays before and after. The
+  operator is several facts, none an identity alone: the database login
+  (`session_user`), the process's REAL uid and its passwd name (the first
+  field of the `Uid:` line in `/proc/self/status`, from the kernel), its audit
+  login uid and passwd name (`/proc/self/loginuid`, which `sudo` does not
+  change; `null` where the kernel has none), the connection's client address
+  (also the row's `ip_address`) and `application_name`, and `os_user` from
+  `SUDO_USER`/`USER`/`LOGNAME`, which is advisory (`os_user_source` says so:
+  anyone can set it). Run the binary directly as yourself: under `sudo -u` the
+  real uid names the target account, and only the login uid still names you. A
+  shared maintenance login names no person; a per-operator login does. A
+  no-op `--apply` is recorded too (`changed: false`), which is how a grant made
+  some other way is ratified. A dry run writes nothing.
+
+**A human's agents carry that human's scopes.** Agents acting through the
+human's OAuth client hold what that client is granted, because the refresh
+grant re-reads `granted_scopes`: a grant reaches them at their next refresh. A
+revocation also takes effect at the next refresh; an access token minted before
+it keeps the scope until it expires.
+
+No migration.
