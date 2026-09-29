@@ -502,6 +502,9 @@ Current reservation:
   `origin/*` ref carries a `112`. **Applied to a throwaway database only, NOT to
   any deployed database.**
 
+- **113–115**: claimed by open pull requests (113 batch R2, HELD; 114 W-own,
+  115 W9). Their entries land with them.
+
 - **116**: public `link_retired_shared_signer` — the ATTESTED retire of a
   FORMER shared HTTP signer (batch HTTP-id). One SECURITY DEFINER,
   `epigraph_link_retired_shared_signer(agent, operator, attested uuid[])`,
@@ -531,9 +534,48 @@ Current reservation:
   a link it recorded is permanent like 107's. **Applied to a throwaway database
   only, NOT to any deployed database.**
 
-- **117+**: public next (113–115 are claimed by open PRs)
+- **117**: claimed by an open pull request (W10). Its entry lands with it.
 
-Next public migration **outside both reserved tenancy ranges** must be `117` or
+- **118**: public `app_role_table_lockdown` (batch W11). The application role
+  no longer holds UPDATE/DELETE on credential and ledger tables. REVOKEs
+  INSERT/UPDATE/DELETE/TRUNCATE from `epigraph_app` on `_sqlx_migrations` and the
+  four tenancy bookkeeping tables (and INSERT/UPDATE/DELETE on
+  `_sqlx_migrations` from `epigraph_maintenance`); REVOKEs UPDATE/DELETE on
+  `refresh_tokens`, `oauth_authorization_codes`, `oauth_authorize_sessions`,
+  `oauth_clients` and `agent_keys`, after moving every request-path UPDATE/DELETE
+  on them into a SECURITY DEFINER owned by `epigraph_maintenance` (refresh
+  check / atomic rotate / revoke / revoke-by-hash / revoke-client, code consume,
+  session to-consent / take, client lock-for-link / write-once link / audited
+  approve, agent-key set-status with no un-revoke). `refresh_tokens` gains
+  nullable `family_id` and `revoked_reason`; presenting a token spent by
+  rotation more than 30 seconds earlier revokes its family and writes an
+  `oauth.refresh_token_reuse` security event, while inside those 30 seconds (a
+  concurrent refresh) it is refused and the family stays live. The rotation
+  derives the successor's scopes from the client and caps its expiry at the
+  client type's TTL, and the application role no longer reads `token_hash`.
+  `agents`: table UPDATE/DELETE revoked, UPDATE granted back on the columns the
+  live paths write, and `agents_competence_guard` refuses a change to
+  `properties.competence_scopes` on a non-privileged session.
+  `match_candidates`: DELETE revoked and the `match_candidates_stale_guard`
+  trigger refuses the transition to `stale` on a non-privileged session, so
+  retirement (HTTP and MCP) runs on the maintenance connection. Append-only
+  tables (`provenance_log` among them) lose application UPDATE/DELETE, tables
+  with no writer lose every application write, and a restrictive policy lets
+  only the definers write `oauth.` security events.
+  The remaining tables without row security that the application role may
+  update or delete are an explicit, justified allowlist in
+  `epigraph-db/tests/app_role_table_lockdown.rs`. **Ordering:** it uses no
+  object 111–117 create, replaces no function they create, and none of them
+  grants table privileges, so 118-then-111..117 (sqlx applies a lower pending
+  version after a higher applied one) and 111..118 in order end in the same
+  catalog (measured). After 118 is applied, a binary that does not embed it is
+  refused by the head check unless `--allow-db-ahead`, so every open branch must
+  merge `main` (with 118) before it deploys. **Undo:** the GRANTs are listed at
+  the end of the file. **Applied to a throwaway database only.**
+
+- **119+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `119` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

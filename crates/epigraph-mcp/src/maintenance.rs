@@ -23,6 +23,13 @@
 //! already counted by `crates/epigraph-db/tests/viewer_ratchet.rs` and is a
 //! visible enum diff if a fourth is ever added.
 //!
+//! A fourth CALLER, not a fourth reason: since migration 118,
+//! `retire_match_candidate` takes a session here when (and only when) a
+//! maintenance pool is attached, and spends only its connection, because the
+//! database refuses a retirement on an application-role session. It reuses
+//! `SystemReason::BeliefRecomputation` (the retirement deletes derived belief
+//! rows). `tests/tool_viewer_coverage.rs` lists it with the other three.
+//!
 //! # Why this is not lint-laundering
 //!
 //! A reviewer will and should ask whether moving `Viewer::system` one directory

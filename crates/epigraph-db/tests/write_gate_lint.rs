@@ -221,7 +221,9 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
         "evidence.rs::store_embedding",
         "embedding backfill, corpus-wide",
     ),
-    ("match_candidate.rs::retire", "dedup sweep, corpus-wide"),
+    // The statements moved from `retire` into `retire_conn` (migration 118), so
+    // the HTTP route runs them on the maintenance connection.
+    ("match_candidate.rs::retire_conn", "dedup sweep, corpus-wide"),
     // ── privatization: selection must be unfiltered to be correct ───────────
     // Filtering these would silently skip the rows they exist to find, which is
     // the argument `SystemReason::PrivatizationSelection` already records. They

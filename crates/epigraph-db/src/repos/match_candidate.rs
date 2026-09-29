@@ -268,8 +268,27 @@ impl MatchCandidateRepo {
     /// Tolerates any starting status (the CLI does the same): a candidate that
     /// is `pending`, `rejected` or already `stale` simply has no matcher edge
     /// to delete, and the flip to `stale` is idempotent.
+    ///
+    /// # Migration 118: a privileged connection
+    ///
+    /// `stale` is an administrative state: on a non-privileged session the
+    /// `match_candidates_stale_guard` trigger refuses the flip (SQLSTATE
+    /// 42501, `MC01`), and the whole retirement rolls back. Run it on the
+    /// maintenance connection ([`Self::retire_conn`]).
     pub async fn retire(&self, id: Uuid, by: Option<Uuid>) -> sqlx::Result<RetirementOutcome> {
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.acquire().await?;
+        Self::retire_conn(&mut conn, id, by).await
+    }
+
+    /// [`Self::retire`] on a connection the caller owns: the HTTP route passes
+    /// its maintenance connection.
+    pub async fn retire_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        by: Option<Uuid>,
+    ) -> sqlx::Result<RetirementOutcome> {
+        use sqlx::Acquire;
+        let mut tx = conn.begin().await?;
 
         // Row-lock the candidate. This serialises retirement against a
         // *subsequent* decide — that path's first write is `set_status`, which

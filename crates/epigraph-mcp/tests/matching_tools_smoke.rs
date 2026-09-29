@@ -592,6 +592,7 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
     let out = tools::matching::retire_match_candidate(
         &server,
         &fixture::public_viewer(&pool).await,
+        None,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
@@ -662,6 +663,7 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
     tools::matching::retire_match_candidate(
         &read_only,
         &fixture::public_viewer(&pool).await,
+        None,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
@@ -788,6 +790,7 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
     tools::matching::retire_match_candidate(
         &server,
         &fixture::public_viewer(&pool).await,
+        None,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
@@ -1004,4 +1007,157 @@ async fn find_cross_source_matches_omits_sweep_coverage_for_an_invisible_claim(p
         serde_json::json!([]),
         "the pre-existing non-leaking shape is preserved: {json}"
     );
+}
+
+/// A pool whose connections are `SET SESSION AUTHORIZATION <role>`.
+async fn role_pool(pool: &PgPool, role: &'static str) -> PgPool {
+    use sqlx::Executor;
+    let url = fixture::database_url_for(pool).await;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("role pool")
+}
+
+/// Migration 118: on an MCP server whose own pool is the APPLICATION role,
+/// `retire_match_candidate` retires only through a maintenance connection.
+/// Without one the stale guard refuses it, the error names the fix, and
+/// nothing changes; with one (the maintenance role, not a superuser) the
+/// retirement and its cascade go through.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_on_an_application_role_server_needs_the_maintenance_connection(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    tools::matching::decide_match_candidate(
+        &build_server(pool.clone(), false).await,
+        &fixture::public_viewer(&pool).await,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+        None,
+    )
+    .await
+    .expect("promote");
+
+    let app = role_pool(&pool, "epigraph_app").await;
+    let server = build_server(app.clone(), false).await;
+    let params = || RetireMatchCandidateParams {
+        candidate_id: cand.to_string(),
+    };
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let e = tools::matching::retire_match_candidate(&server, &viewer, None, params(), None)
+        .await
+        .expect_err("an application-role server without a maintenance connection");
+    assert!(
+        e.message.contains("MAINTENANCE_DATABASE_URL") && e.message.contains("MC01"),
+        "the refusal names the fix and the guard: {}",
+        e.message
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "promoted", "a refused retirement changes nothing");
+    assert_eq!(edge_relationships(&pool, a, b).await.len(), 1);
+
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+    let mut conn = maint.acquire().await.expect("maintenance connection");
+    let out =
+        tools::matching::retire_match_candidate(&server, &viewer, Some(&mut *conn), params(), None)
+            .await
+            .expect("retire on the maintenance connection");
+    let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
+    assert_eq!(body["candidate"]["status"], "stale");
+    assert_eq!(body["retirement"]["edges_retracted"], 1);
+    assert!(edge_relationships(&pool, a, b).await.is_empty());
+}
+
+/// Migration 118, one frame up: the `#[tool]` dispatch body
+/// (`EpiGraphMcpFull::retire_match_candidate`), not the tool function under it.
+/// The body chooses the connection: with a maintenance pool attached to the
+/// server's `ScopedPool` it mints a maintenance session and retires on it;
+/// without one it runs on the server's own pool. The server's own pool here is
+/// the APPLICATION role, so the two arms differ observably: attached, the
+/// retirement goes through; not attached, the stale guard refuses it (MC01)
+/// and nothing changes. A dispatch body that always passed no connection would
+/// fail the first arm.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_retire_tool_spends_the_attached_maintenance_connection(pool: PgPool) {
+    use epigraph_db::{ScopedPool, SessionGucMode};
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    tools::matching::decide_match_candidate(
+        &build_server(pool.clone(), false).await,
+        &fixture::public_viewer(&pool).await,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+        None,
+    )
+    .await
+    .expect("promote");
+
+    let url = fixture::database_url_for(&pool).await;
+    let app = role_pool(&pool, "epigraph_app").await;
+    let params = || {
+        Parameters(RetireMatchCandidateParams {
+            candidate_id: cand.to_string(),
+        })
+    };
+
+    // No maintenance pool attached: the server's own (application-role) pool.
+    let scoped = ScopedPool::connect(&url, SessionGucMode::Session)
+        .await
+        .expect("scoped pool");
+    let bare = build_server(app.clone(), false)
+        .await
+        .with_scoped_pool(scoped);
+    let e = bare
+        .retire_match_candidate(params(), rmcp::model::Extensions::default())
+        .await
+        .expect_err("no maintenance pool: the application role retires nothing");
+    assert!(
+        e.message.contains("MAINTENANCE_DATABASE_URL") && e.message.contains("MC01"),
+        "the refusal names the fix and the guard: {}",
+        e.message
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "promoted", "a refused retirement changes nothing");
+
+    // A maintenance pool (the maintenance role, not a superuser) attached.
+    let scoped = ScopedPool::connect(&url, SessionGucMode::Session)
+        .await
+        .expect("scoped pool")
+        .with_maintenance_pool(role_pool(&pool, "epigraph_maintenance").await);
+    let wired = build_server(app, false).await.with_scoped_pool(scoped);
+    let out = wired
+        .retire_match_candidate(params(), rmcp::model::Extensions::default())
+        .await
+        .expect("retire through the attached maintenance connection");
+    let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
+    assert_eq!(body["candidate"]["status"], "stale");
+    assert_eq!(body["retirement"]["edges_retracted"], 1);
+    assert!(edge_relationships(&pool, a, b).await.is_empty());
 }

@@ -1360,6 +1360,16 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              it admits noise, never MISattribution — the attribution property is carried by the \
              sibling `agent_id = epigraph_principal_id()` arm, which is NOT exempted here.",
         ),
+        (
+            "security_events_oauth_privileged",
+            "oauth.",
+            "118's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 6) <> \
+             'oauth.'`) says WHICH rows the restriction applies to, and grants nothing. A \
+             restrictive policy is AND-ed with the permissive `security_events_append`, so every \
+             non-`oauth.` row still needs 077's attribution arms; an `oauth.*` row needs one of \
+             the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
+             i.e. the maintenance session or one of 118's definers.",
+        ),
     ];
 
     let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
@@ -1677,6 +1687,14 @@ async fn security_event_log_writes_under_rls_on_the_app_role(pool: PgPool) {
     assert_eq!(stored, 1, "the event must actually be in the table");
 }
 
+/// Tables whose application-role SELECT is column-level by design: `(table,
+/// the one column withheld, why)`.
+const COLUMN_RESTRICTED_SELECT: &[(&str, &str, &str)] = &[(
+    "refresh_tokens",
+    "token_hash",
+    "migration 118: the bearer secret's image; every lookup by hash is a definer",
+)];
+
 /// Every relation in `public` is reachable by `epigraph_app` on a FRESH migrate.
 ///
 /// **This test must NOT call `grant_app_privileges`.** That fixture re-issues
@@ -1689,8 +1707,17 @@ async fn security_event_log_writes_under_rls_on_the_app_role(pool: PgPool) {
 /// the later tables already exist: a prod/fresh divergence in exactly the
 /// environment 11d is rehearsed in. 077 now also issues `ALTER DEFAULT
 /// PRIVILEGES`, which is the half that covers later migrations.
+///
+/// A table on [`COLUMN_RESTRICTED_SELECT`] has its table-level SELECT replaced
+/// by column grants on purpose. It must still be reachable (every column but
+/// the named one readable), and the named column must NOT be: the list is
+/// exact in both directions.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool: PgPool) {
+    let restricted: Vec<&str> = COLUMN_RESTRICTED_SELECT
+        .iter()
+        .map(|(t, _, _)| *t)
+        .collect();
     let missing: Vec<String> = sqlx::query_scalar(
         "SELECT c.relname::text FROM pg_class c \
           WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' \
@@ -1700,6 +1727,39 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
     .fetch_all(&pool)
     .await
     .expect("privilege sweep");
+    let missing: Vec<String> = missing
+        .into_iter()
+        .filter(|t| !restricted.contains(&t.as_str()))
+        .collect();
+    for (table, withheld, why) in COLUMN_RESTRICTED_SELECT {
+        assert!(!why.trim().is_empty(), "{table}: no justification");
+        let (table_level, withheld_readable, others_unreadable): (bool, bool, i64) =
+            sqlx::query_as(
+                "SELECT has_table_privilege('epigraph_app', ('public.' || $1)::regclass, 'SELECT'), \
+                        has_column_privilege('epigraph_app', ('public.' || $1)::regclass, $2, 'SELECT'), \
+                        (SELECT count(*) FROM pg_attribute a \
+                          WHERE a.attrelid = ('public.' || $1)::regclass AND a.attnum > 0 \
+                            AND NOT a.attisdropped AND a.attname <> $2 \
+                            AND NOT has_column_privilege('epigraph_app', a.attrelid, a.attnum, 'SELECT'))",
+            )
+            .bind(table)
+            .bind(withheld)
+            .fetch_one(&pool)
+            .await
+            .expect("column privilege sweep");
+        assert!(
+            !table_level,
+            "{table} is on COLUMN_RESTRICTED_SELECT but grants table-level SELECT again; remove the entry"
+        );
+        assert!(
+            !withheld_readable,
+            "epigraph_app can read {table}.{withheld} ({why})"
+        );
+        assert_eq!(
+            others_unreadable, 0,
+            "epigraph_app cannot read some column of {table} other than {withheld}"
+        );
+    }
 
     assert!(
         missing.is_empty(),

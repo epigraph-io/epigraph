@@ -133,6 +133,13 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
 /// `epigraph-db/tests/viewer_ratchet.rs`. Listed here so the three-way
 /// partition below is total and a tool cannot move between categories
 /// unnoticed.
+///
+/// `retire_match_candidate` is not here. W11 (migration 118) listed it when
+/// its dispatch body minted only the maintenance session; batch H-b's body
+/// first acquires the request's viewer (the retirement is recorded under the
+/// caller's write identity), so it classifies as a request-viewer tool. The
+/// maintenance connection it may also mint spends only its CONNECTION (never
+/// the bypass viewer) on one candidate's retirement.
 const EXPECTED_MAINTENANCE_TOOLS: &[&str] = &[
     "backfill_embeddings",
     "recompute_beliefs",

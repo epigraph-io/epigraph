@@ -1243,8 +1243,13 @@ impl AgentRepository {
         client_row_id: Uuid,
     ) -> Result<AgentId, DbError> {
         // 1. Lock the client row and check for an existing link.
+        // Migration 118: the row lock is taken inside a SECURITY DEFINER
+        // (`FOR UPDATE` needs the UPDATE privilege, which the application role
+        // no longer holds on `oauth_clients`). A lock taken in a function is
+        // held until the caller's transaction ends, exactly as before.
         let existing: Option<(Option<Uuid>, String, String)> = sqlx::query_as(
-            "SELECT agent_id, client_id, client_type FROM oauth_clients WHERE id = $1 FOR UPDATE",
+            "SELECT agent_id, client_id, client_type \
+             FROM public.epigraph_oauth_client_lock_for_link($1)",
         )
         .bind(client_row_id)
         .fetch_optional(&mut *conn)
