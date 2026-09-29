@@ -86,6 +86,16 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         Some(env!("CARGO_BIN_EXE_prune_recall_events")),
         "src/bin/prune_recall_events.rs",
     ),
+    (
+        "replay_deferred_cascades",
+        Some(env!("CARGO_BIN_EXE_replay_deferred_cascades")),
+        "src/bin/replay_deferred_cascades.rs",
+    ),
+    (
+        "sweep_semantic_duplicates",
+        Some(env!("CARGO_BIN_EXE_sweep_semantic_duplicates")),
+        "src/bin/sweep_semantic_duplicates.rs",
+    ),
 ];
 
 const SENTINEL_TAG: &str = "HELPLEAK";
