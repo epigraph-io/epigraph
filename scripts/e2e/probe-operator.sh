@@ -24,6 +24,18 @@
 #   OP-LIVE   CALIBRATION for OP-RVK01: the same shape with a LIVE operator
 #             row on the same DSN must record the link, so the refusal above is
 #             not a DSN that can never link.
+#   OP-AUTHOR the AUTHORING half (batch H-b, from the #505 x #503 merge report's
+#             ad-hoc probe): an agent linked on the superuser DSN is restarted
+#             on the LEAST-PRIVILEGE DSN without --operator-id, and its stdio
+#             submit_claim must be authored by the agent, OWNED by the
+#             operator's personal group, DS-wired (a BBA row) and, when
+#             OPENAI_API_KEY is set, embedded.
+#
+# UNIQUE PER RUN. The agent identities are derived from `--agent-model` (plus a
+# fixed prompt hash), and agents and operator links survive the other scripts'
+# TRUNCATE. With a model derived from the label alone, a second run with the
+# same label re-derives the SAME agent, which is already linked, and OP-LIVE
+# fails. Every model below therefore carries a per-run nonce.
 #
 # Each arm prints PASS or FAIL from the rows the database holds afterwards.
 
@@ -50,6 +62,7 @@ E2E="$(cd "$(dirname "$0")" && pwd)"
 # A derived, DECLARED identity per arm (stdio + --operator-id requires one).
 # The prompt hash is a fixed public test value, not a secret.
 PHASH="$(printf 'ab%.0s' $(seq 1 32))"
+RUN="$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
 
 q() { PGPASSWORD="$E2E_SU_PW" psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
 
@@ -112,7 +125,7 @@ echo "=== OP-APP: --operator-id on the least-privilege DSN must refuse and write
 OP1="$(new_operator)"
 G1="$(q "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:$OP1'")"
 M1_BEFORE="$(q "SELECT count(*) FROM group_memberships WHERE group_id = '$G1'")"
-RC="$(run_stdio "$E2E_APP_DSN" "e2e-op-app-$LABEL" "$OP1" "$E2E/op.app.$LABEL.err")"
+RC="$(run_stdio "$E2E_APP_DSN" "e2e-op-app-$LABEL-$RUN" "$OP1" "$E2E/op.app.$LABEL.err")"
 LINKS="$(agent_of_model "$OP1")"
 M1_AFTER="$(q "SELECT count(*) FROM group_memberships WHERE group_id = '$G1'")"
 echo "   exit=$RC links=$LINKS memberships: $M1_BEFORE -> $M1_AFTER"
@@ -138,7 +151,7 @@ OP2="$(new_operator)"
 G2="$(q "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:$OP2'")"
 q "UPDATE group_memberships SET revoked_at = now() WHERE group_id = '$G2' AND agent_id = '$OP2'" >/dev/null
 M2_BEFORE="$(q "SELECT count(*) || '/' || count(*) FILTER (WHERE revoked_at IS NULL) FROM group_memberships WHERE group_id = '$G2'")"
-RC="$(run_stdio "$E2E_SU_DSN" "e2e-op-rvk01-$LABEL" "$OP2" "$E2E/op.rvk01.$LABEL.err")"
+RC="$(run_stdio "$E2E_SU_DSN" "e2e-op-rvk01-$LABEL-$RUN" "$OP2" "$E2E/op.rvk01.$LABEL.err")"
 LINKS="$(agent_of_model "$OP2")"
 M2_AFTER="$(q "SELECT count(*) || '/' || count(*) FILTER (WHERE revoked_at IS NULL) FROM group_memberships WHERE group_id = '$G2'")"
 echo "   exit=$RC links=$LINKS memberships(total/live): $M2_BEFORE -> $M2_AFTER"
@@ -152,10 +165,50 @@ verdict "$OK" "refused at startup naming RVK01, +0 links, operator row still rev
 echo
 echo "=== OP-LIVE (calibration): the same DSN and shape with a LIVE operator row links ==="
 OP3="$(new_operator)"
-RC="$(run_stdio "$E2E_SU_DSN" "e2e-op-live-$LABEL" "$OP3" "$E2E/op.live.$LABEL.err")"
+RC="$(run_stdio "$E2E_SU_DSN" "e2e-op-live-$LABEL-$RUN" "$OP3" "$E2E/op.live.$LABEL.err")"
 LINKS="$(agent_of_model "$OP3")"
 echo "   exit=$RC links=$LINKS"
 OK=false
 if [ "$RC" = "running" ] && [ "$LINKS" = 1 ] \
    && grep -q 'operator link recorded' "$E2E/op.live.$LABEL.err"; then OK=true; fi
 verdict "$OK" "link recorded and the process kept serving"
+
+# ---------------------------------------------------------------------------
+echo
+echo "=== OP-AUTHOR: an operated agent, restarted on the least-privilege DSN, authors into its operator's group ==="
+OP4="$(new_operator)"
+G4="$(q "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:$OP4'")"
+MODEL4="e2e-op-author-$LABEL-$RUN"
+RC="$(run_stdio "$E2E_SU_DSN" "$MODEL4" "$OP4" "$E2E/op.author.link.$LABEL.err")"
+AG4="$(q "SELECT agent_id FROM operator_links WHERE operator_id = '$OP4'")"
+echo "   link on the superuser DSN: exit=$RC agent=$AG4"
+# The restart: the APP DSN, NO --operator-id, the same derived identity, and one
+# submit_claim over stdio (newline-delimited JSON-RPC). The key is passed through
+# the environment only, never printed.
+CONTENT4="OP-AUTHOR claim $LABEL $RUN"
+{
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"op-author-probe","version":"1"}}}'
+  sleep 2
+  printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"submit_claim\",\"arguments\":{\"content\":\"$CONTENT4\",\"methodology\":\"extraction\",\"evidence_data\":\"op-author probe\",\"evidence_type\":\"empirical\",\"confidence\":0.7,\"novelty_threshold\":0.0}}}"
+  sleep 25
+} | env -u EPIGRAPH_OPERATOR_ID -u EPIGRAPH_MCP_EXTENSIONS -u EPIGRAPH_SESSION_GUC_MODE RUST_LOG=warn \
+    "$BIN" --database-url "$E2E_APP_DSN" --agent-model "$MODEL4" \
+      --agent-system-prompt-hash "$PHASH" \
+    > "$E2E/op.author.$LABEL.out" 2> "$E2E/op.author.$LABEL.err"
+RESP="$(grep '"id":7' "$E2E/op.author.$LABEL.out" | tail -1)"
+CL4="$(q "SELECT id FROM claims WHERE content = '$CONTENT4'")"
+AUTH4="$(q "SELECT CASE agent_id WHEN '${AG4:-00000000-0000-0000-0000-000000000000}' THEN 'AGENT' ELSE agent_id::text END FROM claims WHERE content = '$CONTENT4'")"
+OWN4="$(q "SELECT CASE owner_group_id WHEN '$G4' THEN 'OPERATOR-GROUP' ELSE owner_group_id::text END FROM claims WHERE content = '$CONTENT4'")"
+BBA4="$(q "SELECT count(*) FROM mass_functions WHERE claim_id = '${CL4:-00000000-0000-0000-0000-000000000000}'")"
+EMB4="$(q "SELECT count(*) FROM claims WHERE content = '$CONTENT4' AND embedding IS NOT NULL")"
+ERR4="$(printf '%s' "$RESP" | grep -o '"isError":true' | head -1)"
+echo "   submit_claim: ${ERR4:-ok} | claim=${CL4:-none} author=$AUTH4 owner=$OWN4 bbas=$BBA4 embedded=$EMB4"
+OK=false
+if [ -n "$CL4" ] && [ "$AUTH4" = AGENT ] && [ "$OWN4" = OPERATOR-GROUP ] && [ "$BBA4" -ge 1 ]; then OK=true; fi
+verdict "$OK" "authored by the linked agent, owned by the operator's personal group, DS-wired"
+if [ -n "${OPENAI_API_KEY:-}" ]; then
+  [ "$EMB4" = 1 ] && verdict true "embedded" || verdict false "embedded (OPENAI_API_KEY set, but no vector)"
+else
+  echo "   SKIP: embedded (no OPENAI_API_KEY; the embedder fails before the database, README trap 4)"
+fi

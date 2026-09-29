@@ -113,6 +113,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
             evidence_type: None,
             locality_tag: None,
         },
+        None,
     )
     .await
     .expect("submit_ds_evidence");
@@ -234,6 +235,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
                 evidence_type: None,
                 locality_tag: None,
             },
+            None,
         )
         .await
         .expect("submit_ds_evidence");

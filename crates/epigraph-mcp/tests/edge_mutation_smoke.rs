@@ -113,6 +113,7 @@ async fn patch_shallow_merges_properties_and_retires(pool: PgPool) {
             valid_to: None,
             properties: Some(serde_json::json!({"overwrite": "new", "added": 1})),
         },
+        None,
     )
     .await
     .expect("properties-only patch succeeds");
@@ -163,6 +164,7 @@ async fn patch_shallow_merges_properties_and_retires(pool: PgPool) {
             valid_to: Some("now".to_string()),
             properties: None,
         },
+        None,
     )
     .await
     .expect("retirement patch succeeds");
@@ -232,6 +234,7 @@ async fn patch_rejects_non_object_properties_without_corrupting_the_column(pool:
                 valid_to: None,
                 properties: Some(bad.clone()),
             },
+            None,
         )
         .await
         .unwrap_err_or_panic(&format!("non-object properties {bad} must be rejected"));
@@ -258,6 +261,7 @@ async fn patch_rejects_empty_body_and_unknown_edge(pool: PgPool) {
             valid_to: None,
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("empty patch body must be rejected");
@@ -274,6 +278,7 @@ async fn patch_rejects_empty_body_and_unknown_edge(pool: PgPool) {
             valid_to: Some("now".to_string()),
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("patching a nonexistent edge must fail");
@@ -302,6 +307,7 @@ async fn delete_removes_only_the_targeted_edge(pool: PgPool) {
         DeleteEdgeParams {
             edge_id: doomed.to_string(),
         },
+        None,
     )
     .await
     .expect("delete succeeds");
@@ -342,6 +348,7 @@ async fn delete_removes_only_the_targeted_edge(pool: PgPool) {
         DeleteEdgeParams {
             edge_id: doomed.to_string(),
         },
+        None,
     )
     .await
     .expect_err("deleting a nonexistent edge must fail");
@@ -392,6 +399,7 @@ async fn an_edge_the_caller_cannot_read_is_not_patched_or_retracted(pool: PgPool
             valid_to: Some("now".to_string()),
             properties: Some(serde_json::json!({"gate": 1})),
         },
+        None,
     )
     .await
     .expect_err("patch_edge on an edge the caller cannot read must be refused");
@@ -412,6 +420,7 @@ async fn an_edge_the_caller_cannot_read_is_not_patched_or_retracted(pool: PgPool
         DeleteEdgeParams {
             edge_id: edge.to_string(),
         },
+        None,
     )
     .await
     .expect_err("delete_edge on an edge the caller cannot read must be refused");
@@ -431,6 +440,7 @@ async fn an_edge_the_caller_cannot_read_is_not_patched_or_retracted(pool: PgPool
         DeleteEdgeParams {
             edge_id: edge.to_string(),
         },
+        None,
     )
     .await
     .expect("a caller that can read the edge retracts it");
@@ -438,4 +448,62 @@ async fn an_edge_the_caller_cannot_read_is_not_patched_or_retracted(pool: PgPool
         read_edge(&pool, edge).await.expect("edge row").1.is_some(),
         "calibration: the member's retraction must land"
     );
+}
+
+/// Batch H-b review (authority-attack, medium), measured on config A: an
+/// unrelated `claims:write` caller retired another agent's WORLD-OWNED edge
+/// (both endpoints public) with `patch_edge {valid_to: 2020-01-01}`, while
+/// `delete_edge` is admin-gated. Over HTTP the patch now requires ownership of
+/// the edge's SOURCE claim (its author, the author's operator, or
+/// `claims:admin`). Load-bearing, verified by reverting: without
+/// `require_edge_ownership` the stranger's patch lands and this fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stranger_cannot_patch_another_agents_edge_over_http(pool: PgPool) {
+    let server = common::build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (author, author_token, author_viewer) = common::seed_caller(&pool, &["claims:write"]).await;
+    let (_stranger, stranger_token, stranger_viewer) =
+        common::seed_caller(&pool, &["claims:write"]).await;
+    let source = seed_claim(&pool, "the author's public source", 0.6).await;
+    let target = seed_claim(&pool, "the author's public target", 0.6).await;
+    sqlx::query("UPDATE claims SET agent_id = $1 WHERE id = ANY($2)")
+        .bind(author)
+        .bind(vec![source, target])
+        .execute(&pool)
+        .await
+        .expect("author both endpoints");
+    let edge = seed_edge(
+        &pool,
+        source,
+        target,
+        "decomposes_to",
+        serde_json::json!({}),
+    )
+    .await;
+    let retire = |id: Uuid| PatchEdgeParams {
+        edge_id: id.to_string(),
+        valid_to: Some("2020-01-01T00:00:00Z".to_string()),
+        properties: None,
+    };
+
+    let err = do_patch_edge(
+        &server,
+        &stranger_viewer,
+        retire(edge),
+        Some(&stranger_token),
+    )
+    .await
+    .expect_err("a stranger must not retire another agent's edge over HTTP");
+    assert!(
+        err.message.contains("is asserted by claim"),
+        "{}",
+        err.message
+    );
+    let (_, valid_to) = read_edge(&pool, edge).await.expect("edge row");
+    assert!(valid_to.is_none(), "nothing written");
+
+    do_patch_edge(&server, &author_viewer, retire(edge), Some(&author_token))
+        .await
+        .expect("the source claim's author retires its own edge");
+    let (_, valid_to) = read_edge(&pool, edge).await.expect("edge row");
+    assert!(valid_to.is_some());
 }

@@ -25,7 +25,7 @@ mod fixture;
 
 mod common;
 
-use common::{admin_auth, build_scoped_test_server, seed_claim, seed_claim_with_belief};
+use common::{build_scoped_test_server, seed_claim, seed_claim_with_belief};
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
 use epigraph_mcp::tools::supersede::mark_duplicate;
 use epigraph_mcp::types::{LinkEpistemicParams, MarkDuplicateParams};
@@ -48,6 +48,7 @@ async fn wire(
             relationship: relationship.to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("link_epistemic");
@@ -86,6 +87,7 @@ async fn link_only(
             relationship: relationship.to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("link_epistemic");
@@ -105,19 +107,20 @@ fn body(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 
 async fn dedup(
     server: &epigraph_mcp::server::EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    _viewer: &epigraph_db::visibility::Viewer,
     dup: Uuid,
     canonical: Uuid,
 ) -> serde_json::Value {
+    let (auth, admin_viewer) = common::server_admin(server).await;
     let result = mark_duplicate(
         server,
-        viewer,
+        &admin_viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
             reason: Some("cascade regression fixture".to_string()),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("mark_duplicate succeeds");
@@ -242,15 +245,16 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
          live on the edge's TARGET)"
     );
 
+    let (auth, admin_viewer) = common::server_admin(&server).await;
     mark_duplicate(
         &server,
-        &viewer,
+        &admin_viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
             reason: Some("cascade regression fixture".to_string()),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("mark_duplicate succeeds");

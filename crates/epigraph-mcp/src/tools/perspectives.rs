@@ -17,7 +17,9 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// Create a new perspective (frame of discernment viewpoint).
 pub async fn create_perspective(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: CreatePerspectiveParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     if params.name.is_empty() || params.name.len() > 200 {
         return Err(invalid_params("name must be between 1 and 200 characters"));
@@ -28,10 +30,23 @@ pub async fn create_perspective(
         return Err(invalid_params("confidence_calibration must be in [0, 1]"));
     }
 
+    // The caller (batch H-b, D1), not the shared server signer. Over the
+    // authenticated transport a DIFFERENT owner is refused (batch H-b review:
+    // an OAuth caller created a perspective owned by, with a PERSPECTIVE_OF
+    // edge to, a foreign agent); stdio keeps the parameter as given.
+    let me = server.write_identity(auth, viewer).await?.agent_id();
     let owner_agent_id = if let Some(ref id) = params.owner_agent_id {
-        Some(parse_uuid(id)?)
+        let requested = parse_uuid(id)?;
+        if auth.is_some() && requested != me {
+            return Err(invalid_params(format!(
+                "owner_agent_id {requested} is not the calling agent ({me}); over an \
+                 authenticated connection a perspective is owned by its caller. Omit \
+                 owner_agent_id or pass your own. Nothing was written."
+            )));
+        }
+        Some(requested)
     } else {
-        Some(server.agent_id().await?)
+        Some(me)
     };
 
     let frame_ids: Vec<uuid::Uuid> = params
@@ -90,9 +105,26 @@ pub async fn create_perspective(
 
 /// Set a perspective's source-reliability map (the frame-function lens): evidence-type
 /// tag -> alpha in [0,1], merged into `properties.source_reliability`. Empty map clears it.
+/// Set a perspective's source-reliability map.
+///
+/// # Stamped, owned, and never success over nothing (batch H-b review)
+///
+/// This ran on the unstamped pool with no ownership check and reported
+/// `status: set` whatever the UPDATE did. Measured on config A: `OK` with
+/// nothing stored for a group-private foreign perspective (the UPDATE's USING
+/// filtered it out) and for a random uuid; `42501` for a foreign public one. It
+/// now runs on a transaction stamped from the write identity, reads the
+/// perspective through the caller's viewer (an invisible or missing one is
+/// "not found"), requires over HTTP what `patch_claim` requires of a claim —
+/// the perspective's owner, the owner's operator, or `claims:admin` (a
+/// perspective with no owner needs `claims:admin`) — and refuses a write that
+/// changed no row. stdio keeps no ownership check (the batch H-b bar), but is
+/// now stamped and row-checked like HTTP.
 pub async fn set_source_reliability(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: SetSourceReliabilityParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.perspective_id)?;
     for (tag, &alpha) in &params.source_reliability {
@@ -102,9 +134,41 @@ pub async fn set_source_reliability(
             )));
         }
     }
-    PerspectiveRepository::set_source_reliability(&server.pool, id, &params.source_reliability)
+    let caller = server.write_identity(auth, viewer).await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, caller, "set_source_reliability")
+            .await?;
+    let row = PerspectiveRepository::get_by_id(&mut *tx, viewer, id)
         .await
-        .map_err(internal_error)?;
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("perspective {id} not found")))?;
+    if auth.is_some() {
+        // A perspective with no owner has no author arm; only claims:admin
+        // passes (the nil id matches no agent and no operator link).
+        let owner = row.owner_agent_id.unwrap_or_else(uuid::Uuid::nil);
+        crate::tools::claims::require_owner_or_admin(server, auth, caller, owner)
+            .await
+            .map_err(|e| {
+                invalid_params(format!(
+                    "perspective {id} is owned by agent {owner}; setting its source \
+                     reliability over HTTP requires that owner, its operator, or claims:admin \
+                     ({}). Nothing was written.",
+                    e.message
+                ))
+            })?;
+    }
+    let changed =
+        PerspectiveRepository::set_source_reliability_conn(&mut tx, id, &params.source_reliability)
+            .await
+            .map_err(crate::errors::db_caller_error)?;
+    if changed == 0 {
+        return Err(invalid_params(format!(
+            "perspective {id} is not writable by the calling agent ({}): the update changed no \
+             row. Nothing was written.",
+            caller.agent_id()
+        )));
+    }
+    tx.commit().await.map_err(internal_error)?;
 
     // Backlog 86ee2d30 (G12): a tag outside the lens's reach is still stored —
     // the vocabulary is operator-extensible, so this is a WARNING, never a

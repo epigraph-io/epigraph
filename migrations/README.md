@@ -447,9 +447,64 @@ Current reservation:
   ref and no open PR carries a `110`. **Applied to a throwaway database only,
   NOT to any deployed database.**
 
-- **111+**: public next
+- **111**: public `admin_claim_write` — the audited admin path for a
+  `claims:admin` write into a claim whose owning group the admin cannot write
+  (batch H-b, D2; operator decision 2026-09-25). One SECURITY DEFINER,
+  `epigraph_admin_patch_claim(client, jti, claim, action, add, remove, props,
+  trace)`, owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and
+  granted to `epigraph_app` and `epigraph_maintenance`. In one statement
+  sequence it re-checks the grant against the token's client record
+  (`oauth_clients.id` = the token's `sub`: `status = 'active'`, `claims:admin`
+  in `granted_scopes`, `agent_id` = the session principal; `ADM02`), takes the
+  admin from `epigraph.principal_id` and refuses a NULL one (`ADM01`), applies
+  the labels / properties / trace with `update_labels_conn` /
+  `patch_claim_atomic_conn`'s semantics, and writes one `security_events` row
+  (`claims.admin_write`: admin, client, jti, action, target, author, owning
+  group, before/after). It writes `claims` under FORCE through
+  `epigraph_definer_bypass()`, so dropping the orphan `*_privacy` policies
+  (R3) does not affect it. Called from MCP `update_labels` / `patch_claim` /
+  `resolve_backlog_item` (`tools::admin_write`) and HTTP
+  `PATCH /api/v1/claims/:id/labels`, only when the ownership gate admitted the
+  caller through `claims:admin` AND the caller's own writable set lacks the
+  owning group. Registered in `schema_contract.rs::migration_111_admin_write_definer_is_owned_and_granted`
+  and `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`; behaviour, as
+  `epigraph_app`, in `epigraph-db/tests/admin_claim_write.rs`. Like 100, 101
+  and 107–110 it sits inside internal's `060–112`. **No undo runbook ships**:
+  undo is `DROP FUNCTION public.epigraph_admin_patch_claim(uuid, uuid, uuid,
+  text, text[], text[], jsonb, uuid)` together with a binary that no longer
+  calls it (such a binary refuses the admin path's writes with 42883 rather than
+  writing unaudited). Checked before claiming: no `origin/*` ref carries a
+  `111`. **Applied to a throwaway database only, NOT to any deployed
+  database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `111` or
+- **112**: public `admin_audit_write` — the audit row for an admin write that
+  needs no definer of its own (batch H-b review; H3's workflow admin arm). One
+  SECURITY DEFINER, `epigraph_admin_audit_write(client, jti, admin,
+  event_type, details)`, owned by `epigraph_maintenance`, EXECUTE revoked from
+  PUBLIC and granted to `epigraph_app` and `epigraph_maintenance`. It re-checks
+  the grant with 111's predicate (`oauth_clients.id` = the token's `sub`,
+  active, `claims:admin` granted, bound to `admin`; `ADM02`), accepts only
+  `workflows.admin_write` (`ADM03`), and writes one `security_events` row
+  attributed to the admin on the caller's transaction. It exists because that
+  transaction is stamped from `workflow-ingest-system`, and
+  `security_events_append` admits an attributed row only for the session
+  principal: measured, a plain INSERT of the admin's row was refused there.
+  Called from MCP `add_step` / `delete_step` / `ingest_workflow` /
+  `improve_workflow_hierarchy` (`tools::workflow_authority`) and the HTTP
+  step / ingest routes, only when the workflow gate admitted the caller through
+  its admin arm. Registered in
+  `schema_contract.rs::migration_112_admin_audit_definer_is_owned_and_granted`
+  and `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Inside internal's
+  `060–112`, like 111. **No undo runbook ships**: undo is `DROP FUNCTION
+  public.epigraph_admin_audit_write(uuid, uuid, uuid, text, jsonb)` with a
+  binary that no longer calls it (such a binary refuses the workflow admin arm
+  with 42883 rather than writing unaudited). Checked before claiming: no
+  `origin/*` ref carries a `112`. **Applied to a throwaway database only, NOT to
+  any deployed database.**
+
+- **113+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `113` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

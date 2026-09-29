@@ -25,6 +25,7 @@ pub async fn batch_submit_claims(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: BatchSubmitClaimsParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     if params.claims.is_empty() {
         return Err(invalid_params("claims array cannot be empty"));
@@ -33,7 +34,10 @@ pub async fn batch_submit_claims(
         return Err(invalid_params("Maximum 100 claims per batch"));
     }
 
-    let _agent_id = server.agent_id().await?;
+    // Refuse up front, before any entry is attempted, when the request has no
+    // author (see `EpiGraphMcpFull::write_identity`); each entry resolves the
+    // same identity again inside `submit_claim_response`.
+    let _author = server.write_identity(auth, viewer).await?;
     let mut submitted = 0_usize;
     let mut errors = Vec::new();
     let mut results = Vec::with_capacity(params.claims.len());
@@ -48,7 +52,8 @@ pub async fn batch_submit_claims(
         };
         let claim_params = SubmitClaimParams::from(entry);
 
-        match crate::tools::claims::submit_claim_response(server, viewer, claim_params).await {
+        match crate::tools::claims::submit_claim_response(server, viewer, claim_params, auth).await
+        {
             Ok(mut response) => {
                 submitted += 1;
                 if let Some(d) = response.deduplicated.as_mut() {

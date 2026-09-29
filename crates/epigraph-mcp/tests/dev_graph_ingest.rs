@@ -73,7 +73,7 @@ async fn ingest_extraction_into_target_db() {
         serde_json::from_str(&raw).expect("parse DocumentExtraction");
 
     let server = make_server(pool.clone()).await;
-    let result = do_ingest_document(&server, &viewer, &extraction)
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
         .await
         .expect("do_ingest_document succeeds");
 

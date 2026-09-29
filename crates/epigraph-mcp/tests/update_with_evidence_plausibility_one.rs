@@ -50,6 +50,7 @@ async fn update_with_evidence_does_not_violate_plausibility_bounds_at_one(pool: 
             strength: 0.8,
             labels: vec![],
         },
+        None,
     )
     .await;
 

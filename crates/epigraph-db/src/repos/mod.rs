@@ -77,13 +77,13 @@ pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
-    ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository, ClaimSortField,
-    ClaimSortOrder, ConsolidateMode, ConsolidateResult, DedupRepair, EvolveStepResult,
-    FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit, LabelQuery,
-    LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
-    SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
-    EXPANSION_RELATIONSHIPS,
+    AdminClaimAction, AdminClaimWrite, AdminToken, BeliefBoundedClaimHit, BeliefSort,
+    ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor,
+    ClaimPairDistance, ClaimRepository, ClaimSortField, ClaimSortOrder, ConsolidateMode,
+    ConsolidateResult, DedupRepair, EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit,
+    GroundedNeighbor, HybridHit, LabelQuery, LevelAndSourceType, LineageHead, NearestClaimHit,
+    PatchClaimDiff, PatchClaimInput, SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES,
+    CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,

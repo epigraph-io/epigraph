@@ -21,7 +21,7 @@ mod fixture;
 
 mod common;
 
-use common::{admin_auth, build_scoped_test_server, seed_claim, seed_claim_with_belief};
+use common::{build_scoped_test_server, seed_claim, seed_claim_with_belief};
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
 use epigraph_mcp::tools::supersede::{mark_duplicate, supersede_claim};
 use epigraph_mcp::types::{LinkEpistemicParams, MarkDuplicateParams, SupersedeClaimParams};
@@ -55,6 +55,7 @@ async fn wire_supports(
             relationship: "supports".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("link_epistemic supports");
@@ -82,16 +83,17 @@ async fn supersede_reports_the_downstream_target_it_repaired(pool: PgPool) {
 
     // The enumeration the proposal sketched, run here to prove it is a trap:
     // after the commit, nothing outgoing is still sourced at the retracted id.
+    let (auth, admin_viewer) = common::server_admin(&server).await;
     let result = supersede_claim(
         &server,
-        &viewer,
+        &admin_viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
             truth_value: 0.5,
             reason: "observability fixture".to_string(),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("supersede_claim succeeds");
@@ -175,16 +177,17 @@ async fn sole_supporter_retraction_is_reported_as_unbacked_not_as_nothing_to_do(
     let b = seed_claim(&pool, "sole-supported claim B", 0.5).await;
     wire_supports(&server, &viewer, a, b).await;
 
+    let (auth, admin_viewer) = common::server_admin(&server).await;
     let result = supersede_claim(
         &server,
-        &viewer,
+        &admin_viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
             truth_value: 0.5,
             reason: "unbacked reporting fixture".to_string(),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("supersede_claim succeeds");
@@ -240,16 +243,17 @@ async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
     .await
     .expect("corrupt surviving BBA");
 
+    let (auth, admin_viewer) = common::server_admin(&server).await;
     let result = supersede_claim(
         &server,
-        &viewer,
+        &admin_viewer,
         SupersedeClaimParams {
             claim_id: a.to_string(),
             content: format!("replacement for {a}"),
             truth_value: 0.5,
             reason: "error reporting fixture".to_string(),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("a cascade failure must NOT fail the already-committed supersede");
@@ -283,15 +287,16 @@ async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
     let u = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
     wire_supports(&server, &viewer, u, dup).await;
 
+    let (auth, admin_viewer) = common::server_admin(&server).await;
     let result = mark_duplicate(
         &server,
-        &viewer,
+        &admin_viewer,
         MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),
             reason: None,
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
     .expect("mark_duplicate succeeds");
@@ -331,4 +336,109 @@ async fn mark_duplicate_keeps_its_keys_and_reports_the_cascade(pool: PgPool) {
             .is_empty(),
         "healthy cascade must report no errors; got {cascade}"
     );
+}
+
+/// Batch H-b: the cascade now runs on ONE transaction stamped from the
+/// retracting caller, so a downstream target the stamp cannot write (on a clean
+/// schema, a `42501`) must fail ALONE. The refusal is injected with a trigger
+/// (this harness is BYPASSRLS, so no policy refuses anything): deleting D's
+/// stale BBA raises. B, the other target, must still be repaired and
+/// committed; D's stale BBA must survive (rolled back, not deleted with nothing
+/// re-derived); and the failure must be reported.
+///
+/// Load-bearing: without the engine's per-edge savepoint the injected error
+/// aborts the whole stamped transaction, B's repair is lost at COMMIT, and the
+/// `a_to_b` assertion fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refused_downstream_target_fails_alone_on_the_stamped_cascade(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let c = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
+    let b = seed_claim(&pool, "downstream claim B", 0.5).await;
+    let d = seed_claim(&pool, "downstream claim D, refused", 0.5).await;
+    wire_supports(&server, &viewer, a, b).await;
+    wire_supports(&server, &viewer, c, b).await;
+    wire_supports(&server, &viewer, a, d).await;
+
+    sqlx::query(&format!(
+        "CREATE FUNCTION public.test_refuse_d() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF OLD.claim_id = '{d}'::uuid THEN \
+           RAISE EXCEPTION 'injected: target D refuses this stamp' USING ERRCODE = '42501'; \
+         END IF; RETURN OLD; END $$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("inject fn");
+    sqlx::query(
+        "CREATE TRIGGER refuse_d BEFORE DELETE ON mass_functions \
+         FOR EACH ROW EXECUTE FUNCTION public.test_refuse_d()",
+    )
+    .execute(&pool)
+    .await
+    .expect("inject trigger");
+
+    let (auth, admin_viewer) = common::server_admin(&server).await;
+    let result = supersede_claim(
+        &server,
+        &admin_viewer,
+        SupersedeClaimParams {
+            claim_id: a.to_string(),
+            content: format!("replacement for {a}"),
+            truth_value: 0.5,
+            reason: "savepoint isolation fixture".to_string(),
+        },
+        Some(&auth),
+    )
+    .await
+    .expect("the supersession itself commits whatever the cascade meets");
+    let json = body(&result);
+    let cascade = &json["belief_cascade"];
+    let new_a: Uuid = json["new_claim_id"]
+        .as_str()
+        .expect("new id")
+        .parse()
+        .expect("uuid");
+
+    assert_eq!(
+        edge_bbas(&pool, b, new_a).await,
+        0,
+        "a_to_b: B's stale A-edge BBA must be invalidated and COMMITTED despite D's refusal; \
+         got {cascade}"
+    );
+    assert!(
+        cascade["recomputed"]
+            .as_array()
+            .expect("recomputed")
+            .iter()
+            .any(|v| v.as_str() == Some(b.to_string().as_str())),
+        "B must be recomputed: {cascade}"
+    );
+    assert_eq!(
+        edge_bbas(&pool, d, new_a).await,
+        1,
+        "D's stale BBA must be ROLLED BACK with its refused savepoint, not lost: {cascade}"
+    );
+    assert!(
+        cascade["errors"]
+            .as_array()
+            .expect("errors")
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.contains("injected"))),
+        "D's refusal must be reported: {cascade}"
+    );
+}
+
+/// Edge-factor BBAs stored on `claim` whose edge is now sourced at `source`.
+async fn edge_bbas(pool: &PgPool, claim: Uuid, source: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions m JOIN edges e ON e.id = m.perspective_id \
+         WHERE m.claim_id = $1 AND e.source_id = $2",
+    )
+    .bind(claim)
+    .bind(source)
+    .fetch_one(pool)
+    .await
+    .expect("count BBAs")
 }

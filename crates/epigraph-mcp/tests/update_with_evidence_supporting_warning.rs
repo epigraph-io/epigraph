@@ -41,6 +41,7 @@ async fn run_update(
             strength,
             labels: Vec::new(),
         },
+        None,
     )
     .await
     .expect("update_with_evidence ok");

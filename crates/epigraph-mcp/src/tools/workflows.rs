@@ -311,6 +311,7 @@ pub async fn store_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: StoreWorkflowParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     use epigraph_ingest::common::schema::ThesisDerivation;
     use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
@@ -369,6 +370,7 @@ pub async fn store_workflow(
             server,
             viewer,
             &extraction,
+            auth,
         )
         .await?;
 
@@ -888,6 +890,7 @@ pub async fn report_workflow_outcome(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: ReportWorkflowOutcomeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
 
@@ -952,8 +955,10 @@ pub async fn report_workflow_outcome(
         ))
     })?;
 
-    let agent_id = server.agent_id().await?;
-    let agent_id_typed = AgentId::from_uuid(agent_id);
+    // Author = the request's principal (batch H-b, D1); signer = this server.
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
+    let signer_typed = AgentId::from_uuid(server.signer_agent_id().await?);
     let pub_key = server.signer.public_key();
 
     let quality = params
@@ -970,8 +975,9 @@ pub async fn report_workflow_outcome(
     .map_err(internal_error)?;
 
     let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
+    // `Evidence::agent_id` is `evidence.signer_id`: this server signs it.
     let mut evidence = Evidence::new(
-        agent_id_typed,
+        signer_typed,
         pub_key,
         evidence_hash,
         EvidenceType::Observation {
@@ -1041,7 +1047,7 @@ pub async fn report_workflow_outcome(
     // behind to make `evidence_content_hash_claim_unique` refuse the identical
     // retry that would land it.
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "report_workflow_outcome")
+        crate::claim_helper::begin_author_stamped_tx(server, author, "report_workflow_outcome")
             .await?;
 
     EvidenceRepository::create(&mut *tx, &evidence)
@@ -1184,6 +1190,7 @@ pub async fn deprecate_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: DeprecateWorkflowParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(&params.workflow_id)?;
     let cascade = params.cascade.unwrap_or(false);
@@ -1255,10 +1262,12 @@ pub async fn deprecate_workflow(
     // is the correct direction: an unstamped read returns FEWER rows, so a
     // cascade planned on one connection and executed on another could silently
     // skip a child it was entitled to deprecate.
-    let agent_id = server.agent_id().await?;
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "deprecate_workflow")
-            .await?;
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.write_identity(auth, viewer).await?,
+        "deprecate_workflow",
+    )
+    .await?;
 
     // Deprecate the target workflow (A4: also set is_current = false).
     // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same

@@ -119,7 +119,7 @@ async fn control_live_personal_membership_ingests(pool: PgPool) {
     let (_agent, _personal) = agent_with_team_writer(&pool, &server).await;
 
     let doi = "10.9999/owner-authority-control";
-    do_ingest_document(&server, &viewer, &doc(doi))
+    do_ingest_document(&server, &viewer, &doc(doi), None)
         .await
         .expect("a live personal membership must ingest");
     assert!(doc_claims(&pool, doi).await > 0, "control wrote nothing");
@@ -142,7 +142,7 @@ async fn revoked_personal_membership_refuses_the_walk(pool: PgPool) {
     .unwrap();
 
     let doi = "10.9999/owner-authority-revoked";
-    let err = do_ingest_document(&server, &viewer, &doc(doi))
+    let err = do_ingest_document(&server, &viewer, &doc(doi), None)
         .await
         .expect_err("an author revoked in its personal group must be refused");
     assert!(
@@ -182,6 +182,7 @@ async fn revoked_personal_membership_is_refused_by_the_preflight(pool: PgPool) {
         IngestDocumentInlineParams {
             extraction: doc(doi),
         },
+        None,
     )
     .await;
     assert!(res.is_err(), "the preflight must refuse, got {res:?}");
@@ -217,7 +218,7 @@ async fn reader_personal_membership_refuses_the_walk(pool: PgPool) {
     .unwrap();
 
     let doi = "10.9999/owner-authority-reader";
-    do_ingest_document(&server, &viewer, &doc(doi))
+    do_ingest_document(&server, &viewer, &doc(doi), None)
         .await
         .expect_err("a read-only personal membership must be refused");
     assert_eq!(doc_claims(&pool, doi).await, 0);

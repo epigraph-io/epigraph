@@ -110,6 +110,7 @@ async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
             relationship: "decomposes_to".to_string(),
             properties: Some(serde_json::json!({"chapter": 1})),
         },
+        None,
     )
     .await
     .expect("happy path succeeds");
@@ -140,6 +141,7 @@ async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
             relationship: "decomposes_to".to_string(),
             properties: Some(serde_json::json!({"chapter": 1})),
         },
+        None,
     )
     .await
     .expect("idempotent re-run succeeds");
@@ -181,6 +183,7 @@ async fn invalid_relationship_is_rejected(pool: PgPool) {
             relationship: "supports".to_string(), // valid for generic POST, rejected here
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("supports must be rejected by the tight allow-list");
@@ -221,6 +224,7 @@ async fn missing_source_claim_returns_404_equivalent(pool: PgPool) {
             relationship: "section_follows".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("missing source claim must error");
@@ -247,6 +251,7 @@ async fn missing_target_claim_returns_404_equivalent(pool: PgPool) {
             relationship: "continues_argument".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("missing target claim must error");
@@ -272,6 +277,7 @@ async fn self_loop_is_rejected(pool: PgPool) {
             relationship: "decomposes_to".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect_err("self-loops must be rejected before hitting the DB CHECK");

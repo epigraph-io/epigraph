@@ -253,6 +253,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("decide");
@@ -290,6 +291,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("a second promote must be refused as already decided");
@@ -326,6 +328,7 @@ async fn decide_match_candidate_reject_marks_status_and_skips_edge(pool: PgPool)
             candidate_id: cand.to_string(),
             verdict: "reject".into(),
         },
+        None,
     )
     .await
     .expect("decide");
@@ -364,6 +367,7 @@ async fn decide_match_candidate_rejected_in_read_only_mode(pool: PgPool) {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("read-only must refuse writes");
@@ -395,6 +399,7 @@ async fn decide_match_candidate_promote_blocked_when_endpoint_not_current(pool: 
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("promote must be refused when an endpoint is not current");
@@ -449,6 +454,7 @@ async fn decide_match_candidate_promote_contradicts_writes_contradicts_edge(pool
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promoting a contradicts candidate must succeed");
@@ -492,6 +498,7 @@ async fn decide_match_candidate_promote_distinct_is_refused_and_writes_no_edge(p
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("promoting a 'distinct' candidate must be refused");
@@ -534,6 +541,7 @@ async fn decide_match_candidate_promote_paraphrase_still_writes_corroborates(poo
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
@@ -562,6 +570,7 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
@@ -582,9 +591,11 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
 
     let out = tools::matching::retire_match_candidate(
         &server,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
+        None,
     )
     .await
     .expect("retire");
@@ -642,6 +653,7 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
@@ -649,9 +661,11 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
     let read_only = build_server(pool.clone(), true).await;
     tools::matching::retire_match_candidate(
         &read_only,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
+        None,
     )
     .await
     .expect_err("retire must be refused in read-only mode");
@@ -695,6 +709,7 @@ async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgP
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
@@ -711,6 +726,7 @@ async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgP
             candidate_id: cand.to_string(),
             verdict: "reject".into(),
         },
+        None,
     )
     .await
     .expect_err("reject on a promoted row must be refused");
@@ -765,14 +781,17 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect("promote");
     tools::matching::retire_match_candidate(
         &server,
+        &fixture::public_viewer(&pool).await,
         RetireMatchCandidateParams {
             candidate_id: cand.to_string(),
         },
+        None,
     )
     .await
     .expect("retire");
@@ -788,6 +807,7 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
         },
+        None,
     )
     .await
     .expect_err("promote on a retired row must be refused");
@@ -824,6 +844,7 @@ async fn decide_match_candidate_unknown_verdict_points_at_the_retire_tool(pool: 
             candidate_id: cand.to_string(),
             verdict: "retire".into(),
         },
+        None,
     )
     .await
     .expect_err("`retire` is not a decide verdict");

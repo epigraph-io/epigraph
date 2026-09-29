@@ -7,14 +7,13 @@ use common::*;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_claim_marks_old_and_links_new(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let old = seed_claim(&pool, "v1", 0.5).await;
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
-    let auth = admin_auth();
+    let (auth, admin_viewer) = common::server_admin(&server).await;
 
     let result = epigraph_mcp::tools::supersede::supersede_claim(
         &server,
-        &viewer,
+        &admin_viewer,
         epigraph_mcp::types::SupersedeClaimParams {
             claim_id: old.to_string(),
             content: "v2".into(),
@@ -58,7 +57,6 @@ async fn supersede_claim_marks_old_and_links_new(pool: PgPool) {
 /// will fail with a constraint violation before reaching the assertions.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_claim_nulls_embedding_on_superseded_claim(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     // Seed an agent row so we can insert a claim with a real embedding.
     let agent_id = uuid::Uuid::new_v4();
     sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, $2)")
@@ -96,14 +94,14 @@ async fn supersede_claim_nulls_embedding_on_superseded_claim(pool: PgPool) {
     .unwrap();
 
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
-    let auth = admin_auth();
+    let (auth, admin_viewer) = common::server_admin(&server).await;
 
     // Call the MCP supersede handler. If the handler fails to null the
     // embedding before flipping is_current=false this will surface as a
     // chk_deprecated_no_embedding constraint violation, not an assertion error.
     let result = epigraph_mcp::tools::supersede::supersede_claim(
         &server,
-        &viewer,
+        &admin_viewer,
         epigraph_mcp::types::SupersedeClaimParams {
             claim_id: old_id.to_string(),
             content: "mcp-supersede-embedding-test-v2".into(),

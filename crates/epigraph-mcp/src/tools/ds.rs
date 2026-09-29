@@ -100,6 +100,7 @@ pub async fn submit_ds_evidence(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: SubmitDsEvidenceParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
     let frame_id = parse_uuid(&params.frame_id)?;
@@ -218,7 +219,8 @@ pub async fn submit_ds_evidence(
         }
     }
 
-    let agent_id = server.agent_id().await?;
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
 
     let masses_json = serde_json::to_value(
         mass_fn
@@ -275,7 +277,7 @@ pub async fn submit_ds_evidence(
     // `epigraph_derived_require_tenancy` fills `(visibility, owner_group_id)` from
     // the parent claim and 070 arm (c) re-stamps it, so the `WITH CHECK` asks about
     // the CLAIM's group, not the evidence author's. The stamp here carries
-    // `server.agent_id()`'s writable set, so a BBA against ANOTHER group's claim is
+    // the write identity's writable set, so a BBA against ANOTHER group's claim is
     // still refused on a cleanly-migrated schema. `tools/challenges.rs` states the
     // same residual for `challenge_claim` in its doc header, and
     // `epigraph-db/tests/tool_write_tables_require_a_stamp.rs::
@@ -284,8 +286,7 @@ pub async fn submit_ds_evidence(
     // for the same reason. Whether an admin scope should carry write authority into
     // a group it is not a member of is a tenancy-model decision, not a bug here.
     let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_ds_evidence")
-            .await?;
+        crate::claim_helper::begin_author_stamped_tx(server, author, "submit_ds_evidence").await?;
 
     FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
         .await

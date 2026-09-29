@@ -1345,6 +1345,14 @@ pub struct VerifyResponse {
     /// Added with backlog `49c17386`: `signature_valid` alone conflated
     /// "unsigned" with "bad signature", and while `claim_from_row` hardcoded
     /// `signature = None` every claim looked like the latter.
+    ///
+    /// The signature belongs to the claim's SIGNER (`claims.signer_id`), which
+    /// is not necessarily its author (`claims.agent_id`). Since batch H-b an MCP
+    /// `submit_claim` / `memorize` / `batch_submit_claims` / resolution claim is
+    /// authored by the calling agent and signed by the MCP server's key, and the
+    /// server's agent is recorded as the signer, so such a claim reports
+    /// `signed = true, signature_valid = true`. Claims written before that, and
+    /// by paths that store no signature, report `signed = false`.
     pub signed: bool,
     /// The authoritative integrity verdict. See [`HashCheck`] — in particular,
     /// only [`HashCheck::Mismatch`] is evidence of tampering.
@@ -1811,7 +1819,7 @@ pub struct StructureSourceParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkHierarchicalParams {
     #[schemars(
-        description = "UUID of the source claim. Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused. Either refusal writes nothing."
+        description = "UUID of the source claim. Written with YOUR agent's authority (the authenticated caller over HTTP, this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused. Either refusal writes nothing."
     )]
     pub source_claim_id: String,
 
@@ -1857,7 +1865,7 @@ pub struct LinkHierarchicalResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchEdgeParams {
     #[schemars(
-        description = "UUID of the edge to patch. Must be an edge YOU can read and this server's agent can write; otherwise (for example an edge touching another group's private claim) it reports not found and nothing is written."
+        description = "UUID of the edge to patch. Must be an edge YOU can read and your agent can write; otherwise (for example an edge touching another group's private claim) it reports not found and nothing is written."
     )]
     pub edge_id: String,
 
@@ -1897,7 +1905,7 @@ pub struct PatchEdgeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteEdgeParams {
     #[schemars(
-        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge YOU can read and this server's agent can write; otherwise it reports not found and nothing is written."
+        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge YOU can read and your agent can write; otherwise it reports not found and nothing is written."
     )]
     pub edge_id: String,
 }
@@ -1926,7 +1934,7 @@ pub struct DeleteEdgeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkAlternativeParams {
     #[schemars(
-        description = "UUID of the first competing claim. Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused, with nothing written."
+        description = "UUID of the first competing claim. Written with YOUR agent's authority (the authenticated caller over HTTP, this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
     )]
     pub claim_a: String,
 
@@ -1972,12 +1980,12 @@ pub struct LinkAlternativeResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LinkEpistemicParams {
     #[schemars(
-        description = "UUID of the source claim (the evidence / asserting side). Written with this server's agent's authority: a group-private claim of this server's agent's own group works; a group-private claim you cannot read reports not found, and one owned by a group this server's agent cannot write is refused, with nothing written."
+        description = "UUID of the source claim (the evidence / asserting side). Written with YOUR agent's authority (the authenticated caller over HTTP, this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
     )]
     pub source_claim_id: String,
 
     #[schemars(
-        description = "UUID of the target claim (the side whose belief is recomputed). Same authority rule as source_claim_id for the edge itself. A PUBLIC target owned by a group this server's agent cannot write still gets the edge, but its belief is not moved: the response reports belief_wired=false."
+        description = "UUID of the target claim (the side whose belief is recomputed). Same authority rule as source_claim_id for the edge itself. A PUBLIC target owned by a group your agent cannot write still gets the edge, but its belief is not moved: the response reports belief_wired=false."
     )]
     pub target_claim_id: String,
 
@@ -2014,7 +2022,7 @@ pub struct LinkEpistemicBelief {
 /// BBA yet and its source has since gained belief. It is `false` when no belief
 /// moved: the edge was already wired, the source has no belief interval, the
 /// transfer was vacuous, the relationship is structural, or the wire was
-/// refused or failed (e.g. a target owned by a group this server's agent cannot
+/// refused or failed (e.g. a target owned by a group the calling agent cannot
 /// write) — the edge row stays either way. `target_belief` is a best-effort read of the
 /// target's cached DS columns after the recompute (`None` if the target carries
 /// no belief yet or the read failed).
@@ -2444,7 +2452,7 @@ pub struct UpdateLabelsParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchClaimParams {
     #[schemars(
-        description = "UUID of the claim to patch. Must be a claim you can read (otherwise: not found) and one owned by a group this server's agent can write (otherwise: refused, nothing written). When you are authenticated (HTTP) you must also own it or hold claims:admin."
+        description = "UUID of the claim to patch. Must be a claim you can read (otherwise: not found) and one owned by a group your agent can write (otherwise: refused, nothing written). When you are authenticated (HTTP) you must also own it or hold claims:admin."
     )]
     pub claim_id: String,
     #[schemars(description = "New trace_id (must reference an existing reasoning_traces row)")]
@@ -2503,7 +2511,9 @@ pub struct PublishEventParams {
     #[schemars(description = "Event type (e.g. 'claim.created', 'analysis.completed')")]
     pub event_type: String,
 
-    #[schemars(description = "UUID of the actor (agent) triggering this event")]
+    #[schemars(
+        description = "UUID of the actor (agent) triggering this event. Over an authenticated (HTTP) connection it must be your own agent id (omitted, it defaults to you); another agent's id is refused. On stdio it is recorded as given."
+    )]
     pub actor_id: Option<String>,
 
     #[schemars(
@@ -2803,7 +2813,7 @@ pub struct CreatePerspectiveParams {
     pub description: Option<String>,
 
     #[schemars(
-        description = "UUID of the agent who owns this perspective (defaults to current agent)"
+        description = "UUID of the agent who owns this perspective (defaults to the calling agent: the authenticated caller over HTTP, this server's own agent on stdio). Over HTTP it must be your own agent id; another agent's id is refused."
     )]
     pub owner_agent_id: Option<String>,
 

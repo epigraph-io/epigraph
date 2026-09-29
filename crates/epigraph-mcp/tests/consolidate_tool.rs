@@ -77,9 +77,14 @@ async fn tool_merges_and_caps_confidence_at_best_source(pool: PgPool) {
     let s2 = seed_claim(&pool, agent, "tool src two", 0.9).await;
 
     let server = build_server(pool.clone(), false).await;
-    let out = consolidate_claims(&server, &viewer, params(&[s1, s2], "tool merged", None))
-        .await
-        .expect("consolidate ok");
+    let out = consolidate_claims(
+        &server,
+        &viewer,
+        params(&[s1, s2], "tool merged", None),
+        None,
+    )
+    .await
+    .expect("consolidate ok");
     let j = json_of(out);
 
     assert_eq!(j["superseded_ids"].as_array().unwrap().len(), 2);
@@ -131,7 +136,7 @@ async fn unknown_mode_is_rejected(pool: PgPool) {
     let server = build_server(pool, false).await;
     let mut p = params(&[s1, s2], "x", None);
     p.mode = "obliterate".to_string();
-    let err = consolidate_claims(&server, &viewer, p)
+    let err = consolidate_claims(&server, &viewer, p, None)
         .await
         .expect_err("bad mode rejected");
     let msg = format!("{err:?}").to_lowercase();
@@ -183,9 +188,14 @@ async fn a_revoked_acting_agent_is_refused_as_a_denial(pool: PgPool) {
         .await
         .unwrap();
 
-    let err = consolidate_claims(&server, &viewer, params(&[s1, s2], "revoked merged", None))
-        .await
-        .expect_err("a revoked acting agent must be refused");
+    let err = consolidate_claims(
+        &server,
+        &viewer,
+        params(&[s1, s2], "revoked merged", None),
+        None,
+    )
+    .await
+    .expect_err("a revoked acting agent must be refused");
     assert_eq!(
         err.code,
         rmcp::model::ErrorCode::INVALID_REQUEST,

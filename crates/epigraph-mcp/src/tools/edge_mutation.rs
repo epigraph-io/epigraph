@@ -36,7 +36,7 @@
 //!
 //! # Tenancy
 //!
-//! Both mutations run on ONE transaction stamped from the MCP server's own
+//! Both mutations run on ONE transaction stamped from the write identity (the caller over HTTP, the server's own
 //! agent (`claim_helper::begin_author_stamped_tx`), with their events on the
 //! same transaction. WRITE authority is the server agent's, as for every other
 //! MCP write. READ authority is the CALLER's: before either write, the edge is
@@ -122,8 +122,9 @@ pub async fn patch_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_patch_edge(server, viewer, params).await
+    do_patch_edge(server, viewer, params, auth).await
 }
 
 /// The caller-read gate both tools apply, on the write transaction.
@@ -142,6 +143,66 @@ async fn require_visible_edge(
     }
 }
 
+/// OWNERSHIP of the edge on the authenticated transport (batch H-b review).
+///
+/// `patch_edge` needed only `claims:write` and checked no ownership, so a
+/// caller could set `valid_to` in the past on another agent's WORLD-OWNED edge
+/// (both endpoints public), which retires it — measured on config A: an
+/// unrelated attacker's `patch_edge {valid_to: 2020-01-01}` landed on the
+/// victim's `decomposes_to` edge, while `delete_edge` (and
+/// `retire_match_candidate`, the same retraction by `valid_to`) is gated on
+/// `claims:admin`. An edge is asserted by its SOURCE claim's author (the
+/// attribution `retraction_cascade` and the edge-write path use), so over HTTP
+/// the patch requires what `patch_claim` requires of that claim: its author,
+/// the author's operator, or `claims:admin`. An edge whose source is not a
+/// claim has no author to own it and needs `claims:admin`. stdio is unchanged
+/// (the batch H-b bar), as `patch_claim`'s whole-patch check is HTTP-only.
+async fn require_edge_ownership(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
+    edge_id: uuid::Uuid,
+) -> Result<(), McpError> {
+    let Some(token) = auth else {
+        return Ok(());
+    };
+    let (source_type, source_id) = EdgeRepository::source_of(&mut *conn, viewer, edge_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("edge {edge_id} not found")))?;
+    let author = if source_type == "claim" {
+        epigraph_db::ClaimRepository::get_agent_id(&mut *conn, viewer, source_id)
+            .await
+            .map_err(internal_error)?
+    } else {
+        None
+    };
+    match author {
+        Some(author) => {
+            crate::tools::claims::require_owner_or_admin(server, auth, caller, author)
+                .await
+                .map_err(|e| {
+                    invalid_params(format!(
+                        "edge {edge_id} is asserted by claim {source_id}, whose author is agent \
+                         {author}; patching it over HTTP requires that author, its operator, or \
+                         claims:admin ({}). Nothing was written.",
+                        e.message
+                    ))
+                })?;
+        }
+        None if token.has_scope("claims:admin") => {}
+        None => {
+            return Err(invalid_params(format!(
+                "edge {edge_id}'s source is a {source_type} ({source_id}), not a claim you can \
+                 own; patching it over HTTP requires claims:admin. Nothing was written."
+            )))
+        }
+    }
+    Ok(())
+}
+
 /// Core logic factored out so integration tests can call it directly without
 /// round-tripping through the rmcp dispatch layer (mirrors
 /// `do_link_epistemic`).
@@ -149,6 +210,7 @@ pub async fn do_patch_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: PatchEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
 
@@ -168,7 +230,7 @@ pub async fn do_patch_edge(
 
     let valid_to = resolve_valid_to(params.valid_to.as_deref())?;
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT: the UPDATE and
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1): the UPDATE and
     // both events.
     //
     // The UPDATE used to run on the unstamped pool. `edges_tenancy` then let it
@@ -186,10 +248,11 @@ pub async fn do_patch_edge(
     // UPDATE. They now ride the UPDATE's transaction, each SAVEPOINT-wrapped
     // inside `publish_or_log_conn`: a refused event cannot abort the patch, and
     // no `edge.updated` is emitted for a patch that was rolled back.
-    let actor_id = server.agent_id().await?;
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "patch_edge").await?;
+    let actor = server.write_identity(auth, viewer).await?;
+    let actor_id = actor.agent_id();
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, actor, "patch_edge").await?;
     require_visible_edge(&mut tx, viewer, edge_id).await?;
+    require_edge_ownership(server, &mut tx, viewer, auth, actor, edge_id).await?;
     let updated = EdgeRepository::update_valid_to_and_properties(
         &mut *tx,
         edge_id,
@@ -249,8 +312,9 @@ pub async fn delete_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_delete_edge(server, viewer, params).await
+    do_delete_edge(server, viewer, params, auth).await
 }
 
 /// Core logic factored out for direct test invocation (see `do_patch_edge`).
@@ -258,18 +322,19 @@ pub async fn do_delete_edge(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: DeleteEdgeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let edge_id = parse_uuid(&params.edge_id)?;
 
-    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT: the retraction
+    // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1): the retraction
     // and its event. Same reasoning as `do_patch_edge`. On the unstamped pool
     // only a public, world-owned edge was retractable on a cleanly-migrated
     // schema. Stamped, the server agent's own group's edges are too, and an edge
     // in another agent's private group still reports "not found" with nothing
     // written (#374 owns whether it should).
-    let actor_id = server.agent_id().await?;
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, actor_id, "delete_edge").await?;
+    let actor = server.write_identity(auth, viewer).await?;
+    let actor_id = actor.agent_id();
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, actor, "delete_edge").await?;
     require_visible_edge(&mut tx, viewer, edge_id).await?;
 
     // `EdgeRepository::delete` reports absence as `Ok(false)`, not

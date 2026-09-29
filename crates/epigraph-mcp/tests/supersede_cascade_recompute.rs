@@ -19,7 +19,7 @@ mod fixture;
 
 mod common;
 
-use common::{admin_auth, build_scoped_test_server, seed_claim, seed_claim_with_belief};
+use common::{build_scoped_test_server, seed_claim, seed_claim_with_belief};
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
 use epigraph_mcp::tools::supersede::supersede_claim;
 use epigraph_mcp::types::{LinkEpistemicParams, SupersedeClaimParams};
@@ -73,6 +73,7 @@ async fn wire_supports(
             relationship: "supports".to_string(),
             properties: None,
         },
+        None,
     )
     .await
     .expect("link_epistemic supports");
@@ -110,19 +111,20 @@ async fn wire_supports(
 
 async fn supersede(
     server: &epigraph_mcp::server::EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    _viewer: &epigraph_db::visibility::Viewer,
     old: Uuid,
 ) -> Result<rmcp::model::CallToolResult, epigraph_mcp::errors::McpError> {
+    let (auth, admin_viewer) = common::server_admin(server).await;
     supersede_claim(
         server,
-        viewer,
+        &admin_viewer,
         SupersedeClaimParams {
             claim_id: old.to_string(),
             content: format!("replacement for {old}"),
             truth_value: 0.5,
             reason: "retracted by cascade regression fixture".to_string(),
         },
-        Some(&admin_auth()),
+        Some(&auth),
     )
     .await
 }

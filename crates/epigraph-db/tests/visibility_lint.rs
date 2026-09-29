@@ -1053,6 +1053,48 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          row this statement just inserted.",
     ),
     (
+        "claim.rs",
+        "create_strict_signed",
+        "WRITE into `claims`: `create_strict`'s INSERT plus the `signature` / `signer_id` columns \
+         (batch H-b, D1-sig). Same explicit `TenancyDecl`, same 077 `WITH CHECK`, and `RETURNING` \
+         projects back only the row this statement just inserted; `create_strict` delegates to it.",
+    ),
+    (
+        "security_event.rs",
+        "admin_audit_write",
+        "WRITE through migration 112's SECURITY DEFINER `epigraph_admin_audit_write` (batch \
+         H-b review): one `security_events` row for an admin workflow write, after re-checking \
+         the token's `oauth_clients` grant. There is no read to filter; the row is the audit \
+         of a write the caller just made on the same transaction.",
+    ),
+    (
+        "perspective.rs",
+        "set_source_reliability_conn",
+        "WRITE of one caller-named `perspectives` row's `properties.source_reliability` on the \
+         caller's STAMPED connection (batch H-b review). There is no read to filter: \
+         `perspectives`' own row security decides the UPDATE with the stamp's write authority, \
+         and the MCP caller has already read the row through its viewer on the same \
+         transaction; the returned count lets it refuse a write that changed nothing.",
+    ),
+    (
+        "workflow.rs",
+        "ingest_anchors",
+        "READ of `workflows` only: three `find_root_by_canonical` / `head_by_canonical` lookups \
+         by `canonical_name` (batch H-b review, H3's lineage-takeover fix). `workflows` has no \
+         row security and no policy, as `find_root_by_canonical` records, so there is nothing \
+         for a viewer to filter; the ingest entry points call it on the plan walk's own \
+         transaction to decide which existing rows need the caller's authority.",
+    ),
+    (
+        "claim.rs",
+        "admin_patch_claim_conn",
+        "WRITE through migration 111's SECURITY DEFINER `epigraph_admin_patch_claim` (batch H-b, \
+         D2). The function takes the admin from the session's `epigraph.principal_id`, re-checks \
+         the token's `oauth_clients` grant and writes one `claims` row plus its `security_events` \
+         audit row; there is no read to filter, and the target is one caller-named claim the \
+         caller has already read through its own viewer.",
+    ),
+    (
         "instance_admin.rs",
         "privatization_authority",
         "READ of `group_memberships` and `groups`, returning four scalars and no ids. It MUST run \
@@ -1835,6 +1877,43 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "ensure_evidence_perspective",
         "WRITE: idempotent INSERT INTO `perspectives` for an evidence BBA's perspective; same \
          argument as `ensure_edge_perspective`.",
+    ),
+    (
+        "workflow.rs",
+        "head_by_canonical",
+        "READ of `workflows` by `canonical_name` (latest generation). `workflows` has no row \
+         security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
+         viewer to filter; batch H-b's H3 check resolves the workflow a step op names with it.",
+    ),
+    (
+        "perspective.rs",
+        "set_reliability_map",
+        "WRITE of one caller-named `perspectives` row's reliability map (the body the pool \
+         forms and `set_source_reliability_conn` share; executor-generic since the batch H-b \
+         review so the MCP tool can run it on its stamped transaction and count the rows). \
+         There is no read to filter: `perspectives`' row security decides the UPDATE with the \
+         executor's stamp, and it stays the one ungated write `write_gate_lint` registers.",
+    ),
+    (
+        "security_event.rs",
+        "admin_grant_is_live",
+        "READ of `oauth_clients` by primary key (batch H-b review: the workflow admin arm's \
+         re-check, migration 111's ADM02 predicate). `oauth_clients` deliberately carries no row \
+         security and no policy (077 section 9: the token mint must update it), so there is \
+         nothing for a viewer to filter; the one row it reads is the caller's own token client.",
+    ),
+    (
+        "workflow.rs",
+        "record_submitter",
+        "WRITE of one `workflows` row's `metadata.epigraph_submitted_by`, once (batch H-b, H3). \
+         `workflows` has no row security and no policy, so there is no stamp to satisfy; the \
+         ingest entry point calls it on the plan walk's own transaction.",
+    ),
+    (
+        "workflow.rs",
+        "submitter_of",
+        "READ of one `workflows` row's recorded submitter (batch H-b, H3). No row security and no \
+         policy on `workflows`; it is an authority check's input, not a disclosure.",
     ),
     (
         "workflow.rs",

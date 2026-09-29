@@ -98,7 +98,7 @@ async fn a_paper_node_has_a_neighborhood_and_a_walk(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let extraction: DocumentExtraction = serde_json::from_str(PAPER).unwrap();
-    let out = tools::ingestion::do_ingest_document(&server, &viewer, &extraction)
+    let out = tools::ingestion::do_ingest_document(&server, &viewer, &extraction, None)
         .await
         .expect("ingest");
     let paper: Uuid = first_text(&out)["paper_id"]
@@ -160,6 +160,7 @@ async fn a_workflow_nodes_executes_edge_is_visible_with_direction_both(pool: PgP
                 confidence: None,
                 tags: None,
             },
+            None,
         )
         .await
         .expect("store_workflow"),
@@ -215,7 +216,7 @@ async fn a_private_edge_is_not_returned_to_a_stranger(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let public = fixture::public_viewer(&pool).await;
     let extraction: DocumentExtraction = serde_json::from_str(PAPER).unwrap();
-    let out = tools::ingestion::do_ingest_document(&server, &public, &extraction)
+    let out = tools::ingestion::do_ingest_document(&server, &public, &extraction, None)
         .await
         .expect("ingest");
     let paper: Uuid = first_text(&out)["paper_id"]

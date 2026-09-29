@@ -459,6 +459,52 @@ pub struct PatchClaimInput {
     pub remove_labels: Vec<String>,
 }
 
+/// Which audited admin write [`ClaimRepository::admin_patch_claim_conn`] records.
+///
+/// A closed set, because it is written into the `security_events` audit row
+/// and migration 111's function refuses anything else (`ADM03`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminClaimAction {
+    /// MCP `update_labels` / HTTP `PATCH /api/v1/claims/:id/labels`.
+    UpdateLabels,
+    /// MCP `patch_claim`.
+    PatchClaim,
+    /// The original's `resolved` label in MCP `resolve_backlog_item`.
+    ResolveBacklogItem,
+}
+
+impl AdminClaimAction {
+    /// The `action` string migration 111 records and accepts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UpdateLabels => "update_labels",
+            Self::PatchClaim => "patch_claim",
+            Self::ResolveBacklogItem => "resolve_backlog_item",
+        }
+    }
+}
+
+/// What [`ClaimRepository::admin_patch_claim_conn`] wrote: the row's labels,
+/// properties and trace after the write, and before it.
+#[derive(Debug, Clone)]
+pub struct AdminClaimWrite {
+    pub labels: Vec<String>,
+    pub properties: serde_json::Value,
+    pub trace_id: Option<Uuid>,
+    pub before_labels: Vec<String>,
+    pub before_properties: serde_json::Value,
+    pub before_trace_id: Option<Uuid>,
+}
+
+/// The token facts the audited admin path re-checks and records: the token's
+/// `sub` (an `oauth_clients.id`) and its `jti`.
+#[derive(Debug, Clone, Copy)]
+pub struct AdminToken {
+    pub client_id: Uuid,
+    pub jti: Uuid,
+}
+
 /// Diff produced by [`ClaimRepository::patch_claim_atomic_conn`].
 #[derive(Debug)]
 pub struct PatchClaimDiff {
@@ -559,9 +605,10 @@ fn claim_from_row(
 /// `claims.signer_id`.
 ///
 /// `signer_public_key` is `Option` because the join that supplies it MUST be a
-/// `LEFT JOIN` — `signer_id` is NULL on every claim written by today's
-/// `create*` methods (none of them insert `signature`/`signer_id`), so an inner
-/// join would turn every single-claim read into "not found".
+/// `LEFT JOIN` — `signer_id` is NULL on every claim written by the `create*`
+/// methods other than [`ClaimRepository::create_strict_signed`] (batch H-b's
+/// MCP submission path), so an inner join would turn every single-claim read of
+/// an unsigned row into "not found".
 struct RowCryptoColumns {
     content_hash: Vec<u8>,
     signature: Option<Vec<u8>>,
@@ -5106,6 +5153,45 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
+        Self::create_strict_signed(conn, claim, decl, None).await
+    }
+
+    /// [`Self::create_strict`], additionally persisting the claim's Ed25519
+    /// signature with `signer_id` as its SIGNER (batch H-b, D1-sig).
+    ///
+    /// # Why the signer is recorded apart from the author
+    ///
+    /// `claims.agent_id` is the AUTHOR. Since D1 an authenticated MCP write
+    /// authors as the caller, while the digest is still signed with the MCP
+    /// server's key, so the two are different agents and often the author has no
+    /// private key at all (an OAuth principal's `derived` agent). `verify_claim`
+    /// already verifies against `claims.signer_id -> agents.public_key`, never
+    /// against the author's key (`post_fix_crypto_columns`), so recording the
+    /// signer is what lets a caller-authored claim verify, without weakening the
+    /// check.
+    ///
+    /// # What is persisted, and when nothing is
+    ///
+    /// The signature and `signer_id` are written together or not at all (the
+    /// `claims_signature_requires_signer` CHECK), and ONLY when the signature
+    /// verifies under `claim.public_key` over the digest this INSERT stores
+    /// (`blake3(content)`). A signature over a different digest (the ingest
+    /// planner's seed-scoped compound hash) or one that does not verify is not
+    /// stored: an unverifiable signature on a row would read as tampering. The
+    /// caller vouches that `signer_id` is the agent whose registered key is
+    /// `claim.public_key`; `verify_claim` re-checks that pairing on every read.
+    ///
+    /// `signer_id = None` is exactly [`Self::create_strict`]: every existing row
+    /// keeps `signature = NULL` and reports `signed: false`, unchanged.
+    ///
+    /// # Errors
+    /// As [`Self::create_strict`].
+    pub async fn create_strict_signed(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<Claim, DbError> {
         use sqlx::Row;
 
         let id: Uuid = claim.id.into();
@@ -5116,9 +5202,24 @@ impl ClaimRepository {
         let updated_at = claim.updated_at;
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
+        let (signature, signer_id): (Option<Vec<u8>>, Option<Uuid>) =
+            match (signer_id, claim.signature) {
+                (Some(signer), Some(sig))
+                    if epigraph_crypto::SignatureVerifier::verify(
+                        &claim.public_key,
+                        &content_hash,
+                        &sig,
+                    )
+                    .unwrap_or(false) =>
+                {
+                    (Some(sig.to_vec()), Some(signer))
+                }
+                _ => (None, None),
+            };
+
         let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id, signature, signer_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
         )
         .bind(id)
@@ -5131,6 +5232,8 @@ impl ClaimRepository {
         .bind(updated_at)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
+        .bind(signature)
+        .bind(signer_id)
         .fetch_one(&mut *conn)
         .await?;
 
@@ -5235,6 +5338,23 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<(Claim, bool), DbError> {
+        Self::create_or_get_signed(conn, viewer, claim, decl, None).await
+    }
+
+    /// [`Self::create_or_get`], persisting the claim's signature with
+    /// `signer_id` as its signer on the INSERT branch; see
+    /// [`Self::create_strict_signed`]. A found row is returned as it is: its
+    /// signature (or its absence) is never rewritten.
+    ///
+    /// # Errors
+    /// As [`Self::create_or_get`].
+    pub async fn create_or_get_signed(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<(Claim, bool), DbError> {
         use sqlx::Acquire;
 
         let agent_id: Uuid = claim.agent_id.into();
@@ -5256,7 +5376,7 @@ impl ClaimRepository {
                 .begin()
                 .await
                 .map_err(|source| DbError::QueryFailed { source })?;
-            match Self::create_strict(&mut sp, claim, decl).await {
+            match Self::create_strict_signed(&mut sp, claim, decl, signer_id).await {
                 Ok(c) => {
                     sp.commit()
                         .await
@@ -7955,6 +8075,79 @@ impl ClaimRepository {
                 id: claim_id,
             }),
         }
+    }
+
+    /// The AUDITED admin path for a `claims:admin` write into a claim whose
+    /// owning group the admin cannot write (batch H-b, D2; migration 111).
+    ///
+    /// Calls `public.epigraph_admin_patch_claim`, a SECURITY DEFINER owned by
+    /// `epigraph_maintenance`, which in one step re-checks the token's client
+    /// record (`oauth_clients`: active, `claims:admin` granted, bound to the
+    /// session principal), applies the label add/remove, the shallow properties
+    /// merge and the trace relink with exactly the semantics of
+    /// [`Self::update_labels_conn`] and [`Self::patch_claim_atomic_conn`], and
+    /// writes a `security_events` row (`claims.admin_write`) naming the admin,
+    /// the token, the action, the target and the before/after state. The write
+    /// and its audit row commit with the caller's transaction or not at all.
+    ///
+    /// The ADMIN is read from the session's `epigraph.principal_id`, so `conn`
+    /// must be a transaction stamped from the admin's OWN viewer (never the
+    /// claim author's). A NULL principal is refused.
+    ///
+    /// # Errors
+    /// * `DbError::InvalidData` if an added label carries unexpanded shell
+    ///   syntax (checked before the call, as the ordinary path checks it).
+    /// * `DbError::QueryFailed` with SQLSTATE `42501` when the function refuses
+    ///   the admin (`ADM01` no principal, `ADM02` no live `claims:admin` grant),
+    ///   `P0002` when the claim does not exist (`ADM04`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admin_patch_claim_conn(
+        conn: &mut sqlx::PgConnection,
+        token: AdminToken,
+        claim_id: Uuid,
+        action: AdminClaimAction,
+        add_labels: &[String],
+        remove_labels: &[String],
+        properties: Option<&serde_json::Value>,
+        trace_id: Option<Uuid>,
+    ) -> Result<AdminClaimWrite, DbError> {
+        crate::label_validation::reject_unexpanded_labels(add_labels)?;
+        let out: serde_json::Value = sqlx::query_scalar(
+            "SELECT public.epigraph_admin_patch_claim($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(token.client_id)
+        .bind(token.jti)
+        .bind(claim_id)
+        .bind(action.as_str())
+        .bind(add_labels)
+        .bind(remove_labels)
+        .bind(properties)
+        .bind(trace_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        let labels = |key: &str| -> Vec<String> {
+            out.get(key)
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let trace = |key: &str| -> Option<Uuid> {
+            out.get(key)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
+        Ok(AdminClaimWrite {
+            labels: labels("labels"),
+            properties: out.get("properties").cloned().unwrap_or_default(),
+            trace_id: trace("trace_id"),
+            before_labels: labels("before_labels"),
+            before_properties: out.get("before_properties").cloned().unwrap_or_default(),
+            before_trace_id: trace("before_trace_id"),
+        })
     }
 
     /// The two facts a write gate decides on for one claim, read through

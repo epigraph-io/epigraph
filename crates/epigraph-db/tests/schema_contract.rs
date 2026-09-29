@@ -1264,3 +1264,87 @@ async fn migration_107_operator_definers_are_owned_and_granted(pool: PgPool) {
         );
     }
 }
+
+/// Migration 111's audited admin definer (batch H-b, D2):
+/// `epigraph_admin_patch_claim` must stay SECURITY DEFINER, be owned by
+/// `epigraph_maintenance` (whose membership `epigraph_definer_bypass()` tests
+/// inside the frame, so the write works whatever the orphan `*_privacy`
+/// policies say), carry an explicit ACL, refuse PUBLIC and admit
+/// `epigraph_app`, which the MCP and API servers call it as.
+///
+/// The OWNER is pinned HERE and not behaviourally: this harness migrates as a
+/// superuser, so with the guarded `OWNER TO` silently no-opped the function
+/// would be superuser-owned and still work in every test, while a cluster whose
+/// migrator is a non-bypassing owner would have it RLS-filtered to "claim not
+/// found" (ADM04). Same template as `migration_107_operator_definers_are_owned_and_granted`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_111_admin_write_definer_is_owned_and_granted(pool: PgPool) {
+    let signature =
+        "public.epigraph_admin_patch_claim(uuid, uuid, uuid, text, text[], text[], jsonb, uuid)";
+    let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+           FROM pg_proc p \
+           JOIN pg_namespace n ON n.oid = p.pronamespace \
+           JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_admin_patch_claim'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, owner, vol, acl) =
+        meta.expect("public.epigraph_admin_patch_claim must exist (migration 111)");
+    assert!(secdef, "the admin definer must stay SECURITY DEFINER");
+    assert_eq!(owner, "epigraph_maintenance", "the admin definer's owner");
+    assert_eq!(vol, "v", "the admin definer writes: VOLATILE");
+    assert!(
+        acl.is_some(),
+        "an explicit ACL, never the default (PUBLIC EXECUTE)"
+    );
+    for (role, expected) in [("public", false), ("epigraph_app", true)] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(role)
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on the admin definer");
+    }
+}
+
+/// Migration 112 (batch H-b review): the workflow admin arm's audit definer,
+/// same template as 111.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_112_admin_audit_definer_is_owned_and_granted(pool: PgPool) {
+    let signature = "public.epigraph_admin_audit_write(uuid, uuid, uuid, text, jsonb)";
+    let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+           FROM pg_proc p \
+           JOIN pg_namespace n ON n.oid = p.pronamespace \
+           JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_admin_audit_write'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, owner, vol, acl) =
+        meta.expect("public.epigraph_admin_audit_write must exist (migration 112)");
+    assert!(secdef, "the admin audit definer must stay SECURITY DEFINER");
+    assert_eq!(
+        owner, "epigraph_maintenance",
+        "the admin audit definer's owner"
+    );
+    assert_eq!(vol, "v", "the admin audit definer writes: VOLATILE");
+    assert!(
+        acl.is_some(),
+        "an explicit ACL, never the default (PUBLIC EXECUTE)"
+    );
+    for (role, expected) in [("public", false), ("epigraph_app", true)] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(role)
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on the admin audit definer");
+    }
+}
