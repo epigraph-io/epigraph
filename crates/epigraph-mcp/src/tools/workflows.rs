@@ -1237,7 +1237,7 @@ pub mod __test_only {
 }
 
 #[cfg(test)]
-mod confidence_tests {
+mod tests {
     use super::resolve_workflow_confidence;
 
     #[test]
