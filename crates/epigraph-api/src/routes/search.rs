@@ -732,39 +732,42 @@ pub async fn semantic_search(
             // this file). The theme lookup above is nearest-first with no
             // relevance floor, so any non-empty theme set wins the shortlist;
             // a small stale one would answer every query from its few members.
-            // Enter diverse mode only when the query's own nearest
+            // Enter diverse mode only when most of the query's own nearest
             // neighbourhood — REST's candidate space: all levels, no window —
-            // is mostly themed. Runs on the same viewer-stamped `read`.
+            // is reachable through the shortlist. Runs on the same
+            // viewer-stamped `read`.
+            let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
             let covered = if themes.is_empty() {
                 false
             } else {
                 use epigraph_engine::diverse_retrieval::{
                     theme_coverage_sufficient, MIN_THEME_COVERAGE_FRACTION, THEME_COVERAGE_PROBE_K,
                 };
-                let coverage =
-                    epigraph_db::ClaimThemeRepository::nearest_theme_coverage_at_dim_since(
-                        &mut *read,
-                        &viewer,
-                        &embedding_str,
-                        THEME_COVERAGE_PROBE_K,
-                        centroid_dim_used,
-                        /*paragraph_only=*/ false,
-                        /*since=*/ None,
-                    )
-                    .await
-                    .map_err(|e| ApiError::InternalError {
-                        message: format!("Theme coverage probe failed: {e}"),
-                    })?;
+                let coverage = epigraph_db::ClaimThemeRepository::nearest_theme_coverage_since(
+                    &mut *read,
+                    &viewer,
+                    &embedding_str,
+                    centroid_dim_used,
+                    &theme_ids,
+                    centroid_dim_used,
+                    THEME_COVERAGE_PROBE_K,
+                    /*paragraph_only=*/ false,
+                    /*since=*/ None,
+                )
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Theme coverage probe failed: {e}"),
+                })?;
                 let sufficient = theme_coverage_sufficient(coverage, MIN_THEME_COVERAGE_FRACTION);
                 if !sufficient {
                     tracing::info!(
                         target: "diverse_retrieval.coverage_guard",
                         handler = "semantic_search",
                         probed = coverage.probed,
-                        themed = coverage.themed,
+                        reachable = coverage.reachable,
                         min_fraction = MIN_THEME_COVERAGE_FRACTION,
                         centroid_dim = centroid_dim_used,
-                        "themes do not cover the query's nearest neighbourhood; \
+                        "the theme shortlist does not cover the query's nearest neighbourhood; \
                          diverse mode falls back to flat search"
                     );
                 }
@@ -773,8 +776,6 @@ pub async fn semantic_search(
 
             // Only enter diverse mode if themes exist AND cover this query.
             if covered {
-                let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
-
                 // Retrieve candidate claims via the shared helper — same
                 // SQL shape as before, plus the level-filter knob for
                 // MCP. REST passes `paragraph_only=false` to preserve
@@ -1567,12 +1568,16 @@ mod db_integration_tests {
     /// populated and the caller does NOT hint, the search picks 3072d.
     #[sqlx::test(migrations = "../../migrations")]
     async fn diverse_search_auto_picks_3072d_when_majority_populated(pool: sqlx::PgPool) {
-        // 8/10 themes have centroid_3072 (80% > 50% threshold)
-        let theme_ids = seed_themes_with_mixed_centroids(&pool, 10, 8).await;
+        // 3/5 themes have centroid_3072 (60% > 50% threshold)
+        let theme_ids = seed_themes_with_mixed_centroids(&pool, 5, 3).await;
         let agent = seed_agent(&pool, "diverse-auto-test").await;
         // Attach claims to the 3072-populated themes only so the search has
-        // candidates after theme selection.
-        let theme_ids_3072 = &theme_ids[..8];
+        // candidates after theme selection. Exactly as many 3072-d themes as
+        // the helper's `max_themes` (3), so the whole 3072-d theme set is the
+        // shortlist and the query's neighbourhood is fully reachable through
+        // it — the theme-coverage guard counts shortlist membership only, and
+        // this arm is about dimension auto-detect, not the guard.
+        let theme_ids_3072 = &theme_ids[..3];
         let _claims = seed_claims_with_3072_embeddings(&pool, 50, theme_ids_3072, agent).await;
 
         let resp = call_diverse_search(pool.clone(), None)

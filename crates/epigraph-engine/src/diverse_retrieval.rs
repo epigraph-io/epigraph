@@ -16,8 +16,8 @@
 //! `fetch_batched_context` for paragraph-context enrichment.
 //!
 //! If the corpus has no themes yet, returns `Ok(vec![])` so the caller can
-//! fall back to flat ANN. Same response if the themes do not cover the
-//! query's nearest neighbourhood (the theme-coverage guard, see
+//! fall back to flat ANN. Same response if the theme shortlist does not cover
+//! the query's nearest neighbourhood (the theme-coverage guard, see
 //! [`MIN_THEME_COVERAGE_FRACTION`]) or if themes exist but contain no
 //! candidates — the helper does not distinguish the cases.
 //!
@@ -65,29 +65,43 @@ pub const MAX_CANDIDATE_POOL: u32 = 1000;
 ///
 /// Matched to pgvector's default `hnsw.ef_search` (40): an HNSW index scan
 /// returns at most `ef_search` rows without iterative scanning, so a larger
-/// probe would silently be truncated to this size on an index plan and not on
-/// a sequential one. Staying within one candidate list keeps the probe the
-/// same size under either plan. The fraction is computed over the rows
-/// actually returned regardless (see
-/// [`epigraph_db::NeighbourhoodThemeCoverage::probed`]).
+/// probe would be truncated to this size on an index plan and not on a
+/// sequential one.
+///
+/// That keeps the probe the same size across plans only when NO filter
+/// applies. The viewer predicate, the `since` window, and a level filter the
+/// chosen index does not carry are applied after the index scan, so under an
+/// index plan a filtered probe can return far fewer than K rows. The
+/// coverage fraction is therefore computed over the rows actually returned
+/// (see [`epigraph_db::NeighbourhoodThemeCoverage::probed`]), and there is
+/// deliberately no minimum on that count: a floor cannot tell a truncated
+/// scan from a viewer whose visible neighbourhood is genuinely small, and the
+/// flat fallback runs the same kind of post-filtered index scan, so falling
+/// back would not recover the rows the probe missed.
 pub const THEME_COVERAGE_PROBE_K: i32 = 40;
 
-/// Minimum fraction of the query's nearest neighbourhood that must belong to
-/// a selectable theme for diverse mode to run. Below it, diverse mode falls
-/// back to flat retrieval.
+/// Minimum fraction of the query's nearest neighbourhood that diverse mode
+/// must be able to reach through its theme shortlist for diverse selection to
+/// run. Below it, diverse mode falls back to flat retrieval.
 ///
-/// Why one half: diverse mode can only return themed claims, so the unthemed
-/// share of the neighbourhood is exactly what diverse mode cannot see. Once
-/// that share is the majority, the relevance lost outweighs any diversity
-/// gained. A full corpus partition (the theme builder assigns every embedded
-/// claim) sits at or near 1.0; a partition decays toward 0 as unthemed claims
-/// are ingested after the last rebuild; a small stale theme set sits near 0
-/// for almost every query. The threshold only has to separate those regimes,
-/// and the boundary is inclusive (`>=`).
+/// Why one half: diverse mode can only return members of the `max_themes`
+/// themes it shortlisted, so the share of the neighbourhood outside that
+/// shortlist (unthemed claims AND members of themes that were not
+/// shortlisted) is exactly what it cannot see. Once that share is the
+/// majority, the relevance lost outweighs any diversity gained. A small stale
+/// theme set sits near 0 for almost every query; a partition whose nearest
+/// themes hold the query's neighbours sits near 1.0. The boundary is
+/// inclusive (`>=`).
+///
+/// Tradeoff, accepted: on a healthy fine-grained partition, a small
+/// `max_themes` shortlist can hold less than half of a broad query's
+/// neighbourhood, and such a request now falls back. That is the same
+/// judgement applied honestly: diverse selection over that shortlist would
+/// hide most of the relevant claims.
 pub const MIN_THEME_COVERAGE_FRACTION: f64 = 0.5;
 
-/// Decide whether a measured neighbourhood is covered well enough by themes
-/// for diverse selection to run.
+/// Decide whether a measured neighbourhood is covered well enough by the
+/// theme shortlist for diverse selection to run.
 ///
 /// `false` when nothing was probed: with no visible neighbour there is no
 /// evidence the themes cover the query, and the flat path answers the empty
@@ -100,7 +114,7 @@ pub fn theme_coverage_sufficient(
     if coverage.probed <= 0 {
         return false;
     }
-    (coverage.themed as f64) / (coverage.probed as f64) >= min_fraction
+    (coverage.reachable as f64) / (coverage.probed as f64) >= min_fraction
 }
 
 /// Find the `max_themes` claim_themes whose centroid at `centroid_dim` is
@@ -305,8 +319,8 @@ pub struct DiverseRetrievalConfig {
 ///
 /// Returns the selected `(claim_id, content, similarity)` tuples in
 /// `diverse_select` selection order. Returns `Ok(vec![])` when no themes
-/// exist, when the themes do not cover the query's nearest neighbourhood
-/// (see [`MIN_THEME_COVERAGE_FRACTION`]; logged under the
+/// exist, when the theme shortlist does not cover the query's nearest
+/// neighbourhood (see [`MIN_THEME_COVERAGE_FRACTION`]; logged under the
 /// `diverse_retrieval.coverage_guard` target), OR when themes exist but the
 /// candidate pool is empty — callers should fall back to flat ANN in every
 /// case (the helper does not distinguish them).
@@ -329,17 +343,23 @@ pub async fn run_diverse_pipeline(
         return Ok(vec![]);
     }
 
+    let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
+
     // Theme-coverage guard. The theme lookup above is nearest-first with no
     // relevance floor, so ANY non-empty theme set wins the shortlist — and a
     // small stale one then funnels every query through its few members. Only
-    // run diverse selection when the query's own nearest neighbourhood (in the
-    // same candidate space, before theme restriction) is mostly themed.
-    let coverage = ClaimThemeRepository::nearest_theme_coverage_at_dim_since(
+    // run diverse selection when most of the query's own nearest neighbourhood
+    // (same candidate space, before theme restriction) is reachable through
+    // the shortlist. MCP's candidate space is one dimension throughout, so the
+    // neighbourhood and reachability dimensions are both `centroid_dim`.
+    let coverage = ClaimThemeRepository::nearest_theme_coverage_since(
         pool,
         viewer,
         query_pgvec,
-        THEME_COVERAGE_PROBE_K,
         config.centroid_dim,
+        &theme_ids,
+        config.centroid_dim,
+        THEME_COVERAGE_PROBE_K,
         config.paragraph_only,
         config.since,
     )
@@ -349,16 +369,15 @@ pub async fn run_diverse_pipeline(
         tracing::info!(
             target: "diverse_retrieval.coverage_guard",
             probed = coverage.probed,
-            themed = coverage.themed,
+            reachable = coverage.reachable,
             min_fraction = MIN_THEME_COVERAGE_FRACTION,
             centroid_dim = config.centroid_dim,
-            "themes do not cover the query's nearest neighbourhood; \
+            "the theme shortlist does not cover the query's nearest neighbourhood; \
              diverse mode falls back to flat retrieval"
         );
         return Ok(vec![]);
     }
 
-    let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
     let candidates = candidates_in_themes_at_dim_since(
         pool,
         viewer,
@@ -409,8 +428,8 @@ mod tests {
         assert_eq!(got, vec![1, 3]);
     }
 
-    fn cov(probed: i64, themed: i64) -> epigraph_db::NeighbourhoodThemeCoverage {
-        epigraph_db::NeighbourhoodThemeCoverage { probed, themed }
+    fn cov(probed: i64, reachable: i64) -> epigraph_db::NeighbourhoodThemeCoverage {
+        epigraph_db::NeighbourhoodThemeCoverage { probed, reachable }
     }
 
     /// The boundary is inclusive: exactly the threshold share passes, one

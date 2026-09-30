@@ -2212,3 +2212,90 @@ async fn diverse_mode_falls_back_one_below_threshold(pool: PgPool) {
          retrieval and return the 5 nearest (unthemed) paragraphs"
     );
 }
+
+/// Coverage is measured against the theme SHORTLIST, not against "any theme".
+///
+/// Theme N holds the query's whole neighbourhood (60 relevant paragraphs), but
+/// its centroid sits off-axis, so it loses the `max_themes = 1` shortlist to
+/// theme S, whose centroid equals the query and whose three members are
+/// off-topic. Diverse mode draws only from the shortlist, so it can see none
+/// of N's members. A guard that counted membership in any theme would read the
+/// neighbourhood as fully covered and return S's off-topic members; the guard
+/// must instead fall back to flat retrieval.
+///
+/// Exact reads (indexes dropped) for the same reason as the coverage-bug arm.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_mode_falls_back_when_neighbourhood_sits_outside_the_theme_shortlist(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/cov-shortlist", "shortlist").await;
+
+    let neighbourhood_theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "holds-the-neighbourhood",
+        &diverse_fixture::cluster_pgvec(3, 1.0),
+    )
+    .await;
+    let shortlisted_theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "wins-the-shortlist",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+    )
+    .await;
+
+    let mut off_topic = std::collections::HashSet::new();
+    for i in 0..3 {
+        off_topic.insert(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper,
+                &format!("shortlisted-off-topic-{i}"),
+                &diverse_fixture::cluster_pgvec(5, 1.0),
+                Some(shortlisted_theme),
+            )
+            .await,
+        );
+    }
+    let mut relevant = Vec::new();
+    for i in 0..60 {
+        let v = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, (i as f32) * 0.01);
+        relevant.push(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper,
+                &format!("neighbourhood-{i}"),
+                &v,
+                Some(neighbourhood_theme),
+            )
+            .await,
+        );
+    }
+    drop_ann_indexes(&pool).await;
+
+    let server = build_test_server(pool.clone());
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+    let params = diverse_params(/*diverse=*/ true, Some(1), Some(0.4), 5);
+    let resp = parse_response(
+        recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query)
+            .await
+            .expect("diverse recall"),
+    );
+
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+    let leaked: Vec<&Uuid> = returned.intersection(&off_topic).collect();
+    assert!(
+        leaked.is_empty(),
+        "the shortlist holds none of the query's neighbourhood, yet diverse=true returned its \
+         off-topic members: {leaked:?}"
+    );
+    let flat_top_5: std::collections::HashSet<Uuid> = relevant[..5].iter().copied().collect();
+    assert_eq!(
+        returned, flat_top_5,
+        "the request must fall back to flat retrieval and return the 5 nearest paragraphs"
+    );
+}
