@@ -94,12 +94,35 @@
 //! Runtime `sqlx::query` / `query_scalar` throughout — never the compile-time
 //! macros — so no `.sqlx/` cache entry is needed and `SQLX_OFFLINE=true` builds.
 //!
+//! # Set-based, and bounded
+//!
+//! Each claims batch resolves the target group ONCE PER DISTINCT AUTHOR of the
+//! batch (a CTE map `author -> group`), then updates the batch's rows with one
+//! join. An earlier form evaluated the resolver as a correlated subquery per
+//! ROW, twice (the SET and the guard); on production that was the dominant cost
+//! of a batch. Derived rows follow through 070's arm (d), which is a
+//! STATEMENT-level trigger: one UPDATE per derived table per batch, joined to
+//! the batch's transition table, however many claims the batch holds. The
+//! agent-keyed arms (`perspectives`, `recall_events`) are batched and cursored
+//! the same way instead of one unbounded UPDATE each.
+//!
+//! `--entity <name>` runs one arm alone (e.g. `recall_events` without the
+//! claims walk). `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
+//! once the budget is spent and exits 3 ("partial, re-run to resume"); the
+//! cursor of every committed batch is already persisted.
+//!
 //! Usage:
 //!     epigraph-tenancy-backfill run [--batch-size 5000] [--dry-run]
+//!         [--entity claims|communities|perspectives|recall-events|harvester-fragments]
+//!         [--max-runtime 2h]
 //!     epigraph-tenancy-backfill verify
+//!
+//! Exit codes: 0 complete; 1 failed, or `verify` found residue; 3 stopped by
+//! `--max-runtime` (partial, resumable).
 
 use clap::{Parser, Subcommand};
 use sqlx::{PgPool, Row};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// The role migrations 070/071 re-own their `SECURITY DEFINER` bodies to, and
@@ -230,10 +253,68 @@ enum Command {
         /// Report what would be stamped without writing.
         #[arg(long)]
         dry_run: bool,
+        /// Run ONE entity arm alone (no settle, no final verify).
+        #[arg(long, value_enum)]
+        entity: Option<Entity>,
+        /// Stop cleanly between batches after this long (`90m`, `2h`, `3600s`,
+        /// or bare seconds) and exit 3; a re-run resumes from the cursor.
+        #[arg(long, value_parser = parse_duration)]
+        max_runtime: Option<Duration>,
     },
     /// Deploy pre-flight. Exits non-zero if any entity is incomplete.
     Verify,
 }
+
+/// The entity arms `run --entity` can select.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Entity {
+    Claims,
+    Communities,
+    Perspectives,
+    RecallEvents,
+    HarvesterFragments,
+}
+
+/// `90m`, `2h`, `3600s`, or bare seconds.
+fn parse_duration(raw: &str) -> Result<Duration, String> {
+    let raw = raw.trim();
+    let (num, mult) = match raw.chars().last() {
+        Some('s') => (&raw[..raw.len() - 1], 1),
+        Some('m') => (&raw[..raw.len() - 1], 60),
+        Some('h') => (&raw[..raw.len() - 1], 3600),
+        _ => (raw, 1),
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("not a duration: {raw:?} (use e.g. 90m, 2h, 3600s)"))?;
+    if n == 0 {
+        return Err("the duration must be positive".to_string());
+    }
+    Ok(Duration::from_secs(n * mult))
+}
+
+/// When a `--max-runtime` budget runs out. Checked only BETWEEN batches.
+#[derive(Clone, Copy, Debug)]
+struct Deadline(Option<Instant>);
+
+impl Deadline {
+    fn expired(self) -> bool {
+        self.0.is_some_and(|d| Instant::now() >= d)
+    }
+}
+
+/// How a `run` ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RunEnd {
+    Complete,
+    /// `--max-runtime` stopped it between batches; everything committed so far
+    /// is kept and the cursors are persisted.
+    Partial,
+}
+
+/// The exit code for [`RunEnd::Partial`].
+const EXIT_PARTIAL: i32 = 3;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -282,8 +363,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             batch_size,
             dry_run,
+            entity,
+            max_runtime,
         } => {
-            run(&pool, batch_size, dry_run).await?;
+            let deadline = Deadline(max_runtime.map(|d| Instant::now() + d));
+            if run(&pool, batch_size, dry_run, entity, deadline).await? == RunEnd::Partial {
+                eprintln!(
+                    "run: PARTIAL — stopped by --max-runtime between batches; every committed \
+                     batch is kept and its cursor persisted. Re-run the same command to resume."
+                );
+                std::process::exit(EXIT_PARTIAL);
+            }
             Ok(())
         }
         Command::Verify => {
@@ -309,11 +399,18 @@ async fn main() -> anyhow::Result<()> {
 // run
 // =============================================================================
 
-async fn run(pool: &PgPool, batch_size: i64, dry_run: bool) -> anyhow::Result<()> {
+async fn run(
+    pool: &PgPool,
+    batch_size: i64,
+    dry_run: bool,
+    entity: Option<Entity>,
+    deadline: Deadline,
+) -> anyhow::Result<RunEnd> {
     if batch_size <= 0 {
         anyhow::bail!("--batch-size must be positive");
     }
     preflight(pool).await?;
+    let wants = |e: Entity| entity.is_none_or(|x| x == e);
 
     // PHASE 0 is not in the plan's *Files* line and is the single largest piece
     // of unlisted work in PR-12. D2 derives every claim's owner from
@@ -323,22 +420,52 @@ async fn run(pool: &PgPool, batch_size: i64, dry_run: bool) -> anyhow::Result<()
     // one-shot orphan agents that have never authenticated and therefore have
     // NO personal group. Without this phase the claims arm cannot resolve an
     // owner for their claims and the backfill stalls on batch 1.
-    materialize_personal_groups(pool, dry_run).await?;
-
-    if dry_run {
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE owner_group_id = $1")
-            .bind(WORLD)
-            .fetch_one(pool)
-            .await?;
-        println!("dry-run: {n} claims would be stamped; no writes performed.");
-        return Ok(());
+    if wants(Entity::Claims) || wants(Entity::Perspectives) || wants(Entity::RecallEvents) {
+        materialize_personal_groups(pool, dry_run).await?;
     }
 
-    backfill_claims(pool, batch_size).await?;
-    backfill_communities(pool).await?;
-    backfill_agent_keyed(pool, "perspectives", "owner_agent_id").await?;
-    backfill_agent_keyed(pool, "recall_events", "agent_id").await?;
-    backfill_harvester_fragments(pool).await?;
+    if dry_run {
+        for (e, table) in [
+            (Entity::Claims, "claims"),
+            (Entity::Communities, "communities"),
+            (Entity::Perspectives, "perspectives"),
+            (Entity::RecallEvents, "recall_events"),
+            (Entity::HarvesterFragments, "harvester_fragments"),
+        ] {
+            if wants(e) {
+                let n = residual(pool, table).await?;
+                println!("dry-run: {n} {table} row(s) are world-owned; no writes performed.");
+            }
+        }
+        return Ok(RunEnd::Complete);
+    }
+
+    if wants(Entity::Claims) && backfill_claims(pool, batch_size, deadline).await? {
+        return Ok(RunEnd::Partial);
+    }
+    if wants(Entity::Communities) {
+        backfill_communities(pool).await?;
+    }
+    if wants(Entity::Perspectives)
+        && backfill_agent_keyed(pool, "perspectives", "owner_agent_id", batch_size, deadline)
+            .await?
+    {
+        return Ok(RunEnd::Partial);
+    }
+    if wants(Entity::RecallEvents)
+        && backfill_agent_keyed(pool, "recall_events", "agent_id", batch_size, deadline).await?
+    {
+        return Ok(RunEnd::Partial);
+    }
+    if wants(Entity::HarvesterFragments) {
+        backfill_harvester_fragments(pool).await?;
+    }
+    if let Some(e) = entity {
+        println!(
+            "run: entity {e:?} done (no settle, no verify: run `verify` when every arm is done)."
+        );
+        return Ok(RunEnd::Complete);
+    }
 
     // The remaining entities are either trigger-propagated (the 17 claim-derived
     // tables and `edges`) or have nothing to derive from (`frames`, `contexts`).
@@ -352,7 +479,7 @@ async fn run(pool: &PgPool, batch_size: i64, dry_run: bool) -> anyhow::Result<()
         eprintln!("run: finished with {failures} entity/entities still incomplete; see `verify`.");
         std::process::exit(1);
     }
-    Ok(())
+    Ok(RunEnd::Complete)
 }
 
 /// Refuse to run against a database that has not had migration 070 applied.
@@ -401,9 +528,12 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
     // repair conditional on unrelated state. An author whose rows are all
     // REVOKED is not "needing repair": that is an operator's decision, counted
     // and reported below, and this binary does not reverse it.
+    // Over DISTINCT authors, not over claims rows: the resolver is a correlated
+    // subquery, and evaluating it once per claim row was a full pass of it over
+    // the whole table (OB6).
     let needing_repair: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM (
-            SELECT DISTINCT c.agent_id FROM claims c
+            SELECT c.agent_id FROM (SELECT DISTINCT agent_id FROM claims) c
              WHERE {pg} IS NULL
                 OR NOT EXISTS (SELECT 1 FROM group_memberships m
                                 WHERE m.group_id = {pg}
@@ -415,7 +545,7 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
     .await?;
     let left_revoked: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM (
-            SELECT DISTINCT c.agent_id FROM claims c
+            SELECT c.agent_id FROM (SELECT DISTINCT agent_id FROM claims) c
              WHERE {pg} IS NOT NULL
                AND EXISTS (SELECT 1 FROM group_memberships m
                             WHERE m.group_id = {pg} AND m.agent_id = c.agent_id)
@@ -459,10 +589,10 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
     // must not be given a second one.
     sqlx::query(&format!(
         "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id)
-         SELECT DISTINCT 'personal:' || a.id::text,
+         SELECT 'personal:' || a.id::text,
                 'did:epigraph:personal:' || a.id::text,
                 ''::bytea, 'personal', a.id
-           FROM claims c JOIN agents a ON a.id = c.agent_id
+           FROM (SELECT DISTINCT agent_id FROM claims) c JOIN agents a ON a.id = c.agent_id
           WHERE {} IS NULL
          ON CONFLICT (did_key) DO UPDATE SET updated_at = now()",
         personal_group_sql("a.id")
@@ -520,7 +650,13 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
 /// Each batch is one transaction containing the row selection, the UPDATE
 /// (which fires arm (d) and propagates to 18 more tables), and the cursor
 /// advance. That grouping is what makes `kill -9` safe.
-async fn backfill_claims(pool: &PgPool, batch_size: i64) -> anyhow::Result<()> {
+///
+/// Returns `true` when `deadline` stopped the walk between batches (partial).
+async fn backfill_claims(
+    pool: &PgPool,
+    batch_size: i64,
+    deadline: Deadline,
+) -> anyhow::Result<bool> {
     let mut cursor: Option<Uuid> = current_cursor(pool, "claims").await?;
     // SEEDED FROM THE PERSISTED COUNT, not from zero. `rows_done` is meant to
     // describe the BACKFILL, and re-initialising it on every process start made
@@ -529,6 +665,13 @@ async fn backfill_claims(pool: &PgPool, batch_size: i64) -> anyhow::Result<()> {
     let mut total: i64 = persisted_rows_done(pool, "claims").await?;
 
     loop {
+        if deadline.expired() {
+            tracing::warn!(
+                total,
+                "claims walk stopped by --max-runtime; cursor persisted"
+            );
+            return Ok(true);
+        }
         let mut tx = pool.begin().await?;
 
         // FOR UPDATE SKIP LOCKED per the acceptance line. The `id >` cursor and
@@ -558,24 +701,17 @@ async fn backfill_claims(pool: &PgPool, batch_size: i64) -> anyhow::Result<()> {
 
         // Resolve the owner IN SQL, in the same statement as the write, so
         // there is no window in which the binary holds a mapping the database
-        // disagrees with. A claim whose author has no personal group is LEFT
-        // ALONE rather than stamped to world or seed — `verify` will then fail
-        // and name it, which is the fail-closed outcome. Phase 0 makes this
-        // set empty in the normal case.
-        let n = sqlx::query(&format!(
-            "UPDATE claims c
-                SET owner_group_id = {}, visibility = 'public'
-              WHERE c.id = ANY($1)
-                AND c.owner_group_id = $2
-                AND {} IS NOT NULL",
-            owner_group_sql("c.agent_id"),
-            owner_group_sql("c.agent_id")
-        ))
-        .bind(&ids)
-        .bind(WORLD)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        // disagrees with, and ONCE PER DISTINCT AUTHOR of the batch (the `map`
+        // CTE), not once per row (OB6). A claim whose author resolves to no
+        // group is LEFT ALONE rather than stamped to world or seed — `verify`
+        // will then fail and name it, which is the fail-closed outcome. Phase 0
+        // makes this set empty in the normal case.
+        let n = sqlx::query(&claims_batch_update_sql())
+            .bind(&ids)
+            .bind(WORLD)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
 
         total += n as i64;
         advance_cursor(&mut tx, "claims", Some(last), total).await?;
@@ -620,7 +756,26 @@ async fn backfill_claims(pool: &PgPool, batch_size: i64) -> anyhow::Result<()> {
     }
 
     finish_entity(pool, "claims", total).await?;
-    Ok(())
+    Ok(false)
+}
+
+/// The claims arm's per-batch UPDATE: `$1` the batch's claim ids, `$2` the
+/// world group. The owner is resolved once per distinct author of the batch.
+fn claims_batch_update_sql() -> String {
+    format!(
+        "WITH batch AS MATERIALIZED (
+            SELECT c.id, c.agent_id FROM claims c
+             WHERE c.id = ANY($1) AND c.owner_group_id = $2),
+         map AS MATERIALIZED (
+            SELECT a.agent_id, {gid} AS gid
+              FROM (SELECT DISTINCT agent_id FROM batch) a)
+         UPDATE claims c
+            SET owner_group_id = m.gid, visibility = 'public'
+           FROM batch b JOIN map m ON m.agent_id = b.agent_id
+          WHERE c.id = b.id
+            AND m.gid IS NOT NULL",
+        gid = owner_group_sql("a.agent_id")
+    )
 }
 
 /// `communities` → `('public', communities.id)`.
@@ -655,23 +810,89 @@ async fn backfill_communities(pool: &PgPool) -> anyhow::Result<()> {
 /// as "keyed on the QUERYING agent, not on a claim". A NULL row therefore has
 /// no derivable owner and is left `('public', world)`: see `settle_remaining`
 /// for why that is legal.
-async fn backfill_agent_keyed(pool: &PgPool, table: &str, agent_col: &str) -> anyhow::Result<()> {
+///
+/// Batched and cursored like the claims arm (OB6: it used to be one unbounded
+/// UPDATE per table), with the owner resolved once per distinct agent of the
+/// batch. Returns `true` when `deadline` stopped it between batches.
+async fn backfill_agent_keyed(
+    pool: &PgPool,
+    table: &str,
+    agent_col: &str,
+    batch_size: i64,
+    deadline: Deadline,
+) -> anyhow::Result<bool> {
     // `table` and `agent_col` are compile-time constants from this file, never
     // caller input, so the format! is not an injection surface.
-    let resolver = owner_group_sql(&format!("t.{agent_col}"));
-    let sql = format!(
-        "UPDATE {table} t SET owner_group_id = {resolver}, visibility = 'public'
-          WHERE t.{agent_col} IS NOT NULL
-            AND t.owner_group_id = $1
-            AND {resolver} IS NOT NULL"
+    let select = format!(
+        "SELECT t.id FROM {table} t
+          WHERE t.owner_group_id = $1
+            AND t.{agent_col} IS NOT NULL
+            AND ($2::uuid IS NULL OR t.id > $2)
+          ORDER BY t.id
+          LIMIT $3
+          FOR UPDATE SKIP LOCKED"
     );
-    let n = sqlx::query(&sql)
-        .bind(WORLD)
-        .execute(pool)
-        .await?
-        .rows_affected();
-    finish_entity(pool, table, n as i64).await?;
-    Ok(())
+    let update = format!(
+        "WITH batch AS MATERIALIZED (
+            SELECT t.id, t.{agent_col} AS agent_id FROM {table} t
+             WHERE t.id = ANY($1) AND t.owner_group_id = $2),
+         map AS MATERIALIZED (
+            SELECT a.agent_id, {gid} AS gid
+              FROM (SELECT DISTINCT agent_id FROM batch) a)
+         UPDATE {table} t
+            SET owner_group_id = m.gid, visibility = 'public'
+           FROM batch b JOIN map m ON m.agent_id = b.agent_id
+          WHERE t.id = b.id
+            AND m.gid IS NOT NULL",
+        gid = owner_group_sql("a.agent_id")
+    );
+    let mut cursor: Option<Uuid> = current_cursor(pool, table).await?;
+    let mut total: i64 = persisted_rows_done(pool, table).await?;
+    loop {
+        if deadline.expired() {
+            tracing::warn!(
+                table,
+                total,
+                "walk stopped by --max-runtime; cursor persisted"
+            );
+            return Ok(true);
+        }
+        let mut tx = pool.begin().await?;
+        let ids: Vec<Uuid> = sqlx::query_scalar(&select)
+            .bind(WORLD)
+            .bind(cursor)
+            .bind(batch_size)
+            .fetch_all(&mut *tx)
+            .await?;
+        let Some(&last) = ids.last() else {
+            tx.rollback().await?;
+            break;
+        };
+        let n = sqlx::query(&update)
+            .bind(&ids)
+            .bind(WORLD)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        total += n as i64;
+        advance_cursor(&mut tx, table, Some(last), total).await?;
+        tx.commit().await?;
+        tracing::info!(table, batch = ids.len(), stamped = n, total, "batch");
+        cursor = Some(last);
+    }
+    // As for claims: a row the walk could not stamp (its agent resolves to no
+    // group) is left world-owned, so rewind the cursor and let a re-run retry.
+    let left: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} WHERE owner_group_id = $1 AND {agent_col} IS NOT NULL"
+    ))
+    .bind(WORLD)
+    .fetch_one(pool)
+    .await?;
+    if left > 0 {
+        reset_cursor(pool, table).await?;
+    }
+    finish_entity(pool, table, total).await?;
+    Ok(false)
 }
 
 /// `harvester_fragments` → its claim's tenancy, via the provenance join.
