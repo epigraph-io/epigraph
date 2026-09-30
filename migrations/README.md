@@ -780,7 +780,13 @@ Current reservation:
   --apply`), which is audited and ONE-WAY (the arming table grants the
   maintenance role SELECT/INSERT only, the app role SELECT only). The per-process
   valve `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off` travels as the session setting
-  `epigraph.operator_link_enforcement`. Registered in
+  `epigraph.operator_link_enforcement`. Also
+  `epigraph_link_legacy_authors(operator, exclude[], quiet_since)`: one audited
+  call records a RETIRED link to a HUMAN operator for every agent that authored
+  a tier-A row and has no link, skipping (and reporting) humans, OAuth
+  principals, holders of write authority in the operator's group, 107's
+  shared-signer fingerprint, excluded ids, and claim authors at or after the
+  cutoff (`epigraph-operator link-legacy-authors`). Registered in
   `schema_contract.rs::migration_122_operator_binding_definers_are_owned_and_granted`,
   `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` and
   `verify_operator_function_grants`. Behaviour in

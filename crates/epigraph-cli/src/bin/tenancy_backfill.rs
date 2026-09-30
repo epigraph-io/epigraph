@@ -1144,6 +1144,11 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_require_bound_author", 122),
     ("epigraph_claims_require_operator_binding", 122),
     ("epigraph_arm_operator_binding", 122),
+    // The legacy-author tie: under a non-member owner its reads of the FORCEd
+    // tier-A tables and of `operator_links` are filtered and its link INSERT is
+    // refused by 107's definer-only policy, so it fails CLOSED (links nothing,
+    // or errors); the stake is the tie silently skipped.
+    ("epigraph_link_legacy_authors", 122),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -1403,6 +1408,12 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_arm_operator_binding",
             "public.epigraph_arm_operator_binding()",
+            false,
+        ),
+        // A link function: the request DSN must never record links.
+        (
+            "epigraph_link_legacy_authors",
+            "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
             false,
         ),
     ];

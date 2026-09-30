@@ -27,6 +27,8 @@
 //!
 //! * `arm-operator-binding` — turn enforcement ON, once, after reporting every
 //!   unbound agent that wrote recently (see [`arm`]).
+//! * `link-legacy-authors` — tie every legacy author to the human operator with
+//!   a RETIRED link, in one audited definer call (see [`legacy`]).
 //!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
@@ -68,6 +70,7 @@ pub mod arm;
 pub mod bind;
 pub mod client_scope;
 pub mod hide;
+pub mod legacy;
 pub mod link;
 pub mod manifest;
 pub mod reown;

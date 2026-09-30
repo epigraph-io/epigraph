@@ -367,6 +367,13 @@ const GUARDED_DEFINERS: &[(&str, usize, &[&str])] = &[
         0,
         &["public.epigraph_ensure_personal_group(p_operator)"],
     ),
+    // Migration 122's legacy-author tie resolves the OPERATOR's personal group
+    // through the same definer, once, and creates no membership at all.
+    (
+        "epigraph_link_legacy_authors",
+        0,
+        &["public.epigraph_ensure_personal_group(p_operator)"],
+    ),
 ];
 
 /// Functions the LIVE database may hold whose source matches

@@ -324,3 +324,268 @@ async fn arm_arms_when_every_recent_writer_is_bound(pool: PgPool) {
         .await
         .expect("armed: the human still writes");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// link-legacy-authors
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every shape the legacy tie must link or skip, around one human operator.
+#[allow(dead_code)]
+struct Legacy {
+    human: Uuid,
+    human_group: Uuid,
+    old_author: Uuid,
+    recent_author: Uuid,
+    evidence_signer: Uuid,
+    oauth_principal: Uuid,
+    already_linked: Uuid,
+    other_human: Uuid,
+    excluded: Uuid,
+    shared_signer: Uuid,
+    writer_in_group: Uuid,
+    no_rows: Uuid,
+}
+
+async fn legacy_fixture(pool: &PgPool) -> Legacy {
+    let (human, human_group) = fixture::seed_agent_with_group(pool, "human").await;
+    make_human(pool, human).await;
+    let mut authors = Vec::new();
+    for label in [
+        "old", "recent", "signer", "oauth", "linked", "human2", "excluded", "shared", "writer",
+        "none",
+    ] {
+        authors.push(fixture::seed_agent_with_group(pool, label).await);
+    }
+    let [old, recent, signer, oauth, linked, human2, excluded, shared, writer, none]: [(Uuid, Uuid);
+        10] = authors.try_into().expect("ten");
+
+    // Claims (unarmed, so every author may still write), all but one OLD.
+    for (a, g) in [old, recent, oauth, linked, human2, excluded, shared, writer] {
+        insert_claim(pool, a, g).await.expect("seed claim");
+    }
+    sqlx::query("UPDATE claims SET created_at = now() - interval '90 days' WHERE agent_id <> $1")
+        .bind(recent.0)
+        .execute(pool)
+        .await
+        .expect("age the claims");
+    // An author through `evidence.signer_id` only.
+    let c = insert_claim(pool, old.0, old.1).await.expect("claim");
+    sqlx::query("UPDATE claims SET created_at = now() - interval '90 days' WHERE id = $1")
+        .bind(c)
+        .execute(pool)
+        .await
+        .expect("age");
+    let ev = fixture::seed_evidence(pool, c, "testimony").await;
+    sqlx::query("UPDATE evidence SET signer_id = $2, signature = $3 WHERE id = $1")
+        .bind(ev)
+        .bind(signer.0)
+        .bind(vec![7u8; 64])
+        .execute(pool)
+        .await
+        .expect("signer");
+    // An HTTP service principal.
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'legacy service', 'service', ARRAY['claims:write'], 'active', $2, \
+                 'Example', 'ops@example.invalid')",
+    )
+    .bind(format!("service-{}", oauth.0))
+    .bind(oauth.0)
+    .execute(pool)
+    .await
+    .expect("service client");
+    // Already linked (live): not a candidate at all.
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, linked.0, human)
+            .await
+            .expect("live link");
+    }
+    make_human(pool, human2.0).await;
+    // 107's shared-signer fingerprint: lineage to two principals.
+    for target in [human, human2.0] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+        )
+        .bind(shared.0)
+        .bind(target)
+        .execute(pool)
+        .await
+        .expect("lineage edge");
+    }
+    // A live writer row in the operator's group, with no link.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(human_group)
+    .bind(writer.0)
+    .execute(pool)
+    .await
+    .expect("writer row");
+
+    Legacy {
+        human,
+        human_group,
+        old_author: old.0,
+        recent_author: recent.0,
+        evidence_signer: signer.0,
+        oauth_principal: oauth.0,
+        already_linked: linked.0,
+        other_human: human2.0,
+        excluded: excluded.0,
+        shared_signer: shared.0,
+        writer_in_group: writer.0,
+        no_rows: none.0,
+    }
+}
+
+/// The legacy tie links exactly the quiet, non-principal, non-human authors
+/// (through any author column) with RETIRED links and no membership, skips and
+/// names every other shape, writes nothing on a dry run, audits each applied
+/// run once, and is idempotent.
+///
+/// Verified to fail, each mutation of the definer applied alone:
+/// * the `recent_writer` arm removed -> the recent author is linked;
+/// * the `oauth_principal` arm removed -> the service principal is linked;
+/// * the link inserted with `retired = false` -> the retired assertion fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_legacy_authors_ties_exactly_the_quiet_legacy_authors(pool: PgPool) {
+    let fx = legacy_fixture(&pool).await;
+    let excl = std::env::temp_dir().join(format!("legacy-exclude-{}", Uuid::new_v4()));
+    std::fs::write(&excl, format!("# not this one\n{}\n", fx.excluded)).expect("exclude file");
+    let human_s = fx.human.to_string();
+    let excl_s = excl.display().to_string();
+    let args = [
+        "link-legacy-authors",
+        "--operator",
+        human_s.as_str(),
+        "--exclude-agents-file",
+        excl_s.as_str(),
+    ];
+    let links = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Uuid, bool)>(
+                "SELECT agent_id, retired FROM operator_links ORDER BY agent_id",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("links")
+        }
+    };
+    let audits = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM security_events \
+                  WHERE event_type = 'operator.legacy_authors_linked'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("audits")
+        }
+    };
+    let before = links().await;
+
+    let dry = run_op(&pool, &args).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    for (tag, agent) in [
+        ("LINKED-RETIRED", fx.old_author),
+        ("LINKED-RETIRED", fx.evidence_signer),
+        ("SKIPPED:recent_writer", fx.recent_author),
+        ("SKIPPED:oauth_principal", fx.oauth_principal),
+        ("SKIPPED:human_operator", fx.other_human),
+        ("SKIPPED:excluded", fx.excluded),
+        ("SKIPPED:shared_signer", fx.shared_signer),
+        ("SKIPPED:write_authority", fx.writer_in_group),
+    ] {
+        assert!(
+            dry.stdout.contains(&format!("{tag}\t{agent}")),
+            "expected {tag} for {agent}:\n{}",
+            dry.show()
+        );
+    }
+    // Not candidates: already linked, authored nothing, the operator itself.
+    // (The operator's id is on the header line, so look for a per-agent line.)
+    for absent in [fx.already_linked, fx.no_rows, fx.human] {
+        assert!(
+            !dry.stdout.contains(&format!("\t{absent}")),
+            "{absent} is not a candidate:\n{}",
+            dry.show()
+        );
+    }
+    assert_eq!(links().await, before, "a dry run must link nothing");
+    assert_eq!(
+        audits().await,
+        0,
+        "a dry run's audit row rolls back with it"
+    );
+
+    let mut apply = args.to_vec();
+    apply.push("--apply");
+    let applied = run_op(&pool, &apply).await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    let mut expected = before.clone();
+    expected.push((fx.old_author, true));
+    expected.push((fx.evidence_signer, true));
+    expected.sort();
+    assert_eq!(
+        links().await,
+        expected,
+        "exactly the two quiet legacy authors, RETIRED:\n{}",
+        applied.show()
+    );
+    let memberships: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = ANY($2)",
+    )
+    .bind(fx.human_group)
+    .bind(vec![fx.old_author, fx.evidence_signer])
+    .fetch_one(&pool)
+    .await
+    .expect("memberships");
+    assert_eq!(memberships, 0, "a retired tie grants no membership");
+    let details: serde_json::Value = sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = 'operator.legacy_authors_linked'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("one audit row");
+    assert_eq!(details["linked"], 2, "{details}");
+    assert_eq!(details["candidates"], 8, "{details}");
+
+    let again = run_op(&pool, &apply).await;
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(
+        !again.stdout.contains("LINKED-RETIRED"),
+        "a re-run links nothing new:\n{}",
+        again.show()
+    );
+    assert_eq!(links().await, expected);
+    assert_eq!(audits().await, 2, "one audit row per applied run");
+    let _ = std::fs::remove_file(excl);
+}
+
+/// The operator must be a HUMAN operator; nothing is tied otherwise.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_legacy_authors_refuses_a_non_human_operator(pool: PgPool) {
+    let (not_human, _) = fixture::seed_agent_with_group(&pool, "not-human").await;
+    let (author, group) = fixture::seed_agent_with_group(&pool, "author").await;
+    insert_claim(&pool, author, group).await.expect("claim");
+    let r = run_op(
+        &pool,
+        &[
+            "link-legacy-authors",
+            "--operator",
+            &not_human.to_string(),
+            "--no-quiet-window",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(r.stderr.contains("is not a human operator"), "{}", r.show());
+    assert_eq!(link_row(&pool, author).await, None);
+}

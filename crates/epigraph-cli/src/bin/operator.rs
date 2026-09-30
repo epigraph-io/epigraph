@@ -27,11 +27,13 @@
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
 //!         --agent-system-prompt-hash H) [--apply]
 //!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
+//!     epigraph-operator link-legacy-authors --operator <uuid> [--exclude-agents-file F] \
+//!         [--quiet-days 30 | --no-quiet-window] [--apply]
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 
 use clap::{Parser, Subcommand};
-use epigraph_cli::operator::{self, arm, bind, client_scope, hide, link, reown, reverse};
+use epigraph_cli::operator::{self, arm, bind, client_scope, hide, legacy, link, reown, reverse};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -84,6 +86,28 @@ enum Command {
         #[arg(long)]
         allow_unbound_writers: bool,
         /// Arm. Without it, only the report is printed.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Tie every legacy author (an agent that authored a tier-A row and has no
+    /// operator link) to a HUMAN operator with a RETIRED link, in one audited
+    /// call (migration 122). Skipped agents are listed with the reason.
+    LinkLegacyAuthors {
+        /// The human operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// Agent ids never to tie (one per line; `#` comments allowed).
+        #[arg(long)]
+        exclude_agents_file: Option<PathBuf>,
+        /// Skip, as `recent_writer`, every agent that authored a claim in this
+        /// many days: it may still be running and wants a LIVE link.
+        #[arg(long, default_value_t = 30, conflicts_with = "no_quiet_window")]
+        quiet_days: i64,
+        /// Tie recent writers too (no quiet window).
+        #[arg(long)]
+        no_quiet_window: bool,
+        /// Commit. Without it, the call runs in a transaction that is rolled
+        /// back.
         #[arg(long)]
         apply: bool,
     },
@@ -256,6 +280,33 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("{line}");
             }
             Ok(if report.refused { 1 } else { 0 })
+        }
+        Command::LinkLegacyAuthors {
+            operator: op,
+            exclude_agents_file,
+            quiet_days,
+            no_quiet_window,
+            apply,
+        } => {
+            if !no_quiet_window && quiet_days <= 0 {
+                anyhow::bail!("--quiet-days must be at least 1 (or pass --no-quiet-window)");
+            }
+            let exclude = match exclude_agents_file {
+                Some(f) => operator::read_ids_file(&f)?,
+                None => Vec::new(),
+            };
+            let opts = legacy::Options {
+                operator: op,
+                exclude,
+                quiet_since: (!no_quiet_window)
+                    .then(|| chrono::Utc::now() - chrono::Duration::days(quiet_days)),
+                apply,
+            };
+            let rows = legacy::run(&mut conn, &opts).await?;
+            for line in legacy::describe(&rows, &opts) {
+                println!("{line}");
+            }
+            Ok(0)
         }
         Command::LinkRetired {
             agents_file,

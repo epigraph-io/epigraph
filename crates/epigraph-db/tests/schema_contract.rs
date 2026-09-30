@@ -1444,6 +1444,12 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
             "v",
             false,
         ),
+        (
+            "epigraph_link_legacy_authors",
+            "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
+            "v",
+            false,
+        ),
     ] {
         let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
             "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
