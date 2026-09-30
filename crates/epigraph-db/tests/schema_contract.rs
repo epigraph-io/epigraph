@@ -1476,7 +1476,61 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
         ),
         (
             "epigraph_register_human_operator",
-            "public.epigraph_register_human_operator(uuid, text)",
+            "public.epigraph_register_human_operator(uuid, text, uuid)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_human_of",
+            "public.epigraph_human_of(uuid, boolean)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_binding_armed",
+            "public.epigraph_operator_binding_armed()",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_require_bound_writer",
+            "public.epigraph_require_bound_writer(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_require_writer_scope",
+            "public.epigraph_require_writer_scope(uuid, uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_require_attributable",
+            "public.epigraph_require_attributable(uuid, uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_links_audit",
+            "public.epigraph_operator_links_audit()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_human_operators_guard_insert",
+            "public.epigraph_human_operators_guard_insert()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_human_operators_guard_update",
+            "public.epigraph_human_operators_guard_update()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_human_operators_audit",
+            "public.epigraph_human_operators_audit()",
             "v",
             false,
         ),
@@ -1558,7 +1612,9 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
     for (col, expected) in [
         ("revoked_at", true),
         ("revoked_by", true),
+        ("revoked_reason", true),
         ("agent_id", false),
+        ("client_id", false),
         ("reason", false),
     ] {
         let can: bool = sqlx::query_scalar(
@@ -1571,4 +1627,32 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
         .expect("column privilege");
         assert_eq!(can, expected, "maintenance UPDATE of human_operators.{col}");
     }
+}
+
+/// Migration 122: the operator-binding claims trigger fires AFTER
+/// `claims_require_tenancy` (PostgreSQL fires same-event BEFORE ROW triggers in
+/// name order). Its OPL02 scope check reads `owner_group_id`, which the tenancy
+/// trigger fills for a supersede or a step-lineage insert; sorting first, it
+/// read NULL and refused every supersede of a linked agent's claim (review
+/// SEC-4). Renaming the trigger back fails this.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_122_binding_trigger_fires_after_the_tenancy_fill(pool: PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT tgname::text FROM pg_trigger \
+          WHERE tgrelid = 'public.claims'::regclass AND NOT tgisinternal \
+            AND tgname IN ('claims_require_tenancy', 'claims_require_operator_binding', \
+                           'claims_require_tenancy_then_operator_binding') \
+          ORDER BY tgname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("trigger names");
+    assert_eq!(
+        names,
+        vec![
+            "claims_require_tenancy".to_string(),
+            "claims_require_tenancy_then_operator_binding".to_string()
+        ],
+        "the binding trigger must exist once, and sort after the tenancy trigger"
+    );
 }

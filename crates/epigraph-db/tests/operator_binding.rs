@@ -30,9 +30,11 @@
 //!   role: fails `arming_is_maintenance_only_audited_and_one_way`;
 //! * `epigraph_is_human_operator(l.operator_id)` dropped from arm (b): fails
 //!   `a_live_link_and_a_human_operator_are_bound_and_a_retired_link_is_not`;
-//! * the claims trigger's `epigraph_require_operator_scope` call removed, and
+//! * the claims trigger's `epigraph_require_writer_scope` calls removed, and
 //!   separately the `group_memberships_operator_scope` trigger removed: each
 //!   fails `a_linked_agent_writes_only_where_its_own_operator_writes`.
+//!
+//! The tests added by the review fixes name their own mutations.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -304,7 +306,7 @@ fn code_of<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>) -> Option<String> {
 /// either. Measured on the APPLICATION ROLE (a privileged session is exempt).
 /// An instance-admin principal crosses groups.
 ///
-/// Verified to fail: the `PERFORM ... epigraph_require_operator_scope` line
+/// Verified to fail: the `PERFORM ... epigraph_require_writer_scope` lines
 /// removed from the claims trigger -> the write into B's group lands; the
 /// membership trigger's `CREATE TRIGGER` removed -> B's enrolment lands.
 #[sqlx::test(migrations = "../../migrations")]
@@ -780,4 +782,548 @@ async fn the_human_registry_is_maintenance_written_audited_and_required(pool: Pg
     AgentRepository::link_operator(&mut conn, agent, dcr)
         .await
         .expect("an exact re-link of an existing link records nothing and is not refused");
+}
+
+/// Link `agent` live to `operator` (a registered human) on the harness pool.
+async fn link_live(pool: &PgPool, agent: Uuid, operator: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_operator(&mut conn, agent, operator)
+        .await
+        .expect("live link");
+}
+
+/// A `('public', group)` claim by `author` inserted on an `epigraph_app`
+/// connection stamped as `writer` with `groups` readable AND writable.
+async fn write_as(
+    pool: &PgPool,
+    writer: Uuid,
+    groups: &[Uuid],
+    author: Uuid,
+    owner: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    as_app_stamped(pool, writer, groups, |mut conn| async move {
+        let r = insert_claim(&mut *conn, author, owner).await;
+        (conn, r)
+    })
+    .await
+}
+
+/// Review SEC-1 / SEC-2: the trigger binds the WRITER (the session principal
+/// `ScopedPool` stamps from the authenticated viewer), not only the author
+/// column the request supplies. Two humans; X is A's agent, Y is B's, U is
+/// bound to nobody. Every write is on the application role, and the stamps
+/// deliberately make the owner group writable, so row security (and the orphan
+/// permissive policies a production database may still carry) admits the row
+/// and the trigger alone decides.
+///
+/// Verified to fail: the trigger's writer branch replaced by the author-only
+/// checks (the pre-review body) -> U's write naming human A lands, and Y's
+/// write naming human A inside B's group lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_writer_is_bound_not_only_the_author_column(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, b_group) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
+    let (u, u_group) = fixture::seed_agent_with_group(&pool, "unbound-u").await;
+    link_live(&pool, x, a).await;
+    link_live(&pool, y, b).await;
+    arm(&pool).await;
+
+    // An unbound writer, whatever author it names, writes nothing.
+    for (author, owner, what) in [
+        (a, u_group, "U names human A, owned by U's own group"),
+        (a, a_group, "U names human A, owned by A's group"),
+        (x, a_group, "U names A's agent X, owned by A's group"),
+    ] {
+        let r = write_as(&pool, u, &[u_group, a_group], author, owner).await;
+        assert_opl01(r, what);
+    }
+
+    // A bound writer may name only an author of its own human.
+    for (author, what) in [
+        (a, "B's agent Y names human A in B's group"),
+        (x, "B's agent Y names A's agent X in B's group"),
+    ] {
+        let r = write_as(&pool, y, &[b_group], author, b_group).await;
+        assert_eq!(code_of(&r).as_deref(), Some("OPL02"), "{what}: {r:?}");
+    }
+    // Nor write, under its own name, where its human does not write.
+    let r = write_as(&pool, y, &[a_group], y, a_group).await;
+    assert_eq!(
+        code_of(&r).as_deref(),
+        Some("OPL02"),
+        "Y into A's group: {r:?}"
+    );
+
+    // Controls: its own name in its human's group; a human naming its agent.
+    write_as(&pool, y, &[b_group], y, b_group)
+        .await
+        .expect("Y as itself into B's group");
+    write_as(&pool, a, &[a_group], x, a_group)
+        .await
+        .expect("human A names its own agent X in its own group");
+    let wrong: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE agent_id = $1 AND owner_group_id <> $2",
+    )
+    .bind(a)
+    .bind(a_group)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(wrong, 0, "no claim attributed to A outside A's group");
+}
+
+/// Review SEC-4: once armed, the real supersede act
+/// (`ClaimRepository::supersede_act_conn`, which declares no owner and
+/// inherits the old claim's author) works for a live-linked agent superseding
+/// its own claim and for a human superseding its RETIRED legacy author's claim,
+/// and is refused for an unbound writer.
+///
+/// Verified to fail: the trigger renamed back to sort before
+/// `claims_require_tenancy` -> X's supersede is refused OPL02 on a NULL owner;
+/// `epigraph_require_attributable` reading only LIVE links for the author ->
+/// A's supersede of the legacy claim is refused OPL01.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "legacy").await;
+    let (u, u_group) = fixture::seed_agent_with_group(&pool, "unbound-u").await;
+    link_live(&pool, x, a).await;
+    let x_claim = insert_claim(&pool, x, a_group).await.expect("X's claim");
+    let legacy_claim = insert_claim(&pool, legacy, a_group)
+        .await
+        .expect("legacy claim");
+    let a_claim = insert_claim(&pool, a, a_group).await.expect("A's claim");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy author's retired tie");
+    }
+    arm(&pool).await;
+
+    let supersede = |writer: Uuid, groups: Vec<Uuid>, old: Uuid| {
+        let pool = pool.clone();
+        async move {
+            as_app_stamped(&pool, writer, &groups, |mut conn| async move {
+                let r = {
+                    let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+                    let r = epigraph_db::ClaimRepository::supersede_act_conn(
+                        &mut tx,
+                        epigraph_core::ClaimId::from_uuid(old),
+                        &format!("revision of {old}"),
+                        epigraph_core::TruthValue::new(0.6).expect("truth"),
+                        "operator binding probe",
+                    )
+                    .await;
+                    if r.is_ok() {
+                        tx.commit().await.expect("commit");
+                    }
+                    r
+                };
+                (conn, r)
+            })
+            .await
+        }
+    };
+
+    let (new_x, _) = supersede(x, vec![a_group], x_claim)
+        .await
+        .expect("a live-linked agent supersedes its own claim once armed");
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(new_x)
+        .fetch_one(&pool)
+        .await
+        .expect("owner");
+    assert_eq!(owner, a_group, "the successor inherits the owner group");
+
+    supersede(a, vec![a_group], legacy_claim)
+        .await
+        .expect("a human supersedes its own retired legacy author's claim once armed");
+
+    let refused = supersede(u, vec![u_group, a_group], a_claim)
+        .await
+        .expect_err("an unbound writer must not supersede");
+    assert!(
+        matches!(refused, epigraph_db::DbError::OperatorLinkRequired { .. }),
+        "{refused:?}"
+    );
+    let still: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(a_claim)
+        .fetch_one(&pool)
+        .await
+        .expect("current");
+    assert!(still, "a refused supersede retires nothing");
+}
+
+/// Review SEC-10: the valve relieves the BINDING (OPL01) only. With it open, an
+/// unbound agent writes, but a linked agent still cannot write into another
+/// human's group and another human still cannot enrol it there (OPL02).
+///
+/// Verified to fail: `epigraph_require_writer_scope` gated on
+/// `epigraph_operator_binding_enforced()` (the valve) instead of
+/// `epigraph_operator_binding_armed()` -> Y's write into A's group lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_valve_relieves_the_binding_but_never_the_cross_human_scope(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, b_group) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
+    let (u, u_group) = fixture::seed_agent_with_group(&pool, "unbound-u").await;
+    link_live(&pool, x, a).await;
+    link_live(&pool, y, b).await;
+    arm(&pool).await;
+
+    let valve_write = |writer: Uuid, groups: Vec<Uuid>, author: Uuid, owner: Uuid| {
+        let pool = pool.clone();
+        async move {
+            as_app_stamped(&pool, writer, &groups, |mut conn| async move {
+                sqlx::query(
+                    "SELECT set_config('epigraph.operator_link_enforcement', 'off', false)",
+                )
+                .execute(&mut *conn)
+                .await
+                .expect("valve");
+                let r = insert_claim(&mut *conn, author, owner).await;
+                sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+                    .execute(&mut *conn)
+                    .await
+                    .expect("valve reset");
+                (conn, r)
+            })
+            .await
+        }
+    };
+    valve_write(u, vec![u_group], u, u_group)
+        .await
+        .expect("the valve admits an unbound author (its purpose)");
+    let r = valve_write(y, vec![a_group], y, a_group).await;
+    assert_eq!(
+        code_of(&r).as_deref(),
+        Some("OPL02"),
+        "valve open, Y into A's group: {r:?}"
+    );
+
+    let enrol = as_app_stamped(&pool, b, &[b_group], |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', 'off', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("valve");
+        let r = sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'writer')",
+        )
+        .bind(b_group)
+        .bind(x)
+        .execute(&mut *conn)
+        .await;
+        sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("valve reset");
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        code_of(&enrol).as_deref(),
+        Some("OPL02"),
+        "valve open, B enrols X: {enrol:?}"
+    );
+}
+
+/// Review SEC-6 / SEC-8: a human is the agent of the ONE client its
+/// registration names, so the application role (which may INSERT
+/// `oauth_clients`, but not UPDATE it) cannot undo a suspension by minting a
+/// fresh active human client; and the registry's rules hold for a direct
+/// maintenance write: a revoke is final (no un-revoke by UPDATE), an INSERT for
+/// an agent with no active human client is refused, and a direct INSERT is
+/// audited like the definer's.
+///
+/// Verified to fail, each alone: `epigraph_is_human_operator` reading any
+/// active human client of the agent (not `h.client_id`) -> the minted client
+/// revives B's agent; the `human_operators_guard_update` trigger dropped -> the
+/// un-revoke lands; the `human_operators_audit` trigger dropped -> the direct
+/// INSERT leaves no audit row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_registry_keys_on_its_client_and_holds_for_direct_writes(pool: PgPool) {
+    let (b, _) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
+    link_live(&pool, y, b).await;
+    let binding = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT public.epigraph_author_binding($1)")
+                .bind(agent)
+                .fetch_one(&pool)
+                .await
+                .expect("binding")
+        }
+    };
+    assert_eq!(binding(y).await.as_deref(), Some("live_link"));
+
+    sqlx::query("UPDATE oauth_clients SET status = 'suspended' WHERE agent_id = $1")
+        .bind(b)
+        .execute(&pool)
+        .await
+        .expect("suspend B's recorded client");
+    assert_eq!(binding(y).await, None, "a suspended client binds nobody");
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query(
+            "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                        status, agent_id) \
+             VALUES ($1, 'minted', 'human', ARRAY['claims:write'], 'active', $2)",
+        )
+        .bind(format!("minted-{b}"))
+        .bind(b)
+        .execute(&mut *conn)
+        .await
+        .expect("the app role may register a client");
+        (conn, ())
+    })
+    .await;
+    assert_eq!(
+        binding(y).await,
+        None,
+        "a freshly minted active human client must not revive a suspended human"
+    );
+
+    // Revoke through the definer, then try to un-revoke directly.
+    let (unrevoke, no_client_insert, direct_ok) =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            sqlx::query("SELECT * FROM public.epigraph_revoke_human_operator($1, 'test')")
+                .bind(b)
+                .execute(&mut *conn)
+                .await
+                .expect("revoke");
+            let unrevoke = sqlx::query(
+                "UPDATE human_operators SET revoked_at = NULL, revoked_by = NULL, \
+                        revoked_reason = NULL WHERE agent_id = $1",
+            )
+            .bind(b)
+            .execute(&mut *conn)
+            .await
+            .err()
+            .and_then(|e| sqlstate(&e));
+            let (bare, _) = (Uuid::new_v4(), ());
+            sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'human')")
+                .bind(bare)
+                .bind(bare.as_bytes().repeat(2))
+                .execute(&mut *conn)
+                .await
+                .expect("bare agent");
+            let no_client =
+                sqlx::query("INSERT INTO human_operators (agent_id, reason) VALUES ($1, 'direct')")
+                    .bind(bare)
+                    .execute(&mut *conn)
+                    .await
+                    .err()
+                    .and_then(|e| sqlstate(&e));
+            (conn, (unrevoke, no_client, bare))
+        })
+        .await;
+    assert_eq!(unrevoke.as_deref(), Some("55000"), "revoke is final");
+    assert_eq!(
+        no_client_insert.as_deref(),
+        Some("55000"),
+        "no active human client"
+    );
+    let _ = direct_ok;
+    let human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
+        .bind(b)
+        .fetch_one(&pool)
+        .await
+        .expect("is human");
+    assert!(!human, "B stays revoked");
+
+    // A direct maintenance INSERT for a real human client is audited.
+    let (c, _) = fixture::seed_agent_with_group(&pool, "human-c").await;
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id) \
+         VALUES ($1, 'c', 'human', ARRAY['claims:write'], 'active', $2)",
+    )
+    .bind(format!("c-{c}"))
+    .bind(c)
+    .execute(&pool)
+    .await
+    .expect("C's client");
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("INSERT INTO human_operators (agent_id, reason) VALUES ($1, 'direct')")
+            .bind(c)
+            .execute(&mut *conn)
+            .await
+            .expect("a direct maintenance registration of a real human client");
+        (conn, ())
+    })
+    .await;
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'operator.human_registered' AND agent_id = $1",
+    )
+    .bind(c)
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(
+        audited, 1,
+        "a direct registration is audited like the definer's"
+    );
+}
+
+/// Review SEC-12 / SEC-5: every link row is audited where it is written, and
+/// OPERATED_BY edges an application session forges FROM a human no longer
+/// block linking agents to that human (107's operator-side fingerprint is
+/// skipped for a registered human operator).
+///
+/// Verified to fail, each alone: the `operator_links_audit` trigger dropped ->
+/// no `operator.link_recorded` row; section 9's `NOT
+/// public.epigraph_is_human_operator(p_operator) AND` removed from
+/// `epigraph_link_operator` -> the link after the forgery is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn links_are_audited_and_forged_edges_cannot_block_a_human(pool: PgPool) {
+    let (a, _) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (u, u_group) = fixture::seed_agent_with_group(&pool, "unbound-u").await;
+    let (p, _) = fixture::seed_agent_with_group(&pool, "principal-p").await;
+    let (fleet, _) = fixture::seed_agent_with_group(&pool, "new-fleet-agent").await;
+    let (legacy, legacy_group) = fixture::seed_agent_with_group(&pool, "legacy").await;
+    insert_claim(&pool, legacy, legacy_group)
+        .await
+        .expect("legacy claim");
+
+    as_app_stamped(&pool, u, &[u_group], |mut conn| async move {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY'), \
+                    ($1, 'agent', $3, 'agent', 'OPERATED_BY')",
+        )
+        .bind(a)
+        .bind(u)
+        .bind(p)
+        .execute(&mut *conn)
+        .await
+        .expect("an app session can write these edges");
+        (conn, ())
+    })
+    .await;
+
+    link_live(&pool, fleet, a).await;
+    link_live(&pool, fleet, a).await; // an exact re-link records nothing new
+    let linked: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT * FROM public.epigraph_link_legacy_authors($1)")
+            .bind(a)
+            .fetch_all(&pool)
+            .await
+            .expect("the legacy tie is not refused either");
+    assert!(
+        linked.contains(&(legacy, "linked".to_string())),
+        "{linked:?}"
+    );
+
+    let events: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT agent_id, details->>'retired' FROM security_events \
+          WHERE event_type = 'operator.link_recorded' ORDER BY created_at, agent_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("link events");
+    assert!(events.contains(&(fleet, "false".to_string())), "{events:?}");
+    assert!(events.contains(&(legacy, "true".to_string())), "{events:?}");
+    assert_eq!(
+        events.iter().filter(|(agent, _)| *agent == fleet).count(),
+        1,
+        "one event per recorded link, none for a re-link"
+    );
+}
+
+/// Reviews C6 / SEC-11, C7 and C8 (the `foreign_write_authority` survivor):
+/// `epigraph_link_legacy_authors` never ties an agent whose own auth lineage
+/// names ANOTHER registered human, nor one that writes in a group this operator
+/// does not write; and it counts `challenges.resolved_by` as authorship.
+///
+/// Verified to fail, each alone: the `skipped:operated_by_other_human` arm
+/// deleted -> B's agent is tied to A; the `skipped:foreign_write_authority` arm
+/// deleted -> the foreign writer is tied to A; the `challenges.resolved_by`
+/// UNION arm deleted -> the resolver is not a candidate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_legacy_tie_never_takes_another_humans_agent(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, b_group) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (of_b, of_b_group) = fixture::seed_agent_with_group(&pool, "b-lineage").await;
+    let (foreign, foreign_group) = fixture::seed_agent_with_group(&pool, "b-writer").await;
+    let (plain, plain_group) = fixture::seed_agent_with_group(&pool, "plain").await;
+    let (resolver, _) = fixture::seed_agent_with_group(&pool, "resolver").await;
+    for (agent, group) in [
+        (of_b, of_b_group),
+        (foreign, foreign_group),
+        (plain, plain_group),
+    ] {
+        insert_claim(&pool, agent, group)
+            .await
+            .expect("legacy claim");
+    }
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+    )
+    .bind(of_b)
+    .bind(b)
+    .execute(&pool)
+    .await
+    .expect("lineage to B");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(b_group)
+    .bind(foreign)
+    .execute(&pool)
+    .await
+    .expect("a writer row in B's group");
+    let a_claim = insert_claim(&pool, a, a_group).await.expect("A's claim");
+    sqlx::query(
+        "INSERT INTO challenges (claim_id, challenge_type, explanation, resolved_by, state) \
+         VALUES ($1, 'factual', 'resolved', $2, 'resolved')",
+    )
+    .bind(a_claim)
+    .bind(resolver)
+    .execute(&pool)
+    .await
+    .expect("a challenge resolved by the resolver");
+
+    let outcomes: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT * FROM public.epigraph_link_legacy_authors($1)")
+            .bind(a)
+            .fetch_all(&pool)
+            .await
+            .expect("legacy tie");
+    let outcome = |agent: Uuid| {
+        outcomes
+            .iter()
+            .find(|(id, _)| *id == agent)
+            .map(|(_, o)| o.clone())
+    };
+    assert_eq!(
+        outcome(of_b).as_deref(),
+        Some("skipped:operated_by_other_human"),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        outcome(foreign).as_deref(),
+        Some("skipped:foreign_write_authority"),
+        "{outcomes:?}"
+    );
+    assert_eq!(outcome(plain).as_deref(), Some("linked"), "{outcomes:?}");
+    assert_eq!(outcome(resolver).as_deref(), Some("linked"), "{outcomes:?}");
+    let tied_to_a: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM operator_links WHERE operator_id = $1 AND agent_id IN ($2, $3)",
+    )
+    .bind(a)
+    .bind(of_b)
+    .bind(foreign)
+    .fetch_one(&pool)
+    .await
+    .expect("links");
+    assert_eq!(tied_to_a, 0, "neither is tied to A");
 }

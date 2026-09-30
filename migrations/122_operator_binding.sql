@@ -12,7 +12,8 @@
 -- precondition.
 --
 -- A claim INSERT (and an UPDATE that changes `claims.agent_id`) is admitted
--- only when its author is BOUND:
+-- only when its author is BOUND, and, when the session's authenticated
+-- principal is not the author, only when that WRITER is bound too (section 2):
 --
 --   (a) a HUMAN OPERATOR (`epigraph_is_human_operator`): an agent with a live
 --       row in the maintenance-only registry `human_operators` (section 1c)
@@ -37,13 +38,18 @@
 --
 -- Every agent is tied to exactly one human for life (`operator_links` is keyed
 -- on the agent, and 107 refuses a second operator, live or retired), and
--- admin access is the only thing that crosses groups. So a claim authored by a
+-- admin access is the only thing that crosses groups. So a claim written by a
 -- live-linked agent must be owned by a group its OPERATOR holds a live
 -- `writer`/`admin` membership in (`epigraph_operator_writes_group`), never by
 -- another human's personal or private group and never by the agent's own
--- personal group (which no human holds). A revoked agent therefore writes
--- nothing: its default declaration falls back to its own group, which this
--- refuses. Refused with SQLSTATE `OPL02` (`DbError::OperatorScopeRefused`).
+-- personal group (which no human holds); and a claim written by a human must be
+-- owned by a group that human writes (`epigraph_require_writer_scope`: on the
+-- claims path a human is scoped like everyone). A revoked agent therefore
+-- writes nothing: its default declaration falls back to its own group, which
+-- this refuses. A claim may also NAME, as its author, only an agent of the
+-- writer's own human (`epigraph_require_attributable`), so one human's agent
+-- cannot put words in another human's mouth. Refused with SQLSTATE `OPL02`
+-- (`DbError::OperatorScopeRefused`).
 --
 -- The same rule guards the door every other write goes through: a `writer` /
 -- `admin` row in `group_memberships` for a live-linked agent is refused
@@ -51,7 +57,14 @@
 -- (`group_memberships_operator_scope`), so another human cannot enrol my agent
 -- into their group and let it write evidence, edges or beliefs there. A
 -- membership that PREDATES the link (or outlives the operator's own) is not
--- revisited; it is a residual this file names rather than hides.
+-- revisited here; `epigraph-operator link` lists such rows and revokes them on
+-- request (`--revoke-foreign-writes`). The link definer does not refuse them:
+-- any application session can enrol an unlinked agent as a writer in its own
+-- group, so a refusal would let it strand every new agent (measured by review).
+--
+-- Section 1b is enforced whenever the database is ARMED, whatever the
+-- session's valve (section 4): the valve relieves the binding, never the
+-- cross-human scope.
 --
 -- EXEMPT from 1b only (never from section 1's binding): a privileged session
 -- (`epigraph_bypass()`: the maintenance role or a superuser, i.e. the operator
@@ -66,17 +79,23 @@
 -- it as an operator" certified itself: 107's `epigraph_link_operator` never
 -- asked whether its operator is a human, so linking X to Y made Y one. And
 -- `client_type = 'human'` alone is what an unauthenticated dynamic client
--- registration is typed as. So (a) requires BOTH an active human client AND a
--- live row in `human_operators`, which only a maintenance session writes:
--- `epigraph_register_human_operator` (refuses an agent with no active human
--- client) and `epigraph_revoke_human_operator`, each audited by one
--- `security_events` row (`operator.human_registered` / `operator.human_revoked`).
--- The grants are the protection (the table is rowless, like
--- `operator_binding_arming`): the app role may only SELECT; the maintenance
--- role may SELECT, INSERT and UPDATE `revoked_at`, and nothing else. A
--- maintenance login can therefore also INSERT directly; "only through the
--- definer" is the audited convention, and the trust basis is 107 section 4's
--- (the maintenance DSN authorizes).
+-- registration is typed as. So (a) requires BOTH a live row in
+-- `human_operators`, which only a maintenance session writes, AND the ONE
+-- OAuth client that row names (`client_id`) still being an active human client
+-- of the agent. Keyed on that client, not on "any active human client": the
+-- application role may INSERT `oauth_clients` (dynamic registration) but not
+-- UPDATE it, so it cannot undo a suspension by minting a fresh active client.
+--
+-- The rules live on the TABLE, not only in the two definers
+-- (`epigraph_register_human_operator`, `epigraph_revoke_human_operator`): a
+-- BEFORE INSERT trigger requires the named (or the agent's one) active human
+-- client; a BEFORE UPDATE trigger admits only a revoke, and nothing at all on
+-- a revoked row (revoke is final); an AFTER trigger writes the one
+-- `security_events` row per registration and per revoke
+-- (`operator.human_registered` / `operator.human_revoked`). So a maintenance
+-- login's direct INSERT or UPDATE, which its grants admit because the definers
+-- run as that role, meets the same checks and leaves the same audit. The app
+-- role may only SELECT.
 --
 -- The registry also gates the LINK RECORD: `operator_links_operator_is_human`
 -- (BEFORE INSERT on `operator_links`) refuses a new link whose operator is not
@@ -93,12 +112,26 @@
 -- ===================================================================
 -- 2. WHERE IT IS ENFORCED: A TRIGGER, SO NO WRITE PATH CAN SKIP IT
 --
--- `claims_require_operator_binding` is a BEFORE INSERT OR UPDATE OF agent_id
--- row trigger on `claims`. Every claim write reaches it: REST, MCP over HTTP
--- and stdio, the CLIs, workflow ingest, default and explicit declarations, and
--- a raw INSERT on any role (a superuser included: triggers are not bypassed by
--- BYPASSRLS). It is named to sort BEFORE `claims_require_tenancy`, so an
--- unbound author is refused before any tenancy work.
+-- `claims_require_tenancy_then_operator_binding` is a BEFORE INSERT OR UPDATE
+-- OF agent_id row trigger on `claims`. Every claim write reaches it: REST, MCP
+-- over HTTP and stdio, the CLIs, workflow ingest, default and explicit
+-- declarations, and a raw INSERT on any role (a superuser included: triggers
+-- are not bypassed by BYPASSRLS). It is named to sort AFTER
+-- `claims_require_tenancy`, because section 1b reads `owner_group_id`, which
+-- that trigger fills for a supersede or a step-lineage insert.
+--
+-- WHO it binds. `claims.agent_id` is a column the writing session supplies
+-- (REST takes it from the request body), so binding it alone let any session
+-- write as any bound author. The trigger therefore binds the session's
+-- authenticated PRINCIPAL (`epigraph_principal_id()`, stamped by `ScopedPool`
+-- from the viewer) whenever it differs from the author: the writer must be
+-- bound (OPL01), must write the owner group (OPL02), and may name as author
+-- only an agent of its own human, a RETIRED one included (OPL02 otherwise), so
+-- a human superseding its own legacy author's claim is admitted. With no
+-- principal, or a principal equal to the author, or on a privileged session,
+-- the author is the one checked. Workflow ingest writes as one shared system
+-- agent under that agent's own stamp, so its request paths bind their CALLER
+-- before stamping (`AgentRepository::require_writer_authority`).
 --
 -- `default_decl_for_author` calls the same check
 -- (`epigraph_require_bound_author`) BEFORE it resolves a personal group, so the
@@ -138,12 +171,13 @@
 -- `ScopedPool` opens. `epigraph_operator_binding_enforced()` honours that
 -- session setting. Default (unset, or any other value): ON.
 --
+-- The valve relieves the BINDING (OPL01) only. The cross-human scope (OPL02,
+-- section 1b) keys on the arming alone, so no valve lets one human's agent
+-- write into another human's group.
+--
 -- The setting is the valve's TRANSPORT, not an authority boundary. Any session
--- can set a custom GUC; a session that can do so can equally INSERT a claim
--- naming any bound agent as its author (`claims.agent_id` is a column the
--- writing session supplies, and 077's policies check the OWNER group, not the
--- author). So the setting adds no capability a database session did not
--- already have; what it guards against is a CODE PATH forgetting the rule,
+-- can set a custom GUC, so a raw session that sets it writes as an unbound
+-- agent; what the setting guards against is a CODE PATH forgetting the rule,
 -- which it does, because nothing sets it but the valve.
 --
 -- ===================================================================
@@ -157,18 +191,22 @@
 -- (whether that operator holds a live writer/admin row there), which
 -- `group_memberships_tenancy` would otherwise hide from a non-member. Accepted
 -- for 107's reason: the request path must ask about the AUTHOR and its
--- OPERATOR, neither of which is the session principal.
+-- OPERATOR, neither of which is the session principal. `epigraph_human_of`
+-- adds nothing to that: `operator_links` is already app-readable (107).
 --
 -- ===================================================================
 -- 6. UNDO
 --
--- `DROP TRIGGER IF EXISTS claims_require_operator_binding ON public.claims;`
--- then drop the functions and `operator_binding_arming`. To stop enforcing
+-- `DROP TRIGGER IF EXISTS claims_require_tenancy_then_operator_binding ON
+-- public.claims;` then drop the functions and `operator_binding_arming`; re-run
+-- 107's and 116's link definers (section 9) and 120's `epigraph_propagate_tenancy`
+-- (section 8). To stop enforcing
 -- without DDL, set the valve (section 4) on every writing unit and restart it.
 -- A link `epigraph_link_legacy_authors` (section 7) recorded is an
 -- `operator_links` row like 107's and is permanent by the same rule. Drop
--- `operator_links_operator_is_human` before `human_operators` (the trigger's
--- body reads it through `epigraph_is_human_operator`).
+-- `operator_links_operator_is_human` and `operator_links_audit` before
+-- `human_operators` (the first trigger's body reads it through
+-- `epigraph_is_human_operator`).
 -- **Applied to a throwaway database only, NOT to any deployed database.**
 
 SET LOCAL lock_timeout = '3s';
@@ -186,33 +224,59 @@ CREATE TABLE IF NOT EXISTS public.operator_binding_arming (
 REVOKE ALL ON public.operator_binding_arming FROM PUBLIC;
 
 -- The human-operator registry (section 1c). Rowless on purpose; see there.
+-- `client_id` is the ONE OAuth client (oauth_clients.id) the registration was
+-- made for: the human test reads that row's status, not "any active human
+-- client of the agent", because the application role may INSERT
+-- `oauth_clients` rows (dynamic client registration) and could otherwise mint a
+-- fresh active client to undo a suspension. It holds no UPDATE there, so a
+-- suspended recorded client stays suspended.
 CREATE TABLE IF NOT EXISTS public.human_operators (
-    agent_id   uuid PRIMARY KEY REFERENCES public.agents(id) ON DELETE RESTRICT,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    created_by text NOT NULL DEFAULT session_user,
-    reason     text NOT NULL,
-    revoked_at timestamptz,
-    revoked_by text
+    agent_id       uuid PRIMARY KEY REFERENCES public.agents(id) ON DELETE RESTRICT,
+    client_id      uuid NOT NULL REFERENCES public.oauth_clients(id) ON DELETE RESTRICT,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    created_by     text NOT NULL DEFAULT session_user,
+    reason         text NOT NULL,
+    revoked_at     timestamptz,
+    revoked_by     text,
+    revoked_reason text
 );
 REVOKE ALL ON public.human_operators FROM PUBLIC;
 
--- (a): is this agent a human operator? A live registry row AND an ACTIVE human
--- OAuth client, and nothing else: in particular NOT "some link names it as an
--- operator" (a link must not be able to make a human), and NOT a human client
--- alone (a dynamic client registration is typed 'human' too).
+-- (a): is this agent a human operator? A live registry row AND its RECORDED
+-- human OAuth client still active, and nothing else: in particular NOT "some
+-- link names it as an operator" (a link must not be able to make a human), NOT
+-- a human client alone (a dynamic client registration is typed 'human' too),
+-- and NOT some other active human client of the same agent (section 1c).
 CREATE OR REPLACE FUNCTION public.epigraph_is_human_operator(p_agent uuid)
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
     SELECT p_agent IS NOT NULL
        AND EXISTS (SELECT 1 FROM public.human_operators h
-                    WHERE h.agent_id = p_agent AND h.revoked_at IS NULL)
-       AND EXISTS (SELECT 1 FROM public.oauth_clients c
-                    WHERE c.agent_id = p_agent
+                     JOIN public.oauth_clients c ON c.id = h.client_id
+                    WHERE h.agent_id = p_agent AND h.revoked_at IS NULL
+                      AND c.agent_id = p_agent
                       AND c.client_type = 'human'
                       AND c.status = 'active')
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_is_human_operator(uuid) FROM PUBLIC;
+
+-- The human an agent belongs to: itself when it is a human operator; else the
+-- operator of its link (`p_live_only`: a live link only; otherwise a link of
+-- any state, which is how a RETIRED legacy author still belongs to a human);
+-- else NULL. Never more than one: `operator_links` is keyed on the agent.
+CREATE OR REPLACE FUNCTION public.epigraph_human_of(p_agent uuid, p_live_only boolean)
+RETURNS uuid
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT CASE
+             WHEN p_agent IS NULL THEN NULL
+             WHEN public.epigraph_is_human_operator(p_agent) THEN p_agent
+             ELSE (SELECT l.operator_id FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND (NOT p_live_only OR NOT l.retired))
+           END
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_human_of(uuid, boolean) FROM PUBLIC;
 
 -- How is this author bound? 'live_link' (b), 'human_operator' (a), or NULL.
 CREATE OR REPLACE FUNCTION public.epigraph_author_binding(p_agent uuid)
@@ -230,12 +294,23 @@ SET search_path = public, pg_temp AS $$
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_author_binding(uuid) FROM PUBLIC;
 
--- Is enforcement in force on THIS session? Armed, and the valve not off.
-CREATE OR REPLACE FUNCTION public.epigraph_operator_binding_enforced()
+-- Is the database ARMED (section 3)? Whatever this session's valve says: the
+-- cross-human scope (OPL02, section 1b) keys on this, because the valve is
+-- relief for section 1's binding only (section 4).
+CREATE OR REPLACE FUNCTION public.epigraph_operator_binding_armed()
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
     SELECT EXISTS (SELECT 1 FROM public.operator_binding_arming)
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_operator_binding_armed() FROM PUBLIC;
+
+-- Is the BINDING (OPL01) in force on THIS session? Armed, and the valve not off.
+CREATE OR REPLACE FUNCTION public.epigraph_operator_binding_enforced()
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT public.epigraph_operator_binding_armed()
        AND COALESCE(current_setting('epigraph.operator_link_enforcement', true), '') <> 'off'
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_operator_binding_enforced() FROM PUBLIC;
@@ -262,6 +337,30 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_require_bound_author(uuid) FROM PUBLIC;
 
+-- Section 2's WRITER check: the session principal that writes a claim naming
+-- another agent as its author must itself be bound. NULL (no principal) is
+-- unbound. Same code, same fix, its own wording.
+CREATE OR REPLACE FUNCTION public.epigraph_require_bound_writer(p_writer uuid)
+RETURNS void
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF NOT public.epigraph_operator_binding_enforced() THEN
+        RETURN;
+    END IF;
+    IF public.epigraph_author_binding(p_writer) IS NOT NULL THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION 'OPL01: the writing principal % is not bound to a human operator (it is '
+                    'neither a human operator nor the holder of a live operator link), and '
+                    'every claim must be written by a bound agent', p_writer
+        USING ERRCODE = 'OPL01',
+              HINT = 'Record a live link for the writing agent on a maintenance DSN: '
+                     'epigraph-operator link --agent <agent id> --operator <human operator '
+                     'agent id> --apply. See docs/tenancy.md "Operator binding".';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_bound_writer(uuid) FROM PUBLIC;
+
 -- Section 1b: does this operator hold a live writer/admin row in this group?
 CREATE OR REPLACE FUNCTION public.epigraph_operator_writes_group(p_operator uuid, p_group uuid)
 RETURNS boolean
@@ -284,10 +383,13 @@ SET search_path = public, pg_temp AS $$
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_operator_scope_exempt() FROM PUBLIC;
 
--- Section 1b's check: a live-linked author (not itself a human) may be named on
--- a row owned by `p_group` only if its operator writes that group. Quiet for a
--- human author, an unbound author (section 1 refuses those first), an unarmed
--- database, the valve, and the exemption.
+-- Section 1b at the MEMBERSHIP DOOR: a live-linked agent (not itself a human)
+-- may be given a writer/admin row in `p_group` only if its operator writes that
+-- group. Quiet for a human (the row being written is what makes a human a
+-- writer of a group: its own first admin row, or any group it is enrolled in),
+-- an unbound agent, an unarmed database, and the exemption. NOT quiet under the
+-- valve (section 4): the valve relieves the binding, never the cross-human
+-- scope. The claims path uses the stricter `epigraph_require_writer_scope`.
 CREATE OR REPLACE FUNCTION public.epigraph_require_operator_scope(p_agent uuid, p_group uuid)
 RETURNS void
 LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -295,7 +397,7 @@ SET search_path = public, pg_temp AS $$
 DECLARE
     v_operator uuid;
 BEGIN
-    IF NOT public.epigraph_operator_binding_enforced() THEN
+    IF NOT public.epigraph_operator_binding_armed() THEN
         RETURN;
     END IF;
     IF public.epigraph_is_human_operator(p_agent) THEN
@@ -320,28 +422,133 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_require_operator_scope(uuid, uuid) FROM PUBLIC;
 
+-- Section 1b on the CLAIMS path: the agent that writes a claim owned by
+-- `p_group` must belong to a human (itself, or its live link's operator) who
+-- holds a live writer/admin row in `p_group`. Unlike the membership door, a
+-- HUMAN is not exempt here: a human writes only where it writes, like
+-- everyone. Quiet for an unbound agent (section 1's OPL01 is the refusal for
+-- it), an unarmed database, and the exemption; NOT for the valve (section 4).
+CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, p_group uuid)
+RETURNS void
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_human uuid;
+BEGIN
+    IF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN;
+    END IF;
+    v_human := public.epigraph_human_of(p_agent, true);
+    IF v_human IS NULL OR public.epigraph_operator_writes_group(v_human, p_group) THEN
+        RETURN;
+    END IF;
+    IF public.epigraph_operator_scope_exempt() THEN
+        RETURN;
+    END IF;
+    IF v_human = p_agent THEN
+        RAISE EXCEPTION 'OPL02: human operator % holds no writer/admin membership in group %; '
+                        'a human writes only where it writes', p_agent, p_group
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Write into a group you write (your personal group is the default). '
+                         'Admin access crosses groups; nothing else does.';
+    END IF;
+    RAISE EXCEPTION 'OPL02: agent % is linked to operator %, which holds no writer/admin '
+                    'membership in group %; a linked agent writes only where its own operator '
+                    'writes', p_agent, v_human, p_group
+        USING ERRCODE = 'OPL02',
+              HINT = 'Write into a group the operator writes (its personal group is the '
+                     'default), or have the operator join the group first. Admin access '
+                     'crosses groups; nothing else does.';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM PUBLIC;
+
+-- Section 2's ATTRIBUTION check, for a claim whose author is not its writer:
+-- the author must belong to the WRITER's own human (a link of ANY state
+-- counts, so a human who supersedes its own retired legacy author's claim
+-- passes). An author that belongs to no human at all is unbound (OPL01, under
+-- the valve's rule); one that belongs to ANOTHER human is a cross-human
+-- attribution (OPL02, armed; an instance-admin principal and a privileged
+-- session are exempt, as everywhere in section 1b).
+CREATE OR REPLACE FUNCTION public.epigraph_require_attributable(p_author uuid, p_writer uuid)
+RETURNS void
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_author_human uuid;
+    v_writer_human uuid;
+BEGIN
+    IF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN;
+    END IF;
+    v_author_human := public.epigraph_human_of(p_author, false);
+    IF v_author_human IS NULL THEN
+        PERFORM public.epigraph_require_bound_author(p_author);
+        RETURN;
+    END IF;
+    v_writer_human := public.epigraph_human_of(p_writer, true);
+    IF v_writer_human IS NULL OR v_writer_human = v_author_human THEN
+        RETURN;
+    END IF;
+    IF public.epigraph_operator_scope_exempt() THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION 'OPL02: agent % writes a claim attributed to %, which belongs to human '
+                    'operator %, not to the writer''s operator %; a claim may name only an '
+                    'author of the writer''s own human', p_writer, p_author, v_author_human,
+                    v_writer_human
+        USING ERRCODE = 'OPL02',
+              HINT = 'Author the claim as the writing agent itself. Admin access crosses '
+                     'humans; nothing else does.';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid) FROM PUBLIC;
+
 -- The trigger body. A DEFINER owned by the maintenance role, like 070's
 -- trigger bodies: PostgreSQL checks EXECUTE on a trigger function when the
 -- trigger is CREATED, not when it fires, and the definer frame is what calls
--- the check above. So no writing role (an operator script's login included)
+-- the checks above. So no writing role (an operator script's login included)
 -- needs a grant of its own, and none can meet a 42501 here instead of the
--- rule. It reads nothing itself; the check reads the link and client tables.
+-- rule. It reads nothing itself; the checks read the link and client tables.
+--
+-- WHO is checked (section 2): the AUTHOR (`NEW.agent_id`) when the session has
+-- no principal, when the principal IS the author, or on a privileged session;
+-- otherwise the WRITER (the session principal) is bound and scoped, and the
+-- author must be the writer's own human's (`epigraph_require_attributable`).
+-- `epigraph_principal_id()` is what `ScopedPool` stamps from the viewer, so
+-- this binds the identity a request authenticated as, not a column the request
+-- body supplied.
 CREATE OR REPLACE FUNCTION public.epigraph_claims_require_operator_binding()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
+DECLARE
+    v_writer uuid;
 BEGIN
     IF TG_OP = 'UPDATE' AND NEW.agent_id IS NOT DISTINCT FROM OLD.agent_id THEN
         RETURN NEW;
     END IF;
-    PERFORM public.epigraph_require_bound_author(NEW.agent_id);
-    PERFORM public.epigraph_require_operator_scope(NEW.agent_id, NEW.owner_group_id);
+    IF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN NEW;
+    END IF;
+    v_writer := public.epigraph_principal_id();
+    IF v_writer IS NULL OR v_writer = NEW.agent_id OR public.epigraph_bypass() THEN
+        PERFORM public.epigraph_require_bound_author(NEW.agent_id);
+        PERFORM public.epigraph_require_writer_scope(NEW.agent_id, NEW.owner_group_id);
+    ELSE
+        PERFORM public.epigraph_require_bound_writer(v_writer);
+        PERFORM public.epigraph_require_writer_scope(v_writer, NEW.owner_group_id);
+        PERFORM public.epigraph_require_attributable(NEW.agent_id, v_writer);
+    END IF;
     RETURN NEW;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_claims_require_operator_binding() FROM PUBLIC;
 
+-- Named to sort AFTER `claims_require_tenancy` (PostgreSQL fires same-event
+-- row triggers in name order): the scope check reads `owner_group_id`, which
+-- that trigger fills for a supersede or a step-lineage insert. Sorting first,
+-- it read NULL and refused every such write (review SEC-4).
 DROP TRIGGER IF EXISTS claims_require_operator_binding ON public.claims;
-CREATE TRIGGER claims_require_operator_binding
+DROP TRIGGER IF EXISTS claims_require_tenancy_then_operator_binding ON public.claims;
+CREATE TRIGGER claims_require_tenancy_then_operator_binding
     BEFORE INSERT OR UPDATE OF agent_id ON public.claims
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_claims_require_operator_binding();
 
@@ -367,11 +574,122 @@ CREATE TRIGGER group_memberships_operator_scope
     BEFORE INSERT OR UPDATE OF role, revoked_at, group_id, agent_id ON public.group_memberships
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_group_memberships_operator_scope();
 
--- Section 1c: register a human operator. Maintenance only; audited; refuses
--- an agent that is not the agent of an ACTIVE human OAuth client. Idempotent
--- for a live row; a REVOKED row is not revived by it (a re-registration is an
--- explicit, separate decision: revoke is final for that row).
-CREATE OR REPLACE FUNCTION public.epigraph_register_human_operator(p_agent uuid, p_reason text)
+-- Section 1c: the registry's rules live on the TABLE, so a maintenance
+-- login's direct INSERT / UPDATE (which its grants admit, because the
+-- definers below run as that role) meets exactly the definers' checks and
+-- leaves exactly their audit rows (review SEC-8).
+--
+-- BEFORE INSERT: the row is live; `client_id` is the agent's own ACTIVE human
+-- client (resolved when omitted, and then only if it is the agent's ONE active
+-- human client); and a revoked registration is never revived (the INSERT of
+-- an existing agent conflicts on the key and is discarded by an `ON CONFLICT
+-- DO NOTHING`, or fails on it).
+CREATE OR REPLACE FUNCTION public.epigraph_human_operators_guard_insert()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_n integer;
+BEGIN
+    IF NEW.revoked_at IS NOT NULL OR NEW.revoked_by IS NOT NULL
+       OR NEW.revoked_reason IS NOT NULL THEN
+        RAISE EXCEPTION 'human_operators: a registration is recorded live; revoke it with '
+                        'epigraph_revoke_human_operator' USING ERRCODE = '55000';
+    END IF;
+    IF NEW.reason IS NULL OR length(trim(NEW.reason)) = 0 THEN
+        RAISE EXCEPTION 'human_operators: a reason is required' USING ERRCODE = '22004';
+    END IF;
+    IF NEW.client_id IS NULL THEN
+        SELECT count(*) INTO v_n FROM public.oauth_clients c
+         WHERE c.agent_id = NEW.agent_id AND c.client_type = 'human' AND c.status = 'active';
+        IF v_n > 1 THEN
+            RAISE EXCEPTION 'human_operators: % has % active human OAuth clients; name the one '
+                            'this registration is for', NEW.agent_id, v_n
+                USING ERRCODE = '55000';
+        END IF;
+        SELECT c.id INTO NEW.client_id FROM public.oauth_clients c
+         WHERE c.agent_id = NEW.agent_id AND c.client_type = 'human' AND c.status = 'active';
+    END IF;
+    IF NEW.client_id IS NULL OR NOT EXISTS (
+            SELECT 1 FROM public.oauth_clients c
+             WHERE c.id = NEW.client_id AND c.agent_id = NEW.agent_id
+               AND c.client_type = 'human' AND c.status = 'active') THEN
+        RAISE EXCEPTION 'human_operators: % is not the agent of that ACTIVE human OAuth client; '
+                        'only a human''s own principal can be registered', NEW.agent_id
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_human_operators_guard_insert() FROM PUBLIC;
+
+-- BEFORE UPDATE: the ONLY change a registration ever takes is its revoke
+-- (revoked_at NULL -> set, with who and why). Revoke is final: a revoked row
+-- takes no change at all, so it cannot be un-revoked by a direct UPDATE.
+CREATE OR REPLACE FUNCTION public.epigraph_human_operators_guard_update()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF OLD.revoked_at IS NOT NULL THEN
+        RAISE EXCEPTION 'human_operators: the registration of % was REVOKED, and revoke is '
+                        'final; nothing was changed', OLD.agent_id USING ERRCODE = '55000';
+    END IF;
+    IF NEW.revoked_at IS NULL
+       OR NEW.revoked_reason IS NULL OR length(trim(NEW.revoked_reason)) = 0
+       OR (NEW.agent_id, NEW.client_id, NEW.created_at, NEW.created_by, NEW.reason)
+          IS DISTINCT FROM (OLD.agent_id, OLD.client_id, OLD.created_at, OLD.created_by,
+                            OLD.reason) THEN
+        RAISE EXCEPTION 'human_operators: a registration is only ever revoked (revoked_at, '
+                        'revoked_by and a revoked_reason set); nothing was changed'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_human_operators_guard_update() FROM PUBLIC;
+
+-- AFTER INSERT / UPDATE: one `security_events` row per registration and per
+-- revoke, whatever path wrote it.
+CREATE OR REPLACE FUNCTION public.epigraph_human_operators_audit()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('operator.human_registered', NEW.agent_id, true,
+                jsonb_build_object('reason', NEW.reason, 'client_id', NEW.client_id,
+                                   'recorded_by', session_user));
+    ELSE
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('operator.human_revoked', NEW.agent_id, true,
+                jsonb_build_object('reason', NEW.revoked_reason, 'client_id', NEW.client_id,
+                                   'recorded_by', session_user));
+    END IF;
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_human_operators_audit() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS human_operators_guard_insert ON public.human_operators;
+CREATE TRIGGER human_operators_guard_insert
+    BEFORE INSERT ON public.human_operators
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_human_operators_guard_insert();
+DROP TRIGGER IF EXISTS human_operators_guard_update ON public.human_operators;
+CREATE TRIGGER human_operators_guard_update
+    BEFORE UPDATE ON public.human_operators
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_human_operators_guard_update();
+DROP TRIGGER IF EXISTS human_operators_audit ON public.human_operators;
+CREATE TRIGGER human_operators_audit
+    AFTER INSERT OR UPDATE ON public.human_operators
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_human_operators_audit();
+
+-- Section 1c: register a human operator. Maintenance only; audited (by the
+-- table's trigger); refuses an agent that is not the agent of an ACTIVE human
+-- OAuth client (`p_client`, or the agent's one active human client when NULL).
+-- Idempotent for a live row; a REVOKED row is not revived by it (a
+-- re-registration is an explicit, separate decision: revoke is final for that
+-- row).
+CREATE OR REPLACE FUNCTION public.epigraph_register_human_operator(
+    p_agent uuid, p_reason text, p_client uuid DEFAULT NULL)
 RETURNS TABLE (registered_now boolean, created_at timestamptz, created_by text)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
@@ -382,35 +700,34 @@ BEGIN
         RAISE EXCEPTION 'epigraph_register_human_operator: the agent and a reason are required'
             USING ERRCODE = '22004';
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM public.oauth_clients c
-                    WHERE c.agent_id = p_agent AND c.client_type = 'human'
-                      AND c.status = 'active') THEN
-        RAISE EXCEPTION 'epigraph_register_human_operator: % is not the agent of an ACTIVE '
-                        'human OAuth client; only a human''s own principal can be registered',
-                        p_agent
-            USING ERRCODE = '55000';
-    END IF;
     IF EXISTS (SELECT 1 FROM public.human_operators h
                 WHERE h.agent_id = p_agent AND h.revoked_at IS NOT NULL) THEN
         RAISE EXCEPTION 'epigraph_register_human_operator: % was registered and REVOKED; a '
                         'revoked registration is not revived', p_agent
             USING ERRCODE = '55000';
     END IF;
-    INSERT INTO public.human_operators (agent_id, reason)
-    VALUES (p_agent, p_reason)
-    ON CONFLICT (agent_id) DO NOTHING;
-    GET DIAGNOSTICS v_rows = ROW_COUNT;
-    IF v_rows > 0 THEN
-        INSERT INTO public.security_events (event_type, agent_id, success, details)
-        VALUES ('operator.human_registered', p_agent, true,
-                jsonb_build_object('reason', p_reason, 'recorded_by', session_user));
+    IF NOT EXISTS (SELECT 1 FROM public.human_operators h WHERE h.agent_id = p_agent) THEN
+        IF NOT EXISTS (SELECT 1 FROM public.oauth_clients c
+                        WHERE c.agent_id = p_agent AND c.client_type = 'human'
+                          AND c.status = 'active'
+                          AND (p_client IS NULL OR c.id = p_client)) THEN
+            RAISE EXCEPTION 'epigraph_register_human_operator: % is not the agent of an ACTIVE '
+                            'human OAuth client; only a human''s own principal can be '
+                            'registered', p_agent
+                USING ERRCODE = '55000';
+        END IF;
+        INSERT INTO public.human_operators (agent_id, client_id, reason)
+        VALUES (p_agent, p_client, p_reason)
+        ON CONFLICT (agent_id) DO NOTHING;
+        GET DIAGNOSTICS v_rows = ROW_COUNT;
     END IF;
     RETURN QUERY SELECT v_rows > 0, h.created_at, h.created_by
                    FROM public.human_operators h WHERE h.agent_id = p_agent;
 END $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text, uuid) FROM PUBLIC;
 
--- Section 1c: revoke a registration. Maintenance only; audited; final.
+-- Section 1c: revoke a registration. Maintenance only; audited (by the
+-- table's trigger); final.
 CREATE OR REPLACE FUNCTION public.epigraph_revoke_human_operator(p_agent uuid, p_reason text)
 RETURNS TABLE (revoked_now boolean)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
@@ -423,14 +740,9 @@ BEGIN
             USING ERRCODE = '22004';
     END IF;
     UPDATE public.human_operators h
-       SET revoked_at = now(), revoked_by = session_user
+       SET revoked_at = now(), revoked_by = session_user, revoked_reason = p_reason
      WHERE h.agent_id = p_agent AND h.revoked_at IS NULL;
     GET DIAGNOSTICS v_rows = ROW_COUNT;
-    IF v_rows > 0 THEN
-        INSERT INTO public.security_events (event_type, agent_id, success, details)
-        VALUES ('operator.human_revoked', p_agent, true,
-                jsonb_build_object('reason', p_reason, 'recorded_by', session_user));
-    END IF;
     RETURN QUERY SELECT v_rows > 0;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_revoke_human_operator(uuid, text) FROM PUBLIC;
@@ -462,6 +774,33 @@ DROP TRIGGER IF EXISTS operator_links_operator_is_human ON public.operator_links
 CREATE TRIGGER operator_links_operator_is_human
     BEFORE INSERT ON public.operator_links
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_operator_links_operator_is_human();
+
+-- Section 1c at the link record: once armed, a LIVE link is exactly what turns
+-- a refused agent into a writer, so every link row is audited where it is
+-- written, on every path (107's two link functions, 116's attested retire,
+-- section 7's legacy tie, a raw INSERT): one `operator.link_recorded`
+-- `security_events` row per row inserted, naming the agent, the operator, the
+-- state and the session that recorded it. An `ON CONFLICT DO NOTHING` re-link
+-- inserts nothing and records nothing.
+CREATE OR REPLACE FUNCTION public.epigraph_operator_links_audit()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('operator.link_recorded', NEW.agent_id, true,
+            jsonb_build_object('operator_id', NEW.operator_id,
+                               'operator_group_id', NEW.operator_group_id,
+                               'retired', NEW.retired,
+                               'recorded_by', session_user));
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_operator_links_audit() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS operator_links_audit ON public.operator_links;
+CREATE TRIGGER operator_links_audit
+    AFTER INSERT ON public.operator_links
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_operator_links_audit();
 
 -- Arm enforcement, once (section 3). Maintenance only; audited.
 CREATE OR REPLACE FUNCTION public.epigraph_arm_operator_binding()
@@ -508,18 +847,49 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_group_memberships_operator_scope() '
                 'OWNER TO epigraph_maintenance';
-        EXECUTE 'ALTER FUNCTION public.epigraph_register_human_operator(uuid, text) '
+        EXECUTE 'ALTER FUNCTION public.epigraph_register_human_operator(uuid, text, uuid) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_revoke_human_operator(uuid, text) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_operator_links_operator_is_human() '
                 'OWNER TO epigraph_maintenance';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text) '
+        EXECUTE 'ALTER FUNCTION public.epigraph_operator_links_audit() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_human_operators_guard_insert() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_human_operators_guard_update() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_human_operators_audit() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_human_of(uuid, boolean) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_operator_binding_armed() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_require_bound_writer(uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_require_writer_scope(uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_require_attributable(uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text, uuid) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_revoke_human_operator(uuid, text) '
                 'TO epigraph_maintenance';
+        -- The definers run as this role, so it holds the DML they issue; the
+        -- table's own triggers (section 1c) hold a direct write to the same
+        -- rules and the same audit as the definers.
         EXECUTE 'GRANT SELECT, INSERT ON public.human_operators TO epigraph_maintenance';
-        EXECUTE 'GRANT UPDATE (revoked_at, revoked_by) ON public.human_operators '
+        EXECUTE 'GRANT UPDATE (revoked_at, revoked_by, revoked_reason) ON public.human_operators '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_human_of(uuid, boolean) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_binding_armed() '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_bound_writer(uuid) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_writes_group(uuid, uuid) '
                 'TO epigraph_maintenance';
@@ -548,7 +918,7 @@ DO $$ BEGIN
         EXECUTE 'GRANT SELECT ON public.operator_binding_arming TO epigraph_app';
         EXECUTE 'REVOKE ALL ON public.human_operators FROM epigraph_app';
         EXECUTE 'GRANT SELECT ON public.human_operators TO epigraph_app';
-        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text) '
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text, uuid) '
                 'FROM epigraph_app';
         EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_revoke_human_operator(uuid, text) '
                 'FROM epigraph_app';
@@ -565,6 +935,16 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_writes_group(uuid, uuid) '
                 'TO epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_operator_scope(uuid, uuid) '
+                'TO epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_human_of(uuid, boolean) '
+                'TO epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_binding_armed() '
+                'TO epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_bound_writer(uuid) '
+                'TO epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) '
+                'TO epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid) '
                 'TO epigraph_app';
     END IF;
 END $$;
@@ -583,15 +963,20 @@ END $$;
 -- "Authored" means named in an author column: `claims.agent_id`,
 -- `evidence.signer_id`, `claim_versions.created_by`,
 -- `mass_functions.source_agent_id`, `challenges.challenger_id`,
+-- `challenges.resolved_by` (resolving a challenge is a write to it),
 -- `claim_signature_revocations.revoked_by`, `perspectives.owner_agent_id`,
--- `recall_events.agent_id`. NOT `edges.signer_id`, which on legacy rows is a
--- bulk attestation key rather than an author (`epigraph-operator`'s
--- `tables::EDGE_WRITER` records why).
+-- `recall_events.agent_id`. NOT the three SIGNING-KEY columns, which name the
+-- key that signed a row rather than the agent that wrote it: `edges.signer_id`
+-- (on legacy rows a bulk attestation key; `epigraph-operator`'s
+-- `tables::EDGE_WRITER` records why), `claims.signer_id` (for HTTP-era rows
+-- the shared signer's key, whose tie is 116's attested retire, never a bulk
+-- one) and `claim_signature_revocations.previous_signer_id` (the key a
+-- revocation replaced; its author is `revoked_by`).
 --
 -- REFUSED (55000 / 22023 / 22004, nothing written): an operator that is not a
--- HUMAN operator (section 1 arm (a)); an operator that is itself operated; an
--- operator carrying 107's shared-signer fingerprint; 105's RVK01 / RVK02 on the
--- operator's personal group; a NULL operator or a NULL in the exclusion set.
+-- HUMAN operator (section 1 arm (a)); an operator that is itself operated;
+-- 105's RVK01 / RVK02 on the operator's personal group; a NULL operator or a
+-- NULL in the exclusion set.
 --
 -- SKIPPED, per agent, reported and never written (a retired link is permanent
 -- and never promoted, so a wrong one strands an agent for good):
@@ -605,6 +990,13 @@ END $$;
 --                     so an HTTP principal is not tied by side effect;
 --   write_authority   a live writer/admin row in the operator's group: 107's
 --                     retire refuses that, and such an agent wants a LIVE link;
+--   operated_by_other_human
+--                     an OPERATED_BY edge from it names a registered human
+--                     operator OTHER than this one: its own auth lineage says
+--                     it acts for another human, and a tie (permanent) to this
+--                     one would misattribute it for good (OB5). An app session
+--                     can forge such an edge, which can only make an agent
+--                     SKIPPED, never tied;
 --   foreign_write_authority
 --                     a live writer/admin row in a group (other than its own
 --                     personal group) that the operator does NOT write: it acts
@@ -665,13 +1057,12 @@ BEGIN
                         'and cannot be an operator', p_operator
             USING ERRCODE = '55000';
     END IF;
-    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
-         WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
-        RAISE EXCEPTION 'epigraph_link_legacy_authors: operator % carries OPERATED_BY '
-                        'auth-lineage edges to more than one principal, the fingerprint of a '
-                        'shared HTTP signer; refusing it as an operator', p_operator
-            USING ERRCODE = '55000';
-    END IF;
+    -- No operator-side shared-signer fingerprint here (107 section 9 has one):
+    -- the operator was just proven a registered human operator, which no
+    -- shared HTTP signer is, and the OPERATED_BY edges that fingerprint counts
+    -- are writable by any application session. Counting them let any session
+    -- block every legacy tie to a human by forging two edges from it (review
+    -- SEC-5).
 
     -- The operator's personal group, through 105's definer (RVK01 / RVK02
     -- abort the call before anything is written).
@@ -685,6 +1076,7 @@ BEGIN
                 UNION SELECT cv.created_by FROM public.claim_versions cv
                 UNION SELECT mf.source_agent_id FROM public.mass_functions mf
                 UNION SELECT ch.challenger_id FROM public.challenges ch
+                UNION SELECT ch.resolved_by FROM public.challenges ch
                 UNION SELECT r.revoked_by FROM public.claim_signature_revocations r
                 UNION SELECT p.owner_agent_id FROM public.perspectives p
                 UNION SELECT re.agent_id FROM public.recall_events re) x
@@ -700,6 +1092,11 @@ BEGIN
             WHEN EXISTS (SELECT 1 FROM public.oauth_clients c
                           WHERE c.agent_id = v_agent AND c.status <> 'revoked')
                 THEN 'skipped:oauth_principal'
+            WHEN EXISTS (SELECT 1 FROM public.edges e
+                          WHERE e.source_id = v_agent AND e.relationship = 'OPERATED_BY'
+                            AND e.target_id <> p_operator
+                            AND public.epigraph_is_human_operator(e.target_id))
+                THEN 'skipped:operated_by_other_human'
             WHEN EXISTS (SELECT 1 FROM public.group_memberships m
                           WHERE m.group_id = v_group AND m.agent_id = v_agent
                             AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin'))
@@ -982,5 +1379,536 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_propagate_tenancy() FROM PUBLIC;
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'ALTER FUNCTION public.epigraph_propagate_tenancy() OWNER TO epigraph_maintenance';
+    END IF;
+END $$;
+
+-- ===================================================================
+-- 9. THE LINK DEFINERS: NO FORGEABLE FINGERPRINT ON A HUMAN OPERATOR (SEC-5)
+--
+-- 107's `epigraph_link_operator` and `epigraph_link_retired_agent` and 116's
+-- `epigraph_link_retired_shared_signer` refuse, on a first link, an OPERATOR
+-- carrying OPERATED_BY edges to more than one principal (107 section 9, the
+-- shared-signer fingerprint). Those edges are writable by any application
+-- session (107 says so), and since section 1c every new link's operator must be
+-- a registered human operator, which is never a shared HTTP signer. So the
+-- check had become a lever and nothing else: two forged edges FROM a human made
+-- every new link to that human fail, and once armed an agent that cannot be
+-- linked cannot write, which strands every new agent of that human (measured
+-- by review on a throwaway database).
+--
+-- The three bodies below are 107's and 116's, byte for byte, except that the
+-- operator-side fingerprint is skipped when the operator is a human operator
+-- (`NOT public.epigraph_is_human_operator(p_operator) AND` added to its
+-- condition; a non-human operator is refused anyway, by
+-- `operator_links_operator_is_human`). The AGENT-side fingerprint is kept: it
+-- is what 116's attested retire exists for. `CREATE OR REPLACE` keeps each
+-- function's owner and ACL; both are re-asserted below.
+--
+-- UNDO: re-run the three `CREATE OR REPLACE FUNCTION` texts from 107 and 116.
+CREATE OR REPLACE FUNCTION public.epigraph_link_operator(p_agent uuid, p_operator uuid)
+RETURNS TABLE (operator_group_id uuid,
+               group_created boolean,
+               membership_created boolean,
+               membership_live boolean,
+               edge_created boolean,
+               link_live boolean,
+               link_retired boolean)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_group     uuid;
+    v_other     uuid;
+    v_group_existed boolean;
+    v_link_rows integer := 0;
+    v_mem_rows  integer := 0;
+    v_edge_rows integer := 0;
+BEGIN
+    IF p_agent IS NULL OR p_operator IS NULL THEN
+        RAISE EXCEPTION 'epigraph_link_operator: agent and operator are both required'
+            USING ERRCODE = '22004';
+    END IF;
+    IF p_agent = p_operator THEN
+        RAISE EXCEPTION 'epigraph_link_operator: agent % cannot be its own operator', p_agent
+            USING ERRCODE = '22023';
+    END IF;
+    -- Serialise every link write (section 10). Taken before any check reads
+    -- `operator_links`, so under READ COMMITTED each check below sees every
+    -- link committed by the call this one waited for.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+    IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_link_operator: agent % does not exist', p_agent
+            USING ERRCODE = '22023';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_operator: operator % does not exist', p_operator
+            USING ERRCODE = '22023';
+    END IF;
+    -- Single hop, enforced from BOTH ends. An operator that is itself
+    -- operated, or an agent that already operates others, would make "who
+    -- owns this" depend on a chain nobody declared as a whole. Checking only
+    -- the first end let the order link(X, O) then link(O, P) build X -> O -> P
+    -- (measured by review); the second check closes that order.
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_operator: % is itself operated by another agent and '
+                        'cannot be an operator', p_operator
+            USING ERRCODE = '55000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.operator_id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_link_operator: % already operates other agents and cannot '
+                        'itself be operated', p_agent
+            USING ERRCODE = '55000';
+    END IF;
+    -- One operator per agent, ever. A second declaration is a configuration
+    -- error to surface, not a link to add or a link to silently replace --
+    -- whatever the state of the first link's membership.
+    SELECT l.operator_id INTO v_other
+      FROM public.operator_links l
+     WHERE l.agent_id = p_agent AND l.operator_id <> p_operator;
+    IF v_other IS NOT NULL THEN
+        RAISE EXCEPTION 'epigraph_link_operator: agent % already has a link to operator %; '
+                        'an agent is linked to one operator, and re-pointing it is an '
+                        'out-of-band act', p_agent, v_other
+            USING ERRCODE = '55000';
+    END IF;
+    -- A SHARED SIGNER is neither linkable nor an operator (section 9). Checked
+    -- on a FIRST link only: an exact relink (a row for this very pair already
+    -- exists) records nothing new, and the edges the check counts are
+    -- writable by any app session, so counting them on a relink turned forged
+    -- edges into a fatal stdio startup for an agent that was already linked.
+    IF NOT EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.operator_id = p_operator) THEN
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_operator: agent % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing to link it', p_agent
+                USING ERRCODE = '55000';
+        END IF;
+        IF NOT public.epigraph_is_human_operator(p_operator)
+           AND (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_operator: operator % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing it as an operator', p_operator
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+
+    -- (a) The operator's personal group, through THE personal-group definer,
+    -- `epigraph_ensure_personal_group` (migration 105), and nothing else. It is
+    -- the one place a personal group and its first admin row are minted, and
+    -- its contract is exactly what this link needs (section 3):
+    --   * a live row for the operator -> the group, nothing written;
+    --   * no row of any state         -> the group (if absent) and the
+    --                                    operator's own epoch-0 admin row;
+    --   * only REVOKED rows            -> RAISE 'RVK01': the operator's own
+    --                                    membership of its own group was
+    --                                    revoked, and linking agents into that
+    --                                    group is refused, not papered over;
+    --   * a group under the key that is not the operator's own (a squat that
+    --     predates 108) -> RAISE 'RVK02'.
+    -- Both RAISEs abort this whole call before anything below is written; the
+    -- Rust callers map them to `DbError::MembershipRevoked` /
+    -- `DbError::PersonalGroupNotOwned`.
+    v_group_existed := EXISTS (SELECT 1 FROM public.groups g
+                                WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text);
+    v_group := public.epigraph_ensure_personal_group(p_operator);
+
+    -- (b) The link record: recorded once. See section 4.
+    INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id)
+    VALUES (p_agent, p_operator, v_group)
+    ON CONFLICT (agent_id) DO NOTHING;
+    GET DIAGNOSTICS v_link_rows = ROW_COUNT;
+
+    -- (c) The agent's writer membership: recorded once, and ONLY by the call
+    -- that recorded the link row (section 3). Keying on `v_link_rows` makes
+    -- "never revive" rest on the app-immutable `operator_links` table rather
+    -- than on membership history, which a hard DELETE can erase. The two
+    -- membership guards stay as defense in depth. A RETIRED row is never
+    -- promoted (section 7): its ON CONFLICT above affected nothing, so
+    -- `v_link_rows` is 0.
+    IF v_link_rows > 0 THEN
+        INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share,
+                                              epoch, role)
+        SELECT v_group, p_agent, ''::bytea, 0, 'writer'
+         WHERE NOT EXISTS (SELECT 1 FROM public.group_memberships m
+                            WHERE m.group_id = v_group AND m.agent_id = p_agent)
+           AND NOT EXISTS (SELECT 1 FROM public.operator_links l
+                            WHERE l.agent_id = p_agent AND l.retired)
+        ON CONFLICT DO NOTHING;
+        GET DIAGNOSTICS v_mem_rows = ROW_COUNT;
+    END IF;
+
+    -- (d) The graph record, if no OPERATED_BY edge exists between the pair in
+    -- any state. It grants nothing; see section 4.
+    INSERT INTO public.edges (source_id, source_type, target_id, target_type,
+                              relationship, properties)
+    SELECT p_agent, 'agent', p_operator, 'agent', 'OPERATED_BY',
+           jsonb_build_object('source', 'epigraph_link_operator')
+     WHERE NOT EXISTS (SELECT 1 FROM public.edges e
+                        WHERE e.source_id = p_agent AND e.target_id = p_operator
+                          AND e.relationship = 'OPERATED_BY');
+    GET DIAGNOSTICS v_edge_rows = ROW_COUNT;
+
+    -- `link_live` is computed by the SAME actor read the authoring and
+    -- ownership paths use, not re-derived here. `membership_live` alone over-reports: a
+    -- live membership whose role is no longer writer/admin (review probe: role
+    -- set to 'reader', then re-link) returned membership_live=t while
+    -- the actor read returned nothing, and the startup log said the
+    -- agent authored into the operator's group when it did not.
+    RETURN QUERY
+    SELECT v_group,
+           NOT v_group_existed,
+           v_mem_rows > 0,
+           EXISTS (SELECT 1 FROM public.group_memberships m
+                    WHERE m.group_id = v_group AND m.agent_id = p_agent
+                      AND m.revoked_at IS NULL),
+           v_edge_rows > 0,
+           EXISTS (SELECT 1 FROM public.epigraph_operator_actor(p_agent) o
+                    WHERE o.operator_id = p_operator),
+           EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.retired);
+END $$;
+
+CREATE OR REPLACE FUNCTION public.epigraph_link_retired_agent(p_agent uuid, p_operator uuid)
+RETURNS TABLE (operator_group_id uuid,
+               group_created boolean,
+               link_created boolean,
+               link_retired boolean,
+               edge_created boolean,
+               membership_live boolean)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_group     uuid;
+    v_other     uuid;
+    v_group_existed boolean;
+    v_link_rows integer := 0;
+    v_edge_rows integer := 0;
+BEGIN
+    IF p_agent IS NULL OR p_operator IS NULL THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent and operator are both required'
+            USING ERRCODE = '22004';
+    END IF;
+    IF p_agent = p_operator THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % cannot be its own operator',
+                        p_agent
+            USING ERRCODE = '22023';
+    END IF;
+    -- Serialise every link write (section 10). Taken before any check reads
+    -- `operator_links`, so under READ COMMITTED each check below sees every
+    -- link committed by the call this one waited for.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+    IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % does not exist', p_agent
+            USING ERRCODE = '22023';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: operator % does not exist', p_operator
+            USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: % is itself operated by another agent '
+                        'and cannot be an operator', p_operator
+            USING ERRCODE = '55000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.operator_id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: % already operates other agents and '
+                        'cannot itself be operated', p_agent
+            USING ERRCODE = '55000';
+    END IF;
+    SELECT l.operator_id INTO v_other
+      FROM public.operator_links l
+     WHERE l.agent_id = p_agent AND l.operator_id <> p_operator;
+    IF v_other IS NOT NULL THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % already has a link to operator '
+                        '%; an agent is linked to one operator, and re-pointing it is an '
+                        'out-of-band act', p_agent, v_other
+            USING ERRCODE = '55000';
+    END IF;
+    -- A retire is not a demotion (section 7). An ACTOR row for this very pair
+    -- cannot be turned into a retired one -- `operator_links` rows are never
+    -- edited -- so `ON CONFLICT (agent_id) DO NOTHING` below would leave it
+    -- acting and report success. Refused instead, so the caller cannot
+    -- believe a key was de-authorized when it was not.
+    IF EXISTS (SELECT 1 FROM public.operator_links l
+                WHERE l.agent_id = p_agent AND l.operator_id = p_operator
+                  AND NOT l.retired) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % already has an ACTOR (not '
+                        'retired) link to operator %, and a retired link cannot replace it',
+                        p_agent, p_operator
+            USING ERRCODE = '55000',
+                  HINT = 'End its authority by revoking its membership in the operator''s '
+                         'group; the operator keeps ownership of its claims either way.';
+    END IF;
+    -- A SHARED SIGNER is neither linkable nor an operator (section 9). Checked
+    -- on a FIRST link only: an exact relink (a row for this very pair already
+    -- exists) records nothing new, and the edges the check counts are
+    -- writable by any app session, so counting them on a relink turned forged
+    -- edges into a fatal stdio startup for an agent that was already linked.
+    IF NOT EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.operator_id = p_operator) THEN
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_retired_agent: agent % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing to link it', p_agent
+                USING ERRCODE = '55000';
+        END IF;
+        IF NOT public.epigraph_is_human_operator(p_operator)
+           AND (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_retired_agent: operator % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing it as an operator', p_operator
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+
+    -- The operator's personal group, through the one personal-group definer:
+    -- see `epigraph_link_operator` step (a). RVK01 / RVK02 abort the call.
+    v_group_existed := EXISTS (SELECT 1 FROM public.groups g
+                                WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text);
+    v_group := public.epigraph_ensure_personal_group(p_operator);
+
+    -- ZERO write authority is a precondition, not a hope (section 7). A live
+    -- `writer`/`admin` row for the agent in the operator's group -- the
+    -- routine "add my agents to my group", made BEFORE the retire -- would
+    -- survive it, and `Viewer::resolve` counts it: review measured a retired
+    -- identity inserting a claim owned by the operator's group through exactly
+    -- that row. Refused, not revoked here: revoking is the operator's decision
+    -- and has its own last-admin rules. Locked first, in the order every
+    -- roster writer takes them (the agent's rows in the group, then the
+    -- `groups` row, whose FOR UPDATE also conflicts with a concurrent
+    -- membership INSERT's foreign-key share lock). That closes a concurrent
+    -- promotion and an INSERT whose foreign-key check got there first; one
+    -- trigger-first INSERT order remains open (section 7's RESIDUAL).
+    PERFORM 1 FROM public.group_memberships m
+     WHERE m.group_id = v_group AND m.agent_id = p_agent
+       FOR UPDATE;
+    PERFORM 1 FROM public.groups g WHERE g.id = v_group FOR UPDATE;
+    IF EXISTS (SELECT 1 FROM public.group_memberships m
+                WHERE m.group_id = v_group AND m.agent_id = p_agent
+                  AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin')) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % holds a live writer/admin '
+                        'membership in operator group %, and a retired identity may hold no '
+                        'write authority there', p_agent, v_group
+            USING ERRCODE = '55000',
+                  HINT = 'Revoke that membership first, then retire the agent.';
+    END IF;
+
+    -- The record, retired. No membership: see section 7.
+    INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id, retired)
+    VALUES (p_agent, p_operator, v_group, true)
+    ON CONFLICT (agent_id) DO NOTHING;
+    GET DIAGNOSTICS v_link_rows = ROW_COUNT;
+
+    INSERT INTO public.edges (source_id, source_type, target_id, target_type,
+                              relationship, properties)
+    SELECT p_agent, 'agent', p_operator, 'agent', 'OPERATED_BY',
+           jsonb_build_object('source', 'epigraph_link_retired_agent')
+     WHERE NOT EXISTS (SELECT 1 FROM public.edges e
+                        WHERE e.source_id = p_agent AND e.target_id = p_operator
+                          AND e.relationship = 'OPERATED_BY');
+    GET DIAGNOSTICS v_edge_rows = ROW_COUNT;
+
+    -- `membership_live` REPORTS a live membership of any role; it is never
+    -- created or changed here. A live writer/admin row was refused above, so
+    -- a true value here is a `reader` row (no write authority). Callers still
+    -- treat it as a refusal-worthy surprise, not a success.
+    RETURN QUERY
+    SELECT v_group,
+           NOT v_group_existed,
+           v_link_rows > 0,
+           EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.retired),
+           v_edge_rows > 0,
+           EXISTS (SELECT 1 FROM public.group_memberships m
+                    WHERE m.group_id = v_group AND m.agent_id = p_agent
+                      AND m.revoked_at IS NULL);
+END $$;
+
+CREATE OR REPLACE FUNCTION public.epigraph_link_retired_shared_signer(
+    p_agent    uuid,
+    p_operator uuid,
+    p_attested uuid[])
+RETURNS TABLE (operator_group_id uuid,
+               group_created boolean,
+               link_created boolean,
+               link_retired boolean,
+               edge_created boolean,
+               membership_live boolean)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_group         uuid;
+    v_other         uuid;
+    v_group_existed boolean;
+    v_first_link    boolean;
+    v_lineage       uuid[] := '{}';
+    v_unattested    uuid[] := '{}';
+    v_link_rows     integer := 0;
+    v_edge_rows     integer := 0;
+BEGIN
+    IF p_agent IS NULL OR p_operator IS NULL OR p_attested IS NULL THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: agent, operator and the attested '
+                        'principal set are all required (the set may be empty)'
+            USING ERRCODE = '22004';
+    END IF;
+    -- A NULL element would make `t = ANY (p_attested)` NULL for every t it does
+    -- not match, and the NOT below would then drop t from the unattested set:
+    -- an attestation of nothing would pass the check. Refuse it outright.
+    IF array_position(p_attested, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: the attested principal set '
+                        'contains a NULL; attest principals by id only'
+            USING ERRCODE = '22004';
+    END IF;
+    IF p_agent = p_operator THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: agent % cannot be its own operator',
+                        p_agent
+            USING ERRCODE = '22023';
+    END IF;
+    -- 107 section 10: every link write takes this lock before reading links.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+    IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: agent % does not exist', p_agent
+            USING ERRCODE = '22023';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: operator % does not exist',
+                        p_operator
+            USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: % is itself operated by another '
+                        'agent and cannot be an operator', p_operator
+            USING ERRCODE = '55000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.operator_id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: % already operates other agents '
+                        'and cannot itself be operated', p_agent
+            USING ERRCODE = '55000';
+    END IF;
+    SELECT l.operator_id INTO v_other
+      FROM public.operator_links l
+     WHERE l.agent_id = p_agent AND l.operator_id <> p_operator;
+    IF v_other IS NOT NULL THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: agent % already has a link to '
+                        'operator %; an agent is linked to one operator, and re-pointing it is '
+                        'an out-of-band act', p_agent, v_other
+            USING ERRCODE = '55000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l
+                WHERE l.agent_id = p_agent AND l.operator_id = p_operator
+                  AND NOT l.retired) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: agent % already has an ACTOR (not '
+                        'retired) link to operator %, and a retired link cannot replace it',
+                        p_agent, p_operator
+            USING ERRCODE = '55000',
+                  HINT = 'End its authority by revoking its membership in the operator''s '
+                         'group; the operator keeps ownership of its claims either way.';
+    END IF;
+
+    v_first_link := NOT EXISTS (SELECT 1 FROM public.operator_links l
+                                 WHERE l.agent_id = p_agent AND l.operator_id = p_operator);
+    IF v_first_link THEN
+        -- The AGENT side: every principal it carried, except itself and the
+        -- operator, must be attested (section 2).
+        SELECT COALESCE(array_agg(DISTINCT e.target_id ORDER BY e.target_id), '{}')
+          INTO v_lineage
+          FROM public.edges e
+         WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY'
+           AND e.target_id <> p_agent;
+        SELECT COALESCE(array_agg(t ORDER BY t), '{}')
+          INTO v_unattested
+          FROM unnest(v_lineage) AS t
+         WHERE t <> p_operator AND NOT COALESCE(t = ANY (p_attested), false);
+        IF cardinality(v_unattested) > 0 THEN
+            RAISE EXCEPTION 'epigraph_link_retired_shared_signer: agent % carried OPERATED_BY '
+                            'auth-lineage to principals that were not attested: %; nothing was '
+                            'written', p_agent, v_unattested
+                USING ERRCODE = '55000',
+                      HINT = 'Attest a principal only if every write the signer made for it '
+                             'belongs to the operator.';
+        END IF;
+        -- The OPERATOR side: unchanged from 107 section 9.
+        IF NOT public.epigraph_is_human_operator(p_operator)
+           AND (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_retired_shared_signer: operator % carries OPERATED_BY '
+                            'auth-lineage edges to more than one principal, the fingerprint of a '
+                            'shared HTTP signer; refusing it as an operator', p_operator
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+
+    -- The operator's personal group, through 105's definer (107 section 3).
+    v_group_existed := EXISTS (SELECT 1 FROM public.groups g
+                                WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text);
+    v_group := public.epigraph_ensure_personal_group(p_operator);
+
+    -- ZERO write authority is a precondition (107 section 7), locked in the
+    -- order every roster writer takes them.
+    PERFORM 1 FROM public.group_memberships m
+     WHERE m.group_id = v_group AND m.agent_id = p_agent
+       FOR UPDATE;
+    PERFORM 1 FROM public.groups g WHERE g.id = v_group FOR UPDATE;
+    IF EXISTS (SELECT 1 FROM public.group_memberships m
+                WHERE m.group_id = v_group AND m.agent_id = p_agent
+                  AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin')) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_shared_signer: agent % holds a live writer/admin '
+                        'membership in operator group %, and a retired identity may hold no '
+                        'write authority there', p_agent, v_group
+            USING ERRCODE = '55000',
+                  HINT = 'Revoke that membership first, then retire the agent.';
+    END IF;
+
+    INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id, retired)
+    VALUES (p_agent, p_operator, v_group, true)
+    ON CONFLICT (agent_id) DO NOTHING;
+    GET DIAGNOSTICS v_link_rows = ROW_COUNT;
+
+    INSERT INTO public.edges (source_id, source_type, target_id, target_type,
+                              relationship, properties)
+    SELECT p_agent, 'agent', p_operator, 'agent', 'OPERATED_BY',
+           jsonb_build_object('source', 'epigraph_link_retired_shared_signer',
+                              'attested', to_jsonb(p_attested))
+     WHERE NOT EXISTS (SELECT 1 FROM public.edges e
+                        WHERE e.source_id = p_agent AND e.target_id = p_operator
+                          AND e.relationship = 'OPERATED_BY');
+    GET DIAGNOSTICS v_edge_rows = ROW_COUNT;
+
+    -- The attestation, on the record, once: only when this call created the
+    -- link (an exact relink attests nothing new).
+    IF v_link_rows > 0 THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('operator.shared_signer_retired', p_agent, true,
+                jsonb_build_object('operator_id', p_operator,
+                                   'operator_group_id', v_group,
+                                   'attested', to_jsonb(p_attested),
+                                   'lineage_targets', to_jsonb(v_lineage),
+                                   'recorded_by', session_user));
+    END IF;
+
+    RETURN QUERY
+    SELECT v_group,
+           NOT v_group_existed,
+           v_link_rows > 0,
+           EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.retired),
+           v_edge_rows > 0,
+           EXISTS (SELECT 1 FROM public.group_memberships m
+                    WHERE m.group_id = v_group AND m.agent_id = p_agent
+                      AND m.revoked_at IS NULL);
+END $$;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_link_operator(uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_link_retired_agent(uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[]) '
+                'OWNER TO epigraph_maintenance';
     END IF;
 END $$;
