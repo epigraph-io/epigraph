@@ -16,26 +16,50 @@
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-/// Register `agent` as a human operator. Returns whether this call registered it
-/// (`false`: it already was).
+/// Register `agent` as a human operator for the ONE OAuth client `client`
+/// (`oauth_clients.id`). Returns whether this call registered it (`false`: it
+/// already was, for that same client).
+///
+/// The client is NAMED, never inferred: the human test keys on the recorded
+/// client, and the application role may insert `oauth_clients` rows (dynamic
+/// client registration), so "the agent's one active human client" could be a
+/// row an application session planted, or be ambiguous (the definer then
+/// refuses). An agent already registered for a DIFFERENT client is refused
+/// here, with nothing changed.
 ///
 /// # Errors
-/// The definer refused (no active human client, a revoked registration, a
-/// missing reason), or a statement failed.
+/// The definer refused (`client` is not an active human client of `agent`, a
+/// revoked registration, a missing reason), the agent is registered for
+/// another client, or a statement failed.
 pub async fn register(
     conn: &mut PgConnection,
     agent: Uuid,
+    client: Uuid,
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<bool> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     let now: bool = sqlx::query_scalar(
-        "SELECT registered_now FROM public.epigraph_register_human_operator($1, $2)",
+        "SELECT registered_now FROM public.epigraph_register_human_operator($1, $2, $3)",
     )
     .bind(agent)
     .bind(reason)
+    .bind(client)
     .fetch_one(&mut *tx)
     .await?;
+    let recorded: Uuid =
+        sqlx::query_scalar("SELECT client_id FROM public.human_operators WHERE agent_id = $1")
+            .bind(agent)
+            .fetch_one(&mut *tx)
+            .await?;
+    if recorded != client {
+        tx.rollback().await?;
+        anyhow::bail!(
+            "{agent} is already registered as a human operator for OAuth client {recorded}, not \
+             {client}; nothing was changed (a registration names one client for life; revoke it \
+             to register the human again)"
+        );
+    }
     if apply {
         tx.commit().await?;
     } else {

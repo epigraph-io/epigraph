@@ -830,7 +830,8 @@ BEGIN
                         'linked to it', NEW.operator_id
             USING ERRCODE = '55000',
                   HINT = 'A maintenance session registers a human with '
-                         'epigraph-operator register-human-operator --agent <id> --apply.';
+                         'epigraph-operator register-human-operator --agent <id> --client '
+                         '<its human OAuth client id> --reason <text> --apply.';
     END IF;
     RETURN NEW;
 END $$;

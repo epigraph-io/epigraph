@@ -369,10 +369,16 @@ when that WRITER is bound too (see "Who is checked" below). Bound means:
   `human` too. Keying on the recorded client means suspending it suspends the
   human: minting a fresh active client for the same agent (the application
   role may register clients, but not update them) does not revive it. Register
-  and revoke with `epigraph-operator register-human-operator` /
+  and revoke with `epigraph-operator register-human-operator --agent <id>
+  --client <oauth client id> --reason <text> [--apply]` /
   `revoke-human-operator --agent <id> --reason <text> [--apply]` (maintenance
-  DSN; register refuses an agent with no active human client, or with more than
-  one unless the client is named). The registry's rules and its audit live on
+  DSN). `--client` is REQUIRED: the operator names the human's own OAuth client
+  rather than letting it be inferred, because the application role may insert
+  `oauth_clients` rows, so "the agent's one active human client" could be a row
+  an application session planted before the human was registered. Register
+  refuses a client that is not an active `human` client of that agent, and an
+  agent already registered for a different client. Verify the recorded
+  `human_operators.client_id` after registering. The registry's rules and its audit live on
   the table itself, so a direct maintenance `INSERT` / `UPDATE` meets the same
   checks and leaves the same `security_events` row as the command; revoke is
   final (a revoked row takes no change at all) and stops every agent

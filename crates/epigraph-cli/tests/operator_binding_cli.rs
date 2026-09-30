@@ -757,21 +757,53 @@ async fn link_refuses_a_second_human_live_or_retired(pool: PgPool) {
 /// link to it succeeds; an agent without a human client is refused; revoking
 /// stops the human binding at once.
 ///
+/// Delta review SEC-D6 / DIS-D7: the client is NAMED (`--client`, required).
+/// An application session may insert an ACTIVE `human` client naming the
+/// person before the operator registers it; the registration records the
+/// client the operator named, not the planted one, and a registration for a
+/// different client than the recorded one is refused.
+///
 /// Verified to fail: `human::register` committing its dry-run transaction ->
-/// the "nothing registered" assertion fails.
+/// the "nothing registered" assertion fails; `human::register` binding NULL
+/// for the client (the pre-fix "the agent's one active human client") -> the
+/// definer refuses the two-client person and the registration fails.
 #[sqlx::test(migrations = "../../migrations")]
 async fn register_and_revoke_a_human_operator(pool: PgPool) {
     let (person, _) = fixture::seed_agent_with_group(&pool, "person").await;
-    sqlx::query(
-        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
-                                    status, agent_id) \
-         VALUES ($1, 'person', 'human', ARRAY['claims:write'], 'active', $2)",
-    )
-    .bind(format!("person-{person}"))
-    .bind(person)
-    .execute(&pool)
-    .await
-    .expect("human client");
+    let client_row = |label: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO oauth_clients (client_id, client_name, client_type, \
+                                            allowed_scopes, status, agent_id) \
+                 VALUES ($1, $2, 'human', ARRAY['claims:write'], 'active', $3) RETURNING id",
+            )
+            .bind(format!("{label}-{person}"))
+            .bind(label)
+            .bind(person)
+            .fetch_one(&pool)
+            .await
+            .expect("human client")
+        }
+    };
+    let real_client = client_row("person").await;
+    // Planted by an application session (the app role holds INSERT on
+    // oauth_clients), before the operator registers the person.
+    let planted = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                        status, agent_id) \
+             VALUES ($1, 'planted', 'human', ARRAY['claims:write'], 'active', $2) RETURNING id",
+        )
+        .bind(format!("planted-{person}"))
+        .bind(person)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the app role inserts a human client");
+        (conn, id)
+    })
+    .await;
+    let c = real_client.to_string();
     let (service, _) = fixture::seed_agent_with_group(&pool, "not-a-person").await;
     let registered = |agent: Uuid| {
         let pool = pool.clone();
@@ -785,9 +817,37 @@ async fn register_and_revoke_a_human_operator(pool: PgPool) {
     };
     let p = person.to_string();
 
+    let unnamed = run_op(
+        &pool,
+        &[
+            "register-human-operator",
+            "--agent",
+            &p,
+            "--reason",
+            "test",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_ne!(
+        unnamed.code,
+        0,
+        "the client must be named: {}",
+        unnamed.show()
+    );
+    assert!(!registered(person).await);
+
     let dry = run_op(
         &pool,
-        &["register-human-operator", "--agent", &p, "--reason", "test"],
+        &[
+            "register-human-operator",
+            "--agent",
+            &p,
+            "--client",
+            &c,
+            "--reason",
+            "test",
+        ],
     )
     .await;
     assert_eq!(dry.code, 0, "{}", dry.show());
@@ -800,6 +860,8 @@ async fn register_and_revoke_a_human_operator(pool: PgPool) {
             "register-human-operator",
             "--agent",
             &p,
+            "--client",
+            &c,
             "--reason",
             "test",
             "--apply",
@@ -808,6 +870,36 @@ async fn register_and_revoke_a_human_operator(pool: PgPool) {
     .await;
     assert_eq!(applied.code, 0, "{}", applied.show());
     assert!(registered(person).await);
+    let recorded: Uuid =
+        sqlx::query_scalar("SELECT client_id FROM human_operators WHERE agent_id = $1")
+            .bind(person)
+            .fetch_one(&pool)
+            .await
+            .expect("recorded client");
+    assert_eq!(
+        recorded, real_client,
+        "the registration records the client the operator named, not the planted one"
+    );
+    let other = run_op(
+        &pool,
+        &[
+            "register-human-operator",
+            "--agent",
+            &p,
+            "--client",
+            &planted.to_string(),
+            "--reason",
+            "test",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(
+        other.code,
+        1,
+        "a registration for another client is refused: {}",
+        other.show()
+    );
     let audits: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM security_events WHERE event_type = 'operator.human_registered' \
             AND agent_id = $1",
@@ -838,6 +930,8 @@ async fn register_and_revoke_a_human_operator(pool: PgPool) {
             "register-human-operator",
             "--agent",
             &service.to_string(),
+            "--client",
+            &c,
             "--reason",
             "test",
             "--apply",

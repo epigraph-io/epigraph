@@ -205,7 +205,8 @@ async fn refuse(conn: &mut PgConnection, agent: Uuid, operator: Uuid) -> anyhow:
         bail!(
             "operator {operator} is not a human operator: a human operator needs BOTH a live \
              row in the human_operators registry and an active human OAuth client (register \
-             one with `epigraph-operator register-human-operator --agent <id> --apply`). A live \
+             one with `epigraph-operator register-human-operator --agent <id> --client <its human \
+             OAuth client id> --reason <text> --apply`). A live \
              link to it would not bind agent {agent} to a human; refusing."
         );
     }

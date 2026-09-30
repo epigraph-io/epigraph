@@ -27,7 +27,7 @@
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
 //!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
-//!     epigraph-operator register-human-operator --agent <uuid> --reason TEXT [--apply]
+//!     epigraph-operator register-human-operator --agent <uuid> --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-human-operator --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
 //!         --agent-system-prompt-hash H) [--apply]
@@ -66,6 +66,12 @@ enum Command {
         /// The human's own agent id.
         #[arg(long)]
         agent: Uuid,
+        /// The human's own OAuth client (`oauth_clients.id`, an ACTIVE
+        /// `human` client of `--agent`) this registration is for. Required:
+        /// the human test keys on this one client, and the application role
+        /// may insert `oauth_clients` rows, so it is never inferred.
+        #[arg(long)]
+        client: Uuid,
         /// Recorded on the registry row and in the audit row.
         #[arg(long)]
         reason: String,
@@ -325,12 +331,13 @@ async fn main_inner() -> anyhow::Result<i32> {
     match cli.command {
         Command::RegisterHumanOperator {
             agent,
+            client,
             reason,
             apply,
         } => {
-            let now = human::register(&mut conn, agent, &reason, apply).await?;
+            let now = human::register(&mut conn, agent, client, &reason, apply).await?;
             println!(
-                "{}{}\tagent={agent}",
+                "{}{}\tagent={agent}\tclient={client}",
                 if apply { "" } else { "WOULD BE " },
                 if now {
                     "REGISTERED"

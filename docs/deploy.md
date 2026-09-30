@@ -1455,7 +1455,10 @@ arming is one-way and every step before it must leave no live writer unbound.
    122 (it fails closed with `42883` without it), so migrate BEFORE they serve.
 2b. **Register the human operator(s)** (maintenance DSN, audited):
    `epigraph-operator register-human-operator --agent <the human's own agent>
-   --reason <text> --apply`. Only the agent of an active human OAuth client can
+   --client <that human's own OAuth client id> --reason <text> --apply`, then
+   read back `human_operators.client_id` and confirm it is the client you named.
+   `--client` is required, never inferred: the application role may insert
+   `oauth_clients` rows. Only the agent of an active human OAuth client can
    be registered; from 122 on, no link can be recorded to anyone else, so this
    precedes every link below. Check that no dynamically registered `human`
    client's agent is in the registry. The registration records that one client:
