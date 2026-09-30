@@ -990,13 +990,6 @@ END $$;
 --                     so an HTTP principal is not tied by side effect;
 --   write_authority   a live writer/admin row in the operator's group: 107's
 --                     retire refuses that, and such an agent wants a LIVE link;
---   operated_by_other_human
---                     an OPERATED_BY edge from it names a registered human
---                     operator OTHER than this one: its own auth lineage says
---                     it acts for another human, and a tie (permanent) to this
---                     one would misattribute it for good (OB5). An app session
---                     can forge such an edge, which can only make an agent
---                     SKIPPED, never tied;
 --   foreign_write_authority
 --                     a live writer/admin row in a group (other than its own
 --                     personal group) that the operator does NOT write: it acts
@@ -1004,6 +997,13 @@ END $$;
 --                     tying it to this operator would misattribute that;
 --   shared_signer     107's fingerprint (OPERATED_BY lineage to more than one
 --                     principal): retire it with 116's attested variant;
+--   operated_by_other_human
+--                     an OPERATED_BY edge from it names a registered human
+--                     operator OTHER than this one: its own auth lineage says
+--                     it acts for another human, and a tie (permanent) to this
+--                     one would misattribute it for good (OB5). An app session
+--                     can forge such an edge, which can only make an agent
+--                     SKIPPED, never tied;
 --   recent_writer     it authored a claim at or after `p_quiet_since`: it may
 --                     still be running, and a retired identity can never write
 --                     again once binding is armed. Give it a LIVE link, or pass
@@ -1092,11 +1092,6 @@ BEGIN
             WHEN EXISTS (SELECT 1 FROM public.oauth_clients c
                           WHERE c.agent_id = v_agent AND c.status <> 'revoked')
                 THEN 'skipped:oauth_principal'
-            WHEN EXISTS (SELECT 1 FROM public.edges e
-                          WHERE e.source_id = v_agent AND e.relationship = 'OPERATED_BY'
-                            AND e.target_id <> p_operator
-                            AND public.epigraph_is_human_operator(e.target_id))
-                THEN 'skipped:operated_by_other_human'
             WHEN EXISTS (SELECT 1 FROM public.group_memberships m
                           WHERE m.group_id = v_group AND m.agent_id = v_agent
                             AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin'))
@@ -1111,6 +1106,11 @@ BEGIN
             WHEN (SELECT count(DISTINCT e.target_id) FROM public.edges e
                    WHERE e.source_id = v_agent AND e.relationship = 'OPERATED_BY') > 1
                 THEN 'skipped:shared_signer'
+            WHEN EXISTS (SELECT 1 FROM public.edges e
+                          WHERE e.source_id = v_agent AND e.relationship = 'OPERATED_BY'
+                            AND e.target_id <> p_operator
+                            AND public.epigraph_is_human_operator(e.target_id))
+                THEN 'skipped:operated_by_other_human'
             WHEN p_quiet_since IS NOT NULL
                  AND EXISTS (SELECT 1 FROM public.claims c
                               WHERE c.agent_id = v_agent AND c.created_at >= p_quiet_since)
