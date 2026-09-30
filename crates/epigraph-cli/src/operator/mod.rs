@@ -25,6 +25,9 @@
 //!   agent is bound to a human operator. Hosts run it before spawning an agent,
 //!   because under D9 the agent's own app DSN cannot record the link.
 //!
+//! * `arm-operator-binding` — turn enforcement ON, once, after reporting every
+//!   unbound agent that wrote recently (see [`arm`]).
+//!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
 //!
@@ -61,6 +64,7 @@
 //! is stricter than `epigraph_db::assert_maintenance_privilege` (which is
 //! conditioned on row security being active): it is unconditional.
 
+pub mod arm;
 pub mod bind;
 pub mod client_scope;
 pub mod hide;

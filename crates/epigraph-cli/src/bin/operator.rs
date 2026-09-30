@@ -26,11 +26,12 @@
 //!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
 //!         --agent-system-prompt-hash H) [--apply]
+//!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 
 use clap::{Parser, Subcommand};
-use epigraph_cli::operator::{self, bind, client_scope, hide, link, reown, reverse};
+use epigraph_cli::operator::{self, arm, bind, client_scope, hide, link, reown, reverse};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -68,6 +69,21 @@ enum Command {
         operator: Uuid,
         /// Perform the link. Without it, everything runs in a transaction that
         /// is rolled back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Turn operator-binding enforcement ON for this database (migration 122),
+    /// once and irreversibly, after reporting every agent that wrote claims
+    /// recently and is not bound to a human operator.
+    ArmOperatorBinding {
+        /// The census window: agents that authored claims in this many days.
+        #[arg(long, default_value_t = 14)]
+        recent_days: i32,
+        /// Arm even though the census lists unbound recent writers (their
+        /// writes are refused from then on).
+        #[arg(long)]
+        allow_unbound_writers: bool,
+        /// Arm. Without it, only the report is printed.
         #[arg(long)]
         apply: bool,
     },
@@ -229,6 +245,17 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: the link above ran and was rolled back.");
             }
             Ok(if outcome.link.link_live { 0 } else { 3 })
+        }
+        Command::ArmOperatorBinding {
+            recent_days,
+            allow_unbound_writers,
+            apply,
+        } => {
+            let report = arm::run(&mut conn, recent_days, apply, allow_unbound_writers).await?;
+            for line in arm::describe(&report, recent_days, apply) {
+                println!("{line}");
+            }
+            Ok(if report.refused { 1 } else { 0 })
         }
         Command::LinkRetired {
             agents_file,

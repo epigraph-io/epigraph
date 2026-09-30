@@ -219,3 +219,108 @@ async fn link_refuses_an_agent_that_is_an_oauth_principal(pool: PgPool) {
         "nothing may be linked"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arm-operator-binding
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn armed(pool: &PgPool) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM operator_binding_arming)")
+        .fetch_one(pool)
+        .await
+        .expect("armed read")
+}
+
+/// A `('public', group)` claim by `agent`, straight into the table.
+async fn insert_claim(pool: &PgPool, agent: Uuid, group: Uuid) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(format!("binding cli probe {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Arming is one-way, so the census comes first: a dry run lists the unbound
+/// recent writer and arms nothing; `--apply` REFUSES (exit 1, nothing armed)
+/// while one exists; `--allow-unbound-writers` arms, after which that writer is
+/// refused OPL01; a re-run reports ALREADY-ARMED.
+///
+/// Verified to fail: the unbound-writer refusal removed from `arm::run` ->
+/// the plain `--apply` arms and the test fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_refuses_while_an_unbound_agent_wrote_recently(pool: PgPool) {
+    let (unbound, group) = fixture::seed_agent_with_group(&pool, "unbound").await;
+    insert_claim(&pool, unbound, group)
+        .await
+        .expect("unarmed: an unbound author still writes");
+    let unbound_s = unbound.to_string();
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .contains(&format!("UNBOUND\t{unbound_s}\t1 claim(s)")),
+        "{}",
+        dry.show()
+    );
+    assert!(dry.stdout.contains("DRY RUN"), "{}", dry.show());
+    assert!(!armed(&pool).await, "a dry run must not arm");
+
+    let refused = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(refused.stdout.contains("REFUSED"), "{}", refused.show());
+    assert!(!armed(&pool).await, "a refused --apply must not arm");
+
+    let forced = run_op(
+        &pool,
+        &["arm-operator-binding", "--apply", "--allow-unbound-writers"],
+    )
+    .await;
+    assert_eq!(forced.code, 0, "{}", forced.show());
+    assert!(forced.stdout.contains("ARMED"), "{}", forced.show());
+    assert!(armed(&pool).await);
+    let e = insert_claim(&pool, unbound, group)
+        .await
+        .expect_err("armed: the unbound writer is refused");
+    assert_eq!(
+        e.as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("OPL01"),
+        "{e}"
+    );
+
+    let again = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(again.stdout.contains("ALREADY-ARMED"), "{}", again.show());
+}
+
+/// With every recent writer bound, `--apply` arms without an override.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_arms_when_every_recent_writer_is_bound(pool: PgPool) {
+    let (human, group) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    insert_claim(&pool, human, group)
+        .await
+        .expect("the human writes");
+    let r = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        r.show()
+    );
+    assert!(armed(&pool).await);
+    insert_claim(&pool, human, group)
+        .await
+        .expect("armed: the human still writes");
+}
