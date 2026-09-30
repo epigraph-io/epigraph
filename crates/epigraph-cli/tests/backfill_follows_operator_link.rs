@@ -389,3 +389,90 @@ async fn the_claims_walk_resumes_rewinds_and_honours_its_budget(pool: PgPool) {
     assert_eq!(code, 0, "a re-run resumes and completes:\n{stderr}");
     assert_eq!(world_claims_by(&pool, author).await, 0);
 }
+
+/// World-owned rows of an agent-keyed table (`perspectives`, `recall_events`).
+async fn world_rows_by(pool: &PgPool, table: &str, agent_col: &str, agent: Uuid) -> i64 {
+    sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} WHERE {agent_col} = $1 AND owner_group_id = $2"
+    ))
+    .bind(agent)
+    .bind(Uuid::nil())
+    .fetch_one(pool)
+    .await
+    .expect("count")
+}
+
+/// Delta review COR-D5 / DIS-D8: review C2's rewind also holds for the two
+/// AGENT-KEYED arms (`backfill_agent_keyed`): a cursor carried over from an
+/// earlier run, above every world-owned row, is rewound in the same run, so a
+/// single-entity run of `recall-events` (the runbook's first loop) or of
+/// `perspectives` stamps every row and exits 0 instead of reporting resolvable
+/// rows as residue (exit 1).
+///
+/// Verified to fail: the `if !from_start { cursor = None; continue 'passes; }`
+/// rewind in `backfill_agent_keyed` disabled (`if false && !from_start`) ->
+/// both single-entity runs exit 1 with every row still world-owned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_agent_keyed_walks_rewind_a_carried_cursor(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "agent-keyed author").await;
+    for i in 0..3 {
+        sqlx::query(
+            "INSERT INTO recall_events (tool, query_text, agent_id, owner_group_id, visibility) \
+             VALUES ('recall', $1, $2, $3, 'public')",
+        )
+        .bind(format!("carried {i}"))
+        .bind(author)
+        .bind(Uuid::nil())
+        .execute(&pool)
+        .await
+        .expect("world-owned recall event");
+        sqlx::query(
+            "INSERT INTO perspectives (name, owner_agent_id, visibility, owner_group_id) \
+             VALUES ($1, $2, 'public', $3)",
+        )
+        .bind(format!("carried perspective {i} {author}"))
+        .bind(author)
+        .bind(Uuid::nil())
+        .execute(&pool)
+        .await
+        .expect("world-owned perspective");
+    }
+
+    for (entity, table, agent_col) in [
+        ("recall-events", "recall_events", "agent_id"),
+        ("perspectives", "perspectives", "owner_agent_id"),
+    ] {
+        assert_eq!(world_rows_by(&pool, table, agent_col, author).await, 3);
+        // A cursor an earlier run left ABOVE every world-owned row.
+        let carried = sqlx::query(
+            "UPDATE tenancy_backfill_progress \
+                SET last_id = 'ffffffff-ffff-ffff-ffff-ffffffffffff', rows_done = 5000 \
+              WHERE entity = $1",
+        )
+        .bind(table)
+        .execute(&pool)
+        .await
+        .expect("carried cursor")
+        .rows_affected();
+        assert_eq!(carried, 1, "migration 062 seeds a progress row for {table}");
+        let (code, stderr) = run_backfill(
+            &pool,
+            &[
+                "run",
+                "--legacy-owner",
+                "operator",
+                "--entity",
+                entity,
+                "--batch-size",
+                "1",
+            ],
+        )
+        .await;
+        assert_eq!(code, 0, "{entity}: {stderr}");
+        assert_eq!(
+            world_rows_by(&pool, table, agent_col, author).await,
+            0,
+            "{entity}: the carried cursor is rewound in the same run"
+        );
+    }
+}
