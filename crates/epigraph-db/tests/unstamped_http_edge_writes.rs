@@ -62,8 +62,10 @@
 //! # The second register: raw `INSERT INTO edges` in a route file
 //!
 //! A route file that writes an edge with its own SQL instead of the repo layer
-//! is registered too ([`RAW_INSERTS`]), stamped or not. Measured at this commit
-//! every one of them runs unstamped:
+//! is registered too ([`RAW_INSERTS`]), stamped or not. Measured when this table
+//! was written, every one of them ran unstamped; `persist_packet`'s have since
+//! moved onto the stamped claim-write transaction (operator-binding delta
+//! review), and the rest still run unstamped:
 //!
 //! | file | handler | endpoints -> relationship | executor | in D8 scope |
 //! |---|---|---|---|---|
@@ -72,8 +74,8 @@
 //! | experiment_loop.rs | submit_results | experiment_result -> experiment result_of | `state.db_pool` | no |
 //! | experiment_loop.rs | analyze_result | analysis -> experiment_result analyzes | `state.db_pool` | no |
 //! | experiment_loop.rs | analyze_result | analysis -> claim provides_evidence | `state.db_pool` | no |
-//! | submit.rs | persist_packet | agent -> claim AUTHORED, claim -> trace HAS_TRACE, trace -> claim TRACES, trace -> evidence USES_EVIDENCE | a transaction begun on `state.db_pool` | no |
-//! | submit.rs | persist_packet | evidence -> claim SUPPORTS | a transaction begun on `state.db_pool` | yes |
+//! | submit.rs | persist_packet | agent -> claim AUTHORED, claim -> trace HAS_TRACE, trace -> claim TRACES, trace -> evidence USES_EVIDENCE | `AppState::begin_claim_write` (stamped with the caller's viewer on a server) | no |
+//! | submit.rs | persist_packet | evidence -> claim SUPPORTS | `AppState::begin_claim_write` (stamped with the caller's viewer on a server) | yes |
 //!
 //! # What this file does NOT see
 //!

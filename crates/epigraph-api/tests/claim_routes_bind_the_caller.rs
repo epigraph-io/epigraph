@@ -10,7 +10,7 @@
 //!
 //! Every arm runs with the orphan permissive `claims_privacy` policy installed
 //! (`FOR ALL USING (true)`, no `WITH CHECK`), standing in for the one a
-//! long-lived deployment still carries and no migration creates: with it, row
+//! long-lived deployment may carry and no migration creates: with it, row
 //! security admits any claim INSERT, so what refuses a write here is the
 //! trigger and nothing else.
 //!
@@ -20,12 +20,17 @@
 //!
 //! # Verified to fail
 //!
-//! `submit.rs::persist_packet` and `policies.rs::create_challenge` reverted to
-//! a transaction on `state.db_pool` (the pre-fix handlers) -> the unbound and
-//! the other-human callers are refused only by the database's no-principal
-//! rule (OPL01), and with that rule also removed from migration 122 their
-//! writes land (the packet authored as human A in A's group, the challenge in
-//! A's group under the system identity).
+//! 1. `submit.rs::persist_packet` and `policies.rs::create_challenge` reverted
+//!    to a transaction on `state.db_pool` (the pre-fix handlers), the
+//!    database's no-principal rule kept -> the LEGITIMATE controls fail: the
+//!    human's own packet and challenge are refused OPL01 (an unstamped write),
+//!    so the stamping is load-bearing.
+//! 2. The same, with the no-principal rule also removed from migration 122 ->
+//!    the unbound caller's challenge is written into A's group under the
+//!    system identity; the unbound caller's packet claim passes the trigger as
+//!    human A, and the request then fails only because this test schema has
+//!    no orphan policy on `reasoning_traces` (the unstamped trace insert is
+//!    refused by row security, rolling the claim back).
 
 mod viewer_fixture;
 
