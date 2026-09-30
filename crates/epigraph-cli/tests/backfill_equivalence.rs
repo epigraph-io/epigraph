@@ -271,7 +271,11 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
     .expect("edges prior");
 
     // ---- run: many tiny batches ----
-    let (code, stderr) = run_backfill(&pool, &["run", "--batch-size", "3"]).await;
+    let (code, stderr) = run_backfill(
+        &pool,
+        &["run", "--legacy-owner", "operator", "--batch-size", "3"],
+    )
+    .await;
     assert_eq!(code, 0, "run must complete:\n{stderr}");
 
     // ---- claims: set-based == per-row ----

@@ -637,6 +637,8 @@ async fn reown_linked_moves_a_linked_authors_personal_claims_and_their_derived_r
             "reown-linked",
             "--operator",
             &human_s,
+            "--legacy-owner",
+            "operator",
             "--manifest-out",
             &m1,
         ],
@@ -656,6 +658,8 @@ async fn reown_linked_moves_a_linked_authors_personal_claims_and_their_derived_r
             "reown-linked",
             "--operator",
             &human_s,
+            "--legacy-owner",
+            "operator",
             "--manifest-out",
             &m2,
             "--apply",
@@ -683,6 +687,8 @@ async fn reown_linked_moves_a_linked_authors_personal_claims_and_their_derived_r
             "reown-linked",
             "--operator",
             &human_s,
+            "--legacy-owner",
+            "operator",
             "--manifest-out",
             &m3,
             "--apply",
@@ -859,4 +865,50 @@ async fn register_and_revoke_a_human_operator(pool: PgPool) {
         !registered(person).await,
         "a revoked human is no longer one"
     );
+}
+
+/// `reown-linked --legacy-owner platform` moves only a LIVE-linked author's
+/// personal-group claims, and reports (never moves) a retired-linked author's.
+///
+/// Verified to fail: the candidate query's `($2 OR NOT l.retired)` reduced to
+/// `TRUE` -> the retired-linked author's claim moves too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reown_linked_under_platform_moves_only_live_linked_authors(pool: PgPool) {
+    let (human, human_group) = fixture::seed_human_operator(&pool, "human").await;
+    let (live, live_group) = fixture::seed_agent_with_group(&pool, "live").await;
+    let (retired, retired_group) = fixture::seed_agent_with_group(&pool, "retired").await;
+    let c_live = insert_claim(&pool, live, live_group).await.expect("claim");
+    let c_retired = insert_claim(&pool, retired, retired_group)
+        .await
+        .expect("claim");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, live, human)
+            .await
+            .expect("live link");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, human)
+            .await
+            .expect("retired link");
+    }
+    let m = std::env::temp_dir().join(format!("reown-platform-{}.jsonl", Uuid::new_v4()));
+    let m_s = m.display().to_string();
+    let r = run_op(
+        &pool,
+        &[
+            "reown-linked",
+            "--operator",
+            &human.to_string(),
+            "--legacy-owner",
+            "platform",
+            "--manifest-out",
+            &m_s,
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(r.stdout.contains("REPORT\t1 claim(s)"), "{}", r.show());
+    assert_eq!(owner_of(&pool, "claims", c_live).await, human_group);
+    assert_eq!(owner_of(&pool, "claims", c_retired).await, retired_group);
+    let _ = std::fs::remove_file(m);
 }

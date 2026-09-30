@@ -34,7 +34,8 @@
 //!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
 //!     epigraph-operator link-legacy-authors --operator <uuid> [--exclude-agents-file F] \
 //!         [--quiet-days 30 | --no-quiet-window] [--apply]
-//!     epigraph-operator reown-linked --operator <uuid> --manifest-out reown-linked-1.jsonl [--apply]
+//!     epigraph-operator reown-linked --operator <uuid> --legacy-owner operator|platform \
+//!         --manifest-out reown-linked-1.jsonl [--apply]
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 
@@ -167,6 +168,11 @@ enum Command {
         /// `lock_timeout` for each batch (a PostgreSQL interval).
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
+        /// Who owns the legacy corpus (as `epigraph-tenancy-backfill run`):
+        /// `operator` moves every linked author's personal-group claims;
+        /// `platform` only LIVE-linked authors'. Required.
+        #[arg(long, value_enum)]
+        legacy_owner: reown_linked::LegacyOwner,
     },
     /// Record a RETIRED operator link for each agent id in a file.
     LinkRetired {
@@ -408,8 +414,16 @@ async fn main_inner() -> anyhow::Result<i32> {
             apply,
             batch_size,
             lock_timeout,
+            legacy_owner,
         } => {
-            let ids = reown_linked::candidates(&mut conn, op).await?;
+            let ids = reown_linked::candidates(&mut conn, op, legacy_owner).await?;
+            if legacy_owner == reown_linked::LegacyOwner::Platform {
+                let left = reown_linked::retired_left_behind(&mut conn, op).await?;
+                println!(
+                    "REPORT\t{left} claim(s) owned by a RETIRED-linked author's own personal group \
+                     are left in place (--legacy-owner platform)"
+                );
+            }
             println!(
                 "reown-linked: operator={op} candidates={} (claims owned by a linked author's own \
                  personal group)",

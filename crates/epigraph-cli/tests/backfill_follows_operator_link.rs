@@ -58,7 +58,7 @@ async fn the_backfill_stamps_a_linked_authors_claims_to_the_operators_group(pool
     let ev = fixture::seed_evidence(&pool, c_linked, "testimony").await;
     let c_unlinked = fixture::seed_public_claim(&pool, unlinked, "legacy by an unlinked one").await;
 
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "run must complete:\n{stderr}");
     assert_eq!(
         owner_of(&pool, "claims", c_linked).await,
@@ -98,4 +98,81 @@ async fn the_backfill_stamps_a_linked_authors_claims_to_the_operators_group(pool
         stderr.contains("REPORT: 1 row(s) in claims"),
         "verify must report the linked author's personal-group claim:\n{stderr}"
     );
+}
+
+/// `--legacy-owner platform` (decision D1's default shape): only rows of
+/// authors with a LIVE link to a registered human move (to that operator's
+/// group, derived rows following); rows of retired-linked and unlinked authors
+/// STAY world-owned as the platform corpus, derived rows included. `verify
+/// --legacy-owner platform` passes and reports the corpus; the strict `verify`
+/// fails on it. A re-run walks nothing.
+///
+/// Verified to fail: `author_filter`'s platform arm replaced by `TRUE` -> the
+/// retired-linked and unlinked authors' claims are stamped (to the operator /
+/// NULL-skipped), and the "stays world-owned" assertions or the verify exit
+/// codes fail.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_platform_run_moves_only_live_linked_authors(pool: PgPool) {
+    let (operator, operator_group) = fixture::seed_human_operator(&pool, "operator").await;
+    let (live, _) = fixture::seed_agent_with_group(&pool, "live").await;
+    let (retired, _) = fixture::seed_agent_with_group(&pool, "retired").await;
+    let (unlinked, _) = fixture::seed_agent_with_group(&pool, "unlinked").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, live, operator)
+            .await
+            .expect("live link");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, operator)
+            .await
+            .expect("retired link");
+    }
+    let c_live = fixture::seed_public_claim(&pool, live, "by a live-linked agent").await;
+    let ev_live = fixture::seed_evidence(&pool, c_live, "testimony").await;
+    let c_retired = fixture::seed_public_claim(&pool, retired, "by a retired identity").await;
+    let ev_retired = fixture::seed_evidence(&pool, c_retired, "testimony").await;
+    let c_unlinked = fixture::seed_public_claim(&pool, unlinked, "by an unlinked agent").await;
+
+    let (code, stderr) = run_backfill(
+        &pool,
+        &["run", "--legacy-owner", "platform", "--batch-size", "2"],
+    )
+    .await;
+    assert_eq!(code, 0, "a platform run completes:\n{stderr}");
+    assert_eq!(owner_of(&pool, "claims", c_live).await, operator_group);
+    assert_eq!(owner_of(&pool, "evidence", ev_live).await, operator_group);
+    let world = Uuid::nil();
+    assert_eq!(
+        owner_of(&pool, "claims", c_retired).await,
+        world,
+        "platform corpus"
+    );
+    assert_eq!(
+        owner_of(&pool, "evidence", ev_retired).await,
+        world,
+        "its derived row"
+    );
+    assert_eq!(
+        owner_of(&pool, "claims", c_unlinked).await,
+        world,
+        "platform corpus"
+    );
+
+    let (code, stderr) = run_backfill(&pool, &["verify", "--legacy-owner", "platform"]).await;
+    assert_eq!(
+        code, 0,
+        "verify under the platform decision passes:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("REPORT: 2 world-owned claim(s) form the platform corpus"),
+        "{stderr}"
+    );
+    let (code, _) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "the strict verify still fails on the platform corpus"
+    );
+
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "platform"]).await;
+    assert_eq!(code, 0, "a re-run is a no-op:\n{stderr}");
+    assert_eq!(owner_of(&pool, "claims", c_retired).await, world);
 }

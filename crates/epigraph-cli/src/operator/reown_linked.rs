@@ -24,13 +24,28 @@
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+/// Who owns the legacy corpus: the same decision `epigraph-tenancy-backfill
+/// run --legacy-owner` takes, and required here for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum LegacyOwner {
+    /// Every linked author (live or retired) is the operator's.
+    Operator,
+    /// Only LIVE-linked authors are the operator's; a retired-linked author's
+    /// claims are left where they are (reported), for the platform decision.
+    Platform,
+}
+
 /// Claims owned by their author's own personal group (the canonical did_key,
 /// created by the author) whose author has an `operator_links` row naming
-/// `operator`, in id order.
+/// `operator` (under `platform`: a LIVE row), in id order.
 ///
 /// # Errors
 /// The read fails.
-pub async fn candidates(conn: &mut PgConnection, operator: Uuid) -> anyhow::Result<Vec<Uuid>> {
+pub async fn candidates(
+    conn: &mut PgConnection,
+    operator: Uuid,
+    mode: LegacyOwner,
+) -> anyhow::Result<Vec<Uuid>> {
     Ok(sqlx::query_scalar(
         "SELECT c.id FROM claims c \
            JOIN operator_links l ON l.agent_id = c.agent_id AND l.operator_id = $1 \
@@ -38,9 +53,30 @@ pub async fn candidates(conn: &mut PgConnection, operator: Uuid) -> anyhow::Resu
           WHERE g.kind = 'personal' \
             AND g.created_by_agent_id = c.agent_id \
             AND g.did_key = 'did:epigraph:personal:' || c.agent_id::text \
+            AND ($2 OR NOT l.retired) \
           ORDER BY c.id",
     )
     .bind(operator)
+    .bind(mode == LegacyOwner::Operator)
     .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// Under `platform`: how many claims a RETIRED-linked author's own personal
+/// group still owns (left behind by the decision, reported).
+///
+/// # Errors
+/// The read fails.
+pub async fn retired_left_behind(conn: &mut PgConnection, operator: Uuid) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM claims c \
+           JOIN operator_links l ON l.agent_id = c.agent_id AND l.operator_id = $1 AND l.retired \
+           JOIN groups g ON g.id = c.owner_group_id \
+          WHERE g.kind = 'personal' \
+            AND g.created_by_agent_id = c.agent_id \
+            AND g.did_key = 'did:epigraph:personal:' || c.agent_id::text",
+    )
+    .bind(operator)
+    .fetch_one(&mut *conn)
     .await?)
 }

@@ -235,11 +235,22 @@ the caller meant `'group'` — a failed write is recoverable, a disclosure is no
 ```bash
 # 070 MUST be applied first — the backfill relies on arm (d) to propagate to the
 # 17 claim-derived tables. The binary refuses to start otherwise.
-epigraph-tenancy-backfill run --batch-size 5000
+epigraph-tenancy-backfill run --legacy-owner operator|platform --batch-size 5000
 
 # The deploy pre-flight. Exit code is the guard; it prints offending ids.
-epigraph-tenancy-backfill verify
+epigraph-tenancy-backfill verify [--legacy-owner operator|platform]
 ```
+
+**`--legacy-owner` is required on `run`**: who owns the legacy corpus is an
+operator decision, not a default. `operator`: a world-owned row of an author
+linked to a human (live OR retired) goes to that operator's group, an unlinked
+author's to its own personal group. `platform`: only rows of authors with a LIVE
+link to a registered human operator move (to that operator's group); rows of
+retired-linked and unlinked authors, and their derived rows, stay world-owned as
+the platform corpus (the walk itself skips them, so a re-run never revisits
+them). `verify` takes the same flag: without it the check is strict (no
+world-owned residue at all); under `platform` it fails only on rows that should
+have moved and REPORTS the platform corpus.
 
 It is resumable across a `kill -9`: the `tenancy_backfill_progress` cursor is
 committed in the same transaction as its batch.
@@ -476,12 +487,12 @@ before arming.
    WHERE m.revoked_at IS NULL AND m.role IN ('writer', 'admin')
      AND NOT public.epigraph_operator_writes_group(l.operator_id, m.group_id);
   ```
-* The backfill (`epigraph-tenancy-backfill run`) stamps a world-owned row of a
-  LINKED author (any link state) to the operator's group; an unlinked author
-  keeps the personal-group fallback. `verify` still fails on any world-owned
-  residue, and REPORTS (not a failure) rows still owned by a linked author's
-  own personal group.
-* `epigraph-operator reown-linked --operator <human> --manifest-out <new path>
+* The backfill (`epigraph-tenancy-backfill run --legacy-owner ...`) stamps a
+  world-owned row of a linked author to the operator's group: any link state
+  under `operator`, LIVE links only under `platform` (see "Running the
+  backfill"). `verify` REPORTS (not a failure) rows still owned by a linked
+  author's own personal group.
+* `epigraph-operator reown-linked --operator <human> --legacy-owner operator|platform --manifest-out <new path>
   [--apply]` moves those claims into the operator's group through
   `reown-claims`' guarded batches (`--derived follow-claim`; derived rows follow
   through 070's arm (d); `reown-reverse` undoes a manifest). Resumable: a re-run
