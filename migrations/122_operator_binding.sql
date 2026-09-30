@@ -477,13 +477,16 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM
 -- trigger decides it): there a RETIRED link to the writer's human
 -- counts, so a human can supersede its own legacy author's claim. A fresh
 -- claim may never name a retired identity (OB1). An author that belongs to no
--- human (for the row's kind) is unbound (OPL01, under the valve's rule); one
--- that belongs to ANOTHER human is a cross-human attribution (OPL02, armed; an
--- instance-admin principal and a privileged session are exempt, as everywhere
--- in section 1b). So is an author that belongs to a human while the WRITER
--- belongs to none: with the valve closed the writer's own OPL01 comes first,
--- and with it open (section 4) the valve relieves that OPL01 only, never lets
--- an unbound writer put words in a bound identity's mouth.
+-- human at all is unbound (OPL01, under the valve's rule); so is a RETIRED
+-- identity of the writer's OWN human named on a fresh claim (OPL01: the valve
+-- may relieve it, and it stays inside one human). One that belongs to ANOTHER
+-- human, by a link of ANY state, is a cross-human attribution (OPL02, armed; an
+-- instance-admin principal and a privileged session are exempt for a live-bound
+-- author, as everywhere in section 1b, and meet OPL01 for a retired one). So is
+-- an author that belongs to a human while the WRITER belongs to none: with the
+-- valve closed the writer's own OPL01 comes first, and with it open (section 4)
+-- the valve relieves that OPL01 only, never lets an unbound writer (or another
+-- human's agent) put words in a bound identity's mouth, a retired one included.
 CREATE OR REPLACE FUNCTION public.epigraph_require_attributable(
     p_author uuid, p_writer uuid, p_inherited boolean)
 RETURNS void
@@ -496,16 +499,21 @@ BEGIN
     IF NOT public.epigraph_operator_binding_armed() THEN
         RETURN;
     END IF;
+    v_writer_human := public.epigraph_human_of(p_writer, true);
     v_author_human := public.epigraph_human_of(p_author, NOT COALESCE(p_inherited, false));
     IF v_author_human IS NULL THEN
-        PERFORM public.epigraph_require_bound_author(p_author);
+        -- No human for this row's kind. A RETIRED identity still belongs to
+        -- its human: a writer outside that human is refused below (OPL02,
+        -- whatever the valve), before the binding check the valve relieves.
+        v_author_human := public.epigraph_human_of(p_author, false);
+        IF v_author_human IS NULL OR v_author_human = v_writer_human
+           OR public.epigraph_operator_scope_exempt() THEN
+            PERFORM public.epigraph_require_bound_author(p_author);
+            RETURN;
+        END IF;
+    ELSIF v_writer_human = v_author_human THEN
         RETURN;
-    END IF;
-    v_writer_human := public.epigraph_human_of(p_writer, true);
-    IF v_writer_human = v_author_human THEN
-        RETURN;
-    END IF;
-    IF public.epigraph_operator_scope_exempt() THEN
+    ELSIF public.epigraph_operator_scope_exempt() THEN
         RETURN;
     END IF;
     IF v_writer_human IS NULL THEN

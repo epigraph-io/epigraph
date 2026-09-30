@@ -527,9 +527,13 @@ on every boot while set, and makes every connection the process's `ScopedPool`
 opens carry the session setting `epigraph.operator_link_enforcement = 'off'`,
 which the binding check honours. It relieves `OPL01` ONLY: the cross-human
 scope (`OPL02`) keys on arming alone, so no valve lets one human's agent write
-into another human's group, and no valve lets an UNBOUND writer name a bound
-author (a human, or any human's agent): with the valve open an unbound writer
-may author only as itself or as another unbound identity. Any other value, including a typo, leaves
+into another human's group, and no valve lets an UNBOUND writer, or another
+human's agent, name a bound author (a human, any human's agent, or a RETIRED
+identity tied to a human): with the valve open an unbound writer may author
+only as itself or as another unbound identity. What the valve does relieve
+inside one human is the binding itself: a fresh claim naming the writer's own
+human's retired identity is `OPL01` with the valve closed and admitted with it
+open. Any other value, including a typo, leaves
 enforcement ON. It reaches only `ScopedPool` connections (every request unit
 and operator CLI); any other pool, and a transaction-mode pooler, stay
 enforced. The setting is a transport, not an authority boundary: any raw

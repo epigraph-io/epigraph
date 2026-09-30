@@ -1176,6 +1176,101 @@ async fn the_valve_never_lets_an_unbound_writer_name_a_bound_author(pool: PgPool
         .expect("valve open, U names another unbound agent");
 }
 
+/// Delta review round 2 DIS-R2-1: a RETIRED identity still belongs to its
+/// human. With the valve open, neither an unbound writer nor another human's
+/// agent may name it (OPL02, keyed on the arming), which the live-only lookup
+/// missed: the author "belonged to no human", took the binding branch, and the
+/// valve relieved that. With the valve closed another human's agent is refused
+/// OPL02 too (it was OPL01). The writer's OWN human's retired identity on a
+/// fresh claim stays OPL01, which the valve relieves (one human, no crossing).
+///
+/// Verified to fail: `epigraph_require_attributable`'s any-state lookup
+/// removed (the `IF v_author_human IS NULL THEN` branch back to a bare
+/// `epigraph_require_bound_author` + RETURN) -> U's and Y's valve-open claims
+/// naming A's retired identity land.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_valve_lets_a_writer_outside_its_human_name_a_retired_identity(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, b_group) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
+    let (u, u_group) = fixture::seed_agent_with_group(&pool, "unbound-u").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+    link_live(&pool, x, a).await;
+    link_live(&pool, y, b).await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy identity's retired tie to A");
+    }
+    arm(&pool).await;
+
+    let write = |writer: Uuid, group: Uuid, valve_off: bool| {
+        let pool = pool.clone();
+        async move {
+            as_app_stamped(&pool, writer, &[group], |mut conn| async move {
+                let v = if valve_off { "off" } else { "" };
+                sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', $1, false)")
+                    .bind(v)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("valve");
+                let r = insert_claim(&mut *conn, legacy, group).await;
+                sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+                    .execute(&mut *conn)
+                    .await
+                    .expect("valve reset");
+                (conn, r)
+            })
+            .await
+        }
+    };
+
+    for (writer, group, valve_off, what) in [
+        (
+            u,
+            u_group,
+            true,
+            "valve open, unbound U names A's retired identity",
+        ),
+        (
+            y,
+            b_group,
+            true,
+            "valve open, B's agent Y names A's retired identity",
+        ),
+        (
+            y,
+            b_group,
+            false,
+            "valve closed, B's agent Y names A's retired identity",
+        ),
+    ] {
+        let r = write(writer, group, valve_off).await;
+        assert_eq!(code_of(&r).as_deref(), Some("OPL02"), "{what}: {r:?}");
+    }
+    let named: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE agent_id = $1")
+        .bind(legacy)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        named, 0,
+        "{named} claim(s) attributed to the retired identity"
+    );
+
+    // Controls. Within A's own human a fresh claim naming its retired identity
+    // is OPL01 with the valve closed, and relieved by the valve (no crossing).
+    assert_opl01(
+        write(x, a_group, false).await,
+        "valve closed, A's agent X names A's retired identity",
+    );
+    write(x, a_group, true)
+        .await
+        .expect("valve open, A's agent X names its own human's retired identity");
+}
+
 /// Delta review SEC-D5: the checks read the NEW author only, so an UPDATE of
 /// `claims.agent_id` must not be a way to take over a claim another human
 /// said. Human B also writes A's group; B's claim sits there; A's live agent X,

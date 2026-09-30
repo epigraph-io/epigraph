@@ -1525,7 +1525,8 @@ After arming: set `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off` on the affected
 units and restart them (new binaries only; old binaries do not carry the
 valve). The valve relieves `OPL01` only (including the refusal of an
 unstamped application session); `OPL02` stays in force, including for an
-unbound writer that names a bound author. Removing the arming row, or dropping the trigger, is a superuser DDL
+unbound writer (or another human's agent) that names a bound author or a
+retired identity tied to a human. Removing the arming row, or dropping the trigger, is a superuser DDL
 act on the migration DSN.
 
 No new environment variable is required; `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT`
