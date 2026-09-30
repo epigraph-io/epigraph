@@ -48,6 +48,16 @@ pub const VALVE_OFF_WARNING: &str = "EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off: ope
      (OPL01) are ACCEPTED on every connection it opens. This is an emergency valve: link the \
      agent (epigraph-operator link) and remove the variable.";
 
+/// The boot INFO line of a process that enforces on an armed database.
+///
+/// It names the refusal's code in parentheses, never as `OPL01:`: a refusal's
+/// own message is `OPL01: ...` / `OPL02: ...` (migration 122), and the deploy
+/// runbook counts refusals in the logs by exactly that `OPL0[12]:` prefix, so a
+/// boot line (or [`VALVE_OFF_WARNING`]) carrying it would read as a refusal on
+/// every restart.
+pub const ARMED_BOOT_INFO: &str = "operator binding ENFORCED: the database is armed; a claim by \
+     an agent not bound to a human operator is refused (OPL01)";
+
 /// Whether this process enforces operator binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Enforcement {
@@ -109,8 +119,7 @@ pub async fn log_boot_state(pool: &sqlx::PgPool, unit: &str) {
         Ok(Some(true)) if valve == Enforcement::On => tracing::info!(
             target: "tenancy.operator_binding",
             unit,
-            "operator binding ENFORCED: the database is armed; a claim by an agent not bound to \
-             a human operator is refused (OPL01)"
+            "{ARMED_BOOT_INFO}"
         ),
         Ok(Some(true)) => tracing::warn!(
             target: "tenancy.operator_binding",
@@ -141,7 +150,22 @@ pub async fn log_boot_state(pool: &sqlx::PgPool, unit: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::Enforcement;
+    use super::{Enforcement, ARMED_BOOT_INFO, VALVE_OFF_WARNING};
+
+    /// The boot lines name the code but never in a refusal's `OPL0x:` form,
+    /// which is what the deploy runbook counts as a refusal in the logs.
+    #[test]
+    fn boot_lines_never_read_as_a_refusal() {
+        for line in [ARMED_BOOT_INFO, VALVE_OFF_WARNING] {
+            assert!(line.contains("OPL01"), "the line names the code: {line}");
+            for refusal in ["OPL01:", "OPL02:"] {
+                assert!(
+                    !line.contains(refusal),
+                    "a boot line must not carry a refusal's prefix {refusal:?}: {line}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn only_the_exact_word_off_opens_the_valve() {
