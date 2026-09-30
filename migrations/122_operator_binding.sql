@@ -114,8 +114,10 @@
 -- 2. WHERE IT IS ENFORCED: A TRIGGER, SO NO WRITE PATH CAN SKIP IT
 --
 -- `claims_require_tenancy_then_operator_binding` is a BEFORE INSERT OR UPDATE
--- OF agent_id row trigger on `claims`. Every claim write reaches it: REST, MCP
--- over HTTP and stdio, the CLIs, workflow ingest, default and explicit
+-- OF agent_id, supersedes row trigger on `claims` (the `supersedes` half only
+-- guards an existing claim's lineage; see the trigger body's comment). Every
+-- claim write reaches it: REST, MCP over HTTP and stdio, the CLIs, workflow
+-- ingest, default and explicit
 -- declarations, and a raw INSERT on any role (a superuser included: triggers
 -- are not bypassed by BYPASSRLS). It is named to sort AFTER
 -- `claims_require_tenancy`, because section 1b reads `owner_group_id`, which
@@ -128,10 +130,11 @@
 -- from the viewer) whenever it differs from the author: the writer must be
 -- bound (OPL01), must write the owner group (OPL02), and may name as author
 -- only a bound agent of its own human (OPL01 / OPL02 otherwise); the author a
--- supersede INHERITS (a new row naming `supersedes` whose author IS that
--- predecessor's author) may also be a RETIRED agent of that human, so a human
--- superseding its own legacy author's claim is admitted, while a fresh claim
--- naming a retired identity is not, whatever `supersedes` it points at. With a
+-- supersede INHERITS (a new row naming `supersedes` whose predecessor has that
+-- author and group, is already retired, and has no other current successor:
+-- what the supersede act writes) may also be a RETIRED agent of that human, so
+-- a human superseding its own legacy author's claim is admitted, while a fresh
+-- claim naming a retired identity is not, however `supersedes` is posed. With a
 -- principal equal to the author, or on a privileged session, the author is
 -- the one checked. With NO principal on an application session the writer is
 -- unbound: refused OPL01 (fail closed, so a route that forgot to stamp its
@@ -549,16 +552,53 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, bool
 -- author must be the writer's own human's (`epigraph_require_attributable`).
 -- `epigraph_principal_id()` is what `ScopedPool` stamps from the viewer, so
 -- this binds the identity a request authenticated as, not a column the request
--- body supplied.
+-- body supplied (section 4 says what that stamp is, and is not, a boundary
+-- against).
+--
+-- INHERITED (the one admission of a RETIRED author) means exactly what
+-- `supersede_act_conn` writes, and nothing a writer can pose: an INSERT that
+-- names `supersedes`, where that predecessor carries the SAME author, is owned
+-- by the SAME group, is already RETIRED (`is_current = false`: the act retires
+-- it first, in the same transaction), and has no other CURRENT successor. So a
+-- supersede re-states one retired claim once, in its own group; it does not
+-- mint fresh claims under a retired identity (a current predecessor, a second
+-- successor, or a different group is refused as a fresh claim naming that
+-- identity), and a group the writer cannot write is refused OPL02 before the
+-- predecessor's author is compared, so the answer never says who authored a
+-- claim the writer could not read. One current successor is an INSERT-side
+-- rule: claim UPDATEs outside `agent_id` / `supersedes` stay governed by row
+-- security alone ("Scope" in docs/tenancy.md).
+--
+-- LINEAGE. `supersedes` on an existing claim is also guarded (the trigger
+-- fires on UPDATE OF `supersedes`): once armed, a non-exempt session may not
+-- clear it, nor re-point it while the claim stays current. Otherwise an
+-- inherited successor could be laundered into a plain fresh claim by the
+-- retired identity (OPL02, keyed on the arming). Setting it on a claim that
+-- had none, and re-pointing it on a claim retired in the same statement (the
+-- dedup and consolidate acts), are untouched.
 CREATE OR REPLACE FUNCTION public.epigraph_claims_require_operator_binding()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
     v_writer uuid;
-    v_inherited boolean;
+    v_inherited boolean := false;
 BEGIN
     IF TG_OP = 'UPDATE' AND NEW.agent_id IS NOT DISTINCT FROM OLD.agent_id THEN
+        -- Only `supersedes` (the trigger's other column) can have changed.
+        IF NEW.supersedes IS NOT DISTINCT FROM OLD.supersedes OR OLD.supersedes IS NULL
+           OR NOT public.epigraph_operator_binding_armed() THEN
+            RETURN NEW;
+        END IF;
+        IF (NEW.supersedes IS NULL OR COALESCE(NEW.is_current, true))
+           AND NOT public.epigraph_operator_scope_exempt() THEN
+            RAISE EXCEPTION 'OPL02: claim % records that it supersedes %; an application session '
+                            'does not clear, or re-point on a current claim, the lineage of an '
+                            'existing claim', NEW.id, OLD.supersedes
+                USING ERRCODE = 'OPL02',
+                      HINT = 'Supersede the claim instead, or retire it in the same statement '
+                             '(the dedup act). Admin access crosses humans; nothing else does.';
+        END IF;
         RETURN NEW;
     END IF;
     IF NOT public.epigraph_operator_binding_armed() THEN
@@ -602,15 +642,18 @@ BEGIN
     ELSE
         PERFORM public.epigraph_require_bound_writer(v_writer);
         PERFORM public.epigraph_require_writer_scope(v_writer, NEW.owner_group_id);
-        -- INHERITED means what `supersede_act_conn` does: a NEW row that
-        -- names `supersedes` AND carries exactly the predecessor's author.
-        -- Merely naming `supersedes` (a column the writer chooses) is not
-        -- inheritance, and an UPDATE never inherits.
-        v_inherited := TG_OP = 'INSERT' AND NEW.supersedes IS NOT NULL
-                       AND NEW.agent_id IS NOT DISTINCT FROM
-                           (SELECT p.agent_id FROM public.claims p WHERE p.id = NEW.supersedes);
-        PERFORM public.epigraph_require_attributable(NEW.agent_id, v_writer,
-                                                     COALESCE(v_inherited, false));
+        IF TG_OP = 'INSERT' AND NEW.supersedes IS NOT NULL THEN
+            v_inherited :=
+                EXISTS (SELECT 1 FROM public.claims p
+                         WHERE p.id = NEW.supersedes
+                           AND p.agent_id IS NOT DISTINCT FROM NEW.agent_id
+                           AND p.owner_group_id IS NOT DISTINCT FROM NEW.owner_group_id
+                           AND NOT COALESCE(p.is_current, true))
+                AND NOT EXISTS (SELECT 1 FROM public.claims s
+                                 WHERE s.supersedes = NEW.supersedes AND s.id <> NEW.id
+                                   AND COALESCE(s.is_current, true));
+        END IF;
+        PERFORM public.epigraph_require_attributable(NEW.agent_id, v_writer, v_inherited);
     END IF;
     RETURN NEW;
 END $$;
@@ -623,7 +666,7 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_claims_require_operator_binding() FRO
 DROP TRIGGER IF EXISTS claims_require_operator_binding ON public.claims;
 DROP TRIGGER IF EXISTS claims_require_tenancy_then_operator_binding ON public.claims;
 CREATE TRIGGER claims_require_tenancy_then_operator_binding
-    BEFORE INSERT OR UPDATE OF agent_id ON public.claims
+    BEFORE INSERT OR UPDATE OF agent_id, supersedes ON public.claims
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_claims_require_operator_binding();
 
 -- Section 1b at the membership door: a writer/admin row for a live-linked agent

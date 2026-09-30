@@ -1035,6 +1035,201 @@ async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
     assert!(still, "a refused supersede retires nothing");
 }
 
+/// A claim naming `author`, pointing `supersedes` at `pred`, owned by `owner`,
+/// inserted on an application connection stamped as `writer` with `groups`.
+async fn pose_successor(
+    pool: &PgPool,
+    writer: Uuid,
+    groups: &[Uuid],
+    author: Uuid,
+    owner: Uuid,
+    pred: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    as_app_stamped(pool, writer, groups, |mut conn| async move {
+        let id = Uuid::new_v4();
+        let r = sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                                 visibility, owner_group_id, supersedes) \
+             VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5, $6)",
+        )
+        .bind(id)
+        .bind(format!("posed successor {id}"))
+        .bind(id.as_bytes().repeat(2))
+        .bind(author)
+        .bind(owner)
+        .bind(pred)
+        .execute(&mut *conn)
+        .await
+        .map(|_| id);
+        (conn, r)
+    })
+    .await
+}
+
+/// Delta review round 2 SEC-R2-2 / DIS-R2-5: the inherited-author admission is
+/// what the supersede act writes and nothing a writer can pose. A live agent of
+/// the retired identity's own human may not mint fresh claims under that
+/// identity by pointing `supersedes` at a CURRENT claim of it, at a claim in a
+/// different group (the platform corpus included), or at a predecessor that
+/// already has a current successor; nor launder an admitted successor into a
+/// plain fresh claim by clearing or re-pointing its `supersedes`. A predecessor
+/// in a group the writer cannot write is refused the same way whoever
+/// authored it (no oracle). The real supersede act, and the dedup/consolidate
+/// shape (re-point while retiring), still work.
+///
+/// Verified to fail, each alone: the inherited rule's `NOT COALESCE(p.is_current,
+/// true)` dropped -> the successor of a current claim lands; its owner-group
+/// equality dropped -> the successor of the retired world-owned claim lands in
+/// A's group; its `NOT EXISTS` current-successor clause dropped -> the second
+/// successor lands; the trigger's lineage branch reduced to `RETURN NEW` -> the
+/// cleared and re-pointed lineage lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_inherited_author_is_one_retired_predecessor_restated_in_its_group(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, b_group) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+    link_live(&pool, x, a).await;
+    let world = Uuid::nil();
+    let l1 = insert_claim(&pool, legacy, a_group).await.expect("l1");
+    let l2 = insert_claim(&pool, legacy, a_group).await.expect("l2");
+    let l_world = insert_claim(&pool, legacy, world)
+        .await
+        .expect("world, current");
+    let l_world_retired = insert_claim(&pool, legacy, world).await.expect("world");
+    let l_in_b = insert_claim(&pool, legacy, b_group)
+        .await
+        .expect("L in B's group");
+    let b_in_b = insert_claim(&pool, b, b_group)
+        .await
+        .expect("B's own claim");
+    let x_claim = insert_claim(&pool, x, a_group).await.expect("X's claim");
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(l_world_retired)
+        .execute(&pool)
+        .await
+        .expect("retire the world claim");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy identity's retired tie to A");
+    }
+    arm(&pool).await;
+    let ga = [a_group];
+
+    // Posed successors naming the retired identity: fresh claims, OPL01.
+    for (pred, what) in [
+        (l1, "a CURRENT predecessor of the retired identity"),
+        (
+            l_world,
+            "a current platform-corpus claim, owned by A's group",
+        ),
+        (
+            l_world_retired,
+            "a RETIRED platform-corpus claim, owned by A's group",
+        ),
+    ] {
+        assert_opl01(
+            pose_successor(&pool, x, &ga, legacy, a_group, pred).await,
+            what,
+        );
+    }
+
+    // The real supersede act still admits the inherited author, once.
+    let s1 = as_app_stamped(&pool, x, &ga, |mut conn| async move {
+        let r = {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+            let r = epigraph_db::ClaimRepository::supersede_act_conn(
+                &mut tx,
+                epigraph_core::ClaimId::from_uuid(l1),
+                "a revision of l1",
+                epigraph_core::TruthValue::new(0.6).expect("truth"),
+                "operator binding probe",
+            )
+            .await;
+            if r.is_ok() {
+                tx.commit().await.expect("commit");
+            }
+            r
+        };
+        (conn, r)
+    })
+    .await
+    .expect("X supersedes its human's retired identity's claim")
+    .0;
+    assert_opl01(
+        pose_successor(&pool, x, &ga, legacy, a_group, l1).await,
+        "a second successor of an already-restated claim",
+    );
+
+    // No oracle: a predecessor in a group X cannot write is refused alike,
+    // whoever authored it.
+    for owner in [b_group, a_group] {
+        let as_l = pose_successor(&pool, x, &ga, legacy, owner, l_in_b).await;
+        let as_b = pose_successor(&pool, x, &ga, legacy, owner, b_in_b).await;
+        assert!(as_l.is_err() && as_b.is_err(), "{as_l:?} / {as_b:?}");
+        assert_eq!(
+            code_of(&as_l),
+            code_of(&as_b),
+            "owner {owner}: the refusal must not depend on who authored the predecessor"
+        );
+    }
+
+    // The admitted successor's lineage is not laundered.
+    for (to, what) in [(None, "cleared"), (Some(l2), "re-pointed, still current")] {
+        let r = as_app_stamped(&pool, x, &ga, |mut conn| async move {
+            let r = sqlx::query("UPDATE claims SET supersedes = $2 WHERE id = $1")
+                .bind(s1)
+                .bind(to)
+                .execute(&mut *conn)
+                .await
+                .map(|d| d.rows_affected());
+            (conn, r)
+        })
+        .await;
+        assert_eq!(code_of(&r).as_deref(), Some("OPL02"), "{what}: {r:?}");
+    }
+    let (sup, current): (Option<Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(s1)
+            .fetch_one(&pool)
+            .await
+            .expect("read back");
+    assert_eq!(
+        (sup, current),
+        (Some(l1), true),
+        "the successor is unchanged"
+    );
+    let named: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE agent_id = $1")
+        .bind(legacy)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(named, 6, "five seeded claims and the one real successor");
+
+    // Controls: re-pointing while retiring (the dedup/consolidate shape) and a
+    // privileged session are untouched.
+    as_app_stamped(&pool, x, &ga, |mut conn| async move {
+        let r = sqlx::query(
+            "UPDATE claims SET supersedes = $2, is_current = false, embedding = NULL, \
+                               embedding_3072 = NULL WHERE id = $1",
+        )
+        .bind(s1)
+        .bind(x_claim)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("re-point while retiring");
+    sqlx::query("UPDATE claims SET supersedes = NULL WHERE id = $1")
+        .bind(s1)
+        .execute(&pool)
+        .await
+        .expect("a privileged session may clear a lineage");
+}
+
 /// Review SEC-10: the valve relieves the BINDING (OPL01) only. With it open, an
 /// unbound agent writes, but a linked agent still cannot write into another
 /// human's group and another human still cannot enrol it there (OPL02).

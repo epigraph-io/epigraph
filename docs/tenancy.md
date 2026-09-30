@@ -405,11 +405,19 @@ session's authenticated PRINCIPAL (the one `ScopedPool` stamps from the
 request's viewer) whenever it differs from the author: that writer must be
 bound (`OPL01`), must write the owner group (`OPL02`, below), and may name as
 author only a bound agent of its OWN human (`OPL01` / `OPL02` otherwise). The
-one exception is the author a supersede INHERITS (a new row naming
-`supersedes` whose author IS that predecessor's author, which is what the
-supersede act writes): it may be a retired agent of the writer's own human, so
-a human can supersede its own legacy author's claims; a fresh claim never
-names a retired identity, whatever `supersedes` it points at. With a principal
+one exception is the author a supersede INHERITS, which is exactly what the
+supersede act writes: a new row naming `supersedes` whose predecessor carries
+the same author, is owned by the same group, is already retired (the act
+retires it first, in the same transaction), and has no other current
+successor. That author may be a retired agent of the writer's own human, so a
+human can supersede its own legacy author's claims, once per claim and in the
+claim's own group; a fresh claim never names a retired identity, however
+`supersedes` is posed (at a current claim, at a claim in another group, or as
+a second successor). Nor can an existing claim's lineage be laundered: once
+armed, an application session may not clear `claims.supersedes`, nor re-point
+it on a claim that stays current (`OPL02`); setting it on a claim that had
+none, and re-pointing it while retiring the claim in the same statement (the
+dedup and consolidate acts), are unchanged. With a principal
 equal to the author, or a privileged session, the author is the one checked.
 An APPLICATION session with NO principal (a write on an unstamped connection)
 is an unbound writer: refused `OPL01` once armed, so a path that forgot to
@@ -466,11 +474,14 @@ system agent is live-linked to one human, another human's callers are refused
 rather than writing into that human's group; a per-operator system identity is
 the follow-up that lets them ingest workflows.
 
-**Scope: claim INSERTs.** The trigger governs claim INSERTs and changes of
-`claims.agent_id`. Every other claim UPDATE (content, truth value, labels,
-`is_current`, `supersedes`, properties, embedding: the retire half of a
-supersede, a dedup, a relabel, a re-score) is gated by tenancy row security
-alone, not by `OPL01` / `OPL02`. On a schema with only this series' policies
+**Scope: claim INSERTs.** The trigger governs claim INSERTs, changes of
+`claims.agent_id`, and the clearing or re-pointing of an existing
+`claims.supersedes` (above). Every other claim UPDATE (content, truth value,
+labels, `is_current`, a first `supersedes`, properties, embedding: the retire
+half of a supersede, a dedup, a relabel, a re-score) is gated by tenancy row
+security alone, not by `OPL01` / `OPL02`. So "one current successor" is an
+INSERT-side rule: an update that re-opens a retired predecessor is row
+security's question, not this trigger's. On a schema with only this series' policies
 that is the owner-group rule: an update needs the row readable and its owner
 group in the session's writable set, so one human's agent cannot update
 another human's claim, but an UNBOUND agent can still update claims in a group
