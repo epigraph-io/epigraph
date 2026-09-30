@@ -1396,3 +1396,115 @@ async fn migration_116_shared_signer_retire_is_owned_and_not_app_executable(pool
         assert_eq!(can, expected, "{role} EXECUTE on the shared-signer retire");
     }
 }
+
+/// Migration 122 (operator binding): every definer it adds is a SECURITY
+/// DEFINER owned by `epigraph_maintenance` (the reads must pass
+/// `epigraph_definer_bypass()` to see `operator_links` at all, and the trigger
+/// body must reach the check without a per-role grant), carries an explicit
+/// ACL that excludes PUBLIC, and grants `epigraph_app` exactly the four reads
+/// the request path calls. Arming is maintenance-only. The owner is pinned here
+/// because the harness migrates as a superuser, so a silently no-opped
+/// `OWNER TO` would still pass every behavioural test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgPool) {
+    for (name, signature, volatility, app_may_execute) in [
+        (
+            "epigraph_is_human_operator",
+            "public.epigraph_is_human_operator(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_author_binding",
+            "public.epigraph_author_binding(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_binding_enforced",
+            "public.epigraph_operator_binding_enforced()",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_require_bound_author",
+            "public.epigraph_require_bound_author(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_claims_require_operator_binding",
+            "public.epigraph_claims_require_operator_binding()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_arm_operator_binding",
+            "public.epigraph_arm_operator_binding()",
+            "v",
+            false,
+        ),
+    ] {
+        let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+               FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+               JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE n.nspname = 'public' AND p.proname = $1",
+        )
+        .bind(name)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl) =
+            meta.unwrap_or_else(|| panic!("public.{name} must exist (migration 122)"));
+        assert!(secdef, "{name} must stay SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{name} owner");
+        assert_eq!(vol, volatility, "{name} volatility");
+        assert!(
+            acl.is_some(),
+            "{name} must carry an EXPLICIT ACL; a NULL proacl is the default grant, which \
+             includes EXECUTE to PUBLIC"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_may_execute),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE on {name}");
+        }
+    }
+
+    // The arming record: SELECT for the app, SELECT and INSERT (never UPDATE or
+    // DELETE) for the maintenance role. That grant set is what makes arming
+    // one-way.
+    for (role, privilege, expected) in [
+        ("epigraph_app", "SELECT", true),
+        ("epigraph_app", "INSERT", false),
+        ("epigraph_app", "UPDATE", false),
+        ("epigraph_app", "DELETE", false),
+        ("epigraph_maintenance", "SELECT", true),
+        ("epigraph_maintenance", "INSERT", true),
+        ("epigraph_maintenance", "UPDATE", false),
+        ("epigraph_maintenance", "DELETE", false),
+    ] {
+        let can: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege($1, 'public.operator_binding_arming', $2)",
+        )
+        .bind(role)
+        .bind(privilege)
+        .fetch_one(&pool)
+        .await
+        .expect("table privilege");
+        assert_eq!(
+            can, expected,
+            "{role} {privilege} on operator_binding_arming"
+        );
+    }
+}

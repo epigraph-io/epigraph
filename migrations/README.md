@@ -768,9 +768,31 @@ Current reservation:
   row under ACCESS EXCLUSIVE); added in place before 121 was applied to any
   deployed database.
 
-- **122+**: public next
+- **122**: public `operator_binding` — every claim is authored by an agent
+  BOUND to a human operator: (a) the agent of an active `human` OAuth client,
+  or an agent that is some link's `operator_id`; or (b) the holder of a LIVE
+  (`retired = false`) `operator_links` row. A BEFORE INSERT OR UPDATE OF
+  `agent_id` trigger on `claims` (`claims_require_operator_binding`, a
+  maintenance-owned definer body) raises `OPL01` naming the fix
+  (`epigraph-operator link`) for any other author, on every role. Applying the
+  file enforces NOTHING: enforcement starts when a maintenance session calls
+  `epigraph_arm_operator_binding()` (`epigraph-operator arm-operator-binding
+  --apply`), which is audited and ONE-WAY (the arming table grants the
+  maintenance role SELECT/INSERT only, the app role SELECT only). The per-process
+  valve `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off` travels as the session setting
+  `epigraph.operator_link_enforcement`. Registered in
+  `schema_contract.rs::migration_122_operator_binding_definers_are_owned_and_granted`,
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` and
+  `verify_operator_function_grants`. Behaviour in
+  `epigraph-db/tests/operator_binding.rs`. Checked before claiming: no open PR
+  branch carries a `122`. **Deploy order:** apply before the binaries that
+  read it; ARM only after the enforcing binaries serve (docs/deploy.md). Undo
+  is in the file's header. **Applied to a throwaway database only, NOT to any
+  deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `122` or
+- **123+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `123` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

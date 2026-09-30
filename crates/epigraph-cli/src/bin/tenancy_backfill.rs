@@ -1129,6 +1129,21 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // error, which a green pre-flight must not hide.
     ("epigraph_edge_writer_scope", 120),
     ("epigraph_reown_legacy_edges_to_signer", 120),
+    // 122, operator binding. The four reads fail OPEN in the dangerous
+    // direction under a non-member owner, which is why they are registered:
+    // `operator_links` is FORCEd and admits only a definer frame, so an
+    // unbypassed `epigraph_author_binding` reads no link and every linked
+    // agent reads as UNBOUND -- once armed, every claim write by an operated
+    // agent is refused (an outage, loud). `epigraph_is_human_operator` loses
+    // its operator arm the same way. The arming definer's INSERT is refused by
+    // the grant set, so arming fails loudly. The trigger body only calls the
+    // check, so its owner decides whether the check is reachable at all.
+    ("epigraph_is_human_operator", 122),
+    ("epigraph_author_binding", 122),
+    ("epigraph_operator_binding_enforced", 122),
+    ("epigraph_require_bound_author", 122),
+    ("epigraph_claims_require_operator_binding", 122),
+    ("epigraph_arm_operator_binding", 122),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -1359,6 +1374,35 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_link_retired_shared_signer",
             "public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])",
+            false,
+        ),
+        // 122 (operator binding). `default_decl_for_author` calls the check on
+        // the request path, so a missing grant is 42501 on every default-decl
+        // claim write once armed; the three reads it and the trigger use are
+        // app-callable for the same reason. Arming is a maintenance act.
+        (
+            "epigraph_require_bound_author",
+            "public.epigraph_require_bound_author(uuid)",
+            true,
+        ),
+        (
+            "epigraph_author_binding",
+            "public.epigraph_author_binding(uuid)",
+            true,
+        ),
+        (
+            "epigraph_is_human_operator",
+            "public.epigraph_is_human_operator(uuid)",
+            true,
+        ),
+        (
+            "epigraph_operator_binding_enforced",
+            "public.epigraph_operator_binding_enforced()",
+            true,
+        ),
+        (
+            "epigraph_arm_operator_binding",
+            "public.epigraph_arm_operator_binding()",
             false,
         ),
     ];
