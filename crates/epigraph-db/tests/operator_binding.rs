@@ -1243,7 +1243,7 @@ async fn an_application_session_never_re_attributes_a_claim(pool: PgPool) {
 /// Delta review SEC-D1 / DIS-D1 (the database half): an APPLICATION session
 /// with no principal stamped (a route that wrote on the raw pool) is an
 /// unbound writer, not a licence to be checked on the author column alone.
-/// Measured in the production shape: the orphan permissive `claims_privacy`
+/// Measured in the shape a long-lived deployment may carry: the orphan permissive `claims_privacy`
 /// policy (`FOR ALL USING (true)`, no `WITH CHECK`, standing in for the one no
 /// migration creates) is installed, so row security admits the unstamped
 /// INSERT and only the trigger can refuse it.
@@ -1259,7 +1259,7 @@ async fn an_unstamped_application_session_writes_no_claim_once_armed(pool: PgPoo
     sqlx::query("CREATE POLICY claims_privacy ON claims FOR ALL USING (true)")
         .execute(&pool)
         .await
-        .expect("the orphan permissive policy (production shape)");
+        .expect("the orphan permissive policy (a deployment shape)");
     arm(&pool).await;
 
     let unstamped = |author: Uuid, valve_off: bool| {

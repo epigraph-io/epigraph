@@ -1,6 +1,6 @@
 #![cfg(feature = "db")]
 //! Migration 122 through the claim-writing HTTP handlers, on the APPLICATION
-//! ROLE, in the production shape: `POST /api/v1/submit/packet` and
+//! ROLE, in the shape a long-lived deployment may carry: `POST /api/v1/submit/packet` and
 //! `POST /api/v1/policy-challenges` write a claim whose author comes from the
 //! request (the packet's `claim.agent_id`) or is the shared system agent. The
 //! claims trigger binds the session PRINCIPAL whenever it differs from the
@@ -77,7 +77,7 @@ async fn app_role_state(pool: &PgPool) -> AppState {
     state
 }
 
-/// The production shape: the orphan permissive policy, then arming as the
+/// That deployment shape: the orphan permissive policy, then arming as the
 /// maintenance role would.
 async fn install_orphan_policy_and_arm(pool: &PgPool) {
     sqlx::query("CREATE POLICY claims_privacy ON claims FOR ALL USING (true)")
