@@ -1459,10 +1459,16 @@ arming is one-way and every step before it must leave no live writer unbound.
 4. **Tie the legacy authors**: `epigraph-operator link-legacy-authors
    --operator <human>` (dry run, read the SKIPPED lines), then `--apply`. Give
    every `recent_writer` it skips a live link (step 3) or an explicit decision.
-5. **Backfill** as the maintenance login: `epigraph-tenancy-backfill run` (it
-   now stamps a linked author's world-owned rows to the operator's group).
-   Batched and resumable; it rewrites claims and, through 070's arm (d), their
-   derived rows, so check free disk first: the write volume lands in WAL.
+5. **Backfill** as the maintenance login: `ANALYZE claims`, then
+   `epigraph-tenancy-backfill run --dry-run`, then `run` (it now stamps a
+   linked author's world-owned rows to the operator's group). Batched,
+   resumable, and boundable: `--max-runtime` stops between batches with exit 3,
+   `--entity` runs one arm. It rewrites claims and, through 070's arm (d), their
+   derived rows, so check free disk first (the write volume lands in WAL) and
+   `VACUUM (ANALYZE)` the rewritten tables between windows. Embedded claims
+   dominate the cost (each update inserts into the HNSW indexes); see
+   `docs/tenancy.md` "Running the backfill" for the cost model and the
+   drop-and-rebuild alternative.
 6. **Re-own** what linked authors' own groups still hold:
    `epigraph-operator reown-linked --operator <human> --manifest-out <path>`
    (dry run), then `--apply` with a new manifest path. Keep the manifests.

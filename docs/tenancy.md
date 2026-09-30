@@ -244,6 +244,35 @@ epigraph-tenancy-backfill verify
 It is resumable across a `kill -9`: the `tenancy_backfill_progress` cursor is
 committed in the same transaction as its batch.
 
+**Bounded runs.** `--entity claims|communities|perspectives|recall-events|harvester-fragments`
+runs one arm alone (no settle, no final verify). `--max-runtime 2h` (or `90m`,
+`3600s`) stops cleanly between batches and exits **3**: partial, re-run the same
+command to resume. Use them to run the claims walk in windows with a `VACUUM`
+between (below).
+
+**Cost model (measured on a 5433 `*_test` seed: 200k claims, 400k edges, rows
+in all 17 derived tables).** A batch resolves each distinct author's group once
+and updates its rows with one join; arm (d) then issues one UPDATE per derived
+table and one edges statement per batch (migration 122 made the edges meet
+set-based). A 5,000-claim batch of UN-embedded claims takes ~4.5 s (~1,100
+claims/s). A claims row that carries an embedding costs ~5 ms more per row,
+because every UPDATE of `owner_group_id` is non-HOT and inserts a new entry into
+each HNSW index on `claims.embedding` (~30 s per 5,000 embedded claims on the
+seed; more on a larger graph). Two ways to run a large corpus:
+
+* keep the HNSW indexes (recall stays fast; the walk takes roughly
+  `claims x 6 ms`), in `--max-runtime` windows; or
+* in a maintenance window, `DROP` the HNSW indexes on `claims`, run the walk at
+  ~1,100 claims/s, then `CREATE INDEX CONCURRENTLY` them again (a build costs
+  ~1 ms per vector serially on the seed, ~5x less than the incremental
+  inserts; semantic recall is slow until they are back).
+
+Before the walk, `ANALYZE claims` (the backfill's batch selection and the
+trigger's joins read its statistics). Each moved claim leaves one dead tuple in
+`claims` and in each derived row; public edges are not rewritten. Between
+windows: `VACUUM (ANALYZE) claims, evidence, claim_cluster_membership, triples,
+entity_mentions, mass_functions;`.
+
 **It is single-operator.** `FOR UPDATE SKIP LOCKED` is on the batch selection so
 a batch does not block behind an unrelated application transaction — it does
 **not** make two concurrent operators divide the work. Both processes share one
