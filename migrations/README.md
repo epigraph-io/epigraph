@@ -789,7 +789,14 @@ Current reservation:
   a tier-A row and has no link, skipping (and reporting) humans, OAuth
   principals, holders of write authority in the operator's group, 107's
   shared-signer fingerprint, excluded ids, and claim authors at or after the
-  cutoff (`epigraph-operator link-legacy-authors`). Registered in
+  cutoff (`epigraph-operator link-legacy-authors`). Section 8 re-creates
+  arm (d)'s `epigraph_propagate_tenancy` (OB6) with 120's body except the edges
+  meet: the edges touching the batch are found by two equi-joins instead of one
+  OR join (whose nested-loop plan tested every edge against every changed
+  claim), and each endpoint's tenancy is read by LEFT JOINs with
+  `epigraph_node_tenancy`'s exact fallback instead of two function calls per
+  edge; pinned by `epigraph-cli/tests/backfill_equivalence.rs` and the arm (d)
+  suites. Registered in
   `schema_contract.rs::migration_122_operator_binding_definers_are_owned_and_granted`,
   `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` and
   `verify_operator_function_grants`. Behaviour in

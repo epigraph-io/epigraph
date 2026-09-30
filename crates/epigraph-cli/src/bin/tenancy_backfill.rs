@@ -1192,8 +1192,9 @@ const DEFINER_FUNCTIONS: &[&str] = &[
     // missing 070 body is a finding" into "skipped".
     "epigraph_edges_tenancy",
     "epigraph_inherit_tenancy_stmt",
-    // Last redefined by migration 120 (114's body plus the `m.v = 'group'`
-    // conjunct on the edges statement); see the note above.
+    // Last redefined by migration 122 (120's body with the edges meet made
+    // set-based: two equi-joins and inlined endpoint reads, OB6); see the note
+    // above.
     "epigraph_propagate_tenancy",
     // `epigraph_ownership_transcribe` (071) was the sixth entry until PR-22.
     // Migration 084 drops the function with the table it wrote through, so an
