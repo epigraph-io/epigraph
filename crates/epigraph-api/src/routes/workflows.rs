@@ -1435,8 +1435,20 @@ pub async fn evolve_step(
     }
     let agent = auth.owner_id.unwrap_or(auth.client_id);
     let level = req.level.unwrap_or(2);
-    let result = epigraph_db::ClaimRepository::evolve_step(
-        &state.db_pool,
+    // The step claim is written on a transaction STAMPED as its author, so
+    // migration 122's claims trigger sees the writing principal (here the
+    // author itself, from the token): once armed it refuses a claim written by
+    // an application session with no principal, which the raw pool is.
+    let author_viewer = epigraph_db::Viewer::resolve(&state.db_pool, agent)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("evolve_step: could not resolve the author's viewer: {e}"),
+        })?;
+    let mut tx = state
+        .begin_claim_write(&author_viewer, "evolve_step")
+        .await?;
+    let result = epigraph_db::ClaimRepository::evolve_step_conn(
+        &mut tx,
         epigraph_core::ClaimId::from_uuid(parent_id),
         &req.content,
         &req.edge_type,
@@ -1450,9 +1462,13 @@ pub async fn evolve_step(
             entity: "Claim".into(),
             id: id.to_string(),
         },
+        e if e.is_write_authority_refusal() => ApiError::from(e),
         other => ApiError::InternalError {
             message: other.to_string(),
         },
+    })?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("evolve_step: commit failed: {e}"),
     })?;
 
     Ok(Json(EvolveStepResponse {

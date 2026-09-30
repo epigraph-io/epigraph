@@ -1323,6 +1323,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "evolve_step_conn",
+        "WRITE. `evolve_step`'s body on the caller's transaction (the request paths stamp it with \
+         the author's viewer, so migration 122's claims trigger sees the writing principal). Its \
+         one read is the parent's FOR UPDATE lock probe, of the row it is about to write.",
+    ),
+    (
+        "claim.rs",
         "migrate_consolidated_edges_conn",
         "WRITE, privileged only (refuses otherwise). Re-points the retired sources' live edges \
          onto the merged claim on the maintenance connection; its read verifies the committed \

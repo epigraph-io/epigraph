@@ -18,7 +18,9 @@
 //! Verified to fail: `default_decl_for_author`'s acting-link branch removed ->
 //! the step claim lands in the system agent's own group and the owner
 //! assertion fails; the `require_caller_write_authority` call removed from
-//! `begin_system_ingest_stamped_tx` -> the unbound caller's store lands.
+//! `begin_system_ingest_stamped_tx` -> the unbound caller's store lands;
+//! `tools::evolve_step` back on `ClaimRepository::evolve_step(&server.pool, ..)`
+//! (unstamped) -> the bound caller's evolve is refused OPL01 once armed.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -171,4 +173,44 @@ async fn a_live_linked_system_agent_keeps_workflow_ingest_working_once_armed(poo
         owner, human_group,
         "a live-linked system agent's claims belong to its operator"
     );
+
+    // Delta review (the no-principal rule): `evolve_step` writes its step claim
+    // on a transaction stamped with its author, so the bound caller can still
+    // evolve the step once armed. On the raw pool (no principal) the database
+    // refuses the write (OPL01), which is what it did before the conversion.
+    let parent: Uuid = sqlx::query_scalar("SELECT id FROM claims WHERE content = $1")
+        .bind(&step)
+        .fetch_one(&pool)
+        .await
+        .expect("the step to evolve");
+    let evolved = format!("evolved bound step {}", Uuid::new_v4());
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&server, None)
+        .await
+        .expect("stdio viewer");
+    epigraph_mcp::tools::evolve_step::evolve_step(
+        &server,
+        &viewer,
+        epigraph_mcp::tools::evolve_step::EvolveStepParams {
+            parent_id: parent.to_string(),
+            canonical_name: None,
+            step_index: None,
+            step_lineage_id: String::new(),
+            content: evolved.clone(),
+            edge_type: "revises".to_string(),
+            rationale: Some("operator binding probe".to_string()),
+            level: None,
+        },
+        None,
+    )
+    .await
+    .map_err(|e| e.message.to_string())
+    .expect("a bound caller evolves a step on the app role once armed");
+    let (author, owner): (Uuid, Uuid) =
+        sqlx::query_as("SELECT agent_id, owner_group_id FROM claims WHERE content = $1")
+            .bind(&evolved)
+            .fetch_one(&pool)
+            .await
+            .expect("evolved step claim");
+    assert_eq!(author, caller, "the evolved step is the caller's");
+    assert_eq!(owner, human_group, "it inherits the parent's owner");
 }

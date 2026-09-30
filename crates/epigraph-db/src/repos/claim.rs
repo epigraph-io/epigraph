@@ -6490,6 +6490,37 @@ impl ClaimRepository {
         level: u32,
         agent_id: Uuid,
     ) -> Result<EvolveStepResult, DbError> {
+        let mut tx = pool.begin().await?;
+        let result = Self::evolve_step_conn(
+            &mut tx,
+            parent,
+            new_content,
+            edge_type,
+            reason,
+            level,
+            agent_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// [`Self::evolve_step`] on the caller's connection, inside the caller's
+    /// transaction (which the caller commits). The request paths use this on
+    /// a transaction stamped with the caller's viewer, so that migration 122's
+    /// claims trigger sees the writing principal: once the database is armed
+    /// it refuses a claim written by an application session with no
+    /// principal.
+    #[instrument(skip(conn))]
+    pub async fn evolve_step_conn(
+        conn: &mut sqlx::PgConnection,
+        parent: ClaimId,
+        new_content: &str,
+        edge_type: &str,
+        reason: Option<&str>,
+        level: u32,
+        agent_id: Uuid,
+    ) -> Result<EvolveStepResult, DbError> {
         if !matches!(edge_type, "supersedes" | "revises") {
             return Err(DbError::QueryFailed {
                 source: sqlx::Error::Protocol(format!(
@@ -6498,7 +6529,7 @@ impl ClaimRepository {
             });
         }
         let parent_uuid: Uuid = parent.into();
-        let mut tx = pool.begin().await?;
+        let tx = conn;
 
         // The parent's tenancy is read HERE, under the same FOR UPDATE that
         // guards the lineage id, and bound explicitly on the INSERT below.
@@ -6614,7 +6645,6 @@ impl ClaimRepository {
             .await?;
         }
 
-        tx.commit().await?;
         Ok(EvolveStepResult {
             new_claim_id: new_uuid,
             step_lineage_id: lineage_id,
