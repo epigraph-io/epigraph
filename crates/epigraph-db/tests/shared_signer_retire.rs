@@ -289,14 +289,27 @@ async fn an_exact_relink_is_idempotent_and_audits_once(pool: PgPool) {
 /// Every other refusal of 107's retire still holds: an operator that itself
 /// fronted many principals, and a signer that still holds write authority in
 /// the operator's group. Both write nothing.
+///
+/// Since migration 122 (review SEC-5) the operator-side fingerprint applies
+/// only to an operator that is NOT a registered human operator (those edges are
+/// app-forgeable; a registered human is never a shared signer), so the
+/// fingerprinted operator here is an unregistered agent.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_rest_of_107s_retire_still_refuses(pool: PgPool) {
     // Operator-side fingerprint.
-    let (signer, operator, other) = former_signer(&pool).await;
+    // The former signer's own lineage names `first` too, so it is attested.
+    let (signer, first, other) = former_signer(&pool).await;
+    let operator = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(operator)
+        .bind(hash32(operator))
+        .execute(&pool)
+        .await
+        .expect("an unregistered operator");
     let (x, y) = (seed_agent(&pool).await, seed_agent(&pool).await);
     lineage_edge(&pool, operator, x).await;
     lineage_edge(&pool, operator, y).await;
-    let e = retire_shared(&pool, signer, operator, vec![other, x, y])
+    let e = retire_shared(&pool, signer, operator, vec![other, first, x, y])
         .await
         .expect_err("an operator with the shared-signer fingerprint is refused");
     assert!(e.to_string().contains("refusing it as an operator"), "{e}");

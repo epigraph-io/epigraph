@@ -45,6 +45,19 @@ async fn seed_bare_agent(pool: &PgPool) -> Uuid {
     agent
 }
 
+/// An agent row that is NOT a registered human operator: the shape of a shared
+/// HTTP signer, which no human registration ever names.
+async fn seed_unregistered_agent(pool: &PgPool) -> Uuid {
+    let agent = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent)
+        .bind(hash32(agent))
+        .execute(pool)
+        .await
+        .expect("seed agent");
+    agent
+}
+
 async fn link(pool: &PgPool, agent: Uuid, operator: Uuid) -> epigraph_db::OperatorLinkOutcome {
     let mut conn = pool.acquire().await.expect("acquire");
     AgentRepository::link_operator(&mut conn, agent, operator)
@@ -626,6 +639,14 @@ async fn an_app_session_cannot_move_a_membership_row(pool: PgPool) {
 ///
 /// CALIBRATION: an agent with exactly ONE lineage edge (not a shared-signer
 /// fingerprint) still links, as the agent and as an operator.
+///
+/// Migration 122 (review SEC-5): the operator-side fingerprint applies only to
+/// an operator that is NOT a registered human operator, because those edges
+/// are app-forgeable and a registered human is never a shared signer. The two
+/// operator arms therefore use unregistered signers (the real shape); a
+/// registered human carrying two such edges is accepted, which
+/// `operator_binding.rs::links_are_audited_and_forged_edges_cannot_block_a_human`
+/// pins.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_shared_signer_is_refused_as_agent_and_as_operator(pool: PgPool) {
     let operator = seed_bare_agent(&pool).await;
@@ -634,7 +655,7 @@ async fn a_shared_signer_is_refused_as_agent_and_as_operator(pool: PgPool) {
     // that landed in one arm cannot make a later arm fail for another reason.
     let mut signers = Vec::new();
     for _ in 0..4 {
-        let signer = seed_bare_agent(&pool).await;
+        let signer = seed_unregistered_agent(&pool).await;
         lineage_edge(&pool, signer, p1).await;
         lineage_edge(&pool, signer, p2).await;
         signers.push(signer);
@@ -718,10 +739,11 @@ async fn a_shared_signer_is_refused_as_agent_and_as_operator(pool: PgPool) {
 /// forgeries are made, and the relinks of the existing links (acting and
 /// retired) still succeed and still report the link.
 ///
-/// CALIBRATION: the fingerprint still refuses a FIRST link, for a fresh agent
-/// with the same two edges and for a fresh agent naming the forged operator
-/// (the accepted residual), so the relink arm is the pair-exists skip and not
-/// a check that was switched off.
+/// CALIBRATION: the fingerprint still refuses a FIRST link for a fresh agent
+/// with the same two edges, so the relink arm is the pair-exists skip and not a
+/// check that was switched off. The former residual (a first link to the
+/// forged OPERATOR was refused too) is closed by migration 122 (review SEC-5):
+/// a registered human operator is never fingerprinted, so it is now accepted.
 #[sqlx::test(migrations = "../../migrations")]
 async fn forged_lineage_edges_cannot_break_an_existing_links_relink(pool: PgPool) {
     let operator = seed_bare_agent(&pool).await;
@@ -758,10 +780,10 @@ async fn forged_lineage_edges_cannot_break_an_existing_links_relink(pool: PgPool
         .await
         .expect_err("CALIBRATION: a first link of a two-edge agent is still refused");
     assert!(err.to_string().contains("more than one principal"), "{err}");
-    let err = AgentRepository::link_operator(&mut conn, seed_bare_agent(&pool).await, operator)
+    let fresh_of_operator = seed_bare_agent(&pool).await;
+    AgentRepository::link_operator(&mut conn, fresh_of_operator, operator)
         .await
-        .expect_err("CALIBRATION (the residual): a first link to the forged operator is refused");
-    assert!(err.to_string().contains("more than one principal"), "{err}");
+        .expect("a first link to a registered human with forged edges is accepted (SEC-5)");
 }
 
 /// `link_live` reports what the authoring and ownership paths will actually
