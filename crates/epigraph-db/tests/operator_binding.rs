@@ -1240,6 +1240,77 @@ async fn an_application_session_never_re_attributes_a_claim(pool: PgPool) {
     .expect("X re-scores its own claim");
 }
 
+/// Delta review SEC-D1 / DIS-D1 (the database half): an APPLICATION session
+/// with no principal stamped (a route that wrote on the raw pool) is an
+/// unbound writer, not a licence to be checked on the author column alone.
+/// Measured in the production shape: the orphan permissive `claims_privacy`
+/// policy (`FOR ALL USING (true)`, no `WITH CHECK`, standing in for the one no
+/// migration creates) is installed, so row security admits the unstamped
+/// INSERT and only the trigger can refuse it.
+///
+/// Verified to fail: the trigger's `v_writer IS NULL AND NOT epigraph_bypass()
+/// AND epigraph_operator_binding_enforced()` refusal removed -> the unstamped
+/// claims attributed to human A and to A's agent X land in A's group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unstamped_application_session_writes_no_claim_once_armed(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    link_live(&pool, x, a).await;
+    sqlx::query("CREATE POLICY claims_privacy ON claims FOR ALL USING (true)")
+        .execute(&pool)
+        .await
+        .expect("the orphan permissive policy (production shape)");
+    arm(&pool).await;
+
+    let unstamped = |author: Uuid, valve_off: bool| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+                let principal: Option<String> =
+                    sqlx::query_scalar("SELECT public.epigraph_principal_id()::text")
+                        .fetch_one(&mut *conn)
+                        .await
+                        .expect("principal");
+                assert_eq!(principal, None, "this session must carry no principal");
+                if valve_off {
+                    sqlx::query(
+                        "SELECT set_config('epigraph.operator_link_enforcement', 'off', false)",
+                    )
+                    .execute(&mut *conn)
+                    .await
+                    .expect("valve");
+                }
+                let r = insert_claim(&mut *conn, author, a_group).await;
+                sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+                    .execute(&mut *conn)
+                    .await
+                    .expect("valve reset");
+                (conn, r)
+            })
+            .await
+        }
+    };
+
+    for (author, what) in [
+        (a, "unstamped app session names human A in A's group"),
+        (x, "unstamped app session names A's agent X in A's group"),
+    ] {
+        let r = unstamped(author, false).await;
+        assert_opl01(r, what);
+    }
+    let written: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE owner_group_id = $1")
+        .bind(a_group)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(written, 0, "an unstamped session wrote {written} claim(s)");
+
+    // The valve relieves exactly that OPL01 (and then the author is checked).
+    unstamped(a, true)
+        .await
+        .expect("valve open: the unstamped write is checked on its author");
+}
+
 /// Review SEC-6 / SEC-8: a human is the agent of the ONE client its
 /// registration names, so the application role (which may INSERT
 /// `oauth_clients`, but not UPDATE it) cannot undo a suspension by minting a

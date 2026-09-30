@@ -131,9 +131,12 @@
 -- supersede INHERITS (a new row naming `supersedes` whose author IS that
 -- predecessor's author) may also be a RETIRED agent of that human, so a human
 -- superseding its own legacy author's claim is admitted, while a fresh claim
--- naming a retired identity is not, whatever `supersedes` it points at. With no
--- principal, or a principal equal to the author, or on a privileged session,
--- the author is the one checked. Workflow ingest writes as one shared system
+-- naming a retired identity is not, whatever `supersedes` it points at. With a
+-- principal equal to the author, or on a privileged session, the author is
+-- the one checked. With NO principal on an application session the writer is
+-- unbound: refused OPL01 (fail closed, so a route that forgot to stamp its
+-- viewer cannot write as the author its request body names); only the valve
+-- relieves that, and then the author is the one checked. Workflow ingest writes as one shared system
 -- agent under that agent's own stamp, so its request paths bind their CALLER
 -- before stamping (`AgentRepository::require_writer_authority`).
 --
@@ -531,8 +534,9 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, bool
 -- needs a grant of its own, and none can meet a 42501 here instead of the
 -- rule. It reads nothing itself; the checks read the link and client tables.
 --
--- WHO is checked (section 2): the AUTHOR (`NEW.agent_id`) when the session has
--- no principal, when the principal IS the author, or on a privileged session;
+-- WHO is checked (section 2): the AUTHOR (`NEW.agent_id`) when the principal
+-- IS the author, on a privileged session, or (valve open only) when an
+-- application session has no principal, which is otherwise refused OPL01;
 -- otherwise the WRITER (the session principal) is bound and scoped, and the
 -- author must be the writer's own human's (`epigraph_require_attributable`).
 -- `epigraph_principal_id()` is what `ScopedPool` stamps from the viewer, so
@@ -568,6 +572,22 @@ BEGIN
                          'by the writer. Admin access crosses humans; nothing else does.';
     END IF;
     v_writer := public.epigraph_principal_id();
+    -- NO PRINCIPAL on an application session is an unbound writer, not a
+    -- licence to be checked on the author column alone: a route that forgot
+    -- to stamp its viewer would otherwise write as whatever bound author its
+    -- request body named, into that author's group. Fail closed (OPL01, so
+    -- the valve relieves it and nothing else does); with the valve open the
+    -- author arm below still applies its OPL02.
+    IF v_writer IS NULL AND NOT public.epigraph_bypass()
+       AND public.epigraph_operator_binding_enforced() THEN
+        RAISE EXCEPTION 'OPL01: this application session carries no authenticated principal, '
+                        'so the writer of this claim (attributed to %) is not bound to a human '
+                        'operator; once armed, a claim is written only by a bound, stamped '
+                        'writer', NEW.agent_id
+            USING ERRCODE = 'OPL01',
+                  HINT = 'Write on a transaction stamped with the request''s viewer '
+                         '(ScopedPool::begin_as). See docs/tenancy.md "Operator binding".';
+    END IF;
     IF v_writer IS NULL OR v_writer = NEW.agent_id OR public.epigraph_bypass() THEN
         PERFORM public.epigraph_require_bound_author(NEW.agent_id);
         PERFORM public.epigraph_require_writer_scope(NEW.agent_id, NEW.owner_group_id);
