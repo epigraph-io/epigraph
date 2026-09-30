@@ -872,7 +872,9 @@ impl ClaimRepository {
         agent_id: Uuid,
     ) -> Result<TenancyDecl, DbError> {
         if let Some(link) = crate::repos::AgentRepository::operator_actor(conn, agent_id).await? {
-            // An acting link is a live (not retired) link: bound (migration 122).
+            // An acting link is a live (not retired) link. It binds (migration
+            // 122) only while its operator is a registered human operator; if
+            // not, the claims trigger refuses the write (OPL01), not this read.
             return Ok(TenancyDecl::public(link.operator_group_id));
         }
         // Refuse an unbound author BEFORE 105's definer can provision a

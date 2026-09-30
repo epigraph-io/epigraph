@@ -162,9 +162,10 @@ async fn refuse(conn: &mut PgConnection, agent: Uuid, operator: Uuid) -> anyhow:
         .context("asking whether the operator is a human operator (is migration 122 applied?)")?;
     if !human {
         bail!(
-            "operator {operator} is not a human operator: it is not the agent of an active \
-             human OAuth client, and no link names it as an operator. A live link to it would \
-             not bind agent {agent} to a human; refusing."
+            "operator {operator} is not a human operator: a human operator needs BOTH a live \
+             row in the human_operators registry and an active human OAuth client (register \
+             one with `epigraph-operator register-human-operator --agent <id> --apply`). A live \
+             link to it would not bind agent {agent} to a human; refusing."
         );
     }
     let clients: Vec<(String, String)> = sqlx::query_as(

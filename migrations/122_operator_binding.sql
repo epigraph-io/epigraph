@@ -655,9 +655,9 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
     IF NOT public.epigraph_is_human_operator(p_operator) THEN
-        RAISE EXCEPTION 'epigraph_link_legacy_authors: % is not a human operator (not the agent '
-                        'of an active human OAuth client, and no link names it as an operator); '
-                        'legacy authors are tied to a human or not at all', p_operator
+        RAISE EXCEPTION 'epigraph_link_legacy_authors: % is not a human operator (a live '
+                        'human_operators row and an active human OAuth client are both '
+                        'required); legacy authors are tied to a human or not at all', p_operator
             USING ERRCODE = '55000';
     END IF;
     IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_operator) THEN
