@@ -359,7 +359,9 @@ subject to the same check; 071's shim was too, until PR-22 retired it.
 human account, and there may be many humans. Once a database is ARMED (below),
 a claim may be INSERTED only when its author is BOUND, and, when the session's
 authenticated principal is not the author, only when that WRITER is bound too
-(see "Who is checked" below). `claims.agent_id` of an existing claim is changed
+(see "Who is checked" below; the one exception, a maintenance session
+restating a retired claim, is under "A linked agent writes only where its own
+operator writes"). `claims.agent_id` of an existing claim is changed
 only by a privileged session or an instance-admin principal (`OPL02` for
 anyone else), and is then checked like an insert. Bound means:
 
@@ -446,7 +448,10 @@ agent is refused unless its operator writes that group, so another human
 cannot enrol my agent to write evidence, edges or beliefs in their group. Both
 refusals are SQLSTATE **`OPL02`**. Only admin access crosses groups: a
 privileged (maintenance) session and a session whose principal is a live
-instance admin are exempt from `OPL02` (never from `OPL01`). A consequence: an
+instance admin are exempt from `OPL02`. Neither is exempt from `OPL01`, with
+one exception for the privileged session alone: its supersede, whose successor
+inherits a retired predecessor's author and group, is admitted whatever that
+author's binding (the platform corpus's edit path, "Existing rows"). A consequence: an
 agent whose membership in its operator's group was REVOKED writes nothing (its
 default declaration falls back to its own personal group, which `OPL02`
 refuses); ending an agent's writes is a revoke or a retire. Residual, named: a
@@ -635,15 +640,25 @@ before arming.
   the backfill"). `verify` REPORTS (not a failure) rows still owned by a linked
   author's own personal group.
 * **World-owned claims once armed.** Nobody holds a writer row in the world
-  group, so once armed a claim owned by it is superseded (the successor
-  inherits the world owner) or otherwise written into it only by a privileged
-  session or an instance-admin principal; everyone else, a human included, is
-  refused `OPL02`. Under `--legacy-owner platform` the retired-linked and
-  unlinked authors' rows STAY world-owned (the platform corpus), so a human
-  revises them only through an instance-admin principal, or after they are
-  moved (`--legacy-owner operator`, or `reown-linked`); the "human supersedes
-  its own legacy author's claim" admission applies to rows in the human's own
-  group. That is a consequence of the platform decision, not a defect.
+  group, so once armed a NEW claim owned by it (a supersede's successor
+  inherits the world owner) is written only by a privileged session or an
+  instance-admin principal; everyone else, a human included, is refused
+  `OPL02`. Under `--legacy-owner platform` the retired-linked and unlinked
+  authors' rows STAY world-owned (the platform corpus), to be revised only by
+  an elevated act. A privileged (maintenance) session's supersede of such a
+  claim carries its predecessor's author whatever that author's binding (the
+  successor restates the one retired claim, in the world group); an
+  instance-admin PRINCIPAL supersedes a retired-linked author's claim but not
+  an unlinked author's (`OPL01`: an admin stamp is a value an application
+  session sets, so it is not relieved of the binding). A fresh claim naming
+  such an author is refused on every session. The "human supersedes its own
+  legacy author's claim" admission applies to rows in the human's own group.
+  Revising the corpus IN PLACE (an UPDATE of content, truth value, labels or
+  `is_current`) is not governed by the binding trigger ("Scope" above): with
+  this series' policies only a session that writes the world group can do it,
+  but a database that still carries the orphan permissive `*_privacy`
+  policies admits it from any application session, so arming does not protect
+  the corpus from in-place rewrites until those policies are removed.
 * `epigraph-operator reown-linked --operator <human> --legacy-owner operator|platform --manifest-out <new path>
   [--apply]` moves those claims into the operator's group through
   `reown-claims`' guarded batches (`--derived follow-claim`; derived rows follow

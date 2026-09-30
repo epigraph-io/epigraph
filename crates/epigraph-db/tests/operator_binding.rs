@@ -1230,6 +1230,154 @@ async fn an_inherited_author_is_one_retired_predecessor_restated_in_its_group(po
         .expect("a privileged session may clear a lineage");
 }
 
+/// The supersede act on `conn`, in its own transaction, committed on success.
+async fn supersede_on(
+    conn: &mut sqlx::PgConnection,
+    old: Uuid,
+) -> Result<(Uuid, Uuid), epigraph_db::DbError> {
+    let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+    let r = epigraph_db::ClaimRepository::supersede_act_conn(
+        &mut tx,
+        epigraph_core::ClaimId::from_uuid(old),
+        &format!("custodial revision of {old}"),
+        epigraph_core::TruthValue::new(0.6).expect("truth"),
+        "operator binding probe",
+    )
+    .await;
+    if r.is_ok() {
+        tx.commit().await.expect("commit");
+    }
+    r
+}
+
+/// Delta review round 2 COR-R2-1 / DIS-R2-2: under the platform decision the
+/// retired-linked and unlinked legacy rows stay world-owned, to be revised only
+/// by an elevated act. Once armed, a PRIVILEGED (maintenance) session's
+/// supersede of such a claim carries its predecessor's author whatever that
+/// author's binding; before this, the author arm refused every one (OPL01).
+/// Nothing else is relieved: a fresh claim, or a posed second successor,
+/// naming an unbound author is still OPL01 on that session, and an
+/// instance-admin PRINCIPAL (an application-session stamp) supersedes a
+/// retired-linked author's world claim but not an unlinked one's.
+///
+/// Verified to fail: the author arm's `IF NOT (v_inherited AND
+/// public.epigraph_bypass())` guard removed (require_bound_author always) ->
+/// the maintenance session's supersedes are refused OPL01; the guard widened to
+/// `v_inherited` alone -> the maintenance session still passes, and the
+/// principal-equals-author control (the retired identity stamped as itself,
+/// superseding its own retired world claim) lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_privileged_session_revises_the_platform_corpus_once_armed(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+    let (unlinked, _) = fixture::seed_agent_with_group(&pool, "unlinked-legacy").await;
+    let world = Uuid::nil();
+    let mut corpus = Vec::new();
+    for author in [legacy, unlinked, legacy, unlinked, legacy] {
+        corpus.push(insert_claim(&pool, author, world).await.expect("corpus"));
+    }
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy identity's retired tie to A");
+    }
+    sqlx::query(
+        "INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'operator binding test')",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await
+    .expect("A is an instance admin");
+    arm(&pool).await;
+
+    // The maintenance session revises both kinds of corpus claim.
+    let (c_ret, c_unl) = (corpus[0], corpus[1]);
+    let (revised, fresh, second) =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let revised = [
+                supersede_on(&mut conn, c_ret).await,
+                supersede_on(&mut conn, c_unl).await,
+            ];
+            let fresh = insert_claim(&mut *conn, unlinked, world).await;
+            let id = Uuid::new_v4();
+            let second = sqlx::query(
+                "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                                     visibility, owner_group_id, supersedes) \
+                 VALUES ($1, 'posed second successor', $2, 0.5, $3, true, 'public', $4, $5)",
+            )
+            .bind(id)
+            .bind(id.as_bytes().repeat(2))
+            .bind(unlinked)
+            .bind(world)
+            .bind(c_unl)
+            .execute(&mut *conn)
+            .await
+            .map(|_| id);
+            (conn, (revised, fresh, second))
+        })
+        .await;
+    for (r, author) in revised.into_iter().zip([legacy, unlinked]) {
+        let (new, _) = r.unwrap_or_else(|e| panic!("maintenance supersede of {author}'s: {e:?}"));
+        let row: (Uuid, Uuid) =
+            sqlx::query_as("SELECT agent_id, owner_group_id FROM claims WHERE id = $1")
+                .bind(new)
+                .fetch_one(&pool)
+                .await
+                .expect("successor");
+        assert_eq!(
+            row,
+            (author, world),
+            "the successor inherits author and owner"
+        );
+    }
+    assert_opl01(
+        fresh,
+        "a maintenance session's FRESH claim naming an unlinked author",
+    );
+    assert_opl01(second, "a maintenance session's posed second successor");
+
+    // The retired identity stamped as ITSELF is the author arm on an
+    // application session: never relieved.
+    let (c_self, c_admin_ret, c_admin_unl) = (corpus[4], corpus[2], corpus[3]);
+    let as_itself = as_app_stamped(&pool, legacy, &[world], |mut conn| async move {
+        let r = supersede_on(&mut conn, c_self).await;
+        (conn, r)
+    })
+    .await;
+    assert!(
+        matches!(
+            as_itself,
+            Err(epigraph_db::DbError::OperatorLinkRequired { .. })
+        ),
+        "the retired identity as its own principal: {as_itself:?}"
+    );
+
+    // An instance-admin principal: a retired-linked author's corpus claim,
+    // yes; an unlinked author's, no (OPL01, documented). The stamp lists the
+    // world group as writable so row security admits the retire half and the
+    // trigger alone decides (whether a real admin viewer carries it is the
+    // tenancy layer's question, not this one's).
+    let admin = |old: Uuid| {
+        let pool = pool.clone();
+        async move {
+            as_app_stamped(&pool, a, &[a_group, world], |mut conn| async move {
+                let r = supersede_on(&mut conn, old).await;
+                (conn, r)
+            })
+            .await
+        }
+    };
+    admin(c_admin_ret)
+        .await
+        .expect("an instance admin revises a retired-linked author's corpus claim");
+    let r = admin(c_admin_unl).await;
+    assert!(
+        matches!(r, Err(epigraph_db::DbError::OperatorLinkRequired { .. })),
+        "an instance admin and an unlinked author's corpus claim: {r:?}"
+    );
+}
+
 /// Review SEC-10: the valve relieves the BINDING (OPL01) only. With it open, an
 /// unbound agent writes, but a linked agent still cannot write into another
 /// human's group and another human still cannot enrol it there (OPL02).

@@ -14,7 +14,8 @@
 -- A claim INSERT (and an UPDATE that changes `claims.agent_id`, which only a
 -- privileged session or an instance-admin principal may make: section 2) is
 -- admitted only when its author is BOUND, and, when the session's authenticated
--- principal is not the author, only when that WRITER is bound too (section 2):
+-- principal is not the author, only when that WRITER is bound too (section 2;
+-- the one privileged-session exception, restating a retired claim, is in 1b):
 --
 --   (a) a HUMAN OPERATOR (`epigraph_is_human_operator`): an agent with a live
 --       row in the maintenance-only registry `human_operators` (section 1c)
@@ -67,11 +68,17 @@
 -- session's valve (section 4): the valve relieves the binding, never the
 -- cross-human scope.
 --
--- EXEMPT from 1b only (never from section 1's binding): a privileged session
--- (`epigraph_bypass()`: the maintenance role or a superuser, i.e. the operator
--- CLIs and the audited admin definers) and a session whose principal is a
--- live instance admin (`epigraph_is_instance_admin`, 083). Admin access crosses
--- groups; nothing else does.
+-- EXEMPT from 1b only: a privileged session (`epigraph_bypass()`: the
+-- maintenance role or a superuser, i.e. the operator CLIs and the audited
+-- admin definers) and a session whose principal is a live instance admin
+-- (`epigraph_is_instance_admin`, 083). Admin access crosses groups; nothing
+-- else does. Neither is exempt from section 1's binding, with ONE exception
+-- for the privileged session alone: its supersede, whose successor inherits a
+-- retired predecessor's author and group (section 2), is admitted whatever
+-- that author's binding. That is the platform corpus's edit path: world-owned
+-- legacy rows are authored by retired-linked or unlinked identities by
+-- construction. An instance-admin principal is not relieved of the binding,
+-- because it is a stamp an application session sets (section 4).
 --
 -- ===================================================================
 -- 1c. WHO IS A HUMAN: AN EXPLICIT, AUDITED REGISTRY (OB7)
@@ -636,23 +643,34 @@ BEGIN
                   HINT = 'Write on a transaction stamped with the request''s viewer '
                          '(ScopedPool::begin_as). See docs/tenancy.md "Operator binding".';
     END IF;
+    IF TG_OP = 'INSERT' AND NEW.supersedes IS NOT NULL THEN
+        v_inherited :=
+            EXISTS (SELECT 1 FROM public.claims p
+                     WHERE p.id = NEW.supersedes
+                       AND p.agent_id IS NOT DISTINCT FROM NEW.agent_id
+                       AND p.owner_group_id IS NOT DISTINCT FROM NEW.owner_group_id
+                       AND NOT COALESCE(p.is_current, true))
+            AND NOT EXISTS (SELECT 1 FROM public.claims s
+                             WHERE s.supersedes = NEW.supersedes AND s.id <> NEW.id
+                               AND COALESCE(s.is_current, true));
+    END IF;
     IF v_writer IS NULL OR v_writer = NEW.agent_id OR public.epigraph_bypass() THEN
-        PERFORM public.epigraph_require_bound_author(NEW.agent_id);
+        -- THE PLATFORM CORPUS'S EDIT PATH. A PRIVILEGED session (the
+        -- maintenance role or a superuser: `epigraph_bypass()`, which no
+        -- application session can forge) restating a retired predecessor
+        -- carries that predecessor's author whatever its binding: world-owned
+        -- legacy rows are authored by retired-linked or unlinked identities by
+        -- construction, so the author check would refuse every such supersede.
+        -- Nothing else is relieved: a fresh claim, or a posed successor, is
+        -- checked on its author as always, and an instance-admin PRINCIPAL is
+        -- not relieved here (it is a stamp an application session sets).
+        IF NOT (v_inherited AND public.epigraph_bypass()) THEN
+            PERFORM public.epigraph_require_bound_author(NEW.agent_id);
+        END IF;
         PERFORM public.epigraph_require_writer_scope(NEW.agent_id, NEW.owner_group_id);
     ELSE
         PERFORM public.epigraph_require_bound_writer(v_writer);
         PERFORM public.epigraph_require_writer_scope(v_writer, NEW.owner_group_id);
-        IF TG_OP = 'INSERT' AND NEW.supersedes IS NOT NULL THEN
-            v_inherited :=
-                EXISTS (SELECT 1 FROM public.claims p
-                         WHERE p.id = NEW.supersedes
-                           AND p.agent_id IS NOT DISTINCT FROM NEW.agent_id
-                           AND p.owner_group_id IS NOT DISTINCT FROM NEW.owner_group_id
-                           AND NOT COALESCE(p.is_current, true))
-                AND NOT EXISTS (SELECT 1 FROM public.claims s
-                                 WHERE s.supersedes = NEW.supersedes AND s.id <> NEW.id
-                                   AND COALESCE(s.is_current, true));
-        END IF;
         PERFORM public.epigraph_require_attributable(NEW.agent_id, v_writer, v_inherited);
     END IF;
     RETURN NEW;
