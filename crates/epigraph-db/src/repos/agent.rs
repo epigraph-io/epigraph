@@ -1504,6 +1504,28 @@ impl AgentRepository {
         Ok(())
     }
 
+    /// Refuse, with [`DbError::OperatorScopeRefused`] (`OPL02`), a live-linked
+    /// agent named on a row owned by `group_id` when its operator holds no
+    /// writer/admin membership there (migration 122 section 1b); quiet for a
+    /// human author, an unarmed database, the valve, a privileged session and an
+    /// instance-admin principal. The same definer the claims trigger calls.
+    ///
+    /// # Errors
+    /// [`DbError::OperatorScopeRefused`], or `DbError::QueryFailed` if the
+    /// function is absent or the call fails.
+    pub async fn require_operator_scope(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        group_id: Uuid,
+    ) -> Result<(), DbError> {
+        sqlx::query("SELECT public.epigraph_require_operator_scope($1, $2)")
+            .bind(agent_id)
+            .bind(group_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
     /// How `agent_id` is bound to a human operator (migration 122):
     /// `Some("live_link")`, `Some("human_operator")`, or `None` (unbound).
     /// Independent of arming and of the valve.

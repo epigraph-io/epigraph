@@ -307,16 +307,36 @@ subject to the same check; 071's shim was too, until PR-22 retired it.
 ## Operator binding
 
 **The invariant.** Every writing agent is irrevocably tied to one individual
-human account. Once a database is ARMED (below), a claim may be written (and
-`claims.agent_id` changed) only when its author is BOUND:
+human account, and there may be many humans. Once a database is ARMED (below),
+a claim may be written (and `claims.agent_id` changed) only when its author is
+BOUND:
 
 * (a) a **human operator**: the agent of an ACTIVE `client_type = 'human'` OAuth
-  client, or an agent that some `operator_links` row names as its operator; or
-* (b) the holder of a **live link**: an `operator_links` row for the agent with
-  `retired = false` (recorded by `epigraph-operator link`, or by a stdio
-  process's own startup on a maintenance DSN).
+  client (nothing else makes an agent a human; in particular not being named as
+  some link's operator); or
+* (b) the holder of a **live link to a human operator**: an `operator_links`
+  row for the agent with `retired = false` whose operator is (a) (recorded by
+  `epigraph-operator link`, or by a stdio process's own startup on a
+  maintenance DSN). An agent has ONE operator for life: a link to a second
+  human is refused, live or retired, and never re-pointed.
 
-Anything else is refused with SQLSTATE **`OPL01`**. The refusal is a trigger on
+Anything else is refused with SQLSTATE **`OPL01`**.
+
+**A linked agent writes only where its own operator writes (`OPL02`).** A claim
+authored by a live-linked agent must be owned by a group its operator holds a
+live `writer`/`admin` membership in: normally the operator's personal group,
+never another human's group, and never the agent's own personal group. The
+same rule guards the membership door: a `writer`/`admin` row for a live-linked
+agent is refused unless its operator writes that group, so another human
+cannot enrol my agent to write evidence, edges or beliefs in their group. Both
+refusals are SQLSTATE **`OPL02`**. Only admin access crosses groups: a
+privileged (maintenance) session and a session whose principal is a live
+instance admin are exempt from `OPL02` (never from `OPL01`). A consequence: an
+agent whose membership in its operator's group was REVOKED writes nothing (its
+default declaration falls back to its own personal group, which `OPL02`
+refuses); ending an agent's writes is a revoke or a retire. Residual, named: a
+writer row that predates the link, or outlives the operator's own membership,
+is not revisited by the door; audit with the query in "Existing rows". The refusal is a trigger on
 `claims` (`claims_require_operator_binding`, migration 122), so it holds on
 every path: REST, MCP over HTTP and stdio, the CLIs, workflow ingest, default and
 explicit tenancy declarations, and a raw `INSERT` on any role.
@@ -326,9 +346,9 @@ Surfaces:
 
 | surface | what the caller sees |
 |---|---|
-| HTTP | `403`, body starts `OPL01:` and names the fix |
-| MCP | `INVALID_REQUEST`, message carries `OPL01` and the fix |
-| Rust | `DbError::OperatorLinkRequired` (`is_write_authority_refusal()`) |
+| HTTP | `403`, body starts `OPL01:` (and names the fix) or `OPL02:` |
+| MCP | `INVALID_REQUEST`, message carries `OPL01` / `OPL02` |
+| Rust | `DbError::OperatorLinkRequired` / `DbError::OperatorScopeRefused` (`is_write_authority_refusal()`) |
 
 **The fix** is an operator action on a maintenance DSN:
 
@@ -344,11 +364,6 @@ EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... \
 `link` refuses an operator that is not a human operator, and refuses an agent
 that is the principal of an un-revoked OAuth client (see "HTTP principals"
 below). It is idempotent; a dry run is the default.
-
-**LIVE means `retired = false`.** An agent whose membership in its operator's
-group was REVOKED keeps its link row and is still bound: it writes into its own
-personal group, as before (`reown-linked` moves those rows later). Ending an
-agent's ability to write is a retire, not a revoke.
 
 ### Arming, and the valve
 
@@ -408,7 +423,20 @@ before arming.
   principals, holders of write authority in the operator's group, 107's
   shared-signer fingerprint (use `link-retired --attest-shared-signer`),
   `--exclude-agents-file` ids, and agents that authored a claim within
-  `--quiet-days` (30; they may still be running and want a live link).
+  `--quiet-days` (30; they may still be running and want a live link), and
+  agents holding write authority in a group the operator does not write
+  (`foreign_write_authority`: they act in someone else's group). `--operator`
+  is always explicit; with many humans, run it once per human over that human's
+  own legacy agents (a later run skips everything an earlier one tied).
+* Audit writer rows that predate a link (the `OPL02` door does not revisit
+  them):
+
+  ```sql
+  SELECT m.agent_id, m.group_id FROM group_memberships m
+    JOIN operator_links l ON l.agent_id = m.agent_id AND NOT l.retired
+   WHERE m.revoked_at IS NULL AND m.role IN ('writer', 'admin')
+     AND NOT public.epigraph_operator_writes_group(l.operator_id, m.group_id);
+  ```
 * The backfill (`epigraph-tenancy-backfill run`) stamps a world-owned row of a
   LINKED author (any link state) to the operator's group; an unlinked author
   keeps the personal-group fallback. `verify` still fails on any world-owned

@@ -1095,6 +1095,20 @@ fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) 
             ),
         );
     }
+    if let epigraph_db::DbError::OperatorScopeRefused { message } = &e {
+        tracing::warn!(
+            detail = %message,
+            "submit_packet refused: the author is outside its operator's groups"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            ErrorResponse::new(
+                "Forbidden",
+                "OPL02: the author agent is linked to a human operator that does not write the \
+                 target group; nothing was written.",
+            ),
+        );
+    }
     if e.is_personal_group_refusal() {
         tracing::warn!(
             detail = %e,

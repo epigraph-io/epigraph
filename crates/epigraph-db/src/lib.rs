@@ -66,8 +66,8 @@ pub mod visibility;
 // keep that module path resolving. The constant is unaffected and is exported
 // below from where PR-08 actually put it.
 pub use errors::{
-    DbError, OPERATOR_LINK_FIX, OPERATOR_LINK_REQUIRED, PERSONAL_GROUP_NOT_OWNED,
-    PERSONAL_MEMBERSHIP_REVOKED,
+    DbError, OPERATOR_LINK_FIX, OPERATOR_LINK_REQUIRED, OPERATOR_SCOPE_REFUSED,
+    PERSONAL_GROUP_NOT_OWNED, PERSONAL_MEMBERSHIP_REVOKED,
 };
 pub use label_validation::reject_unexpanded_labels;
 pub use pool::{

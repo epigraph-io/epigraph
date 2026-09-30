@@ -33,6 +33,12 @@ pub const PERSONAL_GROUP_NOT_OWNED: &str = "RVK02";
 /// armed. Same custom-class reasoning as [`PERSONAL_MEMBERSHIP_REVOKED`].
 pub const OPERATOR_LINK_REQUIRED: &str = "OPL01";
 
+/// SQLSTATE `OPL02`: a live-linked agent was named on a row owned by a group its
+/// OPERATOR holds no writer/admin membership in, or given a writer/admin row in
+/// such a group (migration 122 section 1b). Every agent writes only where its
+/// own human writes; admin access is the only thing that crosses groups.
+pub const OPERATOR_SCOPE_REFUSED: &str = "OPL02";
+
 /// The remedy every surface prints with an [`DbError::OperatorLinkRequired`].
 /// One string, so the HTTP body, the MCP message and the CLI text cannot drift.
 pub const OPERATOR_LINK_FIX: &str = "an operator records a live link for the agent on a \
@@ -186,6 +192,12 @@ pub enum DbError {
     #[error("OPL01 operator link required: {message}. Fix: {}", OPERATOR_LINK_FIX)]
     OperatorLinkRequired { message: String },
 
+    /// A live-linked agent wrote (or was enrolled to write) into a group its
+    /// operator does not write (SQLSTATE [`OPERATOR_SCOPE_REFUSED`], migration
+    /// 122 section 1b). A DENIAL (HTTP 403, MCP `INVALID_REQUEST`).
+    #[error("OPL02 outside the operator's groups: {message}")]
+    OperatorScopeRefused { message: String },
+
     /// Migration failed
     #[error("Migration failed: {source}")]
     MigrationFailed {
@@ -261,6 +273,14 @@ impl From<sqlx::Error> for DbError {
                     message: db_err.message().to_string(),
                 }
             }
+            // OPL02, migration 122 section 1b: outside the operator's groups.
+            sqlx::Error::Database(db_err)
+                if db_err.code().as_deref() == Some(OPERATOR_SCOPE_REFUSED) =>
+            {
+                Self::OperatorScopeRefused {
+                    message: db_err.message().to_string(),
+                }
+            }
             // All other database errors become QueryFailed
             other => Self::QueryFailed { source: other },
         }
@@ -285,11 +305,15 @@ impl DbError {
     /// cannot fix by changing a parameter and that is never a server fault:
     /// migration 105's two personal-group refusals
     /// ([`Self::is_personal_group_refusal`]) and migration 122's
-    /// [`Self::OperatorLinkRequired`]. The write surfaces map exactly this set
+    /// [`Self::OperatorLinkRequired`] and [`Self::OperatorScopeRefused`]. The write surfaces map exactly this set
     /// to a denial (HTTP 403, MCP `INVALID_REQUEST`).
     #[must_use]
     pub fn is_write_authority_refusal(&self) -> bool {
-        self.is_personal_group_refusal() || matches!(self, Self::OperatorLinkRequired { .. })
+        self.is_personal_group_refusal()
+            || matches!(
+                self,
+                Self::OperatorLinkRequired { .. } | Self::OperatorScopeRefused { .. }
+            )
     }
 }
 

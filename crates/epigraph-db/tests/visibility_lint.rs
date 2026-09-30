@@ -1065,6 +1065,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "require_operator_scope",
+        "CHECK through migration 122's `epigraph_require_operator_scope` SECURITY DEFINER \
+         function: returns nothing, raises OPL02 when a linked agent's operator does not write \
+         the NAMED group. Same reason as `require_bound_author`.",
+    ),
+    (
+        "agent.rs",
         "author_binding",
         "READ through migration 122's `epigraph_author_binding` SECURITY DEFINER function; same \
          reason as `operator_actor`. It returns one label ('live_link' / 'human_operator' / \

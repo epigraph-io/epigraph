@@ -627,6 +627,17 @@ impl From<DbError> for ApiError {
                     ),
                 }
             }
+            // Migration 122 section 1b (OPL02): a linked agent outside its
+            // operator's groups. The group and operator ids stay in the log.
+            DbError::OperatorScopeRefused { message } => {
+                tracing::warn!(detail = %message, "linked agent outside its operator's groups");
+                ApiError::Forbidden {
+                    reason: "OPL02: the author agent is linked to a human operator that holds no \
+                             writer/admin membership in the target group; a linked agent writes \
+                             only where its own operator writes. Nothing was written."
+                        .to_string(),
+                }
+            }
             DbError::InvalidData { reason } => ApiError::ValidationError {
                 field: "data".to_string(),
                 reason,
@@ -789,6 +800,14 @@ mod tests {
             other => panic!("OPL01 must be Forbidden: {other:?}"),
         }
         assert_eq!(api.into_response().status(), StatusCode::FORBIDDEN);
+
+        let scope = ApiError::from(DbError::OperatorScopeRefused {
+            message: "OPL02: agent a is linked to operator o ... group g".to_string(),
+        });
+        match &scope {
+            ApiError::Forbidden { reason } => assert!(reason.starts_with("OPL02"), "{reason}"),
+            other => panic!("OPL02 must be Forbidden: {other:?}"),
+        }
     }
 
     #[test]

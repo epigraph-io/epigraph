@@ -1450,6 +1450,30 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
             "v",
             false,
         ),
+        (
+            "epigraph_operator_writes_group",
+            "public.epigraph_operator_writes_group(uuid, uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_scope_exempt",
+            "public.epigraph_operator_scope_exempt()",
+            "s",
+            false,
+        ),
+        (
+            "epigraph_require_operator_scope",
+            "public.epigraph_require_operator_scope(uuid, uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_group_memberships_operator_scope",
+            "public.epigraph_group_memberships_operator_scope()",
+            "v",
+            false,
+        ),
     ] {
         let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
             "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \

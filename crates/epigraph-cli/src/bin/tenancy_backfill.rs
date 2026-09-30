@@ -1173,6 +1173,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_require_bound_author", 122),
     ("epigraph_claims_require_operator_binding", 122),
     ("epigraph_arm_operator_binding", 122),
+    // Section 1b (a linked agent writes only where its operator writes). Under
+    // a non-member owner `group_memberships` reads are filtered, so no operator
+    // "writes" any group and every linked agent's write is refused (loud).
+    ("epigraph_operator_writes_group", 122),
+    ("epigraph_operator_scope_exempt", 122),
+    ("epigraph_require_operator_scope", 122),
+    ("epigraph_group_memberships_operator_scope", 122),
     // The legacy-author tie: under a non-member owner its reads of the FORCEd
     // tier-A tables and of `operator_links` are filtered and its link INSERT is
     // refused by 107's definer-only policy, so it fails CLOSED (links nothing,
@@ -1438,6 +1445,16 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_arm_operator_binding",
             "public.epigraph_arm_operator_binding()",
             false,
+        ),
+        (
+            "epigraph_operator_writes_group",
+            "public.epigraph_operator_writes_group(uuid, uuid)",
+            true,
+        ),
+        (
+            "epigraph_require_operator_scope",
+            "public.epigraph_require_operator_scope(uuid, uuid)",
+            true,
         ),
         // A link function: the request DSN must never record links.
         (

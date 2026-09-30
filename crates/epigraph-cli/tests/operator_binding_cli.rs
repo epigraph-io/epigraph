@@ -702,3 +702,51 @@ async fn reown_linked_moves_a_linked_authors_personal_claims_and_their_derived_r
     assert!(again.stdout.contains("candidates=0"), "{}", again.show());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Two humans (OB5): an agent is tied to ONE human for life. `link` to a second
+/// human is refused (107's one-operator rule, surfaced by name), and the first
+/// link is left exactly as it was, whether it is live or retired.
+///
+/// Verified to fail: 107's one-operator refusal in `epigraph_link_operator`
+/// (`IF v_other IS NOT NULL`) disabled -> the live agent's `link` to the second
+/// human no longer exits 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_refuses_a_second_human_live_or_retired(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "human-a").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "human-b").await;
+    make_human(&pool, a).await;
+    make_human(&pool, b).await;
+    let (live, _) = fixture::seed_agent_with_group(&pool, "live").await;
+    let (retired, _) = fixture::seed_agent_with_group(&pool, "retired").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, live, a)
+            .await
+            .expect("live -> a");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, a)
+            .await
+            .expect("retired -> a");
+    }
+    for agent in [live, retired] {
+        let r = run_op(
+            &pool,
+            &[
+                "link",
+                "--agent",
+                &agent.to_string(),
+                "--operator",
+                &b.to_string(),
+                "--apply",
+            ],
+        )
+        .await;
+        assert_eq!(r.code, 1, "{}", r.show());
+        assert!(
+            r.stderr.contains("already has a link to operator"),
+            "{}",
+            r.show()
+        );
+    }
+    assert_eq!(link_row(&pool, live).await, Some((a, false)));
+    assert_eq!(link_row(&pool, retired).await, Some((a, true)));
+}

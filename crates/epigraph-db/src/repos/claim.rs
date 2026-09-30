@@ -839,7 +839,10 @@ impl ClaimRepository {
     /// read, so it answers correctly on an unstamped `epigraph_app` session,
     /// where `groups_tenancy` hides every row and a read-first lookup here
     /// would be blind. An unlinked, revoked or RETIRED author falls through to
-    /// [`Self::personal_group_of`] exactly as before.
+    /// [`Self::personal_group_of`]; once the database is armed (migration 122)
+    /// an unbound author is refused before that (`OPL01`), and a live-linked
+    /// agent whose membership was revoked is refused after it (`OPL02`: its own
+    /// personal group is not a group its operator writes).
     ///
     /// It is the ACTOR read, never the author read
     /// ([`AgentRepository::operator_of_author`](crate::repos::AgentRepository::operator_of_author)):
@@ -875,9 +878,13 @@ impl ClaimRepository {
         // Refuse an unbound author BEFORE 105's definer can provision a
         // personal group for an agent that may not write at all.
         crate::repos::AgentRepository::require_bound_author(conn, agent_id).await?;
-        Ok(TenancyDecl::public(
-            Self::personal_group_of(conn, agent_id).await?,
-        ))
+        let group = Self::personal_group_of(conn, agent_id).await?;
+        // A live-linked agent that is not ACTING (its membership was revoked)
+        // falls back to its own personal group, which its operator does not
+        // write: refused here by name (OPL02, 122 section 1b) rather than by
+        // the trigger after the caller built the whole write.
+        crate::repos::AgentRepository::require_operator_scope(conn, agent_id, group).await?;
+        Ok(TenancyDecl::public(group))
     }
 
     /// The id of `agent_id`'s personal group, resolved by the `SECURITY DEFINER`

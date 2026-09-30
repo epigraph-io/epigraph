@@ -108,7 +108,8 @@ pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
         },
         // Migration 122's OPL01: the author is not bound to a human operator.
         // The same class of denial; its rendering carries the code and the fix.
-        e @ epigraph_db::DbError::OperatorLinkRequired { .. } => McpError {
+        e @ (epigraph_db::DbError::OperatorLinkRequired { .. }
+        | epigraph_db::DbError::OperatorScopeRefused { .. }) => McpError {
             code: ErrorCode::INVALID_REQUEST,
             message: Cow::from(e.to_string()),
             data: None,
@@ -211,6 +212,11 @@ mod tests {
             "the denial must carry the code and name the fix: {}",
             unbound.message
         );
+        let scope = db_caller_error(epigraph_db::DbError::OperatorScopeRefused {
+            message: "OPL02: agent a is linked to operator o".to_string(),
+        });
+        assert_eq!(scope.code, ErrorCode::INVALID_REQUEST);
+        assert!(scope.message.contains("OPL02"), "{}", scope.message);
     }
 
     /// The executor wraps the refusal in `IngestExecutorError::Repository`; the

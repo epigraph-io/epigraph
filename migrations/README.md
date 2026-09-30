@@ -769,12 +769,15 @@ Current reservation:
   deployed database.
 
 - **122**: public `operator_binding` — every claim is authored by an agent
-  BOUND to a human operator: (a) the agent of an active `human` OAuth client,
-  or an agent that is some link's `operator_id`; or (b) the holder of a LIVE
-  (`retired = false`) `operator_links` row. A BEFORE INSERT OR UPDATE OF
-  `agent_id` trigger on `claims` (`claims_require_operator_binding`, a
-  maintenance-owned definer body) raises `OPL01` naming the fix
-  (`epigraph-operator link`) for any other author, on every role. Applying the
+  BOUND to a human operator: (a) the agent of an active `human` OAuth client;
+  or (b) the holder of a LIVE (`retired = false`) `operator_links` row whose
+  operator is (a). A BEFORE INSERT OR UPDATE OF `agent_id` trigger on `claims`
+  (`claims_require_operator_binding`, a maintenance-owned definer body) raises
+  `OPL01` naming the fix (`epigraph-operator link`) for any other author, on
+  every role; and `OPL02` when a live-linked author's claim is owned by a group
+  its operator does not write, with the same rule on writer/admin rows in
+  `group_memberships` (`group_memberships_operator_scope`); a privileged
+  session and an instance-admin principal are exempt from `OPL02` only. Applying the
   file enforces NOTHING: enforcement starts when a maintenance session calls
   `epigraph_arm_operator_binding()` (`epigraph-operator arm-operator-binding
   --apply`), which is audited and ONE-WAY (the arming table grants the

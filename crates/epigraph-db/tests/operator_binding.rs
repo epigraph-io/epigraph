@@ -27,7 +27,12 @@
 //! * the valve clause dropped from `epigraph_operator_binding_enforced`: fails
 //!   `the_valve_lifts_enforcement_for_its_own_session_only`;
 //! * `GRANT ... UPDATE, DELETE` on `operator_binding_arming` to the maintenance
-//!   role: fails `arming_is_maintenance_only_audited_and_one_way`.
+//!   role: fails `arming_is_maintenance_only_audited_and_one_way`;
+//! * `epigraph_is_human_operator(l.operator_id)` dropped from arm (b): fails
+//!   `a_live_link_and_a_human_operator_are_bound_and_a_retired_link_is_not`;
+//! * the claims trigger's `epigraph_require_operator_scope` call removed, and
+//!   separately the `group_memberships_operator_scope` trigger removed: each
+//!   fails `a_linked_agent_writes_only_where_its_own_operator_writes`.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -155,8 +160,11 @@ async fn once_armed_an_unbound_author_is_refused_with_opl01_on_every_role(pool: 
     assert_eq!(written, 0, "a refused author wrote {written} claim(s)");
 }
 
-/// Armed: (b) a LIVE link binds; (a) a human OAuth client's agent binds, and so
-/// does an agent that operates others; a RETIRED link does not.
+/// Armed: (a) a human OAuth client's agent binds; (b) a LIVE link to a human
+/// binds; a RETIRED link does not, and neither does a live link to an operator
+/// that is not a human (a link cannot make a human), nor does being named as
+/// some link's operator. (Superuser session: section 1b's group arm is exempt
+/// here, so only the binding arm is measured.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_live_link_and_a_human_operator_are_bound_and_a_retired_link_is_not(pool: PgPool) {
     let (human, human_group) = fixture::seed_agent_with_group(&pool, "human").await;
@@ -174,8 +182,8 @@ async fn a_live_link_and_a_human_operator_are_bound_and_a_retired_link_is_not(po
         AgentRepository::link_retired_agent(&mut conn, retired, human)
             .await
             .expect("retired link");
-        // `operator_only` has no human client; it is a human operator only
-        // because a link names it as the operator.
+        // `operator_only` has no human client: a link naming it as the
+        // operator must not make it, or `operated`, bound.
         AgentRepository::link_operator(&mut conn, operated, operator_only)
             .await
             .expect("link naming operator_only");
@@ -193,30 +201,36 @@ async fn a_live_link_and_a_human_operator_are_bound_and_a_retired_link_is_not(po
         }
     };
     assert_eq!(binding(human).await.as_deref(), Some("human_operator"));
-    assert_eq!(
-        binding(operator_only).await.as_deref(),
-        Some("human_operator")
-    );
     assert_eq!(binding(live).await.as_deref(), Some("live_link"));
     assert_eq!(binding(retired).await, None, "a retired link binds nothing");
+    assert_eq!(
+        binding(operator_only).await,
+        None,
+        "being named as an operator does not make an agent a human"
+    );
+    assert_eq!(
+        binding(operated).await,
+        None,
+        "a live link to a non-human binds nobody to a human"
+    );
 
     insert_claim(&pool, human, human_group)
         .await
         .expect("a human operator writes");
-    insert_claim(&pool, operator_only, operator_only_group)
+    insert_claim(&pool, live, human_group)
         .await
-        .expect("an agent that operates others writes");
-    insert_claim(&pool, live, live_group)
-        .await
-        .expect("a live-linked agent writes");
+        .expect("a live-linked agent writes into its operator's group");
+    let _ = live_group;
     assert_opl01(
         insert_claim(&pool, retired, retired_group).await,
         "a retired identity",
     );
+    assert_opl01(
+        insert_claim(&pool, operator_only, operator_only_group).await,
+        "an operator that is not a human",
+    );
 
-    // A human whose client is no longer active, and whom no link names as an
-    // operator, is not a human operator. (`human` above stays one through its
-    // links even if its client is suspended: arm (a)'s second disjunct.)
+    // A human whose client is no longer active is not a human operator.
     let (lapsed, lapsed_group) = fixture::seed_agent_with_group(&pool, "lapsed").await;
     make_human(&pool, lapsed).await;
     insert_claim(&pool, lapsed, lapsed_group)
@@ -231,6 +245,158 @@ async fn a_live_link_and_a_human_operator_are_bound_and_a_retired_link_is_not(po
         insert_claim(&pool, lapsed, lapsed_group).await,
         "a suspended human client's agent",
     );
+}
+
+/// Run `f` on a connection that is `epigraph_app`, stamped as `principal` with
+/// `groups` as its read AND writable set, exactly the three GUCs `ScopedPool`
+/// stamps; the stamp is cleared and the role reset afterwards.
+async fn as_app_stamped<F, Fut, T>(pool: &PgPool, principal: Uuid, groups: &[Uuid], f: F) -> T
+where
+    F: FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
+    Fut: std::future::Future<Output = (sqlx::pool::PoolConnection<sqlx::Postgres>, T)>,
+{
+    let set = groups
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', $1, false), \
+                    set_config('epigraph.group_ids', $2, false), \
+                    set_config('epigraph.writable_group_ids', $2, false)",
+        )
+        .bind(principal.to_string())
+        .bind(&set)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp");
+        let (mut conn, out) = f(conn).await;
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', '', false), \
+                    set_config('epigraph.group_ids', '', false), \
+                    set_config('epigraph.writable_group_ids', '', false)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("unstamp");
+        (conn, out)
+    })
+    .await
+}
+
+fn code_of<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>) -> Option<String> {
+    r.as_ref().err().and_then(sqlstate)
+}
+
+/// Section 1b, with TWO humans (OB5): a live-linked agent writes only into
+/// groups its OWN operator writes. Human B cannot enrol A's agent as a writer
+/// in B's group, a membership that predates arming does not let the agent write
+/// a claim there, and the agent's own personal group is not its operator's
+/// either. Measured on the APPLICATION ROLE (a privileged session is exempt).
+/// An instance-admin principal crosses groups.
+///
+/// Verified to fail: the `PERFORM ... epigraph_require_operator_scope` line
+/// removed from the claims trigger -> the write into B's group lands; the
+/// membership trigger's `CREATE TRIGGER` removed -> B's enrolment lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_linked_agent_writes_only_where_its_own_operator_writes(pool: PgPool) {
+    let (a, a_group) = fixture::seed_agent_with_group(&pool, "human-a").await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "human-b").await;
+    make_human(&pool, a).await;
+    make_human(&pool, b).await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "a-agent-y").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, x, a)
+            .await
+            .expect("x -> a");
+        AgentRepository::link_operator(&mut conn, y, a)
+            .await
+            .expect("y -> a");
+    }
+    // Before arming, B enrolled X as a writer in B's group.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(b_group)
+    .bind(x)
+    .execute(&pool)
+    .await
+    .expect("unarmed: a membership B grants");
+    arm(&pool).await;
+
+    let (own, foreign, personal) = as_app_stamped(
+        &pool,
+        x,
+        &[a_group, b_group, x_group],
+        |mut conn| async move {
+            let own = insert_claim(&mut *conn, x, a_group).await;
+            let foreign = insert_claim(&mut *conn, x, b_group).await;
+            let personal = insert_claim(&mut *conn, x, x_group).await;
+            (conn, (own, foreign, personal))
+        },
+    )
+    .await;
+    assert!(own.is_ok(), "into its operator's group: {own:?}");
+    assert_eq!(code_of(&foreign).as_deref(), Some("OPL02"), "{foreign:?}");
+    let named = epigraph_db::DbError::from(foreign.expect_err("refused"));
+    assert!(
+        matches!(named, epigraph_db::DbError::OperatorScopeRefused { .. })
+            && named.is_write_authority_refusal(),
+        "OPL02 must map to OperatorScopeRefused: {named:?}"
+    );
+    assert_eq!(code_of(&personal).as_deref(), Some("OPL02"), "{personal:?}");
+
+    // B, as itself, enrols A's other agent into B's group: refused at the door.
+    let enrol = as_app_stamped(&pool, b, &[b_group], |mut conn| async move {
+        let r = sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'writer')",
+        )
+        .bind(b_group)
+        .bind(y)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        code_of(&enrol).as_deref(),
+        Some("OPL02"),
+        "another human must not enrol my agent: {enrol:?}"
+    );
+    // A READER row is no write authority and stays allowed.
+    as_app_stamped(&pool, b, &[b_group], |mut conn| async move {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'reader')",
+        )
+        .bind(b_group)
+        .bind(y)
+        .execute(&mut *conn)
+        .await
+        .expect("a reader row");
+        (conn, ())
+    })
+    .await;
+
+    // An instance-admin principal crosses groups.
+    let (admin, _) = fixture::seed_agent_with_group(&pool, "instance-admin").await;
+    make_human(&pool, admin).await;
+    sqlx::query("INSERT INTO instance_admins (agent_id) VALUES ($1)")
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .expect("instance admin");
+    let crossed = as_app_stamped(&pool, admin, &[b_group], |mut conn| async move {
+        let r = insert_claim(&mut *conn, x, b_group).await;
+        (conn, r)
+    })
+    .await;
+    assert!(crossed.is_ok(), "admin access crosses groups: {crossed:?}");
 }
 
 /// The valve's transport: `epigraph.operator_link_enforcement = 'off'` lifts
