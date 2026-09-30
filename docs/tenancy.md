@@ -463,11 +463,24 @@ system agent is live-linked to one human, another human's callers are refused
 rather than writing into that human's group; a per-operator system identity is
 the follow-up that lets them ingest workflows.
 
-**Scope: claims.** The invariant, as specified, governs claim writes. Other
-rows that name an agent (evidence, challenges, DS mass, edges, perspectives,
-recall events) are gated by tenancy (row security and the `OPL02` membership
-door), not by `OPL01`: an unbound agent that holds a writer row in a group can
-still write those rows there once armed. Extending the binding to them is an
+**Scope: claim INSERTs.** The trigger governs claim INSERTs and changes of
+`claims.agent_id`. Every other claim UPDATE (content, truth value, labels,
+`is_current`, `supersedes`, properties, embedding: the retire half of a
+supersede, a dedup, a relabel, a re-score) is gated by tenancy row security
+alone, not by `OPL01` / `OPL02`. On a schema with only this series' policies
+that is the owner-group rule: an update needs the row readable and its owner
+group in the session's writable set, so one human's agent cannot update
+another human's claim, but an UNBOUND agent can still update claims in a group
+it writes (its own). A database that still carries the orphan permissive
+`*_privacy` policies (no `WITH CHECK`, `USING` true for every non-sealed row,
+OR'd with the tenancy policy) admits ANY claim UPDATE from any application
+session, other humans' group-private claims included, and arming does not
+change that. So for claims too, do not rely on arming for update isolation
+until those policies are removed. Other rows that name an agent (evidence,
+challenges, DS mass, edges, perspectives, recall events) are likewise gated by
+tenancy (row security and the `OPL02` membership door), not by `OPL01`: an
+unbound agent that holds a writer row in a group can still write those rows
+there once armed. Extending the binding to updates and to those rows is an
 open decision, not an oversight. Surfaces:
 
 | surface | what the caller sees |
@@ -569,6 +582,25 @@ before arming.
   `recall_events.agent_id`); the signing-key columns (`edges.signer_id`,
   `claims.signer_id`, `claim_signature_revocations.previous_signer_id`) name a
   key, not a writer, and are excluded.
+* **Register every human before tying legacy authors.** The
+  `operated_by_other_human` skip consults the REGISTRY: an agent whose
+  OPERATED_BY edge names a person who holds an active `human` client but is not
+  yet registered is tied to `--operator`, permanently (a link is never
+  re-pointed). The skip is deliberately not widened to "any active human
+  client", because a dynamic client registration is typed `human` too and such
+  a rule would leave an operator's own agents untied. Before `--apply`, list the
+  candidates whose lineage names an unregistered human-client agent and decide
+  each one (register that person first, or exclude the agent):
+
+  ```sql
+  SELECT DISTINCT e.source_id AS agent, e.target_id AS unregistered_human_client_agent
+    FROM edges e
+    JOIN oauth_clients c ON c.agent_id = e.target_id
+                        AND c.client_type = 'human' AND c.status = 'active'
+   WHERE e.relationship = 'OPERATED_BY'
+     AND NOT public.epigraph_is_human_operator(e.target_id)
+     AND NOT EXISTS (SELECT 1 FROM operator_links l WHERE l.agent_id = e.source_id);
+  ```
 * Audit writer rows that predate a link (the `OPL02` door does not revisit
   them):
 
@@ -584,6 +616,16 @@ before arming.
   operator's OWN world-owned rows also go to its personal group (see "Running
   the backfill"). `verify` REPORTS (not a failure) rows still owned by a linked
   author's own personal group.
+* **World-owned claims once armed.** Nobody holds a writer row in the world
+  group, so once armed a claim owned by it is superseded (the successor
+  inherits the world owner) or otherwise written into it only by a privileged
+  session or an instance-admin principal; everyone else, a human included, is
+  refused `OPL02`. Under `--legacy-owner platform` the retired-linked and
+  unlinked authors' rows STAY world-owned (the platform corpus), so a human
+  revises them only through an instance-admin principal, or after they are
+  moved (`--legacy-owner operator`, or `reown-linked`); the "human supersedes
+  its own legacy author's claim" admission applies to rows in the human's own
+  group. That is a consequence of the platform decision, not a defect.
 * `epigraph-operator reown-linked --operator <human> --legacy-owner operator|platform --manifest-out <new path>
   [--apply]` moves those claims into the operator's group through
   `reown-claims`' guarded batches (`--derived follow-claim`; derived rows follow

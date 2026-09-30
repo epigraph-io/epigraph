@@ -1471,9 +1471,13 @@ arming is one-way and every step before it must leave no live writer unbound.
    `--revoke-foreign-writes` revoking them. Linking a SHARED system identity
    (the workflow-ingest agent) to one human makes that human own every
    workflow row; the request paths then refuse other humans' callers.
-4. **Tie the legacy authors**: `epigraph-operator link-legacy-authors
-   --operator <human>` (dry run, read the SKIPPED lines), then `--apply`. Give
-   every `recent_writer` it skips a live link (step 3) or an explicit decision.
+4. **Tie the legacy authors**: register EVERY human first (step 2b; the
+   other-human lineage skip consults the registry, so an agent operated by a
+   not-yet-registered person would be tied to `--operator` for good; the
+   read-only query is in `docs/tenancy.md`, "Existing rows"), then
+   `epigraph-operator link-legacy-authors --operator <human>` (dry run, read
+   the SKIPPED lines), then `--apply`. Give every `recent_writer` it skips a
+   live link (step 3) or an explicit decision.
 5. **Backfill** as the maintenance login, ONLY after the operator has decided
    who owns the legacy corpus (`--legacy-owner operator|platform`, required, no
    default): `ANALYZE claims`, then `epigraph-tenancy-backfill run
@@ -1503,6 +1507,10 @@ arming is one-way and every step before it must leave no live writer unbound.
    not appear there: inventory those separately. So is a claim written on an
    application connection with NO principal (a CLI or job on the application
    DSN): once armed it is refused `OPL01`.
+   Arming binds claim INSERTs; claim UPDATEs other than a change of author stay
+   gated by row security alone, so while a database still carries orphan
+   permissive `*_privacy` policies, arming does not isolate claim updates
+   between humans (`docs/tenancy.md`, "Scope: claim INSERTs").
 9. **Smoke**: through the real HTTP route (not a hand-stamped SQL session), a
    claim posted by an unbound principal naming a bound author is refused
    (`OPL01`; HTTP 403); an INSERT on an unstamped application connection is
