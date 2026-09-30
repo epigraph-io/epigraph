@@ -202,9 +202,9 @@ pub async fn run(
     apply: bool,
 ) -> anyhow::Result<BindOutcome> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-    let (agent, agent_created) = resolve_agent(&mut *tx, spec).await?;
-    refuse(&mut *tx, agent, operator).await?;
-    let link = AgentRepository::link_operator(&mut *tx, agent, operator)
+    let (agent, agent_created) = resolve_agent(&mut tx, spec).await?;
+    refuse(&mut tx, agent, operator).await?;
+    let link = AgentRepository::link_operator(&mut tx, agent, operator)
         .await
         .map_err(|e| anyhow::anyhow!("{}", super::link::refusal_text(operator, &e)))?;
     if apply {
