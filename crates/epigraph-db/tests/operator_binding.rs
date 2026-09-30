@@ -1044,6 +1044,72 @@ async fn the_valve_relieves_the_binding_but_never_the_cross_human_scope(pool: Pg
     );
 }
 
+/// Delta review SEC-D2 / COR-D7 / DIS-D4: with the valve open, an UNBOUND
+/// writer (stamped honestly as itself, writing into its own group) may still
+/// author only as itself or as another unbound identity. Naming a human, or a
+/// human's agent, is a cross-human attribution the valve never relieves
+/// (OPL02, keyed on the arming). The owner group is the writer's own, so row
+/// security admits every arm and the trigger alone decides.
+///
+/// Verified to fail: `epigraph_require_attributable` returning early when the
+/// writer's human is NULL (the pre-fix `IF v_writer_human IS NULL OR ...`) ->
+/// U's claims naming human A and B's agent Y land.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_valve_never_lets_an_unbound_writer_name_a_bound_author(pool: PgPool) {
+    let (a, _) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
+    let (u, u_group) = fixture::seed_agent_with_group(&pool, "unbound-u").await;
+    let (v, _) = fixture::seed_agent_with_group(&pool, "unbound-v").await;
+    link_live(&pool, y, b).await;
+    arm(&pool).await;
+
+    let valve_write = |author: Uuid| {
+        let pool = pool.clone();
+        async move {
+            as_app_stamped(&pool, u, &[u_group], |mut conn| async move {
+                sqlx::query(
+                    "SELECT set_config('epigraph.operator_link_enforcement', 'off', false)",
+                )
+                .execute(&mut *conn)
+                .await
+                .expect("valve");
+                let r = insert_claim(&mut *conn, author, u_group).await;
+                sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+                    .execute(&mut *conn)
+                    .await
+                    .expect("valve reset");
+                (conn, r)
+            })
+            .await
+        }
+    };
+
+    for (author, what) in [
+        (a, "valve open, unbound U names human A"),
+        (y, "valve open, unbound U names B's live agent Y"),
+    ] {
+        let r = valve_write(author).await;
+        assert_eq!(code_of(&r).as_deref(), Some("OPL02"), "{what}: {r:?}");
+    }
+    let named: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE owner_group_id = $1 AND agent_id <> $2",
+    )
+    .bind(u_group)
+    .bind(u)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(named, 0, "an unbound writer attributed {named} claim(s)");
+
+    // Controls: the valve's purpose (an unbound writer as itself, or naming
+    // another unbound identity) is untouched.
+    valve_write(u).await.expect("valve open, U as itself");
+    valve_write(v)
+        .await
+        .expect("valve open, U names another unbound agent");
+}
+
 /// Review SEC-6 / SEC-8: a human is the agent of the ONE client its
 /// registration names, so the application role (which may INSERT
 /// `oauth_clients`, but not UPDATE it) cannot undo a suspension by minting a

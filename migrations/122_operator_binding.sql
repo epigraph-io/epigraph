@@ -474,7 +474,10 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM
 -- human (for the row's kind) is unbound (OPL01, under the valve's rule); one
 -- that belongs to ANOTHER human is a cross-human attribution (OPL02, armed; an
 -- instance-admin principal and a privileged session are exempt, as everywhere
--- in section 1b).
+-- in section 1b). So is an author that belongs to a human while the WRITER
+-- belongs to none: with the valve closed the writer's own OPL01 comes first,
+-- and with it open (section 4) the valve relieves that OPL01 only, never lets
+-- an unbound writer put words in a bound identity's mouth.
 CREATE OR REPLACE FUNCTION public.epigraph_require_attributable(
     p_author uuid, p_writer uuid, p_inherited boolean)
 RETURNS void
@@ -493,11 +496,20 @@ BEGIN
         RETURN;
     END IF;
     v_writer_human := public.epigraph_human_of(p_writer, true);
-    IF v_writer_human IS NULL OR v_writer_human = v_author_human THEN
+    IF v_writer_human = v_author_human THEN
         RETURN;
     END IF;
     IF public.epigraph_operator_scope_exempt() THEN
         RETURN;
+    END IF;
+    IF v_writer_human IS NULL THEN
+        RAISE EXCEPTION 'OPL02: the writing principal % belongs to no human operator, and a claim '
+                        'it writes may not be attributed to %, which belongs to human operator %; '
+                        'an unbound writer names no bound author', p_writer, p_author,
+                        v_author_human
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Author the claim as the writing agent itself. The valve relieves the '
+                         'binding (OPL01) only; admin access crosses humans; nothing else does.';
     END IF;
     RAISE EXCEPTION 'OPL02: agent % writes a claim attributed to %, which belongs to human '
                     'operator %, not to the writer''s operator %; a claim may name only an '
