@@ -1308,8 +1308,10 @@ human writes them.
 * The act runs on a transaction stamped with the CALLER's own authority, the
   one the authority read ran on. The single exception: over MCP, a
   `claims:admin` caller on a claim it does not write acts with the MCP server
-  agent's stamp, exactly as every call did before OA1 (when `claims:admin` was
-  the tools' scope). No other admission borrows the server agent's stamp. Over
+  agent's stamp, as every call did before OA1 (when `claims:admin` was the
+  tools' scope), but only while the token's client record still grants it
+  `claims:admin` (section 3 below). No other admission borrows the server
+  agent's stamp. Over
   HTTP the database still decides a `claims:admin` write, so an admin whose
   stamp cannot write the row's group is refused (`403`, nothing written) on an
   application-role deployment; that residual is unchanged by OA1.
@@ -1367,6 +1369,71 @@ a HUMAN's own client an admin-only scope:
 human's OAuth client hold what that client is granted, because the refresh
 grant re-reads `granted_scopes`: a grant reaches them at their next refresh. A
 revocation also takes effect at the next refresh; an access token minted before
-it keeps the scope until it expires.
+it keeps the scope until it expires, except on the paths that re-read the
+grant on every call: the audited admin writes (migrations 111 and 112) and the
+MCP server-stamp borrow in section 3.
+
+### 3. BREAKING for hand-minted and de-scoped admin tokens — the MCP server-stamp borrow re-checks the live grant (`ADM02`)
+
+The borrow in section 1 (MCP `supersede_claim` / `mark_duplicate` by a
+`claims:admin` caller on a claim it does not write, acting with the MCP server
+agent's stamp) no longer trusts the token's `claims:admin` scope alone. MCP
+verifies a token's signature and expiry but not its revocation, so on every
+such call the server now also requires the token's client record to grant the
+scope live, with the same predicate the audited admin paths (`patch_claim`'s
+admin write, migration 111, and the admin audit write, 112) already apply:
+
+* an `oauth_clients` row whose `id` is the token's client id,
+* whose `agent_id` is the token's agent principal (a token with no agent
+  principal is refused before the grant is read),
+* whose `status` is `active`,
+* and whose `granted_scopes` contains `claims:admin`.
+
+Otherwise the call is refused with `ADM02` wording (MCP invalid-request; the
+message names the caller agent and the client record) and nothing is written:
+the claim stays current, with no successor and no deferred cascade. Calls on a
+claim the caller writes itself are unaffected; they never borrow.
+
+**Who this reaches after the upgrade.** Any MCP caller whose token carries
+`claims:admin` but whose client record does not grant it live, now:
+
+* a client whose `claims:admin` was revoked (`revoke-client-scope`), or whose
+  status is no longer `active`, while an access token minted before that is
+  still unexpired: refused at once instead of until expiry;
+* a **hand-minted** admin token (signed outside the token endpoint), whose
+  client id names no `oauth_clients` row, or a row for a different agent, or a
+  row without the grant: refused on every such call, however long it lives;
+* the injected context of an `--allow-unauthenticated-http` listener, which has
+  no client record.
+
+Before the upgrade, list the admin tokens the deployment's MCP clients use and
+confirm each came from the token endpoint for a client that holds the grant.
+
+**How to restore the borrow for a caller that should have it.**
+
+* A human's own client: grant it through the audited command in section 2,
+  as yourself, on the maintenance DSN:
+
+  ```
+  EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... \
+    epigraph-operator grant-client-scope <oauth_clients.id> claims:admin --dry-run
+  EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... \
+    epigraph-operator grant-client-scope <oauth_clients.id> claims:admin --apply --reason "..."
+  ```
+
+  The command grants only to an `active` human client, so a revoked or
+  suspended client must be reactivated first, through whatever reviewed path
+  the deployment uses for that. Because the check is live, a token that
+  already carries `claims:admin` in its scope lands again as soon as the
+  grant is applied; a token minted without the scope needs a refresh (the
+  refresh grant re-reads `granted_scopes`) before it reaches the borrow at all.
+* A hand-minted token cannot be re-granted: there is no client row, or no
+  row for its agent, to grant. Replace it with a token issued by the token
+  endpoint to a client that holds the grant, then grant that client as above
+  if it is a human's.
+* The command refuses `service` and `agent` clients: a service client's
+  scopes are defined by `bootstrap_clients`, and an agent client's by the
+  approval route. Do not work around either with a raw `UPDATE
+  oauth_clients`; that is the unaudited path section 2 replaces.
 
 No migration.
