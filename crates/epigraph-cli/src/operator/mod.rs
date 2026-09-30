@@ -29,7 +29,7 @@
 //!
 //! * `arm-operator-binding` — turn enforcement ON, once, after reporting every
 //!   unbound agent that wrote recently (see [`arm`]).
-//! * `link-legacy-authors` — tie every legacy author to the human operator with
+//! * `link-legacy-authors` — tie every legacy author to a named human operator with
 //!   a RETIRED link, in one audited definer call (see [`legacy`]).
 //! * `reown-linked` — move the claims a linked author's OWN personal group owns
 //!   into its operator's group, through `reown-claims`' guarded batches (see

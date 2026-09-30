@@ -476,8 +476,10 @@ before arming.
   `--quiet-days` (30; they may still be running and want a live link), and
   agents holding write authority in a group the operator does not write
   (`foreign_write_authority`: they act in someone else's group). `--operator`
-  is always explicit; with many humans, run it once per human over that human's
-  own legacy agents (a later run skips everything an earlier one tied).
+  is always explicit, and a run ties EVERY untied candidate to that one operator
+  (there is no include list): with many humans, scope each run with
+  `--exclude-agents-file` listing every agent that is not that human's (a later
+  run skips everything an earlier one tied).
 * Audit writer rows that predate a link (the `OPL02` door does not revisit
   them):
 
