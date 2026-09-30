@@ -289,6 +289,28 @@ async fn refuse_operator_http_signer(
 /// EXECUTE-grant hint, because on a stdio host the usual cause is an
 /// `epigraph_app` DSN (`42501`).
 pub fn link_refusal_text(agent: Uuid, operator: Uuid, e: &epigraph_db::DbError) -> String {
+    link_refusal_text_for(agent, operator, None, e)
+}
+
+/// [`link_refusal_text`] for a process that knows its LLM identity
+/// (`--agent-model` + prompt hash): the printed fix then names that identity
+/// (`epigraph-operator link --agent-model <m> --agent-system-prompt-hash <h>`),
+/// which also records the agent's LLM provenance properties, where the
+/// `--agent <id>` form would link a row an app DSN could not annotate (review
+/// C5).
+pub fn link_refusal_text_for(
+    agent: Uuid,
+    operator: Uuid,
+    llm: Option<(&str, &str)>,
+    e: &epigraph_db::DbError,
+) -> String {
+    let fix = match llm {
+        Some((model, hash)) => format!(
+            "`epigraph-operator link --agent-model {model} --agent-system-prompt-hash {hash} \
+             --operator {operator} --apply`"
+        ),
+        None => format!("`epigraph-operator link --agent {agent} --operator {operator} --apply`"),
+    };
     match e {
         epigraph_db::DbError::MembershipRevoked { message } => format!(
             "refused to record agent {agent} as operated by {operator}: the operator's OWN \
@@ -306,8 +328,7 @@ pub fn link_refusal_text(agent: Uuid, operator: Uuid, e: &epigraph_db::DbError) 
             "could not record agent {agent} as operated by {operator} \
              (epigraph_link_operator is EXECUTE-able by epigraph_maintenance only; on an \
              epigraph_app DSN the host records the link on a maintenance connection BEFORE \
-             starting this process: `epigraph-operator link --agent {agent} --operator \
-             {operator} --apply` with EPIGRAPH_OPERATOR_MAINTENANCE_DSN set): {other}"
+             starting this process: {fix} with EPIGRAPH_OPERATOR_MAINTENANCE_DSN set): {other}"
         ),
     }
 }
@@ -353,7 +374,13 @@ pub async fn self_link(
     }
     let outcome = AgentRepository::link_operator(&mut conn, agent, operator)
         .await
-        .map_err(|e| link_refusal_text(agent, operator, &e))?;
+        .map_err(|e| {
+            let llm = server
+                .llm_identity
+                .as_ref()
+                .map(|(m, h)| (m.as_str(), h.as_str()));
+            link_refusal_text_for(agent, operator, llm, &e)
+        })?;
     match LinkStatus::of(&outcome) {
         LinkStatus::Live => tracing::info!(
             agent = %agent,
@@ -560,5 +587,21 @@ mod tests {
             },
         );
         assert!(other.contains("EXECUTE-able"), "{other}");
+        assert!(other.contains(&format!("--agent {a}")), "{other}");
+        // Review C5: an LLM identity is told the form that records its
+        // provenance, not the bare `--agent <id>` one.
+        let llm = super::link_refusal_text_for(
+            a,
+            o,
+            Some(("model-m", "abcd")),
+            &epigraph_db::DbError::QueryFailed {
+                source: sqlx::Error::RowNotFound,
+            },
+        );
+        assert!(
+            llm.contains("--agent-model model-m --agent-system-prompt-hash abcd")
+                && !llm.contains(&format!("--agent {a}")),
+            "{llm}"
+        );
     }
 }

@@ -265,16 +265,19 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("{}", super::link::refusal_text(operator, &e)))?;
     if apply {
         tx.commit().await?;
-        if agent_created {
-            if let AgentSpec::Llm { model, prompt_hash } = spec {
-                if let Err(e) =
-                    AgentRepository::set_llm_properties(pool, agent, model, prompt_hash).await
-                {
-                    eprintln!(
-                        "warning: agent {agent} was created and linked, but its LLM provenance \
-                         properties were not recorded: {e}"
-                    );
-                }
+        // Recorded whether this run created the row or found it: a process on
+        // an app DSN may have created the row itself and been unable to record
+        // the properties (review C5). The properties derive from the same
+        // (model, hash) pair as the key, and the write merges, so re-recording
+        // is idempotent.
+        if let AgentSpec::Llm { model, prompt_hash } = spec {
+            if let Err(e) =
+                AgentRepository::set_llm_properties(pool, agent, model, prompt_hash).await
+            {
+                eprintln!(
+                    "warning: agent {agent} is linked, but its LLM provenance properties were \
+                     not recorded: {e}"
+                );
             }
         }
     } else {

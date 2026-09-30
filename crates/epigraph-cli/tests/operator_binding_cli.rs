@@ -988,3 +988,52 @@ async fn link_lists_and_on_request_revokes_writer_rows_in_another_humans_group(p
     assert!(!live_in_b().await, "the row in B's group is revoked");
     assert_eq!(link_row(&pool, z).await, Some((a, false)));
 }
+
+/// Review C5: an LLM identity whose process created its own agent row on an
+/// app DSN (where it could not record its LLM provenance) gets the provenance
+/// when the host links it by `--agent-model` / `--agent-system-prompt-hash`,
+/// the form the process's refusal now prints.
+///
+/// Verified to fail: `set_llm_properties` back under `if agent_created` ->
+/// the pre-existing row's properties stay `{}`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_records_the_llm_provenance_of_a_row_the_process_created(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let model = "provenance-model";
+    let hash = "cd".repeat(32);
+    let key = epigraph_crypto::keypair_from_llm_agent_prehashed(model, &hash).public_key();
+    let agent: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, 'mcp-agent') RETURNING id",
+    )
+    .bind(key.to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("the row the process created");
+    let human_s = human.to_string();
+    let r = run_op(
+        &pool,
+        &[
+            "link",
+            "--agent-model",
+            model,
+            "--agent-system-prompt-hash",
+            hash.as_str(),
+            "--operator",
+            human_s.as_str(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let (m, src): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT properties->>'llm_model', properties->>'source' FROM agents WHERE id = $1",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("agent");
+    assert_eq!(m.as_deref(), Some(model));
+    assert_eq!(src.as_deref(), Some("mcp-llm-agent"));
+    assert_eq!(link_row(&pool, agent).await, Some((human, false)));
+}
