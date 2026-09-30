@@ -2299,3 +2299,64 @@ async fn diverse_mode_falls_back_when_neighbourhood_sits_outside_the_theme_short
         "the request must fall back to flat retrieval and return the 5 nearest paragraphs"
     );
 }
+
+/// The coverage-bug layout again, but with the ANN indexes KEPT and planner
+/// statistics present — the plan shape a populated database runs. The guard
+/// must fall back here too (no off-topic member, flat top-5); the exact-read
+/// arm above is the deterministic reproduction, this one pins that nothing in
+/// the index-backed plan turns the fallback into an error or a wrong answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_mode_falls_back_under_index_backed_plans(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/cov-indexed", "coverage indexed").await;
+    let off_topic_theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "stale-probe-theme",
+        &diverse_fixture::cluster_pgvec(5, 1.0),
+    )
+    .await;
+    let mut off_topic = std::collections::HashSet::new();
+    for i in 0..3 {
+        off_topic.insert(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper,
+                &format!("off-topic-{i}"),
+                &diverse_fixture::cluster_pgvec(5, 1.0),
+                Some(off_topic_theme),
+            )
+            .await,
+        );
+    }
+    let relevant = seed_unthemed_relevant(&pool, agent, paper, "relevant", 120).await;
+    sqlx::query("VACUUM ANALYZE claims")
+        .execute(&pool)
+        .await
+        .expect("analyze claims");
+    sqlx::query("VACUUM ANALYZE claim_themes")
+        .execute(&pool)
+        .await
+        .expect("analyze claim_themes");
+
+    let server = build_test_server(pool.clone());
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+    let params = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 5);
+    let resp = parse_response(
+        recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query)
+            .await
+            .expect("diverse recall"),
+    );
+
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+    assert!(
+        returned.is_disjoint(&off_topic),
+        "off-topic members of the uncovering theme set must not be returned"
+    );
+    let flat_top_5: std::collections::HashSet<Uuid> = relevant[..5].iter().copied().collect();
+    assert_eq!(returned, flat_top_5, "the fallback returns the flat top-5");
+}
