@@ -620,9 +620,9 @@ impl From<DbError> for ApiError {
                 tracing::warn!(detail = %message, "claim author is not bound to a human operator");
                 ApiError::Forbidden {
                     reason: format!(
-                        "OPL01: the author agent is not bound to a human operator (neither a \
-                         human operator nor the holder of a live operator link); nothing was \
-                         written. Fix: {}",
+                        "OPL01: the author agent, or the authenticated caller writing it, is \
+                         not bound to a human operator (neither a human operator nor the holder \
+                         of a live operator link); nothing was written. Fix: {}",
                         epigraph_db::OPERATOR_LINK_FIX
                     ),
                 }
@@ -632,9 +632,11 @@ impl From<DbError> for ApiError {
             DbError::OperatorScopeRefused { message } => {
                 tracing::warn!(detail = %message, "linked agent outside its operator's groups");
                 ApiError::Forbidden {
-                    reason: "OPL02: the author agent is linked to a human operator that holds no \
-                             writer/admin membership in the target group; a linked agent writes \
-                             only where its own operator writes. Nothing was written."
+                    reason: "OPL02: the write is outside the groups its human operator holds \
+                             writer/admin membership in, or names an author that belongs to \
+                             another human than the caller's; an agent writes only where its own \
+                             operator writes, and only in its own human's name. Nothing was \
+                             written."
                         .to_string(),
                 }
             }

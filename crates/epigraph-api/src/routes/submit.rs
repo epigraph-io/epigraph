@@ -1077,19 +1077,20 @@ struct PersistOutcome {
 /// got a 500 whose body carried both ids.
 #[cfg(feature = "db")]
 fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) {
-    // Migration 122 (OPL01): the author is not bound to a human operator.
+    // Migration 122 (OPL01): the author, or the authenticated caller writing
+    // it, is not bound to a human operator.
     if let epigraph_db::DbError::OperatorLinkRequired { message } = &e {
         tracing::warn!(
             detail = %message,
-            "submit_packet refused: the author is not bound to a human operator"
+            "submit_packet refused: the author or the caller is not bound to a human operator"
         );
         return (
             StatusCode::FORBIDDEN,
             ErrorResponse::new(
                 "Forbidden",
                 format!(
-                    "OPL01: the author agent is not bound to a human operator; nothing was \
-                     written. Fix: {}",
+                    "OPL01: the author agent, or the authenticated caller writing it, is not \
+                     bound to a human operator; nothing was written. Fix: {}",
                     epigraph_db::OPERATOR_LINK_FIX
                 ),
             ),
@@ -1098,14 +1099,15 @@ fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) 
     if let epigraph_db::DbError::OperatorScopeRefused { message } = &e {
         tracing::warn!(
             detail = %message,
-            "submit_packet refused: the author is outside its operator's groups"
+            "submit_packet refused: outside the operator's groups, or attributed across humans"
         );
         return (
             StatusCode::FORBIDDEN,
             ErrorResponse::new(
                 "Forbidden",
-                "OPL02: the author agent is linked to a human operator that does not write the \
-                 target group; nothing was written.",
+                "OPL02: the write is outside the groups its human operator writes, or names an \
+                 author that belongs to another human than the authenticated caller's; nothing \
+                 was written.",
             ),
         );
     }
@@ -1134,7 +1136,7 @@ fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) 
 
 #[cfg(feature = "db")]
 async fn persist_packet(
-    pool: &epigraph_db::PgPool,
+    state: &AppState,
     viewer: &epigraph_db::visibility::Viewer,
     packet: &EpistemicPacket,
     claim_id: ClaimId,
@@ -1143,6 +1145,7 @@ async fn persist_packet(
     truth_value: f64,
 ) -> Result<PersistOutcome, (StatusCode, ErrorResponse)> {
     let agent_id = AgentId::from_uuid(packet.claim.agent_id);
+    let pool = &state.db_pool;
 
     // 1. Verify agent exists (FK constraint check)
     let agent_exists = AgentRepository::get_by_id(pool, agent_id)
@@ -1165,16 +1168,23 @@ async fn persist_packet(
         ));
     }
 
-    // 2. Begin transaction
-    let mut tx = pool.begin().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new(
-                "DatabaseError",
-                format!("Failed to begin transaction: {}", e),
-            ),
-        )
-    })?;
+    // 2. Begin transaction, STAMPED with the authenticated viewer. The
+    // packet's author is a body field; migration 122's claims trigger binds
+    // the session principal whenever it differs from that author (the caller
+    // must be bound and may name only an author of its own human). On the raw
+    // pool the trigger saw no principal and checked the body's author alone.
+    let mut tx = state
+        .begin_claim_write(viewer, "submit_packet")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to begin transaction: {e:?}"),
+                ),
+            )
+        })?;
 
     // 3. Find-or-create the claim keyed on (content_hash, agent_id).
     //
@@ -1219,6 +1229,11 @@ async fn persist_packet(
         epigraph_db::ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl)
             .await
             .map_err(|e| {
+                // The claims trigger's refusals (OPL01 / OPL02) are denials of
+                // the writer's authority, not server faults.
+                if e.is_write_authority_refusal() {
+                    return author_tenancy_error(e);
+                }
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
@@ -1681,7 +1696,7 @@ pub async fn submit_packet(
             .collect();
 
         match persist_packet(
-            &state.db_pool,
+            &state,
             &viewer,
             &packet,
             domain_claim_id,

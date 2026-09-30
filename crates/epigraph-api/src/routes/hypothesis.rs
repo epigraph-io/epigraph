@@ -115,10 +115,19 @@ pub async fn create_hypothesis(
     // and the in-repo consumer that constrains any answer. Tracked as
     // `D-PR16-claim-authorship-is-not-a-credential` in
     // `docs/tenancy/progress.json`, with an owner.
+    //
+    // THE CLAIM IS WRITTEN ON A TRANSACTION STAMPED WITH THE VIEWER, so that
+    // migration 122's claims trigger binds the authenticated caller whenever
+    // the body's `agent_id` names someone else (the caller must be bound, and
+    // may name only an author of its own human). The follow-on writes below
+    // are unchanged; only the claim row is what the trigger guards.
     let content_hash = epigraph_crypto::ContentHasher::hash(request.statement.as_bytes());
     let decl =
         epigraph_db::ClaimRepository::default_decl_for_author_pool(&state.db_pool, principal)
             .await?;
+    let mut tx = state
+        .begin_claim_write(&viewer, "create_hypothesis")
+        .await?;
     let claim_id: (Uuid,) = sqlx::query_as(
         r#"
         INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, embedding, visibility, owner_group_id)
@@ -137,10 +146,20 @@ pub async fn create_hypothesis(
     .bind(format_embedding(&embedding))
     .bind(decl.visibility_bind())
     .bind(decl.owner_group_bind())
-    .fetch_one(&state.db_pool)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to create hypothesis claim: {e}"),
+    .map_err(|e| {
+        let e = epigraph_db::DbError::from(e);
+        if e.is_write_authority_refusal() {
+            ApiError::from(e)
+        } else {
+            ApiError::InternalError {
+                message: format!("Failed to create hypothesis claim: {e}"),
+            }
+        }
+    })?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to commit hypothesis claim: {e}"),
     })?;
 
     // 3. Add to hypothesis_assessment frame
