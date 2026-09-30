@@ -347,6 +347,24 @@ async fn default_decl_refuses_an_unbound_author_before_provisioning_a_group(pool
     assert_eq!(groups_of(bare).await, 1);
 }
 
+/// With the valve variable unset (this process never sets it), a connection
+/// from a `ScopedPool` carries no valve and stays enforced. The valve-open half
+/// is `operator_binding_valve.rs`, alone in its own process.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_scoped_pool_without_the_valve_stays_enforced(pool: PgPool) {
+    assert!(
+        std::env::var(epigraph_db::operator_binding::ENFORCEMENT_ENV).is_err(),
+        "this test process must not carry the valve variable"
+    );
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "unbound").await;
+    arm(&pool).await;
+    let scoped = fixture::scoped_pool(&pool).await;
+    assert_opl01(
+        insert_claim(scoped.inner(), agent, group).await,
+        "a ScopedPool connection with the valve closed",
+    );
+}
+
 /// Moving a claim to an unbound author is a claim write like any other.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_update_that_hands_a_claim_to_an_unbound_author_is_refused(pool: PgPool) {

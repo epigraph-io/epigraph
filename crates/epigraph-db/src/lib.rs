@@ -52,6 +52,7 @@
 
 pub mod errors;
 pub mod label_validation;
+pub mod operator_binding;
 pub mod pool;
 pub mod repos;
 pub mod visibility;
