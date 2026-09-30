@@ -78,6 +78,19 @@
 //! deploy at 2 a.m."* `verify` therefore recomputes, prints offending ids, and
 //! exits non-zero on any residual. The boolean is reported, never trusted.
 //!
+//! # An author tied to an operator is stamped to the OPERATOR's group
+//!
+//! Operator binding (migration 122) ties every writing agent to one human
+//! operator through `operator_links`. The owner this binary stamps follows that
+//! tie: an author with a link of ANY state (live or retired) is stamped to the
+//! link's `operator_group_id`; only an author with no link falls back to its own
+//! personal group ([`owner_group_sql`]). The fallback is kept on purpose, so a
+//! run before the legacy authors are tied still declares every row, and
+//! `verify` still FAILS on any world-owned residue either way. Rows an earlier
+//! run already stamped to a linked author's own personal group are not world-
+//! owned, so this binary never revisits them: `verify` REPORTS them (never a
+//! failure), and `epigraph-operator reown-linked` moves them.
+//!
 //! Runtime `sqlx::query` / `query_scalar` throughout — never the compile-time
 //! macros — so no `.sqlx/` cache entry is needed and `SQLX_OFFLINE=true` builds.
 //!
@@ -120,6 +133,22 @@ fn personal_group_sql(agent_expr: &str) -> String {
            ORDER BY (g.did_key = 'did:epigraph:personal:' || {agent_expr}::text) DESC,
                     g.created_at ASC
            LIMIT 1)"
+    )
+}
+
+/// The owner the backfill stamps for an `{agent}` expression: the group of the
+/// author's `operator_links` row (ANY state: a retired identity's work belongs
+/// to its operator too), else the author's own personal group
+/// ([`personal_group_sql`]), else NULL (the row is left for `verify` to name).
+///
+/// `operator_links` is FORCEd with a SELECT policy that admits a maintenance
+/// session (`epigraph_definer_bypass()`), which is the only kind of session
+/// this binary runs on (`MaintenancePool`).
+fn owner_group_sql(agent_expr: &str) -> String {
+    format!(
+        "COALESCE((SELECT l.operator_group_id FROM operator_links l \
+                    WHERE l.agent_id = {agent_expr}), {})",
+        personal_group_sql(agent_expr)
     )
 }
 
@@ -539,8 +568,8 @@ async fn backfill_claims(pool: &PgPool, batch_size: i64) -> anyhow::Result<()> {
               WHERE c.id = ANY($1)
                 AND c.owner_group_id = $2
                 AND {} IS NOT NULL",
-            personal_group_sql("c.agent_id"),
-            personal_group_sql("c.agent_id")
+            owner_group_sql("c.agent_id"),
+            owner_group_sql("c.agent_id")
         ))
         .bind(&ids)
         .bind(WORLD)
@@ -629,7 +658,7 @@ async fn backfill_communities(pool: &PgPool) -> anyhow::Result<()> {
 async fn backfill_agent_keyed(pool: &PgPool, table: &str, agent_col: &str) -> anyhow::Result<()> {
     // `table` and `agent_col` are compile-time constants from this file, never
     // caller input, so the format! is not an injection surface.
-    let resolver = personal_group_sql(&format!("t.{agent_col}"));
+    let resolver = owner_group_sql(&format!("t.{agent_col}"));
     let sql = format!(
         "UPDATE {table} t SET owner_group_id = {resolver}, visibility = 'public'
           WHERE t.{agent_col} IS NOT NULL
@@ -1669,6 +1698,25 @@ async fn verify(pool: &PgPool) -> anyhow::Result<usize> {
         }
     }
 
+    // REPORTED, never a failure: rows owned by an author's OWN personal group
+    // while that author has an operator link (any state). They are declared,
+    // so the tenancy gate is satisfied; operator binding wants them in the
+    // operator's group, and `epigraph-operator reown-linked` moves them.
+    for (table, agent_col) in [
+        ("claims", "agent_id"),
+        ("perspectives", "owner_agent_id"),
+        ("recall_events", "agent_id"),
+    ] {
+        let n = linked_author_personal_residue(pool, table, agent_col).await?;
+        if n > 0 {
+            eprintln!(
+                "REPORT: {n} row(s) in {table} are owned by their author's own personal group \
+                 although the author is linked to an operator; `epigraph-operator reown-linked` \
+                 moves the claims (not a failure)."
+            );
+        }
+    }
+
     // Reported, never trusted (062's demotion).
     let incomplete: Vec<String> = sqlx::query_scalar(
         "SELECT entity FROM tenancy_backfill_progress WHERE NOT complete ORDER BY entity",
@@ -1683,6 +1731,26 @@ async fn verify(pool: &PgPool) -> anyhow::Result<usize> {
     }
 
     Ok(failures)
+}
+
+/// Rows of `table` owned by their author's own personal group (the canonical
+/// did_key, created by the author) while that author has an `operator_links`
+/// row of any state. `table` and `agent_col` are constants from this file.
+async fn linked_author_personal_residue(
+    pool: &PgPool,
+    table: &str,
+    agent_col: &str,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} t
+           JOIN operator_links l ON l.agent_id = t.{agent_col}
+           JOIN groups g ON g.id = t.owner_group_id
+          WHERE g.kind = 'personal'
+            AND g.created_by_agent_id = t.{agent_col}
+            AND g.did_key = 'did:epigraph:personal:' || t.{agent_col}::text"
+    ))
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Print up to 20 offending ids. Tables without an `id` column
