@@ -117,6 +117,56 @@ pub fn theme_coverage_sufficient(
     (coverage.reachable as f64) / (coverage.probed as f64) >= min_fraction
 }
 
+/// The theme-coverage guard's verdict on a probe RESULT, shared by the MCP
+/// pipeline and the REST route so both log and decide identically.
+///
+/// Returns `true` only when the probe succeeded and
+/// [`theme_coverage_sufficient`] holds at [`MIN_THEME_COVERAGE_FRACTION`].
+///
+/// A probe ERROR fails OPEN to flat retrieval (`false`, logged at `warn`):
+/// the guard is an optimisation of result quality, and flat retrieval is the
+/// default, viewer-scoped path both surfaces already take whenever the guard
+/// fires, so a failed measurement must degrade the request to it rather than
+/// fail the request. (The REST caller additionally runs the probe inside a
+/// savepoint so the failure cannot poison the transaction the flat search
+/// then runs on.)
+///
+/// `surface` names the caller in the log line.
+pub fn theme_coverage_allows_diverse<E: std::fmt::Display>(
+    probe: Result<epigraph_db::NeighbourhoodThemeCoverage, E>,
+    surface: &'static str,
+    centroid_dim: u32,
+) -> bool {
+    match probe {
+        Ok(coverage) => {
+            let sufficient = theme_coverage_sufficient(coverage, MIN_THEME_COVERAGE_FRACTION);
+            if !sufficient {
+                tracing::info!(
+                    target: "diverse_retrieval.coverage_guard",
+                    surface,
+                    probed = coverage.probed,
+                    reachable = coverage.reachable,
+                    min_fraction = MIN_THEME_COVERAGE_FRACTION,
+                    centroid_dim,
+                    "the theme shortlist does not cover the query's nearest neighbourhood; \
+                     diverse mode falls back to flat retrieval"
+                );
+            }
+            sufficient
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "diverse_retrieval.coverage_guard",
+                surface,
+                error = %error,
+                centroid_dim,
+                "theme-coverage probe failed; diverse mode falls back to flat retrieval"
+            );
+            false
+        }
+    }
+}
+
 /// Find the `max_themes` claim_themes whose centroid at `centroid_dim` is
 /// most similar to `query_pgvec`.
 ///
@@ -320,7 +370,8 @@ pub struct DiverseRetrievalConfig {
 /// Returns the selected `(claim_id, content, similarity)` tuples in
 /// `diverse_select` selection order. Returns `Ok(vec![])` when no themes
 /// exist, when the theme shortlist does not cover the query's nearest
-/// neighbourhood (see [`MIN_THEME_COVERAGE_FRACTION`]; logged under the
+/// neighbourhood or the coverage probe itself fails (see
+/// [`theme_coverage_allows_diverse`]; logged under the
 /// `diverse_retrieval.coverage_guard` target), OR when themes exist but the
 /// candidate pool is empty — callers should fall back to flat ANN in every
 /// case (the helper does not distinguish them).
@@ -328,7 +379,9 @@ pub struct DiverseRetrievalConfig {
 /// # Errors
 ///
 /// Returns `sqlx::Error` if the theme lookup or candidate retrieval
-/// query fails.
+/// query fails. A failure of the theme-coverage probe is NOT an error: it
+/// fails open to `Ok(vec![])` (flat fallback), see
+/// [`theme_coverage_allows_diverse`].
 pub async fn run_diverse_pipeline(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
@@ -352,7 +405,7 @@ pub async fn run_diverse_pipeline(
     // (same candidate space, before theme restriction) is reachable through
     // the shortlist. MCP's candidate space is one dimension throughout, so the
     // neighbourhood and reachability dimensions are both `centroid_dim`.
-    let coverage = ClaimThemeRepository::nearest_theme_coverage_since(
+    let probe = ClaimThemeRepository::nearest_theme_coverage_since(
         pool,
         viewer,
         query_pgvec,
@@ -363,18 +416,8 @@ pub async fn run_diverse_pipeline(
         config.paragraph_only,
         config.since,
     )
-    .await
-    .map_err(db_error_to_sqlx)?;
-    if !theme_coverage_sufficient(coverage, MIN_THEME_COVERAGE_FRACTION) {
-        tracing::info!(
-            target: "diverse_retrieval.coverage_guard",
-            probed = coverage.probed,
-            reachable = coverage.reachable,
-            min_fraction = MIN_THEME_COVERAGE_FRACTION,
-            centroid_dim = config.centroid_dim,
-            "the theme shortlist does not cover the query's nearest neighbourhood; \
-             diverse mode falls back to flat retrieval"
-        );
+    .await;
+    if !theme_coverage_allows_diverse(probe, "run_diverse_pipeline", config.centroid_dim) {
         return Ok(vec![]);
     }
 
@@ -475,6 +518,32 @@ mod tests {
         assert!(!theme_coverage_sufficient(
             cov(0, 0),
             MIN_THEME_COVERAGE_FRACTION
+        ));
+    }
+
+    /// A probe ERROR fails open to flat retrieval: it never lets diverse mode
+    /// run on an unmeasured neighbourhood, and it is not surfaced as an error
+    /// (the caller has a flat path to degrade to).
+    #[test]
+    fn coverage_probe_error_fails_open_to_flat() {
+        let failed: Result<epigraph_db::NeighbourhoodThemeCoverage, &str> =
+            Err("canceling statement due to statement timeout");
+        assert!(!theme_coverage_allows_diverse(failed, "unit", 1536));
+    }
+
+    /// On a successful probe the shared verdict is exactly
+    /// `theme_coverage_sufficient` at the production threshold, in both
+    /// directions — so neither surface can drift from the rule.
+    #[test]
+    fn coverage_verdict_on_success_follows_the_threshold() {
+        let k = i64::from(THEME_COVERAGE_PROBE_K);
+        let at = (MIN_THEME_COVERAGE_FRACTION * k as f64).ceil() as i64;
+        let ok = |c| -> Result<_, &str> { Ok(c) };
+        assert!(theme_coverage_allows_diverse(ok(cov(k, at)), "unit", 1536));
+        assert!(!theme_coverage_allows_diverse(
+            ok(cov(k, at - 1)),
+            "unit",
+            1536
         ));
     }
 
