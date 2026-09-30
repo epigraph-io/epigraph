@@ -8,7 +8,8 @@
 //!   under another key), although the binary now resolves it once per distinct
 //!   author of a batch. The batch size is 3 so the walk spans many batches and
 //!   authors straddle batch boundaries.
-//! * the 17 claim-derived tables: every row takes its claim's tenancy, except a
+//! * the 17 claim-derived tables (rows seeded in evidence, reasoning_traces,
+//!   challenges and claim_versions): every row takes its claim's tenancy, except a
 //!   WRITER-OWNED row (kept, the claim being public) and a PINNED evidence row
 //!   (owner kept, visibility `group`): 110/114's rules, unchanged.
 //! * `edges`: every edge equals the meet 120's body computed, recomputed here
@@ -25,7 +26,9 @@
 //!   alone -> the non-canonical author's claims stay world-owned;
 //! * the edges meet in 122 with the evidence LEFT JOIN on the source side
 //!   dropped -> the evidence->claim edge onto the private claim takes the wrong
-//!   meet.
+//!   meet;
+//! * `'challenges'` removed from 122 section 8's `derived` array -> the
+//!   challenge row stays world-owned while its claim moves.
 
 mod viewer_fixture;
 
@@ -184,6 +187,26 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
     .await
     .expect("pin");
     fixture::seed_reasoning_trace(&pool, claims[3], "deductive").await;
+    // Two more derived tables with rows (review C8: the comparison below spans
+    // all 17, and a table with no rows proves nothing about its arm).
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO challenges (claim_id, challenge_type, explanation) \
+             VALUES ('{}', 'factual', 'equivalence probe')",
+            claims[6]
+        ),
+    )
+    .await;
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO claim_versions (claim_id, version_number, content, truth_value) \
+             VALUES ('{}', 1, 'equivalence probe v1', 0.5)",
+            claims[7]
+        ),
+    )
+    .await;
     exec(
         &pool,
         &format!(
@@ -337,18 +360,56 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
     assert_eq!(owner_of(live).await, human_group);
     assert_eq!(owner_of(retired).await, human_group);
 
-    // ---- derived rows: the trigger's rules ----
-    let derived_off: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM (
-            SELECT d.claim_id, d.owner_group_id, d.visibility, d.id AS rid FROM evidence d
-             WHERE NOT d.writer_owned
-               AND NOT EXISTS (SELECT 1 FROM evidence_visibility_pins p WHERE p.evidence_id = d.id)
-            UNION ALL SELECT d.claim_id, d.owner_group_id, d.visibility, d.id FROM reasoning_traces d
-            UNION ALL SELECT d.claim_id, d.owner_group_id, d.visibility, d.id FROM mass_functions d
-          ) d JOIN claims c ON c.id = d.claim_id
+    // ---- derived rows: the trigger's rules, over ALL 17 claim-derived tables
+    // (review C8: this compared three while the doc said seventeen). A
+    // writer-owned row (114) and a pinned evidence row (110) are the stated
+    // exceptions, checked by name below.
+    const DERIVED: &[(&str, &str)] = &[
+        (
+            "evidence",
+            "NOT d.writer_owned AND NOT EXISTS (SELECT 1 FROM evidence_visibility_pins p \
+             WHERE p.evidence_id = d.id)",
+        ),
+        ("mass_functions", "NOT d.writer_owned"),
+        ("reasoning_traces", "NOT d.writer_owned"),
+        ("triples", "TRUE"),
+        ("entity_mentions", "TRUE"),
+        ("claim_versions", "TRUE"),
+        ("ds_combined_beliefs", "TRUE"),
+        ("ds_bayesian_divergence", "TRUE"),
+        ("claim_frames", "TRUE"),
+        ("harvester_claim_provenance", "TRUE"),
+        ("challenges", "TRUE"),
+        ("experiment_triples", "TRUE"),
+        ("experiment_entity_mentions", "TRUE"),
+        ("claim_clusters", "TRUE"),
+        ("claim_cluster_membership", "TRUE"),
+        ("claim_neighborhood_membership", "TRUE"),
+        ("claim_signature_revocations", "TRUE"),
+    ];
+    let union = DERIVED
+        .iter()
+        .map(|(t, keep)| {
+            format!("SELECT d.claim_id, d.owner_group_id, d.visibility FROM {t} d WHERE {keep}")
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let seeded: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM ({union}) d WHERE d.claim_id = ANY($1)"
+    ))
+    .bind(&claims)
+    .fetch_one(&pool)
+    .await
+    .expect("derived rows seeded");
+    assert!(
+        seeded >= 4,
+        "the fixture seeds derived rows in several tables to compare, got {seeded}"
+    );
+    let derived_off: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM ({union}) d JOIN claims c ON c.id = d.claim_id
          WHERE c.id = ANY($1)
-           AND (d.owner_group_id, d.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility)",
-    )
+           AND (d.owner_group_id, d.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility)"
+    ))
     .bind(&claims)
     .fetch_one(&pool)
     .await

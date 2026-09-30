@@ -176,3 +176,215 @@ async fn a_platform_run_moves_only_live_linked_authors(pool: PgPool) {
     assert_eq!(code, 0, "a re-run is a no-op:\n{stderr}");
     assert_eq!(owner_of(&pool, "claims", c_retired).await, world);
 }
+
+async fn world_claims_by(pool: &PgPool, agent: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM claims WHERE agent_id = $1 AND owner_group_id = $2")
+        .bind(agent)
+        .bind(Uuid::nil())
+        .fetch_one(pool)
+        .await
+        .expect("world count")
+}
+
+/// Reviews C3 and C8: under `--legacy-owner platform` a registered human
+/// operator's OWN world-owned claims are its (stamped to its personal group,
+/// DESIGN D1: "the operator's own backlog ... stay his"), and a live link to an
+/// operator that is no longer a registered human stamps nothing (such a link
+/// binds nothing, migration 122).
+///
+/// Verified to fail, each alone: `PLATFORM_STAMPED_AUTHORS` / `owner_sql`
+/// reduced to live-linked authors (the pre-review filter) -> the human's own
+/// claim stays world-owned; `public.epigraph_is_human_operator(l.operator_id)`
+/// removed from both -> the revoked operator's agent's claim moves.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_platform_run_owns_a_humans_own_rows_and_nothing_for_a_revoked_operator(pool: PgPool) {
+    let (human, human_group) = fixture::seed_human_operator(&pool, "human").await;
+    let (gone, _) = fixture::seed_human_operator(&pool, "revoked-human").await;
+    let (agent_of_gone, _) = fixture::seed_agent_with_group(&pool, "agent-of-revoked").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, agent_of_gone, gone)
+            .await
+            .expect("live link");
+    }
+    sqlx::query("SELECT * FROM public.epigraph_revoke_human_operator($1, 'left')")
+        .bind(gone)
+        .execute(&pool)
+        .await
+        .expect("revoke");
+    let own = fixture::seed_public_claim(&pool, human, "the operator's own legacy claim").await;
+    let orphaned =
+        fixture::seed_public_claim(&pool, agent_of_gone, "by a revoked human's agent").await;
+
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "platform"]).await;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        owner_of(&pool, "claims", own).await,
+        human_group,
+        "a human operator's own legacy claim is its own"
+    );
+    assert_eq!(
+        owner_of(&pool, "claims", orphaned).await,
+        Uuid::nil(),
+        "a link to a revoked operator binds nothing and stamps nothing"
+    );
+}
+
+/// Review C4: under `platform` a WORLD-owned edge between a platform-corpus
+/// claim (which never moves) and a group-private claim used to stay stale, and
+/// `run` / `verify` failed on it with no remedy. The run now re-stamps it to
+/// its endpoints' meet and completes.
+///
+/// Verified to fail: the `settle_world_edges_with_private_endpoints` call
+/// removed from `settle_remaining` -> `run` exits 1 on the edge check.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_platform_run_repairs_a_world_edge_onto_a_private_endpoint(pool: PgPool) {
+    let (human, human_group) = fixture::seed_human_operator(&pool, "human").await;
+    let (retired, _) = fixture::seed_agent_with_group(&pool, "retired").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, human)
+            .await
+            .expect("retired link");
+    }
+    let corpus = fixture::seed_public_claim(&pool, retired, "platform corpus").await;
+    let private = fixture::seed_group_claim(&pool, human, human_group, "private endpoint").await;
+    let edge = fixture::seed_edge(&pool, corpus, private).await;
+    sqlx::query(
+        "UPDATE edges SET owner_group_id = $2, visibility = 'public', co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(edge)
+    .bind(Uuid::nil())
+    .execute(&pool)
+    .await
+    .expect("stale edge");
+
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "platform"]).await;
+    assert_eq!(
+        code, 0,
+        "the run repairs the stale edge and completes:\n{stderr}"
+    );
+    let (owner, vis): (Uuid, String) =
+        sqlx::query_as("SELECT owner_group_id, visibility::text FROM edges WHERE id = $1")
+            .bind(edge)
+            .fetch_one(&pool)
+            .await
+            .expect("edge");
+    assert_eq!((owner, vis.as_str()), (human_group, "group"));
+    assert_eq!(owner_of(&pool, "claims", corpus).await, Uuid::nil());
+}
+
+/// Reviews C2 and C8 (OB6's flags, previously unpinned):
+/// * a claims cursor CARRIED OVER from an earlier run (an aborted run, or one
+///   under the other `--legacy-owner`) no longer hides the rows below it: the
+///   single-entity run rewinds and walks again, and exits 0 only when nothing
+///   is left (it used to exit 0 WITH residue);
+/// * `--entity` runs that arm alone (another entity leaves claims untouched);
+/// * `--max-runtime` stops between batches and exits 3, keeping the committed
+///   batch; a re-run completes.
+///
+/// Verified to fail, each alone: the `continue 'passes` rewind removed ->
+/// the carried-cursor run exits 1 with residue; `wants` ignoring `--entity` ->
+/// the harvester-fragments run stamps the claims; `Deadline::expired` always
+/// false -> the budgeted run exits 0.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_claims_walk_resumes_rewinds_and_honours_its_budget(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    for i in 0..3 {
+        fixture::seed_public_claim(&pool, author, &format!("carried {i}")).await;
+    }
+
+    // --entity: another arm alone leaves the claims walk untouched.
+    let (code, stderr) = run_backfill(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "harvester-fragments",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        world_claims_by(&pool, author).await,
+        3,
+        "not the claims arm"
+    );
+
+    // A cursor an earlier run left ABOVE every world-owned claim.
+    sqlx::query(
+        "UPDATE tenancy_backfill_progress SET last_id = 'ffffffff-ffff-ffff-ffff-ffffffffffff', \
+                rows_done = 5000 WHERE entity = 'claims'",
+    )
+    .execute(&pool)
+    .await
+    .expect("carried cursor");
+    let (code, stderr) = run_backfill(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "claims",
+            "--batch-size",
+            "1",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        world_claims_by(&pool, author).await,
+        0,
+        "the carried cursor is rewound in the same run"
+    );
+
+    // --max-runtime: a statement-level sleep makes one batch outlast a 1s
+    // budget, so the walk stops after exactly one batch and exits 3.
+    for i in 0..3 {
+        fixture::seed_public_claim(&pool, author, &format!("budgeted {i}")).await;
+    }
+    sqlx::query(
+        "CREATE FUNCTION test_slow_batch() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN PERFORM pg_sleep(1.2); RETURN NULL; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("slow fn");
+    sqlx::query(
+        "CREATE TRIGGER zz_test_slow_batch AFTER UPDATE ON claims \
+         FOR EACH STATEMENT EXECUTE FUNCTION test_slow_batch()",
+    )
+    .execute(&pool)
+    .await
+    .expect("slow trigger");
+    let budgeted = [
+        "run",
+        "--legacy-owner",
+        "operator",
+        "--entity",
+        "claims",
+        "--batch-size",
+        "1",
+        "--max-runtime",
+        "1s",
+    ];
+    let (code, stderr) = run_backfill(&pool, &budgeted).await;
+    assert_eq!(code, 3, "a spent budget is a partial run:\n{stderr}");
+    assert!(stderr.contains("PARTIAL"), "{stderr}");
+    assert_eq!(
+        world_claims_by(&pool, author).await,
+        2,
+        "exactly the one committed batch is kept"
+    );
+    sqlx::query("DROP TRIGGER zz_test_slow_batch ON claims")
+        .execute(&pool)
+        .await
+        .expect("drop slow trigger");
+    let (code, stderr) = run_backfill(&pool, &budgeted).await;
+    assert_eq!(code, 0, "a re-run resumes and completes:\n{stderr}");
+    assert_eq!(world_claims_by(&pool, author).await, 0);
+}
