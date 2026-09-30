@@ -2059,7 +2059,7 @@ pub struct DeleteStepRequest {
 fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> ApiError {
     match e {
         epigraph_ingest_executor::IngestExecutorError::Repository(db)
-            if db.is_personal_group_refusal() =>
+            if db.is_write_authority_refusal() =>
         {
             ApiError::from(db)
         }
@@ -2091,9 +2091,9 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
         e @ (E::ChainRewireRefused { .. } | E::StepNotWritable { .. }) => ApiError::Forbidden {
             reason: e.to_string(),
         },
-        E::Repo(db) if db.is_personal_group_refusal() => ApiError::from(db),
+        E::Repo(db) if db.is_write_authority_refusal() => ApiError::from(db),
         E::Executor(epigraph_ingest_executor::IngestExecutorError::Repository(db))
-            if db.is_personal_group_refusal() =>
+            if db.is_write_authority_refusal() =>
         {
             ApiError::from(db)
         }

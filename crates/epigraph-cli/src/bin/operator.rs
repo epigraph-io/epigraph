@@ -11,8 +11,11 @@
 //! Exit codes: 0 success; 1 refused or failed before writing (for
 //! `hide-evidence --apply`, also an invariant violation, rolled back); 2 a
 //! batch violated an invariant and was rolled back (under `--apply` the run
-//! stops there); 3 `link-retired` refused at least one id, or `reown-reverse`
-//! HELD at least one claim or hidden row (it is not fully restored).
+//! stops there); 3 `link-retired` refused at least one id, `link` left the
+//! agent without a LIVE link (its link is retired, or its membership revoked),
+//! or `reown-reverse` HELD at least one claim or hidden row (it is not fully
+//! restored). `arm-operator-binding --apply` exits 1 when the census of unbound
+//! recent writers refused it.
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -24,19 +27,28 @@
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
 //!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
+//!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
+//!         --agent-system-prompt-hash H) [--apply]
+//!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
+//!     epigraph-operator link-legacy-authors --operator <uuid> [--exclude-agents-file F] \
+//!         [--quiet-days 30 | --no-quiet-window] [--apply]
+//!     epigraph-operator reown-linked --operator <uuid> --manifest-out reown-linked-1.jsonl [--apply]
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 
 use clap::{Parser, Subcommand};
-use epigraph_cli::operator::{self, client_scope, hide, link, reown, reverse};
+use epigraph_cli::operator::{
+    self, arm, bind, client_scope, hide, legacy, link, reown, reown_linked, reverse,
+};
 use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(
     name = "epigraph-operator",
-    about = "Operator ownership backfill (retired links, claim re-own, and its reversal) and \
-             audited admin-only scope grants on human OAuth clients"
+    about = "Operator ownership backfill (retired links, claim re-own, and its reversal), \
+             operator binding (live links, the legacy-author tie, arming), and audited \
+             admin-only scope grants on human OAuth clients"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,6 +57,89 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Record a LIVE operator link for ONE agent (migration 107's
+    /// `epigraph_link_operator`), binding it to a human operator (migration
+    /// 122). Run by a host before it spawns the agent: under D9 the agent's own
+    /// app DSN cannot record the link. Idempotent.
+    Link {
+        /// An existing agent id.
+        #[arg(long)]
+        agent: Option<Uuid>,
+        /// With `--agent-system-prompt-hash`: the identity a stdio
+        /// `epigraph-mcp` derives (`EPIGRAPH_AGENT_MODEL`). The agent is
+        /// created as `epigraph-mcp` would create it if it does not exist yet.
+        #[arg(long)]
+        agent_model: Option<String>,
+        /// The lowercase-hex BLAKE3 prompt hash (`EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH`).
+        #[arg(long)]
+        agent_system_prompt_hash: Option<String>,
+        /// The human operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// Perform the link. Without it, everything runs in a transaction that
+        /// is rolled back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Turn operator-binding enforcement ON for this database (migration 122),
+    /// once and irreversibly, after reporting every agent that wrote claims
+    /// recently and is not bound to a human operator.
+    ArmOperatorBinding {
+        /// The census window: agents that authored claims in this many days.
+        #[arg(long, default_value_t = 14)]
+        recent_days: i32,
+        /// Arm even though the census lists unbound recent writers (their
+        /// writes are refused from then on).
+        #[arg(long)]
+        allow_unbound_writers: bool,
+        /// Arm. Without it, only the report is printed.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Tie every legacy author (an agent that authored a tier-A row and has no
+    /// operator link) to a HUMAN operator with a RETIRED link, in one audited
+    /// call (migration 122). Skipped agents are listed with the reason.
+    LinkLegacyAuthors {
+        /// The human operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// Agent ids never to tie (one per line; `#` comments allowed).
+        #[arg(long)]
+        exclude_agents_file: Option<PathBuf>,
+        /// Skip, as `recent_writer`, every agent that authored a claim in this
+        /// many days: it may still be running and wants a LIVE link.
+        #[arg(long, default_value_t = 30, conflicts_with = "no_quiet_window")]
+        quiet_days: i64,
+        /// Tie recent writers too (no quiet window).
+        #[arg(long)]
+        no_quiet_window: bool,
+        /// Commit. Without it, the call runs in a transaction that is rolled
+        /// back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Move every claim owned by a LINKED author's own personal group into its
+    /// operator's personal group (`reown-claims` with `--derived follow-claim`
+    /// over the claims the predicate selects). Resumable: a re-run selects
+    /// what is left. Run one instance at a time.
+    ReownLinked {
+        /// The operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// Where to write the undo manifest. Must not exist; use a new path
+        /// per run.
+        #[arg(long)]
+        manifest_out: PathBuf,
+        /// Perform the writes. Without it, every batch rolls back.
+        #[arg(long)]
+        apply: bool,
+        /// Claims per transaction.
+        #[arg(long, default_value_t = 200)]
+        batch_size: usize,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+    },
     /// Record a RETIRED operator link for each agent id in a file.
     LinkRetired {
         /// One agent UUID per line; `#` comments and blank lines ignored.
@@ -174,8 +269,9 @@ async fn main_inner() -> anyhow::Result<i32> {
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
         client_scope::validate_scope(&a.scope)?;
     }
-    if let Command::ReownClaims { batch_size, .. } | Command::ReownReverse { batch_size, .. } =
-        &cli.command
+    if let Command::ReownClaims { batch_size, .. }
+    | Command::ReownReverse { batch_size, .. }
+    | Command::ReownLinked { batch_size, .. } = &cli.command
     {
         if *batch_size == 0 {
             anyhow::bail!("--batch-size must be at least 1");
@@ -189,6 +285,93 @@ async fn main_inner() -> anyhow::Result<i32> {
     let mut conn = db.pool().acquire().await?;
     let mut stdout = std::io::stdout();
     match cli.command {
+        Command::Link {
+            agent,
+            agent_model,
+            agent_system_prompt_hash,
+            operator: op,
+            apply,
+        } => {
+            let spec = bind::AgentSpec::from_flags(agent, agent_model, agent_system_prompt_hash)?;
+            let outcome = bind::run(db.pool(), &mut conn, &spec, op, apply).await?;
+            println!("{}", bind::describe(&outcome, op, apply));
+            if !apply {
+                println!("DRY RUN: the link above ran and was rolled back.");
+            }
+            Ok(if outcome.link.link_live { 0 } else { 3 })
+        }
+        Command::ArmOperatorBinding {
+            recent_days,
+            allow_unbound_writers,
+            apply,
+        } => {
+            let report = arm::run(&mut conn, recent_days, apply, allow_unbound_writers).await?;
+            for line in arm::describe(&report, recent_days, apply) {
+                println!("{line}");
+            }
+            Ok(if report.refused { 1 } else { 0 })
+        }
+        Command::LinkLegacyAuthors {
+            operator: op,
+            exclude_agents_file,
+            quiet_days,
+            no_quiet_window,
+            apply,
+        } => {
+            if !no_quiet_window && quiet_days <= 0 {
+                anyhow::bail!("--quiet-days must be at least 1 (or pass --no-quiet-window)");
+            }
+            let exclude = match exclude_agents_file {
+                Some(f) => operator::read_ids_file(&f)?,
+                None => Vec::new(),
+            };
+            let opts = legacy::Options {
+                operator: op,
+                exclude,
+                quiet_since: (!no_quiet_window)
+                    .then(|| chrono::Utc::now() - chrono::Duration::days(quiet_days)),
+                apply,
+            };
+            let rows = legacy::run(&mut conn, &opts).await?;
+            for line in legacy::describe(&rows, &opts) {
+                println!("{line}");
+            }
+            Ok(0)
+        }
+        Command::ReownLinked {
+            operator: op,
+            manifest_out,
+            apply,
+            batch_size,
+            lock_timeout,
+        } => {
+            let ids = reown_linked::candidates(&mut conn, op).await?;
+            println!(
+                "reown-linked: operator={op} candidates={} (claims owned by a linked author's own \
+                 personal group)",
+                ids.len()
+            );
+            if ids.is_empty() {
+                println!("RESULT\n  claims moved: 0 (nothing to move)");
+                return Ok(0);
+            }
+            let opts = reown::Options {
+                operator: op,
+                mode: reown::DerivedMode::FollowClaim,
+                manifest_out,
+                apply,
+                batch_size,
+                lock_timeout,
+                hide: hide::HideArgs::default(),
+            };
+            reown::validate(&opts)?;
+            let report = reown::run(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(if report.batch_failures.is_empty() {
+                0
+            } else {
+                2
+            })
+        }
         Command::LinkRetired {
             agents_file,
             operator: op,

@@ -1437,3 +1437,52 @@ confirm each came from the token endpoint for a client that holds the grant.
   oauth_clients`; that is the unaudited path section 2 replaces.
 
 No migration.
+
+## Operator binding (migration 122) — deploy order
+
+Every claim must be authored by an agent bound to a human operator (a human
+operator, or the holder of a live `operator_links` row); anything else is
+refused with `OPL01`. The invariant, the error code and the valve are in
+`docs/tenancy.md` ("Operator binding"). This section is the ORDER, because
+arming is one-way and every step before it must leave no live writer unbound.
+
+1. **Build** every binary from the merged commit (api, mcp, `epigraph-migrate`,
+   `epigraph-operator`, `epigraph-tenancy-backfill`).
+2. **Migrate 122** (`epigraph-migrate`, on the migration DSN). It enforces
+   nothing: it adds the trigger, the arming table (empty), and the definers.
+   Old binaries keep working; the new binaries' default-declaration path needs
+   122 (it fails closed with `42883` without it), so migrate BEFORE they serve.
+3. **Live-link the live writers** that are not human operators:
+   `epigraph-operator link --agent <id> --operator <human> --apply`, on the
+   maintenance DSN. `link` refuses an OAuth principal: see "HTTP principals" in
+   `docs/tenancy.md` and resolve those before step 8.
+4. **Tie the legacy authors**: `epigraph-operator link-legacy-authors
+   --operator <human>` (dry run, read the SKIPPED lines), then `--apply`. Give
+   every `recent_writer` it skips a live link (step 3) or an explicit decision.
+5. **Backfill** as the maintenance login: `epigraph-tenancy-backfill run` (it
+   now stamps a linked author's world-owned rows to the operator's group).
+   Batched and resumable; it rewrites claims and, through 070's arm (d), their
+   derived rows, so check free disk first: the write volume lands in WAL.
+6. **Re-own** what linked authors' own groups still hold:
+   `epigraph-operator reown-linked --operator <human> --manifest-out <path>`
+   (dry run), then `--apply` with a new manifest path. Keep the manifests.
+7. **Verify**: `epigraph-tenancy-backfill verify` exits 0; its REPORT line for
+   linked authors' personal-group rows should read zero (or be explained).
+8. **Deploy the new request binaries** (api, then mcp, as for 107), and the
+   fleet host change (pass the operator id; run `link` at every spawn, on a
+   maintenance DSN). Then **arm**: `epigraph-operator arm-operator-binding`
+   (census), then `--apply`. The census must list no unbound recent writer you
+   intend to keep.
+9. **Smoke**: a claim by an unbound agent is refused (`OPL01`; HTTP 403); a
+   claim by a live-linked agent and by the human succeeds; the boot logs say
+   "operator binding ENFORCED".
+
+**Rollback.** Before step 8's arm: every step is reversible or harmless (links
+are permanent records but grant nothing new; `reown-reverse` undoes step 6).
+After arming: set `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off` on the affected
+units and restart them (new binaries only; old binaries do not carry the
+valve). Removing the arming row, or dropping the trigger, is a superuser DDL
+act on the migration DSN.
+
+No new environment variable is required; `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT`
+exists only as the emergency valve.

@@ -18,6 +18,21 @@
 //!   claims (Amendment 2; migration 110's `evidence_visibility_pins` keeps
 //!   them hidden), under the guards and manifest `hide`'s module doc lists.
 //!
+//! And the operator-binding commands (migration 122; see [`bind`]):
+//!
+//! * `link` — record a LIVE operator link for one agent (by id, or by the
+//!   `(model, prompt hash)` identity a stdio `epigraph-mcp` derives), so the
+//!   agent is bound to a human operator. Hosts run it before spawning an agent,
+//!   because under D9 the agent's own app DSN cannot record the link.
+//!
+//! * `arm-operator-binding` — turn enforcement ON, once, after reporting every
+//!   unbound agent that wrote recently (see [`arm`]).
+//! * `link-legacy-authors` — tie every legacy author to the human operator with
+//!   a RETIRED link, in one audited definer call (see [`legacy`]).
+//! * `reown-linked` — move the claims a linked author's OWN personal group owns
+//!   into its operator's group, through `reown-claims`' guarded batches (see
+//!   [`reown_linked`]).
+//!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
 //!
@@ -54,11 +69,15 @@
 //! is stricter than `epigraph_db::assert_maintenance_privilege` (which is
 //! conditioned on row security being active): it is unconditional.
 
+pub mod arm;
+pub mod bind;
 pub mod client_scope;
 pub mod hide;
+pub mod legacy;
 pub mod link;
 pub mod manifest;
 pub mod reown;
+pub mod reown_linked;
 pub mod reverse;
 pub mod tables;
 

@@ -12,12 +12,19 @@
 //!
 //! The env var DECLARES the operator; the DSN AUTHORIZES the link.
 //! `epigraph_link_operator` is EXECUTE-able by `epigraph_maintenance` (and
-//! superusers) only. Epiclaw's per-agent processes connect with a privileged DSN
-//! today, so they can record their own link; on an `epigraph_app` DSN the call
-//! fails with `42501` and [`self_link`] returns that error, which `main` treats
-//! as FATAL — a declared operator the process cannot record is never silently
-//! dropped. A host that moves agents onto `epigraph_app` must record the link
-//! itself, on a maintenance connection, before starting them.
+//! superusers) only. Under operator decision D9 a request-serving process
+//! (every per-agent stdio process included) holds only an `epigraph_app` DSN,
+//! where that call fails with `42501`. So the link is recorded OUT OF BAND, by
+//! the host, on a maintenance connection, BEFORE the process starts:
+//! `epigraph-operator link --agent-model <m> --agent-system-prompt-hash <h>
+//! --operator <human> --apply` (or `--agent <id>`). [`self_link`] then reads the
+//! ACTOR record first and, when it already names the declared operator, starts
+//! without calling the link function at all, so a correctly declared agent on
+//! an app DSN is never stranded. Only when no such live link exists does it
+//! call the link function, which records it on a maintenance DSN and, on an app
+//! DSN, fails with `42501`: [`self_link`] returns that error, naming the
+//! command above, and `main` treats it as FATAL — a declared operator the
+//! process cannot record is never silently dropped.
 //!
 //! # Never on a shared HTTP listener
 //!
@@ -298,8 +305,9 @@ pub fn link_refusal_text(agent: Uuid, operator: Uuid, e: &epigraph_db::DbError) 
         other => format!(
             "could not record agent {agent} as operated by {operator} \
              (epigraph_link_operator is EXECUTE-able by epigraph_maintenance only; on an \
-             epigraph_app DSN the host must record the link on a maintenance connection \
-             instead): {other}"
+             epigraph_app DSN the host records the link on a maintenance connection BEFORE \
+             starting this process: `epigraph-operator link --agent {agent} --operator \
+             {operator} --apply` with EPIGRAPH_OPERATOR_MAINTENANCE_DSN set): {other}"
         ),
     }
 }
@@ -328,6 +336,21 @@ pub async fn self_link(
         server.pool.acquire().await.map_err(|e| {
             format!("could not acquire a connection to record the operator link: {e}")
         })?;
+    // A live link the host already recorded on a maintenance connection (D9:
+    // this process may hold only an app DSN, where the link function is 42501).
+    // Read through the SAME actor read the authoring path uses; a link to a
+    // DIFFERENT operator is not accepted here and falls through to the link
+    // call, which refuses it by name.
+    if let Some(outcome) = recorded_live_link(&mut conn, agent, operator).await? {
+        tracing::info!(
+            agent = %agent,
+            operator = %operator,
+            operator_group = %outcome.operator_group_id,
+            "operator link recorded: this agent authors into the operator's personal group \
+             (live link recorded out of band on a maintenance connection; not re-linked)"
+        );
+        return Ok(outcome);
+    }
     let outcome = AgentRepository::link_operator(&mut conn, agent, operator)
         .await
         .map_err(|e| link_refusal_text(agent, operator, &e))?;
@@ -366,6 +389,41 @@ pub async fn self_link(
         ),
     }
     Ok(outcome)
+}
+
+/// The outcome of an ACTING link to `operator` that is already recorded for
+/// `agent`, or `None`. Read with `epigraph_operator_actor`, which an
+/// `epigraph_app` session may call, so it answers on the DSN a D9 process holds.
+/// An acting link is, by that read's definition, not retired, with a live
+/// writer/admin membership in the operator's own group, so the synthesised
+/// outcome reports exactly that and claims nothing was created.
+///
+/// # Errors
+/// The read fails (fail closed: a process that cannot ask does not start).
+async fn recorded_live_link(
+    conn: &mut sqlx::PgConnection,
+    agent: Uuid,
+    operator: Uuid,
+) -> Result<Option<OperatorLinkOutcome>, String> {
+    let actor = AgentRepository::operator_actor(conn, agent)
+        .await
+        .map_err(|e| {
+            format!(
+                "could not read whether agent {agent} already acts for operator {operator} \
+                 (is migration 107 applied?): {e}"
+            )
+        })?;
+    Ok(actor
+        .filter(|link| link.operator_id == operator)
+        .map(|link| OperatorLinkOutcome {
+            operator_group_id: link.operator_group_id,
+            group_created: false,
+            membership_created: false,
+            membership_live: true,
+            edge_created: false,
+            link_live: true,
+            link_retired: false,
+        }))
 }
 
 /// What a [`self_link`] outcome means for this process, as the startup log

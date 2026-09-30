@@ -68,7 +68,7 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
         },
         // Migration 105's personal-group refusal (the step claim's owner
         // declaration): a denial, as on every other write tool.
-        E::Repo(db) if db.is_personal_group_refusal() => crate::errors::db_caller_error(db),
+        E::Repo(db) if db.is_write_authority_refusal() => crate::errors::db_caller_error(db),
         E::Executor(x) => crate::errors::executor_caller_error("executor error", x),
         E::Db(_) | E::Repo(_) => internal_error(e.to_string()),
     }
