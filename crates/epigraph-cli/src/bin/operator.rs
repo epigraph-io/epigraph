@@ -24,11 +24,13 @@
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
 //!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
+//!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
+//!         --agent-system-prompt-hash H) [--apply]
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 
 use clap::{Parser, Subcommand};
-use epigraph_cli::operator::{self, client_scope, hide, link, reown, reverse};
+use epigraph_cli::operator::{self, bind, client_scope, hide, link, reown, reverse};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -45,6 +47,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Record a LIVE operator link for ONE agent (migration 107's
+    /// `epigraph_link_operator`), binding it to a human operator (migration
+    /// 122). Run by a host before it spawns the agent: under D9 the agent's own
+    /// app DSN cannot record the link. Idempotent.
+    Link {
+        /// An existing agent id.
+        #[arg(long)]
+        agent: Option<Uuid>,
+        /// With `--agent-system-prompt-hash`: the identity a stdio
+        /// `epigraph-mcp` derives (`EPIGRAPH_AGENT_MODEL`). The agent is
+        /// created as `epigraph-mcp` would create it if it does not exist yet.
+        #[arg(long)]
+        agent_model: Option<String>,
+        /// The lowercase-hex BLAKE3 prompt hash (`EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH`).
+        #[arg(long)]
+        agent_system_prompt_hash: Option<String>,
+        /// The human operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// Perform the link. Without it, everything runs in a transaction that
+        /// is rolled back.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Record a RETIRED operator link for each agent id in a file.
     LinkRetired {
         /// One agent UUID per line; `#` comments and blank lines ignored.
@@ -189,6 +215,21 @@ async fn main_inner() -> anyhow::Result<i32> {
     let mut conn = db.pool().acquire().await?;
     let mut stdout = std::io::stdout();
     match cli.command {
+        Command::Link {
+            agent,
+            agent_model,
+            agent_system_prompt_hash,
+            operator: op,
+            apply,
+        } => {
+            let spec = bind::AgentSpec::from_flags(agent, agent_model, agent_system_prompt_hash)?;
+            let outcome = bind::run(db.pool(), &mut conn, &spec, op, apply).await?;
+            println!("{}", bind::describe(&outcome, op, apply));
+            if !apply {
+                println!("DRY RUN: the link above ran and was rolled back.");
+            }
+            Ok(if outcome.link.link_live { 0 } else { 3 })
+        }
         Command::LinkRetired {
             agents_file,
             operator: op,

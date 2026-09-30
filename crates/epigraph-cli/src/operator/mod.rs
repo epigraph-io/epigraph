@@ -18,6 +18,13 @@
 //!   claims (Amendment 2; migration 110's `evidence_visibility_pins` keeps
 //!   them hidden), under the guards and manifest `hide`'s module doc lists.
 //!
+//! And the operator-binding commands (migration 122; see [`bind`]):
+//!
+//! * `link` — record a LIVE operator link for one agent (by id, or by the
+//!   `(model, prompt hash)` identity a stdio `epigraph-mcp` derives), so the
+//!   agent is bound to a human operator. Hosts run it before spawning an agent,
+//!   because under D9 the agent's own app DSN cannot record the link.
+//!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
 //!
@@ -54,6 +61,7 @@
 //! is stricter than `epigraph_db::assert_maintenance_privilege` (which is
 //! conditioned on row security being active): it is unconditional.
 
+pub mod bind;
 pub mod client_scope;
 pub mod hide;
 pub mod link;
