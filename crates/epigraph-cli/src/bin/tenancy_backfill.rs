@@ -1960,7 +1960,7 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         ),
         (
             "epigraph_require_attributable",
-            "public.epigraph_require_attributable(uuid, uuid)",
+            "public.epigraph_require_attributable(uuid, uuid, boolean)",
             true,
         ),
         (

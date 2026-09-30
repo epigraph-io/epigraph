@@ -878,12 +878,15 @@ async fn the_writer_is_bound_not_only_the_author_column(pool: PgPool) {
 /// (`ClaimRepository::supersede_act_conn`, which declares no owner and
 /// inherits the old claim's author) works for a live-linked agent superseding
 /// its own claim and for a human superseding its RETIRED legacy author's claim,
-/// and is refused for an unbound writer.
+/// and is refused for an unbound writer. A fresh claim naming the retired
+/// author is refused.
 ///
 /// Verified to fail: the trigger renamed back to sort before
 /// `claims_require_tenancy` -> X's supersede is refused OPL02 on a NULL owner;
 /// `epigraph_require_attributable` reading only LIVE links for the author ->
-/// A's supersede of the legacy claim is refused OPL01.
+/// A's supersede of the legacy claim is refused OPL01; the trigger passing
+/// `true` for `p_inherited` whatever `supersedes` says -> the fresh claim
+/// naming the retired author lands.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
     let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
@@ -942,6 +945,14 @@ async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
     supersede(a, vec![a_group], legacy_claim)
         .await
         .expect("a human supersedes its own retired legacy author's claim once armed");
+
+    // The retired author is admissible only as the author a supersede
+    // INHERITS: a FRESH claim naming it is refused (OB1: the author is a human
+    // or holds a live link), even by its own human.
+    assert_opl01(
+        write_as(&pool, a, &[a_group], legacy, a_group).await,
+        "a fresh claim naming a retired identity",
+    );
 
     let refused = supersede(u, vec![u_group, a_group], a_claim)
         .await

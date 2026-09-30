@@ -126,8 +126,10 @@
 -- authenticated PRINCIPAL (`epigraph_principal_id()`, stamped by `ScopedPool`
 -- from the viewer) whenever it differs from the author: the writer must be
 -- bound (OPL01), must write the owner group (OPL02), and may name as author
--- only an agent of its own human, a RETIRED one included (OPL02 otherwise), so
--- a human superseding its own legacy author's claim is admitted. With no
+-- only a bound agent of its own human (OPL01 / OPL02 otherwise); the author a
+-- supersede INHERITS may also be a RETIRED agent of that human, so a human
+-- superseding its own legacy author's claim is admitted, while a fresh claim
+-- naming a retired identity is not. With no
 -- principal, or a principal equal to the author, or on a privileged session,
 -- the author is the one checked. Workflow ingest writes as one shared system
 -- agent under that agent's own stamp, so its request paths bind their CALLER
@@ -463,13 +465,18 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM PUBLIC;
 
 -- Section 2's ATTRIBUTION check, for a claim whose author is not its writer:
--- the author must belong to the WRITER's own human (a link of ANY state
--- counts, so a human who supersedes its own retired legacy author's claim
--- passes). An author that belongs to no human at all is unbound (OPL01, under
--- the valve's rule); one that belongs to ANOTHER human is a cross-human
--- attribution (OPL02, armed; an instance-admin principal and a privileged
--- session are exempt, as everywhere in section 1b).
-CREATE OR REPLACE FUNCTION public.epigraph_require_attributable(p_author uuid, p_writer uuid)
+-- the author must be BOUND (section 1) and belong to the WRITER's own human.
+-- One exception, for the author a supersede INHERITS rather than chooses
+-- (`p_inherited`: the row names `supersedes`, and `supersede_act_conn` copies
+-- the predecessor's author): there a RETIRED link to the writer's human
+-- counts, so a human can supersede its own legacy author's claim. A fresh
+-- claim may never name a retired identity (OB1). An author that belongs to no
+-- human (for the row's kind) is unbound (OPL01, under the valve's rule); one
+-- that belongs to ANOTHER human is a cross-human attribution (OPL02, armed; an
+-- instance-admin principal and a privileged session are exempt, as everywhere
+-- in section 1b).
+CREATE OR REPLACE FUNCTION public.epigraph_require_attributable(
+    p_author uuid, p_writer uuid, p_inherited boolean)
 RETURNS void
 LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
@@ -480,7 +487,7 @@ BEGIN
     IF NOT public.epigraph_operator_binding_armed() THEN
         RETURN;
     END IF;
-    v_author_human := public.epigraph_human_of(p_author, false);
+    v_author_human := public.epigraph_human_of(p_author, NOT COALESCE(p_inherited, false));
     IF v_author_human IS NULL THEN
         PERFORM public.epigraph_require_bound_author(p_author);
         RETURN;
@@ -500,7 +507,7 @@ BEGIN
               HINT = 'Author the claim as the writing agent itself. Admin access crosses '
                      'humans; nothing else does.';
 END $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, boolean) FROM PUBLIC;
 
 -- The trigger body. A DEFINER owned by the maintenance role, like 070's
 -- trigger bodies: PostgreSQL checks EXECUTE on a trigger function when the
@@ -536,7 +543,8 @@ BEGIN
     ELSE
         PERFORM public.epigraph_require_bound_writer(v_writer);
         PERFORM public.epigraph_require_writer_scope(v_writer, NEW.owner_group_id);
-        PERFORM public.epigraph_require_attributable(NEW.agent_id, v_writer);
+        PERFORM public.epigraph_require_attributable(NEW.agent_id, v_writer,
+                                                     NEW.supersedes IS NOT NULL);
     END IF;
     RETURN NEW;
 END $$;
@@ -869,7 +877,7 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_require_writer_scope(uuid, uuid) '
                 'OWNER TO epigraph_maintenance';
-        EXECUTE 'ALTER FUNCTION public.epigraph_require_attributable(uuid, uuid) '
+        EXECUTE 'ALTER FUNCTION public.epigraph_require_attributable(uuid, uuid, boolean) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text, uuid) '
                 'TO epigraph_maintenance';
@@ -889,7 +897,7 @@ DO $$ BEGIN
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) '
                 'TO epigraph_maintenance';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid) '
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, boolean) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_writes_group(uuid, uuid) '
                 'TO epigraph_maintenance';
@@ -944,7 +952,7 @@ DO $$ BEGIN
                 'TO epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) '
                 'TO epigraph_app';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid) '
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, boolean) '
                 'TO epigraph_app';
     END IF;
 END $$;

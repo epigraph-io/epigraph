@@ -1506,7 +1506,7 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
         ),
         (
             "epigraph_require_attributable",
-            "public.epigraph_require_attributable(uuid, uuid)",
+            "public.epigraph_require_attributable(uuid, uuid, boolean)",
             "s",
             true,
         ),

@@ -396,8 +396,10 @@ session write as any bound author. The trigger therefore also binds the
 session's authenticated PRINCIPAL (the one `ScopedPool` stamps from the
 request's viewer) whenever it differs from the author: that writer must be
 bound (`OPL01`), must write the owner group (`OPL02`, below), and may name as
-author only an agent of its OWN human (`OPL02` otherwise); a retired agent of
-its own human counts, so a human can supersede its own legacy author's claims.
+author only a bound agent of its OWN human (`OPL01` / `OPL02` otherwise). The
+one exception is the author a supersede INHERITS (the row names `supersedes`):
+it may be a retired agent of the writer's own human, so a human can supersede
+its own legacy author's claims; a fresh claim never names a retired identity.
 With no principal, a principal equal to the author, or a privileged session,
 the author is the one checked. Consequences to decide before arming: a write
 whose principal is an identity that can never be bound (a shared HTTP
