@@ -125,7 +125,8 @@ pub async fn add_step(
 ) -> Result<CallToolResult, McpError> {
     let caller = server.write_identity(auth, viewer).await?;
     let (_system_agent_id, mut tx) =
-        crate::claim_helper::begin_system_ingest_stamped_tx(server, "add_step").await?;
+        crate::claim_helper::begin_system_ingest_stamped_tx(server, "add_step", caller.agent_id())
+            .await?;
     // H3 (batch H-b): the CALLER's authority over the workflow, before the
     // system-stamped write. The stamp stays the system agent's.
     let authority = require_authority_over(
@@ -203,8 +204,12 @@ pub async fn delete_step(
 ) -> Result<CallToolResult, McpError> {
     let lineage = parse_uuid(&params.step_lineage_id)?;
     let caller = server.write_identity(auth, viewer).await?;
-    let (_system_agent_id, mut tx) =
-        crate::claim_helper::begin_system_ingest_stamped_tx(server, "delete_step").await?;
+    let (_system_agent_id, mut tx) = crate::claim_helper::begin_system_ingest_stamped_tx(
+        server,
+        "delete_step",
+        caller.agent_id(),
+    )
+    .await?;
     // H3 (batch H-b); see `add_step`.
     let authority = require_authority_over(
         server,

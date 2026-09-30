@@ -329,7 +329,8 @@ pub async fn store_workflow(
     };
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
-    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
+    let mut tx =
+        begin_system_ingest_stamped_tx(&state, "workflows/ingest", viewer.principal()).await?;
     let decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
     let result =
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
@@ -1743,7 +1744,8 @@ pub async fn ingest_workflow(
         obj.remove(epigraph_db::WorkflowRepository::SUBMITTER_KEY);
     }
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
-    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
+    let mut tx =
+        begin_system_ingest_stamped_tx(&state, "workflows/ingest", viewer.principal()).await?;
     let auth = auth_ctx.as_ref().map(|a| &a.0);
     let decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
     let result =
@@ -1856,14 +1858,25 @@ pub async fn ingest_workflow(
 /// a decision about who "owns" a workflow the system agent authored — neither
 /// of which is a mechanical conversion. Tracked as open work, not fixed here.
 ///
+/// # The CALLER is bound before anything is written (migration 122)
+///
+/// As on the MCP side: the claims trigger sees only the shared system agent,
+/// so this binds `caller` (the request's principal; `None` is unbound) on the
+/// stamped transaction, through
+/// `epigraph_ingest_executor::require_caller_write_authority`. Once the
+/// database is armed an unbound caller is refused (`OPL01`) and a caller whose
+/// human does not write the system agent's owner group is refused (`OPL02`),
+/// both as 403.
+///
 /// # Errors
 /// `ApiError::InternalError` if the system agent has no write authority, if the
 /// process was not built through `AppState::with_scoped_pool`, or if the stamp
-/// fails. Never a fallback to `state.db_pool`.
+/// fails. Never a fallback to `state.db_pool`. A 403 for the caller refusals.
 #[cfg(feature = "db")]
 pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
     state: &'s AppState,
     route: &'static str,
+    caller: Option<Uuid>,
 ) -> Result<epigraph_db::ScopedTx<'s>, ApiError> {
     let scoped = state.scoped.as_ref().ok_or_else(|| {
         tracing::error!(
@@ -1898,12 +1911,31 @@ pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
             }
         })?;
 
-    scoped
+    let mut tx = scoped
         .begin_as(&authority.viewer)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("{route}: could not begin a system-agent-stamped transaction: {e}"),
-        })
+        })?;
+    epigraph_ingest_executor::require_caller_write_authority(&mut tx, authority.agent_id, caller)
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                route = route,
+                caller = ?caller,
+                error = %e,
+                "workflow write refused: the caller may not write through the ingest system agent"
+            );
+            if e.is_write_authority_refusal() {
+                ApiError::from(e)
+            } else {
+                ApiError::InternalError {
+                    message: format!("{route}: could not check the caller's authority: {e}"),
+                }
+            }
+        })?;
+    Ok(tx)
 }
 
 #[cfg(feature = "db")]
@@ -1964,7 +1996,13 @@ async fn auto_wire_inserted_edges(
     let Some(agent_id) = result.system_agent_id else {
         return;
     };
-    let mut tx = match begin_system_ingest_stamped_tx(state, "workflows/ingest:ds").await {
+    let mut tx = match begin_system_ingest_stamped_tx(
+        state,
+        "workflows/ingest:ds",
+        viewer.principal(),
+    )
+    .await
+    {
         Ok(tx) => tx,
         Err(e) => {
             tracing::warn!(
@@ -2385,7 +2423,7 @@ pub async fn add_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
-    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps").await?;
+    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps", auth.agent_id).await?;
     let authority = require_api_workflow_authority(&mut tx, &auth, &req.canonical_name).await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
@@ -2439,7 +2477,8 @@ pub async fn delete_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
-    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps/delete").await?;
+    let mut tx =
+        begin_system_ingest_stamped_tx(&state, "workflows/steps/delete", auth.agent_id).await?;
     let authority = require_api_workflow_authority(&mut tx, &auth, &req.canonical_name).await?;
     let r =
         epigraph_ingest_executor::delete_step(&mut tx, &req.canonical_name, req.step_lineage_id)

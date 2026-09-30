@@ -1526,6 +1526,39 @@ impl AgentRepository {
         Ok(())
     }
 
+    /// Refuse a WRITER that is not entitled to write a claim owned by
+    /// `group_id` (migration 122 section 2, the checks the claims trigger
+    /// applies to a session principal that is not the author): `OPL01`
+    /// ([`DbError::OperatorLinkRequired`]) when `writer` is unbound or `None`
+    /// once the database is armed (the valve relieves this half), and `OPL02`
+    /// ([`DbError::OperatorScopeRefused`]) when the writer's human holds no
+    /// writer/admin membership in `group_id` (armed, whatever the valve; an
+    /// instance-admin principal and a privileged session are exempt).
+    ///
+    /// For the write paths whose rows are authored and stamped as a SHARED
+    /// system identity (workflow ingest): the database sees only that
+    /// identity, so the request path binds its real caller here, on the same
+    /// stamped transaction, before any row is written.
+    ///
+    /// # Errors
+    /// [`DbError::OperatorLinkRequired`], [`DbError::OperatorScopeRefused`], or
+    /// `DbError::QueryFailed` if the functions are absent or the call fails.
+    pub async fn require_writer_authority(
+        conn: &mut sqlx::PgConnection,
+        writer: Option<Uuid>,
+        group_id: Uuid,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "SELECT public.epigraph_require_bound_writer($1), \
+                    public.epigraph_require_writer_scope($1, $2)",
+        )
+        .bind(writer)
+        .bind(group_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     /// How `agent_id` is bound to a human operator (migration 122):
     /// `Some("live_link")`, `Some("human_operator")`, or `None` (unbound).
     /// Independent of arming and of the valve.
