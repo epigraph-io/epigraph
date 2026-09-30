@@ -112,7 +112,11 @@ pub struct SemanticSearchRequest {
     #[serde(default)]
     pub agent_id: Option<Uuid>,
 
-    /// Enable diverse hierarchical retrieval (theme-based + coverage selection)
+    /// Enable diverse hierarchical retrieval (theme-based + coverage selection).
+    ///
+    /// Falls back to flat search (reported as `centroid_dim_used: null`) when
+    /// no themes exist, or when fewer than half of the query's nearest claims
+    /// belong to the `max_themes` themes diverse mode would draw from.
     #[serde(default)]
     pub diverse: Option<bool>,
 
@@ -416,6 +420,83 @@ async fn generate_query_embedding_with_dim(
 /// Format embedding vector as pgvector string literal
 ///
 /// Converts a Vec<f32> to the format "[0.1,0.2,0.3,...]" expected by pgvector.
+/// Run the diverse-mode theme-coverage probe on the request's viewer-stamped
+/// `read` WITHOUT letting a probe failure poison it.
+///
+/// The guard fails open (see
+/// `epigraph_engine::diverse_retrieval::theme_coverage_allows_diverse`): a
+/// failed probe sends the request to the flat tail, which runs on this same
+/// `read`. Under `SessionGucMode::Transaction` the read is ONE transaction, so
+/// a failing statement (an error, or `statement_timeout`) would abort it and
+/// the flat search after it would then fail with "current transaction is
+/// aborted". The probe therefore runs inside a savepoint, rolled back to on
+/// failure — which restores the transaction to its state before the probe,
+/// including the transaction-local tenancy stamp. Under
+/// `SessionGucMode::Session` each statement is its own implicit transaction,
+/// so a failed probe poisons nothing and no bracket is needed.
+///
+/// No `statement_timeout` is set here: `SET LOCAL` would outlive the probe and
+/// cap the flat search too. The probe is kept cheap instead, by always ordering
+/// the neighbourhood by the ANN-indexed 1536-d column.
+///
+/// Outer `Err`: the savepoint bracket itself failed, so the transaction can no
+/// longer be trusted — the caller propagates it. Inner `Err`: the probe
+/// failed and the transaction is intact — the caller falls back to flat.
+#[cfg(feature = "db")]
+async fn probe_theme_coverage_isolated(
+    read: &mut epigraph_db::ScopedRead<'_>,
+    viewer: &epigraph_db::Viewer,
+    query_vec_1536: &str,
+    shortlist: &[Uuid],
+    reachable_dim: u32,
+) -> Result<Result<epigraph_db::NeighbourhoodThemeCoverage, epigraph_db::DbError>, ApiError> {
+    use epigraph_engine::diverse_retrieval::THEME_COVERAGE_PROBE_K;
+
+    let bracket_failed = |e: sqlx::Error| {
+        tracing::error!(
+            target: "diverse_retrieval.coverage_guard",
+            error = %e,
+            handler = "semantic_search",
+            "theme-coverage probe savepoint bracket failed"
+        );
+        ApiError::InternalError {
+            message: "Theme coverage probe could not be isolated".to_string(),
+        }
+    };
+
+    let in_tx = read.mode() == epigraph_db::SessionGucMode::Transaction;
+    if in_tx {
+        sqlx::query("SAVEPOINT theme_coverage_probe")
+            .execute(&mut **read)
+            .await
+            .map_err(bracket_failed)?;
+    }
+    let probe = epigraph_db::ClaimThemeRepository::nearest_theme_coverage_since(
+        &mut **read,
+        viewer,
+        query_vec_1536,
+        /*neighbourhood_dim=*/ 1536,
+        shortlist,
+        reachable_dim,
+        THEME_COVERAGE_PROBE_K,
+        /*paragraph_only=*/ false,
+        /*since=*/ None,
+    )
+    .await;
+    if in_tx {
+        let end = if probe.is_ok() {
+            "RELEASE SAVEPOINT theme_coverage_probe"
+        } else {
+            "ROLLBACK TO SAVEPOINT theme_coverage_probe"
+        };
+        sqlx::query(end)
+            .execute(&mut **read)
+            .await
+            .map_err(bracket_failed)?;
+    }
+    Ok(probe)
+}
+
 #[cfg(feature = "db")]
 fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
     format!(
@@ -600,7 +681,9 @@ pub async fn semantic_search(
         // transcribed so a sizing change invalidates the citation instead of
         // silently invalidating this comment. (An earlier revision wrote "8",
         // which was the background JOB pool; since operator decision D9 that
-        // pool lives in `bin/drain_jobs.rs`, not in this process.) Bounded regardless: at most seven statements on one handle, no
+        // pool lives in `bin/drain_jobs.rs`, not in this process.) Bounded regardless: at most seven reads on one handle (plus, under
+        // `SessionGucMode::Transaction`, the two-statement savepoint bracket
+        // around the coverage probe), no
         // per-node loop, no unbounded N. `detect_voids` in `routes/voids.rs` is
         // the shape in this shard that is NOT bounded; its own doc says so.
         // This shard does NOT discharge
@@ -632,6 +715,13 @@ pub async fn semantic_search(
         // When `diverse=true`, navigate themes first, then apply submodular selection.
         // Falls through to flat search if no themes exist yet (clustering hasn't run)
         // or if the themes do not cover the query's nearest neighbourhood.
+        // The 1536-d query vector the flat tail searches with, once some step
+        // of the diverse branch has had to compute it (at 1536 the diverse
+        // embedding IS this vector; at 3072 the coverage probe needs it).
+        // Reused by the flat tail so a diverse request that falls back does
+        // not embed the same text twice.
+        let mut flat_query_vec: Option<String> = None;
+
         if request.diverse.unwrap_or(false) {
             let max_themes = request.max_themes.unwrap_or(5) as i32;
             let alpha = request.diversity_weight.unwrap_or(0.5);
@@ -700,6 +790,11 @@ pub async fn semantic_search(
             let query_embedding =
                 generate_query_embedding_with_dim(&state, query, target_dim).await;
             let embedding_str = format_embedding_for_pgvector(&query_embedding);
+            if target_dim == EMBEDDING_DIM {
+                // `generate_query_embedding` is exactly this call at
+                // `EMBEDDING_DIM`, so the flat tail can reuse the vector.
+                flat_query_vec = Some(embedding_str.clone());
+            }
 
             // The claim-embedding column name (still used by the post-
             // selection full-row + graph-neighbor queries below). Column
@@ -726,7 +821,7 @@ pub async fn semantic_search(
                 message: format!("Theme search failed: {e}"),
             })?;
 
-            // Theme-coverage guard (same rule as
+            // Theme-coverage guard (same rule and verdict function as
             // `epigraph_engine::diverse_retrieval::run_diverse_pipeline`, which
             // this route does not call — see the import note at the top of
             // this file). The theme lookup above is nearest-first with no
@@ -734,44 +829,42 @@ pub async fn semantic_search(
             // a small stale one would answer every query from its few members.
             // Enter diverse mode only when most of the query's own nearest
             // neighbourhood — REST's candidate space: all levels, no window —
-            // is reachable through the shortlist. Runs on the same
-            // viewer-stamped `read`.
+            // is reachable through the shortlist.
+            //
+            // The neighbourhood is ordered by the 1536-d column at EVERY
+            // `centroid_dim`: that column carries the ANN index (the 3072-d one
+            // has none, so ordering by it would scan every row that has one),
+            // and it is also what the flat tail this guard falls back to
+            // searches. Reachability is still checked at `centroid_dim_used`.
+            // A probe failure falls back to flat rather than failing the
+            // request; see `probe_theme_coverage_isolated`.
             let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
             let covered = if themes.is_empty() {
                 false
             } else {
-                use epigraph_engine::diverse_retrieval::{
-                    theme_coverage_sufficient, MIN_THEME_COVERAGE_FRACTION, THEME_COVERAGE_PROBE_K,
+                let probe_vec = match &flat_query_vec {
+                    Some(v) => v.clone(),
+                    None => {
+                        let v = format_embedding_for_pgvector(
+                            &generate_query_embedding(&state, query).await,
+                        );
+                        flat_query_vec = Some(v.clone());
+                        v
+                    }
                 };
-                let coverage = epigraph_db::ClaimThemeRepository::nearest_theme_coverage_since(
-                    &mut *read,
+                let probe = probe_theme_coverage_isolated(
+                    &mut read,
                     &viewer,
-                    &embedding_str,
-                    centroid_dim_used,
+                    &probe_vec,
                     &theme_ids,
                     centroid_dim_used,
-                    THEME_COVERAGE_PROBE_K,
-                    /*paragraph_only=*/ false,
-                    /*since=*/ None,
                 )
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Theme coverage probe failed: {e}"),
-                })?;
-                let sufficient = theme_coverage_sufficient(coverage, MIN_THEME_COVERAGE_FRACTION);
-                if !sufficient {
-                    tracing::info!(
-                        target: "diverse_retrieval.coverage_guard",
-                        handler = "semantic_search",
-                        probed = coverage.probed,
-                        reachable = coverage.reachable,
-                        min_fraction = MIN_THEME_COVERAGE_FRACTION,
-                        centroid_dim = centroid_dim_used,
-                        "the theme shortlist does not cover the query's nearest neighbourhood; \
-                         diverse mode falls back to flat search"
-                    );
-                }
-                sufficient
+                .await?;
+                epigraph_engine::diverse_retrieval::theme_coverage_allows_diverse(
+                    probe,
+                    "semantic_search",
+                    centroid_dim_used,
+                )
             };
 
             // Only enter diverse mode if themes exist AND cover this query.
@@ -970,10 +1063,13 @@ pub async fn semantic_search(
         }
 
         // Flat-path uses the legacy 1536d `claims.embedding` column directly,
-        // so generate the query embedding at that dim. Diverse-path generates
-        // its own (possibly 3072d) embedding above.
-        let query_embedding = generate_query_embedding(&state, query).await;
-        let embedding_str = format_embedding_for_pgvector(&query_embedding);
+        // so it needs the query embedding at that dim. A diverse request that
+        // fell through may already have computed it (see `flat_query_vec`);
+        // otherwise generate it here.
+        let embedding_str = match flat_query_vec {
+            Some(v) => v,
+            None => format_embedding_for_pgvector(&generate_query_embedding(&state, query).await),
+        };
 
         // Step 2b: Flat pgvector similarity search (DEFAULT path)
         //
@@ -1417,8 +1513,16 @@ mod db_integration_tests {
         ids
     }
 
-    /// Insert N claims with `embedding_3072` populated and assigned to the
-    /// given themes (round-robin). Returns inserted claim ids.
+    /// Insert N claims with `embedding_3072` AND the 1536-d `embedding`
+    /// populated, assigned to the given themes (round-robin). Returns
+    /// inserted claim ids.
+    ///
+    /// Both columns, because the diverse path's theme-coverage probe orders
+    /// the query's neighbourhood by the (ANN-indexed) 1536-d column at every
+    /// `centroid_dim` — as the flat fallback does. A claim with only a 3072-d
+    /// embedding is outside that neighbourhood, and a corpus of such claims
+    /// reads as uncovered and falls back. Real 3072-d claims are re-embeddings
+    /// of claims that already carry the 1536-d vector.
     async fn seed_claims_with_3072_embeddings(
         pool: &sqlx::PgPool,
         n: usize,
@@ -1433,16 +1537,18 @@ mod db_integration_tests {
         for i in 0..n {
             let theme_id = theme_ids[i % theme_ids.len()];
             let pgvec = pgvec_at_dim(i as f32 * 0.05, EMBEDDING_DIM_LARGE);
+            let pgvec_1536 = pgvec_at_dim(i as f32 * 0.05, EMBEDDING_DIM);
             let content = format!("test-3072-claim-{}-{}", i, Uuid::new_v4());
             let claim_id = sqlx::query_scalar::<_, Uuid>(
-                "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding_3072, theme_id) \
-                 VALUES ($1, sha256($1::bytea), 0.5, $2, $3::vector, $4) \
+                "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding_3072, theme_id, embedding) \
+                 VALUES ($1, sha256($1::bytea), 0.5, $2, $3::vector, $4, $5::vector) \
                  RETURNING id",
             )
             .bind(&content)
             .bind(agent_id)
             .bind(&pgvec)
             .bind(theme_id)
+            .bind(&pgvec_1536)
             .fetch_one(pool)
             .await
             .expect("seed 3072 claim");
@@ -1491,11 +1597,30 @@ mod db_integration_tests {
         query: &str,
         centroid_dim: Option<u32>,
     ) -> Result<SemanticSearchResponse, ApiError> {
+        call_diverse_search_in_mode(
+            pool,
+            query,
+            centroid_dim,
+            epigraph_db::SessionGucMode::Session,
+        )
+        .await
+    }
+
+    /// [`call_diverse_search_with_query`] with the scoped pool's
+    /// `SessionGucMode` chosen by the caller. Under `Transaction` the handler's
+    /// `read` is one transaction, which is the shape a failed statement can
+    /// poison for every read after it.
+    async fn call_diverse_search_in_mode(
+        pool: sqlx::PgPool,
+        query: &str,
+        centroid_dim: Option<u32>,
+        mode: epigraph_db::SessionGucMode,
+    ) -> Result<SemanticSearchResponse, ApiError> {
         let viewer = epigraph_db::Viewer::resolve(&pool, uuid::Uuid::nil())
             .await
             .expect("resolve viewer");
         let url = database_url_for(&pool).await;
-        let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
+        let scoped = epigraph_db::ScopedPool::connect(&url, mode)
             .await
             .expect("connect a scoped pool");
         let state = AppState::with_scoped_pool(scoped, ApiConfig::default());
@@ -1824,5 +1949,191 @@ mod db_integration_tests {
             returned.is_subset(&themed),
             "every diverse pick must come from the covering theme; got {returned:?}"
         );
+    }
+
+    /// The fallback at `centroid_dim = 3072`, reached by AUTO-DETECT, with the
+    /// ANN indexes kept and planner statistics present (the realistic plan
+    /// shape). A single stale theme carries a 3072-d centroid (so auto-detect
+    /// resolves to 3072) and three off-topic members; the query's neighbourhood
+    /// is sixty relevant unthemed claims. The guard must send the request to
+    /// the flat tail: `centroid_dim_used == None` and the flat top-5.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_at_3072_falls_back_when_theme_set_does_not_cover_query(
+        pool: sqlx::PgPool,
+    ) {
+        let agent = seed_agent(&pool, "coverage-3072").await;
+        let off_3072 = pgvec_at_dim(0.0, EMBEDDING_DIM_LARGE);
+
+        let theme = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claim_themes (label, description) VALUES ('stale-3072', 'coverage test') \
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("create theme");
+        sqlx::query("UPDATE claim_themes SET centroid_3072 = $2::vector WHERE id = $1")
+            .bind(theme)
+            .bind(&off_3072)
+            .execute(&pool)
+            .await
+            .expect("set 3072 centroid");
+
+        let mut off = std::collections::HashSet::new();
+        for i in 0..3 {
+            let c = seed_claim_1536(
+                &pool,
+                agent,
+                &format!("off-topic-3072-{i}"),
+                &off_topic(i as f32 * 0.01),
+                Some(theme),
+            )
+            .await;
+            sqlx::query("UPDATE claims SET embedding_3072 = $2::vector WHERE id = $1")
+                .bind(c)
+                .bind(&off_3072)
+                .execute(&pool)
+                .await
+                .expect("set 3072 embedding");
+            off.insert(c);
+        }
+        let mut relevant = Vec::new();
+        for i in 0..60 {
+            relevant.push(
+                seed_claim_1536(
+                    &pool,
+                    agent,
+                    &format!("relevant-3072-{i}"),
+                    &query_neighbour(i as f32 * 0.01),
+                    None,
+                )
+                .await,
+            );
+        }
+        analyze_claims(&pool).await;
+
+        let resp = call_diverse_search_with_query(pool.clone(), COVERAGE_QUERY, None)
+            .await
+            .expect("diverse search must succeed");
+
+        assert_eq!(
+            resp.centroid_dim_used, None,
+            "an uncovered query must be answered by the flat tail even when auto-detect \
+             resolved to 3072"
+        );
+        let returned: std::collections::HashSet<Uuid> =
+            resp.results.iter().map(|r| r.claim_id).collect();
+        assert!(
+            returned.is_disjoint(&off),
+            "the stale 3072-d theme's off-topic members must not be returned"
+        );
+        let flat_top_5: std::collections::HashSet<Uuid> = relevant[..5].iter().copied().collect();
+        assert_eq!(returned, flat_top_5, "the fallback returns the flat top-5");
+    }
+
+    /// A FAILING coverage probe falls back to flat instead of failing the
+    /// request, in the given `SessionGucMode`.
+    ///
+    /// Layout: one theme holding sixty relevant claims (a covered query — the
+    /// control run proves diverse mode runs), plus one group-private claim
+    /// nearest of all that the public viewer must never see. The probe is then
+    /// broken by renaming `claims.theme_id`, which only the probe and the
+    /// diverse candidate query read (the auto-detect and theme lookup read
+    /// `claim_themes`; the flat search reads neither).
+    ///
+    /// Under `Transaction` this is the savepoint's test: without it the failed
+    /// probe aborts the request's transaction and the flat search on the same
+    /// `read` fails with "current transaction is aborted".
+    async fn assert_probe_failure_falls_back_to_flat(
+        pool: sqlx::PgPool,
+        mode: epigraph_db::SessionGucMode,
+    ) {
+        let agent = seed_agent(&pool, "coverage-probe-fails").await;
+        let theme = seed_theme_1536(&pool, "covering", &query_neighbour(0.0)).await;
+        let mut relevant = Vec::new();
+        for i in 0..60 {
+            relevant.push(
+                seed_claim_1536(
+                    &pool,
+                    agent,
+                    &format!("themed-relevant-{i}"),
+                    &query_neighbour(0.01 + i as f32 * 0.01),
+                    Some(theme),
+                )
+                .await,
+            );
+        }
+        let private = seed_claim_1536(
+            &pool,
+            agent,
+            "group-private-nearest",
+            &query_neighbour(0.0),
+            Some(theme),
+        )
+        .await;
+        // A real personal group owned by the author (the shape
+        // `AgentRepository::ensure_personal_group` mints); the nil test viewer
+        // is not a member.
+        let group: Uuid = sqlx::query_scalar(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ('coverage-private', 'did:epigraph:personal:' || $1::text, ''::bytea, \
+                     'personal', $1) \
+             RETURNING id",
+        )
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a private group");
+        sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+            .bind(private)
+            .bind(group)
+            .execute(&pool)
+            .await
+            .expect("make the nearest claim group-private");
+
+        let control = call_diverse_search_in_mode(pool.clone(), COVERAGE_QUERY, Some(1536), mode)
+            .await
+            .expect("control diverse search must succeed");
+        assert_eq!(
+            control.centroid_dim_used,
+            Some(1536),
+            "control: the covered query runs diverse selection"
+        );
+
+        sqlx::query("ALTER TABLE claims RENAME COLUMN theme_id TO theme_id_unavailable")
+            .execute(&pool)
+            .await
+            .expect("break the coverage probe");
+
+        let resp = call_diverse_search_in_mode(pool.clone(), COVERAGE_QUERY, Some(1536), mode)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("a failed coverage probe must fall back to flat, not fail ({mode:?}): {e:?}")
+            });
+        assert_eq!(
+            resp.centroid_dim_used, None,
+            "the fallback answers from the flat tail ({mode:?})"
+        );
+        let returned: std::collections::HashSet<Uuid> =
+            resp.results.iter().map(|r| r.claim_id).collect();
+        assert!(
+            !returned.contains(&private),
+            "the flat fallback must stay viewer-scoped ({mode:?})"
+        );
+        let flat_top_5: std::collections::HashSet<Uuid> = relevant[..5].iter().copied().collect();
+        assert_eq!(
+            returned, flat_top_5,
+            "the fallback returns the viewer's flat top-5 ({mode:?})"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_probe_failure_falls_back_in_session_mode(pool: sqlx::PgPool) {
+        assert_probe_failure_falls_back_to_flat(pool, epigraph_db::SessionGucMode::Session).await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_probe_failure_falls_back_in_transaction_mode(pool: sqlx::PgPool) {
+        assert_probe_failure_falls_back_to_flat(pool, epigraph_db::SessionGucMode::Transaction)
+            .await;
     }
 }
