@@ -1591,7 +1591,8 @@ impl ClaimRepository {
     ///
     /// Backs the **default** path of `POST /api/v1/search/semantic` — the one
     /// taken whenever `diverse` is absent, and also whenever `diverse=true` but
-    /// the corpus has no themes yet.
+    /// the corpus has no themes yet or the themes do not cover the query's
+    /// nearest neighbourhood (the theme-coverage guard).
     ///
     /// # Why this moved out of `routes/search.rs`
     ///

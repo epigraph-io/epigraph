@@ -573,7 +573,8 @@ pub async fn semantic_search(
         // ACQUIRED HERE, AND THE PLACEMENT IS FORCED rather than chosen. This
         // handler has two success paths — the diverse `return Ok(...)` and the
         // flat tail — and the diverse path FALLS THROUGH to the flat one when
-        // the corpus has no themes. Acquiring separately per path would put the
+        // the corpus has no themes or the themes do not cover the query.
+        // Acquiring separately per path would put the
         // fall-through shape on two connections and two transactions, which is
         // precisely the property the conversion exists to establish. One acquire
         // above the branch is the only shape that holds for all three request
@@ -977,7 +978,8 @@ pub async fn semantic_search(
         //
         // PR-07: this is reached whenever `diverse` is absent — i.e. the
         // default request shape — and whenever `diverse=true` but the corpus
-        // has no themes. It ran unfiltered and returned `claims.content`, with
+        // has no themes (or, since the theme-coverage guard, themes that do not
+        // cover the query). It ran unfiltered and returned `claims.content`, with
         // no `check_content_access` pass behind it: an authenticated principal
         // could submit an arbitrary probe vector and get other tenants' claim
         // text back, ranked by relevance. The statement now lives in
