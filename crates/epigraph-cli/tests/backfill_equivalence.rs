@@ -8,8 +8,8 @@
 //!   under another key), although the binary now resolves it once per distinct
 //!   author of a batch. The batch size is 3 so the walk spans many batches and
 //!   authors straddle batch boundaries.
-//! * the 17 claim-derived tables (rows seeded in evidence, reasoning_traces,
-//!   challenges and claim_versions): every row takes its claim's tenancy, except a
+//! * the 17 claim-derived tables (a row seeded in EVERY one, each asserted
+//!   present before the comparison): every row takes its claim's tenancy, except a
 //!   WRITER-OWNED row (kept, the claim being public) and a PINNED evidence row
 //!   (owner kept, visibility `group`): 110/114's rules, unchanged.
 //! * `edges`: every edge equals the meet 120's body computed, recomputed here
@@ -28,7 +28,10 @@
 //!   dropped -> the evidence->claim edge onto the private claim takes the wrong
 //!   meet;
 //! * `'challenges'` removed from 122 section 8's `derived` array -> the
-//!   challenge row stays world-owned while its claim moves.
+//!   challenge row stays world-owned while its claim moves;
+//! * `'claim_cluster_membership'` removed from the same array (delta review
+//!   DIS-D9: before every table was seeded, this left the test green) -> the
+//!   membership row stays world-owned while its claim moves.
 
 mod viewer_fixture;
 
@@ -207,6 +210,19 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
         ),
     )
     .await;
+    // Delta review DIS-D9: a row in EVERY one of the 17 derived tables, so each
+    // arm of 122 section 8's `derived` array is compared on at least one row
+    // (a fresh database has no frame, so the mass_functions seed below used to
+    // insert nothing, and 13 of the 17 tables were compared empty). Owner and
+    // visibility are left to the inherit trigger, as for the rows above.
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses, owner_group_id, visibility) \
+         VALUES ('equivalence frame', ARRAY['h0','h1'], $1, 'public') RETURNING id",
+    )
+    .bind(WORLD)
+    .fetch_one(&pool)
+    .await
+    .expect("frame");
     exec(
         &pool,
         &format!(
@@ -216,6 +232,112 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
         ),
     )
     .await;
+    let entity: Uuid = sqlx::query_scalar(
+        "INSERT INTO entities (canonical_name, type_top) VALUES ('equivalence entity', 'Concept') \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("entity");
+    let (xs, xo): (Uuid, Uuid) = sqlx::query_as(
+        "WITH a AS (INSERT INTO experiment_entities (canonical_name, entity_type) \
+                    VALUES ('equivalence s', 'concept') RETURNING id), \
+              b AS (INSERT INTO experiment_entities (canonical_name, entity_type) \
+                    VALUES ('equivalence o', 'concept') RETURNING id) \
+         SELECT a.id, b.id FROM a, b",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("experiment entities");
+    let run = Uuid::new_v4();
+    let cluster = Uuid::new_v4();
+    exec(
+        &pool,
+        &format!("INSERT INTO graph_cluster_runs (run_id, cluster_count) VALUES ('{run}', 1)"),
+    )
+    .await;
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO graph_clusters (id, run_id, label, size) \
+             VALUES ('{cluster}', '{run}', 'equivalence cluster', 1)"
+        ),
+    )
+    .await;
+    let theme: Uuid = sqlx::query_scalar(
+        "INSERT INTO claim_themes (label) VALUES ('equivalence theme') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("theme");
+    let hood: Uuid = sqlx::query_scalar(
+        "INSERT INTO graph_neighborhoods (run_id, theme_id, label, size) \
+         VALUES ($1, $2, 'equivalence neighborhood', 1) RETURNING id",
+    )
+    .bind(run)
+    .bind(theme)
+    .fetch_one(&pool)
+    .await
+    .expect("neighborhood");
+    let fragment: Uuid = sqlx::query_scalar(
+        "WITH s AS (INSERT INTO harvester_sources (content_hash, modality) \
+                    VALUES ('\\x01'::bytea, 'text') RETURNING id) \
+         INSERT INTO harvester_fragments (source_id, content_hash, content_text, \
+                                          owner_group_id, visibility) \
+         SELECT s.id, '\\x02'::bytea, 'equivalence fragment', $1, 'public' FROM s RETURNING id",
+    )
+    .bind(WORLD)
+    .fetch_one(&pool)
+    .await
+    .expect("fragment");
+    for (i, sql) in [
+        "INSERT INTO triples (claim_id, subject_id, predicate, confidence, extractor, \
+                              object_literal) VALUES ($1, $2, 'relates', 0.5, 'equiv', 'x')",
+        "INSERT INTO entity_mentions (entity_id, claim_id, surface_form, mention_role, \
+                                      confidence, extractor) \
+         VALUES ($2, $1, 'x', 'subject', 0.5, 'equiv')",
+        "INSERT INTO ds_combined_beliefs (frame_id, claim_id, scope_type, belief, plausibility) \
+         VALUES ($3, $1, 'global', 0.3, 0.7)",
+        "INSERT INTO ds_bayesian_divergence (claim_id, frame_id, pignistic_prob, \
+                                             bayesian_posterior, kl_divergence) \
+         VALUES ($1, $3, 0.5, 0.5, 0.0)",
+        "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $3)",
+        "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $4)",
+        "INSERT INTO experiment_triples (claim_id, subject_entity_id, predicate, \
+                                         object_entity_id) VALUES ($1, $5, 'relates', $6)",
+        "INSERT INTO experiment_entity_mentions (claim_id, entity_id, surface_form) \
+         VALUES ($1, $5, 'x')",
+        "INSERT INTO claim_clusters (claim_id, cluster_id, centroid_distance, \
+                                     second_centroid_dist, boundary_ratio, silhouette_score, \
+                                     cluster_run_id) VALUES ($1, 1, 0.1, 0.2, 0.5, 0.3, $7)",
+        "INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) VALUES ($1, $8, $7)",
+        "INSERT INTO claim_neighborhood_membership (run_id, claim_id, neighborhood_id) \
+         VALUES ($7, $1, $9)",
+        "INSERT INTO claim_signature_revocations (claim_id, previous_signature, \
+                                                  previous_content_hash, revoked_by, reason) \
+         VALUES ($1, $10, $11, $12, 'equivalence probe')",
+    ]
+    .iter()
+    .enumerate()
+    {
+        // Spread over claims of different authors (10.. are past the rows above).
+        sqlx::query(sql)
+            .bind(claims[10 + i])
+            .bind(entity)
+            .bind(frame)
+            .bind(fragment)
+            .bind(xs)
+            .bind(xo)
+            .bind(run)
+            .bind(cluster)
+            .bind(hood)
+            .bind(vec![7u8; 64])
+            .bind(vec![8u8; 32])
+            .bind(canon)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("derived seed {i}: {e}"));
+    }
     // A private claim in another group, and edges onto it: public->private
     // (stored STALE as world/public, so the meet must repair it), evidence->
     // private, claim->claim public, claim->agent.
@@ -394,17 +516,18 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
         })
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
-    let seeded: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM ({union}) d WHERE d.claim_id = ANY($1)"
-    ))
-    .bind(&claims)
-    .fetch_one(&pool)
-    .await
-    .expect("derived rows seeded");
-    assert!(
-        seeded >= 4,
-        "the fixture seeds derived rows in several tables to compare, got {seeded}"
-    );
+    // Every table carries a row to compare (delta review DIS-D9): an arm with
+    // no row proves nothing about that arm.
+    for (t, keep) in DERIVED {
+        let seeded: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {t} d WHERE {keep} AND d.claim_id = ANY($1)"
+        ))
+        .bind(&claims)
+        .fetch_one(&pool)
+        .await
+        .expect("derived rows seeded");
+        assert!(seeded >= 1, "the fixture seeds no {t} row to compare");
+    }
     let derived_off: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM ({union}) d JOIN claims c ON c.id = d.claim_id
          WHERE c.id = ANY($1)
