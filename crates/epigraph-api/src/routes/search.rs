@@ -561,10 +561,12 @@ pub async fn semantic_search(
         // ---- The one viewer-stamped connection every read below runs on ----
         //
         // PR-29, conversion shard 3 against
-        // `D-PR17-request-path-never-stamps-session-gucs`. All six of this
+        // `D-PR17-request-path-never-stamps-session-gucs`. All seven of this
         // handler's reads run on this handle: the `frac_3072` auto-detect, the
-        // theme lookup, the candidate pull, the full-row fetch, the graph
-        // neighbours, and the flat search. `read_as` and not `acquire_as`: the
+        // theme lookup, the theme-coverage probe, the candidate pull, the
+        // full-row fetch, the graph neighbours, and the flat search. (The
+        // coverage probe was added after PR-29 and follows the same rule.)
+        // `read_as` and not `acquire_as`: the
         // latter hard-refuses `EPIGRAPH_SESSION_GUC_MODE=transaction`, the
         // pooler fallback `bin/server.rs` advertises to operators.
         //
@@ -597,7 +599,7 @@ pub async fn semantic_search(
         // transcribed so a sizing change invalidates the citation instead of
         // silently invalidating this comment. (An earlier revision wrote "8",
         // which was the background JOB pool; since operator decision D9 that
-        // pool lives in `bin/drain_jobs.rs`, not in this process.) Bounded regardless: at most six statements on one handle, no
+        // pool lives in `bin/drain_jobs.rs`, not in this process.) Bounded regardless: at most seven statements on one handle, no
         // per-node loop, no unbounded N. `detect_voids` in `routes/voids.rs` is
         // the shape in this shard that is NOT bounded; its own doc says so.
         // This shard does NOT discharge
@@ -627,7 +629,8 @@ pub async fn semantic_search(
 
         // Step 2a: Diverse hierarchical retrieval path (theme-based + coverage selection)
         // When `diverse=true`, navigate themes first, then apply submodular selection.
-        // Falls through to flat search if no themes exist yet (clustering hasn't run).
+        // Falls through to flat search if no themes exist yet (clustering hasn't run)
+        // or if the themes do not cover the query's nearest neighbourhood.
         if request.diverse.unwrap_or(false) {
             let max_themes = request.max_themes.unwrap_or(5) as i32;
             let alpha = request.diversity_weight.unwrap_or(0.5);
@@ -722,8 +725,53 @@ pub async fn semantic_search(
                 message: format!("Theme search failed: {e}"),
             })?;
 
-            // Only enter diverse mode if themes have been populated
-            if !themes.is_empty() {
+            // Theme-coverage guard (same rule as
+            // `epigraph_engine::diverse_retrieval::run_diverse_pipeline`, which
+            // this route does not call — see the import note at the top of
+            // this file). The theme lookup above is nearest-first with no
+            // relevance floor, so any non-empty theme set wins the shortlist;
+            // a small stale one would answer every query from its few members.
+            // Enter diverse mode only when the query's own nearest
+            // neighbourhood — REST's candidate space: all levels, no window —
+            // is mostly themed. Runs on the same viewer-stamped `read`.
+            let covered = if themes.is_empty() {
+                false
+            } else {
+                use epigraph_engine::diverse_retrieval::{
+                    theme_coverage_sufficient, MIN_THEME_COVERAGE_FRACTION, THEME_COVERAGE_PROBE_K,
+                };
+                let coverage =
+                    epigraph_db::ClaimThemeRepository::nearest_theme_coverage_at_dim_since(
+                        &mut *read,
+                        &viewer,
+                        &embedding_str,
+                        THEME_COVERAGE_PROBE_K,
+                        centroid_dim_used,
+                        /*paragraph_only=*/ false,
+                        /*since=*/ None,
+                    )
+                    .await
+                    .map_err(|e| ApiError::InternalError {
+                        message: format!("Theme coverage probe failed: {e}"),
+                    })?;
+                let sufficient = theme_coverage_sufficient(coverage, MIN_THEME_COVERAGE_FRACTION);
+                if !sufficient {
+                    tracing::info!(
+                        target: "diverse_retrieval.coverage_guard",
+                        handler = "semantic_search",
+                        probed = coverage.probed,
+                        themed = coverage.themed,
+                        min_fraction = MIN_THEME_COVERAGE_FRACTION,
+                        centroid_dim = centroid_dim_used,
+                        "themes do not cover the query's nearest neighbourhood; \
+                         diverse mode falls back to flat search"
+                    );
+                }
+                sufficient
+            };
+
+            // Only enter diverse mode if themes exist AND cover this query.
+            if covered {
                 let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
 
                 // Retrieve candidate claims via the shared helper — same
@@ -913,8 +961,8 @@ pub async fn semantic_search(
                     centroid_dim_used: Some(centroid_dim_used),
                 }));
             }
-            // No themes yet — fall through to flat search below, ON THE SAME
-            // `read`. This fall-through is why the acquire is above the branch:
+            // No themes yet, or themes that do not cover this query — fall
+            // through to flat search below, ON THE SAME `read`. This fall-through is why the acquire is above the branch:
             // the flat search this shape reaches must be the same stamped
             // session the theme lookup ran on.
         }
@@ -1428,6 +1476,18 @@ mod db_integration_tests {
         pool: sqlx::PgPool,
         centroid_dim: Option<u32>,
     ) -> Result<SemanticSearchResponse, ApiError> {
+        call_diverse_search_with_query(pool, "test query for diverse search", centroid_dim).await
+    }
+
+    /// [`call_diverse_search`] with a caller-chosen query text. No embedding
+    /// service is configured on the test state, so the handler embeds `query`
+    /// with [`generate_mock_embedding_with_dim`] — which lets a test compute
+    /// the exact query vector and seed claims at known similarities to it.
+    async fn call_diverse_search_with_query(
+        pool: sqlx::PgPool,
+        query: &str,
+        centroid_dim: Option<u32>,
+    ) -> Result<SemanticSearchResponse, ApiError> {
         let viewer = epigraph_db::Viewer::resolve(&pool, uuid::Uuid::nil())
             .await
             .expect("resolve viewer");
@@ -1437,7 +1497,7 @@ mod db_integration_tests {
             .expect("connect a scoped pool");
         let state = AppState::with_scoped_pool(scoped, ApiConfig::default());
         let request = SemanticSearchRequest {
-            query: "test query for diverse search".to_string(),
+            query: query.to_string(),
             limit: Some(5),
             min_similarity: None,
             claim_type: None,
@@ -1521,6 +1581,219 @@ mod db_integration_tests {
             resp.centroid_dim_used,
             Some(3072),
             "auto-detect should pick 3072 when ≥50% of themes have centroid_3072 set"
+        );
+    }
+
+    // ---- Theme-coverage guard -------------------------------------------
+    //
+    // Diverse mode draws candidates ONLY from themed claims, and the theme
+    // shortlist is `ORDER BY distance LIMIT n` with no relevance floor. A small
+    // stale theme set therefore captured every diverse query. These arms pin
+    // that diverse mode falls back to flat search when the query's own
+    // neighbourhood is not covered by themes, and keeps diverse selection when
+    // it is.
+
+    const COVERAGE_QUERY: &str = "theme coverage guard query";
+
+    fn to_pgvec(v: &[f32]) -> String {
+        let inner: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+        format!("[{}]", inner.join(","))
+    }
+
+    /// The exact vector the handler will embed [`COVERAGE_QUERY`] to (no
+    /// embedding service is configured on the test state), with `drift` added
+    /// on an axis the query does not use — so cosine similarity to the query
+    /// is `1 / sqrt(1 + drift²)`, strictly decreasing in `drift`.
+    fn query_neighbour(drift: f32) -> String {
+        let mut v = generate_mock_embedding_with_dim(COVERAGE_QUERY, EMBEDDING_DIM);
+        v[EMBEDDING_DIM - 2] = drift;
+        to_pgvec(&v)
+    }
+
+    /// A vector orthogonal to the query (the query's mock embedding is zero on
+    /// the last axis), nudged by `drift` on a second unused axis.
+    fn off_topic(drift: f32) -> String {
+        let mut v = vec![0.0f32; EMBEDDING_DIM];
+        v[EMBEDDING_DIM - 1] = 1.0;
+        v[EMBEDDING_DIM - 3] = drift;
+        to_pgvec(&v)
+    }
+
+    async fn seed_theme_1536(pool: &sqlx::PgPool, label: &str, centroid: &str) -> Uuid {
+        let theme_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claim_themes (label, description) VALUES ($1, 'coverage test') \
+             RETURNING id",
+        )
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .expect("create theme");
+        sqlx::query("UPDATE claim_themes SET centroid = $2::vector WHERE id = $1")
+            .bind(theme_id)
+            .bind(centroid)
+            .execute(pool)
+            .await
+            .expect("set centroid");
+        theme_id
+    }
+
+    async fn seed_claim_1536(
+        pool: &sqlx::PgPool,
+        agent_id: Uuid,
+        content: &str,
+        embedding: &str,
+        theme_id: Option<Uuid>,
+    ) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, theme_id) \
+             VALUES ($1, sha256($1::bytea), 0.5, $2, $3::vector, $4) \
+             RETURNING id",
+        )
+        .bind(content)
+        .bind(agent_id)
+        .bind(embedding)
+        .bind(theme_id)
+        .fetch_one(pool)
+        .await
+        .expect("seed 1536 claim")
+    }
+
+    /// Give the planner real statistics, as a live database has. On a
+    /// freshly-seeded, never-analysed table the theme-candidate query plans as
+    /// an HNSW scan whose post-filter on `theme_id` finds nothing among the
+    /// nearest rows, so diverse mode comes back empty and falls through BY
+    /// ACCIDENT, masking the bug. With statistics the selective
+    /// `theme_id = ANY(..)` predicate goes through its btree index and returns
+    /// the themed rows, which is what a populated deployment does.
+    async fn analyze_claims(pool: &sqlx::PgPool) {
+        sqlx::query("ANALYZE claims")
+            .execute(pool)
+            .await
+            .expect("analyze claims");
+    }
+
+    /// The bug, on the REST surface: many relevant UNTHEMED claims plus a tiny
+    /// off-topic theme set. Before the guard the handler entered diverse mode
+    /// (themes were non-empty) and answered with the off-topic theme members
+    /// only. It must instead fall back to flat search — observable as
+    /// `centroid_dim_used == None` (the flat tail's value) and the flat top-5.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_falls_back_when_theme_set_does_not_cover_query(pool: sqlx::PgPool) {
+        let agent = seed_agent(&pool, "coverage-bug").await;
+
+        let theme = seed_theme_1536(&pool, "stale-probe-theme", &off_topic(0.0)).await;
+        let mut off = std::collections::HashSet::new();
+        for i in 0..3 {
+            off.insert(
+                seed_claim_1536(
+                    &pool,
+                    agent,
+                    &format!("off-topic-{i}"),
+                    &off_topic(i as f32 * 0.01),
+                    Some(theme),
+                )
+                .await,
+            );
+        }
+        let mut relevant = Vec::new();
+        for i in 0..60 {
+            relevant.push(
+                seed_claim_1536(
+                    &pool,
+                    agent,
+                    &format!("relevant-{i}"),
+                    &query_neighbour(i as f32 * 0.01),
+                    None,
+                )
+                .await,
+            );
+        }
+        analyze_claims(&pool).await;
+
+        let resp = call_diverse_search_with_query(pool.clone(), COVERAGE_QUERY, Some(1536))
+            .await
+            .expect("diverse search must succeed");
+
+        let returned: std::collections::HashSet<Uuid> =
+            resp.results.iter().map(|r| r.claim_id).collect();
+        let leaked: Vec<&Uuid> = returned.intersection(&off).collect();
+        assert!(
+            leaked.is_empty(),
+            "diverse=true returned off-topic members of an uncovering theme set: {leaked:?}"
+        );
+        let flat_top_5: std::collections::HashSet<Uuid> = relevant[..5].iter().copied().collect();
+        assert_eq!(
+            returned, flat_top_5,
+            "uncovered query must fall back to flat search and return the 5 most relevant claims"
+        );
+        assert_eq!(
+            resp.centroid_dim_used, None,
+            "the fallback answers from the flat tail, which reports no centroid_dim"
+        );
+    }
+
+    /// Per-query, not corpus-wide: most of the corpus is an unthemed far
+    /// cluster, but the query's neighbourhood is themed except for its single
+    /// nearest claim. Diverse selection must still run: `centroid_dim_used` is
+    /// `Some`, and the unthemed nearest claim (which flat search would rank
+    /// first) is absent because diverse candidates are themed only.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_keeps_diverse_selection_when_query_is_covered(pool: sqlx::PgPool) {
+        let agent = seed_agent(&pool, "coverage-ok").await;
+
+        let theme = seed_theme_1536(&pool, "near-theme", &query_neighbour(0.0)).await;
+        let unthemed_nearest = seed_claim_1536(
+            &pool,
+            agent,
+            "unthemed-nearest",
+            &query_neighbour(0.0),
+            None,
+        )
+        .await;
+        let mut themed = std::collections::HashSet::new();
+        for i in 0..60 {
+            themed.insert(
+                seed_claim_1536(
+                    &pool,
+                    agent,
+                    &format!("themed-{i}"),
+                    &query_neighbour(0.05 + i as f32 * 0.01),
+                    Some(theme),
+                )
+                .await,
+            );
+        }
+        for i in 0..150 {
+            seed_claim_1536(
+                &pool,
+                agent,
+                &format!("far-{i}"),
+                &off_topic(i as f32 * 0.01),
+                None,
+            )
+            .await;
+        }
+        analyze_claims(&pool).await;
+
+        let resp = call_diverse_search_with_query(pool.clone(), COVERAGE_QUERY, Some(1536))
+            .await
+            .expect("diverse search must succeed");
+
+        assert_eq!(
+            resp.centroid_dim_used,
+            Some(1536),
+            "a covered query must be answered by the diverse path"
+        );
+        let returned: std::collections::HashSet<Uuid> =
+            resp.results.iter().map(|r| r.claim_id).collect();
+        assert_eq!(returned.len(), 5, "limit=5 → 5 results");
+        assert!(
+            !returned.contains(&unthemed_nearest),
+            "the unthemed nearest claim can only appear via the flat fallback"
+        );
+        assert!(
+            returned.is_subset(&themed),
+            "every diverse pick must come from the covering theme; got {returned:?}"
         );
     }
 }
