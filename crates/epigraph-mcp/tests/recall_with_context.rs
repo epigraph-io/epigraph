@@ -1831,3 +1831,361 @@ async fn epistemic_edges_respect_the_viewer_boundary(pool: PgPool) {
          visibility predicate its ten sibling queries carry."
     );
 }
+
+// ============================================================================
+// Theme-coverage guard (diverse mode must not route a query through a theme
+// set that does not cover the query's neighbourhood)
+// ============================================================================
+//
+// Diverse mode draws its candidates ONLY from claims assigned to a theme. When
+// the theme set is small and stale — built once over a narrow slice of a
+// corpus that has since grown — every diverse query is funnelled through that
+// slice, and the nearest themes win the shortlist however far away they are,
+// because the theme lookup is `ORDER BY distance LIMIT n` with no relevance
+// floor.
+
+/// Seed `n` UNTHEMED paragraphs in the query's bucket (0) with strictly
+/// decreasing similarity to `cluster_pgvec(0, 1.0)`. Returned in similarity
+/// order, so `ids[..k]` is the flat top-k.
+async fn seed_unthemed_relevant(
+    pool: &PgPool,
+    agent: Uuid,
+    paper: Uuid,
+    tag: &str,
+    n: usize,
+) -> Vec<Uuid> {
+    let mut ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, (i as f32) * 0.01);
+        ids.push(
+            diverse_fixture::seed_paragraph(pool, agent, paper, &format!("{tag}-{i}"), &v, None)
+                .await,
+        );
+    }
+    ids
+}
+
+/// The bug: a large corpus of relevant, UNTHEMED paragraphs plus a tiny theme
+/// set that sits in an orthogonal (off-topic) region. Before the guard,
+/// `diverse=true` selected the off-topic theme (it is the nearest theme there
+/// is) and returned only its members — every relevant paragraph was invisible.
+/// After the guard, the query's nearest neighbourhood is measured as uncovered
+/// and the request falls back to flat retrieval, returning the relevant hits.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_mode_falls_back_when_tiny_theme_set_does_not_cover_query(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/cov-bug", "coverage bug").await;
+
+    // Tiny, off-topic theme set: one theme, three members, all in bucket 5
+    // (orthogonal to the query in bucket 0).
+    let off_topic_theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "stale-probe-theme",
+        &diverse_fixture::cluster_pgvec(5, 1.0),
+    )
+    .await;
+    let mut off_topic = std::collections::HashSet::new();
+    for i in 0..3 {
+        off_topic.insert(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper,
+                &format!("off-topic-{i}"),
+                &diverse_fixture::cluster_pgvec(5, 1.0),
+                Some(off_topic_theme),
+            )
+            .await,
+        );
+    }
+
+    // Large relevant corpus that was never themed.
+    let relevant = seed_unthemed_relevant(&pool, agent, paper, "relevant", 120).await;
+
+    // Give the planner real statistics, as a live database has. Without them
+    // a freshly-seeded table plans the theme-candidate query as an HNSW scan
+    // whose post-filter on `theme_id` finds nothing among the nearest rows, so
+    // the pipeline comes back empty and falls back BY ACCIDENT — masking the
+    // bug. With statistics, the selective `theme_id = ANY(..)` predicate is
+    // planned through its btree index and the off-topic members are returned,
+    // which is what a populated deployment does.
+    sqlx::query("ANALYZE claims")
+        .execute(&pool)
+        .await
+        .expect("analyze claims");
+
+    let server = build_test_server(pool.clone());
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+    let params = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 5);
+    let resp = parse_response(
+        recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query)
+            .await
+            .expect("diverse recall"),
+    );
+
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+    let leaked: Vec<&Uuid> = returned.intersection(&off_topic).collect();
+    assert!(
+        leaked.is_empty(),
+        "diverse=true returned off-topic members of a theme set that covers none of the \
+         query's neighbourhood: {leaked:?}"
+    );
+    let flat_top_5: std::collections::HashSet<Uuid> = relevant[..5].iter().copied().collect();
+    assert_eq!(
+        returned, flat_top_5,
+        "with the theme set not covering the query, diverse=true must fall back to flat \
+         retrieval and return the 5 most relevant (unthemed) paragraphs"
+    );
+}
+
+/// The guard must be PER-QUERY, not corpus-wide: here most of the corpus is
+/// unthemed (a large orthogonal cluster), but the query's own neighbourhood is
+/// almost entirely themed. Diverse selection must still run — observable
+/// because diverse candidates come only from themes, so the single UNTHEMED
+/// paragraph that is the query's nearest neighbour must NOT be returned (flat
+/// retrieval would rank it first).
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_covered(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/cov-ok", "coverage ok").await;
+
+    let near_theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "near-theme",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+    )
+    .await;
+
+    // The query's nearest neighbour, deliberately left unthemed.
+    let unthemed_nearest = diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "unthemed-nearest",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+        None,
+    )
+    .await;
+
+    // 60 themed paragraphs in the query's region, all slightly further away.
+    let mut themed = std::collections::HashSet::new();
+    for i in 0..60 {
+        let v = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.05 + (i as f32) * 0.01);
+        themed.insert(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper,
+                &format!("themed-{i}"),
+                &v,
+                Some(near_theme),
+            )
+            .await,
+        );
+    }
+
+    // A large unthemed cluster far from the query, so corpus-wide coverage is
+    // well under half. A corpus-ratio guard would (wrongly) disable diverse
+    // mode here; a per-query guard must not.
+    for i in 0..150 {
+        let v = diverse_fixture::cluster_pgvec_with_drift(6, 1.0, 7, (i as f32) * 0.01);
+        diverse_fixture::seed_paragraph(&pool, agent, paper, &format!("far-{i}"), &v, None).await;
+    }
+    // Planner statistics, as in the coverage-bug test above.
+    sqlx::query("ANALYZE claims")
+        .execute(&pool)
+        .await
+        .expect("analyze claims");
+
+    let server = build_test_server(pool.clone());
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+    let params = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 5);
+    let resp = parse_response(
+        recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query)
+            .await
+            .expect("diverse recall"),
+    );
+
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+    assert_eq!(returned.len(), 5, "budget=5 → 5 results");
+    assert!(
+        !returned.contains(&unthemed_nearest),
+        "a covered neighbourhood must still go through diverse selection, whose candidates \
+         are themed only — the unthemed nearest neighbour appearing means the request fell \
+         back to flat retrieval"
+    );
+    assert!(
+        returned.is_subset(&themed),
+        "every diverse pick must come from the covering theme; got {returned:?}"
+    );
+}
+
+/// Seed a corpus of exactly `THEME_COVERAGE_PROBE_K` paragraphs in the query's
+/// region, laid out nearest-first as `(themed?, count)` runs, so the guard's
+/// probe sees the whole corpus in a known order. Returns `(themed, unthemed)`
+/// ids, each in nearest-first order.
+async fn seed_coverage_layout(
+    pool: &PgPool,
+    agent: Uuid,
+    paper: Uuid,
+    theme: Uuid,
+    layout: &[(bool, usize)],
+) -> (Vec<Uuid>, Vec<Uuid>) {
+    let total: usize = layout.iter().map(|(_, n)| n).sum();
+    assert_eq!(
+        total,
+        epigraph_engine::diverse_retrieval::THEME_COVERAGE_PROBE_K as usize,
+        "the boundary layout must be exactly one probe wide"
+    );
+    let (mut themed, mut unthemed) = (Vec::new(), Vec::new());
+    let mut rank = 0usize;
+    for &(is_themed, n) in layout {
+        for _ in 0..n {
+            let v = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, rank as f32 * 0.01);
+            let id = diverse_fixture::seed_paragraph(
+                pool,
+                agent,
+                paper,
+                &format!("layout-{rank}"),
+                &v,
+                is_themed.then_some(theme),
+            )
+            .await;
+            if is_themed {
+                themed.push(id);
+            } else {
+                unthemed.push(id);
+            }
+            rank += 1;
+        }
+    }
+    sqlx::query("ANALYZE claims")
+        .execute(pool)
+        .await
+        .expect("analyze claims");
+    (themed, unthemed)
+}
+
+/// Themed count needed to sit exactly AT the threshold within one probe.
+fn themed_at_threshold() -> usize {
+    use epigraph_engine::diverse_retrieval::{MIN_THEME_COVERAGE_FRACTION, THEME_COVERAGE_PROBE_K};
+    (MIN_THEME_COVERAGE_FRACTION * f64::from(THEME_COVERAGE_PROBE_K)).ceil() as usize
+}
+
+/// Boundary, inclusive side: exactly the threshold share of the probe is
+/// themed, so diverse selection runs. Observable because the single nearest
+/// paragraph is UNTHEMED — flat retrieval would rank it first, diverse cannot
+/// see it.
+///
+/// Layout is nearest-first: 1 unthemed, then the threshold count themed, then
+/// the rest unthemed. Placing the extra unthemed rows FURTHEST means that if an
+/// approximate index scan ever truncated the probe, it would drop unthemed rows
+/// and only raise the measured share — the arm cannot flip for that reason.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_mode_runs_when_coverage_is_exactly_at_threshold(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/cov-at", "coverage at").await;
+    let theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "boundary-theme",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+    )
+    .await;
+
+    let k = epigraph_engine::diverse_retrieval::THEME_COVERAGE_PROBE_K as usize;
+    let at = themed_at_threshold();
+    assert!(
+        at >= 5 && k - at >= 1,
+        "layout needs ≥5 themed and ≥1 unthemed"
+    );
+    let (themed, unthemed) = seed_coverage_layout(
+        &pool,
+        agent,
+        paper,
+        theme,
+        &[(false, 1), (true, at), (false, k - at - 1)],
+    )
+    .await;
+
+    let server = build_test_server(pool.clone());
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+    let params = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 5);
+    let resp = parse_response(
+        recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query)
+            .await
+            .expect("diverse recall"),
+    );
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+    let themed: std::collections::HashSet<Uuid> = themed.into_iter().collect();
+
+    assert_eq!(returned.len(), 5);
+    assert!(
+        !returned.contains(&unthemed[0]),
+        "{at}/{k} themed is AT the threshold: diverse mode must run, so the unthemed \
+         nearest paragraph must not appear (it did — the guard fell back)"
+    );
+    assert!(returned.is_subset(&themed), "diverse picks are themed only");
+}
+
+/// Boundary, exclusive side: one themed paragraph fewer than the threshold,
+/// so the request must fall back to flat retrieval — observable as the flat
+/// top-5, which here are all unthemed.
+///
+/// Layout is nearest-first: unthemed first, themed furthest, so a truncated
+/// probe could only LOWER the measured share — the arm cannot flip for that
+/// reason either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_mode_falls_back_one_below_threshold(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/cov-below", "coverage below").await;
+    let theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "boundary-theme",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+    )
+    .await;
+
+    let k = epigraph_engine::diverse_retrieval::THEME_COVERAGE_PROBE_K as usize;
+    let below = themed_at_threshold() - 1;
+    assert!(k - below >= 5, "layout needs ≥5 unthemed nearest");
+    let (_themed, unthemed) = seed_coverage_layout(
+        &pool,
+        agent,
+        paper,
+        theme,
+        &[(false, k - below), (true, below)],
+    )
+    .await;
+
+    let server = build_test_server(pool.clone());
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+    let params = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 5);
+    let resp = parse_response(
+        recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query)
+            .await
+            .expect("diverse recall"),
+    );
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+    let flat_top_5: std::collections::HashSet<Uuid> = unthemed[..5].iter().copied().collect();
+    assert_eq!(
+        returned, flat_top_5,
+        "{below}/{k} themed is BELOW the threshold: the request must fall back to flat \
+         retrieval and return the 5 nearest (unthemed) paragraphs"
+    );
+}

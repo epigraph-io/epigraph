@@ -948,9 +948,10 @@ async fn recall_with_context_post_embed(
     //  - `diverse=true`: run the shared diverse-retrieval pipeline
     //    (theme lookup → candidate pool → similarity-neighbour graph →
     //    `diverse_select`). Falls back to flat ANN when the corpus has
-    //    no themes yet OR when no candidates were found in the selected
-    //    themes (matches REST `/api/v1/search/semantic?diverse=true`
-    //    behaviour).
+    //    no themes yet, when the themes do not cover the query's nearest
+    //    neighbourhood (the theme-coverage guard in `run_diverse_pipeline`,
+    //    which REST `/api/v1/search/semantic?diverse=true` applies too), OR
+    //    when no candidates were found in the selected themes.
     //
     //  - `diverse=false` (default): flat paragraph-primary ANN over
     //    `claims.embedding[_3072]`. Unchanged from pre-diverse behaviour.
@@ -1013,9 +1014,10 @@ async fn recall_with_context_post_embed(
         .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
 
         if selected.is_empty() {
-            // No themes (or no candidates in themes) — fall back to flat ANN
-            // so callers still get results in a freshly-clustered or
-            // unclustered corpus. Matches the REST diverse-mode fallback.
+            // No themes, themes that do not cover this query's neighbourhood,
+            // or no candidates in themes — fall back to flat ANN so callers
+            // still get relevant results in an unclustered, partially
+            // clustered, or stale-clustered corpus.
             epigraph_db::ClaimRepository::search_by_embedding_since(
                 &server.pool,
                 viewer,

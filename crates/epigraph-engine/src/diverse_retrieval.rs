@@ -16,9 +16,10 @@
 //! `fetch_batched_context` for paragraph-context enrichment.
 //!
 //! If the corpus has no themes yet, returns `Ok(vec![])` so the caller can
-//! fall back to flat ANN. Same response if themes exist but contain no
-//! candidates — the helper does not distinguish the two cases (matches the
-//! REST route's pre-existing behaviour).
+//! fall back to flat ANN. Same response if the themes do not cover the
+//! query's nearest neighbourhood (the theme-coverage guard, see
+//! [`MIN_THEME_COVERAGE_FRACTION`]) or if themes exist but contain no
+//! candidates — the helper does not distinguish the cases.
 //!
 //! # Layering
 //!
@@ -59,6 +60,48 @@ pub const DEFAULT_CANDIDATE_POOL: i32 = 100;
 /// against this cap at the request boundary so the user sees the value
 /// they will actually get.
 pub const MAX_CANDIDATE_POOL: u32 = 1000;
+
+/// How many of the query's nearest claims the theme-coverage guard inspects.
+///
+/// Matched to pgvector's default `hnsw.ef_search` (40): an HNSW index scan
+/// returns at most `ef_search` rows without iterative scanning, so a larger
+/// probe would silently be truncated to this size on an index plan and not on
+/// a sequential one. Staying within one candidate list keeps the probe the
+/// same size under either plan. The fraction is computed over the rows
+/// actually returned regardless (see
+/// [`epigraph_db::NeighbourhoodThemeCoverage::probed`]).
+pub const THEME_COVERAGE_PROBE_K: i32 = 40;
+
+/// Minimum fraction of the query's nearest neighbourhood that must belong to
+/// a selectable theme for diverse mode to run. Below it, diverse mode falls
+/// back to flat retrieval.
+///
+/// Why one half: diverse mode can only return themed claims, so the unthemed
+/// share of the neighbourhood is exactly what diverse mode cannot see. Once
+/// that share is the majority, the relevance lost outweighs any diversity
+/// gained. A full corpus partition (the theme builder assigns every embedded
+/// claim) sits at or near 1.0; a partition decays toward 0 as unthemed claims
+/// are ingested after the last rebuild; a small stale theme set sits near 0
+/// for almost every query. The threshold only has to separate those regimes,
+/// and the boundary is inclusive (`>=`).
+pub const MIN_THEME_COVERAGE_FRACTION: f64 = 0.5;
+
+/// Decide whether a measured neighbourhood is covered well enough by themes
+/// for diverse selection to run.
+///
+/// `false` when nothing was probed: with no visible neighbour there is no
+/// evidence the themes cover the query, and the flat path answers the empty
+/// case just as well.
+#[must_use]
+pub fn theme_coverage_sufficient(
+    coverage: epigraph_db::NeighbourhoodThemeCoverage,
+    min_fraction: f64,
+) -> bool {
+    if coverage.probed <= 0 {
+        return false;
+    }
+    (coverage.themed as f64) / (coverage.probed as f64) >= min_fraction
+}
 
 /// Find the `max_themes` claim_themes whose centroid at `centroid_dim` is
 /// most similar to `query_pgvec`.
@@ -262,9 +305,11 @@ pub struct DiverseRetrievalConfig {
 ///
 /// Returns the selected `(claim_id, content, similarity)` tuples in
 /// `diverse_select` selection order. Returns `Ok(vec![])` when no themes
-/// exist OR when themes exist but the candidate pool is empty — callers
-/// should fall back to flat ANN in either case (the helper does not
-/// distinguish them, matching the REST route's pre-helper behaviour).
+/// exist, when the themes do not cover the query's nearest neighbourhood
+/// (see [`MIN_THEME_COVERAGE_FRACTION`]; logged under the
+/// `diverse_retrieval.coverage_guard` target), OR when themes exist but the
+/// candidate pool is empty — callers should fall back to flat ANN in every
+/// case (the helper does not distinguish them).
 ///
 /// # Errors
 ///
@@ -281,6 +326,35 @@ pub async fn run_diverse_pipeline(
             .await?;
 
     if themes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Theme-coverage guard. The theme lookup above is nearest-first with no
+    // relevance floor, so ANY non-empty theme set wins the shortlist — and a
+    // small stale one then funnels every query through its few members. Only
+    // run diverse selection when the query's own nearest neighbourhood (in the
+    // same candidate space, before theme restriction) is mostly themed.
+    let coverage = ClaimThemeRepository::nearest_theme_coverage_at_dim_since(
+        pool,
+        viewer,
+        query_pgvec,
+        THEME_COVERAGE_PROBE_K,
+        config.centroid_dim,
+        config.paragraph_only,
+        config.since,
+    )
+    .await
+    .map_err(db_error_to_sqlx)?;
+    if !theme_coverage_sufficient(coverage, MIN_THEME_COVERAGE_FRACTION) {
+        tracing::info!(
+            target: "diverse_retrieval.coverage_guard",
+            probed = coverage.probed,
+            themed = coverage.themed,
+            min_fraction = MIN_THEME_COVERAGE_FRACTION,
+            centroid_dim = config.centroid_dim,
+            "themes do not cover the query's nearest neighbourhood; \
+             diverse mode falls back to flat retrieval"
+        );
         return Ok(vec![]);
     }
 
@@ -333,6 +407,56 @@ mod tests {
         let mut got = nbrs[2].clone();
         got.sort_unstable();
         assert_eq!(got, vec![1, 3]);
+    }
+
+    fn cov(probed: i64, themed: i64) -> epigraph_db::NeighbourhoodThemeCoverage {
+        epigraph_db::NeighbourhoodThemeCoverage { probed, themed }
+    }
+
+    /// The boundary is inclusive: exactly the threshold share passes, one
+    /// fewer themed neighbour fails. Derived from the constants so the arm
+    /// tracks a retuned threshold instead of silently testing the old one.
+    #[test]
+    fn theme_coverage_boundary_is_inclusive_at_the_threshold() {
+        let k = i64::from(THEME_COVERAGE_PROBE_K);
+        let at = (MIN_THEME_COVERAGE_FRACTION * k as f64).ceil() as i64;
+        assert!(
+            at > 0 && at <= k,
+            "threshold must be reachable within the probe"
+        );
+        assert!(
+            theme_coverage_sufficient(cov(k, at), MIN_THEME_COVERAGE_FRACTION),
+            "{at}/{k} themed is at the threshold and must keep diverse mode"
+        );
+        assert!(
+            !theme_coverage_sufficient(cov(k, at - 1), MIN_THEME_COVERAGE_FRACTION),
+            "{}/{k} themed is below the threshold and must fall back",
+            at - 1
+        );
+    }
+
+    /// The fraction is over rows actually probed, not over the requested k: an
+    /// HNSW scan or the viewer predicate can return fewer rows, and dividing by
+    /// k would read a fully-themed small neighbourhood as uncovered.
+    #[test]
+    fn theme_coverage_fraction_is_over_probed_rows_not_k() {
+        let k = i64::from(THEME_COVERAGE_PROBE_K);
+        let probed = k / 4;
+        assert!(probed > 0 && probed < k);
+        assert!(
+            theme_coverage_sufficient(cov(probed, probed), MIN_THEME_COVERAGE_FRACTION),
+            "{probed}/{probed} themed is full coverage even though fewer than k rows came back"
+        );
+    }
+
+    /// Nothing probed is not evidence of coverage.
+    #[test]
+    fn theme_coverage_with_nothing_probed_is_insufficient() {
+        assert!(!theme_coverage_sufficient(cov(0, 0), 0.0));
+        assert!(!theme_coverage_sufficient(
+            cov(0, 0),
+            MIN_THEME_COVERAGE_FRACTION
+        ));
     }
 
     #[test]
