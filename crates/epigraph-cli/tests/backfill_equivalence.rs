@@ -150,7 +150,8 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
         claims.extend(world_claims(&pool, a, 4).await);
     }
     let c0 = claims[0];
-    let normal_ev = fixture::seed_evidence(&pool, c0, "testimony").await;
+    // An ordinary derived row of a moved claim (checked by the derived-rows rule).
+    let _normal_ev = fixture::seed_evidence(&pool, c0, "testimony").await;
     let writer_ev = fixture::seed_evidence(&pool, claims[1], "testimony").await;
     let pinned_ev = fixture::seed_evidence(&pool, claims[2], "testimony").await;
     let (writer, writer_group) = fixture::seed_agent_with_group(&pool, "writer").await;
