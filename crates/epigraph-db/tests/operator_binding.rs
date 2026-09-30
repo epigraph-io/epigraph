@@ -1176,6 +1176,84 @@ async fn the_valve_never_lets_an_unbound_writer_name_a_bound_author(pool: PgPool
         .expect("valve open, U names another unbound agent");
 }
 
+/// Delta review round 2 SEC-R2-1: workflow ingest writes every row as ONE
+/// shared system identity under that identity's own stamp, so the claims
+/// trigger sees writer = author = the system agent and the request path binds
+/// its real CALLER in Rust (`AgentRepository::require_writer_authority`). With
+/// the valve open, the binding half is relieved and the scope half is quiet for
+/// a caller that belongs to no human, so an unbound caller (or no caller) put
+/// its text into the human's group as the live-linked system identity. The
+/// attribution half (OPL02, keyed on the arming) must refuse it whatever the
+/// valve. Measured on the application role, stamped as the system identity,
+/// exactly as the workflow paths stamp it.
+///
+/// Verified to fail: the `epigraph_require_attributable` call dropped from
+/// `require_writer_authority`'s statement -> the unbound and absent callers are
+/// admitted with the valve open.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_workflow_caller_check_holds_with_the_valve_open(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (system, _) = fixture::seed_agent_with_group(&pool, "shared-system").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
+    let (u, _) = fixture::seed_agent_with_group(&pool, "unbound-u").await;
+    link_live(&pool, system, a).await;
+    link_live(&pool, x, a).await;
+    link_live(&pool, y, b).await;
+    arm(&pool).await;
+
+    let check = |caller: Option<Uuid>, valve_off: bool| {
+        let pool = pool.clone();
+        async move {
+            as_app_stamped(&pool, system, &[a_group], |mut conn| async move {
+                let v = if valve_off { "off" } else { "" };
+                sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', $1, false)")
+                    .bind(v)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("valve");
+                let r =
+                    AgentRepository::require_writer_authority(&mut conn, system, caller, a_group)
+                        .await;
+                sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+                    .execute(&mut *conn)
+                    .await
+                    .expect("valve reset");
+                (conn, r)
+            })
+            .await
+        }
+    };
+
+    for (caller, what) in [
+        (Some(u), "valve open, unbound caller"),
+        (None, "valve open, no caller"),
+        (Some(y), "valve open, another human's caller"),
+    ] {
+        let r = check(caller, true).await;
+        assert!(
+            matches!(r, Err(epigraph_db::DbError::OperatorScopeRefused { .. })),
+            "{what}: expected OPL02, got {r:?}"
+        );
+    }
+    let r = check(Some(u), false).await;
+    assert!(
+        matches!(r, Err(epigraph_db::DbError::OperatorLinkRequired { .. })),
+        "valve closed, unbound caller: expected OPL01, got {r:?}"
+    );
+
+    // Controls: callers that belong to the system agent's human.
+    for (caller, what) in [(x, "A's agent X"), (a, "human A")] {
+        check(Some(caller), true)
+            .await
+            .unwrap_or_else(|e| panic!("valve open, {what}: {e:?}"));
+        check(Some(caller), false)
+            .await
+            .unwrap_or_else(|e| panic!("valve closed, {what}: {e:?}"));
+    }
+}
+
 /// Delta review round 2 DIS-R2-1: a RETIRED identity still belongs to its
 /// human. With the valve open, neither an unbound writer nor another human's
 /// agent may name it (OPL02, keyed on the arming), which the live-only lookup

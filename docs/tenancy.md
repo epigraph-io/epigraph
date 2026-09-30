@@ -458,7 +458,10 @@ resolves a personal group, so no group is provisioned for a refused author.
 Workflow ingest authors every row as ONE shared system agent under that agent's
 own stamp, so the database sees only it; its request paths therefore bind their
 real CALLER before writing (`OPL01` for an unbound caller, `OPL02` for a caller
-whose human does not write the group the system agent's rows land in). Once the
+whose human does not write the group the system agent's rows land in, and
+`OPL02` for a caller that does not belong to the system agent's human, which
+holds with the valve open too: the valve never lets an unbound caller write as
+the bound system identity). Once the
 system agent is live-linked to one human, another human's callers are refused
 rather than writing into that human's group; a per-operator system identity is
 the follow-up that lets them ingest workflows.

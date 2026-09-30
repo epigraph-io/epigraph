@@ -273,10 +273,12 @@ pub async fn system_agent_write_authority(
 /// question the trigger cannot: may `caller` write a claim into the group the
 /// system agent's rows are owned by (its default declaration, which is its
 /// operator's group once it is live-linked)? `caller` must be bound (`OPL01`;
-/// `None` is unbound) and its human must write that group (`OPL02`), so an
-/// unbound caller writes nothing once the database is armed, and another
-/// human's caller cannot reach the linked human's group through the system
-/// identity. On an unarmed database both checks are quiet.
+/// `None` is unbound), its human must write that group (`OPL02`), and it must
+/// belong to the system agent's human (`OPL02`, the attribution check, which
+/// the valve never relieves), so an unbound caller writes nothing once the
+/// database is armed, with the valve open too, and another human's caller
+/// cannot reach the linked human's group through the system identity. On an
+/// unarmed database every check is quiet.
 ///
 /// # Errors
 /// [`epigraph_db::DbError::OperatorLinkRequired`],
@@ -296,5 +298,6 @@ pub async fn require_caller_write_authority(
                 .to_string(),
         });
     };
-    epigraph_db::AgentRepository::require_writer_authority(&mut *conn, caller, group).await
+    epigraph_db::AgentRepository::require_writer_authority(&mut *conn, system_agent, caller, group)
+        .await
 }

@@ -1537,6 +1537,12 @@ impl AgentRepository {
     /// writer/admin membership in `group_id` (armed, whatever the valve; an
     /// instance-admin principal and a privileged session are exempt).
     ///
+    /// And the ATTRIBUTION check the trigger applies to such a writer
+    /// (`epigraph_require_attributable`): the rows name `author`, so `writer`
+    /// must belong to `author`'s human. That half is `OPL02` keyed on the
+    /// arming, so it holds with the valve open too, when the first check is
+    /// relieved and the second is quiet for a writer that belongs to no human.
+    ///
     /// For the write paths whose rows are authored and stamped as a SHARED
     /// system identity (workflow ingest): the database sees only that
     /// identity, so the request path binds its real caller here, on the same
@@ -1547,15 +1553,18 @@ impl AgentRepository {
     /// `DbError::QueryFailed` if the functions are absent or the call fails.
     pub async fn require_writer_authority(
         conn: &mut sqlx::PgConnection,
+        author: Uuid,
         writer: Option<Uuid>,
         group_id: Uuid,
     ) -> Result<(), DbError> {
         sqlx::query(
             "SELECT public.epigraph_require_bound_writer($1), \
-                    public.epigraph_require_writer_scope($1, $2)",
+                    public.epigraph_require_writer_scope($1, $2), \
+                    public.epigraph_require_attributable($3, $1, false)",
         )
         .bind(writer)
         .bind(group_id)
+        .bind(author)
         .execute(&mut *conn)
         .await?;
         Ok(())

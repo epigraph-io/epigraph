@@ -1073,11 +1073,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "agent.rs",
         "require_writer_authority",
-        "CHECK through migration 122's `epigraph_require_bound_writer` and \
-         `epigraph_require_writer_scope` SECURITY DEFINER functions: returns nothing, raises \
-         OPL01 / OPL02 for the NAMED writer and group. It runs on the shared system agent's \
-         stamped transaction to bind the real caller, whose own Viewer is not the stamp; same \
-         reason as `require_bound_author`.",
+        "CHECK through migration 122's `epigraph_require_bound_writer`, \
+         `epigraph_require_writer_scope` and `epigraph_require_attributable` SECURITY DEFINER \
+         functions: returns nothing, raises OPL01 / OPL02 for the NAMED author, writer and \
+         group. It runs on the shared system agent's stamped transaction to bind the real \
+         caller, whose own Viewer is not the stamp; same reason as `require_bound_author`.",
     ),
     (
         "agent.rs",
