@@ -11,8 +11,11 @@
 //! Exit codes: 0 success; 1 refused or failed before writing (for
 //! `hide-evidence --apply`, also an invariant violation, rolled back); 2 a
 //! batch violated an invariant and was rolled back (under `--apply` the run
-//! stops there); 3 `link-retired` refused at least one id, or `reown-reverse`
-//! HELD at least one claim or hidden row (it is not fully restored).
+//! stops there); 3 `link-retired` refused at least one id, `link` left the
+//! agent without a LIVE link (its link is retired, or its membership revoked),
+//! or `reown-reverse` HELD at least one claim or hidden row (it is not fully
+//! restored). `arm-operator-binding --apply` exits 1 when the census of unbound
+//! recent writers refused it.
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -43,8 +46,9 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(
     name = "epigraph-operator",
-    about = "Operator ownership backfill (retired links, claim re-own, and its reversal) and \
-             audited admin-only scope grants on human OAuth clients"
+    about = "Operator ownership backfill (retired links, claim re-own, and its reversal), \
+             operator binding (live links, the legacy-author tie, arming), and audited \
+             admin-only scope grants on human OAuth clients"
 )]
 struct Cli {
     #[command(subcommand)]

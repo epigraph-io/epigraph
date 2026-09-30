@@ -304,6 +304,122 @@ Deploying past this is not safe: 070's bodies become RLS-filtered at PR-17 and
 arm (b) then stamps a private endpoint public. Migration 086's read helper is
 subject to the same check; 071's shim was too, until PR-22 retired it.
 
+## Operator binding
+
+**The invariant.** Every writing agent is irrevocably tied to one individual
+human account. Once a database is ARMED (below), a claim may be written (and
+`claims.agent_id` changed) only when its author is BOUND:
+
+* (a) a **human operator**: the agent of an ACTIVE `client_type = 'human'` OAuth
+  client, or an agent that some `operator_links` row names as its operator; or
+* (b) the holder of a **live link**: an `operator_links` row for the agent with
+  `retired = false` (recorded by `epigraph-operator link`, or by a stdio
+  process's own startup on a maintenance DSN).
+
+Anything else is refused with SQLSTATE **`OPL01`**. The refusal is a trigger on
+`claims` (`claims_require_operator_binding`, migration 122), so it holds on
+every path: REST, MCP over HTTP and stdio, the CLIs, workflow ingest, default and
+explicit tenancy declarations, and a raw `INSERT` on any role.
+`ClaimRepository::default_decl_for_author` runs the same check before it
+resolves a personal group, so no group is provisioned for a refused author.
+Surfaces:
+
+| surface | what the caller sees |
+|---|---|
+| HTTP | `403`, body starts `OPL01:` and names the fix |
+| MCP | `INVALID_REQUEST`, message carries `OPL01` and the fix |
+| Rust | `DbError::OperatorLinkRequired` (`is_write_authority_refusal()`) |
+
+**The fix** is an operator action on a maintenance DSN:
+
+```bash
+EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... \
+  epigraph-operator link --agent <agent id> --operator <human operator agent id> [--apply]
+# or, for a stdio fleet identity, before its first start:
+EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... \
+  epigraph-operator link --agent-model <model> --agent-system-prompt-hash <hash> \
+    --operator <human operator agent id> [--apply]
+```
+
+`link` refuses an operator that is not a human operator, and refuses an agent
+that is the principal of an un-revoked OAuth client (see "HTTP principals"
+below). It is idempotent; a dry run is the default.
+
+**LIVE means `retired = false`.** An agent whose membership in its operator's
+group was REVOKED keeps its link row and is still bound: it writes into its own
+personal group, as before (`reown-linked` moves those rows later). Ending an
+agent's ability to write is a retire, not a revoke.
+
+### Arming, and the valve
+
+Applying migration 122 enforces nothing. Enforcement starts when a maintenance
+session arms the database, once:
+
+```bash
+EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... epigraph-operator arm-operator-binding            # census only
+EPIGRAPH_OPERATOR_MAINTENANCE_DSN=... epigraph-operator arm-operator-binding --apply    # arm
+```
+
+The census lists every agent that authored claims in the last `--recent-days`
+(14) and is not bound; `--apply` refuses while that list is non-empty unless
+`--allow-unbound-writers` records that stopping them is the decision. Arming is
+**one-way**: there is no disarm function, and the maintenance role holds no
+UPDATE or DELETE on `operator_binding_arming`. The api and mcp servers log at
+boot whether the database is armed.
+
+The only runtime relief is per process:
+`EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off`. It is read once at boot, logs a WARN
+on every boot while set, and makes every connection the process's `ScopedPool`
+opens carry the session setting `epigraph.operator_link_enforcement = 'off'`,
+which the check honours. Any other value, including a typo, leaves enforcement
+ON. It reaches only `ScopedPool` connections (every request unit and operator
+CLI); any other pool, and a transaction-mode pooler, stay enforced. The setting
+is a transport, not an authority boundary: a session that can set it can
+already write a claim naming any bound agent as its author.
+
+### Stdio agents under D9
+
+A request-serving process holds only the application DSN (operator decision
+D9), where `epigraph_link_operator` is refused (`42501`). A stdio agent with
+`EPIGRAPH_OPERATOR_ID` therefore cannot record its own link. The host records
+it first (`epigraph-operator link`, above); the agent's startup reads the actor
+record and, when it already names the declared operator, starts without calling
+the link function. Without a recorded link the startup exits with a message
+naming that command. A fleet identity is derived from the model and a hash of
+its stable prompt files, so a changed prompt file is a new, unlinked agent:
+run `link` at every spawn.
+
+### HTTP principals
+
+An agent with ANY operator link is refused an OAuth token and a viewer over
+HTTP (migration 107: operated agents are stdio-only). So a non-human OAuth
+principal (a `service` or `agent` client) that writes over REST can be neither
+linked (it would lose HTTP) nor left unlinked once armed (`OPL01`). `link` and
+`link-legacy-authors` refuse or skip such agents rather than cut them off, and
+the arming census lists them if they wrote recently. Decide how each is bound
+before arming.
+
+### Existing rows
+
+* `epigraph-operator link-legacy-authors --operator <human> [--apply]` records
+  a RETIRED link to the human for every agent that authored a tier-A row and
+  has no link (migration 122's `epigraph_link_legacy_authors`, one
+  `security_events` row per call). It skips, and names, humans, OAuth
+  principals, holders of write authority in the operator's group, 107's
+  shared-signer fingerprint (use `link-retired --attest-shared-signer`),
+  `--exclude-agents-file` ids, and agents that authored a claim within
+  `--quiet-days` (30; they may still be running and want a live link).
+* The backfill (`epigraph-tenancy-backfill run`) stamps a world-owned row of a
+  LINKED author (any link state) to the operator's group; an unlinked author
+  keeps the personal-group fallback. `verify` still fails on any world-owned
+  residue, and REPORTS (not a failure) rows still owned by a linked author's
+  own personal group.
+* `epigraph-operator reown-linked --operator <human> --manifest-out <new path>
+  [--apply]` moves those claims into the operator's group through
+  `reown-claims`' guarded batches (`--derived follow-claim`; derived rows follow
+  through 070's arm (d); `reown-reverse` undoes a manifest). Resumable: a re-run
+  selects what is left. Run one instance at a time.
+
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 
 `ownership` was the pre-tenancy ACL table: one row per node, naming an agent and
