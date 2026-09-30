@@ -272,6 +272,32 @@ async fn the_valve_lifts_enforcement_for_its_own_session_only(pool: PgPool) {
     );
 }
 
+/// The refusal reaches Rust as its NAMED form, which every write surface maps
+/// to a denial, and its rendering names the code and the fix.
+#[sqlx::test(migrations = "../../migrations")]
+async fn opl01_maps_to_the_named_denial(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "unbound").await;
+    arm(&pool).await;
+    let e = insert_claim(&pool, agent, group)
+        .await
+        .expect_err("armed and unbound");
+    let db = epigraph_db::DbError::from(e);
+    assert!(
+        matches!(db, epigraph_db::DbError::OperatorLinkRequired { .. }),
+        "OPL01 must map to OperatorLinkRequired, got {db:?}"
+    );
+    assert!(db.is_write_authority_refusal());
+    assert!(
+        !db.is_personal_group_refusal(),
+        "OPL01 is not a personal-group refusal"
+    );
+    let text = db.to_string();
+    assert!(
+        text.contains("OPL01") && text.contains("epigraph-operator link"),
+        "{text}"
+    );
+}
+
 /// Moving a claim to an unbound author is a claim write like any other.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_update_that_hands_a_claim_to_an_unbound_author_is_refused(pool: PgPool) {

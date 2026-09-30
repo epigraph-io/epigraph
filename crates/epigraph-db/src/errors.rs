@@ -26,6 +26,19 @@ pub const PERSONAL_MEMBERSHIP_REVOKED: &str = "RVK01";
 /// Same class as [`PERSONAL_MEMBERSHIP_REVOKED`], for the same reason.
 pub const PERSONAL_GROUP_NOT_OWNED: &str = "RVK02";
 
+/// SQLSTATE `OPL01`: a claim write named an author that is not bound to a human
+/// operator (migration 122). Raised by `epigraph_require_bound_author`, which the
+/// `claims_require_operator_binding` trigger and
+/// `ClaimRepository::default_decl_for_author` both call, once the database is
+/// armed. Same custom-class reasoning as [`PERSONAL_MEMBERSHIP_REVOKED`].
+pub const OPERATOR_LINK_REQUIRED: &str = "OPL01";
+
+/// The remedy every surface prints with an [`DbError::OperatorLinkRequired`].
+/// One string, so the HTTP body, the MCP message and the CLI text cannot drift.
+pub const OPERATOR_LINK_FIX: &str = "an operator records a live link for the agent on a \
+     maintenance DSN: `epigraph-operator link --agent <agent id> --operator <human operator \
+     agent id> --apply` (docs/tenancy.md, \"Operator binding\")";
+
 /// Database operation errors
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -164,6 +177,15 @@ pub enum DbError {
     #[error("Personal group not owned by the agent: {message}")]
     PersonalGroupNotOwned { message: String },
 
+    /// The claim's author is not bound to a human operator (SQLSTATE
+    /// [`OPERATOR_LINK_REQUIRED`], migration 122): it is neither a human
+    /// operator nor the holder of a live operator link, and the database is
+    /// armed. A DENIAL like [`Self::MembershipRevoked`] (HTTP 403, MCP
+    /// `INVALID_REQUEST`), and fixed only by an operator action, which the
+    /// rendered text names ([`OPERATOR_LINK_FIX`]).
+    #[error("OPL01 operator link required: {message}. Fix: {}", OPERATOR_LINK_FIX)]
+    OperatorLinkRequired { message: String },
+
     /// Migration failed
     #[error("Migration failed: {source}")]
     MigrationFailed {
@@ -230,6 +252,15 @@ impl From<sqlx::Error> for DbError {
                     message: db_err.message().to_string(),
                 }
             }
+            // OPL01, migration 122's refusal of an author not bound to a human
+            // operator.
+            sqlx::Error::Database(db_err)
+                if db_err.code().as_deref() == Some(OPERATOR_LINK_REQUIRED) =>
+            {
+                Self::OperatorLinkRequired {
+                    message: db_err.message().to_string(),
+                }
+            }
             // All other database errors become QueryFailed
             other => Self::QueryFailed { source: other },
         }
@@ -248,6 +279,17 @@ impl DbError {
             self,
             Self::MembershipRevoked { .. } | Self::PersonalGroupNotOwned { .. }
         )
+    }
+
+    /// `true` for every refusal of the WRITER's authority that the caller
+    /// cannot fix by changing a parameter and that is never a server fault:
+    /// migration 105's two personal-group refusals
+    /// ([`Self::is_personal_group_refusal`]) and migration 122's
+    /// [`Self::OperatorLinkRequired`]. The write surfaces map exactly this set
+    /// to a denial (HTTP 403, MCP `INVALID_REQUEST`).
+    #[must_use]
+    pub fn is_write_authority_refusal(&self) -> bool {
+        self.is_personal_group_refusal() || matches!(self, Self::OperatorLinkRequired { .. })
     }
 }
 

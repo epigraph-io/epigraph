@@ -1077,6 +1077,24 @@ struct PersistOutcome {
 /// got a 500 whose body carried both ids.
 #[cfg(feature = "db")]
 fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) {
+    // Migration 122 (OPL01): the author is not bound to a human operator.
+    if let epigraph_db::DbError::OperatorLinkRequired { message } = &e {
+        tracing::warn!(
+            detail = %message,
+            "submit_packet refused: the author is not bound to a human operator"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            ErrorResponse::new(
+                "Forbidden",
+                format!(
+                    "OPL01: the author agent is not bound to a human operator; nothing was \
+                     written. Fix: {}",
+                    epigraph_db::OPERATOR_LINK_FIX
+                ),
+            ),
+        );
+    }
     if e.is_personal_group_refusal() {
         tracing::warn!(
             detail = %e,

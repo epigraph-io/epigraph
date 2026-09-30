@@ -106,6 +106,13 @@ pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
             message: Cow::from(message),
             data: None,
         },
+        // Migration 122's OPL01: the author is not bound to a human operator.
+        // The same class of denial; its rendering carries the code and the fix.
+        e @ epigraph_db::DbError::OperatorLinkRequired { .. } => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(e.to_string()),
+            data: None,
+        },
         // Row security let the caller read the row but not change it
         // (migrations 115/117): the same class of denial.
         e @ epigraph_db::DbError::WriteRefused { .. } => McpError {
@@ -135,7 +142,7 @@ pub fn executor_caller_error(
 ) -> McpError {
     match e {
         epigraph_ingest_executor::IngestExecutorError::Repository(db)
-            if db.is_personal_group_refusal() =>
+            if db.is_write_authority_refusal() =>
         {
             db_caller_error(db)
         }
@@ -189,6 +196,20 @@ mod tests {
             squatted.code,
             ErrorCode::INVALID_REQUEST,
             "a squatted personal group is a denial, not a server fault"
+        );
+
+        let unbound = db_caller_error(epigraph_db::DbError::OperatorLinkRequired {
+            message: "OPL01: agent a is not bound to a human operator".to_string(),
+        });
+        assert_eq!(
+            unbound.code,
+            ErrorCode::INVALID_REQUEST,
+            "an unbound author is a denial, not a server fault"
+        );
+        assert!(
+            unbound.message.contains("OPL01") && unbound.message.contains("epigraph-operator link"),
+            "the denial must carry the code and name the fix: {}",
+            unbound.message
         );
     }
 
