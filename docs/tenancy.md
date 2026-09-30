@@ -357,9 +357,11 @@ subject to the same check; 071's shim was too, until PR-22 retired it.
 
 **The invariant.** Every writing agent is irrevocably tied to one individual
 human account, and there may be many humans. Once a database is ARMED (below),
-a claim may be written (and `claims.agent_id` changed) only when its author is
-BOUND, and, when the session's authenticated principal is not the author, only
-when that WRITER is bound too (see "Who is checked" below). Bound means:
+a claim may be INSERTED only when its author is BOUND, and, when the session's
+authenticated principal is not the author, only when that WRITER is bound too
+(see "Who is checked" below). `claims.agent_id` of an existing claim is changed
+only by a privileged session or an instance-admin principal (`OPL02` for
+anyone else), and is then checked like an insert. Bound means:
 
 * (a) a **human operator**: an agent with a live row in the maintenance-only
   registry `human_operators` whose recorded OAuth client (the one client the
@@ -403,14 +405,27 @@ session's authenticated PRINCIPAL (the one `ScopedPool` stamps from the
 request's viewer) whenever it differs from the author: that writer must be
 bound (`OPL01`), must write the owner group (`OPL02`, below), and may name as
 author only a bound agent of its OWN human (`OPL01` / `OPL02` otherwise). The
-one exception is the author a supersede INHERITS (the row names `supersedes`):
-it may be a retired agent of the writer's own human, so a human can supersede
-its own legacy author's claims; a fresh claim never names a retired identity.
-With no principal, a principal equal to the author, or a privileged session,
-the author is the one checked. Consequences to decide before arming: a write
-whose principal is an identity that can never be bound (a shared HTTP
-listener's own agent acting under an admin's borrowed stamp, or a non-human
-OAuth client authoring on another agent's behalf) is refused once armed.
+one exception is the author a supersede INHERITS (a new row naming
+`supersedes` whose author IS that predecessor's author, which is what the
+supersede act writes): it may be a retired agent of the writer's own human, so
+a human can supersede its own legacy author's claims; a fresh claim never
+names a retired identity, whatever `supersedes` it points at. With a principal
+equal to the author, or a privileged session, the author is the one checked.
+An APPLICATION session with NO principal (a write on an unstamped connection)
+is an unbound writer: refused `OPL01` once armed, so a path that forgot to
+stamp its viewer fails closed instead of writing as the author its request
+named (with the valve open, the author is then the one checked). The REST
+handlers that take the author from the request (`POST /api/v1/claims`,
+`/api/v1/submit/packet`, `/api/v1/hypothesis`, `/api/v1/policy-challenges`)
+write on a transaction stamped with the caller's viewer, so the caller is the
+writer the trigger binds; any other claim write on an unstamped application
+connection (a CLI run on an application DSN, a job with no viewer) is refused
+once armed and must be stamped or run on a maintenance DSN. Consequences to
+decide before arming: a write whose principal is an identity that can never be
+bound (a shared HTTP listener's own agent acting under an admin's borrowed
+stamp, or a non-human OAuth client authoring on another agent's behalf, such as
+a decomposition tool posting atoms under the parent claim's author) is refused
+once armed.
 
 **A linked agent writes only where its own operator writes (`OPL02`).** A claim
 written by a live-linked agent must be owned by a group its operator holds a
@@ -435,8 +450,9 @@ a writer in its own group), and the query in "Existing rows" audits them. `OPL02
 holds whenever the database is armed, whatever the valve says. The refusal is a
 trigger on `claims` (`claims_require_tenancy_then_operator_binding`, migration
 122, named to fire after the tenancy trigger fills an inherited owner), so it
-holds on every path: REST, MCP over HTTP and stdio, the CLIs, workflow ingest, default and
-explicit tenancy declarations, and a raw `INSERT` on any role.
+holds for every claim INSERT on every path: REST, MCP over HTTP and stdio, the
+CLIs, workflow ingest, default and explicit tenancy declarations, and a raw
+`INSERT` on any role (an unstamped application session included, as above).
 `ClaimRepository::default_decl_for_author` runs the same check before it
 resolves a personal group, so no group is provisioned for a refused author.
 Workflow ingest authors every row as ONE shared system agent under that agent's
@@ -498,7 +514,9 @@ on every boot while set, and makes every connection the process's `ScopedPool`
 opens carry the session setting `epigraph.operator_link_enforcement = 'off'`,
 which the binding check honours. It relieves `OPL01` ONLY: the cross-human
 scope (`OPL02`) keys on arming alone, so no valve lets one human's agent write
-into another human's group. Any other value, including a typo, leaves
+into another human's group, and no valve lets an UNBOUND writer name a bound
+author (a human, or any human's agent): with the valve open an unbound writer
+may author only as itself or as another unbound identity. Any other value, including a typo, leaves
 enforcement ON. It reaches only `ScopedPool` connections (every request unit
 and operator CLI); any other pool, and a transaction-mode pooler, stay
 enforced. The setting is a transport, not an authority boundary: any raw

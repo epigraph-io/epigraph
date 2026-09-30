@@ -780,10 +780,14 @@ Current reservation:
   (`operator_links_audit`). A BEFORE INSERT OR UPDATE OF `agent_id` trigger on `claims`
   (`claims_require_tenancy_then_operator_binding`, a maintenance-owned definer
   body, named to fire after the tenancy fill) raises `OPL01` naming the fix
-  (`epigraph-operator link`) for any other author, and for a session PRINCIPAL
-  that is not bound when it writes a claim naming another author, on every
-  role; and `OPL02` when the writer's human does not write the claim's owner
-  group, or the named author belongs to another human, with the same rule on
+  (`epigraph-operator link`) for any other author, for a session PRINCIPAL
+  that is not bound when it writes a claim naming another author, and for an
+  application session with NO principal, on every role; and `OPL02` when the
+  writer's human does not write the claim's owner group, or the named author
+  belongs to another human (or to any human while the writer belongs to none),
+  or a non-exempt session changes an existing claim's `agent_id`; a retired
+  author is admitted only as the author a supersede inherits (a new row
+  carrying its predecessor's author); with the same rule on
   writer/admin rows for live-linked agents in `group_memberships`
   (`group_memberships_operator_scope`); a privileged session and an
   instance-admin principal are exempt from `OPL02` only. Applying the

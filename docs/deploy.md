@@ -1500,16 +1500,24 @@ arming is one-way and every step before it must leave no live writer unbound.
    intend to keep. The census lists AUTHORS; a writer that authors as someone
    else (a service client posting on an agent's behalf, a listener acting under
    a borrowed admin stamp) is bound on its own principal once armed and does
-   not appear there: inventory those separately.
-9. **Smoke**: a claim by an unbound agent is refused (`OPL01`; HTTP 403); a
-   claim by a live-linked agent and by the human succeeds; the boot logs say
-   "operator binding ENFORCED".
+   not appear there: inventory those separately. So is a claim written on an
+   application connection with NO principal (a CLI or job on the application
+   DSN): once armed it is refused `OPL01`.
+9. **Smoke**: through the real HTTP route (not a hand-stamped SQL session), a
+   claim posted by an unbound principal naming a bound author is refused
+   (`OPL01`; HTTP 403); an INSERT on an unstamped application connection is
+   refused (`OPL01`); a claim by a live-linked agent and by the human succeeds;
+   the boot logs say "operator binding ENFORCED". Count refusals in the logs by
+   the refusal prefix `OPL01:` / `OPL02:` (with the colon): the boot lines name
+   the code without it.
 
 **Rollback.** Before step 8's arm: every step is reversible or harmless (links
 are permanent records but grant nothing new; `reown-reverse` undoes step 6).
 After arming: set `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off` on the affected
 units and restart them (new binaries only; old binaries do not carry the
-valve). The valve relieves `OPL01` only; `OPL02` stays in force. Removing the arming row, or dropping the trigger, is a superuser DDL
+valve). The valve relieves `OPL01` only (including the refusal of an
+unstamped application session); `OPL02` stays in force, including for an
+unbound writer that names a bound author. Removing the arming row, or dropping the trigger, is a superuser DDL
 act on the migration DSN.
 
 No new environment variable is required; `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT`
