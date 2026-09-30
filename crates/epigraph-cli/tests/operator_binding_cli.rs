@@ -589,3 +589,116 @@ async fn link_legacy_authors_refuses_a_non_human_operator(pool: PgPool) {
     assert!(r.stderr.contains("is not a human operator"), "{}", r.show());
     assert_eq!(link_row(&pool, author).await, None);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reown-linked
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn owner_of(pool: &PgPool, table: &str, id: Uuid) -> Uuid {
+    sqlx::query_scalar(&format!("SELECT owner_group_id FROM {table} WHERE id = $1"))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("owner")
+}
+
+/// `reown-linked` moves exactly the claims a LINKED author's own personal group
+/// owns into the operator's group, and their derived rows follow through
+/// migration 070's arm (d) trigger (the evidence row below is never written by
+/// the command itself). An unlinked author's claim and a linked author's claim
+/// in a THIRD group stay put; a dry run moves nothing; a re-run finds nothing.
+///
+/// Verified to fail: the candidate query's personal-group predicate negated
+/// (`g.kind <> 'personal'`) -> the linked author's claim is not moved.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reown_linked_moves_a_linked_authors_personal_claims_and_their_derived_rows(pool: PgPool) {
+    let (human, human_group) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (linked, linked_group) = fixture::seed_agent_with_group(&pool, "linked").await;
+    let (unlinked, unlinked_group) = fixture::seed_agent_with_group(&pool, "unlinked").await;
+    let third = fixture::seed_group(&pool).await;
+
+    let mine = insert_claim(&pool, linked, linked_group)
+        .await
+        .expect("claim");
+    let evidence = fixture::seed_evidence(&pool, mine, "testimony").await;
+    assert_eq!(owner_of(&pool, "evidence", evidence).await, linked_group);
+    let in_third = insert_claim(&pool, linked, third).await.expect("claim");
+    let theirs = insert_claim(&pool, unlinked, unlinked_group)
+        .await
+        .expect("claim");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, linked, human)
+            .await
+            .expect("retired link");
+    }
+    let dir = std::env::temp_dir().join(format!("reown-linked-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let m1 = dir.join("m1.jsonl").display().to_string();
+    let m2 = dir.join("m2.jsonl").display().to_string();
+    let m3 = dir.join("m3.jsonl").display().to_string();
+    let human_s = human.to_string();
+
+    let dry = run_op(
+        &pool,
+        &[
+            "reown-linked",
+            "--operator",
+            &human_s,
+            "--manifest-out",
+            &m1,
+        ],
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("candidates=1"), "{}", dry.show());
+    assert_eq!(
+        owner_of(&pool, "claims", mine).await,
+        linked_group,
+        "dry run"
+    );
+
+    let applied = run_op(
+        &pool,
+        &[
+            "reown-linked",
+            "--operator",
+            &human_s,
+            "--manifest-out",
+            &m2,
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    assert_eq!(
+        owner_of(&pool, "claims", mine).await,
+        human_group,
+        "{}",
+        applied.show()
+    );
+    assert_eq!(
+        owner_of(&pool, "evidence", evidence).await,
+        human_group,
+        "the derived row follows its claim (070 arm (d))"
+    );
+    assert_eq!(owner_of(&pool, "claims", in_third).await, third);
+    assert_eq!(owner_of(&pool, "claims", theirs).await, unlinked_group);
+
+    let again = run_op(
+        &pool,
+        &[
+            "reown-linked",
+            "--operator",
+            &human_s,
+            "--manifest-out",
+            &m3,
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(again.stdout.contains("candidates=0"), "{}", again.show());
+    let _ = std::fs::remove_dir_all(dir);
+}

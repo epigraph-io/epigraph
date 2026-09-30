@@ -29,6 +29,9 @@
 //!   unbound agent that wrote recently (see [`arm`]).
 //! * `link-legacy-authors` — tie every legacy author to the human operator with
 //!   a RETIRED link, in one audited definer call (see [`legacy`]).
+//! * `reown-linked` — move the claims a linked author's OWN personal group owns
+//!   into its operator's group, through `reown-claims`' guarded batches (see
+//!   [`reown_linked`]).
 //!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
@@ -74,6 +77,7 @@ pub mod legacy;
 pub mod link;
 pub mod manifest;
 pub mod reown;
+pub mod reown_linked;
 pub mod reverse;
 pub mod tables;
 

@@ -29,11 +29,14 @@
 //!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
 //!     epigraph-operator link-legacy-authors --operator <uuid> [--exclude-agents-file F] \
 //!         [--quiet-days 30 | --no-quiet-window] [--apply]
+//!     epigraph-operator reown-linked --operator <uuid> --manifest-out reown-linked-1.jsonl [--apply]
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 
 use clap::{Parser, Subcommand};
-use epigraph_cli::operator::{self, arm, bind, client_scope, hide, legacy, link, reown, reverse};
+use epigraph_cli::operator::{
+    self, arm, bind, client_scope, hide, legacy, link, reown, reown_linked, reverse,
+};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -110,6 +113,28 @@ enum Command {
         /// back.
         #[arg(long)]
         apply: bool,
+    },
+    /// Move every claim owned by a LINKED author's own personal group into its
+    /// operator's personal group (`reown-claims` with `--derived follow-claim`
+    /// over the claims the predicate selects). Resumable: a re-run selects
+    /// what is left. Run one instance at a time.
+    ReownLinked {
+        /// The operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        /// Where to write the undo manifest. Must not exist; use a new path
+        /// per run.
+        #[arg(long)]
+        manifest_out: PathBuf,
+        /// Perform the writes. Without it, every batch rolls back.
+        #[arg(long)]
+        apply: bool,
+        /// Claims per transaction.
+        #[arg(long, default_value_t = 200)]
+        batch_size: usize,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
     },
     /// Record a RETIRED operator link for each agent id in a file.
     LinkRetired {
@@ -240,8 +265,9 @@ async fn main_inner() -> anyhow::Result<i32> {
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
         client_scope::validate_scope(&a.scope)?;
     }
-    if let Command::ReownClaims { batch_size, .. } | Command::ReownReverse { batch_size, .. } =
-        &cli.command
+    if let Command::ReownClaims { batch_size, .. }
+    | Command::ReownReverse { batch_size, .. }
+    | Command::ReownLinked { batch_size, .. } = &cli.command
     {
         if *batch_size == 0 {
             anyhow::bail!("--batch-size must be at least 1");
@@ -307,6 +333,40 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("{line}");
             }
             Ok(0)
+        }
+        Command::ReownLinked {
+            operator: op,
+            manifest_out,
+            apply,
+            batch_size,
+            lock_timeout,
+        } => {
+            let ids = reown_linked::candidates(&mut conn, op).await?;
+            println!(
+                "reown-linked: operator={op} candidates={} (claims owned by a linked author's own \
+                 personal group)",
+                ids.len()
+            );
+            if ids.is_empty() {
+                println!("RESULT\n  claims moved: 0 (nothing to move)");
+                return Ok(0);
+            }
+            let opts = reown::Options {
+                operator: op,
+                mode: reown::DerivedMode::FollowClaim,
+                manifest_out,
+                apply,
+                batch_size,
+                lock_timeout,
+                hide: hide::HideArgs::default(),
+            };
+            reown::validate(&opts)?;
+            let report = reown::run(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(if report.batch_failures.is_empty() {
+                0
+            } else {
+                2
+            })
         }
         Command::LinkRetired {
             agents_file,
