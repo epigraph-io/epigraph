@@ -1413,6 +1413,7 @@ pub struct EvolveStepResponse {
     tag = "workflows"
 )]
 pub async fn evolve_step(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(parent_id): Path<Uuid>,
@@ -1433,20 +1434,19 @@ pub async fn evolve_step(
             message: "parent_id in path and body must match".into(),
         });
     }
-    let agent = auth.owner_id.unwrap_or(auth.client_id);
+    // The step claim is AUTHORED by, and written on a transaction STAMPED
+    // with, the authenticated caller: the viewer's principal (the token's
+    // `agent_id`). NOT `owner_id` / `client_id`: those are `oauth_clients.id`
+    // values, never an agent, so authoring as one broke the agents foreign
+    // key before migration 122 and is refused OPL01 once armed. Migration
+    // 122's claims trigger then sees writer = author = the caller.
+    let Some(agent) = viewer.principal() else {
+        return Err(ApiError::Unauthorized {
+            reason: "evolve_step requires an authenticated principal".into(),
+        });
+    };
     let level = req.level.unwrap_or(2);
-    // The step claim is written on a transaction STAMPED as its author, so
-    // migration 122's claims trigger sees the writing principal (here the
-    // author itself, from the token): once armed it refuses a claim written by
-    // an application session with no principal, which the raw pool is.
-    let author_viewer = epigraph_db::Viewer::resolve(&state.db_pool, agent)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("evolve_step: could not resolve the author's viewer: {e}"),
-        })?;
-    let mut tx = state
-        .begin_claim_write(&author_viewer, "evolve_step")
-        .await?;
+    let mut tx = state.begin_claim_write(&viewer, "evolve_step").await?;
     let result = epigraph_db::ClaimRepository::evolve_step_conn(
         &mut tx,
         epigraph_core::ClaimId::from_uuid(parent_id),
