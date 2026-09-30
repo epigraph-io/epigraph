@@ -1865,6 +1865,36 @@ async fn seed_unthemed_relevant(
     ids
 }
 
+/// Make every vector read in this test's private database EXACT by dropping
+/// the approximate (HNSW) indexes on `claims` and `claim_themes`.
+///
+/// Why the reproduction needs it: an approximate read on the way to the
+/// theme candidates can come back empty, and an empty theme lookup or
+/// candidate pull falls back to flat retrieval BY ACCIDENT — letting the
+/// unfixed code pass. Measured: with the indexes in place the unfixed arm
+/// passed in a small fraction of parallel runs. Observed mechanism: with no
+/// table statistics the candidate query plans as an HNSW scan whose
+/// `theme_id = ANY(..)` post-filter finds none of the far-away themed rows.
+/// Exact reads remove every approximate step, so the arm is deterministic in
+/// both directions. The guard is still exercised under index-backed plans by
+/// the covered/boundary arms below.
+async fn drop_ann_indexes(pool: &PgPool) {
+    sqlx::query(
+        "DO $$ DECLARE r record; BEGIN \
+           FOR r IN SELECT i.relname FROM pg_index x \
+                      JOIN pg_class i ON i.oid = x.indexrelid \
+                      JOIN pg_am a ON a.oid = i.relam \
+                     WHERE x.indrelid IN ('claims'::regclass, 'claim_themes'::regclass) \
+                       AND a.amname = 'hnsw' LOOP \
+             EXECUTE format('DROP INDEX %I', r.relname); \
+           END LOOP; \
+         END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("drop claims and claim_themes ANN indexes");
+}
+
 /// The bug: a large corpus of relevant, UNTHEMED paragraphs plus a tiny theme
 /// set that sits in an orthogonal (off-topic) region. Before the guard,
 /// `diverse=true` selected the off-topic theme (it is the nearest theme there
@@ -1905,17 +1935,7 @@ async fn diverse_mode_falls_back_when_tiny_theme_set_does_not_cover_query(pool: 
     // Large relevant corpus that was never themed.
     let relevant = seed_unthemed_relevant(&pool, agent, paper, "relevant", 120).await;
 
-    // Give the planner real statistics, as a live database has. Without them
-    // a freshly-seeded table plans the theme-candidate query as an HNSW scan
-    // whose post-filter on `theme_id` finds nothing among the nearest rows, so
-    // the pipeline comes back empty and falls back BY ACCIDENT — masking the
-    // bug. With statistics, the selective `theme_id = ANY(..)` predicate is
-    // planned through its btree index and the off-topic members are returned,
-    // which is what a populated deployment does.
-    sqlx::query("ANALYZE claims")
-        .execute(&pool)
-        .await
-        .expect("analyze claims");
+    drop_ann_indexes(&pool).await;
 
     let server = build_test_server(pool.clone());
     let query = diverse_fixture::cluster_pgvec(0, 1.0);
@@ -1998,8 +2018,11 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
         let v = diverse_fixture::cluster_pgvec_with_drift(6, 1.0, 7, (i as f32) * 0.01);
         diverse_fixture::seed_paragraph(&pool, agent, paper, &format!("far-{i}"), &v, None).await;
     }
-    // Planner statistics, as in the coverage-bug test above.
-    sqlx::query("ANALYZE claims")
+    // Keep the ANN indexes here (unlike the coverage-bug arm) and give the
+    // planner statistics, so the guard's probe and the candidate query run
+    // under the plans a populated database would choose. The outcome does not
+    // depend on which plan is picked: the themed rows are the nearest ones.
+    sqlx::query("VACUUM ANALYZE claims")
         .execute(&pool)
         .await
         .expect("analyze claims");
@@ -2067,7 +2090,7 @@ async fn seed_coverage_layout(
             rank += 1;
         }
     }
-    sqlx::query("ANALYZE claims")
+    sqlx::query("VACUUM ANALYZE claims")
         .execute(pool)
         .await
         .expect("analyze claims");

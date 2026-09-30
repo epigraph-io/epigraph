@@ -1658,18 +1658,40 @@ mod db_integration_tests {
         .expect("seed 1536 claim")
     }
 
-    /// Give the planner real statistics, as a live database has. On a
-    /// freshly-seeded, never-analysed table the theme-candidate query plans as
-    /// an HNSW scan whose post-filter on `theme_id` finds nothing among the
-    /// nearest rows, so diverse mode comes back empty and falls through BY
-    /// ACCIDENT, masking the bug. With statistics the selective
-    /// `theme_id = ANY(..)` predicate goes through its btree index and returns
-    /// the themed rows, which is what a populated deployment does.
+    /// Give the planner statistics, as a live database has, so the covered arm
+    /// runs the probe and candidate query under realistic plans.
     async fn analyze_claims(pool: &sqlx::PgPool) {
-        sqlx::query("ANALYZE claims")
+        sqlx::query("VACUUM ANALYZE claims")
             .execute(pool)
             .await
             .expect("analyze claims");
+    }
+
+    /// Make every vector read in this test's private database EXACT by
+    /// dropping the approximate (HNSW) indexes on `claims` and `claim_themes`.
+    ///
+    /// The bug arm needs it: an approximate read on the way to the theme
+    /// candidates can come back empty, and an empty theme lookup or candidate
+    /// pull falls through to flat search BY ACCIDENT — letting unfixed code
+    /// pass. Observed mechanism: with no table statistics the candidate query
+    /// plans as an HNSW scan whose `theme_id = ANY(..)` post-filter finds none
+    /// of the far-away themed rows. Exact reads remove every approximate step,
+    /// so the arm is deterministic in both directions.
+    async fn drop_ann_indexes(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "DO $$ DECLARE r record; BEGIN \
+               FOR r IN SELECT i.relname FROM pg_index x \
+                          JOIN pg_class i ON i.oid = x.indexrelid \
+                          JOIN pg_am a ON a.oid = i.relam \
+                         WHERE x.indrelid IN ('claims'::regclass, 'claim_themes'::regclass) \
+                       AND a.amname = 'hnsw' LOOP \
+                 EXECUTE format('DROP INDEX %I', r.relname); \
+               END LOOP; \
+             END $$",
+        )
+        .execute(pool)
+        .await
+        .expect("drop claims and claim_themes ANN indexes");
     }
 
     /// The bug, on the REST surface: many relevant UNTHEMED claims plus a tiny
@@ -1708,7 +1730,7 @@ mod db_integration_tests {
                 .await,
             );
         }
-        analyze_claims(&pool).await;
+        drop_ann_indexes(&pool).await;
 
         let resp = call_diverse_search_with_query(pool.clone(), COVERAGE_QUERY, Some(1536))
             .await
