@@ -218,7 +218,9 @@ async fn signed_edge(pool: &PgPool, source: Uuid, target: Uuid, signer: Uuid) ->
 }
 
 async fn seed(pool: &PgPool) -> Fx {
-    let (operator, target) = fixture::seed_agent_with_group(pool, "operator").await;
+    // A registered human operator: since migration 122 a link (retired ones
+    // included) can be recorded only to one.
+    let (operator, target) = fixture::seed_human_operator(pool, "operator").await;
     let (retired, retired_group) = fixture::seed_agent_with_group(pool, "retired").await;
     let (actor, actor_group) = fixture::seed_agent_with_group(pool, "actor").await;
     let (stranger, stranger_group) = fixture::seed_agent_with_group(pool, "stranger").await;

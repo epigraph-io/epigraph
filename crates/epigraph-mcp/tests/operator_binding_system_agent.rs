@@ -62,17 +62,7 @@ async fn store(server: &EpiGraphMcpFull, step: &str) -> Result<(), String> {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_live_linked_system_agent_keeps_workflow_ingest_working_once_armed(pool: PgPool) {
-    let (human, human_group) = fixture::seed_agent_with_group(&pool, "human").await;
-    sqlx::query(
-        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
-                                    status, agent_id) \
-         VALUES ($1, 'binding human', 'human', ARRAY['claims:write'], 'active', $2)",
-    )
-    .bind(format!("human-{human}"))
-    .bind(human)
-    .execute(&pool)
-    .await
-    .expect("human client");
+    let (human, human_group) = fixture::seed_human_operator(&pool, "human").await;
     let system = {
         let mut conn = pool.acquire().await.expect("acquire");
         epigraph_ingest_executor::get_or_create_system_agent(&mut conn)

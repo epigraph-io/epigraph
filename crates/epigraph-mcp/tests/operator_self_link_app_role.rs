@@ -49,7 +49,7 @@ async fn app_role_server(pool: &PgPool) -> (EpiGraphMcpFull, Uuid) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_declared_agent_on_an_app_dsn_starts_once_the_host_linked_it(pool: PgPool) {
     let (server, agent) = app_role_server(&pool).await;
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
 
     // Not linked yet: the process cannot record the link itself on an app DSN,
     // and the refusal names the host-side command that fixes it.
@@ -79,7 +79,7 @@ async fn a_declared_agent_on_an_app_dsn_starts_once_the_host_linked_it(pool: PgP
     );
 
     // A declaration naming a DIFFERENT operator is not satisfied by that link.
-    let (other, _) = fixture::seed_agent_with_group(&pool, "other-operator").await;
+    let (other, _) = fixture::seed_human_operator(&pool, "other-operator").await;
     epigraph_mcp::operator::self_link(&server, other)
         .await
         .expect_err("a link to another operator must not satisfy the declaration");

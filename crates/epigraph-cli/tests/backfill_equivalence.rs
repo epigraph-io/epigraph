@@ -108,7 +108,7 @@ fn per_row_owner(agent: &str) -> String {
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
     // ---- authors ----
-    let (human, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (human, _) = fixture::seed_human_operator(&pool, "operator").await;
     let (canon, _) = fixture::seed_agent_with_group(&pool, "canon").await;
     // Both keys: an OLDER non-canonical group and the canonical one; canonical wins.
     let both = bare_agent(&pool).await;

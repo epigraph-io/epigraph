@@ -35,6 +35,9 @@ fn hash32(id: Uuid) -> Vec<u8> {
     id.as_bytes().iter().copied().cycle().take(32).collect()
 }
 
+/// Registered as a HUMAN OPERATOR: since migration 122 a link (retired ones
+/// included) can be recorded only to one, and this file measures 116's own
+/// refusals, not 122's.
 async fn seed_agent(pool: &PgPool) -> Uuid {
     let agent = Uuid::new_v4();
     sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
@@ -43,6 +46,7 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
         .execute(pool)
         .await
         .expect("seed agent");
+    fixture::make_human_operator(pool, agent).await;
     agent
 }
 

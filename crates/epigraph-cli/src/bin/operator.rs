@@ -27,6 +27,8 @@
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
 //!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
+//!     epigraph-operator register-human-operator --agent <uuid> --reason TEXT [--apply]
+//!     epigraph-operator revoke-human-operator --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
 //!         --agent-system-prompt-hash H) [--apply]
 //!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
@@ -38,7 +40,7 @@
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, arm, bind, client_scope, hide, legacy, link, reown, reown_linked, reverse,
+    self, arm, bind, client_scope, hide, human, legacy, link, reown, reown_linked, reverse,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -57,6 +59,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Register a HUMAN operator (migration 122's audited registry). Only the
+    /// agent of an active human OAuth client can be registered.
+    RegisterHumanOperator {
+        /// The human's own agent id.
+        #[arg(long)]
+        agent: Uuid,
+        /// Recorded on the registry row and in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Revoke a human operator's registration. Final for that row: every agent
+    /// live-linked to the human stops authoring (OPL01).
+    RevokeHumanOperator {
+        /// The human's agent id.
+        #[arg(long)]
+        agent: Uuid,
+        /// Recorded on the row and in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Record a LIVE operator link for ONE agent (migration 107's
     /// `epigraph_link_operator`), binding it to a human operator (migration
     /// 122). Run by a host before it spawns the agent: under D9 the agent's own
@@ -285,6 +313,42 @@ async fn main_inner() -> anyhow::Result<i32> {
     let mut conn = db.pool().acquire().await?;
     let mut stdout = std::io::stdout();
     match cli.command {
+        Command::RegisterHumanOperator {
+            agent,
+            reason,
+            apply,
+        } => {
+            let now = human::register(&mut conn, agent, &reason, apply).await?;
+            println!(
+                "{}{}\tagent={agent}",
+                if apply { "" } else { "WOULD BE " },
+                if now {
+                    "REGISTERED"
+                } else {
+                    "ALREADY-REGISTERED"
+                }
+            );
+            if !apply {
+                println!("DRY RUN: the registration and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::RevokeHumanOperator {
+            agent,
+            reason,
+            apply,
+        } => {
+            let now = human::revoke(&mut conn, agent, &reason, apply).await?;
+            println!(
+                "{}{}\tagent={agent}",
+                if apply { "" } else { "WOULD BE " },
+                if now { "REVOKED" } else { "NOT-REGISTERED" }
+            );
+            if !apply {
+                println!("DRY RUN: the revocation and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
         Command::Link {
             agent,
             agent_model,

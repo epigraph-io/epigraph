@@ -340,14 +340,24 @@ human account, and there may be many humans. Once a database is ARMED (below),
 a claim may be written (and `claims.agent_id` changed) only when its author is
 BOUND:
 
-* (a) a **human operator**: the agent of an ACTIVE `client_type = 'human'` OAuth
-  client (nothing else makes an agent a human; in particular not being named as
-  some link's operator); or
+* (a) a **human operator**: an agent with a live row in the maintenance-only
+  registry `human_operators` AND the agent of an ACTIVE `client_type = 'human'`
+  OAuth client. Neither half alone counts: being named as some link's operator
+  never makes an agent a human, and a dynamic client registration is typed
+  `human` too. Register and revoke with
+  `epigraph-operator register-human-operator` / `revoke-human-operator
+  --agent <id> --reason <text> [--apply]` (maintenance DSN; audited; register
+  refuses an agent with no active human client; revoke is final and stops every
+  agent live-linked to that human at once); or
 * (b) the holder of a **live link to a human operator**: an `operator_links`
   row for the agent with `retired = false` whose operator is (a) (recorded by
   `epigraph-operator link`, or by a stdio process's own startup on a
   maintenance DSN). An agent has ONE operator for life: a link to a second
-  human is refused, live or retired, and never re-pointed.
+  human is refused, live or retired, and never re-pointed. And a NEW link can
+  be recorded only to a registered human operator, armed or not
+  (`operator_links_operator_is_human`; link rows are permanent, so a link to a
+  non-human could never be corrected); an exact re-link of an existing link is
+  never refused by it.
 
 Anything else is refused with SQLSTATE **`OPL01`**.
 

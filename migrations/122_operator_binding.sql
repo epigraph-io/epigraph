@@ -14,9 +14,10 @@
 -- A claim INSERT (and an UPDATE that changes `claims.agent_id`) is admitted
 -- only when its author is BOUND:
 --
---   (a) a HUMAN OPERATOR: the agent of an ACTIVE `client_type = 'human'` OAuth
---       client (`epigraph_is_human_operator`). Many humans, each its own
---       operator; nothing here assumes one.
+--   (a) a HUMAN OPERATOR (`epigraph_is_human_operator`): an agent with a live
+--       row in the maintenance-only registry `human_operators` (section 1c)
+--       AND the agent of an ACTIVE `client_type = 'human'` OAuth client. Many
+--       humans, each its own operator; nothing here assumes one.
 --   (b) holds a LIVE link to a human operator: an `operator_links` row for the
 --       agent with `retired = false` whose `operator_id` is (a). A link to
 --       anything that is not (a) binds nobody to a human, so it binds nothing.
@@ -57,6 +58,37 @@
 -- CLIs and the audited admin definers) and a session whose principal is a
 -- live instance admin (`epigraph_is_instance_admin`, 083). Admin access crosses
 -- groups; nothing else does.
+--
+-- ===================================================================
+-- 1c. WHO IS A HUMAN: AN EXPLICIT, AUDITED REGISTRY (OB7)
+--
+-- Neither signal the schema already had is proof of a human. "Some link names
+-- it as an operator" certified itself: 107's `epigraph_link_operator` never
+-- asked whether its operator is a human, so linking X to Y made Y one. And
+-- `client_type = 'human'` alone is what an unauthenticated dynamic client
+-- registration is typed as. So (a) requires BOTH an active human client AND a
+-- live row in `human_operators`, which only a maintenance session writes:
+-- `epigraph_register_human_operator` (refuses an agent with no active human
+-- client) and `epigraph_revoke_human_operator`, each audited by one
+-- `security_events` row (`operator.human_registered` / `operator.human_revoked`).
+-- The grants are the protection (the table is rowless, like
+-- `operator_binding_arming`): the app role may only SELECT; the maintenance
+-- role may SELECT, INSERT and UPDATE `revoked_at`, and nothing else. A
+-- maintenance login can therefore also INSERT directly; "only through the
+-- definer" is the audited convention, and the trust basis is 107 section 4's
+-- (the maintenance DSN authorizes).
+--
+-- The registry also gates the LINK RECORD: `operator_links_operator_is_human`
+-- (BEFORE INSERT on `operator_links`) refuses a new link whose operator is not
+-- (a), on every path (107's two link functions, 116's attested retire, a raw
+-- INSERT), ARMED OR NOT: a link row is permanent, so a link to a non-human
+-- recorded before arming could never be corrected. It fires after each link
+-- function's own refusals (they raise before their INSERT), and it is skipped
+-- when a row for the agent already exists (the INSERT is an `ON CONFLICT DO
+-- NOTHING` re-link that will be discarded): an exact re-link of an existing
+-- link is never refused by it. Because (b) re-checks (a) at write time, a live
+-- link whose operator is revoked from the registry, or whose human client is
+-- suspended, stops authorising at once.
 --
 -- ===================================================================
 -- 2. WHERE IT IS ENFORCED: A TRIGGER, SO NO WRITE PATH CAN SKIP IT
@@ -134,7 +166,9 @@
 -- then drop the functions and `operator_binding_arming`. To stop enforcing
 -- without DDL, set the valve (section 4) on every writing unit and restart it.
 -- A link `epigraph_link_legacy_authors` (section 7) recorded is an
--- `operator_links` row like 107's and is permanent by the same rule.
+-- `operator_links` row like 107's and is permanent by the same rule. Drop
+-- `operator_links_operator_is_human` before `human_operators` (the trigger's
+-- body reads it through `epigraph_is_human_operator`).
 -- **Applied to a throwaway database only, NOT to any deployed database.**
 
 SET LOCAL lock_timeout = '3s';
@@ -151,15 +185,28 @@ CREATE TABLE IF NOT EXISTS public.operator_binding_arming (
 );
 REVOKE ALL ON public.operator_binding_arming FROM PUBLIC;
 
--- (a): is this agent a human operator? The agent of an ACTIVE human OAuth
--- client, and nothing else: in particular NOT "some link names it as an
--- operator", because a stdio self-link on a maintenance DSN never asks whether
--- its operator is a human, and a link must not be able to make one.
+-- The human-operator registry (section 1c). Rowless on purpose; see there.
+CREATE TABLE IF NOT EXISTS public.human_operators (
+    agent_id   uuid PRIMARY KEY REFERENCES public.agents(id) ON DELETE RESTRICT,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    created_by text NOT NULL DEFAULT session_user,
+    reason     text NOT NULL,
+    revoked_at timestamptz,
+    revoked_by text
+);
+REVOKE ALL ON public.human_operators FROM PUBLIC;
+
+-- (a): is this agent a human operator? A live registry row AND an ACTIVE human
+-- OAuth client, and nothing else: in particular NOT "some link names it as an
+-- operator" (a link must not be able to make a human), and NOT a human client
+-- alone (a dynamic client registration is typed 'human' too).
 CREATE OR REPLACE FUNCTION public.epigraph_is_human_operator(p_agent uuid)
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
     SELECT p_agent IS NOT NULL
+       AND EXISTS (SELECT 1 FROM public.human_operators h
+                    WHERE h.agent_id = p_agent AND h.revoked_at IS NULL)
        AND EXISTS (SELECT 1 FROM public.oauth_clients c
                     WHERE c.agent_id = p_agent
                       AND c.client_type = 'human'
@@ -320,6 +367,102 @@ CREATE TRIGGER group_memberships_operator_scope
     BEFORE INSERT OR UPDATE OF role, revoked_at, group_id, agent_id ON public.group_memberships
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_group_memberships_operator_scope();
 
+-- Section 1c: register a human operator. Maintenance only; audited; refuses
+-- an agent that is not the agent of an ACTIVE human OAuth client. Idempotent
+-- for a live row; a REVOKED row is not revived by it (a re-registration is an
+-- explicit, separate decision: revoke is final for that row).
+CREATE OR REPLACE FUNCTION public.epigraph_register_human_operator(p_agent uuid, p_reason text)
+RETURNS TABLE (registered_now boolean, created_at timestamptz, created_by text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_rows integer := 0;
+BEGIN
+    IF p_agent IS NULL OR p_reason IS NULL OR length(trim(p_reason)) = 0 THEN
+        RAISE EXCEPTION 'epigraph_register_human_operator: the agent and a reason are required'
+            USING ERRCODE = '22004';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.oauth_clients c
+                    WHERE c.agent_id = p_agent AND c.client_type = 'human'
+                      AND c.status = 'active') THEN
+        RAISE EXCEPTION 'epigraph_register_human_operator: % is not the agent of an ACTIVE '
+                        'human OAuth client; only a human''s own principal can be registered',
+                        p_agent
+            USING ERRCODE = '55000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.human_operators h
+                WHERE h.agent_id = p_agent AND h.revoked_at IS NOT NULL) THEN
+        RAISE EXCEPTION 'epigraph_register_human_operator: % was registered and REVOKED; a '
+                        'revoked registration is not revived', p_agent
+            USING ERRCODE = '55000';
+    END IF;
+    INSERT INTO public.human_operators (agent_id, reason)
+    VALUES (p_agent, p_reason)
+    ON CONFLICT (agent_id) DO NOTHING;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    IF v_rows > 0 THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('operator.human_registered', p_agent, true,
+                jsonb_build_object('reason', p_reason, 'recorded_by', session_user));
+    END IF;
+    RETURN QUERY SELECT v_rows > 0, h.created_at, h.created_by
+                   FROM public.human_operators h WHERE h.agent_id = p_agent;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text) FROM PUBLIC;
+
+-- Section 1c: revoke a registration. Maintenance only; audited; final.
+CREATE OR REPLACE FUNCTION public.epigraph_revoke_human_operator(p_agent uuid, p_reason text)
+RETURNS TABLE (revoked_now boolean)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_rows integer := 0;
+BEGIN
+    IF p_agent IS NULL OR p_reason IS NULL OR length(trim(p_reason)) = 0 THEN
+        RAISE EXCEPTION 'epigraph_revoke_human_operator: the agent and a reason are required'
+            USING ERRCODE = '22004';
+    END IF;
+    UPDATE public.human_operators h
+       SET revoked_at = now(), revoked_by = session_user
+     WHERE h.agent_id = p_agent AND h.revoked_at IS NULL;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    IF v_rows > 0 THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('operator.human_revoked', p_agent, true,
+                jsonb_build_object('reason', p_reason, 'recorded_by', session_user));
+    END IF;
+    RETURN QUERY SELECT v_rows > 0;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_revoke_human_operator(uuid, text) FROM PUBLIC;
+
+-- Section 1c at the link record: a NEW link only to a registered human.
+CREATE OR REPLACE FUNCTION public.epigraph_operator_links_operator_is_human()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    -- An exact re-link (a row for this agent exists) is discarded by the
+    -- caller's ON CONFLICT DO NOTHING; never refuse it here.
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = NEW.agent_id) THEN
+        RETURN NEW;
+    END IF;
+    IF NOT public.epigraph_is_human_operator(NEW.operator_id) THEN
+        RAISE EXCEPTION 'operator % is not a registered human operator (a live human_operators '
+                        'row and an active human OAuth client are both required); no agent is '
+                        'linked to it', NEW.operator_id
+            USING ERRCODE = '55000',
+                  HINT = 'A maintenance session registers a human with '
+                         'epigraph-operator register-human-operator --agent <id> --apply.';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_operator_links_operator_is_human() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS operator_links_operator_is_human ON public.operator_links;
+CREATE TRIGGER operator_links_operator_is_human
+    BEFORE INSERT ON public.operator_links
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_operator_links_operator_is_human();
+
 -- Arm enforcement, once (section 3). Maintenance only; audited.
 CREATE OR REPLACE FUNCTION public.epigraph_arm_operator_binding()
 RETURNS TABLE (armed_now boolean, armed_at timestamptz, armed_by text)
@@ -365,6 +508,19 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_group_memberships_operator_scope() '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_register_human_operator(uuid, text) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_revoke_human_operator(uuid, text) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_operator_links_operator_is_human() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_revoke_human_operator(uuid, text) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT SELECT, INSERT ON public.human_operators TO epigraph_maintenance';
+        EXECUTE 'GRANT UPDATE (revoked_at, revoked_by) ON public.human_operators '
+                'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_writes_group(uuid, uuid) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_scope_exempt() '
@@ -390,6 +546,12 @@ DO $$ BEGIN
         -- secret, and every relation must be app-readable).
         EXECUTE 'REVOKE ALL ON public.operator_binding_arming FROM epigraph_app';
         EXECUTE 'GRANT SELECT ON public.operator_binding_arming TO epigraph_app';
+        EXECUTE 'REVOKE ALL ON public.human_operators FROM epigraph_app';
+        EXECUTE 'GRANT SELECT ON public.human_operators TO epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_register_human_operator(uuid, text) '
+                'FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_revoke_human_operator(uuid, text) '
+                'FROM epigraph_app';
         EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_arm_operator_binding() '
                 'FROM epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_is_human_operator(uuid) '

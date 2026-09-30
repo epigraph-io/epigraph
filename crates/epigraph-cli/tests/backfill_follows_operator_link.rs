@@ -45,7 +45,7 @@ async fn owner_of(pool: &PgPool, table: &str, id: Uuid) -> Uuid {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_backfill_stamps_a_linked_authors_claims_to_the_operators_group(pool: PgPool) {
-    let (operator, operator_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, operator_group) = fixture::seed_human_operator(&pool, "operator").await;
     let (linked, linked_group) = fixture::seed_agent_with_group(&pool, "linked").await;
     let (unlinked, unlinked_group) = fixture::seed_agent_with_group(&pool, "unlinked").await;
     {

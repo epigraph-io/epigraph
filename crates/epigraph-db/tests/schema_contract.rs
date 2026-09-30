@@ -1474,6 +1474,24 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
             "v",
             false,
         ),
+        (
+            "epigraph_register_human_operator",
+            "public.epigraph_register_human_operator(uuid, text)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_revoke_human_operator",
+            "public.epigraph_revoke_human_operator(uuid, text)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_operator_links_operator_is_human",
+            "public.epigraph_operator_links_operator_is_human()",
+            "v",
+            false,
+        ),
     ] {
         let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
             "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
@@ -1511,9 +1529,10 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
         }
     }
 
-    // The arming record: SELECT for the app, SELECT and INSERT (never UPDATE or
-    // DELETE) for the maintenance role. That grant set is what makes arming
-    // one-way.
+    // The arming record and the human-operator registry: SELECT for the app,
+    // SELECT and INSERT (never a table-wide UPDATE or DELETE) for the
+    // maintenance role. That grant set is what makes arming one-way and the
+    // registry append-only apart from its revocation columns.
     for (role, privilege, expected) in [
         ("epigraph_app", "SELECT", true),
         ("epigraph_app", "INSERT", false),
@@ -1524,17 +1543,32 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
         ("epigraph_maintenance", "UPDATE", false),
         ("epigraph_maintenance", "DELETE", false),
     ] {
+        for table in ["public.operator_binding_arming", "public.human_operators"] {
+            let can: bool = sqlx::query_scalar("SELECT has_table_privilege($1, $2, $3)")
+                .bind(role)
+                .bind(table)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("table privilege");
+            assert_eq!(can, expected, "{role} {privilege} on {table}");
+        }
+    }
+    // The registry's revocation columns are the maintenance role's one UPDATE.
+    for (col, expected) in [
+        ("revoked_at", true),
+        ("revoked_by", true),
+        ("agent_id", false),
+        ("reason", false),
+    ] {
         let can: bool = sqlx::query_scalar(
-            "SELECT has_table_privilege($1, 'public.operator_binding_arming', $2)",
+            "SELECT has_column_privilege('epigraph_maintenance', 'public.human_operators', $1, \
+             'UPDATE')",
         )
-        .bind(role)
-        .bind(privilege)
+        .bind(col)
         .fetch_one(&pool)
         .await
-        .expect("table privilege");
-        assert_eq!(
-            can, expected,
-            "{role} {privilege} on operator_binding_arming"
-        );
+        .expect("column privilege");
+        assert_eq!(can, expected, "maintenance UPDATE of human_operators.{col}");
     }
 }

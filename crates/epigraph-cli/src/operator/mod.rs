@@ -20,6 +20,8 @@
 //!
 //! And the operator-binding commands (migration 122; see [`bind`]):
 //!
+//! * `register-human-operator` / `revoke-human-operator` — the audited registry
+//!   of who is a human (see [`human`]); an agent can be linked only to one.
 //! * `link` — record a LIVE operator link for one agent (by id, or by the
 //!   `(model, prompt hash)` identity a stdio `epigraph-mcp` derives), so the
 //!   agent is bound to a human operator. Hosts run it before spawning an agent,
@@ -73,6 +75,7 @@ pub mod arm;
 pub mod bind;
 pub mod client_scope;
 pub mod hide;
+pub mod human;
 pub mod legacy;
 pub mod link;
 pub mod manifest;

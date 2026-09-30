@@ -294,6 +294,40 @@ pub async fn seed_agent_with_group(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
     (agent, group)
 }
 
+/// Make `agent` a HUMAN OPERATOR (migration 122 section 1c): an ACTIVE
+/// `human` OAuth client for it AND a live `human_operators` registry row. Both
+/// are required; either alone is not a human. Written directly on the harness
+/// (superuser) connection, standing in for the maintenance registration.
+///
+/// Since 122, an agent can be LINKED only to a human operator
+/// (`operator_links_operator_is_human`), so every fixture that records a link
+/// successfully makes its operator one of these first.
+pub async fn make_human_operator(pool: &PgPool, agent: Uuid) {
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id) \
+         VALUES ($1, 'fixture human operator', 'human', ARRAY['claims:write'], 'active', $2)",
+    )
+    .bind(format!("fixture-human-{agent}"))
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("human operator's OAuth client");
+    sqlx::query("INSERT INTO human_operators (agent_id, reason) VALUES ($1, 'test fixture')")
+        .bind(agent)
+        .execute(pool)
+        .await
+        .expect("human operator registry row");
+}
+
+/// [`seed_agent_with_group`] for an agent that is a HUMAN OPERATOR
+/// ([`make_human_operator`]); returns `(agent_id, personal_group_id)`.
+pub async fn seed_human_operator(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
+    let (agent, group) = seed_agent_with_group(pool, label).await;
+    make_human_operator(pool, agent).await;
+    (agent, group)
+}
+
 /// A `visibility = 'public'` claim authored by `agent`.
 pub async fn seed_public_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
     seed_claim(pool, agent, content, "public", world_group(pool).await).await

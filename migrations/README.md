@@ -769,9 +769,12 @@ Current reservation:
   deployed database.
 
 - **122**: public `operator_binding` — every claim is authored by an agent
-  BOUND to a human operator: (a) the agent of an active `human` OAuth client;
-  or (b) the holder of a LIVE (`retired = false`) `operator_links` row whose
-  operator is (a). A BEFORE INSERT OR UPDATE OF `agent_id` trigger on `claims`
+  BOUND to a human operator: (a) an agent with a live row in the
+  maintenance-only, audited registry `human_operators` AND an active `human`
+  OAuth client; or (b) the holder of a LIVE (`retired = false`)
+  `operator_links` row whose operator is (a). A new `operator_links` row whose
+  operator is not (a) is refused by `operator_links_operator_is_human`, armed
+  or not (an exact re-link is skipped). A BEFORE INSERT OR UPDATE OF `agent_id` trigger on `claims`
   (`claims_require_operator_binding`, a maintenance-owned definer body) raises
   `OPL01` naming the fix (`epigraph-operator link`) for any other author, on
   every role; and `OPL02` when a live-linked author's claim is owned by a group

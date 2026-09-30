@@ -27,6 +27,12 @@ fn hash32(id: Uuid) -> Vec<u8> {
 
 /// An agent row with NO personal group — the shape of an operator whose group
 /// `epigraph_link_operator` has to create.
+///
+/// Registered as a HUMAN OPERATOR (an active human client plus a
+/// `human_operators` row): since migration 122 a link can be recorded only to
+/// one (`operator_links_operator_is_human`). Every agent this file seeds is
+/// registered, so 107's own behaviour is measured unchanged; 122's refusal of a
+/// link to a non-registered operator is `operator_binding.rs`'s to test.
 async fn seed_bare_agent(pool: &PgPool) -> Uuid {
     let agent = Uuid::new_v4();
     sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
@@ -35,6 +41,7 @@ async fn seed_bare_agent(pool: &PgPool) -> Uuid {
         .execute(pool)
         .await
         .expect("seed agent");
+    fixture::make_human_operator(pool, agent).await;
     agent
 }
 
@@ -360,7 +367,7 @@ async fn a_hard_deleted_revocation_is_not_revived_by_a_relink(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_app_session_cannot_hard_delete_a_membership(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (operator, group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, group) = fixture::seed_human_operator(&pool, "operator").await;
     let x = seed_bare_agent(&pool).await;
     let y = seed_bare_agent(&pool).await;
     link(&pool, x, operator).await;
@@ -498,8 +505,8 @@ async fn lineage_edge(pool: &PgPool, signer: Uuid, principal: Uuid) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_app_session_cannot_move_a_membership_row(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
-    let (x, x_group) = fixture::seed_agent_with_group(&pool, "x").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
+    let (x, x_group) = fixture::seed_human_operator(&pool, "x").await;
     assert!(link(&pool, x, operator).await.link_live);
     let code_of = |r: &Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
         r.as_ref().err().and_then(sqlstate)
@@ -531,7 +538,7 @@ async fn an_app_session_cannot_move_a_membership_row(pool: PgPool) {
     );
 
     // A revoked operator moves its own row out of its group.
-    let (o2, og2) = fixture::seed_agent_with_group(&pool, "o2").await;
+    let (o2, og2) = fixture::seed_human_operator(&pool, "o2").await;
     sqlx::query(
         "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
     )
@@ -874,7 +881,7 @@ async fn a_second_operator_and_a_self_link_are_refused(pool: PgPool) {
 /// operated by the last OAuth principal that called it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_auth_lineage_edge_alone_is_not_an_operator_link(pool: PgPool) {
-    let (principal, _) = fixture::seed_agent_with_group(&pool, "principal").await;
+    let (principal, _) = fixture::seed_human_operator(&pool, "principal").await;
     let signer = seed_bare_agent(&pool).await;
     epigraph_db::EdgeRepository::create_if_not_exists(
         &pool,
@@ -919,9 +926,9 @@ async fn an_auth_lineage_edge_alone_is_not_an_operator_link(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_app_session_cannot_forge_a_link_from_an_edge_and_a_membership(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (o, o_group) = fixture::seed_agent_with_group(&pool, "forger-o").await;
+    let (o, o_group) = fixture::seed_human_operator(&pool, "forger-o").await;
     let x = seed_bare_agent(&pool).await;
-    let (p, p_group) = fixture::seed_agent_with_group(&pool, "forger-p").await;
+    let (p, p_group) = fixture::seed_human_operator(&pool, "forger-p").await;
     let signer = seed_bare_agent(&pool).await;
     epigraph_db::EdgeRepository::create_if_not_exists(
         &pool,
@@ -1027,7 +1034,7 @@ async fn operator_links_refuses_an_app_insert_by_policy_and_by_grant(pool: PgPoo
          grant it INSERT on every new table"
     );
 
-    let (o, o_group) = fixture::seed_agent_with_group(&pool, "forger").await;
+    let (o, o_group) = fixture::seed_human_operator(&pool, "forger").await;
     let x = seed_bare_agent(&pool).await;
     let o_viewer = Viewer::resolve(&pool, o).await.expect("resolve O");
     fixture::grant_app_privileges(&pool, "epigraph_app").await;
@@ -1081,7 +1088,7 @@ async fn operator_links_refuses_an_app_insert_by_policy_and_by_grant(pool: PgPoo
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_squatted_personal_group_is_not_the_operators(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (z, _) = fixture::seed_agent_with_group(&pool, "squatter").await;
+    let (z, _) = fixture::seed_human_operator(&pool, "squatter").await;
     let d = seed_bare_agent(&pool).await;
     let e = seed_bare_agent(&pool).await;
     // A second not-yet-grouped operator for the team-kind arm, so the two arms
@@ -1240,7 +1247,7 @@ async fn a_squatted_personal_group_is_not_the_operators(pool: PgPool) {
 /// here on the harness), the same two calls succeed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_link_to_an_operator_with_only_a_revoked_own_row_is_refused(pool: PgPool) {
-    let (operator, group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, group) = fixture::seed_human_operator(&pool, "operator").await;
     let actor = seed_bare_agent(&pool).await;
     let retired = seed_bare_agent(&pool).await;
     sqlx::query(
@@ -1325,8 +1332,8 @@ async fn a_link_to_an_operator_with_only_a_revoked_own_row_is_refused(pool: PgPo
 /// restore, so the refusal is the operator's row and not the fixture.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_acting_link_stops_acting_while_its_operators_own_row_is_revoked(pool: PgPool) {
-    let (operator, group) = fixture::seed_agent_with_group(&pool, "operator").await;
-    let (actor, own_group) = fixture::seed_agent_with_group(&pool, "actor").await;
+    let (operator, group) = fixture::seed_human_operator(&pool, "operator").await;
+    let (actor, own_group) = fixture::seed_human_operator(&pool, "actor").await;
     assert!(link(&pool, actor, operator).await.link_live);
     let acting = |pool: PgPool| async move {
         AgentRepository::operator_actor_pool(&pool, actor)
@@ -1452,8 +1459,8 @@ async fn concurrent_links_cannot_build_a_two_hop_chain(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn operator_lookup_works_on_an_unstamped_app_session_and_mints_nothing(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
-    let (agent, own_group) = fixture::seed_agent_with_group(&pool, "agent").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
+    let (agent, own_group) = fixture::seed_human_operator(&pool, "agent").await;
     link(&pool, agent, operator).await;
     let op_group = operator_group(&pool, operator).await;
 
@@ -1510,9 +1517,9 @@ async fn operator_lookup_works_on_an_unstamped_app_session_and_mints_nothing(poo
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_agent_writes_claim_derived_rows_into_the_operator_group(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "agent").await;
-    let (unlinked, _) = fixture::seed_agent_with_group(&pool, "unlinked").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
+    let (agent, _) = fixture::seed_human_operator(&pool, "agent").await;
+    let (unlinked, _) = fixture::seed_human_operator(&pool, "unlinked").await;
     link(&pool, agent, operator).await;
     let op_group = operator_group(&pool, operator).await;
 
@@ -1666,7 +1673,7 @@ async fn link_row(pool: &PgPool, agent: Uuid) -> Option<(Uuid, bool)> {
 #[sqlx::test(migrations = "../../migrations")]
 async fn epigraph_app_cannot_execute_link_retired_agent(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
     let retired = seed_bare_agent(&pool).await;
 
     let refused = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
@@ -1707,8 +1714,8 @@ async fn epigraph_app_cannot_execute_link_retired_agent(pool: PgPool) {
 /// membership, and is idempotent.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_retired_link_records_the_row_and_edge_and_no_membership(pool: PgPool) {
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
-    let (retired, _) = fixture::seed_agent_with_group(&pool, "retired").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
+    let (retired, _) = fixture::seed_human_operator(&pool, "retired").await;
 
     let first = link_retired(&pool, retired, operator).await;
     assert_eq!(first.operator_group_id, op_group);
@@ -1752,8 +1759,8 @@ async fn a_retired_link_records_the_row_and_edge_and_no_membership(pool: PgPool)
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_retired_agent_gains_no_write_authority(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
-    let (retired, own_group) = fixture::seed_agent_with_group(&pool, "retired").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
+    let (retired, own_group) = fixture::seed_human_operator(&pool, "retired").await;
     link_retired(&pool, retired, operator).await;
 
     let viewer = Viewer::resolve(&pool, retired)
@@ -1818,7 +1825,7 @@ async fn a_retired_agent_gains_no_write_authority(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operator_cannot_enrol_a_retired_identity_as_a_writer(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
     let retired = seed_bare_agent(&pool).await;
     let unlinked = seed_bare_agent(&pool).await;
     link_retired(&pool, retired, operator).await;
@@ -1897,7 +1904,7 @@ async fn an_operator_cannot_enrol_a_retired_identity_as_a_writer(pool: PgPool) {
 /// reported as retired.
 #[sqlx::test(migrations = "../../migrations")]
 async fn link_operator_never_promotes_a_retired_link(pool: PgPool) {
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
     let retired = seed_bare_agent(&pool).await;
     link_retired(&pool, retired, operator).await;
 
@@ -1920,8 +1927,8 @@ async fn link_operator_never_promotes_a_retired_link(pool: PgPool) {
 /// membership exactly as they were.
 #[sqlx::test(migrations = "../../migrations")]
 async fn link_retired_agent_refuses_and_never_touches_a_membership(pool: PgPool) {
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
-    let (other_op, _) = fixture::seed_agent_with_group(&pool, "other-operator").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
+    let (other_op, _) = fixture::seed_human_operator(&pool, "other-operator").await;
     let mut conn = pool.acquire().await.expect("acquire");
 
     let err = AgentRepository::link_retired_agent(&mut conn, operator, operator)
@@ -1986,7 +1993,7 @@ async fn link_retired_agent_refuses_and_never_touches_a_membership(pool: PgPool)
 #[sqlx::test(migrations = "../../migrations")]
 async fn retiring_an_agent_that_still_holds_write_authority_is_refused(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
     let writer = seed_bare_agent(&pool).await;
     let reader = seed_bare_agent(&pool).await;
 
@@ -2066,7 +2073,7 @@ async fn retiring_an_agent_that_still_holds_write_authority_is_refused(pool: PgP
 /// membership — is what keeps a retired identity from acting for its operator.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_retired_link_with_a_membership_is_still_not_an_actor(pool: PgPool) {
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
     let retired = seed_bare_agent(&pool).await;
     link_retired(&pool, retired, operator).await;
     sqlx::query(
@@ -2099,7 +2106,7 @@ async fn a_retired_link_with_a_membership_is_still_not_an_actor(pool: PgPool) {
 ///   the acting agent ONLY.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_author_read_and_the_actor_read_answer_different_questions(pool: PgPool) {
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
     let acting = seed_bare_agent(&pool).await;
     let retired = seed_bare_agent(&pool).await;
     let revoked = seed_bare_agent(&pool).await;
@@ -2169,8 +2176,8 @@ async fn the_author_read_and_the_actor_read_answer_different_questions(pool: PgP
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_writer_cannot_rewrite_its_operator_groups_identity(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
-    let (a, a_group) = fixture::seed_agent_with_group(&pool, "operated-writer").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
+    let (a, a_group) = fixture::seed_human_operator(&pool, "operated-writer").await;
     let z = seed_bare_agent(&pool).await;
     link(&pool, a, operator).await;
     let viewer = Viewer::resolve(&pool, a).await.expect("resolve A");
@@ -2268,9 +2275,9 @@ async fn an_operated_writer_cannot_rewrite_its_operator_groups_identity(pool: Pg
 /// change to the default.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_agents_merge_is_owned_by_the_operator_group(pool: PgPool) {
-    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
-    let (agent, own_group) = fixture::seed_agent_with_group(&pool, "operated").await;
-    let (unlinked, unlinked_group) = fixture::seed_agent_with_group(&pool, "unlinked").await;
+    let (operator, op_group) = fixture::seed_human_operator(&pool, "operator").await;
+    let (agent, own_group) = fixture::seed_human_operator(&pool, "operated").await;
+    let (unlinked, unlinked_group) = fixture::seed_human_operator(&pool, "unlinked").await;
     link(&pool, agent, operator).await;
 
     async fn public_claim(pool: &PgPool, author: Uuid, owner: Uuid, content: &str) -> Uuid {

@@ -85,14 +85,20 @@ async fn arm(pool: &PgPool) -> bool {
     .await
 }
 
-/// An ACTIVE human OAuth client whose graph agent is `agent`.
+/// A registered HUMAN OPERATOR: an active human client AND a registry row.
 async fn make_human(pool: &PgPool, agent: Uuid) {
+    fixture::make_human_operator(pool, agent).await;
+}
+
+/// ONLY an active `human` OAuth client, with no registry row: the shape an
+/// unauthenticated dynamic client registration produces.
+async fn make_human_client_only(pool: &PgPool, agent: Uuid) {
     sqlx::query(
         "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
                                     status, agent_id) \
-         VALUES ($1, 'operator binding human', 'human', ARRAY['claims:write'], 'active', $2)",
+         VALUES ($1, 'dcr-shaped client', 'human', ARRAY['claims:write'], 'active', $2)",
     )
-    .bind(format!("human-{agent}"))
+    .bind(format!("dcr-{agent}"))
     .bind(agent)
     .execute(pool)
     .await
@@ -182,11 +188,13 @@ async fn a_live_link_and_a_human_operator_are_bound_and_a_retired_link_is_not(po
         AgentRepository::link_retired_agent(&mut conn, retired, human)
             .await
             .expect("retired link");
-        // `operator_only` has no human client: a link naming it as the
-        // operator must not make it, or `operated`, bound.
-        AgentRepository::link_operator(&mut conn, operated, operator_only)
-            .await
-            .expect("link naming operator_only");
+        // `operator_only` is no registered human: since 122 no link to it can
+        // be recorded at all (section 1c), so `operated` stays unlinked.
+        let refused = AgentRepository::link_operator(&mut conn, operated, operator_only).await;
+        assert!(
+            refused.is_err(),
+            "a link to a non-registered operator must be refused: {refused:?}"
+        );
     }
     arm(&pool).await;
 
@@ -627,4 +635,149 @@ async fn arming_is_maintenance_only_audited_and_one_way(pool: PgPool) {
         .await
         .expect("enforced read");
     assert!(still, "the database must still be armed");
+}
+
+/// OB7: WHO IS A HUMAN is an explicit, audited, maintenance-only registry, and
+/// neither half of the old test certifies alone.
+///
+/// * An agent with an active `human` client and NO registry row (the shape of
+///   an unauthenticated dynamic client registration) cannot author (OPL01) and
+///   cannot be linked to (refused at the link record, armed or not).
+/// * The app role can neither write the registry nor call its definers.
+/// * The maintenance role registers through the audited definer, which refuses
+///   an agent with no active human client; the human then binds.
+/// * Revoking the registration stops the human AND its live-linked agent
+///   (OPL01), and an exact re-link of that existing link is still not refused
+///   (a re-link records nothing new).
+///
+/// Verified to fail, each alone: the registry `EXISTS` removed from
+/// `epigraph_is_human_operator` (the DCR-shaped author writes); the
+/// `operator_links_operator_is_human` trigger removed (the link to it lands);
+/// `GRANT INSERT` on `human_operators` to the app role (the app write lands);
+/// the trigger's existing-row skip removed (the exact re-link is refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_human_registry_is_maintenance_written_audited_and_required(pool: PgPool) {
+    let (dcr, dcr_group) = fixture::seed_agent_with_group(&pool, "dcr-shaped").await;
+    make_human_client_only(&pool, dcr).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "agent").await;
+    arm(&pool).await;
+
+    // A human client alone is not a human.
+    assert_opl01(
+        insert_claim(&pool, dcr, dcr_group).await,
+        "a human client with no registry row",
+    );
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let r = AgentRepository::link_operator(&mut conn, agent, dcr).await;
+        let text = format!("{r:?}");
+        assert!(
+            r.is_err() && text.contains("not a registered human operator"),
+            "a link to a non-registered operator must be refused at the record: {text}"
+        );
+    }
+    let links: i64 = sqlx::query_scalar("SELECT count(*) FROM operator_links WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .expect("links");
+    assert_eq!(links, 0);
+
+    // The app role cannot write the registry, directly or through a definer.
+    let (direct, definer) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let d = sqlx::query("INSERT INTO human_operators (agent_id, reason) VALUES ($1, 'x')")
+            .bind(dcr)
+            .execute(&mut *conn)
+            .await;
+        let f = sqlx::query("SELECT * FROM public.epigraph_register_human_operator($1, 'x')")
+            .bind(dcr)
+            .execute(&mut *conn)
+            .await;
+        (
+            conn,
+            (
+                d.err().and_then(|e| sqlstate(&e)),
+                f.err().and_then(|e| sqlstate(&e)),
+            ),
+        )
+    })
+    .await;
+    assert_eq!(
+        direct.as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "app INSERT"
+    );
+    assert_eq!(
+        definer.as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "app register"
+    );
+
+    // The maintenance role registers through the audited definer.
+    let (no_client, _) = fixture::seed_agent_with_group(&pool, "no-client").await;
+    let (refused, registered) =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let refused = sqlx::query(
+                "SELECT * FROM public.epigraph_register_human_operator($1, 'not a human')",
+            )
+            .bind(no_client)
+            .execute(&mut *conn)
+            .await
+            .err()
+            .and_then(|e| sqlstate(&e));
+            let registered: bool = sqlx::query_scalar(
+                "SELECT registered_now FROM public.epigraph_register_human_operator($1, 'test')",
+            )
+            .bind(dcr)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("maintenance registers");
+            (conn, (refused, registered))
+        })
+        .await;
+    assert_eq!(
+        refused.as_deref(),
+        Some("55000"),
+        "an agent with no active human client"
+    );
+    assert!(registered);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'operator.human_registered'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audits, 1);
+    insert_claim(&pool, dcr, dcr_group)
+        .await
+        .expect("a registered human writes");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_operator(&mut conn, agent, dcr)
+            .await
+            .expect("a link to a registered human");
+    }
+    insert_claim(&pool, agent, dcr_group)
+        .await
+        .expect("its live-linked agent writes");
+
+    // Revoked: the human and its agent stop; an exact re-link is not refused.
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_revoke_human_operator($1, 'left')")
+            .bind(dcr)
+            .execute(&mut *conn)
+            .await
+            .expect("revoke");
+        (conn, ())
+    })
+    .await;
+    assert_opl01(insert_claim(&pool, dcr, dcr_group).await, "a revoked human");
+    assert_opl01(
+        insert_claim(&pool, agent, dcr_group).await,
+        "the live-linked agent of a revoked human",
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_operator(&mut conn, agent, dcr)
+        .await
+        .expect("an exact re-link of an existing link records nothing and is not refused");
 }

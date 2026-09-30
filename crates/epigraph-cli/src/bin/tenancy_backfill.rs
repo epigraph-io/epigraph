@@ -1402,6 +1402,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_operator_scope_exempt", 122),
     ("epigraph_require_operator_scope", 122),
     ("epigraph_group_memberships_operator_scope", 122),
+    // Section 1c (OB7): the human-operator registry. Under a non-member owner
+    // the registration INSERT and the audit row are refused (loud); the link
+    // record trigger reads no registry row and refuses every NEW link (loud).
+    ("epigraph_register_human_operator", 122),
+    ("epigraph_revoke_human_operator", 122),
+    ("epigraph_operator_links_operator_is_human", 122),
     // The legacy-author tie: under a non-member owner its reads of the FORCEd
     // tier-A tables and of `operator_links` are filtered and its link INSERT is
     // refused by 107's definer-only policy, so it fails CLOSED (links nothing,
@@ -1677,6 +1683,17 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_require_operator_scope",
             "public.epigraph_require_operator_scope(uuid, uuid)",
             true,
+        ),
+        // Registering a human is a maintenance act; the request DSN must not.
+        (
+            "epigraph_register_human_operator",
+            "public.epigraph_register_human_operator(uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_revoke_human_operator",
+            "public.epigraph_revoke_human_operator(uuid, text)",
+            false,
         ),
         // A link function: the request DSN must never record links.
         (

@@ -51,18 +51,9 @@ async fn run_op(pool: &PgPool, args: &[&str]) -> Run {
     }
 }
 
-/// An ACTIVE human OAuth client whose graph agent is `agent`.
+/// A registered HUMAN OPERATOR (active human client + registry row).
 async fn make_human(pool: &PgPool, agent: Uuid) {
-    sqlx::query(
-        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
-                                    status, agent_id) \
-         VALUES ($1, 'binding cli human', 'human', ARRAY['claims:write'], 'active', $2)",
-    )
-    .bind(format!("human-{agent}"))
-    .bind(agent)
-    .execute(pool)
-    .await
-    .expect("human client");
+    fixture::make_human_operator(pool, agent).await;
 }
 
 async fn link_row(pool: &PgPool, agent: Uuid) -> Option<(Uuid, bool)> {
@@ -749,4 +740,123 @@ async fn link_refuses_a_second_human_live_or_retired(pool: PgPool) {
     }
     assert_eq!(link_row(&pool, live).await, Some((a, false)));
     assert_eq!(link_row(&pool, retired).await, Some((a, true)));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// register-human-operator / revoke-human-operator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The registry through the real binary: a dry run registers nothing; `--apply`
+/// registers the agent of an active human client (audited once), after which a
+/// link to it succeeds; an agent without a human client is refused; revoking
+/// stops the human binding at once.
+///
+/// Verified to fail: `human::register` committing its dry-run transaction ->
+/// the "nothing registered" assertion fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn register_and_revoke_a_human_operator(pool: PgPool) {
+    let (person, _) = fixture::seed_agent_with_group(&pool, "person").await;
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id) \
+         VALUES ($1, 'person', 'human', ARRAY['claims:write'], 'active', $2)",
+    )
+    .bind(format!("person-{person}"))
+    .bind(person)
+    .execute(&pool)
+    .await
+    .expect("human client");
+    let (service, _) = fixture::seed_agent_with_group(&pool, "not-a-person").await;
+    let registered = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT public.epigraph_is_human_operator($1)")
+                .bind(agent)
+                .fetch_one(&pool)
+                .await
+                .expect("human read")
+        }
+    };
+    let p = person.to_string();
+
+    let dry = run_op(
+        &pool,
+        &["register-human-operator", "--agent", &p, "--reason", "test"],
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("WOULD BE REGISTERED"), "{}", dry.show());
+    assert!(!registered(person).await, "a dry run must register nothing");
+
+    let applied = run_op(
+        &pool,
+        &[
+            "register-human-operator",
+            "--agent",
+            &p,
+            "--reason",
+            "test",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    assert!(registered(person).await);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'operator.human_registered' \
+            AND agent_id = $1",
+    )
+    .bind(person)
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audits, 1);
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "its-agent").await;
+    let linked = run_op(
+        &pool,
+        &[
+            "link",
+            "--agent",
+            &agent.to_string(),
+            "--operator",
+            &p,
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(linked.code, 0, "{}", linked.show());
+
+    let refused = run_op(
+        &pool,
+        &[
+            "register-human-operator",
+            "--agent",
+            &service.to_string(),
+            "--reason",
+            "test",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(!registered(service).await);
+
+    let revoked = run_op(
+        &pool,
+        &[
+            "revoke-human-operator",
+            "--agent",
+            &p,
+            "--reason",
+            "left",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(revoked.code, 0, "{}", revoked.show());
+    assert!(revoked.stdout.contains("REVOKED"), "{}", revoked.show());
+    assert!(
+        !registered(person).await,
+        "a revoked human is no longer one"
+    );
 }

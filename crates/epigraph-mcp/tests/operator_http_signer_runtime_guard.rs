@@ -189,7 +189,9 @@ enum LinkKind {
 }
 
 async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind: LinkKind) {
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    // A registered human operator: since migration 122 a link can be recorded
+    // only to one.
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
     let seed = match kind {
         LinkKind::Acting => 0x71,
         LinkKind::Retired => 0x72,
@@ -239,6 +241,9 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
             .fetch_one(&pool)
             .await
             .expect("an agent for the signer to operate");
+            // The signer must be a registered human to be anyone's operator
+            // (migration 122); what is under test is the listener's refusal.
+            fixture::make_human_operator(&pool, signer_agent).await;
             epigraph_db::AgentRepository::link_retired_agent(&mut conn, operated, signer_agent)
                 .await
                 .expect("link an agent with the SIGNER as its operator");
@@ -375,7 +380,7 @@ async fn principal_less_caller_on_a_retired_signer_cannot_retire_the_humans_item
     seed: u8,
 ) {
     use epigraph_mcp::auth::UnauthenticatedWrites;
-    let (human, _) = fixture::seed_agent_with_group(&pool, "httpid-retired-signer-human").await;
+    let (human, _) = fixture::seed_human_operator(&pool, "httpid-retired-signer-human").await;
     let item: Uuid = sqlx::query_scalar(
         "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels) \
          VALUES (gen_random_uuid(), 'HTTP-id: the human''s open item', \
