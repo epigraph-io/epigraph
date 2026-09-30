@@ -342,14 +342,15 @@ async fn the_claims_walk_resumes_rewinds_and_honours_its_budget(pool: PgPool) {
         "the carried cursor is rewound in the same run"
     );
 
-    // --max-runtime: a statement-level sleep makes one batch outlast a 1s
-    // budget, so the walk stops after exactly one batch and exits 3.
+    // --max-runtime: a statement-level sleep makes one batch outlast a 3s
+    // budget (wide margins: the budget also covers the binary's preflight on a
+    // slow runner), so the walk stops after exactly one batch and exits 3.
     for i in 0..3 {
         fixture::seed_public_claim(&pool, author, &format!("budgeted {i}")).await;
     }
     sqlx::query(
         "CREATE FUNCTION test_slow_batch() RETURNS trigger LANGUAGE plpgsql AS \
-         $$ BEGIN PERFORM pg_sleep(1.2); RETURN NULL; END $$",
+         $$ BEGIN PERFORM pg_sleep(4); RETURN NULL; END $$",
     )
     .execute(&pool)
     .await
@@ -370,7 +371,7 @@ async fn the_claims_walk_resumes_rewinds_and_honours_its_budget(pool: PgPool) {
         "--batch-size",
         "1",
         "--max-runtime",
-        "1s",
+        "3s",
     ];
     let (code, stderr) = run_backfill(&pool, &budgeted).await;
     assert_eq!(code, 3, "a spent budget is a partial run:\n{stderr}");
