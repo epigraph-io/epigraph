@@ -1790,6 +1790,48 @@ mod db_integration_tests {
         .expect("seed 1536 claim")
     }
 
+    /// [`seed_claim_1536`] plus an optional `embedding_3072` and an optional
+    /// owning group (`visibility = 'group'`), all set in the INSERT.
+    ///
+    /// Everything goes into the INSERT on purpose: a later write to `claims`
+    /// from this file counts against `viewer_route_table_lint`'s route-layer
+    /// write ratchet, whose scanner does not skip `#[cfg(test)]` code.
+    async fn seed_claim_with(
+        pool: &sqlx::PgPool,
+        agent_id: Uuid,
+        content: &str,
+        embedding: &str,
+        embedding_3072: Option<&str>,
+        theme_id: Option<Uuid>,
+        owner_group: Option<Uuid>,
+    ) -> Uuid {
+        let q = match owner_group {
+            None => sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, \
+                                     embedding_3072, theme_id) \
+                 VALUES ($1, sha256($1::bytea), 0.5, $2, $3::vector, $4::vector, $5) \
+                 RETURNING id",
+            ),
+            Some(_) => sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, \
+                                     embedding_3072, theme_id, visibility, owner_group_id) \
+                 VALUES ($1, sha256($1::bytea), 0.5, $2, $3::vector, $4::vector, $5, 'group', $6) \
+                 RETURNING id",
+            ),
+        };
+        let q = q
+            .bind(content)
+            .bind(agent_id)
+            .bind(embedding)
+            .bind(embedding_3072)
+            .bind(theme_id);
+        let q = match owner_group {
+            Some(g) => q.bind(g),
+            None => q,
+        };
+        q.fetch_one(pool).await.expect("seed claim")
+    }
+
     /// Give the planner statistics, as a live database has, so the covered arm
     /// runs the probe and candidate query under realistic plans.
     async fn analyze_claims(pool: &sqlx::PgPool) {
@@ -1980,20 +2022,16 @@ mod db_integration_tests {
 
         let mut off = std::collections::HashSet::new();
         for i in 0..3 {
-            let c = seed_claim_1536(
+            let c = seed_claim_with(
                 &pool,
                 agent,
                 &format!("off-topic-3072-{i}"),
                 &off_topic(i as f32 * 0.01),
+                Some(&off_3072),
                 Some(theme),
+                None,
             )
             .await;
-            sqlx::query("UPDATE claims SET embedding_3072 = $2::vector WHERE id = $1")
-                .bind(c)
-                .bind(&off_3072)
-                .execute(&pool)
-                .await
-                .expect("set 3072 embedding");
             off.insert(c);
         }
         let mut relevant = Vec::new();
@@ -2062,14 +2100,6 @@ mod db_integration_tests {
                 .await,
             );
         }
-        let private = seed_claim_1536(
-            &pool,
-            agent,
-            "group-private-nearest",
-            &query_neighbour(0.0),
-            Some(theme),
-        )
-        .await;
         // A real personal group owned by the author (the shape
         // `AgentRepository::ensure_personal_group` mints); the nil test viewer
         // is not a member.
@@ -2083,12 +2113,16 @@ mod db_integration_tests {
         .fetch_one(&pool)
         .await
         .expect("seed a private group");
-        sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
-            .bind(private)
-            .bind(group)
-            .execute(&pool)
-            .await
-            .expect("make the nearest claim group-private");
+        let private = seed_claim_with(
+            &pool,
+            agent,
+            "group-private-nearest",
+            &query_neighbour(0.0),
+            None,
+            Some(theme),
+            Some(group),
+        )
+        .await;
 
         let control = call_diverse_search_in_mode(pool.clone(), COVERAGE_QUERY, Some(1536), mode)
             .await
