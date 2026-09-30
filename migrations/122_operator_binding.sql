@@ -11,8 +11,9 @@
 -- declaration never consults a link at all. This file makes the tie a write
 -- precondition.
 --
--- A claim INSERT (and an UPDATE that changes `claims.agent_id`) is admitted
--- only when its author is BOUND, and, when the session's authenticated
+-- A claim INSERT (and an UPDATE that changes `claims.agent_id`, which only a
+-- privileged session or an instance-admin principal may make: section 2) is
+-- admitted only when its author is BOUND, and, when the session's authenticated
 -- principal is not the author, only when that WRITER is bound too (section 2):
 --
 --   (a) a HUMAN OPERATOR (`epigraph_is_human_operator`): an agent with a live
@@ -550,6 +551,21 @@ BEGIN
     END IF;
     IF NOT public.epigraph_operator_binding_armed() THEN
         RETURN NEW;
+    END IF;
+    -- RE-ATTRIBUTION. Every check below reads the NEW author only, so an
+    -- UPDATE that changes it would let a writer take over (or hand off) a
+    -- claim someone else said, including another human's claim in a group
+    -- both humans write. No repository or route changes `claims.agent_id`;
+    -- only the exemption (a privileged session, an instance-admin principal)
+    -- may, and it is then checked like an insert below. OPL02, keyed on the
+    -- arming: it is attribution, which the valve never relieves.
+    IF TG_OP = 'UPDATE' AND NOT public.epigraph_operator_scope_exempt() THEN
+        RAISE EXCEPTION 'OPL02: claim % is attributed to %; an application session does not '
+                        're-attribute an existing claim (here to %)', NEW.id, OLD.agent_id,
+                        NEW.agent_id
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Supersede the claim instead: the successor is written, and attributed, '
+                         'by the writer. Admin access crosses humans; nothing else does.';
     END IF;
     v_writer := public.epigraph_principal_id();
     IF v_writer IS NULL OR v_writer = NEW.agent_id OR public.epigraph_bypass() THEN

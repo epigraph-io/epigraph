@@ -1176,6 +1176,70 @@ async fn the_valve_never_lets_an_unbound_writer_name_a_bound_author(pool: PgPool
         .expect("valve open, U names another unbound agent");
 }
 
+/// Delta review SEC-D5: the checks read the NEW author only, so an UPDATE of
+/// `claims.agent_id` must not be a way to take over a claim another human
+/// said. Human B also writes A's group; B's claim sits there; A's live agent X,
+/// stamped honestly with that group writable, tries to make the claim its own.
+/// Refused (OPL02) on the application role; a privileged session still may
+/// (and is checked like an insert: `an_update_that_hands_a_claim_to_an_unbound_author_is_refused`).
+///
+/// Verified to fail: the trigger's `TG_OP = 'UPDATE' AND NOT
+/// epigraph_operator_scope_exempt()` refusal removed -> B's claim becomes X's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_application_session_never_re_attributes_a_claim(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    link_live(&pool, x, a).await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(a_group)
+    .bind(b)
+    .execute(&pool)
+    .await
+    .expect("B also writes A's group");
+    let b_claim = insert_claim(&pool, b, a_group)
+        .await
+        .expect("B's claim in the shared group");
+    let x_claim = insert_claim(&pool, x, a_group).await.expect("X's claim");
+    arm(&pool).await;
+
+    let take = as_app_stamped(&pool, x, &[a_group], |mut conn| async move {
+        let r = sqlx::query("UPDATE claims SET agent_id = $2 WHERE id = $1")
+            .bind(b_claim)
+            .bind(x)
+            .execute(&mut *conn)
+            .await
+            .map(|d| d.rows_affected());
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        code_of(&take).as_deref(),
+        Some("OPL02"),
+        "X took over B's claim: {take:?}"
+    );
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(b_claim)
+        .fetch_one(&pool)
+        .await
+        .expect("author");
+    assert_eq!(author, b, "B's claim is still B's");
+
+    // Control: an update that leaves the author alone is untouched.
+    as_app_stamped(&pool, x, &[a_group], |mut conn| async move {
+        let r = sqlx::query("UPDATE claims SET truth_value = 0.6 WHERE id = $1")
+            .bind(x_claim)
+            .execute(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await
+    .expect("X re-scores its own claim");
+}
+
 /// Review SEC-6 / SEC-8: a human is the agent of the ONE client its
 /// registration names, so the application role (which may INSERT
 /// `oauth_clients`, but not UPDATE it) cannot undo a suspension by minting a
