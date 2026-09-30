@@ -886,7 +886,9 @@ async fn the_writer_is_bound_not_only_the_author_column(pool: PgPool) {
 /// `epigraph_require_attributable` reading only LIVE links for the author ->
 /// A's supersede of the legacy claim is refused OPL01; the trigger passing
 /// `true` for `p_inherited` whatever `supersedes` says -> the fresh claim
-/// naming the retired author lands.
+/// naming the retired author lands; the trigger passing
+/// `NEW.supersedes IS NOT NULL` (not "an INSERT carrying the predecessor's
+/// author") -> the posed supersede and the re-attributed successor land.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
     let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
@@ -953,6 +955,70 @@ async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
         write_as(&pool, a, &[a_group], legacy, a_group).await,
         "a fresh claim naming a retired identity",
     );
+
+    // Delta review SEC-D4 / COR-D2 / DIS-D5: pointing `supersedes` at a claim
+    // whose author is NOT the retired identity is not inheritance. A fresh
+    // row naming the retired author with `supersedes` = X's own claim, and a
+    // row inserted as X's supersede then re-attributed to the retired author,
+    // are both refused; the predecessor stays current.
+    let posed = as_app_stamped(&pool, x, &[a_group], |mut conn| async move {
+        let id = Uuid::new_v4();
+        let r = sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                                 visibility, owner_group_id, supersedes) \
+             VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5, $6)",
+        )
+        .bind(id)
+        .bind(format!("posing as a supersede {id}"))
+        .bind(id.as_bytes().repeat(2))
+        .bind(legacy)
+        .bind(a_group)
+        .bind(new_x)
+        .execute(&mut *conn)
+        .await
+        .map(|_| id);
+        (conn, r)
+    })
+    .await;
+    assert_opl01(
+        posed,
+        "a fresh claim naming a retired identity, supersedes = another author's claim",
+    );
+    let reattributed = as_app_stamped(&pool, x, &[a_group], |mut conn| async move {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                                 visibility, owner_group_id, supersedes) \
+             VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5, $6)",
+        )
+        .bind(id)
+        .bind(format!("X's own successor {id}"))
+        .bind(id.as_bytes().repeat(2))
+        .bind(x)
+        .bind(a_group)
+        .bind(new_x)
+        .execute(&mut *conn)
+        .await
+        .expect("X writes a successor naming itself");
+        let r = sqlx::query("UPDATE claims SET agent_id = $2 WHERE id = $1")
+            .bind(id)
+            .bind(legacy)
+            .execute(&mut *conn)
+            .await
+            .map(|_| id);
+        (conn, r)
+    })
+    .await;
+    assert!(
+        reattributed.is_err(),
+        "a successor re-attributed to a retired identity landed: {reattributed:?}"
+    );
+    let x_still: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(new_x)
+        .fetch_one(&pool)
+        .await
+        .expect("current");
+    assert!(x_still, "the posed supersedes retired nothing");
 
     let refused = supersede(u, vec![u_group, a_group], a_claim)
         .await

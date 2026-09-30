@@ -127,9 +127,10 @@
 -- from the viewer) whenever it differs from the author: the writer must be
 -- bound (OPL01), must write the owner group (OPL02), and may name as author
 -- only a bound agent of its own human (OPL01 / OPL02 otherwise); the author a
--- supersede INHERITS may also be a RETIRED agent of that human, so a human
+-- supersede INHERITS (a new row naming `supersedes` whose author IS that
+-- predecessor's author) may also be a RETIRED agent of that human, so a human
 -- superseding its own legacy author's claim is admitted, while a fresh claim
--- naming a retired identity is not. With no
+-- naming a retired identity is not, whatever `supersedes` it points at. With no
 -- principal, or a principal equal to the author, or on a privileged session,
 -- the author is the one checked. Workflow ingest writes as one shared system
 -- agent under that agent's own stamp, so its request paths bind their CALLER
@@ -467,8 +468,9 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM
 -- Section 2's ATTRIBUTION check, for a claim whose author is not its writer:
 -- the author must be BOUND (section 1) and belong to the WRITER's own human.
 -- One exception, for the author a supersede INHERITS rather than chooses
--- (`p_inherited`: the row names `supersedes`, and `supersede_act_conn` copies
--- the predecessor's author): there a RETIRED link to the writer's human
+-- (`p_inherited`: an INSERT that names `supersedes` AND carries exactly that
+-- predecessor's author, which is what `supersede_act_conn` writes; the
+-- trigger decides it): there a RETIRED link to the writer's human
 -- counts, so a human can supersede its own legacy author's claim. A fresh
 -- claim may never name a retired identity (OB1). An author that belongs to no
 -- human (for the row's kind) is unbound (OPL01, under the valve's rule); one
@@ -541,6 +543,7 @@ LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
     v_writer uuid;
+    v_inherited boolean;
 BEGIN
     IF TG_OP = 'UPDATE' AND NEW.agent_id IS NOT DISTINCT FROM OLD.agent_id THEN
         RETURN NEW;
@@ -555,8 +558,15 @@ BEGIN
     ELSE
         PERFORM public.epigraph_require_bound_writer(v_writer);
         PERFORM public.epigraph_require_writer_scope(v_writer, NEW.owner_group_id);
+        -- INHERITED means what `supersede_act_conn` does: a NEW row that
+        -- names `supersedes` AND carries exactly the predecessor's author.
+        -- Merely naming `supersedes` (a column the writer chooses) is not
+        -- inheritance, and an UPDATE never inherits.
+        v_inherited := TG_OP = 'INSERT' AND NEW.supersedes IS NOT NULL
+                       AND NEW.agent_id IS NOT DISTINCT FROM
+                           (SELECT p.agent_id FROM public.claims p WHERE p.id = NEW.supersedes);
         PERFORM public.epigraph_require_attributable(NEW.agent_id, v_writer,
-                                                     NEW.supersedes IS NOT NULL);
+                                                     COALESCE(v_inherited, false));
     END IF;
     RETURN NEW;
 END $$;
