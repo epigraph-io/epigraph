@@ -1,7 +1,7 @@
 //! The operator-binding valve (migration 122).
 //!
 //! Once a database is ARMED, a claim may be authored only by an agent bound to
-//! a human operator; `claims_require_operator_binding` refuses anything else
+//! a human operator; `claims_require_tenancy_then_operator_binding` refuses anything else
 //! with `OPL01`. This module is the one emergency relief, and it is per
 //! PROCESS:
 //!
@@ -23,11 +23,15 @@
 //! # Not an authority boundary
 //!
 //! Any database session can set a custom setting, so [`VALVE_GUC`] is the
-//! valve's transport, not a privilege. It grants nothing a session lacked: a
-//! session that can set it can equally write a claim naming any bound agent as
-//! its author (`claims.agent_id` is supplied by the writer). What the rule
-//! defends against is a CODE PATH writing as an unbound agent, and no code path
-//! sets this but the valve.
+//! valve's transport, not a privilege: a raw session that sets it writes as an
+//! unbound agent. What the setting guards against is a CODE PATH writing as an
+//! unbound agent, and no code path sets it but the valve.
+//!
+//! # `OPL01` only
+//!
+//! The valve relieves the BINDING (`OPL01`). The cross-human scope (`OPL02`,
+//! migration 122 section 1b) keys on the database's arming alone, so no valve
+//! lets one human's agent write into another human's group.
 
 use std::sync::OnceLock;
 

@@ -245,10 +245,14 @@ epigraph-tenancy-backfill verify [--legacy-owner operator|platform]
 operator decision, not a default. `operator`: a world-owned row of an author
 linked to a human (live OR retired) goes to that operator's group, an unlinked
 author's to its own personal group. `platform`: only rows of authors with a LIVE
-link to a registered human operator move (to that operator's group); rows of
+link to a registered human operator move (to that operator's group), and a
+registered human operator's own rows (to its personal group); rows of
 retired-linked and unlinked authors, and their derived rows, stay world-owned as
 the platform corpus (the walk itself skips them, so a re-run never revisits
-them). `verify` takes the same flag: without it the check is strict (no
+them). In both modes the run re-stamps a world-owned edge that touches a
+non-public claim or evidence endpoint to its endpoints' meet (arm (d) repairs
+such an edge only when one of its endpoint claims moves, and the platform
+corpus never moves). `verify` takes the same flag: without it the check is strict (no
 world-owned residue at all); under `platform` it fails only on rows that should
 have moved and REPORTS the platform corpus.
 
@@ -258,7 +262,12 @@ committed in the same transaction as its batch.
 **Bounded runs.** `--entity claims|communities|perspectives|recall-events|harvester-fragments`
 runs one arm alone (no settle, no final verify). `--max-runtime 2h` (or `90m`,
 `3600s`) stops cleanly between batches and exits **3**: partial, re-run the same
-command to resume. Use them to run the claims walk in windows with a `VACUUM`
+command to resume. A walk that begins from a cursor an earlier run left (an
+aborted run, or one under the other `--legacy-owner`) and finds rows below it
+rewinds and walks again in the same run; a walk that covered the table from
+the start and still leaves rows (an author that resolves to no group) resets
+its cursor, and under `--entity` exits **1**, so `0` always means that arm is
+done. Use them to run the claims walk in windows with a `VACUUM`
 between (below).
 
 **Cost model (measured on a 5433 `*_test` seed: 200k claims, 400k edges, rows
@@ -349,17 +358,25 @@ subject to the same check; 071's shim was too, until PR-22 retired it.
 **The invariant.** Every writing agent is irrevocably tied to one individual
 human account, and there may be many humans. Once a database is ARMED (below),
 a claim may be written (and `claims.agent_id` changed) only when its author is
-BOUND:
+BOUND, and, when the session's authenticated principal is not the author, only
+when that WRITER is bound too (see "Who is checked" below). Bound means:
 
 * (a) a **human operator**: an agent with a live row in the maintenance-only
-  registry `human_operators` AND the agent of an ACTIVE `client_type = 'human'`
-  OAuth client. Neither half alone counts: being named as some link's operator
+  registry `human_operators` whose recorded OAuth client (the one client the
+  registration was made for) is still an ACTIVE `client_type = 'human'` client
+  of that agent. Neither half alone counts: being named as some link's operator
   never makes an agent a human, and a dynamic client registration is typed
-  `human` too. Register and revoke with
-  `epigraph-operator register-human-operator` / `revoke-human-operator
-  --agent <id> --reason <text> [--apply]` (maintenance DSN; audited; register
-  refuses an agent with no active human client; revoke is final and stops every
-  agent live-linked to that human at once); or
+  `human` too. Keying on the recorded client means suspending it suspends the
+  human: minting a fresh active client for the same agent (the application
+  role may register clients, but not update them) does not revive it. Register
+  and revoke with `epigraph-operator register-human-operator` /
+  `revoke-human-operator --agent <id> --reason <text> [--apply]` (maintenance
+  DSN; register refuses an agent with no active human client, or with more than
+  one unless the client is named). The registry's rules and its audit live on
+  the table itself, so a direct maintenance `INSERT` / `UPDATE` meets the same
+  checks and leaves the same `security_events` row as the command; revoke is
+  final (a revoked row takes no change at all) and stops every agent
+  live-linked to that human at once; or
 * (b) the holder of a **live link to a human operator**: an `operator_links`
   row for the agent with `retired = false` whose operator is (a) (recorded by
   `epigraph-operator link`, or by a stdio process's own startup on a
@@ -368,14 +385,31 @@ BOUND:
   be recorded only to a registered human operator, armed or not
   (`operator_links_operator_is_human`; link rows are permanent, so a link to a
   non-human could never be corrected); an exact re-link of an existing link is
-  never refused by it.
+  never refused by it. Every link row recorded, by any path, writes one
+  `operator.link_recorded` `security_events` row.
 
 Anything else is refused with SQLSTATE **`OPL01`**.
 
+**Who is checked.** `claims.agent_id` is a column the writing session supplies
+(REST takes it from the request body), so binding it alone would let any
+session write as any bound author. The trigger therefore also binds the
+session's authenticated PRINCIPAL (the one `ScopedPool` stamps from the
+request's viewer) whenever it differs from the author: that writer must be
+bound (`OPL01`), must write the owner group (`OPL02`, below), and may name as
+author only an agent of its OWN human (`OPL02` otherwise); a retired agent of
+its own human counts, so a human can supersede its own legacy author's claims.
+With no principal, a principal equal to the author, or a privileged session,
+the author is the one checked. Consequences to decide before arming: a write
+whose principal is an identity that can never be bound (a shared HTTP
+listener's own agent acting under an admin's borrowed stamp, or a non-human
+OAuth client authoring on another agent's behalf) is refused once armed.
+
 **A linked agent writes only where its own operator writes (`OPL02`).** A claim
-authored by a live-linked agent must be owned by a group its operator holds a
+written by a live-linked agent must be owned by a group its operator holds a
 live `writer`/`admin` membership in: normally the operator's personal group,
-never another human's group, and never the agent's own personal group. The
+never another human's group, and never the agent's own personal group. A claim
+written by a human must be owned by a group that human writes (on the claims
+path a human is scoped like everyone). The
 same rule guards the membership door: a `writer`/`admin` row for a live-linked
 agent is refused unless its operator writes that group, so another human
 cannot enrol my agent to write evidence, edges or beliefs in their group. Both
@@ -386,13 +420,31 @@ agent whose membership in its operator's group was REVOKED writes nothing (its
 default declaration falls back to its own personal group, which `OPL02`
 refuses); ending an agent's writes is a revoke or a retire. Residual, named: a
 writer row that predates the link, or outlives the operator's own membership,
-is not revisited by the door; audit with the query in "Existing rows". The refusal is a trigger on
-`claims` (`claims_require_operator_binding`, migration 122), so it holds on
-every path: REST, MCP over HTTP and stdio, the CLIs, workflow ingest, default and
+is not revisited by the door; `epigraph-operator link` lists such rows as
+`FOREIGN-WRITE` and revokes them with `--revoke-foreign-writes` (it does not
+refuse the link, because any application session can enrol an unlinked agent as
+a writer in its own group), and the query in "Existing rows" audits them. `OPL02`
+holds whenever the database is armed, whatever the valve says. The refusal is a
+trigger on `claims` (`claims_require_tenancy_then_operator_binding`, migration
+122, named to fire after the tenancy trigger fills an inherited owner), so it
+holds on every path: REST, MCP over HTTP and stdio, the CLIs, workflow ingest, default and
 explicit tenancy declarations, and a raw `INSERT` on any role.
 `ClaimRepository::default_decl_for_author` runs the same check before it
 resolves a personal group, so no group is provisioned for a refused author.
-Surfaces:
+Workflow ingest authors every row as ONE shared system agent under that agent's
+own stamp, so the database sees only it; its request paths therefore bind their
+real CALLER before writing (`OPL01` for an unbound caller, `OPL02` for a caller
+whose human does not write the group the system agent's rows land in). Once the
+system agent is live-linked to one human, another human's callers are refused
+rather than writing into that human's group; a per-operator system identity is
+the follow-up that lets them ingest workflows.
+
+**Scope: claims.** The invariant, as specified, governs claim writes. Other
+rows that name an agent (evidence, challenges, DS mass, edges, perspectives,
+recall events) are gated by tenancy (row security and the `OPL02` membership
+door), not by `OPL01`: an unbound agent that holds a writer row in a group can
+still write those rows there once armed. Extending the binding to them is an
+open decision, not an oversight. Surfaces:
 
 | surface | what the caller sees |
 |---|---|
@@ -436,11 +488,13 @@ The only runtime relief is per process:
 `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off`. It is read once at boot, logs a WARN
 on every boot while set, and makes every connection the process's `ScopedPool`
 opens carry the session setting `epigraph.operator_link_enforcement = 'off'`,
-which the check honours. Any other value, including a typo, leaves enforcement
-ON. It reaches only `ScopedPool` connections (every request unit and operator
-CLI); any other pool, and a transaction-mode pooler, stay enforced. The setting
-is a transport, not an authority boundary: a session that can set it can
-already write a claim naming any bound agent as its author.
+which the binding check honours. It relieves `OPL01` ONLY: the cross-human
+scope (`OPL02`) keys on arming alone, so no valve lets one human's agent write
+into another human's group. Any other value, including a typo, leaves
+enforcement ON. It reaches only `ScopedPool` connections (every request unit
+and operator CLI); any other pool, and a transaction-mode pooler, stay
+enforced. The setting is a transport, not an authority boundary: any raw
+session can set a custom setting.
 
 ### Stdio agents under D9
 
@@ -472,6 +526,8 @@ before arming.
   `security_events` row per call). It skips, and names, humans, OAuth
   principals, holders of write authority in the operator's group, 107's
   shared-signer fingerprint (use `link-retired --attest-shared-signer`),
+  agents whose own OPERATED_BY lineage names ANOTHER registered human
+  (`operated_by_other_human`),
   `--exclude-agents-file` ids, and agents that authored a claim within
   `--quiet-days` (30; they may still be running and want a live link), and
   agents holding write authority in a group the operator does not write
@@ -479,7 +535,14 @@ before arming.
   is always explicit, and a run ties EVERY untied candidate to that one operator
   (there is no include list): with many humans, scope each run with
   `--exclude-agents-file` listing every agent that is not that human's (a later
-  run skips everything an earlier one tied).
+  run skips everything an earlier one tied). "Authored" means named in an
+  author column (`claims.agent_id`, `evidence.signer_id`,
+  `claim_versions.created_by`, `mass_functions.source_agent_id`,
+  `challenges.challenger_id`, `challenges.resolved_by`,
+  `claim_signature_revocations.revoked_by`, `perspectives.owner_agent_id`,
+  `recall_events.agent_id`); the signing-key columns (`edges.signer_id`,
+  `claims.signer_id`, `claim_signature_revocations.previous_signer_id`) name a
+  key, not a writer, and are excluded.
 * Audit writer rows that predate a link (the `OPL02` door does not revisit
   them):
 
@@ -491,14 +554,19 @@ before arming.
   ```
 * The backfill (`epigraph-tenancy-backfill run --legacy-owner ...`) stamps a
   world-owned row of a linked author to the operator's group: any link state
-  under `operator`, LIVE links only under `platform` (see "Running the
-  backfill"). `verify` REPORTS (not a failure) rows still owned by a linked
+  under `operator`, LIVE links only under `platform`, where a registered human
+  operator's OWN world-owned rows also go to its personal group (see "Running
+  the backfill"). `verify` REPORTS (not a failure) rows still owned by a linked
   author's own personal group.
 * `epigraph-operator reown-linked --operator <human> --legacy-owner operator|platform --manifest-out <new path>
   [--apply]` moves those claims into the operator's group through
   `reown-claims`' guarded batches (`--derived follow-claim`; derived rows follow
   through 070's arm (d); `reown-reverse` undoes a manifest). Resumable: a re-run
-  selects what is left. Run one instance at a time.
+  selects what is left. Run one instance at a time. Both `reown-linked` and
+  `reown-reverse` switch the session to the application role for their
+  readability probe (`SET SESSION AUTHORIZATION`), which only a SUPERUSER may
+  do: run them on the admin (superuser) DSN, not on a plain maintenance login,
+  which they refuse before writing anything.
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 

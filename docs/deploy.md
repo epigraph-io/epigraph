@@ -1440,9 +1440,10 @@ No migration.
 
 ## Operator binding (migration 122) — deploy order
 
-Every claim must be authored by an agent bound to a human operator (a human
-operator, or the holder of a live `operator_links` row); anything else is
-refused with `OPL01`. The invariant, the error code and the valve are in
+Every claim must be authored, and written, by an agent bound to a human
+operator (a human operator, or the holder of a live `operator_links` row);
+anything else is refused with `OPL01`, and a write that crosses from one human
+into another's group or name with `OPL02`. The invariant, the error code and the valve are in
 `docs/tenancy.md` ("Operator binding"). This section is the ORDER, because
 arming is one-way and every step before it must leave no live writer unbound.
 
@@ -1457,11 +1458,16 @@ arming is one-way and every step before it must leave no live writer unbound.
    --reason <text> --apply`. Only the agent of an active human OAuth client can
    be registered; from 122 on, no link can be recorded to anyone else, so this
    precedes every link below. Check that no dynamically registered `human`
-   client's agent is in the registry.
+   client's agent is in the registry. The registration records that one client:
+   suspending it later is what un-registers the human in effect.
 3. **Live-link the live writers** that are not human operators:
    `epigraph-operator link --agent <id> --operator <human> --apply`, on the
    maintenance DSN. `link` refuses an OAuth principal: see "HTTP principals" in
-   `docs/tenancy.md` and resolve those before step 8.
+   `docs/tenancy.md` and resolve those before step 8. Read its `FOREIGN-WRITE`
+   lines (writer rows in groups the operator does not write) and decide each,
+   `--revoke-foreign-writes` revoking them. Linking a SHARED system identity
+   (the workflow-ingest agent) to one human makes that human own every
+   workflow row; the request paths then refuse other humans' callers.
 4. **Tie the legacy authors**: `epigraph-operator link-legacy-authors
    --operator <human>` (dry run, read the SKIPPED lines), then `--apply`. Give
    every `recent_writer` it skips a live link (step 3) or an explicit decision.
@@ -1479,13 +1485,19 @@ arming is one-way and every step before it must leave no live writer unbound.
 6. **Re-own** what linked authors' own groups still hold:
    `epigraph-operator reown-linked --operator <human> --legacy-owner <decision> --manifest-out <path>`
    (dry run), then `--apply` with a new manifest path. Keep the manifests.
+   `reown-linked` and its undo `reown-reverse` need a SUPERUSER DSN (their
+   probe switches the session to the application role); a plain maintenance
+   login is refused before anything is written.
 7. **Verify**: `epigraph-tenancy-backfill verify --legacy-owner <decision>` exits 0; its REPORT line for
    linked authors' personal-group rows should read zero (or be explained).
 8. **Deploy the new request binaries** (api, then mcp, as for 107), and the
    fleet host change (pass the operator id; run `link` at every spawn, on a
    maintenance DSN). Then **arm**: `epigraph-operator arm-operator-binding`
    (census), then `--apply`. The census must list no unbound recent writer you
-   intend to keep.
+   intend to keep. The census lists AUTHORS; a writer that authors as someone
+   else (a service client posting on an agent's behalf, a listener acting under
+   a borrowed admin stamp) is bound on its own principal once armed and does
+   not appear there: inventory those separately.
 9. **Smoke**: a claim by an unbound agent is refused (`OPL01`; HTTP 403); a
    claim by a live-linked agent and by the human succeeds; the boot logs say
    "operator binding ENFORCED".
@@ -1494,7 +1506,7 @@ arming is one-way and every step before it must leave no live writer unbound.
 are permanent records but grant nothing new; `reown-reverse` undoes step 6).
 After arming: set `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off` on the affected
 units and restart them (new binaries only; old binaries do not carry the
-valve). Removing the arming row, or dropping the trigger, is a superuser DDL
+valve). The valve relieves `OPL01` only; `OPL02` stays in force. Removing the arming row, or dropping the trigger, is a superuser DDL
 act on the migration DSN.
 
 No new environment variable is required; `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT`

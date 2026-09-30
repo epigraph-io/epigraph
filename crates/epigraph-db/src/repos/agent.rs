@@ -1482,7 +1482,7 @@ impl AgentRepository {
     /// 122); return quietly otherwise (bound, unarmed, or this session's valve
     /// off).
     ///
-    /// The same definer the `claims_require_operator_binding` trigger calls, so
+    /// The same definer the `claims_require_tenancy_then_operator_binding` trigger calls, so
     /// the early check and the guarantee cannot disagree. It reads nothing on
     /// the caller's connection, so it answers the same on an unstamped
     /// `epigraph_app` session as on a maintenance one.
@@ -1506,9 +1506,11 @@ impl AgentRepository {
 
     /// Refuse, with [`DbError::OperatorScopeRefused`] (`OPL02`), a live-linked
     /// agent named on a row owned by `group_id` when its operator holds no
-    /// writer/admin membership there (migration 122 section 1b); quiet for a
-    /// human author, an unarmed database, the valve, a privileged session and an
-    /// instance-admin principal. The same definer the claims trigger calls.
+    /// writer/admin membership there (migration 122 section 1b, the MEMBERSHIP
+    /// door's form); quiet for a human, an unarmed database, a privileged
+    /// session and an instance-admin principal, and NOT for the valve (which
+    /// relieves `OPL01` only). The claims trigger applies the stricter
+    /// `epigraph_require_writer_scope`, which scopes a human too.
     ///
     /// # Errors
     /// [`DbError::OperatorScopeRefused`], or `DbError::QueryFailed` if the

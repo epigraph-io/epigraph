@@ -28,7 +28,7 @@ pub const PERSONAL_GROUP_NOT_OWNED: &str = "RVK02";
 
 /// SQLSTATE `OPL01`: a claim write named an author that is not bound to a human
 /// operator (migration 122). Raised by `epigraph_require_bound_author`, which the
-/// `claims_require_operator_binding` trigger and
+/// `claims_require_tenancy_then_operator_binding` trigger and
 /// `ClaimRepository::default_decl_for_author` both call, once the database is
 /// armed. Same custom-class reasoning as [`PERSONAL_MEMBERSHIP_REVOKED`].
 pub const OPERATOR_LINK_REQUIRED: &str = "OPL01";
