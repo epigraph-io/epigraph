@@ -39,6 +39,18 @@
 //! a two-hop chain, a shared-signer fingerprint, 105's RVK01/RVK02), reported
 //! with its own text. A dry run (the default) runs the whole thing, agent
 //! creation included, in one transaction and rolls it back.
+//!
+//! # Writer rows in another human's groups (review SEC-9)
+//!
+//! A link makes the agent write only where its operator writes (migration
+//! 122 section 1b), but a `writer`/`admin` row the agent ALREADY holds in a
+//! group the operator does not write survives the link, and lets it write
+//! evidence, edges and beliefs there. Every such row (other than the agent's
+//! own personal group) is printed as a `FOREIGN-WRITE` line, and
+//! `--revoke-foreign-writes` revokes them in the same transaction as the link.
+//! Not a refusal: any application session can enrol an unlinked agent as a
+//! writer in its own group, so refusing on these rows would let any session
+//! strand a new agent.
 
 use anyhow::{bail, Context};
 use epigraph_db::{AgentRepository, OperatorLinkOutcome};
@@ -119,6 +131,35 @@ pub struct BindOutcome {
     /// first time).
     pub agent_created: bool,
     pub link: OperatorLinkOutcome,
+    /// Groups (other than the agent's own personal group) in which the agent
+    /// holds a live writer/admin row and the operator does not write.
+    pub foreign_writes: Vec<Uuid>,
+    /// Those rows were revoked by this run (`--revoke-foreign-writes`).
+    pub foreign_revoked: bool,
+}
+
+/// The groups, other than `agent`'s own personal group, in which `agent` holds
+/// a live writer/admin row that `operator` does not write: migration 122's
+/// `foreign_write_authority` predicate, the one the legacy tie skips on.
+///
+/// # Errors
+/// A failed read.
+pub async fn foreign_writes(
+    conn: &mut PgConnection,
+    agent: Uuid,
+    operator: Uuid,
+) -> anyhow::Result<Vec<Uuid>> {
+    Ok(sqlx::query_scalar(
+        "SELECT m.group_id FROM group_memberships m JOIN groups g ON g.id = m.group_id \
+          WHERE m.agent_id = $1 AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin') \
+            AND NOT (g.kind = 'personal' AND g.created_by_agent_id = $1) \
+            AND NOT public.epigraph_operator_writes_group($2, m.group_id) \
+          ORDER BY m.group_id",
+    )
+    .bind(agent)
+    .bind(operator)
+    .fetch_all(&mut *conn)
+    .await?)
 }
 
 /// Resolve (and, for a first-seen LLM identity, create) the agent, on `conn`.
@@ -200,11 +241,25 @@ pub async fn run(
     conn: &mut PgConnection,
     spec: &AgentSpec,
     operator: Uuid,
+    revoke_foreign_writes: bool,
     apply: bool,
 ) -> anyhow::Result<BindOutcome> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     let (agent, agent_created) = resolve_agent(&mut tx, spec).await?;
     refuse(&mut tx, agent, operator).await?;
+    let foreign = foreign_writes(&mut tx, agent, operator).await?;
+    if revoke_foreign_writes && !foreign.is_empty() {
+        sqlx::query(
+            "UPDATE group_memberships SET revoked_at = now() \
+              WHERE agent_id = $1 AND group_id = ANY($2) AND revoked_at IS NULL \
+                AND role IN ('writer', 'admin')",
+        )
+        .bind(agent)
+        .bind(&foreign)
+        .execute(&mut *tx)
+        .await
+        .context("revoking the agent's writer rows in groups its operator does not write")?;
+    }
     let link = AgentRepository::link_operator(&mut tx, agent, operator)
         .await
         .map_err(|e| anyhow::anyhow!("{}", super::link::refusal_text(operator, &e)))?;
@@ -229,7 +284,29 @@ pub async fn run(
         agent,
         agent_created,
         link,
+        foreign_revoked: revoke_foreign_writes && !foreign.is_empty(),
+        foreign_writes: foreign,
     })
+}
+
+/// One `FOREIGN-WRITE` line per group in [`BindOutcome::foreign_writes`].
+#[must_use]
+pub fn describe_foreign(o: &BindOutcome, apply: bool) -> Vec<String> {
+    let state = match (o.foreign_revoked, apply) {
+        (true, true) => "REVOKED",
+        (true, false) => "WOULD BE REVOKED",
+        (false, _) => "KEPT (pass --revoke-foreign-writes to revoke it)",
+    };
+    o.foreign_writes
+        .iter()
+        .map(|g| {
+            format!(
+                "FOREIGN-WRITE\tagent={}\tgroup={g}\ta writer/admin row in a group its operator \
+                 does not write: {state}",
+                o.agent
+            )
+        })
+        .collect()
 }
 
 /// One line for the operator. A link that is not LIVE after the call (the

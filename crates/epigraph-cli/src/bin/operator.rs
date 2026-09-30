@@ -105,6 +105,10 @@ enum Command {
         /// The human operator's agent id.
         #[arg(long)]
         operator: Uuid,
+        /// Also revoke every writer/admin row the agent holds in a group its
+        /// operator does not write (listed as FOREIGN-WRITE either way).
+        #[arg(long)]
+        revoke_foreign_writes: bool,
         /// Perform the link. Without it, everything runs in a transaction that
         /// is rolled back.
         #[arg(long)]
@@ -360,11 +364,23 @@ async fn main_inner() -> anyhow::Result<i32> {
             agent_model,
             agent_system_prompt_hash,
             operator: op,
+            revoke_foreign_writes,
             apply,
         } => {
             let spec = bind::AgentSpec::from_flags(agent, agent_model, agent_system_prompt_hash)?;
-            let outcome = bind::run(db.pool(), &mut conn, &spec, op, apply).await?;
+            let outcome = bind::run(
+                db.pool(),
+                &mut conn,
+                &spec,
+                op,
+                revoke_foreign_writes,
+                apply,
+            )
+            .await?;
             println!("{}", bind::describe(&outcome, op, apply));
+            for line in bind::describe_foreign(&outcome, apply) {
+                println!("{line}");
+            }
             if !apply {
                 println!("DRY RUN: the link above ran and was rolled back.");
             }

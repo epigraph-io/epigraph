@@ -912,3 +912,79 @@ async fn reown_linked_under_platform_moves_only_live_linked_authors(pool: PgPool
     assert_eq!(owner_of(&pool, "claims", c_retired).await, retired_group);
     let _ = std::fs::remove_file(m);
 }
+
+/// Review SEC-9: `link` lists every writer/admin row the agent already holds in
+/// a group its new operator does not write (another human's group), keeps them
+/// by default, and revokes them in the link's own transaction under
+/// `--revoke-foreign-writes`. Never a refusal (any app session can enrol an
+/// unlinked agent as a writer in its own group, so a refusal would strand it).
+///
+/// Verified to fail: the `UPDATE group_memberships ... revoked_at` statement in
+/// `bind::run` removed -> the row in B's group stays live after `--apply`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_lists_and_on_request_revokes_writer_rows_in_another_humans_group(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "human-a").await;
+    make_human(&pool, a).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "human-b").await;
+    make_human(&pool, b).await;
+    let (z, _) = fixture::seed_agent_with_group(&pool, "enrolled-by-b").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(b_group)
+    .bind(z)
+    .execute(&pool)
+    .await
+    .expect("B enrolled Z before any link");
+    let live_in_b = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM group_memberships WHERE group_id = $1 \
+                   AND agent_id = $2 AND revoked_at IS NULL)",
+            )
+            .bind(b_group)
+            .bind(z)
+            .fetch_one(&pool)
+            .await
+            .expect("membership")
+        }
+    };
+    let (z_s, a_s, g_s) = (z.to_string(), a.to_string(), b_group.to_string());
+
+    let dry = run_op(&pool, &["link", "--agent", &z_s, "--operator", &a_s]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .lines()
+            .any(|l| l.starts_with("FOREIGN-WRITE") && l.contains(&g_s) && l.contains("KEPT")),
+        "{}",
+        dry.show()
+    );
+
+    let applied = run_op(
+        &pool,
+        &[
+            "link",
+            "--agent",
+            &z_s,
+            "--operator",
+            &a_s,
+            "--revoke-foreign-writes",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    assert!(
+        applied
+            .stdout
+            .lines()
+            .any(|l| l.starts_with("FOREIGN-WRITE") && l.contains(&g_s) && l.contains("REVOKED")),
+        "{}",
+        applied.show()
+    );
+    assert!(!live_in_b().await, "the row in B's group is revoked");
+    assert_eq!(link_row(&pool, z).await, Some((a, false)));
+}
