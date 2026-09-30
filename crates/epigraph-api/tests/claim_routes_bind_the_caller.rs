@@ -1,8 +1,10 @@
 #![cfg(feature = "db")]
 //! Migration 122 through the claim-writing HTTP handlers, on the APPLICATION
-//! ROLE, in the shape a long-lived deployment may carry: `POST /api/v1/submit/packet` and
-//! `POST /api/v1/policy-challenges` write a claim whose author comes from the
-//! request (the packet's `claim.agent_id`) or is the shared system agent. The
+//! ROLE, in the shape a long-lived deployment may carry: `POST /api/v1/submit/packet`,
+//! `POST /api/v1/claims`, `POST /api/v1/hypothesis`,
+//! `POST /api/v1/workflows/steps/:id/evolve` and `POST /api/v1/policy-challenges`
+//! write a claim whose author comes from the request (the body's `agent_id`),
+//! is the caller, or is the shared system agent. The
 //! claims trigger binds the session PRINCIPAL whenever it differs from the
 //! author, so these handlers must write on a transaction stamped with the
 //! caller's viewer; on the raw pool the trigger saw no principal and checked
@@ -31,6 +33,11 @@
 //!    human A, and the request then fails only because this test schema has
 //!    no orphan policy on `reasoning_traces` (the unstamped trace insert is
 //!    refused by row security, rolling the claim back).
+//! 3. (Round 2) Each of `claims.rs::create_claim`,
+//!    `hypothesis.rs::create_hypothesis` and `workflows.rs::evolve_step`
+//!    alone put back on a raw `state.db_pool` transaction -> its own test's
+//!    LEGITIMATE control fails (human A's own write refused OPL01), so each
+//!    handler's stamping is pinned separately.
 
 mod viewer_fixture;
 
@@ -283,5 +290,201 @@ async fn create_challenge_binds_the_authenticated_caller(pool: PgPool) {
         rows(host).await,
         vec![(system, a_group)],
         "the challenge is the system agent's, in A's group"
+    );
+}
+
+/// Delta review round 2 DIS-R2-4: `POST /api/v1/claims` names its author in
+/// the body. An unbound caller and another human's caller naming human A are
+/// refused (403) and write nothing; A as itself writes, into its own group.
+/// The positive control is what pins the stamping: on the raw pool the
+/// database's no-principal rule refuses A's own claim (OPL01) once armed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_claim_binds_the_authenticated_caller(pool: PgPool) {
+    let (a, a_group) = seed_human_operator(&pool, "human-a").await;
+    let (b, _) = seed_human_operator(&pool, "human-b").await;
+    let (u, _) = seed_agent_with_group(&pool, "unbound-u").await;
+    install_orphan_policy_and_arm(&pool).await;
+    let state = app_role_state(&pool).await;
+
+    let post = |caller: Uuid, client_type: ClientType, author: Uuid, content: String| {
+        let pool = pool.clone();
+        let state = state.clone();
+        async move {
+            let viewer = Viewer::resolve(&pool, caller).await.expect("viewer");
+            let req: epigraph_api::routes::claims::CreateClaimRequest =
+                serde_json::from_value(serde_json::json!({
+                    "content": content, "agent_id": author, "initial_truth": 0.6
+                }))
+                .expect("request");
+            let resp = epigraph_api::routes::claims::create_claim(
+                ViewerExtractor(viewer),
+                State(state),
+                Some(Extension(token(caller, client_type))),
+                Json(req),
+            )
+            .await
+            .into_response();
+            body_text(resp).await
+        }
+    };
+
+    for (caller, client_type, what) in [
+        (u, ClientType::Service, "an unbound caller"),
+        (b, ClientType::Human, "another human"),
+    ] {
+        let content = format!("claim by {what} naming human A {}", Uuid::new_v4());
+        let (status, body) = post(caller, client_type, a, content.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+        assert!(body.contains("OPL0"), "{what}: {body}");
+        assert!(
+            claims_with_content(&pool, &content).await.is_empty(),
+            "{what}: nothing may be written"
+        );
+    }
+    let content = format!("claim by A as itself {}", Uuid::new_v4());
+    let (status, body) = post(a, ClientType::Human, a, content.clone()).await;
+    assert!(status.is_success(), "A as itself: {status} {body}");
+    assert_eq!(
+        claims_with_content(&pool, &content).await,
+        vec![(a, a_group)],
+        "A's claim, in A's group"
+    );
+}
+
+/// Delta review round 2 DIS-R2-4: `POST /api/v1/hypothesis` names its author
+/// in the body too. An unbound caller (naming human A, or itself) is refused
+/// and writes nothing; A as itself writes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_hypothesis_binds_the_authenticated_caller(pool: PgPool) {
+    use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+    let (a, a_group) = seed_human_operator(&pool, "human-a").await;
+    let (u, _) = seed_agent_with_group(&pool, "unbound-u").await;
+    // The handler binds the new claim to this frame, which no migration seeds.
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses, visibility, owner_group_id) \
+         VALUES ('hypothesis_assessment', ARRAY['true','false'], 'public', \
+                 '00000000-0000-0000-0000-000000000000'::uuid) \
+         ON CONFLICT (name) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the hypothesis_assessment frame");
+    install_orphan_policy_and_arm(&pool).await;
+    let embedder: std::sync::Arc<dyn EmbeddingService> =
+        std::sync::Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+    let state = app_role_state(&pool).await.with_embedding_service(embedder);
+
+    let post = |caller: Uuid, author: Uuid, statement: String| {
+        let pool = pool.clone();
+        let state = state.clone();
+        async move {
+            let viewer = Viewer::resolve(&pool, caller).await.expect("viewer");
+            let req: epigraph_api::routes::hypothesis::CreateHypothesisRequest =
+                serde_json::from_value(serde_json::json!({
+                    "statement": statement, "agent_id": author
+                }))
+                .expect("request");
+            let resp = epigraph_api::routes::hypothesis::create_hypothesis(
+                ViewerExtractor(viewer),
+                State(state),
+                Json(req),
+            )
+            .await
+            .into_response();
+            body_text(resp).await
+        }
+    };
+
+    for (author, what) in [(a, "U naming human A"), (u, "U as itself")] {
+        let statement = format!("hypothesis: {what} {}", Uuid::new_v4());
+        let (status, body) = post(u, author, statement.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+        assert!(
+            claims_with_content(&pool, &statement).await.is_empty(),
+            "{what}: nothing may be written"
+        );
+    }
+    // The control asserts the COMMITTED claim, not the response status: the
+    // handler commits the claim, then binds it to its frame on the unstamped
+    // pool, which row security refuses on a schema without orphan policies
+    // (a tenancy follow-on outside the operator binding this test pins).
+    let statement = format!("hypothesis: A as itself {}", Uuid::new_v4());
+    let (status, body) = post(a, a, statement.clone()).await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "A as itself: {body}");
+    assert_eq!(
+        claims_with_content(&pool, &statement).await,
+        vec![(a, a_group)],
+        "A's hypothesis claim, in A's group: {status} {body}"
+    );
+}
+
+/// Delta review round 2 SEC-R2-3 / DIS-R2-3 / DIS-R2-4:
+/// `POST /api/v1/workflows/steps/:id/evolve` authors the step as the
+/// authenticated PRINCIPAL. The token is in the shape `/oauth/token` mints:
+/// `client_id` (the `sub`) is an OAuth client row id, never an agent, and a
+/// human client carries no `owner_id`. Once armed, A's evolve lands, authored
+/// by A in A's group; an unbound caller's does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_binds_the_authenticated_caller(pool: PgPool) {
+    let (a, a_group) = seed_human_operator(&pool, "human-a").await;
+    let (u, _) = seed_agent_with_group(&pool, "unbound-u").await;
+    let parent: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, visibility, \
+                             owner_group_id, labels) \
+         VALUES ($1, sha256($1::bytea), 0.5, $2, 'public', $3, ARRAY['workflow_step']) \
+         RETURNING id",
+    )
+    .bind(format!("parent step {}", Uuid::new_v4()))
+    .bind(a)
+    .bind(a_group)
+    .fetch_one(&pool)
+    .await
+    .expect("A's step");
+    install_orphan_policy_and_arm(&pool).await;
+    let state = app_role_state(&pool).await;
+
+    let evolve = |caller: Uuid, client_type: ClientType, content: String| {
+        let pool = pool.clone();
+        let state = state.clone();
+        async move {
+            let viewer = Viewer::resolve(&pool, caller).await.expect("viewer");
+            let auth = AuthContext {
+                client_id: Uuid::new_v4(),
+                agent_id: Some(caller),
+                owner_id: None,
+                client_type,
+                scopes: vec!["claims:write".to_string()],
+                jti: Uuid::new_v4(),
+            };
+            let req: epigraph_api::routes::workflows::EvolveStepRequest =
+                serde_json::from_value(serde_json::json!({
+                    "parent_id": parent, "content": content, "edge_type": "revises"
+                }))
+                .expect("request");
+            let resp = epigraph_api::routes::workflows::evolve_step(
+                ViewerExtractor(viewer),
+                State(state),
+                Some(Extension(auth)),
+                axum::extract::Path(parent),
+                Json(req),
+            )
+            .await
+            .into_response();
+            body_text(resp).await
+        }
+    };
+
+    let content = format!("evolved by an unbound caller {}", Uuid::new_v4());
+    let (status, body) = evolve(u, ClientType::Service, content.clone()).await;
+    assert!(!status.is_success(), "an unbound caller: {status} {body}");
+    assert!(claims_with_content(&pool, &content).await.is_empty());
+
+    let content = format!("evolved by A {}", Uuid::new_v4());
+    let (status, body) = evolve(a, ClientType::Human, content.clone()).await;
+    assert_eq!(status, StatusCode::OK, "A evolves its own step: {body}");
+    assert_eq!(
+        claims_with_content(&pool, &content).await,
+        vec![(a, a_group)],
+        "the step is A's, in A's group"
     );
 }
