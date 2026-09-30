@@ -1477,6 +1477,86 @@ impl AgentRepository {
         Self::operator_actor(&mut conn, agent_id).await
     }
 
+    /// Refuse, with [`DbError::OperatorLinkRequired`] (`OPL01`), an author that
+    /// is not bound to a human operator while the database is ARMED (migration
+    /// 122); return quietly otherwise (bound, unarmed, or this session's valve
+    /// off).
+    ///
+    /// The same definer the `claims_require_operator_binding` trigger calls, so
+    /// the early check and the guarantee cannot disagree. It reads nothing on
+    /// the caller's connection, so it answers the same on an unstamped
+    /// `epigraph_app` session as on a maintenance one.
+    ///
+    /// # Errors
+    /// [`DbError::OperatorLinkRequired`] for an unbound author once armed;
+    /// `DbError::QueryFailed` if the function is absent (a database that has
+    /// not applied migration 122) or the call fails. Deliberately never mapped
+    /// to "bound": a binary that cannot ask must not write as if the answer were
+    /// yes.
+    pub async fn require_bound_author(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<(), DbError> {
+        sqlx::query("SELECT public.epigraph_require_bound_author($1)")
+            .bind(agent_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
+    /// How `agent_id` is bound to a human operator (migration 122):
+    /// `Some("live_link")`, `Some("human_operator")`, or `None` (unbound).
+    /// Independent of arming and of the valve.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent or the read fails.
+    pub async fn author_binding(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT public.epigraph_author_binding($1)")
+                .bind(agent_id)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// Whether operator binding is enforced on THIS connection: the database
+    /// is armed and the session's valve is not off (migration 122).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent or the read fails.
+    pub async fn operator_binding_enforced(conn: &mut sqlx::PgConnection) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT public.epigraph_operator_binding_enforced()")
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// Whether the database is ARMED for operator binding (migration 122),
+    /// whatever this connection's valve says. `None` when the database has not
+    /// applied 122 (the arming table is absent), so a boot log can say so
+    /// instead of failing.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn operator_binding_armed(pool: &PgPool) -> Result<Option<bool>, DbError> {
+        let present: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.operator_binding_arming') IS NOT NULL")
+                .fetch_one(pool)
+                .await?;
+        if !present {
+            return Ok(None);
+        }
+        Ok(Some(
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM public.operator_binding_arming)")
+                .fetch_one(pool)
+                .await?,
+        ))
+    }
+
     /// "Whose are `agent_id`'s claims?" — the operator named by its link
     /// record, through migration 107's `epigraph_operator_of_author`, or `None`.
     ///

@@ -1056,6 +1056,29 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "require_bound_author",
+        "CHECK through migration 122's `epigraph_require_bound_author` SECURITY DEFINER \
+         function, not a table read: it returns nothing and raises OPL01 for an unbound author. \
+         It must answer on an UNSTAMPED epigraph_app session (it runs inside \
+         `default_decl_for_author`, before any stamp), exactly as `operator_actor`, so a Viewer \
+         would be the wrong control.",
+    ),
+    (
+        "agent.rs",
+        "author_binding",
+        "READ through migration 122's `epigraph_author_binding` SECURITY DEFINER function; same \
+         reason as `operator_actor`. It returns one label ('live_link' / 'human_operator' / \
+         NULL) for the NAMED agent; 122 section 5 records the one bit it adds (human-ness).",
+    ),
+    (
+        "agent.rs",
+        "operator_binding_enforced",
+        "READ through migration 122's `epigraph_operator_binding_enforced` SECURITY DEFINER \
+         function: one boolean about the DATABASE (armed) and the SESSION (its valve setting), \
+         no row of any tenant.",
+    ),
+    (
+        "agent.rs",
         "public_key_if_signer",
         "READ of `agents`, projecting `public_key` for one id already held by the caller, and only \
          where `key_kind = 'ed25519'`. `agents` is deliberately not tenancy-partitioned — \

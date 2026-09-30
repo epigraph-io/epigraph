@@ -298,6 +298,55 @@ async fn opl01_maps_to_the_named_denial(pool: PgPool) {
     );
 }
 
+/// The default-declaration path refuses an unbound author BEFORE it resolves a
+/// personal group, so no group is provisioned for an agent that may not write;
+/// a bound author (and every author on an unarmed database) resolves as before.
+#[sqlx::test(migrations = "../../migrations")]
+async fn default_decl_refuses_an_unbound_author_before_provisioning_a_group(pool: PgPool) {
+    let bare = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(bare)
+        .bind(bare.as_bytes().repeat(2))
+        .execute(&pool)
+        .await
+        .expect("bare agent");
+    let groups_of = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+            )
+            .bind(agent)
+            .fetch_one(&pool)
+            .await
+            .expect("group count")
+        }
+    };
+    arm(&pool).await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let refused = epigraph_db::ClaimRepository::default_decl_for_author(&mut conn, bare).await;
+    assert!(
+        matches!(
+            refused,
+            Err(epigraph_db::DbError::OperatorLinkRequired { .. })
+        ),
+        "an unbound author must be refused by name, got {refused:?}"
+    );
+    assert_eq!(
+        groups_of(bare).await,
+        0,
+        "no personal group may be provisioned for a refused author"
+    );
+
+    // Bound as a human operator: resolves (and provisions) as before.
+    make_human(&pool, bare).await;
+    epigraph_db::ClaimRepository::default_decl_for_author(&mut conn, bare)
+        .await
+        .expect("a human operator resolves its personal group");
+    assert_eq!(groups_of(bare).await, 1);
+}
+
 /// Moving a claim to an unbound author is a claim write like any other.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_update_that_hands_a_claim_to_an_unbound_author_is_refused(pool: PgPool) {

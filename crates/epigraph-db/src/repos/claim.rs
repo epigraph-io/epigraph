@@ -847,9 +847,19 @@ impl ClaimRepository {
     /// ever ran again and this chose that group, RLS would refuse every claim
     /// it wrote (`operator_link.rs::a_retired_agent_gains_no_write_authority`).
     ///
+    /// # An UNBOUND author is refused first (migration 122)
+    ///
+    /// Once the database is armed, an author that is neither a human operator
+    /// nor the holder of a live operator link is refused here with
+    /// [`DbError::OperatorLinkRequired`] (`OPL01`), before its personal group is
+    /// resolved (and so before one could be provisioned for it). The
+    /// `claims_require_operator_binding` trigger is the guarantee on every
+    /// path; this is the same check, earlier.
+    ///
     /// # Errors
-    /// Returns `DbError::MembershipRevoked` if the author holds only revoked rows
-    /// in its personal group (and has no acting operator link),
+    /// Returns `DbError::OperatorLinkRequired` for an unbound author once the
+    /// database is armed, `DbError::MembershipRevoked` if the author holds only
+    /// revoked rows in its personal group (and has no acting operator link),
     /// `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
     /// `DbError::QueryFailed` for other database failures — including a
     /// database that has not applied migration 107, which fails CLOSED here
@@ -859,8 +869,12 @@ impl ClaimRepository {
         agent_id: Uuid,
     ) -> Result<TenancyDecl, DbError> {
         if let Some(link) = crate::repos::AgentRepository::operator_actor(conn, agent_id).await? {
+            // An acting link is a live (not retired) link: bound (migration 122).
             return Ok(TenancyDecl::public(link.operator_group_id));
         }
+        // Refuse an unbound author BEFORE 105's definer can provision a
+        // personal group for an agent that may not write at all.
+        crate::repos::AgentRepository::require_bound_author(conn, agent_id).await?;
         Ok(TenancyDecl::public(
             Self::personal_group_of(conn, agent_id).await?,
         ))
