@@ -752,9 +752,10 @@ the `OPL02` relief) switched at once. `role:auditor` reads the platform audit
 trail and confers nothing else.
 
 * **Agents never hold a role** (`CUS01`): the holder must be a registered human
-  (`epigraph_is_human_operator`), re-checked at read time, so revoking the
-  human's registration, or suspending its recorded OAuth client, ends its
-  authority at once.
+  (`epigraph_is_human_operator`) that is not itself linked to a human as an
+  agent (live or retired), re-checked at read time, so revoking the human's
+  registration, suspending its recorded OAuth client, or linking it as an
+  agent ends its authority at once.
 * **Append-only** (`CUS02`): an assignment is never edited or deleted; its only
   change is its end (`revoked_at` stamped now, with who and why), and an ended
   assignment is final. Nothing is back-dated.
@@ -788,7 +789,8 @@ trail and confers nothing else.
   revoking the human, writes into the holder's legacy row (so a rollback that
   restores 083's body resurrects nobody). Migration 123 carried each LIVE row
   of a registered human into an assignment from its `granted_at`, and skipped
-  every other live row loudly.
+  every other live row loudly, naming why (an agent, a human linked as an
+  agent, a human whose client is not active).
 
 Not yet built (the elevation batch): activating the role per session
 (time-boxed, passkey-confirmed), per-act confirmation, audited READS,

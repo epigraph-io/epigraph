@@ -18,10 +18,14 @@
 --
 -- AGENTS NEVER HOLD A ROLE. The holder must be a registered human operator
 -- (`epigraph_is_human_operator`, migration 122: a live `human_operators` row
--- AND its recorded human OAuth client still active). A live-linked agent, a
--- retired identity, an unbound agent and a human whose client is suspended
--- are refused `CUS01`, and the test is repeated at read time, so a human
--- whose registration is later revoked stops holding at once.
+-- AND its recorded human OAuth client still active) that is NOT itself linked
+-- to a human as an agent (no `operator_links` row with it as the agent, live
+-- or retired: 122 admits linking a registered human, and such a principal is
+-- an operated agent whatever its registry row says). A live-linked agent, a
+-- retired identity, an unbound agent, a registered human that is also linked
+-- as an agent, and a human whose client is suspended are refused `CUS01`, and
+-- the test is repeated at read time, so a human whose registration is later
+-- revoked, or who is later linked as an agent, stops holding at once.
 --
 -- Group holders are not admitted yet (`holder_group_id IS NULL` CHECK): the
 -- column exists so a later batch can admit a group whose member human
@@ -181,6 +185,10 @@ SET search_path = public, pg_temp AS $$
     SELECT CASE
              WHEN p_holder IS NULL OR p_role IS NULL OR p_at IS NULL THEN NULL
              WHEN NOT public.epigraph_is_human_operator(p_holder) THEN NULL
+             -- A registered human that is also linked as an agent (live or
+             -- retired) is an operated agent: agents never hold a role.
+             WHEN EXISTS (SELECT 1 FROM public.operator_links l
+                           WHERE l.agent_id = p_holder) THEN NULL
              ELSE (SELECT ra.id FROM public.role_assignments ra
                     WHERE ra.role = p_role AND ra.holder_person_id = p_holder
                       AND ra.revoked_at IS NULL
@@ -201,9 +209,11 @@ DECLARE
     v_any_live   boolean;
     v_other_live boolean;
 BEGIN
-    IF NOT public.epigraph_is_human_operator(NEW.holder_person_id) THEN
-        RAISE EXCEPTION 'CUS01: % is not a registered human operator; agents never hold a role',
-                        NEW.holder_person_id
+    IF NOT public.epigraph_is_human_operator(NEW.holder_person_id)
+       OR EXISTS (SELECT 1 FROM public.operator_links l
+                   WHERE l.agent_id = NEW.holder_person_id) THEN
+        RAISE EXCEPTION 'CUS01: % is not a registered human operator that is no other '
+                        'human''s agent; agents never hold a role', NEW.holder_person_id
             USING ERRCODE = 'CUS01',
                   HINT = 'Grant the role to the human''s own principal (a live human_operators '
                          'row with an active human OAuth client), never to an agent.';
@@ -219,16 +229,14 @@ BEGIN
             USING ERRCODE = 'CUS02';
     END IF;
     SELECT EXISTS (SELECT 1 FROM public.role_assignments ra
-                    WHERE ra.role = 'role:platform-custodian' AND ra.revoked_at IS NULL
-                      AND ra.valid_from <= now()
-                      AND (ra.valid_to IS NULL OR now() < ra.valid_to)
-                      AND public.epigraph_is_human_operator(ra.holder_person_id)),
+                    WHERE ra.role = 'role:platform-custodian'
+                      AND public.epigraph_live_role_assignment(ra.holder_person_id,
+                              'role:platform-custodian', now()) IS NOT NULL),
            EXISTS (SELECT 1 FROM public.role_assignments ra
-                    WHERE ra.role = 'role:platform-custodian' AND ra.revoked_at IS NULL
-                      AND ra.valid_from <= now()
-                      AND (ra.valid_to IS NULL OR now() < ra.valid_to)
+                    WHERE ra.role = 'role:platform-custodian'
                       AND ra.holder_person_id IS DISTINCT FROM NEW.holder_person_id
-                      AND public.epigraph_is_human_operator(ra.holder_person_id))
+                      AND public.epigraph_live_role_assignment(ra.holder_person_id,
+                              'role:platform-custodian', now()) IS NOT NULL)
       INTO v_any_live, v_other_live;
     IF NEW.granted_by IS NULL THEN
         IF v_any_live THEN
@@ -497,7 +505,8 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_end_role_assignment(uuid, text) FROM 
 -- `platform.custodial_act` row naming the assignment, its window, the actor,
 -- the act and its target. Refused (`CUS04`) unless `p_assignment` is a LIVE
 -- role:platform-custodian assignment held NOW by `p_actor`, a registered
--- human, so the refusal rolls the act back with it. The acts are an
+-- human that is no other human's agent, so the refusal rolls the act back
+-- with it. The acts are an
 -- enumerated list (`22023` otherwise), so the trail's vocabulary is closed.
 -- Maintenance-only EXECUTE.
 CREATE OR REPLACE FUNCTION public.epigraph_record_custodial_act(
@@ -522,7 +531,8 @@ BEGIN
        OR v_row.revoked_at IS NOT NULL
        OR v_row.valid_from > now()
        OR (v_row.valid_to IS NOT NULL AND now() >= v_row.valid_to)
-       OR NOT public.epigraph_is_human_operator(p_actor) THEN
+       OR NOT public.epigraph_is_human_operator(p_actor)
+       OR EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_actor) THEN
         RAISE EXCEPTION 'CUS04: % is not a live role:platform-custodian assignment held by %; '
                         'nothing was recorded or changed', p_assignment, p_actor
             USING ERRCODE = 'CUS04',
@@ -626,10 +636,15 @@ CREATE TRIGGER human_operators_refuse_role_node
 --     trigger above. This seed is the only path that writes a past
 --     `valid_from`: the insert guard's trigger is created after it.
 -- (b) SKIP LOUDLY. A live row of anything else (an agent, a retired
---     identity, a human not registered yet) is NOT carried: agents never
---     hold the role. Each one raises a NOTICE and writes a
---     `platform.role_migration_skipped` event naming it. A revoked row is
---     not carried; it stays readable in the table as history.
+--     identity, a human not registered yet, a registered human linked as
+--     another human's agent, a registered human whose human client is not
+--     active) is NOT carried: agents never hold the role, and the seed admits
+--     exactly the holders the insert guard would. Each one raises a NOTICE
+--     and writes a `platform.role_migration_skipped` event naming it and WHY
+--     (`details.reason`), so a suspended human client reads as that, not as
+--     "not a registered human": re-grant it with `grant-role` once its client
+--     is active. A revoked row is not carried; it stays readable in the table
+--     as history.
 -- (c) ANSWER FROM THE ROLE. `epigraph_is_instance_admin(agent)` keeps its
 --     name, signature, grants and subject binding (083's policies, 087's and
 --     122's definers call it), and now answers "holds role:platform-custodian
@@ -650,6 +665,7 @@ SELECT 'role:platform-custodian', ia.agent_id, ia.granted_at, ia.granted_by, 'mi
   FROM public.instance_admins ia
  WHERE ia.revoked_at IS NULL
    AND public.epigraph_is_human_operator(ia.agent_id)
+   AND NOT EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = ia.agent_id)
    AND NOT EXISTS (SELECT 1 FROM public.role_assignments ra
                     WHERE ra.holder_person_id = ia.agent_id
                       AND ra.granted_via = 'migration 123');
@@ -658,20 +674,31 @@ DO $$
 DECLARE
     r record;
 BEGIN
-    FOR r IN SELECT ia.agent_id, ia.granted_at FROM public.instance_admins ia
+    FOR r IN SELECT ia.agent_id, ia.granted_at,
+                    CASE
+                      WHEN EXISTS (SELECT 1 FROM public.operator_links l
+                                    WHERE l.agent_id = ia.agent_id)
+                        THEN 'linked to a human operator as its agent'
+                      WHEN public.epigraph_is_human_operator(ia.agent_id)
+                        THEN NULL
+                      WHEN EXISTS (SELECT 1 FROM public.human_operators h
+                                    WHERE h.agent_id = ia.agent_id AND h.revoked_at IS NULL)
+                        THEN 'a registered human whose human OAuth client is not active'
+                      ELSE 'not a registered human operator'
+                    END AS reason
+               FROM public.instance_admins ia
               WHERE ia.revoked_at IS NULL
-                AND NOT public.epigraph_is_human_operator(ia.agent_id)
                 AND NOT EXISTS (SELECT 1 FROM public.security_events e
                                  WHERE e.event_type = 'platform.role_migration_skipped'
                                    AND e.agent_id = ia.agent_id)
               ORDER BY ia.granted_at, ia.agent_id LOOP
-        RAISE NOTICE 'migration 123: instance admin % is not a registered human operator; it is '
-                     'NOT carried over to role:platform-custodian (agents never hold a role)',
-                     r.agent_id;
+        CONTINUE WHEN r.reason IS NULL;
+        RAISE NOTICE 'migration 123: instance admin % is NOT carried over to '
+                     'role:platform-custodian: %', r.agent_id, r.reason;
         INSERT INTO public.security_events (event_type, agent_id, success, details)
         VALUES ('platform.role_migration_skipped', r.agent_id, false,
                 jsonb_build_object('agent_id', r.agent_id, 'granted_at', r.granted_at,
-                                   'reason', 'not a registered human operator'));
+                                   'reason', r.reason));
     END LOOP;
 END $$;
 

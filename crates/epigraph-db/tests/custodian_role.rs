@@ -151,7 +151,10 @@ async fn assignments_of(pool: &PgPool, holder: Uuid) -> i64 {
 /// Verified to fail: guard (a) removed -> every agent's assignment lands;
 /// guard (a) reading "holds a live operator link" instead of
 /// `epigraph_is_human_operator` -> the live-linked agent's lands and the
-/// human's is refused.
+/// human's is refused; the guard's `operator_links` test removed -> the
+/// linked registered humans are granted; the same test removed from
+/// `epigraph_live_role_assignment` -> the custodian linked after its grant
+/// still holds.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_agent_never_holds_a_role(pool: PgPool) {
     let (human, _) = fixture::seed_human_operator(&pool, "custodian-human").await;
@@ -202,6 +205,57 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
             "{what} holds nothing"
         );
     }
+
+    // A REGISTERED human that is also linked as another human's agent, live
+    // or retired, is an operated agent: refused at the grant, and a custodian
+    // linked AFTER its grant stops holding at once (review SEC-MTC-9).
+    let (linked_human, _) = fixture::seed_human_operator(&pool, "linked-human").await;
+    let (retired_human, _) = fixture::seed_human_operator(&pool, "retired-human").await;
+    let (later, _) = fixture::seed_human_operator(&pool, "linked-after-grant").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, linked_human, human)
+            .await
+            .expect("122 links a registered human live");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired_human, human)
+            .await
+            .expect("122 links a registered human retired");
+    }
+    for (agent, what) in [
+        (linked_human, "a registered human live-linked as an agent"),
+        (
+            retired_human,
+            "a registered human retired-linked as an agent",
+        ),
+    ] {
+        let r = maint_insert(&pool, CUSTODIAN, agent, "0", None, Some(human)).await;
+        assert_code(&r, "CUS01", what);
+        assert_eq!(
+            assignments_of(&pool, agent).await,
+            0,
+            "{what} holds nothing"
+        );
+    }
+    maint_insert(&pool, CUSTODIAN, later, "0", None, Some(human))
+        .await
+        .expect("an unlinked registered human is granted");
+    assert!(holds_at(&pool, later, CUSTODIAN, "now()").await, "it holds");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, later, human)
+            .await
+            .expect("link the custodian as an agent");
+    }
+    assert!(
+        !holds_at(&pool, later, CUSTODIAN, "now()").await,
+        "a custodian linked as an agent holds nothing"
+    );
+    let admin: bool = sqlx::query_scalar("SELECT public.epigraph_is_instance_admin($1)")
+        .bind(later)
+        .fetch_one(&pool)
+        .await
+        .expect("is_instance_admin");
+    assert!(!admin, "nor is it an instance admin");
 }
 
 // =====================================================================
@@ -1241,12 +1295,29 @@ async fn is_instance_admin_answers_from_the_role(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
     let mut ids = (Uuid::nil(), Uuid::nil(), Uuid::nil(), Uuid::nil());
+    let mut more = (Uuid::nil(), Uuid::nil());
     fixture::db_at_122_then_head(&pool, &MIGRATOR, |pool| {
-        let ids = &mut ids;
+        let (ids, more) = (&mut ids, &mut more);
         async move {
             let (human, _) = fixture::seed_human_operator(&pool, "legacy-human").await;
             let (second, _) = fixture::seed_human_operator(&pool, "legacy-second").await;
             let (revoked, _) = fixture::seed_human_operator(&pool, "legacy-revoked").await;
+            let (suspended, _) = fixture::seed_human_operator(&pool, "legacy-suspended").await;
+            let (linked, _) = fixture::seed_human_operator(&pool, "legacy-linked").await;
+            sqlx::query("UPDATE oauth_clients SET status = 'suspended' WHERE agent_id = $1")
+                .bind(suspended)
+                .execute(&pool)
+                .await
+                .expect("suspend the human's client");
+            {
+                let mut conn = pool.acquire().await.expect("acquire");
+                epigraph_db::AgentRepository::link_operator(&mut conn, linked, human)
+                    .await
+                    .expect("a registered human linked as another human's agent");
+            }
+            legacy_admin(&pool, suspended, "now()", false, "suspended client").await;
+            legacy_admin(&pool, linked, "now()", false, "linked as an agent").await;
+            *more = (suspended, linked);
             let agent = bare_agent(&pool).await;
             legacy_admin(
                 &pool,
@@ -1264,6 +1335,7 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
     })
     .await;
     let (human, second, revoked, agent) = ids;
+    let (suspended, linked) = more;
 
     let migrated: Vec<(Uuid, String, bool, String)> = sqlx::query_as(
         "SELECT holder_person_id, role, valid_from = '2026-01-02T03:04:05Z'::timestamptz, \
@@ -1297,14 +1369,30 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
     .await
     .expect("events");
     assert_eq!(flagged, 1, "the carried row is audited as migrated");
-    let skipped: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT agent_id FROM security_events \
+    let mut skipped: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT agent_id, details->>'reason' FROM security_events \
           WHERE event_type = 'platform.role_migration_skipped'",
     )
     .fetch_all(&pool)
     .await
     .expect("skipped");
-    assert_eq!(skipped, vec![agent], "the non-human row is skipped loudly");
+    skipped.sort();
+    let mut expected = vec![
+        (agent, "not a registered human operator".to_string()),
+        (
+            suspended,
+            "a registered human whose human OAuth client is not active".to_string(),
+        ),
+        (
+            linked,
+            "linked to a human operator as its agent".to_string(),
+        ),
+    ];
+    expected.sort();
+    assert_eq!(
+        skipped, expected,
+        "every row not carried is skipped loudly, naming why"
+    );
     assert_eq!(
         assignments_of(&pool, revoked).await,
         0,
