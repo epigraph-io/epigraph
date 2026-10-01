@@ -538,7 +538,8 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_end_role_assignment(uuid, text) FROM 
 -- plan write), recorded in the SAME transaction as the act: a
 -- `platform.custodial_act` row naming the assignment, its window, the actor,
 -- the act and its target. Refused (`CUS04`) unless `p_assignment` is a LIVE
--- role:platform-custodian assignment held NOW by `p_actor`, a registered
+-- role:platform-custodian assignment held NOW (`clock_timestamp()`: the
+-- statement's clock, not the transaction's start) by `p_actor`, a registered
 -- human that is no other human's agent, so the refusal rolls the act back
 -- with it. The acts are an
 -- enumerated list (`22023` otherwise), so the trail's vocabulary is closed.
@@ -563,8 +564,8 @@ BEGIN
        OR v_row.role <> 'role:platform-custodian'
        OR v_row.holder_person_id IS DISTINCT FROM p_actor
        OR v_row.revoked_at IS NOT NULL
-       OR v_row.valid_from > now()
-       OR (v_row.valid_to IS NOT NULL AND now() >= v_row.valid_to)
+       OR v_row.valid_from > clock_timestamp()
+       OR (v_row.valid_to IS NOT NULL AND clock_timestamp() >= v_row.valid_to)
        OR NOT public.epigraph_is_human_operator(p_actor)
        OR EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_actor) THEN
         RAISE EXCEPTION 'CUS04: % is not a live role:platform-custodian assignment held by %; '
@@ -824,8 +825,24 @@ CREATE TRIGGER human_operators_mirror_instance_admins
 -- writes one `platform.custodial_exempt` row naming the assignment, the check
 -- and its subjects (at most one per transaction per check and subjects: the
 -- request path's own pre-check and the trigger reach the same point). A
--- refused write rolls its relief row back with it, so a row means a relief
--- that was used.
+-- refused write rolls its relief row back with it.
+--
+-- A ROW RECORDS A RELIEF GRANTED, NOT NECESSARILY A WRITE. The checks keep
+-- 122's application EXECUTE grant, because the request path calls them
+-- directly: workflow ingest binds its real caller with
+-- `AgentRepository::require_writer_authority` before rows authored by a
+-- shared system identity are written, and the trigger then sees only that
+-- identity, so the pre-check is the only place that caller's relief is
+-- granted. Auditing only in trigger context would silence exactly that
+-- relief. A custodian-stamped session that calls a check directly is
+-- therefore recorded as relieved even when it then writes nothing; every
+-- such row names the stamped principal and its assignment.
+--
+-- THE ROLE IS READ AT THE STATEMENT'S CLOCK (`clock_timestamp()`), not the
+-- transaction's start, so a time-bounded assignment stops relieving at its
+-- `valid_to` inside an open transaction too. (A revoke committed after a
+-- REPEATABLE READ transaction took its snapshot is not seen by that
+-- transaction: bounded by the transaction's length.)
 --
 -- THE THREE CHECKS ARE NOW VOLATILE. A STABLE function must not write; the
 -- relief writes. (Measured: PostgreSQL does not refuse a STABLE plpgsql
@@ -850,7 +867,7 @@ BEGIN
     END IF;
     v_principal := public.epigraph_principal_id();
     v_assignment := public.epigraph_role_assignment_for(v_principal, 'role:platform-custodian',
-                                                        now());
+                                                        clock_timestamp());
     IF v_assignment IS NULL THEN
         RETURN false;
     END IF;

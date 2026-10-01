@@ -17,6 +17,10 @@
 --      authority ended after 123 (an ended assignment, a revoked human, an
 --      agent that was skipped at migration time) does not come back. 123's
 --      mirrors should already have stamped them; this is the belt.
+--      083 has no window: a holder whose live assignment ENDS at a
+--      `valid_to` keeps an open-ended legacy row after the undo. Step 1 lists
+--      each such holder (NOTICE) so the operator ends it by hand at its
+--      `valid_to`; the script does not cut a live custodian short.
 --   2. Drops 123's triggers on `instance_admins`, `human_operators` and
 --      `operator_links` (the freeze, the revoke mirror, the role-node guards).
 --   3. Re-applies, VERBATIM, 083's `epigraph_is_instance_admin` and 122's
@@ -49,6 +53,25 @@ UPDATE public.instance_admins ia
  WHERE ia.revoked_at IS NULL
    AND public.epigraph_live_role_assignment(ia.agent_id, 'role:platform-custodian', now())
        IS NULL;
+
+-- 1b. Time-bounded holders become open-ended under 083: listed, not changed.
+DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT ra.holder_person_id, ra.id, ra.valid_to
+               FROM public.role_assignments ra
+               JOIN public.instance_admins ia
+                 ON ia.agent_id = ra.holder_person_id AND ia.revoked_at IS NULL
+              WHERE ra.id = public.epigraph_live_role_assignment(ra.holder_person_id,
+                                                                 'role:platform-custodian', now())
+                AND ra.valid_to IS NOT NULL
+              ORDER BY ra.valid_to LOOP
+        RAISE NOTICE '123-undo: % holds role:platform-custodian until % (assignment %); under '
+                     '083 its instance_admins row has no end. Revoke it by hand at that time.',
+                     r.holder_person_id, r.valid_to, r.id;
+    END LOOP;
+END $$;
 
 -- 2. 123's triggers on tables 122 and 083 own.
 DROP TRIGGER IF EXISTS instance_admins_frozen ON public.instance_admins;
