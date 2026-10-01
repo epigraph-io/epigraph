@@ -268,10 +268,17 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
 /// DELETE policy exists).
 ///
 /// Verified to fail: the update guard's column comparison removed -> the
-/// `valid_to` / holder / role edits land; the `revoked_at = now()` test
-/// removed -> the back-dated revoke lands; the back-date test on
-/// `valid_from` removed -> the back-dated grant lands; a `FOR DELETE` policy
-/// added -> the catalog arm fails.
+/// `valid_to` / holder / role edits land; any one of `valid_from`,
+/// `granted_by`, `grant_act_id`, `created_at` dropped from that comparison ->
+/// its edit lands (review TST-MTC-5); the `revoked_at = now()` test removed ->
+/// the back-dated revoke lands; the `revoked_by = session_user` test removed ->
+/// the forged revoker lands; the "an ended assignment is final" test removed
+/// -> the well-formed second revoke re-dates the end (review TST-MTC-4); the
+/// insert guard's revoke-field test removed -> the pre-ended INSERT lands
+/// (review TST-MTC-8); its provenance test removed -> the INSERTs posing as
+/// the 123 carry-over, back-dated or carrying an act id land (review
+/// SEC-MTC-2); the back-date test on `valid_from` removed -> the back-dated
+/// grant lands; a `FOR DELETE` policy added -> the catalog arm fails.
 #[sqlx::test(migrations = "../../migrations")]
 async fn assignments_are_append_only(pool: PgPool) {
     let (h, _) = fixture::seed_human_operator(&pool, "h").await;
@@ -308,6 +315,44 @@ async fn assignments_are_append_only(pool: PgPool) {
             "granted_via",
         ),
         (
+            "UPDATE role_assignments SET valid_from = valid_from - interval '1 second', \
+                    revoked_at = now(), revoked_by = session_user, revoked_reason = 'x' \
+              WHERE id = $1",
+            "valid_from",
+        ),
+        (
+            "UPDATE role_assignments SET granted_by = holder_person_id, revoked_at = now(), \
+                    revoked_by = session_user, revoked_reason = 'x' WHERE id = $1",
+            "granted_by",
+        ),
+        (
+            "UPDATE role_assignments SET grant_act_id = gen_random_uuid(), revoked_at = now(), \
+                    revoked_by = session_user, revoked_reason = 'x' WHERE id = $1",
+            "grant_act_id",
+        ),
+        (
+            "UPDATE role_assignments SET created_at = created_at - interval '1 hour', \
+                    revoked_at = now(), revoked_by = session_user, revoked_reason = 'x' \
+              WHERE id = $1",
+            "created_at",
+        ),
+        (
+            "UPDATE role_assignments SET id = gen_random_uuid(), revoked_at = now(), \
+                    revoked_by = session_user, revoked_reason = 'x' WHERE id = $1",
+            "id",
+        ),
+        (
+            "UPDATE role_assignments SET holder_group_id = (SELECT id FROM groups LIMIT 1), \
+                    revoked_at = now(), revoked_by = session_user, revoked_reason = 'x' \
+              WHERE id = $1",
+            "holder_group_id",
+        ),
+        (
+            "UPDATE role_assignments SET revoked_at = now(), revoked_by = 'someone-else', \
+                    revoked_reason = 'x' WHERE id = $1",
+            "a revoke naming another login as its revoker",
+        ),
+        (
             "UPDATE role_assignments SET revoked_at = now() - interval '1 hour', \
                     revoked_by = session_user, revoked_reason = 'back-dated' WHERE id = $1",
             "a back-dated revoke",
@@ -342,15 +387,34 @@ async fn assignments_are_append_only(pool: PgPool) {
         1,
         "the one admitted change"
     );
+    let ended_at = move |pool: PgPool| async move {
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT revoked_at::text, revoked_by, revoked_reason FROM role_assignments \
+              WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("the end")
+    };
+    let first_end = ended_at(pool.clone()).await;
+    // A WELL-FORMED second revoke (stamped now, by this login, with a reason):
+    // only the "an ended assignment is final" test can refuse it.
     assert_code(
         &maint_exec(
             &pool,
-            "UPDATE role_assignments SET revoked_reason = 'again' WHERE id = $1",
+            "UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
+                    revoked_reason = 'again' WHERE id = $1",
             id,
         )
         .await,
         "CUS02",
-        "a second revoke",
+        "a second, well-formed revoke",
+    );
+    assert_eq!(
+        ended_at(pool.clone()).await,
+        first_end,
+        "the end is not re-dated or re-explained"
     );
 
     let deleted = maint_exec(&pool, "DELETE FROM role_assignments WHERE id = $1", id).await;
@@ -370,6 +434,43 @@ async fn assignments_are_append_only(pool: PgPool) {
 
     let back_dated = maint_insert(&pool, CUSTODIAN, h2, "-1 hour", None, Some(h)).await;
     assert_code(&back_dated, "CUS02", "a back-dated valid_from");
+    // The insert guard's other CUS02 arms: a row recorded already ended, and
+    // provenance the writer supplies instead of the database. (With `h` ended
+    // there is no live custodian, so each is a well-formed bootstrap grant
+    // but for the one column under test.)
+    for (columns, values, what) in [
+        (
+            "revoked_at, revoked_by, revoked_reason",
+            "now(), session_user, 'pre-ended'",
+            "an assignment INSERTed already ended",
+        ),
+        (
+            "granted_via",
+            "'migration 123'",
+            "an INSERT posing as the 123 carry-over",
+        ),
+        (
+            "created_at",
+            "'2020-01-01T00:00:00Z'::timestamptz",
+            "a back-dated created_at",
+        ),
+        (
+            "grant_act_id",
+            "gen_random_uuid()",
+            "an INSERT naming an act id",
+        ),
+    ] {
+        let sql = format!(
+            "INSERT INTO role_assignments (role, holder_person_id, valid_from, reason, {columns}) \
+             VALUES ('role:platform-custodian', $1, now(), 'custodian test', {values})"
+        );
+        let r = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let r = sqlx::query(&sql).bind(h2).execute(&mut *conn).await;
+            (conn, r)
+        })
+        .await;
+        assert_code(&r, "CUS02", what);
+    }
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM role_assignments")
         .fetch_one(&pool)
         .await
@@ -525,6 +626,113 @@ async fn the_grantor_rule(pool: PgPool) {
         "CUS03",
         "an auditor is no grantor",
     );
+}
+
+/// The catalog's identity is fixed: a role's key, whether it elevates or
+/// reads the audit, and its projection node never change (`CUS02`), on the
+/// maintenance role; only the description may (review TST-MTC-9).
+///
+/// Verified to fail: the `platform_roles_guard_update` comparison removed ->
+/// the auditor role is made to elevate and the node is re-pointed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_catalog_identity_is_fixed(pool: PgPool) {
+    let other_node = role_node(&pool, CUSTODIAN).await;
+    for (sql, what) in [
+        (
+            "UPDATE platform_roles SET elevates = true WHERE key = 'role:auditor'",
+            "the auditor role made to elevate",
+        ),
+        (
+            "UPDATE platform_roles SET reads_audit = false WHERE key = 'role:auditor'",
+            "the auditor role made blind",
+        ),
+        (
+            "UPDATE platform_roles SET key = 'role:superuser' WHERE key = 'role:auditor'",
+            "a role renamed",
+        ),
+        (
+            "UPDATE platform_roles SET created_by = 'someone' WHERE key = 'role:auditor'",
+            "its provenance rewritten",
+        ),
+    ] {
+        let sql = sql.to_string();
+        let r = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let r = sqlx::query(&sql).execute(&mut *conn).await;
+            (conn, r)
+        })
+        .await;
+        assert_code(&r, "CUS02", what);
+    }
+    let repoint = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r =
+            sqlx::query("UPDATE platform_roles SET role_node_id = $1 WHERE key = 'role:auditor'")
+                .bind(other_node)
+                .execute(&mut *conn)
+                .await;
+        (conn, r)
+    })
+    .await;
+    assert!(
+        repoint.is_err(),
+        "the projection node is never re-pointed: {repoint:?}"
+    );
+    let described = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query(
+            "UPDATE platform_roles SET description = 'reads the trail' \
+              WHERE key = 'role:auditor'",
+        )
+        .execute(&mut *conn)
+        .await
+        .map(|d| d.rows_affected());
+        (conn, r)
+    })
+    .await;
+    assert_eq!(described.expect("the description may change"), 1);
+    let unchanged: (bool, bool) = sqlx::query_as(
+        "SELECT elevates, reads_audit FROM platform_roles WHERE key = 'role:auditor'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("catalog");
+    assert_eq!(
+        unchanged,
+        (false, true),
+        "the auditor role is what 123 made it"
+    );
+}
+
+/// The grantor rule counts only LIVE custodians, re-checked as
+/// `epigraph_live_role_assignment` answers it: a custodian whose human
+/// registration was revoked, or who was linked as an agent, holds nothing,
+/// so it neither grants nor blocks the bootstrap (review TST-MTC-10 (a)).
+///
+/// Verified to fail: the grantor rule's live-custodian test reading the
+/// assignment row alone (no holder re-check) -> the bootstrap grant after
+/// the only custodian's human was revoked is refused CUS03.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_grantor_rule_counts_only_live_custodians(pool: PgPool) {
+    let (a, _) = fixture::seed_human_operator(&pool, "a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "b").await;
+    maint_insert(&pool, CUSTODIAN, a, "0", None, None)
+        .await
+        .expect("bootstrap A");
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_revoke_human_operator($1, 'test')")
+            .bind(a)
+            .execute(&mut *conn)
+            .await
+            .expect("revoke A's human registration");
+        (conn, ())
+    })
+    .await;
+    assert_code(
+        &maint_insert(&pool, CUSTODIAN, b, "0", None, Some(a)).await,
+        "CUS03",
+        "a revoked human is no grantor",
+    );
+    maint_insert(&pool, CUSTODIAN, b, "0", None, None)
+        .await
+        .expect("with no live custodian left, the bootstrap is admitted again");
 }
 
 // =====================================================================
@@ -1875,9 +2083,13 @@ fn db_code(e: &epigraph_db::DbError) -> Option<String> {
 ///
 /// Verified to fail: the CUS04 holder test (`holder_person_id IS DISTINCT
 /// FROM p_actor`) removed -> another holder's assignment records an act; the
-/// revoked test removed -> the ended assignment records one; the
-/// `custodian_assignment_id` select dropped (always NULL) -> the authority
-/// names nothing.
+/// revoked test removed -> the ended assignment records one; the role test
+/// removed -> an AUDITOR assignment records one; the `valid_to` test removed
+/// -> the expired assignment records one; the actor's human re-check removed
+/// -> a revoked human records one; the actor's link test removed -> a
+/// custodian linked as an agent records one (reviews TST-MTC-6, SEC-MTC-9);
+/// the `custodian_assignment_id` select dropped (always NULL) -> the
+/// authority names nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
     use epigraph_db::repos::instance_admin::InstanceAdminRepository;
@@ -2000,6 +2212,69 @@ async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
         Some("CUS04"),
         "an ended assignment: {ended:?}"
     );
+
+    // An AUDITOR assignment is no custodial authority; nor is an expired
+    // custodian assignment, nor one whose holder's human was revoked or who
+    // was linked as an agent (each row itself untouched).
+    let (c, _) = fixture::seed_human_operator(&pool, "auditor-c").await;
+    let (d, _) = fixture::seed_human_operator(&pool, "expiring-d").await;
+    let (e, _) = fixture::seed_human_operator(&pool, "revoked-e").await;
+    let (f, _) = fixture::seed_human_operator(&pool, "linked-f").await;
+    let auditor =
+        RoleAssignmentRepository::grant(&mut conn, AUDITOR, c, None, None, Some(a), "audit")
+            .await
+            .expect("an auditor");
+    let expiring = RoleAssignmentRepository::grant(
+        &mut conn,
+        CUSTODIAN,
+        d,
+        None,
+        Some(chrono::Utc::now() + chrono::Duration::milliseconds(1500)),
+        Some(a),
+        "expires in a moment",
+    )
+    .await
+    .expect("a time-bounded custodian");
+    let of_e = RoleAssignmentRepository::grant(&mut conn, CUSTODIAN, e, None, None, Some(a), "e")
+        .await
+        .expect("E");
+    let of_f = RoleAssignmentRepository::grant(&mut conn, CUSTODIAN, f, None, None, Some(a), "f")
+        .await
+        .expect("F");
+    sqlx::query("SELECT * FROM public.epigraph_revoke_human_operator($1, 'test')")
+        .bind(e)
+        .execute(&mut *conn)
+        .await
+        .expect("revoke E's human registration");
+    epigraph_db::AgentRepository::link_operator(&mut conn, f, a)
+        .await
+        .expect("link F as A's agent");
+    sqlx::query("SELECT pg_sleep(2)")
+        .execute(&mut *conn)
+        .await
+        .expect("let the time-bounded assignment expire");
+    for (assignment, actor, what) in [
+        (auditor, c, "an auditor assignment"),
+        (expiring, d, "an assignment past its valid_to"),
+        (of_e, e, "a holder whose human was revoked"),
+        (of_f, f, "a holder linked as an agent"),
+    ] {
+        let r = RoleAssignmentRepository::record_custodial_act(
+            &mut conn,
+            assignment,
+            actor,
+            "claim.supersede",
+            "claim",
+            target,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            r.as_ref().err().and_then(db_code).as_deref(),
+            Some("CUS04"),
+            "{what}: {r:?}"
+        );
+    }
 
     // The application role records nothing.
     let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
@@ -2150,13 +2425,15 @@ async fn functiondefs(pool: &PgPool) -> Vec<String> {
 async fn the_rollback_restores_122_and_083(pool: PgPool) {
     let mut at_122: Vec<String> = Vec::new();
     let mut ids = (Uuid::nil(), Uuid::nil(), Uuid::nil(), Uuid::nil());
+    let mut kept_group = Uuid::nil();
     fixture::db_at_122_then_head(&pool, &MIGRATOR, |pool| {
-        let (at_122, ids) = (&mut at_122, &mut ids);
+        let (at_122, ids, kept_group) = (&mut at_122, &mut ids, &mut kept_group);
         async move {
             *at_122 = functiondefs(&pool).await;
             let (ended, _) = fixture::seed_human_operator(&pool, "ended").await;
             let (revoked, _) = fixture::seed_human_operator(&pool, "revoked").await;
-            let (kept, _) = fixture::seed_human_operator(&pool, "kept").await;
+            let (kept, kg) = fixture::seed_human_operator(&pool, "kept").await;
+            *kept_group = kg;
             let skipped = bare_agent(&pool).await;
             for h in [ended, revoked, kept, skipped] {
                 legacy_admin(&pool, h, "now()", false, "pre-123 admin").await;
@@ -2238,4 +2515,51 @@ async fn the_rollback_restores_122_and_083(pool: PgPool) {
             .expect("083's body");
         assert_eq!(admin, expected, "{what}");
     }
+
+    // 122's BEHAVIOUR, not only its bodies (review TST-MTC-12): the freeze,
+    // the `platform.` reservation and the self-supersede refusal are gone, so
+    // no 123 trigger or policy was left attached.
+    let fresh = bare_agent(&pool).await;
+    sqlx::query("INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'after the undo')")
+        .bind(fresh)
+        .execute(&pool)
+        .await
+        .expect("instance_admins takes a row again (083)");
+    let from_app = as_app(&pool, Some(kept), &[], |mut conn| async move {
+        let r = sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success) \
+             VALUES ('platform.probe', $1, true)",
+        )
+        .bind(kept)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert!(
+        from_app.is_ok(),
+        "the platform. reservation is gone: {from_app:?}"
+    );
+    let probe = insert_claim(&pool, kept, kept_group)
+        .await
+        .expect("a claim");
+    sqlx::query("UPDATE claims SET supersedes = id WHERE id = $1")
+        .bind(probe)
+        .execute(&pool)
+        .await
+        .expect("122 has no self-supersede refusal");
+    let left_triggers: Vec<String> = sqlx::query_scalar(
+        "SELECT tgname::text FROM pg_trigger WHERE NOT tgisinternal AND tgname IN \
+            ('instance_admins_frozen', 'human_operators_mirror_instance_admins', \
+             'human_operators_refuse_role_node', 'operator_links_refuse_role_node', \
+             'role_assignments_audit', 'role_assignments_guard_insert', \
+             'role_assignments_guard_update', 'platform_roles_guard_update')",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("catalog");
+    assert!(
+        left_triggers.is_empty(),
+        "123 triggers left behind: {left_triggers:?}"
+    );
 }
