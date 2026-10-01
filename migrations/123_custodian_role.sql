@@ -887,8 +887,15 @@ BEGIN
            AND (NEW.supersedes IS NOT DISTINCT FROM OLD.supersedes OR OLD.supersedes IS NULL) THEN
             RETURN NEW;
         END IF;
-        IF NOT public.epigraph_operator_binding_armed()
-           OR public.epigraph_operator_scope_exempt() THEN
+        -- 123 (round 4 COR-R4-1 / SEC-R4-2): the lineage and re-open relief
+        -- is the PRIVILEGED session's alone. 122 returned here for "the
+        -- exemption", so an instance-admin principal (an application-session
+        -- stamp) re-opened what its own INSERT of the row is refused, and
+        -- cleared an inherited successor's lineage. A custodian principal now
+        -- meets the lineage guard below, and its re-open is checked as an
+        -- INSERT; the cross-human SCOPE inside those checks still relieves it
+        -- (audited).
+        IF NOT public.epigraph_operator_binding_armed() OR public.epigraph_bypass() THEN
             RETURN NEW;
         END IF;
         IF NEW.supersedes IS DISTINCT FROM OLD.supersedes AND OLD.supersedes IS NOT NULL
@@ -903,7 +910,8 @@ BEGIN
         IF NOT v_reopen THEN
             RETURN NEW;
         END IF;
-        -- A RE-OPEN on a non-exempt session: checked below as an INSERT of NEW.
+        -- A RE-OPEN on a non-privileged session: checked below as an INSERT
+        -- of NEW.
     ELSIF NOT public.epigraph_operator_binding_armed() THEN
         RETURN NEW;
     END IF;

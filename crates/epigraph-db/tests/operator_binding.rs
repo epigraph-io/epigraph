@@ -2495,3 +2495,147 @@ async fn the_legacy_tie_never_takes_another_humans_agent(pool: PgPool) {
     .expect("links");
     assert_eq!(tied_to_a, 0, "neither is tied to A");
 }
+
+/// One UPDATE on an application session stamped as `writer` with `groups`.
+async fn update_as(
+    pool: &PgPool,
+    writer: Uuid,
+    groups: &[Uuid],
+    sql: &'static str,
+    id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    as_app_stamped(pool, writer, groups, |mut conn| async move {
+        let r = sqlx::query(sql)
+            .bind(id)
+            .execute(&mut *conn)
+            .await
+            .map(|d| d.rows_affected());
+        (conn, r)
+    })
+    .await
+}
+
+/// Delta review round 4 COR-R4-1 / SEC-R4-2 (migration 123): the re-open and
+/// lineage relief is the PRIVILEGED session's alone. A custodian principal
+/// (another human's, on an application session) re-opening a retired claim is
+/// checked exactly as the same principal's INSERT of that row would be, and
+/// meets the lineage guard like any application session; its custodial relief
+/// covers the cross-human SCOPE (audited), never a fresh current claim under a
+/// retired identity. An unbound principal is refused as before. A privileged
+/// session still re-opens anything.
+///
+/// Verified to fail: the UPDATE branch's early return restored to
+/// `epigraph_operator_scope_exempt()` (round-4 mutation M4, which left 122's
+/// suite 27/27 green) -> the custodian's re-open and its lineage clearing land.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, b_group) = fixture::seed_human_operator(&pool, "custodian-b").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "unbound").await;
+    link_live(&pool, x, a).await;
+    let p = insert_claim(&pool, legacy, a_group).await.expect("P");
+    let corpus = insert_claim(&pool, legacy, Uuid::nil())
+        .await
+        .expect("a corpus claim");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy identity's retired tie to A");
+    }
+    fixture::make_custodian(&pool, b).await;
+    assert!(arm(&pool).await, "the database arms");
+
+    // X restates P once (S1), then retires S1; a PRIVILEGED session restates
+    // P again (S2), as a custodial revision on the maintenance DSN would.
+    let s1 = as_app_stamped(&pool, x, &[a_group], |mut conn| async move {
+        let r = supersede_on(&mut conn, p).await;
+        (conn, r)
+    })
+    .await
+    .expect("S1")
+    .0;
+    update_as(
+        &pool,
+        x,
+        &[a_group],
+        "UPDATE claims SET is_current = false WHERE id = $1",
+        s1,
+    )
+    .await
+    .expect("retire S1");
+    let s2 = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, supersedes) \
+         VALUES ($1, 'privileged restatement', $2, 0.5, $3, true, 'public', $4, $5)",
+    )
+    .bind(s2)
+    .bind(s2.as_bytes().repeat(2))
+    .bind(legacy)
+    .bind(a_group)
+    .bind(p)
+    .execute(&pool)
+    .await
+    .expect("a privileged session restates P (S2)");
+    // The superseded corpus claim: retired, with a current successor.
+    let corpus_next = as_app_stamped(&pool, b, &[b_group], |mut conn| async move {
+        let r = supersede_on(&mut conn, corpus).await;
+        (conn, r)
+    })
+    .await;
+    let _ = corpus_next;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(corpus)
+        .execute(&pool)
+        .await
+        .expect("retire the corpus claim");
+
+    const REOPEN: &str = "UPDATE claims SET is_current = true WHERE id = $1";
+    const CLEAR: &str = "UPDATE claims SET supersedes = NULL WHERE id = $1";
+    let custodian = [a_group, b_group, Uuid::nil()];
+
+    // The custodian re-opens S1 while S2 is P's current successor: checked as
+    // its INSERT would be, OPL01 (a fresh current claim under the retired
+    // identity).
+    assert_opl01(
+        update_as(&pool, b, &custodian, REOPEN, s1)
+            .await
+            .map(|_| s1),
+        "a custodian re-opening S1 while S2 is current",
+    );
+    // ...and the custodian clears the current inherited successor's lineage:
+    // the lineage guard, OPL02.
+    let cleared = update_as(&pool, b, &custodian, CLEAR, s2).await;
+    assert_eq!(
+        code_of(&cleared).as_deref(),
+        Some("OPL02"),
+        "a custodian clearing an inherited successor's lineage: {cleared:?}"
+    );
+    // An unbound principal re-opening a retired corpus claim: OPL01.
+    assert_opl01(
+        update_as(&pool, unbound, &[Uuid::nil()], REOPEN, corpus)
+            .await
+            .map(|_| corpus),
+        "an unbound principal re-opening a retired corpus claim",
+    );
+    let (s1_current, s2_lineage): (bool, Option<Uuid>) = sqlx::query_as(
+        "SELECT (SELECT is_current FROM claims WHERE id = $1), \
+                (SELECT supersedes FROM claims WHERE id = $2)",
+    )
+    .bind(s1)
+    .bind(s2)
+    .fetch_one(&pool)
+    .await
+    .expect("read back");
+    assert_eq!((s1_current, s2_lineage), (false, Some(p)), "nothing changed");
+
+    // Control: a privileged session re-opens.
+    sqlx::query(REOPEN)
+        .bind(s1)
+        .execute(&pool)
+        .await
+        .expect("a privileged session re-opens");
+}
