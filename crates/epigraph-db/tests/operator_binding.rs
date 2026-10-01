@@ -2648,7 +2648,11 @@ async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("read back");
-    assert_eq!((s1_current, s2_lineage), (false, Some(p)), "nothing changed");
+    assert_eq!(
+        (s1_current, s2_lineage),
+        (false, Some(p)),
+        "nothing changed"
+    );
 
     // Control: a privileged session re-opens.
     sqlx::query(REOPEN)

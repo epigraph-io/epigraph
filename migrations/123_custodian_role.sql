@@ -492,6 +492,57 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_end_role_assignment(uuid, text) FROM PUBLIC;
 
+-- One custodial act (a maintenance-DSN custodial supersede, a privatization
+-- plan write), recorded in the SAME transaction as the act: a
+-- `platform.custodial_act` row naming the assignment, its window, the actor,
+-- the act and its target. Refused (`CUS04`) unless `p_assignment` is a LIVE
+-- role:platform-custodian assignment held NOW by `p_actor`, a registered
+-- human, so the refusal rolls the act back with it. The acts are an
+-- enumerated list (`22023` otherwise), so the trail's vocabulary is closed.
+-- Maintenance-only EXECUTE.
+CREATE OR REPLACE FUNCTION public.epigraph_record_custodial_act(
+    p_assignment uuid, p_actor uuid, p_act text, p_target_type text, p_target uuid,
+    p_details jsonb)
+RETURNS uuid
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_row public.role_assignments%ROWTYPE;
+    v_id  uuid;
+BEGIN
+    IF p_act IS NULL OR p_act NOT IN ('claim.supersede', 'privatization.plan_create',
+                                      'privatization.plan_transition') THEN
+        RAISE EXCEPTION 'epigraph_record_custodial_act: % is not a recorded custodial act', p_act
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT * INTO v_row FROM public.role_assignments ra WHERE ra.id = p_assignment;
+    IF NOT FOUND
+       OR v_row.role <> 'role:platform-custodian'
+       OR v_row.holder_person_id IS DISTINCT FROM p_actor
+       OR v_row.revoked_at IS NOT NULL
+       OR v_row.valid_from > now()
+       OR (v_row.valid_to IS NOT NULL AND now() >= v_row.valid_to)
+       OR NOT public.epigraph_is_human_operator(p_actor) THEN
+        RAISE EXCEPTION 'CUS04: % is not a live role:platform-custodian assignment held by %; '
+                        'nothing was recorded or changed', p_assignment, p_actor
+            USING ERRCODE = 'CUS04',
+                  HINT = 'Name the actor''s own live assignment: epigraph-operator '
+                         'list-role-assignments --role role:platform-custodian.';
+    END IF;
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('platform.custodial_act', p_actor, true,
+            jsonb_build_object('assignment_id', v_row.id, 'role', v_row.role,
+                               'valid_from', v_row.valid_from, 'valid_to', v_row.valid_to,
+                               'actor', p_actor, 'act', p_act,
+                               'target_type', p_target_type, 'target', p_target,
+                               'details', COALESCE(p_details, '{}'::jsonb),
+                               'recorded_by', session_user))
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END $$;
+REVOKE EXECUTE ON FUNCTION
+    public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb) FROM PUBLIC;
+
 -- The trail's reader: every `platform.` row since `p_since` (newest first,
 -- at most `p_limit`, capped at 1000) for a session that holds a role which
 -- `reads_audit` NOW, as its own principal, or a privileged session. Anyone
@@ -1054,6 +1105,11 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_custodial_relief(text, uuid, uuid, uuid) TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_record_custodial_act(uuid, uuid, text, text, '
+                'uuid, jsonb) OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb) '
+                'TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_grant_role(text, uuid, timestamptz, '
                 'timestamptz, uuid, text) OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_end_role_assignment(uuid, text) '
@@ -1080,5 +1136,8 @@ DO $$ BEGIN
                 'public.epigraph_platform_audit(timestamptz, integer) TO epigraph_app';
         EXECUTE 'REVOKE EXECUTE ON FUNCTION '
                 'public.epigraph_custodial_relief(text, uuid, uuid, uuid) FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb) '
+                'FROM epigraph_app';
     END IF;
 END $$;

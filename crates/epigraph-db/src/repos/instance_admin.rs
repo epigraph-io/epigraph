@@ -38,13 +38,17 @@
 //! read that as "not an admin" would deny an authorised operator — fail-closed,
 //! but wrongly, and invisibly.
 //!
-//! # The write side is not reachable from the API
+//! # There is no write side any more (migration 123)
 //!
-//! [`InstanceAdminRepository::grant`] and [`InstanceAdminRepository::revoke`]
-//! are operator actions issued by the `epigraph-instance-admin` CLI over
-//! `epigraph_maintenance`. **No HTTP route writes this table**, and PR-18a adds
-//! none. On an app-role pool both calls fail with `42501` from the REVOKE, which
-//! is the intended posture rather than a bug to be worked around.
+//! Instance administration is `role:platform-custodian`, held by a registered
+//! human through `role_assignments` ([`crate::repos::RoleAssignmentRepository`],
+//! written by `epigraph-operator grant-role` / `end-role-assignment` on the
+//! maintenance DSN). `instance_admins` is frozen for every role (a trigger
+//! refuses any INSERT or edit but a `revoked_at` stamp), so the `grant` and
+//! `revoke` this repository used to carry are removed: a call would only meet
+//! `CUS05`. [`InstanceAdminRepository::list`] stays, read-compatible, for the
+//! legacy rows; [`InstanceAdminRepository::is_active`] keeps its name and asks
+//! the re-bodied `epigraph_is_instance_admin`, which answers from the role.
 
 use crate::errors::DbError;
 use chrono::{DateTime, Utc};
@@ -74,8 +78,14 @@ pub struct InstanceAdminRepository;
 /// prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrivatizationAuthority {
-    /// A live `instance_admins` row for the caller (condition 2).
+    /// Condition 2: the caller holds `role:platform-custodian` now (since
+    /// migration 123 `epigraph_is_instance_admin` answers from the role, not
+    /// from the frozen `instance_admins` table).
     pub is_instance_admin: bool,
+    /// The live custodian assignment that makes condition 2 true, so a
+    /// custodial act can be recorded against it (`None` exactly when
+    /// `is_instance_admin` is false).
+    pub custodian_assignment_id: Option<Uuid>,
     /// `None` when the target group does not exist. Otherwise the value
     /// condition 3a's 24-hour maturity test is applied to.
     pub target_group_created_at: Option<DateTime<Utc>>,
@@ -188,7 +198,7 @@ impl InstanceAdminRepository {
         agent_id: Uuid,
         target_group_id: Uuid,
     ) -> Result<PrivatizationAuthority, DbError> {
-        let row: (Option<bool>, Option<DateTime<Utc>>, i64, bool) = sqlx::query_as(
+        let row: (Option<bool>, Option<DateTime<Utc>>, i64, bool, Option<Uuid>) = sqlx::query_as(
             r#"
             SELECT public.epigraph_is_instance_admin($1),
                    (SELECT g.created_at FROM public.groups g WHERE g.id = $2),
@@ -197,7 +207,8 @@ impl InstanceAdminRepository {
                        AND m.revoked_at IS NULL AND m.agent_id <> $1),
                    EXISTS (SELECT 1 FROM public.group_memberships m
                             WHERE m.group_id = $2 AND m.agent_id = $1
-                              AND m.role = 'admin' AND m.revoked_at IS NULL)
+                              AND m.role = 'admin' AND m.revoked_at IS NULL),
+                   public.epigraph_role_assignment_for($1, 'role:platform-custodian', now())
             "#,
         )
         .bind(agent_id)
@@ -205,82 +216,17 @@ impl InstanceAdminRepository {
         .fetch_one(&mut *conn)
         .await?;
 
+        let is_instance_admin = row.0.unwrap_or(false);
         Ok(PrivatizationAuthority {
-            is_instance_admin: row.0.unwrap_or(false),
+            is_instance_admin,
+            // Read in the same statement as condition 2, so the two cannot
+            // disagree about the instant; filtered to it so a caller never
+            // records an act against an assignment condition 2 did not see.
+            custodian_assignment_id: row.4.filter(|_| is_instance_admin),
             target_group_created_at: row.1,
             other_live_admins: row.2,
             is_target_group_admin: row.3,
         })
-    }
-
-    /// Grant (or re-grant) instance administrator to `agent_id`.
-    ///
-    /// Re-granting a revoked agent clears `revoked_at` and re-stamps
-    /// `granted_at`, so the row records the LIVE grant. The historical record of
-    /// who granted and revoked before is `privatization_audit` and
-    /// `security_events`, not this table.
-    ///
-    /// `granted_by` and `note` are `COALESCE`d rather than overwritten. A
-    /// re-grant is the documented idempotent operator re-run — the CLI's
-    /// `revoke` reasons explicitly about re-running a completed playbook step —
-    /// and `epigraph-instance-admin grant --agent-id X` with neither flag would
-    /// otherwise silently NULL an existing grantor and justification, which are
-    /// the two audit-adjacent fields on the row. Passing a new value still
-    /// replaces the old one.
-    ///
-    /// Requires a pool connected as `epigraph_maintenance`; migration 083
-    /// revokes INSERT and UPDATE on this table from `epigraph_app`.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails, including
-    /// the `42501` an app-role connection gets.
-    #[instrument(skip(pool))]
-    pub async fn grant(
-        pool: &PgPool,
-        agent_id: Uuid,
-        granted_by: Option<Uuid>,
-        note: Option<&str>,
-    ) -> Result<InstanceAdminRow, DbError> {
-        let row: InstanceAdminRow = sqlx::query_as(
-            r#"
-            INSERT INTO instance_admins (agent_id, granted_by, note)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (agent_id) DO UPDATE
-               SET granted_by = COALESCE(EXCLUDED.granted_by, instance_admins.granted_by),
-                   granted_at = now(),
-                   revoked_at = NULL,
-                   note       = COALESCE(EXCLUDED.note, instance_admins.note)
-            RETURNING agent_id, granted_by, granted_at, revoked_at, note
-            "#,
-        )
-        .bind(agent_id)
-        .bind(granted_by)
-        .bind(note)
-        .fetch_one(pool)
-        .await?;
-        Ok(row)
-    }
-
-    /// Revoke a live grant. Returns `false` if the agent held no live grant.
-    ///
-    /// Revocation is a `revoked_at` stamp, never a `DELETE`: the row is the
-    /// record that the authority once existed, and `agent_id` is referenced by
-    /// `privatization_plans.created_by` / `approved_by` through `agents`.
-    ///
-    /// Requires a pool connected as `epigraph_maintenance`.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn revoke(pool: &PgPool, agent_id: Uuid) -> Result<bool, DbError> {
-        let result = sqlx::query(
-            "UPDATE instance_admins SET revoked_at = now() \
-             WHERE agent_id = $1 AND revoked_at IS NULL",
-        )
-        .bind(agent_id)
-        .execute(pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
     }
 
     /// List grants, live ones only unless `include_revoked`.

@@ -730,11 +730,8 @@ fn blake3_like(s: &str) -> Vec<u8> {
 /// caller's own `sqlx::migrate!` migrator (this file embeds none).
 /// `session_replication_role = replica` is deliberately NOT the shortcut: it
 /// would also silence the audit triggers under test.
-pub async fn db_at_122_then_head<F, Fut>(
-    pool: &PgPool,
-    migrator: &sqlx::migrate::Migrator,
-    seed: F,
-) where
+pub async fn db_at_122_then_head<F, Fut>(pool: &PgPool, migrator: &sqlx::migrate::Migrator, seed: F)
+where
     F: FnOnce(PgPool) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
@@ -764,10 +761,7 @@ pub async fn db_at_122_then_head<F, Fut>(
     drop(conn);
     seed(pool.clone()).await;
     let mut conn = pool.acquire().await.expect("acquire");
-    migrator
-        .run(&mut *conn)
-        .await
-        .expect("migrate 122 -> head");
+    migrator.run(&mut *conn).await.expect("migrate 122 -> head");
     sqlx::query("RESET ALL")
         .execute(&mut *conn)
         .await

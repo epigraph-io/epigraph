@@ -196,7 +196,11 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
                 "{what}: the refusal says why: {text}"
             );
         }
-        assert_eq!(assignments_of(&pool, agent).await, 0, "{what} holds nothing");
+        assert_eq!(
+            assignments_of(&pool, agent).await,
+            0,
+            "{what} holds nothing"
+        );
     }
 }
 
@@ -268,10 +272,10 @@ async fn assignments_are_append_only(pool: PgPool) {
             "UPDATE role_assignments SET holder_person_id = $2, revoked_at = now(), \
                     revoked_by = session_user, revoked_reason = 'x' WHERE id = $1",
         )
-            .bind(id)
-            .bind(h2)
-            .execute(&mut *conn)
-            .await;
+        .bind(id)
+        .bind(h2)
+        .execute(&mut *conn)
+        .await;
         (conn, r)
     })
     .await;
@@ -343,12 +347,13 @@ async fn the_app_role_cannot_write_assignments(pool: PgPool) {
 
     for table in ["role_assignments", "platform_roles"] {
         for privilege in ["INSERT", "UPDATE", "DELETE", "TRUNCATE"] {
-            let held: bool = sqlx::query_scalar("SELECT has_table_privilege('epigraph_app', $1, $2)")
-                .bind(format!("public.{table}"))
-                .bind(privilege)
-                .fetch_one(&pool)
-                .await
-                .expect("privilege");
+            let held: bool =
+                sqlx::query_scalar("SELECT has_table_privilege('epigraph_app', $1, $2)")
+                    .bind(format!("public.{table}"))
+                    .bind(privilege)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("privilege");
             assert!(!held, "epigraph_app holds {privilege} on {table}");
         }
         let select: bool =
@@ -384,7 +389,11 @@ async fn the_app_role_cannot_write_assignments(pool: PgPool) {
     .await;
     assert_code(&insert, "42501", "an app INSERT");
     assert_code(&update, "42501", "an app UPDATE");
-    assert_eq!(seen, vec![h], "a stamped app session reads its own rows only");
+    assert_eq!(
+        seen,
+        vec![h],
+        "a stamped app session reads its own rows only"
+    );
 
     let unstamped: Vec<Uuid> = as_app(&pool, None, &[], |mut conn| async move {
         let seen = sqlx::query_scalar("SELECT holder_person_id FROM role_assignments")
@@ -394,7 +403,10 @@ async fn the_app_role_cannot_write_assignments(pool: PgPool) {
         (conn, seen)
     })
     .await;
-    assert!(unstamped.is_empty(), "an unstamped app session reads none: {unstamped:?}");
+    assert!(
+        unstamped.is_empty(),
+        "an unstamped app session reads none: {unstamped:?}"
+    );
     let catalog: i64 = as_app(&pool, None, &[], |mut conn| async move {
         let n = sqlx::query_scalar("SELECT count(*) FROM platform_roles")
             .fetch_one(&mut *conn)
@@ -467,14 +479,12 @@ async fn the_grantor_rule(pool: PgPool) {
 
 /// `epigraph_holds_role(principal, role, at)` on a privileged session.
 async fn holds_at(pool: &PgPool, who: Uuid, role: &str, at: &str) -> bool {
-    sqlx::query_scalar(&format!(
-        "SELECT public.epigraph_holds_role($1, $2, {at})"
-    ))
-    .bind(who)
-    .bind(role)
-    .fetch_one(pool)
-    .await
-    .expect("holds_role")
+    sqlx::query_scalar(&format!("SELECT public.epigraph_holds_role($1, $2, {at})"))
+        .bind(who)
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .expect("holds_role")
 }
 
 /// An assignment confers the role on `[valid_from, valid_to)` and nowhere
@@ -610,8 +620,16 @@ async fn holds_role_is_subject_bound(pool: PgPool) {
             .await
         }
     };
-    assert_eq!(ask(Some(x), vec![xg]).await, (false, None), "X asks about Y");
-    assert_eq!(ask(None, vec![]).await, (false, None), "unstamped asks about Y");
+    assert_eq!(
+        ask(Some(x), vec![xg]).await,
+        (false, None),
+        "X asks about Y"
+    );
+    assert_eq!(
+        ask(None, vec![]).await,
+        (false, None),
+        "unstamped asks about Y"
+    );
     assert_eq!(
         ask(Some(y), vec![yg]).await,
         (true, Some(id)),
@@ -753,7 +771,10 @@ async fn every_assignment_change_is_audited_and_unforgeable(pool: PgPool) {
         "the event names the holder, the role and the reason"
     );
 
-    assert!(end_role(&pool, via_definer).await.expect("end"), "ended now");
+    assert!(
+        end_role(&pool, via_definer).await.expect("end"),
+        "ended now"
+    );
     assert!(
         !end_role(&pool, via_definer).await.expect("end again"),
         "an ended assignment reports false and is not re-ended"
@@ -800,8 +821,16 @@ async fn every_assignment_change_is_audited_and_unforgeable(pool: PgPool) {
         (conn, (mine, anonymous, ordinary))
     })
     .await;
-    assert_code(&forged.0, "42501", "an attributed platform. row from the app");
-    assert_code(&forged.1, "42501", "an unattributed platform. row from the app");
+    assert_code(
+        &forged.0,
+        "42501",
+        "an attributed platform. row from the app",
+    );
+    assert_code(
+        &forged.1,
+        "42501",
+        "an unattributed platform. row from the app",
+    );
     assert!(
         forged.2.is_ok(),
         "the prefix test is exact: other events still land: {:?}",
@@ -814,7 +843,10 @@ async fn every_assignment_change_is_audited_and_unforgeable(pool: PgPool) {
           WHERE event_type = 'platform.role_granted' AND details->>'assignment_id' = $1::text",
     ] {
         let r = sqlx::query(sql).bind(raw).execute(&pool).await;
-        assert!(r.is_err(), "the audit row is immutable, superuser included: {r:?}");
+        assert!(
+            r.is_err(),
+            "the audit row is immutable, superuser included: {r:?}"
+        );
     }
 
     // The reader: a custodian or an auditor, as itself; nobody else.
@@ -840,7 +872,11 @@ async fn every_assignment_change_is_audited_and_unforgeable(pool: PgPool) {
     .await
     .expect("count");
     assert!(total >= 5, "the trail holds every change: {total}");
-    assert_eq!(read(c, vec![cg]).await, total, "the auditor reads the trail");
+    assert_eq!(
+        read(c, vec![cg]).await,
+        total,
+        "the auditor reads the trail"
+    );
     assert_eq!(read(d, vec![dg]).await, 0, "a plain human reads none of it");
     assert_eq!(
         read(a, vec![ag]).await,
@@ -1061,8 +1097,7 @@ fn no_rust_source_queries_the_occupies_projection() {
                     let lower = line.to_ascii_lowercase();
                     let names_edge = line.contains("OCCUPIES")
                         || (lower.contains("occupies") && lower.contains("relationship"));
-                    if names_edge && !line.trim_start().starts_with("//")
-                    {
+                    if names_edge && !line.trim_start().starts_with("//") {
                         out.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
                     }
                 }
@@ -1244,7 +1279,12 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
     );
     assert_eq!(
         migrated[0],
-        (human, CUSTODIAN.to_string(), true, "migration 123".to_string()),
+        (
+            human,
+            CUSTODIAN.to_string(),
+            true,
+            "migration 123".to_string()
+        ),
         "valid_from = granted_at"
     );
     assert_eq!(migrated[1].0, second);
@@ -1265,7 +1305,11 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
     .await
     .expect("skipped");
     assert_eq!(skipped, vec![agent], "the non-human row is skipped loudly");
-    assert_eq!(assignments_of(&pool, revoked).await, 0, "a revoked row is not carried");
+    assert_eq!(
+        assignments_of(&pool, revoked).await,
+        0,
+        "a revoked row is not carried"
+    );
     let projected: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges WHERE relationship = 'OCCUPIES' AND source_id = $1",
     )
@@ -1311,13 +1355,12 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
             .expect("legacy row")
         }
     };
-    let carried: Uuid = sqlx::query_scalar(
-        "SELECT id FROM role_assignments WHERE holder_person_id = $1",
-    )
-    .bind(human)
-    .fetch_one(&pool)
-    .await
-    .expect("carried");
+    let carried: Uuid =
+        sqlx::query_scalar("SELECT id FROM role_assignments WHERE holder_person_id = $1")
+            .bind(human)
+            .fetch_one(&pool)
+            .await
+            .expect("carried");
     assert!(live_legacy(human).await);
     assert!(end_role(&pool, carried).await.expect("end"));
     assert!(
@@ -1450,11 +1493,197 @@ async fn custodial_relief_is_audited_with_the_assignment(pool: PgPool) {
         (conn, r)
     })
     .await;
-    assert_code(&rolled_back, "OPL01", "an unbound author, even for a custodian");
+    assert_code(
+        &rolled_back,
+        "OPL01",
+        "an unbound author, even for a custodian",
+    );
     assert_eq!(
         relief_events(&pool).await.len(),
         1,
         "a refused write leaves no relief row"
     );
     let _ = b;
+}
+
+// =====================================================================
+// The repository, and a custodial act names a live assignment of its actor.
+// =====================================================================
+
+fn db_code(e: &epigraph_db::DbError) -> Option<String> {
+    match e {
+        epigraph_db::DbError::QueryFailed { source } => sqlstate(source),
+        _ => None,
+    }
+}
+
+/// `RoleAssignmentRepository` on a DOWNGRADED maintenance connection (so the
+/// policies, not the superuser's bypass, admit it): grant, read back, record
+/// a custodial act, end. A custodial act is recorded only against a LIVE
+/// custodian assignment held by its actor (CUS04 for another holder's, an
+/// ended one and one not yet begun) and only for an enumerated act (22023);
+/// the application role cannot record one at all. `privatization_authority`
+/// names the assignment behind condition 2.
+///
+/// Verified to fail: the CUS04 holder test (`holder_person_id IS DISTINCT
+/// FROM p_actor`) removed -> another holder's assignment records an act; the
+/// revoked test removed -> the ended assignment records one; the
+/// `custodian_assignment_id` select dropped (always NULL) -> the authority
+/// names nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
+    use epigraph_db::repos::instance_admin::InstanceAdminRepository;
+    use epigraph_db::RoleAssignmentRepository;
+
+    let (a, a_group) = fixture::seed_human_operator(&pool, "custodian-a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "custodian-b").await;
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let mut conn = maint.acquire().await.expect("maintenance connection");
+
+    let ia =
+        RoleAssignmentRepository::grant(&mut conn, CUSTODIAN, a, None, None, None, "bootstrap")
+            .await
+            .expect("grant A");
+    let ib =
+        RoleAssignmentRepository::grant(&mut conn, CUSTODIAN, b, None, None, Some(a), "second")
+            .await
+            .expect("A grants B");
+    let future = RoleAssignmentRepository::grant(
+        &mut conn,
+        CUSTODIAN,
+        b,
+        Some(chrono::Utc::now() + chrono::Duration::days(1)),
+        None,
+        Some(a),
+        "from tomorrow",
+    )
+    .await
+    .expect("a future assignment for B");
+    assert_eq!(
+        RoleAssignmentRepository::live_for(&mut conn, a, CUSTODIAN)
+            .await
+            .expect("live_for"),
+        Some(ia)
+    );
+    let listed = RoleAssignmentRepository::list(&mut conn, Some(CUSTODIAN), false)
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 3, "the three un-ended assignments");
+    let row = RoleAssignmentRepository::get(&mut conn, ia)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!((row.holder_person_id, row.granted_by), (Some(a), None));
+
+    let target = Uuid::new_v4();
+    let act = RoleAssignmentRepository::record_custodial_act(
+        &mut conn,
+        ia,
+        a,
+        "claim.supersede",
+        "claim",
+        target,
+        serde_json::json!({"reason": "test"}),
+    )
+    .await
+    .expect("A records an act against A's live assignment");
+    let named: (String, String, String) = sqlx::query_as(
+        "SELECT event_type, details->>'assignment_id', details->>'act' FROM security_events \
+          WHERE id = $1",
+    )
+    .bind(act)
+    .fetch_one(&pool)
+    .await
+    .expect("the act");
+    assert_eq!(
+        named,
+        (
+            "platform.custodial_act".to_string(),
+            ia.to_string(),
+            "claim.supersede".to_string()
+        )
+    );
+
+    for (assignment, actor, act, code, what) in [
+        (
+            ib,
+            a,
+            "claim.supersede",
+            "CUS04",
+            "another holder's assignment",
+        ),
+        (
+            future,
+            b,
+            "claim.supersede",
+            "CUS04",
+            "an assignment not yet begun",
+        ),
+        (ia, a, "claim.delete", "22023", "an act outside the list"),
+    ] {
+        let r = RoleAssignmentRepository::record_custodial_act(
+            &mut conn,
+            assignment,
+            actor,
+            act,
+            "claim",
+            target,
+            serde_json::json!({}),
+        )
+        .await;
+        let code_seen = r.as_ref().err().and_then(db_code);
+        assert_eq!(code_seen.as_deref(), Some(code), "{what}: {r:?}");
+    }
+    assert!(RoleAssignmentRepository::end(&mut conn, ib, "ended")
+        .await
+        .expect("end B"));
+    let ended = RoleAssignmentRepository::record_custodial_act(
+        &mut conn,
+        ib,
+        b,
+        "claim.supersede",
+        "claim",
+        target,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        ended.as_ref().err().and_then(db_code).as_deref(),
+        Some("CUS04"),
+        "an ended assignment: {ended:?}"
+    );
+
+    // The application role records nothing.
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let mut app_conn = app.acquire().await.expect("app connection");
+    let refused = RoleAssignmentRepository::record_custodial_act(
+        &mut app_conn,
+        ia,
+        a,
+        "claim.supersede",
+        "claim",
+        target,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        refused.as_ref().err().and_then(db_code).as_deref(),
+        Some("42501"),
+        "the app role: {refused:?}"
+    );
+
+    // privatization_authority names the assignment behind condition 2.
+    let authority = InstanceAdminRepository::privatization_authority(&mut conn, a, a_group)
+        .await
+        .expect("authority");
+    assert!(authority.is_instance_admin);
+    assert_eq!(authority.custodian_assignment_id, Some(ia));
+    let none = InstanceAdminRepository::privatization_authority(&mut conn, b, a_group)
+        .await
+        .expect("authority");
+    assert_eq!(
+        (none.is_instance_admin, none.custodian_assignment_id),
+        (false, None),
+        "B's only live-shaped assignment is not yet begun"
+    );
 }
