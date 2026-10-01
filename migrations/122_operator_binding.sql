@@ -493,9 +493,10 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM
 -- Section 2's ATTRIBUTION check, for a claim whose author is not its writer:
 -- the author must be BOUND (section 1) and belong to the WRITER's own human.
 -- One exception, for the author a supersede INHERITS rather than chooses
--- (`p_inherited`: an INSERT that names `supersedes` AND carries exactly that
--- predecessor's author, which is what `supersede_act_conn` writes; the
--- trigger decides it): there a RETIRED link to the writer's human
+-- (`p_inherited`: an INSERT restating one RETIRED predecessor with that
+-- predecessor's author and group and no other current successor, which is
+-- what `supersede_act_conn` writes; the trigger decides it, see its body's
+-- comment): there a RETIRED link to the writer's human
 -- counts, so a human can supersede its own legacy author's claim. A fresh
 -- claim may never name a retired identity (OB1). An author that belongs to no
 -- human at all is unbound (OPL01, under the valve's rule); so is a RETIRED
