@@ -372,7 +372,7 @@ async fn walking_the_item_pages_one_at_a_time_names_no_id_the_actor_cannot_read(
 // The three-condition check, on the CREATE path and on a READ path.
 // ===========================================================================
 
-/// A caller with the scope but no `instance_admins` row is refused.
+/// A caller with the scope but no `role:platform-custodian` assignment is refused.
 ///
 /// Condition 1 is a claim the token makes about itself; condition 2 is the
 /// instance's own record, and it is what makes condition 1 insufficient rather
@@ -399,10 +399,10 @@ async fn the_scope_alone_does_not_authorise_a_plan(pool: PgPool) {
         Json(plan_body(world.target_group, vec![claim])),
     )
     .await
-    .expect_err("a caller with no instance_admins row must be refused");
+    .expect_err("a caller with no custodian assignment must be refused");
     assert!(
-        matches!(&err, ApiError::Forbidden { reason } if reason.contains("instance administrator")),
-        "expected the instance-admin refusal, got {err:?}"
+        matches!(&err, ApiError::Forbidden { reason } if reason == "not a platform custodian"),
+        "expected the condition-2 refusal (no role:platform-custodian assignment), got {err:?}"
     );
 }
 
@@ -1332,5 +1332,98 @@ async fn an_instance_admin_who_does_not_administer_the_target_is_refused_but_not
     assert_eq!(
         plan_state, "previewed",
         "a refused approve must not move the plan"
+    );
+}
+
+/// Migration 123: every privatization plan WRITE is a custodial act. Creating
+/// a plan and approving it each record one `platform.custodial_act` naming
+/// the acting custodian's live assignment, the act and the plan, in the
+/// write's own transaction; a caller whose assignment has ended is refused at
+/// condition 2 ("not a platform custodian") and writes nothing.
+///
+/// Verified to fail: the create handler's `record_custodial_act` call removed
+/// -> no act for the plan; the approve handler's removed -> no transition act.
+#[sqlx::test(migrations = "../../migrations")]
+async fn plan_writes_are_recorded_as_custodial_acts(pool: PgPool) {
+    let world = World::seed(&pool).await;
+    let state = split_state(&pool).await;
+    let claim = seed_public_claim(&pool, world.actor, "custodial act subject").await;
+    let actor_assignment = viewer_fixture::make_custodian(&pool, world.actor).await;
+
+    let (_, Json(preview)) = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![claim])),
+    )
+    .await
+    .expect("create the plan");
+    let acts = |plan: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Uuid, String, String)>(
+                "SELECT agent_id, details->>'assignment_id', details->>'act' \
+                   FROM security_events \
+                  WHERE event_type = 'platform.custodial_act' AND details->>'target' = $1::text \
+                  ORDER BY created_at, id",
+            )
+            .bind(plan)
+            .fetch_all(&pool)
+            .await
+            .expect("acts")
+        }
+    };
+    assert_eq!(
+        acts(preview.plan_id).await,
+        vec![(
+            world.actor,
+            actor_assignment.to_string(),
+            "privatization.plan_create".to_string()
+        )],
+        "the create is one custodial act naming the actor's assignment"
+    );
+
+    let second = add_admin(&pool, world.target_group, "second-eyes").await;
+    let second_assignment = viewer_fixture::make_custodian(&pool, second).await;
+    approve_plan(
+        ViewerExtractor(Viewer::resolve(&pool, second).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(auth_for(second))),
+        Path(preview.plan_id),
+    )
+    .await
+    .expect("a second custodian approves");
+    let recorded = acts(preview.plan_id).await;
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(
+        recorded[1],
+        (
+            second,
+            second_assignment.to_string(),
+            "privatization.plan_transition".to_string()
+        ),
+        "the approval is a custodial act of the approver's assignment"
+    );
+
+    // An ended assignment: refused at condition 2, nothing written.
+    let ended: bool =
+        sqlx::query_scalar("SELECT public.epigraph_end_role_assignment($1, 'test end')")
+            .bind(actor_assignment)
+            .fetch_one(&pool)
+            .await
+            .expect("end the actor's assignment");
+    assert!(ended);
+    let other = seed_public_claim(&pool, world.actor, "a second subject").await;
+    let err = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![other])),
+    )
+    .await
+    .expect_err("an ended custodian creates nothing");
+    assert!(
+        matches!(&err, ApiError::Forbidden { reason } if reason == "not a platform custodian"),
+        "{err:?}"
     );
 }

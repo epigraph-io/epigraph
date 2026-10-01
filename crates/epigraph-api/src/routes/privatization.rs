@@ -1002,12 +1002,13 @@ pub async fn create_plan(
         .map_err(|e| maintenance_error(e, "create_plan"))?;
     let (maint, bypass) = session.split();
 
-    let actor = crate::middleware::instance_authz::require_instance_admin_for_group(
+    let authority = crate::middleware::instance_authz::require_instance_admin_for_group(
         auth,
         body.target_group_id,
         &mut *maint,
     )
     .await?;
+    let actor = authority.agent_id;
 
     // The closure bounds are resolved BEFORE the seeds, because `node_cap`
     // bounds the seed set too — see `resolve_seeds`.
@@ -1138,6 +1139,20 @@ pub async fn create_plan(
                     .to_string(),
         });
     }
+    // The custodial act, in the plan's own transaction (migration 123).
+    record_custodial_act(
+        &mut tx,
+        authority,
+        "privatization.plan_create",
+        plan_id,
+        serde_json::json!({
+            "target_group_id": body.target_group_id,
+            "mode": mode,
+            "item_count": item_count,
+            "plan_digest": digest,
+        }),
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
@@ -1580,7 +1595,8 @@ pub async fn approve_plan(
     };
 
     let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
-    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let authority = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let actor = authority.agent_id;
 
     refuse_if_expired(&plan)?;
 
@@ -1639,6 +1655,14 @@ pub async fn approve_plan(
     )
     .await
     .map_err(plan_write_error)?;
+    record_custodial_act(
+        &mut tx,
+        authority,
+        "privatization.plan_transition",
+        plan_id,
+        serde_json::json!({"transition": "approve", "to_state": "approved"}),
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
@@ -1682,7 +1706,7 @@ pub async fn apply_plan(
     };
 
     let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
-    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let authority = require_plan_authority(&state, auth, plan.target_group_id).await?;
 
     refuse_if_expired(&plan)?;
     refuse_stale_digest(&plan, &body.plan_digest)?;
@@ -1741,7 +1765,7 @@ pub async fn apply_plan(
     dispatch(
         &state,
         &plan,
-        actor,
+        authority,
         "applying",
         &["previewed".to_string(), "approved".to_string()],
         DispatchKind::Apply,
@@ -1782,7 +1806,8 @@ pub async fn abort_plan(
     };
 
     let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
-    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let authority = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let actor = authority.agent_id;
 
     if !matches!(plan.state.as_str(), "applying" | "reverting") {
         return Err(ApiError::Conflict {
@@ -1841,6 +1866,14 @@ pub async fn abort_plan(
     )
     .await
     .map_err(plan_write_error)?;
+    record_custodial_act(
+        &mut tx,
+        authority,
+        "privatization.plan_transition",
+        plan_id,
+        serde_json::json!({"transition": "abort", "to_state": "failed"}),
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
@@ -1892,7 +1925,7 @@ pub async fn revert_plan(
     };
 
     let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
-    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let authority = require_plan_authority(&state, auth, plan.target_group_id).await?;
 
     // NO TTL CHECK. The 4 h window is on ACTING ON A PREVIEW, and a revert acts
     // on what was applied. A plan that can never be reverted after four hours is
@@ -1936,7 +1969,7 @@ pub async fn revert_plan(
     dispatch(
         &state,
         &plan,
-        actor,
+        authority,
         "reverting",
         &[
             "applied".to_string(),
@@ -2114,7 +2147,8 @@ pub async fn seal_manifest(
     };
 
     let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
-    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let authority = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let actor = authority.agent_id;
     refuse_if_expired(&plan)?;
     refuse_unless_sealable(&plan)?;
 
@@ -2254,7 +2288,8 @@ pub async fn seal_commit(
     };
 
     let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
-    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let authority = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let actor = authority.agent_id;
     refuse_if_expired(&plan)?;
     refuse_unless_sealable(&plan)?;
 
@@ -2476,7 +2511,8 @@ pub async fn unseal_manifest(
     };
 
     let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
-    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let authority = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let actor = authority.agent_id;
     // NOT `refuse_if_expired`. Unsealing is the way BACK, and a plan whose
     // preview has gone stale is exactly the plan an operator most needs to
     // undo — the same argument `revert_plan` makes for skipping the TTL.
@@ -2630,7 +2666,8 @@ pub async fn unseal_commit(
     };
 
     let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
-    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let authority = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    let actor = authority.agent_id;
     if plan.mode != "seal" {
         return Err(ApiError::Conflict {
             reason: format!("plan {plan_id} is mode='{}', not 'seal'", plan.mode),
@@ -3076,14 +3113,16 @@ async fn log_manifest_read(
 /// count `group_memberships` rows, which migration 077's policy narrows on the
 /// actor's connection.
 ///
-/// Returns the caller's `agent_id`, so a handler that needs to attribute a write
-/// cannot proceed with `None` and cannot re-derive it from a different source.
+/// Returns the caller's `agent_id` and its custodian assignment, so a handler
+/// that needs to attribute a write cannot proceed with `None`, cannot re-derive
+/// it from a different source, and records its act against the authority that
+/// was checked.
 #[cfg(feature = "db")]
 async fn require_plan_authority(
     state: &AppState,
     auth: &crate::middleware::bearer::AuthContext,
     target_group_id: Uuid,
-) -> Result<Uuid, ApiError> {
+) -> Result<crate::middleware::instance_authz::CustodianAuthority, ApiError> {
     let mut session = maintenance(state).await?;
     let (maint, _bypass) = session.split();
     crate::middleware::instance_authz::require_instance_admin_for_group(
@@ -3313,7 +3352,7 @@ fn new_correlation_id() -> String {
 async fn dispatch(
     state: &AppState,
     plan: &epigraph_db::repos::privatization::PlanRow,
-    actor: Uuid,
+    authority: crate::middleware::instance_authz::CustodianAuthority,
     to_state: &str,
     from_states: &[String],
     kind: DispatchKind,
@@ -3323,6 +3362,7 @@ async fn dispatch(
     };
     use epigraph_db::repos::security_event::{SecurityEventRepository, SecurityEventRow};
 
+    let actor = authority.agent_id;
     let correlation_id = new_correlation_id();
     let job = match kind {
         DispatchKind::Apply => epigraph_jobs::EpiGraphJob::PrivatizationApply {
@@ -3408,6 +3448,15 @@ async fn dispatch(
     )
     .await
     .map_err(plan_write_error)?;
+    record_custodial_act(
+        &mut tx,
+        authority,
+        "privatization.plan_transition",
+        plan.id,
+        serde_json::json!({"transition": "dispatch", "to_state": to_state,
+                           "correlation_id": correlation_id}),
+    )
+    .await?;
 
     let job_id = PrivatizationRepository::enqueue_job_conn(&mut tx, &job_type, &payload)
         .await
@@ -3641,6 +3690,48 @@ fn selection_error(err: epigraph_db::repos::privatization::SelectionError) -> Ap
 /// answer to the caller — the database refused this write — and the raw error is
 /// logged either way, so the diagnosis is not lost.
 #[cfg(feature = "db")]
+/// One `platform.custodial_act` (migration 123) for a privatization plan write,
+/// on the write's own maintenance transaction, against the assignment the
+/// authority check saw. `CUS04` (the assignment ended between the check and
+/// the write) is the caller's 403, and rolls the write back with it.
+#[cfg(feature = "db")]
+async fn record_custodial_act(
+    tx: &mut sqlx::PgConnection,
+    authority: crate::middleware::instance_authz::CustodianAuthority,
+    act: &str,
+    plan_id: Uuid,
+    details: serde_json::Value,
+) -> Result<Uuid, ApiError> {
+    epigraph_db::RoleAssignmentRepository::record_custodial_act(
+        tx,
+        authority.assignment_id,
+        authority.agent_id,
+        act,
+        "privatization_plan",
+        plan_id,
+        details,
+    )
+    .await
+    .map_err(|err| {
+        let ended = matches!(
+            &err,
+            epigraph_db::DbError::QueryFailed { source }
+                if source
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .as_deref()
+                    == Some("CUS04")
+        );
+        if ended {
+            ApiError::Forbidden {
+                reason: "not a platform custodian".to_string(),
+            }
+        } else {
+            plan_write_error(err)
+        }
+    })
+}
+
 fn plan_write_error(err: epigraph_db::DbError) -> ApiError {
     let insufficient_privilege = matches!(
         &err,
