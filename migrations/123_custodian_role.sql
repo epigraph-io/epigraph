@@ -61,7 +61,7 @@ SET LOCAL lock_timeout = '3s';
 -- Each catalog role has a node in the graph: an `agents` row of
 -- `agent_type = 'role'` at a fixed id. Its public key is 32 random bytes
 -- whose private half exists nowhere, so nothing can sign as it, and the role
--- node is refused as a link or registry subject (section 9), so it can never
+-- node is refused as a link or registry subject (section 5), so it can never
 -- become a bound writer.
 INSERT INTO public.agents (id, public_key, display_name, agent_type, role, labels)
 VALUES
