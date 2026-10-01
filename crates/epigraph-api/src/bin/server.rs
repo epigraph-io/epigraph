@@ -325,9 +325,18 @@ async fn main() {
             epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
         );
         // Operator binding (migration 122): say at boot whether the valve is
-        // open and whether the database is armed. Non-fatal; the trigger
-        // enforces whatever this reports.
-        epigraph_db::operator_binding::log_boot_state(scoped.inner(), "epigraph-api").await;
+        // open and whether the database is armed, and REFUSE TO START on a
+        // privileged DSN of an armed database (operator ruling OQ-7 (b): on
+        // such a DSN the trigger checks the author column alone and relieves
+        // the cross-human scope). One code path, every environment, no
+        // override; an unarmed database (dev, CI) is not refused.
+        if let Err(refusal) =
+            epigraph_db::operator_binding::check_request_unit_boot(scoped.inner(), "epigraph-api")
+                .await
+        {
+            eprintln!("ERROR: {refusal}");
+            std::process::exit(1);
+        }
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
             .with_admin_cascade(false);

@@ -1516,8 +1516,10 @@ arming is one-way and every step before it must leave no live writer unbound.
 8. **Deploy the new request binaries** (api, then mcp, as for 107), and the
    fleet host change (pass the operator id; run `link` at every spawn, on a
    maintenance DSN). Then **arm**: `epigraph-operator arm-operator-binding`
-   (census), then `--apply`. The census must list no unbound recent writer you
-   intend to keep. The census lists AUTHORS; a writer that authors as someone
+   (census), then `--apply`. Before `--apply`, confirm no request unit or
+   stdio MCP config connects on a privileged DSN: once armed, such a unit
+   refuses to start (operator ruling OQ-7 (b); "The custodian role", step 4).
+   The census must list no unbound recent writer you intend to keep. The census lists AUTHORS; a writer that authors as someone
    else (a service client posting on an agent's behalf, a listener acting under
    a borrowed admin stamp) is bound on its own principal once armed and does
    not appear there: inventory those separately. So is a claim written on an
@@ -1603,9 +1605,15 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
    --apply` (no `--granted-by` only while no live custodian exists). Then
    confirm each request unit connects as `epigraph_app` with
    `epigraph_bypass() = false`: its boot log must carry the line that starts
-   `operator binding ENFORCED:` (with the colon), never the ERROR line that
-   starts `operator binding NOT ENFORCED for the writer on this privileged
-   DSN:`. Grep the prefix, not the word: both lines contain "ENFORCED".
+   `operator binding ENFORCED:` (with the colon). On an armed database a
+   request unit (`epigraph-api`, and `epigraph-mcp` on every transport, a
+   stdio config included) on a privileged DSN REFUSES TO START (operator
+   ruling OQ-7 (b)): it exits 1 after the ERROR line that starts `operator
+   binding NOT ENFORCED for the writer on this privileged DSN:`, with
+   `ERROR: refusing to start:` on stderr. Grep the prefix, not the word: both
+   lines contain "ENFORCED". Check every unit and every stdio MCP config's DSN
+   BEFORE arming: arming turns a privileged request DSN into a unit that no
+   longer starts.
 5. **Custodial revisions** of the platform corpus use
    `epigraph-operator custodial-supersede --claim <id> --content-file <f>
    --truth <x> --assignment <the actor's live assignment> --actor <the

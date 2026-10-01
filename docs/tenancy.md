@@ -569,7 +569,12 @@ The census lists every agent that authored claims in the last `--recent-days`
 `--allow-unbound-writers` records that stopping them is the decision. Arming is
 **one-way**: there is no disarm function, and the maintenance role holds no
 UPDATE or DELETE on `operator_binding_arming`. The api and mcp servers log at
-boot whether the database is armed.
+boot whether the database is armed, and REFUSE TO START (exit 1, `ERROR:
+refusing to start: ...` on stderr) when their DSN is privileged
+(`epigraph_bypass()` is true) on an armed database, whatever the valve says:
+on such a DSN the trigger checks the author column alone and relieves the
+cross-human scope (operator ruling OQ-7 (b)). `epigraph-mcp` refuses on every
+transport, stdio included. An unarmed database is not refused.
 
 The only runtime relief is per process:
 `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off`. It is read once at boot, logs a WARN

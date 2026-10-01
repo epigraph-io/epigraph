@@ -63,25 +63,37 @@ pub const ARMED_BOOT_INFO: &str = "operator binding ENFORCED: the database is ar
 ///
 /// Migration 122's trigger binds the session's stamped PRINCIPAL only on a
 /// non-privileged session; on a privileged one it checks the claim's author
-/// column alone (that is the platform corpus's custodial edit path). So a
-/// request unit on such a DSN would let any caller its request body names as
-/// author write as that author, while [`ARMED_BOOT_INFO`] said ENFORCED
-/// (delta review round 4 SEC-R4-3). Same rule as [`ARMED_BOOT_INFO`]: the code
-/// appears only in parentheses, never as a refusal's `OPL0x:` prefix.
+/// column alone (that is the platform corpus's custodial edit path), and since
+/// migration 123 a privileged session is the only one relieved of the
+/// cross-human scope (`OPL02`). So a request unit on such a DSN would let any
+/// caller its request body names as author write as that author, across
+/// humans (delta review round 4 SEC-R4-3). A request unit therefore REFUSES TO
+/// START in this state ([`request_unit_may_serve`], operator ruling OQ-7 (b)).
+/// Same rule as [`ARMED_BOOT_INFO`]: the code appears only in parentheses,
+/// never as a refusal's `OPL0x:` prefix.
 pub const PRIVILEGED_DSN_ERROR: &str = "operator binding NOT ENFORCED for the writer on this \
      privileged DSN: the database is armed, but this process connects as a privileged role \
      (epigraph_bypass() is true), so the claims trigger checks the author column only and \
      ignores the stamped principal (the writer binding, OPL01, does not apply). A request unit \
      must connect as epigraph_app (docs/deploy.md, \"Operator binding\").";
 
-/// What [`log_boot_state`] reports, as a value a test can compare.
+/// The refusal a request unit (the API `server`, `epigraph-mcp` on every
+/// transport) prints to stderr before exiting non-zero when its DSN is
+/// privileged on an armed database (operator ruling OQ-7 (b)). Followed by
+/// [`PRIVILEGED_DSN_ERROR`], which says why.
+pub const PRIVILEGED_DSN_REFUSAL: &str = "refusing to start: a request unit never serves an \
+     armed database on a privileged DSN (operator ruling OQ-7 (b)); connect it as epigraph_app";
+
+/// What [`check_request_unit_boot`] reports, as a value a test can compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootState {
     /// Armed, valve closed, a non-privileged connection: [`ARMED_BOOT_INFO`].
     Enforced,
-    /// Armed, valve closed, a PRIVILEGED connection: [`PRIVILEGED_DSN_ERROR`].
+    /// Armed, a PRIVILEGED connection, whatever the valve says (a privileged
+    /// session is not bound on its principal either way):
+    /// [`PRIVILEGED_DSN_ERROR`]. A request unit refuses to start.
     PrivilegedDsn,
-    /// Armed, but this process's valve is open.
+    /// Armed, a non-privileged connection, but this process's valve is open.
     ValveOff,
     /// Migration 122 applied, not armed.
     NotArmed,
@@ -89,8 +101,10 @@ pub enum BootState {
     NotMigrated,
 }
 
-/// Read what this process will enforce on `pool`'s database: the arming, the
-/// valve, and whether the connection is privileged (`epigraph_bypass()`).
+/// Read what this process will enforce on `pool`'s database: the arming,
+/// whether the connection is privileged (`epigraph_bypass()`), and the valve.
+/// Privilege is read BEFORE the valve: an open valve on a privileged DSN is
+/// still a privileged DSN.
 ///
 /// # Errors
 /// A read failed.
@@ -100,19 +114,36 @@ pub async fn boot_state(pool: &sqlx::PgPool) -> Result<BootState, crate::DbError
         match crate::AgentRepository::operator_binding_armed(pool).await? {
             None => BootState::NotMigrated,
             Some(false) => BootState::NotArmed,
-            Some(true) if valve == Enforcement::Off => BootState::ValveOff,
             Some(true) => {
                 let privileged: bool = sqlx::query_scalar("SELECT public.epigraph_bypass()")
                     .fetch_one(pool)
                     .await?;
                 if privileged {
                     BootState::PrivilegedDsn
+                } else if valve == Enforcement::Off {
+                    BootState::ValveOff
                 } else {
                     BootState::Enforced
                 }
             }
         },
     )
+}
+
+/// Whether a REQUEST UNIT may serve in `state`: every state but
+/// [`BootState::PrivilegedDsn`] (operator ruling OQ-7 (b)). A pure mapping, so
+/// the rule is unit-tested apart from the database.
+///
+/// # Errors
+/// [`PRIVILEGED_DSN_REFUSAL`] for a privileged DSN on an armed database.
+pub fn request_unit_may_serve(state: BootState) -> Result<(), &'static str> {
+    match state {
+        BootState::PrivilegedDsn => Err(PRIVILEGED_DSN_REFUSAL),
+        BootState::Enforced
+        | BootState::ValveOff
+        | BootState::NotArmed
+        | BootState::NotMigrated => Ok(()),
+    }
 }
 
 /// Whether this process enforces operator binding.
@@ -180,7 +211,7 @@ pub const NOT_ARMED_BOOT_WARNING: &str = "operator binding is NOT ARMED on this 
 pub const NOT_MIGRATED_BOOT_WARNING: &str = "migration 122 (operator binding) is not applied to \
      this database; claim writes through default declarations fail closed until it is";
 
-/// The level and the line [`log_boot_state`] emits for `state`: a pure
+/// The level and the line [`check_request_unit_boot`] logs for `state`: a pure
 /// mapping, so a test pins that a privileged DSN is an ERROR naming
 /// [`PRIVILEGED_DSN_ERROR`] (the SEC-R4-3 signal), not an INFO saying
 /// ENFORCED.
@@ -195,37 +226,47 @@ pub fn boot_line(state: BootState) -> (tracing::Level, &'static str) {
     }
 }
 
-/// Log, once at boot, what this process will enforce: the valve state,
-/// whether the database is armed, and whether this connection is privileged
-/// ([`boot_state`], mapped by [`boot_line`]). Non-fatal: a read failure is
-/// logged, not returned, because the trigger enforces whatever this says. A
-/// privileged DSN on an armed database is an ERROR line, never
-/// [`ARMED_BOOT_INFO`]; it does not refuse to serve (the deploy runbook's
-/// per-unit DSN check is the gate).
-pub async fn log_boot_state(pool: &sqlx::PgPool, unit: &str) {
-    match boot_state(pool).await {
-        Ok(state) => match boot_line(state) {
-            (level, line) if level == tracing::Level::ERROR => {
-                tracing::error!(target: "tenancy.operator_binding", unit, "{line}");
-            }
-            (level, line) if level == tracing::Level::WARN => {
-                tracing::warn!(target: "tenancy.operator_binding", unit, "{line}");
-            }
-            (_, line) => tracing::info!(target: "tenancy.operator_binding", unit, "{line}"),
-        },
-        Err(e) => tracing::warn!(
-            target: "tenancy.operator_binding",
-            unit,
-            error = %e,
-            "could not read the operator-binding arming state"
-        ),
+/// A request unit's boot check, once, before it serves: log what this process
+/// will enforce (the valve state, whether the database is armed, and whether
+/// this connection is privileged: [`boot_state`], mapped by [`boot_line`]),
+/// and refuse to serve a privileged DSN on an armed database
+/// ([`request_unit_may_serve`], operator ruling OQ-7 (b)). Fails CLOSED: a
+/// read failure is a refusal too, since without the read the unit cannot
+/// show that its DSN is not privileged.
+///
+/// The caller (a request binary's `main`) prints the `Err` to stderr and exits
+/// non-zero. Only request units call this: the maintenance timers and the
+/// operator CLIs run on the maintenance DSN by design.
+///
+/// # Errors
+/// The refusal text: [`PRIVILEGED_DSN_REFUSAL`] followed by
+/// [`PRIVILEGED_DSN_ERROR`], or the read failure.
+pub async fn check_request_unit_boot(pool: &sqlx::PgPool, unit: &str) -> Result<BootState, String> {
+    let state = boot_state(pool).await.map_err(|e| {
+        format!(
+            "refusing to start: could not read the operator-binding arming state or whether \
+             this DSN is privileged ({e})"
+        )
+    })?;
+    match boot_line(state) {
+        (level, line) if level == tracing::Level::ERROR => {
+            tracing::error!(target: "tenancy.operator_binding", unit, "{line}");
+        }
+        (level, line) if level == tracing::Level::WARN => {
+            tracing::warn!(target: "tenancy.operator_binding", unit, "{line}");
+        }
+        (_, line) => tracing::info!(target: "tenancy.operator_binding", unit, "{line}"),
     }
+    request_unit_may_serve(state)
+        .map_err(|refusal| format!("{refusal}. {PRIVILEGED_DSN_ERROR}"))?;
+    Ok(state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        boot_line, BootState, Enforcement, ARMED_BOOT_INFO, PRIVILEGED_DSN_ERROR, VALVE_OFF_WARNING,
+        boot_line, request_unit_may_serve, BootState, Enforcement, ARMED_BOOT_INFO,
+        PRIVILEGED_DSN_ERROR, PRIVILEGED_DSN_REFUSAL, VALVE_OFF_WARNING,
     };
 
     /// SEC-R4-3's signal is the ERROR line, so its level, its text and the
@@ -268,6 +309,29 @@ mod tests {
                 "a boot line carries a run of spaces: {line:?}"
             );
         }
+    }
+
+    /// Operator ruling OQ-7 (b): a request unit refuses exactly one state, a
+    /// privileged DSN on an armed database, and the refusal names the ruling
+    /// and the role to connect as.
+    #[test]
+    fn a_request_unit_refuses_only_a_privileged_dsn() {
+        assert_eq!(
+            request_unit_may_serve(BootState::PrivilegedDsn),
+            Err(PRIVILEGED_DSN_REFUSAL)
+        );
+        for state in [
+            BootState::Enforced,
+            BootState::ValveOff,
+            BootState::NotArmed,
+            BootState::NotMigrated,
+        ] {
+            assert_eq!(request_unit_may_serve(state), Ok(()), "{state:?}");
+        }
+        assert!(PRIVILEGED_DSN_REFUSAL.starts_with("refusing to start:"));
+        assert!(PRIVILEGED_DSN_REFUSAL.contains("OQ-7 (b)"));
+        assert!(PRIVILEGED_DSN_REFUSAL.contains("epigraph_app"));
+        assert!(!PRIVILEGED_DSN_REFUSAL.contains("  "));
     }
 
     /// The boot lines name the code but never in a refusal's `OPL0x:` form,

@@ -3208,14 +3208,19 @@ async fn a_reopen_never_resurrects_a_superseded_restatement(pool: PgPool) {
 /// Delta review round 4 SEC-R4-3 (migration 123's batch): the writer binding
 /// exists only on a NON-privileged connection, so a process whose DSN is a
 /// superuser or maintenance login does not enforce it whatever the arming says.
-/// Its boot state names that (an ERROR line), never ENFORCED; the same armed
-/// database seen through the application role is ENFORCED.
+/// Its boot state names that (an ERROR line), never ENFORCED, and a request
+/// unit refuses to start on it (operator ruling OQ-7 (b):
+/// `privileged_dsn_boot_refusal.rs` in epigraph-api and epigraph-mcp drive the
+/// binaries); the same armed database seen through the application role is
+/// ENFORCED, which a request unit serves.
 ///
 /// Verified to fail: `boot_state`'s `epigraph_bypass()` read dropped (always
 /// `Enforced` when armed) -> the superuser pool reports ENFORCED.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_boot_line_names_a_privileged_dsn(pool: PgPool) {
-    use epigraph_db::operator_binding::{boot_state, BootState, PRIVILEGED_DSN_ERROR};
+    use epigraph_db::operator_binding::{
+        boot_state, check_request_unit_boot, BootState, PRIVILEGED_DSN_ERROR,
+    };
     let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
     assert_eq!(
         boot_state(&pool).await.expect("boot state"),
@@ -3239,4 +3244,16 @@ async fn the_boot_line_names_a_privileged_dsn(pool: PgPool) {
         "the application role is"
     );
     assert!(PRIVILEGED_DSN_ERROR.contains("NOT ENFORCED"));
+    let refused = check_request_unit_boot(&maint, "test").await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.starts_with("refusing to start:")),
+        "a request unit on the maintenance login refuses: {refused:?}"
+    );
+    assert_eq!(
+        check_request_unit_boot(&app, "test").await,
+        Ok(BootState::Enforced),
+        "a request unit on the application role serves"
+    );
 }
