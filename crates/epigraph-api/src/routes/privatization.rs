@@ -3667,29 +3667,6 @@ fn selection_error(err: epigraph_db::repos::privatization::SelectionError) -> Ap
     }
 }
 
-/// Migration 081's plan guard `RAISE`s when the target group is too young or has
-/// too few other admins.
-///
-/// The handler checks both conditions first, so reaching the guard means the two
-/// disagreed — a race, or a drifted threshold. Reported as a 403 rather than a
-/// 500 because the guard is the authority and its answer is "no", not "broken".
-///
-/// # Discriminated on SQLSTATE, and answered opaquely
-///
-/// The first revision matched the formatted error TEXT for `"target group"` or
-/// `"admins"` and then returned that same raw text to the client as the refusal
-/// reason. Two faults in one function: `DbError::QueryFailed`'s Display carries
-/// whatever the driver formatted, so an unrelated fault whose message happened
-/// to contain either token was reported as an authorization refusal; and
-/// [`scoped_read_error`] three functions below states the house rule the other
-/// way round — log the internal text, answer opaquely. Migration 081 raises
-/// every one of its refusals `USING ERRCODE = '42501'`, which is a discriminator
-/// that does not move when the message is reworded, so that is what is matched.
-///
-/// `42501` is also what a row-level-security denial reports. Both are the same
-/// answer to the caller — the database refused this write — and the raw error is
-/// logged either way, so the diagnosis is not lost.
-#[cfg(feature = "db")]
 /// One `platform.custodial_act` (migration 123) for a privatization plan write,
 /// on the write's own maintenance transaction, against the assignment the
 /// authority check saw. `CUS04` (the assignment ended between the check and
@@ -3732,6 +3709,29 @@ async fn record_custodial_act(
     })
 }
 
+/// Migration 081's plan guard `RAISE`s when the target group is too young or has
+/// too few other admins.
+///
+/// The handler checks both conditions first, so reaching the guard means the two
+/// disagreed — a race, or a drifted threshold. Reported as a 403 rather than a
+/// 500 because the guard is the authority and its answer is "no", not "broken".
+///
+/// # Discriminated on SQLSTATE, and answered opaquely
+///
+/// The first revision matched the formatted error TEXT for `"target group"` or
+/// `"admins"` and then returned that same raw text to the client as the refusal
+/// reason. Two faults in one function: `DbError::QueryFailed`'s Display carries
+/// whatever the driver formatted, so an unrelated fault whose message happened
+/// to contain either token was reported as an authorization refusal; and
+/// [`scoped_read_error`] three functions below states the house rule the other
+/// way round — log the internal text, answer opaquely. Migration 081 raises
+/// every one of its refusals `USING ERRCODE = '42501'`, which is a discriminator
+/// that does not move when the message is reworded, so that is what is matched.
+///
+/// `42501` is also what a row-level-security denial reports. Both are the same
+/// answer to the caller — the database refused this write — and the raw error is
+/// logged either way, so the diagnosis is not lost.
+#[cfg(feature = "db")]
 fn plan_write_error(err: epigraph_db::DbError) -> ApiError {
     let insufficient_privilege = matches!(
         &err,
