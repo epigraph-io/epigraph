@@ -867,3 +867,222 @@ async fn every_assignment_change_is_audited_and_unforgeable(pool: PgPool) {
         assert_eq!((has_app, has_maint), (app, true), "EXECUTE on {func}");
     }
 }
+
+// =====================================================================
+// T10. OCCUPIES is a projection, never an authority.
+// =====================================================================
+
+/// The OCCUPIES edge(s) projecting `assignment`:
+/// (source, target, valid_from = assignment's, valid_to, never_effective).
+async fn projection_of(
+    pool: &PgPool,
+    assignment: Uuid,
+) -> Vec<(Uuid, Uuid, bool, Option<String>, bool)> {
+    sqlx::query_as(
+        "SELECT e.source_id, e.target_id, e.valid_from = ra.valid_from, \
+                e.valid_to::text, COALESCE((e.properties->>'never_effective')::boolean, false) \
+           FROM edges e JOIN role_assignments ra ON ra.id = $1 \
+          WHERE e.relationship = 'OCCUPIES' \
+            AND e.properties @> jsonb_build_object('assignment_id', $1::text)",
+    )
+    .bind(assignment)
+    .fetch_all(pool)
+    .await
+    .expect("projection")
+}
+
+/// Each assignment is projected as ONE `OCCUPIES` edge, holder -> the role's
+/// node, carrying the assignment's window in the edge's own
+/// `valid_from` / `valid_to`; an end closes it, and an assignment ended before
+/// it began is marked `never_effective` (the edge's `temporal_ordering` CHECK
+/// needs `valid_to > valid_from`). Deleting the edge changes nothing anyone
+/// holds: no policy or definer reads OCCUPIES for authority, and no Rust
+/// source mentions it outside a comment. The role node itself is never linked
+/// or registered, so it can never become a writer.
+///
+/// Verified to fail: the projection INSERT removed -> no edge; the revoke's
+/// edge UPDATE removed -> the ended assignment's edge stays open; the
+/// never-effective branch removed -> the end of a future assignment raises the
+/// CHECK; `epigraph_live_role_assignment` reading the edges -> deleting the edge
+/// ends the holding (and the catalog ratchet names it); the role-node guard
+/// trigger on `operator_links` not created -> the role node is linked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn occupies_mirrors_assignments_and_is_never_read_for_authz(pool: PgPool) {
+    let (a, _) = fixture::seed_human_operator(&pool, "a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "b").await;
+    let (c, _) = fixture::seed_human_operator(&pool, "c").await;
+    let custodian_node = role_node(&pool, CUSTODIAN).await;
+    let auditor_node = role_node(&pool, AUDITOR).await;
+
+    let ia = maint_insert(&pool, CUSTODIAN, a, "0", None, None)
+        .await
+        .expect("a");
+    let ib = maint_insert(&pool, CUSTODIAN, b, "0", Some("30 days"), Some(a))
+        .await
+        .expect("b");
+    let ic = maint_insert(&pool, AUDITOR, c, "1 day", None, Some(a))
+        .await
+        .expect("c, from tomorrow");
+    assert_eq!(
+        projection_of(&pool, ia).await,
+        vec![(a, custodian_node, true, None, false)],
+        "one open edge for A"
+    );
+    let pb = projection_of(&pool, ib).await;
+    assert_eq!(pb.len(), 1, "one edge for B");
+    let b_to: Option<String> =
+        sqlx::query_scalar("SELECT valid_to::text FROM role_assignments WHERE id = $1")
+            .bind(ib)
+            .fetch_one(&pool)
+            .await
+            .expect("b window");
+    assert_eq!(
+        (pb[0].0, pb[0].1, pb[0].2, pb[0].3.clone()),
+        (b, custodian_node, true, b_to),
+        "B's edge carries B's window"
+    );
+
+    maint_exec(
+        &pool,
+        "UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
+                revoked_reason = 'ended' WHERE id = $1",
+        ia,
+    )
+    .await
+    .expect("end A");
+    let closed: bool = sqlx::query_scalar(
+        "SELECT e.valid_to = ra.revoked_at FROM edges e JOIN role_assignments ra ON ra.id = $1 \
+          WHERE e.relationship = 'OCCUPIES' \
+            AND e.properties @> jsonb_build_object('assignment_id', $1::text)",
+    )
+    .bind(ia)
+    .fetch_one(&pool)
+    .await
+    .expect("closed");
+    assert!(closed, "the end closes the edge at revoked_at");
+
+    maint_exec(
+        &pool,
+        "UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
+                revoked_reason = 'never began' WHERE id = $1",
+        ic,
+    )
+    .await
+    .expect("end C before it began");
+    let pc = projection_of(&pool, ic).await;
+    assert_eq!(pc.len(), 1, "C's edge stays");
+    assert_eq!(
+        (pc[0].0, pc[0].1, pc[0].4),
+        (c, auditor_node, true),
+        "never effective"
+    );
+
+    // The edge is never authority: delete B's, B still holds.
+    sqlx::query(
+        "DELETE FROM edges WHERE relationship = 'OCCUPIES' \
+            AND properties @> jsonb_build_object('assignment_id', $1::text)",
+    )
+    .bind(ib)
+    .execute(&pool)
+    .await
+    .expect("delete the projection");
+    let holds: bool = sqlx::query_scalar(
+        "SELECT public.epigraph_holds_role($1, 'role:platform-custodian', now())",
+    )
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("holds");
+    assert!(holds, "deleting the projection does not end B's holding");
+
+    // Catalog ratchet: at head, no policy and no function but the projection
+    // reads OCCUPIES.
+    let readers: Vec<String> = sqlx::query_scalar(
+        "SELECT p.proname::text FROM pg_proc p \
+          WHERE p.pronamespace = 'public'::regnamespace \
+            AND p.prosrc ILIKE '%occupies%' \
+            AND p.proname <> 'epigraph_role_assignments_audit' \
+         UNION ALL \
+         SELECT c.relname || '.' || pol.polname FROM pg_policy pol \
+           JOIN pg_class c ON c.oid = pol.polrelid \
+          WHERE COALESCE(pg_get_expr(pol.polqual, pol.polrelid), '') ILIKE '%occupies%' \
+             OR COALESCE(pg_get_expr(pol.polwithcheck, pol.polrelid), '') ILIKE '%occupies%'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("catalog");
+    assert!(
+        readers.is_empty(),
+        "OCCUPIES is a projection, never read for authority: {readers:?}"
+    );
+
+    // The role node is never a link or registry subject.
+    let link = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, custodian_node, a).await
+    };
+    assert!(link.is_err(), "a role node is never linked: {link:?}");
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id) \
+         VALUES ('role-node-client', 'role node', 'human', ARRAY['claims:write'], 'active', $1)",
+    )
+    .bind(custodian_node)
+    .execute(&pool)
+    .await
+    .expect("a client naming the role node");
+    let registered =
+        sqlx::query("INSERT INTO human_operators (agent_id, reason) VALUES ($1, 'probe')")
+            .bind(custodian_node)
+            .execute(&pool)
+            .await;
+    assert!(
+        registered.is_err(),
+        "a role node is never registered as a human: {registered:?}"
+    );
+}
+
+/// No Rust source reads OCCUPIES: a mention outside a `//` comment fails, so
+/// authority can never quietly come to depend on the projection.
+#[test]
+fn no_rust_source_queries_the_occupies_projection() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read");
+                for (n, line) in text.lines().enumerate() {
+                    // The relationship's own spelling, or any spelling next
+                    // to the column that names it (an ILIKE probe). Prose
+                    // such as a chemistry prompt's "occupies on-top sites"
+                    // is neither.
+                    let lower = line.to_ascii_lowercase();
+                    let names_edge = line.contains("OCCUPIES")
+                        || (lower.contains("occupies") && lower.contains("relationship"));
+                    if names_edge && !line.trim_start().starts_with("//")
+                    {
+                        out.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut hits = Vec::new();
+    for krate in std::fs::read_dir(&crates).expect("crates") {
+        let src = krate.expect("crate").path().join("src");
+        if src.is_dir() {
+            walk(&src, &mut hits);
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "OCCUPIES is a projection of role_assignments and is never read for authority; read \
+         epigraph_holds_role / epigraph_role_assignment_for instead:\n  {}",
+        hits.join("\n  ")
+    );
+    // CALIBRATION: the walk reaches this crate's sources.
+    assert!(crates.join("epigraph-db/src/lib.rs").is_file());
+}

@@ -374,13 +374,27 @@ CREATE POLICY security_events_platform_privileged ON public.security_events
 
 -- AFTER INSERT / UPDATE on `role_assignments`: whatever path wrote the row
 -- (a definer below, or a direct maintenance statement), one
--- `platform.role_granted` or `platform.role_ended` row.
+-- `platform.role_granted` or `platform.role_ended` row, and the OCCUPIES
+-- projection (section 5).
 CREATE OR REPLACE FUNCTION public.epigraph_role_assignments_audit()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
+DECLARE
+    v_node uuid;
 BEGIN
+    SELECT r.role_node_id INTO v_node FROM public.platform_roles r WHERE r.key = NEW.role;
     IF TG_OP = 'INSERT' THEN
+        -- Section 5: the projection, holder -> role node, in the edge's own
+        -- validity columns. A structural (agent -> agent) edge: 120 owns it
+        -- by the world group, public.
+        INSERT INTO public.edges (source_id, source_type, target_id, target_type, relationship,
+                                  properties, valid_from, valid_to, visibility, owner_group_id)
+        VALUES (NEW.holder_person_id, 'agent', v_node, 'agent', 'OCCUPIES',
+                jsonb_build_object('assignment_id', NEW.id::text, 'role', NEW.role,
+                                   'source', 'role_assignments', 'projection', true),
+                NEW.valid_from, NEW.valid_to, 'public',
+                '00000000-0000-0000-0000-000000000000'::uuid);
         INSERT INTO public.security_events (event_type, agent_id, success, details)
         VALUES ('platform.role_granted', NEW.holder_person_id, true,
                 jsonb_build_object('assignment_id', NEW.id, 'role', NEW.role,
@@ -390,6 +404,23 @@ BEGIN
                                    'granted_via', NEW.granted_via, 'reason', NEW.reason,
                                    'migrated', NEW.granted_via = 'migration 123'));
     ELSIF OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL THEN
+        -- The projection closes at the end (or keeps an earlier valid_to).
+        -- An assignment ended before it began keeps a one-microsecond window
+        -- marked never_effective: `temporal_ordering` requires
+        -- valid_to > valid_from.
+        UPDATE public.edges e
+           SET valid_to = CASE
+                            WHEN LEAST(COALESCE(NEW.valid_to, NEW.revoked_at), NEW.revoked_at)
+                                 <= NEW.valid_from
+                            THEN NEW.valid_from + interval '1 microsecond'
+                            ELSE LEAST(COALESCE(NEW.valid_to, NEW.revoked_at), NEW.revoked_at)
+                          END,
+               properties = e.properties
+                   || jsonb_build_object('ended_at', NEW.revoked_at,
+                                         'never_effective', NEW.revoked_at <= NEW.valid_from)
+         WHERE e.relationship = 'OCCUPIES' AND e.source_type = 'agent'
+           AND e.source_id = NEW.holder_person_id
+           AND e.properties @> jsonb_build_object('assignment_id', NEW.id::text);
         INSERT INTO public.security_events (event_type, agent_id, success, details)
         VALUES ('platform.role_ended', NEW.holder_person_id, true,
                 jsonb_build_object('assignment_id', NEW.id, 'role', NEW.role,
@@ -478,6 +509,55 @@ $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_platform_audit(timestamptz, integer) FROM PUBLIC;
 
 -- ===================================================================
+-- 5. THE OCCUPIES PROJECTION, AND WHY IT IS NEVER AUTHORITY
+--
+-- The governance graph says who occupies which role with an `OCCUPIES` edge.
+-- The audit trigger above writes one per assignment (holder -> the role's
+-- node, `properties.assignment_id`), in the edge's native `valid_from` /
+-- `valid_to`, and closes it at the end. It is a PROJECTION: nothing reads it
+-- for authority. Every authority question goes to `role_assignments` through
+-- the subject-bound readers (section 3); an edge is ordinary graph content
+-- that any writer of the world group could add, so authority that read edges
+-- could be minted by writing one. The ratchet test
+-- `custodian_role.rs::occupies_mirrors_assignments_and_is_never_read_for_authz`
+-- fails if any policy or function but the projection mentions OCCUPIES, and
+-- `no_rust_source_queries_the_occupies_projection` does the same for Rust.
+--
+-- The projection (like `role_assignments` row security) is not the
+-- disclosure boundary for who holds a role: the edge is world-readable,
+-- as the governance graph's other OCCUPIES edges are.
+--
+-- THE ROLE NODE NEVER BECOMES A WRITER. It is refused as the subject of a
+-- link (agent or operator) and of a human registration, so no session can
+-- bind it to a human and then stamp it.
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_refuse_role_node_subject()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.platform_roles r
+                WHERE r.role_node_id = NEW.agent_id
+                   OR (TG_TABLE_NAME = 'operator_links'
+                       AND r.role_node_id = (to_jsonb(NEW)->>'operator_id')::uuid)) THEN
+        RAISE EXCEPTION '% is the graph node of a platform role; it is never linked, '
+                        'registered or bound to a human', NEW.agent_id
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_refuse_role_node_subject() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS operator_links_refuse_role_node ON public.operator_links;
+CREATE TRIGGER operator_links_refuse_role_node
+    BEFORE INSERT ON public.operator_links
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_refuse_role_node_subject();
+DROP TRIGGER IF EXISTS human_operators_refuse_role_node ON public.human_operators;
+CREATE TRIGGER human_operators_refuse_role_node
+    BEFORE INSERT ON public.human_operators
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_refuse_role_node_subject();
+
+-- ===================================================================
 -- OWNERSHIP AND GRANTS (guarded, as every such block since 060 is)
 --
 -- 077's default privileges hand the application role DML on every new
@@ -509,6 +589,8 @@ DO $$ BEGIN
                 'public.epigraph_role_assignment_for(uuid, text, timestamptz), '
                 'public.epigraph_holds_role(uuid, text, timestamptz) TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_role_assignments_audit() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_refuse_role_node_subject() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_grant_role(text, uuid, timestamptz, '
                 'timestamptz, uuid, text) OWNER TO epigraph_maintenance';
