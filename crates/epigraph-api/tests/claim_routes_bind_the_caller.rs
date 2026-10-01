@@ -38,6 +38,10 @@
 //!    alone put back on a raw `state.db_pool` transaction -> its own test's
 //!    LEGITIMATE control fails (human A's own write refused OPL01), so each
 //!    handler's stamping is pinned separately.
+//! 4. (Round 3 DIS-R3-3) `create_hypothesis`'s frame bind and prior put back
+//!    on `state.db_pool` after the commit -> its control fails: 500 "Failed
+//!    to bind claim to frame" (row security refuses the unstamped
+//!    `claim_frames` INSERT on a schema without an orphan policy there).
 
 mod viewer_fixture;
 
@@ -404,17 +408,33 @@ async fn create_hypothesis_binds_the_authenticated_caller(pool: PgPool) {
             "{what}: nothing may be written"
         );
     }
-    // The control asserts the COMMITTED claim, not the response status: the
-    // handler commits the claim, then binds it to its frame on the unstamped
-    // pool, which row security refuses on a schema without orphan policies
-    // (a tenancy follow-on outside the operator binding this test pins).
+    // The control asserts the response status AND the frame bind and prior:
+    // this schema has no orphan policy on `claim_frames` / `mass_functions`,
+    // so they land only on the claim's stamped transaction (round 3 DIS-R3-3;
+    // on the unstamped pool the route answered 500 after the claim committed).
     let statement = format!("hypothesis: A as itself {}", Uuid::new_v4());
     let (status, body) = post(a, a, statement.clone()).await;
-    assert_ne!(status, StatusCode::FORBIDDEN, "A as itself: {body}");
+    assert_eq!(status, StatusCode::OK, "A as itself: {body}");
     assert_eq!(
         claims_with_content(&pool, &statement).await,
         vec![(a, a_group)],
         "A's hypothesis claim, in A's group: {status} {body}"
+    );
+    let (framed, priors): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM claim_frames cf JOIN frames f ON f.id = cf.frame_id \
+                  WHERE cf.claim_id = c.id AND f.name = 'hypothesis_assessment'), \
+                (SELECT count(*) FROM mass_functions m \
+                  WHERE m.claim_id = c.id AND m.combination_method = 'prior') \
+           FROM claims c WHERE c.content = $1",
+    )
+    .bind(&statement)
+    .fetch_one(&pool)
+    .await
+    .expect("frame bind and prior");
+    assert_eq!(
+        (framed, priors),
+        (1, 1),
+        "the hypothesis is bound to its frame with its prior"
     );
 }
 

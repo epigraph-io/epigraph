@@ -571,8 +571,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `create_hypothesis` and `create_challenge` now write their claim on
 /// `AppState::begin_claim_write`. 264 -> 263 in its round 2: REST
 /// `evolve_step` authors as the caller's `ViewerExtractor` principal and no
-/// longer resolves a viewer on `state.db_pool`.
-const HIGH_WATER: usize = 263;
+/// longer resolves a viewer on `state.db_pool`. 263 -> 260 in its round 3:
+/// `create_hypothesis` reads its frame and writes the frame bind and the prior
+/// on the claim's stamped transaction (`routes/hypothesis.rs` 10 -> 7, read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure).
+const HIGH_WATER: usize = 260;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -798,7 +801,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/groups.rs", 12),
     // 11 before the operator-binding delta review, which moved
     // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`.
-    ("routes/hypothesis.rs", 10),
+    ("routes/hypothesis.rs", 7),
     ("routes/isomorphism.rs", 3),
     // `routes/lineage.rs` was 7 and is GONE, not zeroed: PR-26, the first
     // conversion shard, moved all seven onto `AppState::read_as`. `measure()`
