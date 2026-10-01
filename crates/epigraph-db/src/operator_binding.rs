@@ -58,6 +58,59 @@ pub const VALVE_OFF_WARNING: &str = "EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off: ope
 pub const ARMED_BOOT_INFO: &str = "operator binding ENFORCED: the database is armed; a claim by \
      an agent not bound to a human operator is refused (OPL01)";
 
+/// The boot ERROR of a process on an armed database whose connection is
+/// PRIVILEGED (`epigraph_bypass()` is true: a superuser or maintenance login).
+///
+/// Migration 122's trigger binds the session's stamped PRINCIPAL only on a
+/// non-privileged session; on a privileged one it checks the claim's author
+/// column alone (that is the platform corpus's custodial edit path). So a
+/// request unit on such a DSN would let any caller its request body names as
+/// author write as that author, while [`ARMED_BOOT_INFO`] said ENFORCED
+/// (delta review round 4 SEC-R4-3). Same rule as [`ARMED_BOOT_INFO`]: the code
+/// appears only in parentheses, never as a refusal's `OPL0x:` prefix.
+pub const PRIVILEGED_DSN_ERROR: &str = "operator binding NOT ENFORCED for the writer on this      privileged DSN: the database is armed, but this process connects as a privileged role      (epigraph_bypass() is true), so the claims trigger checks the author column only and      ignores the stamped principal (the writer binding, OPL01, does not apply). A request unit      must connect as epigraph_app (docs/deploy.md, \"Operator binding\").";
+
+/// What [`log_boot_state`] reports, as a value a test can compare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootState {
+    /// Armed, valve closed, a non-privileged connection: [`ARMED_BOOT_INFO`].
+    Enforced,
+    /// Armed, valve closed, a PRIVILEGED connection: [`PRIVILEGED_DSN_ERROR`].
+    PrivilegedDsn,
+    /// Armed, but this process's valve is open.
+    ValveOff,
+    /// Migration 122 applied, not armed.
+    NotArmed,
+    /// Migration 122 not applied.
+    NotMigrated,
+}
+
+/// Read what this process will enforce on `pool`'s database: the arming, the
+/// valve, and whether the connection is privileged (`epigraph_bypass()`).
+///
+/// # Errors
+/// A read failed.
+pub async fn boot_state(pool: &sqlx::PgPool) -> Result<BootState, crate::DbError> {
+    let valve = enforcement();
+    Ok(
+        match crate::AgentRepository::operator_binding_armed(pool).await? {
+            None => BootState::NotMigrated,
+            Some(false) => BootState::NotArmed,
+            Some(true) if valve == Enforcement::Off => BootState::ValveOff,
+            Some(true) => {
+                let privileged: bool = sqlx::query_scalar("SELECT public.epigraph_bypass()")
+                    .fetch_one(pool)
+                    .await?;
+                if privileged {
+                    BootState::PrivilegedDsn
+                } else {
+                    BootState::Enforced
+                }
+            }
+        },
+    )
+}
+
 /// Whether this process enforces operator binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Enforcement {
@@ -110,30 +163,37 @@ pub async fn apply_valve(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Erro
     Ok(())
 }
 
-/// Log, once at boot, what this process will enforce: the valve state and
-/// whether the database is armed. Non-fatal: a read failure is logged, not
-/// returned, because the trigger enforces whatever this says.
+/// Log, once at boot, what this process will enforce: the valve state,
+/// whether the database is armed, and whether this connection is privileged
+/// ([`boot_state`]). Non-fatal: a read failure is logged, not returned, because
+/// the trigger enforces whatever this says. A privileged DSN on an armed
+/// database is an ERROR line, never [`ARMED_BOOT_INFO`]; it does not refuse to
+/// serve (the deploy runbook's per-unit DSN check is the gate).
 pub async fn log_boot_state(pool: &sqlx::PgPool, unit: &str) {
-    let valve = enforcement();
-    match crate::AgentRepository::operator_binding_armed(pool).await {
-        Ok(Some(true)) if valve == Enforcement::On => tracing::info!(
+    match boot_state(pool).await {
+        Ok(BootState::Enforced) => tracing::info!(
             target: "tenancy.operator_binding",
             unit,
             "{ARMED_BOOT_INFO}"
         ),
-        Ok(Some(true)) => tracing::warn!(
+        Ok(BootState::PrivilegedDsn) => tracing::error!(
+            target: "tenancy.operator_binding",
+            unit,
+            "{PRIVILEGED_DSN_ERROR}"
+        ),
+        Ok(BootState::ValveOff) => tracing::warn!(
             target: "tenancy.operator_binding",
             unit,
             "the database is armed for operator binding, but this process's valve is OFF"
         ),
-        Ok(Some(false)) => tracing::warn!(
+        Ok(BootState::NotArmed) => tracing::warn!(
             target: "tenancy.operator_binding",
             unit,
             "operator binding is NOT ARMED on this database: claims by agents not bound to a \
              human operator are accepted. Arm it with `epigraph-operator arm-operator-binding \
              --apply` once every live writer is bound (docs/deploy.md)"
         ),
-        Ok(None) => tracing::warn!(
+        Ok(BootState::NotMigrated) => tracing::warn!(
             target: "tenancy.operator_binding",
             unit,
             "migration 122 (operator binding) is not applied to this database; claim writes \
@@ -150,13 +210,13 @@ pub async fn log_boot_state(pool: &sqlx::PgPool, unit: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Enforcement, ARMED_BOOT_INFO, VALVE_OFF_WARNING};
+    use super::{Enforcement, ARMED_BOOT_INFO, PRIVILEGED_DSN_ERROR, VALVE_OFF_WARNING};
 
     /// The boot lines name the code but never in a refusal's `OPL0x:` form,
     /// which is what the deploy runbook counts as a refusal in the logs.
     #[test]
     fn boot_lines_never_read_as_a_refusal() {
-        for line in [ARMED_BOOT_INFO, VALVE_OFF_WARNING] {
+        for line in [ARMED_BOOT_INFO, VALVE_OFF_WARNING, PRIVILEGED_DSN_ERROR] {
             assert!(line.contains("OPL01"), "the line names the code: {line}");
             for refusal in ["OPL01:", "OPL02:"] {
                 assert!(

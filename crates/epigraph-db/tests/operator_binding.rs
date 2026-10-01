@@ -2966,3 +2966,39 @@ async fn a_retired_identity_is_restated_at_most_once(pool: PgPool) {
     })
     .await;
 }
+
+/// Delta review round 4 SEC-R4-3 (migration 123's batch): the writer binding
+/// exists only on a NON-privileged connection, so a process whose DSN is a
+/// superuser or maintenance login does not enforce it whatever the arming says.
+/// Its boot state names that (an ERROR line), never ENFORCED; the same armed
+/// database seen through the application role is ENFORCED.
+///
+/// Verified to fail: `boot_state`'s `epigraph_bypass()` read dropped (always
+/// `Enforced` when armed) -> the superuser pool reports ENFORCED.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_boot_line_names_a_privileged_dsn(pool: PgPool) {
+    use epigraph_db::operator_binding::{boot_state, BootState, PRIVILEGED_DSN_ERROR};
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    assert_eq!(
+        boot_state(&pool).await.expect("boot state"),
+        BootState::NotArmed
+    );
+    assert!(arm(&pool).await, "the database arms");
+    assert_eq!(
+        boot_state(&pool).await.expect("boot state"),
+        BootState::PrivilegedDsn,
+        "a superuser DSN on an armed database is not ENFORCED for the writer"
+    );
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    assert_eq!(
+        boot_state(&maint).await.expect("boot state"),
+        BootState::PrivilegedDsn,
+        "nor is a maintenance login"
+    );
+    assert_eq!(
+        boot_state(&app).await.expect("boot state"),
+        BootState::Enforced,
+        "the application role is"
+    );
+    assert!(PRIVILEGED_DSN_ERROR.contains("NOT ENFORCED"));
+}
