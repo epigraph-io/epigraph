@@ -22,7 +22,8 @@
 --      each such holder (NOTICE) so the operator ends it by hand at its
 --      `valid_to`; the script does not cut a live custodian short.
 --   2. Drops 123's triggers on `instance_admins`, `human_operators` and
---      `operator_links` (the freeze, the revoke mirror, the role-node guards).
+--      `operator_links` (the freeze, the revoke mirror, the role-node guards,
+--      the role-holder link guard).
 --   3. Re-applies, VERBATIM, 083's `epigraph_is_instance_admin` and 122's
 --      `epigraph_operator_scope_exempt`, `epigraph_require_operator_scope`,
 --      `epigraph_require_writer_scope`, `epigraph_require_attributable` and
@@ -80,6 +81,7 @@ DROP TRIGGER IF EXISTS instance_admins_frozen ON public.instance_admins;
 DROP TRIGGER IF EXISTS human_operators_mirror_instance_admins ON public.human_operators;
 DROP TRIGGER IF EXISTS human_operators_refuse_role_node ON public.human_operators;
 DROP TRIGGER IF EXISTS operator_links_refuse_role_node ON public.operator_links;
+DROP TRIGGER IF EXISTS operator_links_refuse_role_holder ON public.operator_links;
 
 -- 3. 083's and 122's bodies, verbatim (copied from the migration files; do
 --    not re-type them).
@@ -338,6 +340,7 @@ DROP FUNCTION IF EXISTS public.epigraph_grant_role(text, uuid, timestamptz, time
 DROP FUNCTION IF EXISTS public.epigraph_human_operators_mirror_instance_admins();
 DROP FUNCTION IF EXISTS public.epigraph_instance_admins_frozen();
 DROP FUNCTION IF EXISTS public.epigraph_refuse_role_node_subject();
+DROP FUNCTION IF EXISTS public.epigraph_operator_links_refuse_role_holder();
 DROP FUNCTION IF EXISTS public.epigraph_role_assignments_audit();
 DROP FUNCTION IF EXISTS public.epigraph_holds_role(uuid, text, timestamptz);
 DROP FUNCTION IF EXISTS public.epigraph_role_assignment_for(uuid, text, timestamptz);

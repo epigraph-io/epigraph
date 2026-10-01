@@ -840,7 +840,8 @@ Current reservation:
   assignment; reader
   `epigraph_platform_audit`. Each assignment is projected as an `OCCUPIES` edge
   (never read for authority; ratchet-tested); the role nodes are refused as
-  link or registry subjects. Live `instance_admins` rows of registered humans
+  link or registry subjects, and a role holder is refused as a link's agent
+  (`CUS01`: end the assignment first, so the end is audited). Live `instance_admins` rows of registered humans
   are carried over from their `granted_at`; others are skipped loudly; the table
   is then FROZEN for every role but a mirrored `revoked_at` stamp. 122's
   `epigraph_operator_scope_exempt` is re-bodied to `epigraph_bypass()` alone

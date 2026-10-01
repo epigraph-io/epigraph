@@ -142,6 +142,37 @@ async fn assignments_of(pool: &PgPool, holder: Uuid) -> i64 {
 // T1. Agents never hold a role.
 // =====================================================================
 
+/// A live `operator_links` row making `agent` an agent of `operator`, written
+/// by a superuser with triggers off (`session_replication_role = replica`),
+/// i.e. PAST 123's role-holder link guard: the shape the read-time checks
+/// must still hold against. The operator's group is its own personal group.
+async fn link_past_the_guard(pool: &PgPool, agent: Uuid, operator: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers off");
+    let r = sqlx::query(
+        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) \
+         SELECT $1, $2, m.group_id FROM group_memberships m \
+          WHERE m.agent_id = $2 AND m.role = 'admin' AND m.revoked_at IS NULL \
+          ORDER BY m.group_id LIMIT 1",
+    )
+    .bind(agent)
+    .bind(operator)
+    .execute(&mut *conn)
+    .await;
+    sqlx::query("SET session_replication_role = DEFAULT")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers on");
+    assert_eq!(
+        r.expect("a link written past the guard").rows_affected(),
+        1,
+        "one link row"
+    );
+}
+
 /// Only a REGISTERED HUMAN (`epigraph_is_human_operator`: a live registry row
 /// and its active human client) holds a role. A live-linked agent, a
 /// retired-linked agent, an unbound agent, a role's own projection node and a
@@ -153,8 +184,9 @@ async fn assignments_of(pool: &PgPool, holder: Uuid) -> i64 {
 /// `epigraph_is_human_operator` -> the live-linked agent's lands and the
 /// human's is refused; the guard's `operator_links` test removed -> the
 /// linked registered humans are granted; the same test removed from
-/// `epigraph_live_role_assignment` -> the custodian linked after its grant
-/// still holds.
+/// `epigraph_live_role_assignment` -> the custodian linked past the guard
+/// still holds; the `operator_links` holder guard's trigger not created ->
+/// the custodian's link lands (review SEC-MTC-9's residual).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_agent_never_holds_a_role(pool: PgPool) {
     let (human, _) = fixture::seed_human_operator(&pool, "custodian-human").await;
@@ -236,22 +268,79 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
             "{what} holds nothing"
         );
     }
-    maint_insert(&pool, CUSTODIAN, later, "0", None, Some(human))
+    let later_asg = maint_insert(&pool, CUSTODIAN, later, "0", None, Some(human))
         .await
         .expect("an unlinked registered human is granted");
     assert!(holds_at(&pool, later, CUSTODIAN, "now()").await, "it holds");
+
+    // Linking a HOLDER as an agent is refused (CUS01), live or retired, and a
+    // not-yet-begun assignment counts: its holding ends only through
+    // end-role-assignment, whose end is audited (`platform.role_ended`).
+    let (future, _) = fixture::seed_human_operator(&pool, "future-holder").await;
+    maint_insert(&pool, AUDITOR, future, "1 day", None, Some(human))
+        .await
+        .expect("an auditor assignment that begins tomorrow");
+    for (agent, retired_link, what) in [
+        (later, false, "a live link of a custodian"),
+        (later, true, "a retired link of a custodian"),
+        (future, false, "a live link of a not-yet-begun holder"),
+    ] {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let r = if retired_link {
+            epigraph_db::AgentRepository::link_retired_agent(&mut conn, agent, human)
+                .await
+                .map(|_| ())
+        } else {
+            epigraph_db::AgentRepository::link_operator(&mut conn, agent, human)
+                .await
+                .map(|_| ())
+        };
+        drop(conn);
+        let text = format!("{r:?}");
+        assert!(
+            r.is_err() && text.contains("CUS01") && text.contains("end-role-assignment"),
+            "{what} must be refused CUS01, naming the way out: {text}"
+        );
+        let links: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM operator_links WHERE agent_id = $1")
+                .bind(agent)
+                .fetch_one(&pool)
+                .await
+                .expect("links");
+        assert_eq!(links, 0, "{what}: no link row");
+    }
+    assert!(
+        holds_at(&pool, later, CUSTODIAN, "now()").await,
+        "the refused link changed nothing"
+    );
+
+    // The way out: end the assignment (audited), then link.
+    assert!(end_role(&pool, later_asg).await.expect("end"), "ended");
+    assert_eq!(
+        events_for(&pool, "platform.role_ended", later_asg).await,
+        1,
+        "the end is audited"
+    );
     {
         let mut conn = pool.acquire().await.expect("acquire");
         epigraph_db::AgentRepository::link_operator(&mut conn, later, human)
             .await
-            .expect("link the custodian as an agent");
+            .expect("a former custodian is linked once its assignment has ended");
     }
+
+    // Defence in depth: a link that reached the table past the guard (here a
+    // superuser with triggers off) still ends holding at READ time.
+    let (bypassed, _) = fixture::seed_human_operator(&pool, "linked-past-the-guard").await;
+    maint_insert(&pool, CUSTODIAN, bypassed, "0", None, Some(human))
+        .await
+        .expect("granted");
+    link_past_the_guard(&pool, bypassed, human).await;
     assert!(
-        !holds_at(&pool, later, CUSTODIAN, "now()").await,
+        !holds_at(&pool, bypassed, CUSTODIAN, "now()").await,
         "a custodian linked as an agent holds nothing"
     );
     let admin: bool = sqlx::query_scalar("SELECT public.epigraph_is_instance_admin($1)")
-        .bind(later)
+        .bind(bypassed)
         .fetch_one(&pool)
         .await
         .expect("is_instance_admin");
@@ -2179,9 +2268,10 @@ async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
         .execute(&mut *conn)
         .await
         .expect("revoke E's human registration");
-    epigraph_db::AgentRepository::link_operator(&mut conn, f, a)
-        .await
-        .expect("link F as A's agent");
+    // F is linked as A's agent PAST the holder link guard (a superuser with
+    // triggers off: the guard refuses a holder's link, CUS01), so the act's
+    // own link check is what refuses below.
+    link_past_the_guard(&pool, f, a).await;
     sqlx::query("SELECT pg_sleep(2)")
         .execute(&mut *conn)
         .await
@@ -2485,6 +2575,7 @@ async fn the_rollback_restores_122_and_083(pool: PgPool) {
         "SELECT tgname::text FROM pg_trigger WHERE NOT tgisinternal AND tgname IN \
             ('instance_admins_frozen', 'human_operators_mirror_instance_admins', \
              'human_operators_refuse_role_node', 'operator_links_refuse_role_node', \
+             'operator_links_refuse_role_holder', \
              'role_assignments_audit', 'role_assignments_guard_insert', \
              'role_assignments_guard_update', 'platform_roles_guard_update')",
     )

@@ -1690,6 +1690,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_record_custodial_act", 123),
     ("epigraph_platform_audit", 123),
     ("epigraph_refuse_role_node_subject", 123),
+    ("epigraph_operator_links_refuse_role_holder", 123),
     ("epigraph_instance_admins_frozen", 123),
     ("epigraph_human_operators_mirror_instance_admins", 123),
 ];

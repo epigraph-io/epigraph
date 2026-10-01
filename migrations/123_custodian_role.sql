@@ -669,6 +669,46 @@ CREATE TRIGGER human_operators_refuse_role_node
     BEFORE INSERT ON public.human_operators
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_refuse_role_node_subject();
 
+-- A ROLE HOLDER IS NEVER LINKED AS AN AGENT (review SEC-MTC-9). Holding is
+-- re-checked at read time (a principal with any `operator_links` row as the
+-- agent holds nothing), so a link made after a grant would end the holding
+-- SILENTLY: no `platform.role_ended` row. A new link (live or retired, by any
+-- link function) of a principal with an un-ended assignment that has not
+-- lapsed (live, or not yet begun) is therefore refused CUS01; its holding
+-- ends through `epigraph-operator end-role-assignment`, whose end is audited,
+-- and the link is made afterwards. `operator_links` takes no UPDATE (107: no
+-- policy, no grant), so the INSERT is the only way in.
+CREATE OR REPLACE FUNCTION public.epigraph_operator_links_refuse_role_holder()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_assignment uuid;
+    v_role       text;
+BEGIN
+    SELECT ra.id, ra.role INTO v_assignment, v_role
+      FROM public.role_assignments ra
+     WHERE ra.holder_person_id = NEW.agent_id
+       AND ra.revoked_at IS NULL
+       AND (ra.valid_to IS NULL OR ra.valid_to > clock_timestamp())
+     ORDER BY ra.valid_from
+     LIMIT 1;
+    IF v_assignment IS NOT NULL THEN
+        RAISE EXCEPTION 'CUS01: % holds % (assignment %); a role holder is never linked as an '
+                        'agent: end the assignment first (epigraph-operator '
+                        'end-role-assignment), so its end is audited', NEW.agent_id, v_role,
+                        v_assignment
+            USING ERRCODE = 'CUS01';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_operator_links_refuse_role_holder() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS operator_links_refuse_role_holder ON public.operator_links;
+CREATE TRIGGER operator_links_refuse_role_holder
+    BEFORE INSERT ON public.operator_links
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_operator_links_refuse_role_holder();
+
 -- ===================================================================
 -- 6. FROM `instance_admins` TO THE ROLE
 --
@@ -1180,6 +1220,8 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_role_assignments_audit() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_refuse_role_node_subject() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_operator_links_refuse_role_holder() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_instance_admins_frozen() '
                 'OWNER TO epigraph_maintenance';

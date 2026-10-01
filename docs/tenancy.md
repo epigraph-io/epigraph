@@ -759,8 +759,10 @@ reads the platform audit trail and confers nothing else.
 * **Agents never hold a role** (`CUS01`): the holder must be a registered human
   (`epigraph_is_human_operator`) that is not itself linked to a human as an
   agent (live or retired), re-checked at read time, so revoking the human's
-  registration, suspending its recorded OAuth client, or linking it as an
-  agent ends its authority at once.
+  registration or suspending its recorded OAuth client ends its authority at
+  once. A HOLDER is never linked as an agent: a new `operator_links` row for a
+  principal with a live or not-yet-begun assignment is refused `CUS01`, so its
+  holding ends through `end-role-assignment` (audited) before the link.
 * **Append-only** (`CUS02`): an assignment is never edited or deleted; its only
   change is its end (`revoked_at` stamped now, by the revoking login, with
   why), and an ended assignment is final. Nothing is back-dated, and the

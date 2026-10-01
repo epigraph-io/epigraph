@@ -1742,6 +1742,12 @@ async fn migration_123_custodian_definers_are_owned_and_granted(pool: PgPool) {
             false,
         ),
         (
+            "epigraph_operator_links_refuse_role_holder",
+            "public.epigraph_operator_links_refuse_role_holder()",
+            "v",
+            false,
+        ),
+        (
             "epigraph_instance_admins_frozen",
             "public.epigraph_instance_admins_frozen()",
             "v",
