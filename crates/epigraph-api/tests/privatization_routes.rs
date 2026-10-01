@@ -432,10 +432,8 @@ async fn a_read_endpoint_refuses_an_instance_admin_who_does_not_administer_the_t
 
     // A live instance admin with no membership of the target group.
     let (outsider, _own) = seed_agent_with_group(&pool, "pr-outsider").await;
-    let maint = downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, outsider, None, Some("outsider"))
-        .await
-        .expect("grant the outsider");
+    // Since 123: a role:platform-custodian assignment of a registered human.
+    viewer_fixture::make_custodian(&pool, outsider).await;
     // CALIBRATION: the outsider really is an instance admin, so the refusal is
     // attributable to the target-group conditions and not to condition 2.
     assert!(
@@ -824,10 +822,8 @@ impl World {
         add_admin(pool, target_group, "pr-co-1").await;
         add_admin(pool, target_group, "pr-co-2").await;
 
-        let maint = downgraded_pool(pool, "epigraph_maintenance").await;
-        InstanceAdminRepository::grant(&maint, actor, None, Some("route-test"))
-            .await
-            .expect("grant the actor instance admin");
+        // Since 123: a role:platform-custodian assignment of a registered human.
+        viewer_fixture::make_custodian(pool, actor).await;
 
         Self {
             actor,
@@ -948,10 +944,8 @@ async fn approve_by_the_plans_own_author_is_refused_with_409(pool: PgPool) {
     // CAN approve. Without this the assertion above is satisfied by an approve
     // route that refuses everybody.
     let second = add_admin(&pool, world.target_group, "second-eyes").await;
-    let maint = downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, second, None, Some("route-test"))
-        .await
-        .expect("grant the second admin");
+    // Since 123: a role:platform-custodian assignment of a registered human.
+    viewer_fixture::make_custodian(&pool, second).await;
     let Json(approved) = approve_plan(
         ViewerExtractor(Viewer::resolve(&pool, second).await.expect("resolve")),
         State(state),
@@ -1308,10 +1302,8 @@ async fn an_instance_admin_who_does_not_administer_the_target_is_refused_but_not
 
     // An instance admin with no membership in the target group at all.
     let (outsider, _) = seed_agent_with_group(&pool, "outsider").await;
-    let maint = downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, outsider, None, Some("route-test"))
-        .await
-        .expect("grant the outsider instance admin");
+    // Since 123: a role:platform-custodian assignment of a registered human.
+    viewer_fixture::make_custodian(&pool, outsider).await;
 
     let err = approve_plan(
         ViewerExtractor(Viewer::resolve(&pool, outsider).await.expect("resolve")),

@@ -393,14 +393,10 @@ async fn a_linked_agent_writes_only_where_its_own_operator_writes(pool: PgPool) 
     })
     .await;
 
-    // An instance-admin principal crosses groups.
+    // An instance-admin principal (since 123: a platform custodian) crosses
+    // groups.
     let (admin, _) = fixture::seed_agent_with_group(&pool, "instance-admin").await;
-    make_human(&pool, admin).await;
-    sqlx::query("INSERT INTO instance_admins (agent_id) VALUES ($1)")
-        .bind(admin)
-        .execute(&pool)
-        .await
-        .expect("instance admin");
+    fixture::make_custodian(&pool, admin).await;
     let crossed = as_app_stamped(&pool, admin, &[b_group], |mut conn| async move {
         let r = insert_claim(&mut *conn, x, b_group).await;
         (conn, r)
@@ -1411,13 +1407,8 @@ async fn a_privileged_session_revises_the_platform_corpus_once_armed(pool: PgPoo
             .await
             .expect("the legacy identity's retired tie to A");
     }
-    sqlx::query(
-        "INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'operator binding test')",
-    )
-    .bind(a)
-    .execute(&pool)
-    .await
-    .expect("A is an instance admin");
+    // A is an instance admin: since 123, a platform custodian.
+    fixture::make_custodian(&pool, a).await;
     arm(&pool).await;
 
     // The maintenance session revises both kinds of corpus claim.
@@ -1507,16 +1498,30 @@ async fn a_privileged_session_revises_the_platform_corpus_once_armed(pool: PgPoo
     );
 
     // Round 3 COR-R3-6: the binding relief is the PRIVILEGED session's alone,
-    // not every OPL02-exempt session's. A retired identity that is itself a live
-    // instance admin (`instance_admins` is an ordinary table), stamped as
-    // itself, restating its own retired corpus claim stays OPL01: the
-    // instance-admin stamp exempts it from the cross-group scope, never from
-    // the binding.
-    sqlx::query("INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'round 3 probe')")
-        .bind(legacy)
-        .execute(&pool)
-        .await
-        .expect("the retired identity is an instance admin");
+    // not every OPL02-exempt session's. Since 123 a retired identity cannot be
+    // an instance admin at all: the custodian role is held by registered
+    // humans only (CUS01), and a legacy `instance_admins` row confers nothing
+    // (`custodian_role.rs::is_instance_admin_answers_from_the_role`). So the
+    // retired identity stamped as itself, restating its own retired corpus
+    // claim, stays OPL01.
+    let refused = sqlx::query_scalar::<_, Uuid>(
+        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, $2, \
+                                          'round 3 probe')",
+    )
+    .bind(legacy)
+    .bind(a)
+    .fetch_one(&pool)
+    .await;
+    assert_eq!(
+        refused
+            .as_ref()
+            .err()
+            .and_then(|e| e.as_database_error())
+            .and_then(|d| d.code())
+            .as_deref(),
+        Some("CUS01"),
+        "a retired identity never holds the custodian role: {refused:?}"
+    );
     let admin_itself = as_app_stamped(&pool, legacy, &[world], |mut conn| async move {
         let r = supersede_on(&mut conn, c_self).await;
         (conn, r)
