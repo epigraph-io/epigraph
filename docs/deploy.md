@@ -1423,7 +1423,10 @@ confirm each came from the token endpoint for a client that holds the grant.
 
   The command grants only to an `active` human client, so a revoked or
   suspended client must be reactivated first, through whatever reviewed path
-  the deployment uses for that. Because the check is live, a token that
+  the deployment uses for that. From migration 122 on, that path is a
+  privileged (maintenance or admin) session: the REST admin approval runs on
+  the application role and is refused (`42501`) for a client that is
+  `suspended` or `revoked`. Because the check is live, a token that
   already carries `claims:admin` in its scope lands again as soon as the
   grant is applied; a token minted without the scope needs a refresh (the
   refresh grant re-reads `granted_scopes`) before it reaches the borrow at all.

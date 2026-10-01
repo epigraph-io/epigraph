@@ -93,6 +93,9 @@
 -- of the agent. Keyed on that client, not on "any active human client": the
 -- application role may INSERT `oauth_clients` (dynamic registration) but not
 -- UPDATE it, so it cannot undo a suspension by minting a fresh active client.
+-- Nor can it re-activate the suspended client itself through 118's approval
+-- definer: `oauth_clients_reactivation_guard` lets only a privileged session
+-- take a client out of `suspended` or `revoked`.
 --
 -- The rules live on the TABLE, not only in the two definers
 -- (`epigraph_register_human_operator`, `epigraph_revoke_human_operator`): a
@@ -234,7 +237,8 @@
 -- `operator_links` row like 107's and is permanent by the same rule. Drop
 -- `operator_links_operator_is_human` and `operator_links_audit` before
 -- `human_operators` (the first trigger's body reads it through
--- `epigraph_is_human_operator`).
+-- `epigraph_is_human_operator`). Drop `oauth_clients_reactivation_guard` and
+-- its function too (section 1c).
 -- **Applied to a throwaway database only, NOT to any deployed database.**
 
 SET LOCAL lock_timeout = '3s';
@@ -256,8 +260,10 @@ REVOKE ALL ON public.operator_binding_arming FROM PUBLIC;
 -- made for: the human test reads that row's status, not "any active human
 -- client of the agent", because the application role may INSERT
 -- `oauth_clients` rows (dynamic client registration) and could otherwise mint a
--- fresh active client to undo a suspension. It holds no UPDATE there, so a
--- suspended recorded client stays suspended.
+-- fresh active client to undo a suspension. It holds no UPDATE there, and
+-- `oauth_clients_reactivation_guard` refuses the approval definer's move out of
+-- `suspended` / `revoked` on a non-privileged session, so a suspended recorded
+-- client stays suspended.
 CREATE TABLE IF NOT EXISTS public.human_operators (
     agent_id       uuid PRIMARY KEY REFERENCES public.agents(id) ON DELETE RESTRICT,
     client_id      uuid NOT NULL REFERENCES public.oauth_clients(id) ON DELETE RESTRICT,
@@ -949,6 +955,45 @@ DROP TRIGGER IF EXISTS operator_links_audit ON public.operator_links;
 CREATE TRIGGER operator_links_audit
     AFTER INSERT ON public.operator_links
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_operator_links_audit();
+
+-- Section 1c at the CLIENT record: only a privileged session takes a client
+-- back out of `suspended` or `revoked`. The human test (a) reads the status of
+-- the ONE client a registration names, and the link definers refuse an agent
+-- that is the principal of an un-revoked client (section 9), so that move
+-- decides who is a human and who can be linked. The application role holds no
+-- UPDATE on `oauth_clients`, but 118's `epigraph_oauth_client_approve`, which
+-- it may EXECUTE (the REST admin approval), sets `status = 'active'` whatever
+-- the previous status. Without this guard a request-path caller could
+-- re-activate a client that a maintenance session had suspended or revoked,
+-- which would re-register a suspended human. Promoting a `pending` client, and
+-- taking authority away (to `suspended`, or to `revoked`), stay open to every
+-- path. The guard does not key on the arming: the registry and the link record
+-- read the status before the database is armed as well. It is an INVOKER on
+-- purpose, because it reads only OLD/NEW and `epigraph_bypass()` (which keys
+-- on `session_user`), so the caller's definer frame cannot change the answer.
+CREATE OR REPLACE FUNCTION public.epigraph_oauth_clients_reactivation_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF ((OLD.status = 'revoked' AND NEW.status IS DISTINCT FROM 'revoked')
+        OR (OLD.status = 'suspended' AND NEW.status IS DISTINCT FROM 'suspended'
+            AND NEW.status IS DISTINCT FROM 'revoked'))
+       AND NOT public.epigraph_bypass() THEN
+        RAISE EXCEPTION 'OC02: OAuth client % is %; only a maintenance session takes a client '
+                        'out of suspended or revoked (here to %)', OLD.id, OLD.status, NEW.status
+            USING ERRCODE = '42501',
+                  HINT = 'Re-activate it on a maintenance or admin DSN, recorded. A suspended '
+                         'human client un-registers that human until then.';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_oauth_clients_reactivation_guard() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS oauth_clients_reactivation_guard ON public.oauth_clients;
+CREATE TRIGGER oauth_clients_reactivation_guard
+    BEFORE UPDATE OF status ON public.oauth_clients
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_oauth_clients_reactivation_guard();
 
 -- Arm enforcement, once (section 3). Maintenance only; audited.
 CREATE OR REPLACE FUNCTION public.epigraph_arm_operator_binding()

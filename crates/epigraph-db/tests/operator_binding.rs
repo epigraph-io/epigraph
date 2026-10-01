@@ -1966,6 +1966,124 @@ async fn the_registry_keys_on_its_client_and_holds_for_direct_writes(pool: PgPoo
     );
 }
 
+/// Delta review round 3 SEC-R3-1: the application role cannot take an OAuth
+/// client back out of `suspended` or `revoked` through 118's approval definer
+/// (the REST admin approval, which it may EXECUTE). So a human whose recorded
+/// client a maintenance session suspended stays un-registered, and that human's
+/// live agent stays refused. A revoked client stays revoked too. Promoting a
+/// `pending` client on the application role and re-activating on a privileged
+/// session both still work.
+///
+/// Verified to fail: the `oauth_clients_reactivation_guard` trigger dropped ->
+/// the application role's approval re-activates B's suspended client, and Y is
+/// `live_link` again ("re-activated a suspended client").
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_privileged_session_reactivates_a_suspended_or_revoked_client(pool: PgPool) {
+    let (b, b_group) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
+    link_live(&pool, y, b).await;
+    assert!(arm(&pool).await, "the database arms");
+    let recorded: Uuid =
+        sqlx::query_scalar("SELECT client_id FROM human_operators WHERE agent_id = $1")
+            .bind(b)
+            .fetch_one(&pool)
+            .await
+            .expect("B's recorded client");
+    let binding = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT public.epigraph_author_binding($1)")
+                .bind(agent)
+                .fetch_one(&pool)
+                .await
+                .expect("binding")
+        }
+    };
+    let status_of = |client: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT status FROM oauth_clients WHERE id = $1")
+                .bind(client)
+                .fetch_one(&pool)
+                .await
+                .expect("status")
+        }
+    };
+    let app_approve = |client: Uuid| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+                let r = sqlx::query_scalar::<_, bool>(
+                    "SELECT public.epigraph_oauth_client_approve($1, ARRAY['claims:write'], NULL)",
+                )
+                .bind(client)
+                .fetch_one(&mut *conn)
+                .await;
+                (conn, r)
+            })
+            .await
+        }
+    };
+    assert_eq!(binding(y).await.as_deref(), Some("live_link"));
+
+    for from in ["suspended", "revoked"] {
+        // The maintenance act (here the superuser harness, a privileged session).
+        sqlx::query("UPDATE oauth_clients SET status = $2 WHERE id = $1")
+            .bind(recorded)
+            .bind(from)
+            .execute(&pool)
+            .await
+            .expect("take B's recorded client out of service");
+        assert_eq!(binding(y).await, None, "{from}: B is no longer a human");
+        let r = app_approve(recorded).await;
+        assert!(
+            r.is_err(),
+            "{from}: the application role re-activated a {from} client: {r:?}"
+        );
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "{from}: expected 42501, got {r:?}"
+        );
+        assert_eq!(status_of(recorded).await, from, "{from}: the status stays");
+        assert_eq!(
+            binding(y).await,
+            None,
+            "{from}: B's agent stays unbound after the refused approval"
+        );
+        let w = write_as(&pool, y, &[b_group], y, b_group).await;
+        assert_eq!(
+            code_of(&w).as_deref(),
+            Some(OPL01),
+            "{from}: B's agent writes nothing: {w:?}"
+        );
+    }
+
+    // Control: the application role still promotes a PENDING client.
+    let pending = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
+                                    status) \
+         VALUES ($1, $2, 'pending', 'human', ARRAY['claims:read'], 'pending')",
+    )
+    .bind(pending)
+    .bind(format!("pending-{pending}"))
+    .execute(&pool)
+    .await
+    .expect("a pending client");
+    let r = app_approve(pending).await;
+    assert!(matches!(r, Ok(true)), "a pending client is approved: {r:?}");
+    assert_eq!(status_of(pending).await, "active");
+
+    // Control: a privileged session re-activates, and B is a human again.
+    sqlx::query("UPDATE oauth_clients SET status = 'active' WHERE id = $1")
+        .bind(recorded)
+        .execute(&pool)
+        .await
+        .expect("a privileged re-activation");
+    assert_eq!(binding(y).await.as_deref(), Some("live_link"));
+}
+
 /// Review SEC-12 / SEC-5: every link row is audited where it is written, and
 /// OPERATED_BY edges an application session forges FROM a human no longer
 /// block linking agents to that human (107's operator-side fingerprint is

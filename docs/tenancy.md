@@ -372,7 +372,11 @@ anyone else), and is then checked like an insert. Bound means:
   never makes an agent a human, and a dynamic client registration is typed
   `human` too. Keying on the recorded client means suspending it suspends the
   human: minting a fresh active client for the same agent (the application
-  role may register clients, but not update them) does not revive it. Register
+  role may register clients, but not update them) does not revive it, and
+  neither does the admin approval (`POST /api/v1/admin/clients/:id/approve`,
+  which runs on the application role): only a privileged session takes a
+  client out of `suspended` or `revoked` (`oauth_clients_reactivation_guard`,
+  `42501` otherwise; promoting a `pending` client is unaffected). Register
   and revoke with `epigraph-operator register-human-operator --agent <id>
   --client <oauth client id> --reason <text> [--apply]` /
   `revoke-human-operator --agent <id> --reason <text> [--apply]` (maintenance
