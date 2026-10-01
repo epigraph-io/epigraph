@@ -517,7 +517,8 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM
 -- what `supersede_act_conn` writes; the trigger decides it, see its body's
 -- comment): there a RETIRED link to the writer's human
 -- counts, so a human can supersede its own legacy author's claim. A fresh
--- claim may never name a retired identity (OB1). An author that belongs to no
+-- claim naming a retired identity is refused (OB1), and only the valve
+-- (section 4) relieves that, wherever it is set. An author that belongs to no
 -- human at all is unbound (OPL01, under the valve's rule); so is a RETIRED
 -- identity of the writer's OWN human named on a fresh claim (OPL01: the valve
 -- may relieve it, and it stays inside one human). One that belongs to ANOTHER

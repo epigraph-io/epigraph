@@ -683,8 +683,13 @@ before arming.
   successor restates the one retired claim, in the world group); an
   instance-admin PRINCIPAL supersedes a retired-linked author's claim but not
   an unlinked author's (`OPL01`: an admin stamp is a value an application
-  session sets, so it is not relieved of the binding). A fresh claim naming
-  such an author is refused on every session. The "human supersedes its own
+  session sets, so it is not relieved of the binding). With the valve closed,
+  a fresh claim naming such an author is refused (`OPL01`) on every session,
+  maintenance included. The valve relieves that `OPL01` wherever it is set: a
+  privileged session or an instance-admin principal with the valve open can
+  mint a fresh world-owned claim under a legacy identity, and only `OPL02`
+  (the cross-human scope) still holds for everyone else. So keep the valve
+  out of maintenance units, and keep valve windows short. The "human supersedes its own
   legacy author's claim" admission applies to rows in the human's own group.
   Revising the corpus IN PLACE (an UPDATE of content, truth value, labels, or
   retiring a claim) is not governed by the binding trigger ("Scope" above;
