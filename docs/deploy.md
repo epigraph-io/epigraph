@@ -1617,8 +1617,11 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
 5. **Custodial revisions** of the platform corpus use
    `epigraph-operator custodial-supersede --claim <id> --content-file <f>
    --truth <x> --assignment <the actor's live assignment> --actor <the
-   custodian> --reason <text> [--apply]` on the maintenance DSN; it records a
-   `platform.custodial_act` against the assignment in the same transaction.
+   custodian> --reason <text> [--allow-owned] [--apply]` on the maintenance
+   DSN; it records a `platform.custodial_act` against the assignment in the
+   same transaction. A claim the world group does not own is refused unless
+   `--allow-owned` is given, and the act records whether it was (operator
+   ruling OQ-8 (a)).
    The successor has no embedding until the next embedding backfill.
 
 **Rollback.** First roll back every binary that calls a 123 function:

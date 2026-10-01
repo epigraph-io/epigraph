@@ -323,4 +323,21 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
         3,
         "only the three applied revisions (two corpus, one --allow-owned)"
     );
+    // OQ-8 (a): the override is RECORDED on the act, not only admitted.
+    let overrides: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT details->>'target', details->'details'->>'allow_owned' FROM security_events \
+          WHERE event_type = 'platform.custodial_act' ORDER BY created_at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("acts");
+    assert_eq!(
+        overrides,
+        vec![
+            (c_ret_s.clone(), Some("false".to_string())),
+            (c_unl_s.clone(), Some("false".to_string())),
+            (c_own_s.clone(), Some("true".to_string())),
+        ],
+        "each act records whether --allow-owned admitted it"
+    );
 }

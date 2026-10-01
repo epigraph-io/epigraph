@@ -314,6 +314,9 @@ pub async fn custodial_supersede(
             "old_truth": old_truth,
             "new_truth": req.truth,
             "owner_group_id": owner,
+            // OQ-8 (a): the override that admitted a claim the world group
+            // does not own is part of the record, not only of the check.
+            "allow_owned": req.allow_owned,
             "author": author,
             "reason": req.reason,
             "edges_moved": edges_moved,
