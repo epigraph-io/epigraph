@@ -1767,7 +1767,7 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
 }
 
 // =====================================================================
-// T11. A custodian's relief from the cross-human scope is audited.
+// T11. A custodian is never relieved on an application session (OQ-1 (b)).
 // =====================================================================
 
 /// Arm the operator binding as the maintenance role would.
@@ -1803,113 +1803,46 @@ where
     Ok(id)
 }
 
-async fn relief_events(pool: &PgPool) -> Vec<(Option<Uuid>, String, Option<String>)> {
-    sqlx::query_as(
-        "SELECT agent_id, details->>'check', details->>'assignment_id' FROM security_events \
-          WHERE event_type = 'platform.custodial_exempt' ORDER BY created_at, id",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("relief events")
-}
-
-/// Once armed, a principal that holds the custodian role is relieved of the
-/// cross-human scope (OPL02) on an application session, and the relief is one
-/// `platform.custodial_exempt` row naming the assignment and the check. A
-/// privileged session's relief is not audited (it is the operator's own
-/// login); a non-custodian is refused OPL02 and leaves nothing. (Every relief
-/// POINT, the dedup and the clock: `every_relief_point_is_audited`.)
-///
-/// Verified to fail: the relief's audit INSERT removed -> no event; the
-/// bypass arm made to audit too -> a second event; the relief keyed on
-/// `epigraph_bypass()` only (OQ-1 (b)) -> the custodian is refused OPL02.
-/// NOT caught behaviourally: `epigraph_require_writer_scope` left STABLE.
-/// Measured on the test cluster, a STABLE plpgsql function that calls a
-/// VOLATILE one which INSERTs does not error; `schema_contract.rs` pins the
-/// `provolatile` of the three checks instead.
-#[sqlx::test(migrations = "../../migrations")]
-async fn custodial_relief_is_audited_with_the_assignment(pool: PgPool) {
-    let (a, _) = fixture::seed_human_operator(&pool, "custodian-a").await;
-    let (b, bg) = fixture::seed_human_operator(&pool, "human-b").await;
-    let (c, cg) = fixture::seed_human_operator(&pool, "human-c").await;
-    let assignment = fixture::make_custodian(&pool, a).await;
-    arm(&pool).await;
-
-    let crossed = as_app(&pool, Some(a), &[bg], |mut conn| async move {
-        let r = insert_claim(&mut *conn, a, bg).await;
-        (conn, r)
-    })
-    .await;
+/// `Err` with SQLSTATE `OPL02` whose message carries `fragment`: the check
+/// that refused is the one named, not an earlier one.
+fn assert_opl02_by<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>, fragment: &str, what: &str) {
+    assert_code(r, "OPL02", what);
+    let text = r.as_ref().expect_err("refused").to_string();
     assert!(
-        crossed.is_ok(),
-        "a custodian writes into a group its human does not write: {crossed:?}"
+        text.contains(fragment),
+        "{what}: expected the refusal to say {fragment:?}, got {text}"
     );
-    assert_eq!(
-        relief_events(&pool).await,
-        vec![(
-            Some(a),
-            "writer_scope".to_string(),
-            Some(assignment.to_string())
-        )],
-        "exactly one relief row, naming the assignment"
-    );
-
-    // A privileged session's relief is not a custodial act.
-    insert_claim(&pool, a, bg)
-        .await
-        .expect("the superuser writes A's claim into B's group");
-    assert_eq!(relief_events(&pool).await.len(), 1, "no row for bypass");
-
-    // A non-custodian is refused, and leaves nothing.
-    let refused = as_app(&pool, Some(c), &[cg, bg], |mut conn| async move {
-        let r = insert_claim(&mut *conn, c, bg).await;
-        (conn, r)
-    })
-    .await;
-    assert_code(&refused, "OPL02", "a human who is no custodian");
-    assert_eq!(relief_events(&pool).await.len(), 1, "and leaves no row");
-    let _ = b;
 }
 
-/// `platform.custodial_exempt` rows of `check` naming `assignment`.
-async fn reliefs(pool: &PgPool, check: &str, assignment: Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM security_events \
-          WHERE event_type = 'platform.custodial_exempt' AND details->>'check' = $1 \
-            AND details->>'assignment_id' = $2::text",
-    )
-    .bind(check)
-    .bind(assignment)
-    .fetch_one(pool)
-    .await
-    .expect("reliefs")
-}
-
-/// EVERY one of 122's five relief points audits the custodian's relief, once
-/// per transaction per check and subjects (reviews TST-MTC-2 and TST-MTC-3):
-/// the claims-path writer scope; a claim attributed to another human's live
-/// agent (`attribution`); a fresh claim naming another human's RETIRED
-/// identity with the valve open (`attribution_retired`: the only place it
-/// relieves, since the binding check that follows refuses a retired author
-/// otherwise); a re-attribution (`reattribute`); and the membership door
-/// (`operator_scope`), here through the request path's own direct call. The
-/// request path's pre-check and the trigger in ONE transaction leave one row;
-/// a second transaction leaves a second. A non-custodian's direct call is
-/// refused and records nothing. And the role is read at the statement's
-/// clock: inside one open transaction, a write after the assignment's
-/// `valid_to` is refused (review SEC-MTC-5 (a)).
+/// Operator ruling OQ-1 (b): the custodial relief from the cross-human scope
+/// (OPL02) is `epigraph_bypass()` ONLY, the maintenance DSN on which the
+/// audited `epigraph-operator custodial-supersede` runs. A principal that
+/// HOLDS role:platform-custodian is relieved of nothing on an application
+/// session: at each of 122's five relief points it is refused exactly as any
+/// other human is. Holding is not using (DESIGN 6.1a): the app-settable
+/// principal stamp never carries admin power across humans.
 ///
-/// Verified to fail: the audit INSERT restricted to `writer_scope` -> the
-/// other four checks leave no row; the dedup's NOT EXISTS removed -> the
-/// pre-check + write transaction leaves two; the relief reading `now()`
-/// instead of `clock_timestamp()` -> the write after `valid_to` lands.
+/// The five points, each reached on its OWN check (the message names it):
+/// the claims-path writer scope (into another human's group); the attribution
+/// arm (in the custodian's own group, a claim attributed to another human's
+/// live agent); the retired-attribution arm (the same with another human's
+/// RETIRED identity, valve open, so the binding check is out of the way); a
+/// re-attribution (its own claim handed to another human's agent); and the
+/// membership door (`epigraph_require_operator_scope`, as the request path
+/// calls it). A privileged session is relieved at each of the five, and a
+/// custodian on an application session leaves no `platform.` relief row.
+///
+/// Verified to fail: `epigraph_operator_scope_exempt()` given back 122's
+/// principal arm (`OR epigraph_is_instance_admin(epigraph_principal_id())`,
+/// i.e. OQ-1 (a)) -> the custodian's writer-scope write lands (the five
+/// points all read that one function).
 #[sqlx::test(migrations = "../../migrations")]
-async fn every_relief_point_is_audited(pool: PgPool) {
+async fn a_custodian_is_never_relieved_on_an_application_session(pool: PgPool) {
     let (k, kg) = fixture::seed_human_operator(&pool, "custodian-k").await;
     let (a, ag) = fixture::seed_human_operator(&pool, "human-a").await;
-    let (c, cg) = fixture::seed_human_operator(&pool, "human-c").await;
     let (x, _) = fixture::seed_agent_with_group(&pool, "a-live-x").await;
     let (y, _) = fixture::seed_agent_with_group(&pool, "c-live-y").await;
+    let (c, _) = fixture::seed_human_operator(&pool, "human-c").await;
     let (l, _) = fixture::seed_agent_with_group(&pool, "a-retired-l").await;
     {
         let mut conn = pool.acquire().await.expect("acquire");
@@ -1923,54 +1856,64 @@ async fn every_relief_point_is_audited(pool: PgPool) {
             .await
             .expect("L retired to A");
     }
-    let asg = fixture::make_custodian(&pool, k).await;
+    fixture::make_custodian(&pool, k).await;
+    let k_own = insert_claim(&pool, k, kg).await.expect("K's own claim");
     arm(&pool).await;
+    let holds: bool = sqlx::query_scalar(
+        "SELECT public.epigraph_live_role_assignment($1, 'role:platform-custodian', now()) \
+                IS NOT NULL",
+    )
+    .bind(k)
+    .fetch_one(&pool)
+    .await
+    .expect("holds");
+    assert!(holds, "CALIBRATION: K holds the custodian role");
     let k_sets = [kg, ag];
 
-    // writer_scope: K's own claim in A's group.
-    let own = as_app(&pool, Some(k), &k_sets, |mut conn| async move {
+    // CALIBRATION: K writes its own group on an application session.
+    as_app(&pool, Some(k), &k_sets, |mut conn| async move {
+        let r = insert_claim(&mut *conn, k, kg).await;
+        (conn, r)
+    })
+    .await
+    .expect("K writes its own group");
+
+    // 1. writer_scope: K's own claim in A's group.
+    let r = as_app(&pool, Some(k), &k_sets, |mut conn| async move {
         let r = insert_claim(&mut *conn, k, ag).await;
         (conn, r)
     })
-    .await
-    .expect("K writes into A's group");
-    assert_eq!(reliefs(&pool, "writer_scope", asg).await, 1, "writer_scope");
+    .await;
+    assert_opl02_by(&r, "holds no writer/admin membership", "writer_scope");
 
-    // attribution: a claim attributed to A's live agent X.
-    as_app(&pool, Some(k), &k_sets, |mut conn| async move {
-        let r = insert_claim(&mut *conn, x, ag).await;
+    // 2. attribution: in K's own group, a claim attributed to A's live X.
+    let r = as_app(&pool, Some(k), &k_sets, |mut conn| async move {
+        let r = insert_claim(&mut *conn, x, kg).await;
         (conn, r)
     })
-    .await
-    .expect("K writes a claim attributed to X");
-    assert_eq!(reliefs(&pool, "attribution", asg).await, 1, "attribution");
+    .await;
+    assert_opl02_by(&r, "writes a claim attributed to", "attribution");
 
-    // attribution_retired: a fresh claim naming A's retired identity L, with
-    // the valve open (it relieves the binding check, OPL01, only).
-    as_app(&pool, Some(k), &k_sets, |mut conn| async move {
+    // 3. attribution_retired: the same with A's retired L, valve open.
+    let r = as_app(&pool, Some(k), &k_sets, |mut conn| async move {
         sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', 'off', false)")
             .execute(&mut *conn)
             .await
             .expect("open the valve");
-        let r = insert_claim(&mut *conn, l, ag).await;
+        let r = insert_claim(&mut *conn, l, kg).await;
         sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
             .execute(&mut *conn)
             .await
             .expect("close the valve");
         (conn, r)
     })
-    .await
-    .expect("K writes a claim naming the retired L, valve open");
-    assert_eq!(
-        reliefs(&pool, "attribution_retired", asg).await,
-        1,
-        "attribution_retired"
-    );
+    .await;
+    assert_opl02_by(&r, "writes a claim attributed to", "attribution_retired");
 
-    // reattribute: K's own claim handed to X.
-    let handed = as_app(&pool, Some(k), &k_sets, |mut conn| async move {
+    // 4. reattribute: K's own claim handed to A's X.
+    let r = as_app(&pool, Some(k), &k_sets, |mut conn| async move {
         let r = sqlx::query("UPDATE claims SET agent_id = $2 WHERE id = $1")
-            .bind(own)
+            .bind(k_own)
             .bind(x)
             .execute(&mut *conn)
             .await
@@ -1978,88 +1921,78 @@ async fn every_relief_point_is_audited(pool: PgPool) {
         (conn, r)
     })
     .await;
-    assert_eq!(handed.expect("K re-attributes"), 1);
-    assert_eq!(reliefs(&pool, "reattribute", asg).await, 1, "reattribute");
+    assert_opl02_by(&r, "does not re-attribute", "reattribute");
 
-    // operator_scope: C's live agent Y named on a row of A's group, through
-    // the membership door's function as the request path calls it.
-    as_app(&pool, Some(k), &k_sets, |mut conn| async move {
+    // 5. operator_scope: C's live Y named on a row of A's group, through the
+    //    membership door's function as the request path calls it.
+    let r = as_app(&pool, Some(k), &k_sets, |mut conn| async move {
         let r = sqlx::query("SELECT public.epigraph_require_operator_scope($1, $2)")
             .bind(y)
             .bind(ag)
             .execute(&mut *conn)
-            .await;
+            .await
+            .map(|_| ());
         (conn, r)
     })
+    .await;
+    assert_opl02_by(&r, "a linked agent writes only where", "operator_scope");
+
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(k_own)
+        .fetch_one(&pool)
+        .await
+        .expect("author");
+    assert_eq!(author, k, "K's claim is still K's");
+    let platform_reliefs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE lower(event_type) LIKE 'platform.%' AND event_type NOT IN \
+                ('platform.role_granted', 'platform.role_ended')",
+    )
+    .fetch_one(&pool)
     .await
-    .expect("K is relieved at the membership door");
-    assert_eq!(
-        reliefs(&pool, "operator_scope", asg).await,
-        1,
-        "operator_scope"
-    );
+    .expect("count");
+    assert_eq!(platform_reliefs, 0, "no relief row: nothing was relieved");
 
-    // The dedup: the pre-check and the write in ONE transaction, one row; a
-    // second transaction, a second row.
-    let before = reliefs(&pool, "writer_scope", asg).await;
-    for round in 1..=2_i64 {
-        as_app(&pool, Some(k), &k_sets, |mut conn| async move {
-            let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
-            sqlx::query("SELECT public.epigraph_require_writer_scope($1, $2)")
-                .bind(k)
-                .bind(ag)
-                .execute(&mut *tx)
-                .await
-                .expect("the pre-check");
-            insert_claim(&mut *tx, k, ag).await.expect("the write");
-            insert_claim(&mut *tx, k, ag)
-                .await
-                .expect("a second row, same subjects");
-            tx.commit().await.expect("commit");
-            (conn, ())
-        })
-        .await;
-        assert_eq!(
-            reliefs(&pool, "writer_scope", asg).await,
-            before + round,
-            "one row per transaction (round {round})"
-        );
-    }
-
-    // A non-custodian's direct call: refused, nothing recorded.
-    let total = relief_events(&pool).await.len();
-    let refused = as_app(&pool, Some(c), &[cg], |mut conn| async move {
-        let r = sqlx::query("SELECT public.epigraph_require_writer_scope($1, $2)")
-            .bind(c)
+    // The custodial path: a PRIVILEGED session is relieved at each point.
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        insert_claim(&mut *conn, k, ag)
+            .await
+            .expect("bypass: writer_scope");
+        sqlx::query("SELECT public.epigraph_require_attributable($1, $2, false)")
+            .bind(x)
+            .bind(k)
+            .execute(&mut *conn)
+            .await
+            .expect("bypass: attribution");
+        sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', 'off', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("open the valve");
+        sqlx::query("SELECT public.epigraph_require_attributable($1, $2, false)")
+            .bind(l)
+            .bind(k)
+            .execute(&mut *conn)
+            .await
+            .expect("bypass: attribution_retired");
+        sqlx::query("SELECT set_config('epigraph.operator_link_enforcement', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("close the valve");
+        sqlx::query("UPDATE claims SET agent_id = $2 WHERE id = $1")
+            .bind(k_own)
+            .bind(x)
+            .execute(&mut *conn)
+            .await
+            .expect("bypass: reattribute");
+        sqlx::query("SELECT public.epigraph_require_operator_scope($1, $2)")
+            .bind(y)
             .bind(ag)
             .execute(&mut *conn)
-            .await;
-        (conn, r)
-    })
-    .await;
-    assert_code(&refused, "OPL02", "a non-custodian's direct check");
-    assert_eq!(relief_events(&pool).await.len(), total, "no row for it");
-
-    // The clock: a time-bounded custodian, inside ONE transaction that
-    // outlives its valid_to.
-    let (t, tg) = fixture::seed_human_operator(&pool, "custodian-t").await;
-    maint_insert(&pool, CUSTODIAN, t, "0", Some("2 seconds"), Some(k))
-        .await
-        .expect("T holds for two seconds");
-    let (first, second) = as_app(&pool, Some(t), &[tg, ag], |mut conn| async move {
-        let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
-        let first = insert_claim(&mut *tx, t, ag).await;
-        sqlx::query("SELECT pg_sleep(2.5)")
-            .execute(&mut *tx)
             .await
-            .expect("sleep past valid_to");
-        let second = insert_claim(&mut *tx, t, ag).await;
-        drop(tx);
-        (conn, (first, second))
+            .expect("bypass: operator_scope");
+        (conn, ())
     })
     .await;
-    assert!(first.is_ok(), "inside the window: {first:?}");
-    assert_code(&second, "OPL02", "past valid_to, in the same transaction");
 }
 
 // =====================================================================
@@ -2415,8 +2348,8 @@ async fn functiondefs(pool: &PgPool) -> Vec<String> {
 /// belt stamps its row), while a custodian still live keeps it.
 ///
 /// Verified to fail: the undo's re-application of
-/// `epigraph_require_writer_scope` removed -> its 123 body (VOLATILE, the
-/// audited relief) stays and differs; 123's role-end mirror removed (and the
+/// `epigraph_operator_scope_exempt` removed -> its 123 body (`epigraph_bypass()`
+/// alone, OQ-1 (b)) stays and differs; 123's role-end mirror removed (and the
 /// undo's belt with it) -> the ended custodian is an instance admin again;
 /// the undo's belt alone removed -> the skipped agent is one again. (Each of
 /// the mirror and the belt alone is covered by the other here; the mirror
@@ -2483,7 +2416,7 @@ async fn the_rollback_restores_122_and_083(pool: PgPool) {
     }
     let left: Vec<String> = sqlx::query_scalar(
         "SELECT proname::text FROM pg_proc WHERE pronamespace = 'public'::regnamespace \
-            AND proname IN ('epigraph_custodial_relief', 'epigraph_holds_role', \
+            AND proname IN ('epigraph_platform_audit', 'epigraph_holds_role', \
                             'epigraph_role_assignment_for', 'epigraph_grant_role', \
                             'epigraph_record_custodial_act', 'epigraph_live_role_assignment', \
                             'epigraph_instance_admins_frozen')",

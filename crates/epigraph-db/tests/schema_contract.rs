@@ -1462,13 +1462,10 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
             "s",
             false,
         ),
-        // VOLATILE since migration 123: its custodial relief writes the
-        // `platform.custodial_exempt` audit row, which a STABLE function must
-        // not (PostgreSQL does not refuse it, so this pin is the guard).
         (
             "epigraph_require_operator_scope",
             "public.epigraph_require_operator_scope(uuid, uuid)",
-            "v",
+            "s",
             true,
         ),
         (
@@ -1501,22 +1498,16 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
             "s",
             true,
         ),
-        // VOLATILE since migration 123: its custodial relief writes the
-        // `platform.custodial_exempt` audit row, which a STABLE function must
-        // not (PostgreSQL does not refuse it, so this pin is the guard).
         (
             "epigraph_require_writer_scope",
             "public.epigraph_require_writer_scope(uuid, uuid)",
-            "v",
+            "s",
             true,
         ),
-        // VOLATILE since migration 123: its custodial relief writes the
-        // `platform.custodial_exempt` audit row, which a STABLE function must
-        // not (PostgreSQL does not refuse it, so this pin is the guard).
         (
             "epigraph_require_attributable",
             "public.epigraph_require_attributable(uuid, uuid, boolean)",
-            "v",
+            "s",
             true,
         ),
         (
@@ -1671,8 +1662,8 @@ async fn migration_122_binding_trigger_fires_after_the_tenancy_fill(pool: PgPool
 /// `epigraph_definer_bypass()`, or writes a `platform.` audit row the
 /// restrictive policy admits only from such a frame), carries an explicit ACL
 /// that excludes PUBLIC, and grants `epigraph_app` exactly the three
-/// subject-bound readers. The relief and the act recorder write, so they are
-/// VOLATILE; the readers are STABLE. The owner is pinned here because the
+/// subject-bound readers. The act recorder writes, so it is VOLATILE; the
+/// readers are STABLE. The owner is pinned here because the
 /// harness migrates as a superuser, so a silently no-opped `OWNER TO` would
 /// still pass every behavioural test.
 #[sqlx::test(migrations = "../../migrations")]
@@ -1759,12 +1750,6 @@ async fn migration_123_custodian_definers_are_owned_and_granted(pool: PgPool) {
         (
             "epigraph_human_operators_mirror_instance_admins",
             "public.epigraph_human_operators_mirror_instance_admins()",
-            "v",
-            false,
-        ),
-        (
-            "epigraph_custodial_relief",
-            "public.epigraph_custodial_relief(text, uuid, uuid, uuid)",
             "v",
             false,
         ),

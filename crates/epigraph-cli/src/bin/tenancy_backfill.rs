@@ -1675,7 +1675,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // readers find no assignment (every custodian reads as none: authority
     // fails CLOSED, loud), the guards and audit trigger are refused their
     // reads and `platform.` rows (every grant and end fails, loud), and the
-    // relief and the custodial-act recorder are refused their audit INSERT.
+    // custodial-act recorder is refused its audit INSERT.
     // `epigraph_is_instance_admin` (83) and the 122 checks 123 re-bodies keep
     // their entries above.
     ("epigraph_platform_roles_guard_update", 123),
@@ -1692,7 +1692,6 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_refuse_role_node_subject", 123),
     ("epigraph_instance_admins_frozen", 123),
     ("epigraph_human_operators_mirror_instance_admins", 123),
-    ("epigraph_custodial_relief", 123),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2011,8 +2010,8 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         ),
         // 123 (the custodian role): the request path reads its OWN role
         // (subject-bound readers) and the audit trail; granting, ending,
-        // recording a custodial act, the unbound roster read and the audited
-        // relief are maintenance acts the request DSN must never call.
+        // recording a custodial act and the unbound roster read are
+        // maintenance acts the request DSN must never call.
         (
             "epigraph_live_role_assignment",
             "public.epigraph_live_role_assignment(uuid, text, timestamp with time zone)",
@@ -2047,11 +2046,6 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_platform_audit",
             "public.epigraph_platform_audit(timestamp with time zone, integer)",
             true,
-        ),
-        (
-            "epigraph_custodial_relief",
-            "public.epigraph_custodial_relief(text, uuid, uuid, uuid)",
-            false,
         ),
     ];
 

@@ -304,7 +304,8 @@ fn code_of<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>) -> Option<String> {
 /// in B's group, a membership that predates arming does not let the agent write
 /// a claim there, and the agent's own personal group is not its operator's
 /// either. Measured on the APPLICATION ROLE (a privileged session is exempt).
-/// An instance-admin principal crosses groups.
+/// An instance-admin (custodian) principal on an application session does not
+/// cross groups (OQ-1 (b)); a privileged session does.
 ///
 /// Verified to fail: the `PERFORM ... epigraph_require_writer_scope` lines
 /// removed from the claims trigger -> the write into B's group lands; the
@@ -393,8 +394,10 @@ async fn a_linked_agent_writes_only_where_its_own_operator_writes(pool: PgPool) 
     })
     .await;
 
-    // An instance-admin principal (since 123: a platform custodian) crosses
-    // groups.
+    // An instance-admin principal (since 123: a principal holding the
+    // platform custodian role) crosses NOTHING on an application session
+    // (operator ruling OQ-1 (b)): the custodial relief is the privileged
+    // session's alone.
     let (admin, _) = fixture::seed_agent_with_group(&pool, "instance-admin").await;
     fixture::make_custodian(&pool, admin).await;
     let crossed = as_app_stamped(&pool, admin, &[b_group], |mut conn| async move {
@@ -402,7 +405,14 @@ async fn a_linked_agent_writes_only_where_its_own_operator_writes(pool: PgPool) 
         (conn, r)
     })
     .await;
-    assert!(crossed.is_ok(), "admin access crosses groups: {crossed:?}");
+    assert_eq!(
+        code_of(&crossed).as_deref(),
+        Some("OPL02"),
+        "a custodian principal on an application session crosses no group: {crossed:?}"
+    );
+    insert_claim(&pool, x, b_group)
+        .await
+        .expect("a privileged session (the custodial path) crosses groups");
 }
 
 /// The valve's transport: `epigraph.operator_link_enforcement = 'off'` lifts
@@ -1398,8 +1408,8 @@ async fn supersede_on(
 /// author's binding; before this, the author arm refused every one (OPL01).
 /// Nothing else is relieved: a fresh claim, or a posed second successor,
 /// naming an unbound author is still OPL01 on that session, and an
-/// instance-admin PRINCIPAL (an application-session stamp) supersedes a
-/// retired-linked author's world claim but not an unlinked one's.
+/// instance-admin (custodian) PRINCIPAL, an application-session stamp,
+/// supersedes neither kind of world claim (OPL02, operator ruling OQ-1 (b)).
 ///
 /// Verified to fail: the author arm's `IF NOT (v_inherited AND
 /// public.epigraph_bypass())` guard removed (require_bound_author always) ->
@@ -1491,11 +1501,13 @@ async fn a_privileged_session_revises_the_platform_corpus_once_armed(pool: PgPoo
         "the retired identity as its own principal: {as_itself:?}"
     );
 
-    // An instance-admin principal: a retired-linked author's corpus claim,
-    // yes; an unlinked author's, no (OPL01, documented). The stamp lists the
-    // world group as writable so row security admits the retire half and the
-    // trigger alone decides (whether a real admin viewer carries it is the
-    // tenancy layer's question, not this one's).
+    // An instance-admin (custodian) principal on an APPLICATION session
+    // revises no corpus claim, retired-linked or unlinked (operator ruling
+    // OQ-1 (b)): it does not write the world group, and the custodial relief
+    // is the privileged session's alone (the maintenance DSN, where
+    // `epigraph-operator custodial-supersede` records the act). The stamp
+    // lists the world group as writable so row security admits the retire
+    // half and the trigger alone decides.
     let admin = |old: Uuid| {
         let pool = pool.clone();
         async move {
@@ -1506,14 +1518,16 @@ async fn a_privileged_session_revises_the_platform_corpus_once_armed(pool: PgPoo
             .await
         }
     };
-    admin(c_admin_ret)
-        .await
-        .expect("an instance admin revises a retired-linked author's corpus claim");
-    let r = admin(c_admin_unl).await;
-    assert!(
-        matches!(r, Err(epigraph_db::DbError::OperatorLinkRequired { .. })),
-        "an instance admin and an unlinked author's corpus claim: {r:?}"
-    );
+    for (old, what) in [
+        (c_admin_ret, "a retired-linked author's corpus claim"),
+        (c_admin_unl, "an unlinked author's corpus claim"),
+    ] {
+        let r = admin(old).await;
+        assert!(
+            matches!(r, Err(epigraph_db::DbError::OperatorScopeRefused { .. })),
+            "a custodian principal on an application session and {what}: {r:?}"
+        );
+    }
 
     // Round 3 COR-R3-6: the binding relief is the PRIVILEGED session's alone,
     // not every OPL02-exempt session's. Since 123 a retired identity cannot be
@@ -2534,23 +2548,28 @@ async fn update_as(
 }
 
 /// Delta review round 4 COR-R4-1 / SEC-R4-2 (migration 123): the re-open and
-/// lineage relief is the PRIVILEGED session's alone. A custodian principal
-/// (another human's, on an application session) re-opening a retired claim is
-/// checked exactly as the same principal's INSERT of that row would be, and
-/// meets the lineage guard like any application session; its custodial relief
-/// covers the cross-human SCOPE (audited), never a fresh current claim under a
-/// retired identity. An unbound principal is refused as before. A privileged
-/// session still re-opens anything.
+/// lineage relief is the PRIVILEGED session's alone. A re-open on an
+/// application session is checked exactly as the same principal's INSERT of
+/// that row would be: A's own live agent re-opening a superseded restatement
+/// is OPL01 (a fresh current claim under a retired identity). A principal
+/// holding the custodian role (another human, here also a writer of A's group)
+/// is relieved of nothing on an application session (operator ruling OQ-1
+/// (b)): its re-open is the cross-human attribution refusal (OPL02), its
+/// revision of a corpus claim is OPL02, and it meets the lineage guard like
+/// any application session. An unbound principal is refused as before. A
+/// privileged session still re-opens anything.
 ///
 /// The lineage guard holds whatever else the UPDATE changes: clearing or
 /// re-pointing an inherited successor's `supersedes` while re-attributing it
 /// in the SAME statement is the lineage guard's OPL02 too (review COR-MTC-2).
 ///
-/// Verified to fail: the UPDATE branch's early return restored to
-/// `epigraph_operator_scope_exempt()` (round-4 mutation M4, which left 122's
-/// suite 27/27 green) -> the custodian's re-open and its lineage clearing land;
-/// the lineage guard moved back inside the same-author branch -> the clear and
-/// the re-point that re-attribute in the same statement land.
+/// Verified to fail: the lineage guard moved back inside the same-author
+/// branch -> the clear and the re-point that re-attribute in the same
+/// statement land; the re-open's checked-as-an-INSERT branch skipped (the
+/// UPDATE branch returning for every same-author re-open) -> X's re-open of S1
+/// lands. Round-4 mutation M4 (the early return keyed on
+/// `epigraph_operator_scope_exempt()`) is EQUIVALENT under OQ-1 (b): that
+/// function is `epigraph_bypass()` alone, which the early return already reads.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
     let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
@@ -2570,6 +2589,17 @@ async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
             .expect("the legacy identity's retired tie to A");
     }
     fixture::make_custodian(&pool, b).await;
+    // B also writes A's group, so B's refusals below are the cross-human
+    // checks, not the group scope.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(a_group)
+    .bind(b)
+    .execute(&pool)
+    .await
+    .expect("B writes A's group");
     assert!(arm(&pool).await, "the database arms");
 
     // X restates P once (S1), then retires S1; a PRIVILEGED session restates
@@ -2604,17 +2634,28 @@ async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("a privileged session restates P (S2)");
-    // The superseded corpus claim: retired, with a current successor.
-    let corpus_next = as_app_stamped(&pool, b, &[b_group, Uuid::nil()], |mut conn| async move {
+    // The custodian on an application session revises no corpus claim
+    // (OQ-1 (b))...
+    let corpus_by_b = as_app_stamped(&pool, b, &[b_group, Uuid::nil()], |mut conn| async move {
         let r = supersede_on(&mut conn, corpus).await;
         (conn, r)
     })
     .await;
     assert!(
-        corpus_next.is_ok(),
-        "the custodian revises the corpus claim, so it is retired with a current \
-         successor: {corpus_next:?}"
+        matches!(
+            corpus_by_b,
+            Err(epigraph_db::DbError::OperatorScopeRefused { .. })
+        ),
+        "a custodian principal revising a corpus claim on an application session: \
+         {corpus_by_b:?}"
     );
+    // ...the privileged session does: the superseded corpus claim is retired,
+    // with a current successor.
+    let mut conn = pool.acquire().await.expect("acquire");
+    supersede_on(&mut conn, corpus)
+        .await
+        .expect("a privileged session revises the corpus claim");
+    drop(conn);
     sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
         .bind(corpus)
         .execute(&pool)
@@ -2625,14 +2666,26 @@ async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
     const CLEAR: &str = "UPDATE claims SET supersedes = NULL WHERE id = $1";
     let custodian = [a_group, b_group, Uuid::nil()];
 
-    // The custodian re-opens S1 while S2 is P's current successor: checked as
+    // A's own X re-opens S1 while S2 is P's current successor: checked as
     // its INSERT would be, OPL01 (a fresh current claim under the retired
     // identity).
     assert_opl01(
-        update_as(&pool, b, &custodian, REOPEN, s1)
+        update_as(&pool, x, &[a_group], REOPEN, s1)
             .await
             .map(|_| s1),
-        "a custodian re-opening S1 while S2 is current",
+        "X re-opening S1 while S2 is current",
+    );
+    // The custodian re-opens S1: the cross-human attribution refusal, OPL02.
+    let reopened = update_as(&pool, b, &custodian, REOPEN, s1).await;
+    assert_eq!(
+        code_of(&reopened).as_deref(),
+        Some("OPL02"),
+        "a custodian re-opening another human's retired identity's S1: {reopened:?}"
+    );
+    let text = reopened.expect_err("refused").to_string();
+    assert!(
+        text.contains("writes a claim attributed to"),
+        "refused by the attribution check: {text}"
     );
     // ...and the custodian clears the current inherited successor's lineage:
     // the lineage guard, OPL02.
@@ -2641,6 +2694,11 @@ async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
         code_of(&cleared).as_deref(),
         Some("OPL02"),
         "a custodian clearing an inherited successor's lineage: {cleared:?}"
+    );
+    let text = cleared.expect_err("refused").to_string();
+    assert!(
+        text.contains("records that it supersedes"),
+        "refused by the lineage guard: {text}"
     );
     // ...and the same lineage change folded into a re-attribution.
     for (sql, what) in [
@@ -3010,8 +3068,9 @@ async fn a_retired_identity_is_restated_at_most_once(pool: PgPool) {
 /// -> S3, each retired by the next) and then re-opens versions: newest-first
 /// (S2 while S3 is current) and skipping one (S1 while S2 is retired and S3
 /// current) are both refused (OPL01: it inherits nothing, and the retired
-/// identity is no bound author), so the chain keeps ONE current claim. The
-/// custodian's re-open of a mid-chain version is refused the same way. Once
+/// identity is no bound author), so the chain keeps ONE current claim. A
+/// custodian's re-open of a mid-chain version with its own words, on an
+/// application session, is the cross-human refusal (OPL02, OQ-1 (b)). Once
 /// the head is retired, re-opening its predecessor is the ordinary undo and
 /// still works; re-opening the old head while that predecessor is current is
 /// refused (an ancestor is current). A privileged session re-opens anything.
@@ -3035,6 +3094,15 @@ async fn a_reopen_never_resurrects_a_superseded_restatement(pool: PgPool) {
             .expect("the legacy identity's retired tie to A");
     }
     fixture::make_custodian(&pool, b).await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(a_group)
+    .bind(b)
+    .execute(&pool)
+    .await
+    .expect("B writes A's group");
     assert!(arm(&pool).await, "the database arms");
     let ga = [a_group];
     let mut chain = vec![p];
@@ -3079,17 +3147,29 @@ async fn a_reopen_never_resurrects_a_superseded_restatement(pool: PgPool) {
             &format!("X re-opening {what}"),
         );
     }
-    assert_opl01(
-        update_as(
-            &pool,
-            b,
-            &[a_group, b_group],
-            "UPDATE claims SET is_current = true, content = 'custodian words' WHERE id = $1",
-            s2,
-        )
-        .await
-        .map(|_| s2),
-        "the custodian re-opening a mid-chain version with its own words",
+    // The custodian (another human that also writes A's group) re-opening a
+    // mid-chain version with its own words: relieved of nothing on an
+    // application session (operator ruling OQ-1 (b)), so it is the
+    // cross-human attribution refusal.
+    let by_custodian = update_as(
+        &pool,
+        b,
+        &[a_group, b_group],
+        "UPDATE claims SET is_current = true, content = 'custodian words' WHERE id = $1",
+        s2,
+    )
+    .await;
+    assert_eq!(
+        code_of(&by_custodian).as_deref(),
+        Some("OPL02"),
+        "the custodian re-opening a mid-chain version with its own words: {by_custodian:?}"
+    );
+    assert!(
+        by_custodian
+            .expect_err("refused")
+            .to_string()
+            .contains("writes a claim attributed to"),
+        "refused by the attribution check"
     );
     assert_eq!(current_in_chain().await, 1, "still one current version");
 

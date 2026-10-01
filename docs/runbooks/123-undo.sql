@@ -25,10 +25,12 @@
 --      `operator_links` (the freeze, the revoke mirror, the role-node guards).
 --   3. Re-applies, VERBATIM, 083's `epigraph_is_instance_admin` and 122's
 --      `epigraph_operator_scope_exempt`, `epigraph_require_operator_scope`,
---      `epigraph_require_writer_scope`, `epigraph_require_attributable` (STABLE
---      again) and `epigraph_claims_require_operator_binding`: the round-4 fixes
+--      `epigraph_require_writer_scope`, `epigraph_require_attributable` and
+--      `epigraph_claims_require_operator_binding`: the round-4 fixes
 --      (self-supersede refusal, restate-at-most-once, the privileged-only
---      re-open relief) and the audited relief revert with them.
+--      re-open relief) revert with them, and so does OQ-1 (b): under 122's
+--      `epigraph_operator_scope_exempt` an instance-admin PRINCIPAL is
+--      relieved of the cross-human scope on an application session again.
 --      `custodian_role.rs::the_rollback_restores_122_and_083` pins each body
 --      byte-equal to a database at 122.
 --   4. Drops the `platform.` restrictive policy on `security_events`, the
@@ -329,7 +331,6 @@ DROP TRIGGER IF EXISTS role_assignments_audit ON public.role_assignments;
 DROP TRIGGER IF EXISTS role_assignments_guard_insert ON public.role_assignments;
 DROP TRIGGER IF EXISTS role_assignments_guard_update ON public.role_assignments;
 DROP TRIGGER IF EXISTS platform_roles_guard_update ON public.platform_roles;
-DROP FUNCTION IF EXISTS public.epigraph_custodial_relief(text, uuid, uuid, uuid);
 DROP FUNCTION IF EXISTS public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb);
 DROP FUNCTION IF EXISTS public.epigraph_platform_audit(timestamptz, integer);
 DROP FUNCTION IF EXISTS public.epigraph_end_role_assignment(uuid, text);
