@@ -1588,6 +1588,20 @@ impl AgentRepository {
         )
     }
 
+    /// [`Self::author_binding`] for a caller holding a pool (a read through
+    /// the same SECURITY DEFINER function).
+    ///
+    /// # Errors
+    /// As [`Self::author_binding`], plus `DbError::ConnectionFailed` if no
+    /// connection can be acquired.
+    pub async fn author_binding_pool(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::author_binding(&mut conn, agent_id).await
+    }
+
     /// Whether operator binding is enforced on THIS connection: the database
     /// is armed and the session's valve is not off (migration 122).
     ///

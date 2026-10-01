@@ -312,11 +312,7 @@ async fn refuse_human_http_signer(
     server: &EpiGraphMcpFull,
     agent_id: Uuid,
 ) -> Result<(), McpError> {
-    let binding = match server.pool.acquire().await {
-        Ok(mut conn) => AgentRepository::author_binding(&mut conn, agent_id).await,
-        Err(e) => Err(epigraph_db::DbError::from(e)),
-    };
-    match binding {
+    match AgentRepository::author_binding_pool(&server.pool, agent_id).await {
         Ok(b) if b.as_deref() == Some("human_operator") => {
             let reason = human_http_signer_reason(agent_id);
             tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
