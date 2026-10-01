@@ -1547,7 +1547,11 @@ valve). The valve relieves `OPL01` only (including the refusal of an
 unstamped application session); `OPL02` stays in force, including for an
 unbound writer (or another human's agent) that names a bound author or a
 retired identity tied to a human. Removing the arming row, or dropping the trigger, is a superuser DDL
-act on the migration DSN.
+act on the migration DSN. To remove migration 122's functions after step 8,
+first roll the MCP server back to its previous build. The new listener reads
+its signer's binding through a 122 function at startup and on every HTTP tool
+call, and fails closed without it: it refuses to start, and it refuses every
+call.
 
 No new environment variable is required; `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT`
 exists only as the emergency valve.

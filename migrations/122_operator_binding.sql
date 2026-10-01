@@ -247,7 +247,10 @@
 -- `operator_links_operator_is_human` and `operator_links_audit` before
 -- `human_operators` (the first trigger's body reads it through
 -- `epigraph_is_human_operator`). Drop `oauth_clients_reactivation_guard` and
--- its function too (section 1c).
+-- its function too (section 1c). Roll back first any process built against
+-- this file that reads its functions: the MCP HTTP listener checks its
+-- signer through `epigraph_author_binding` at startup and on every call, and
+-- fails closed without it.
 -- **Applied to a throwaway database only, NOT to any deployed database.**
 
 SET LOCAL lock_timeout = '3s';
