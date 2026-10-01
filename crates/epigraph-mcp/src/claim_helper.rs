@@ -256,15 +256,28 @@ pub async fn begin_author_stamped_tx<'p>(
 /// decision on legacy workflows. The system-agent stamp is unchanged for the
 /// rows these writes make.
 ///
+/// # The CALLER is bound before anything is written (migration 122)
+///
+/// The claims trigger sees only the system agent, which is bound once it is
+/// live-linked, whoever called. So this binds `caller` itself, on the stamped
+/// transaction it returns
+/// ([`epigraph_ingest_executor::require_caller_write_authority`]): once the
+/// database is armed an unbound caller is refused (`OPL01`), and a caller whose
+/// human does not write the group the system agent's rows land in is refused
+/// (`OPL02`), so another human's caller cannot write into the linked human's
+/// group through the shared identity. Both map to `INVALID_REQUEST`.
+///
 /// # Errors
 /// * `McpError::internal_error` if the system agent has no write authority (see
 ///   `system_agent_write_authority`) — a loud refusal, nothing written.
+/// * `INVALID_REQUEST` for the caller refusals above.
 /// * `McpError::internal_error` if this process was not built from a
 ///   [`epigraph_db::ScopedPool`], or if `BEGIN` / the GUC stamp fails. Never a
 ///   fallback to the unstamped pool.
 pub async fn begin_system_ingest_stamped_tx<'p>(
     server: &'p EpiGraphMcpFull,
     tool_name: &'static str,
+    caller: uuid::Uuid,
 ) -> Result<(uuid::Uuid, epigraph_db::ScopedTx<'p>), McpError> {
     let scoped = server.scoped.as_ref().ok_or_else(|| {
         tracing::error!(
@@ -299,7 +312,7 @@ pub async fn begin_system_ingest_stamped_tx<'p>(
             ))
         })?;
 
-    let tx = scoped.begin_as(&authority.viewer).await.map_err(|e| {
+    let mut tx = scoped.begin_as(&authority.viewer).await.map_err(|e| {
         tracing::error!(
             target: "tenancy.scoped_write",
             tool = tool_name,
@@ -310,6 +323,29 @@ pub async fn begin_system_ingest_stamped_tx<'p>(
         internal_error(format!(
             "{tool_name}: could not begin a system-agent-stamped transaction: {e}"
         ))
+    })?;
+
+    epigraph_ingest_executor::require_caller_write_authority(
+        &mut tx,
+        authority.agent_id,
+        Some(caller),
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            caller = %caller,
+            error = %e,
+            "workflow write refused: the caller may not write through the ingest system agent"
+        );
+        if e.is_write_authority_refusal() {
+            crate::errors::db_caller_error(e)
+        } else {
+            internal_error(format!(
+                "{tool_name}: could not check the caller's authority: {e}"
+            ))
+        }
     })?;
 
     Ok((authority.agent_id, tx))

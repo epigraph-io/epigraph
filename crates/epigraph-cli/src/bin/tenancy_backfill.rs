@@ -78,15 +78,66 @@
 //! deploy at 2 a.m."* `verify` therefore recomputes, prints offending ids, and
 //! exits non-zero on any residual. The boolean is reported, never trusted.
 //!
+//! # An author tied to an operator is stamped to the OPERATOR's group
+//!
+//! Operator binding (migration 122) ties every writing agent to one human
+//! operator through `operator_links`. The owner this binary stamps follows that
+//! tie: an author with a link of ANY state (live or retired) is stamped to the
+//! link's `operator_group_id`; only an author with no link falls back to its own
+//! personal group ([`owner_group_sql`]). The fallback is kept on purpose, so a
+//! run before the legacy authors are tied still declares every row, and
+//! `verify` still FAILS on any world-owned residue either way. Rows an earlier
+//! run already stamped to a linked author's own personal group are not world-
+//! owned, so this binary never revisits them: `verify` REPORTS them (never a
+//! failure), and `epigraph-operator reown-linked` moves them.
+//!
 //! Runtime `sqlx::query` / `query_scalar` throughout — never the compile-time
 //! macros — so no `.sqlx/` cache entry is needed and `SQLX_OFFLINE=true` builds.
 //!
+//! # Set-based, and bounded
+//!
+//! Each claims batch resolves the target group ONCE PER DISTINCT AUTHOR of the
+//! batch (a CTE map `author -> group`), then updates the batch's rows with one
+//! join. An earlier form evaluated the resolver as a correlated subquery per
+//! ROW, twice (the SET and the guard); on production that was the dominant cost
+//! of a batch. Derived rows follow through 070's arm (d), which is a
+//! STATEMENT-level trigger: one UPDATE per derived table per batch, joined to
+//! the batch's transition table, however many claims the batch holds. The
+//! agent-keyed arms (`perspectives`, `recall_events`) are batched and cursored
+//! the same way instead of one unbounded UPDATE each.
+//!
+//! # `--legacy-owner operator|platform` (required on `run`)
+//!
+//! Who owns the LEGACY corpus is an operator decision this binary does not
+//! make. `operator`: a world-owned row of an author linked to a human (live OR
+//! retired) goes to that operator's group, an unlinked author's to its own
+//! personal group (the behaviour above). `platform`: only rows of authors with
+//! a LIVE link to a registered human operator are stamped (to that operator's
+//! group), and a registered human operator's OWN rows (to its personal group);
+//! rows of retired-linked and unlinked authors STAY world-owned, as the
+//! platform corpus, and so do their derived rows. The batch selection itself is
+//! filtered in `platform` mode, so the walk never revisits the platform corpus.
+//! `verify` takes the same flag (optional; without it the check is the strict
+//! one, "no world-owned residue"): under `platform` it fails only on
+//! world-owned rows that SHOULD have moved and reports the platform corpus.
+//!
+//! `--entity <name>` runs one arm alone (e.g. `recall_events` without the
+//! claims walk). `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
+//! once the budget is spent and exits 3 ("partial, re-run to resume"); the
+//! cursor of every committed batch is already persisted.
+//!
 //! Usage:
-//!     epigraph-tenancy-backfill run [--batch-size 5000] [--dry-run]
-//!     epigraph-tenancy-backfill verify
+//!     epigraph-tenancy-backfill run --legacy-owner operator|platform [--batch-size 5000]
+//!         [--dry-run] [--entity claims|communities|perspectives|recall-events|harvester-fragments]
+//!         [--max-runtime 2h]
+//!     epigraph-tenancy-backfill verify [--legacy-owner operator|platform]
+//!
+//! Exit codes: 0 complete; 1 failed, or `verify` found residue; 3 stopped by
+//! `--max-runtime` (partial, resumable).
 
 use clap::{Parser, Subcommand};
 use sqlx::{PgPool, Row};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// The role migrations 070/071 re-own their `SECURITY DEFINER` bodies to, and
@@ -121,6 +172,70 @@ fn personal_group_sql(agent_expr: &str) -> String {
                     g.created_at ASC
            LIMIT 1)"
     )
+}
+
+/// The owner the backfill stamps for an `{agent}` expression: the group of the
+/// author's `operator_links` row (ANY state: a retired identity's work belongs
+/// to its operator too), else the author's own personal group
+/// ([`personal_group_sql`]), else NULL (the row is left for `verify` to name).
+///
+/// `operator_links` is FORCEd with a SELECT policy that admits a maintenance
+/// session (`epigraph_definer_bypass()`), which is the only kind of session
+/// this binary runs on (`MaintenancePool`).
+fn owner_group_sql(agent_expr: &str) -> String {
+    format!(
+        "COALESCE((SELECT l.operator_group_id FROM operator_links l \
+                    WHERE l.agent_id = {agent_expr}), {})",
+        personal_group_sql(agent_expr)
+    )
+}
+
+/// Who owns the legacy corpus (see the module doc). No default on `run`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyOwner {
+    /// Linked authors' rows (any link state) go to the operator's group;
+    /// unlinked authors' to their own personal group.
+    Operator,
+    /// Only LIVE-linked authors' rows move; the rest stay world-owned (the
+    /// platform corpus).
+    Platform,
+}
+
+/// The authors a `platform` run stamps: holders of a LIVE link to a registered
+/// human operator (migration 122), AND the registered human operators
+/// themselves (review C3). A human is bound on its own (122 arm (a)) and has no
+/// `operator_links` row of its own, so a filter on live links alone left the
+/// operator's OWN legacy rows in the platform corpus; the D1 default keeps
+/// them his ("the operator's own backlog ... stay his"). A subquery the planner
+/// evaluates once.
+const PLATFORM_STAMPED_AUTHORS: &str = "(SELECT l.agent_id FROM operator_links l \
+     WHERE NOT l.retired AND public.epigraph_is_human_operator(l.operator_id) \
+     UNION SELECT h.agent_id FROM human_operators h \
+     WHERE public.epigraph_is_human_operator(h.agent_id))";
+
+/// The batch-selection filter for `mode` on an `{agent}` expression.
+fn author_filter(mode: LegacyOwner, agent_expr: &str) -> String {
+    match mode {
+        LegacyOwner::Operator => "TRUE".to_string(),
+        LegacyOwner::Platform => format!("{agent_expr} IN {PLATFORM_STAMPED_AUTHORS}"),
+    }
+}
+
+/// The owner a batch stamps for `mode` on an `{agent}` expression (NULL: leave
+/// the row as it is). Under `platform`: a live-linked author's operator group,
+/// or, for a registered human operator, its own personal group.
+fn owner_sql(mode: LegacyOwner, agent_expr: &str) -> String {
+    match mode {
+        LegacyOwner::Operator => owner_group_sql(agent_expr),
+        LegacyOwner::Platform => format!(
+            "COALESCE((SELECT l.operator_group_id FROM operator_links l \
+                        WHERE l.agent_id = {agent_expr} AND NOT l.retired \
+                          AND public.epigraph_is_human_operator(l.operator_id)), \
+                      CASE WHEN public.epigraph_is_human_operator({agent_expr}) \
+                           THEN {} END)",
+            personal_group_sql(agent_expr)
+        ),
+    }
 }
 
 /// The 25 tier-A entities, exactly as `migrations/062_tenancy_columns.sql`
@@ -201,9 +316,90 @@ enum Command {
         /// Report what would be stamped without writing.
         #[arg(long)]
         dry_run: bool,
+        /// Run ONE entity arm alone (no settle, no final verify).
+        #[arg(long, value_enum)]
+        entity: Option<Entity>,
+        /// Stop cleanly between batches after this long (`90m`, `2h`, `3600s`,
+        /// or bare seconds) and exit 3; a re-run resumes from the cursor.
+        #[arg(long, value_parser = parse_duration)]
+        max_runtime: Option<Duration>,
+        /// Who owns the legacy corpus: `operator` (linked authors' rows go to
+        /// their operator, unlinked authors' to their own group) or `platform`
+        /// (only live-linked authors' rows move). Required: it is an operator
+        /// decision, not a default.
+        #[arg(long, value_enum)]
+        legacy_owner: LegacyOwner,
     },
     /// Deploy pre-flight. Exits non-zero if any entity is incomplete.
-    Verify,
+    Verify {
+        /// Check under this legacy-ownership decision; without it, the strict
+        /// check (no world-owned residue at all).
+        #[arg(long, value_enum)]
+        legacy_owner: Option<LegacyOwner>,
+    },
+}
+
+/// The entity arms `run --entity` can select.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Entity {
+    Claims,
+    Communities,
+    Perspectives,
+    RecallEvents,
+    HarvesterFragments,
+}
+
+/// `90m`, `2h`, `3600s`, or bare seconds.
+fn parse_duration(raw: &str) -> Result<Duration, String> {
+    let raw = raw.trim();
+    let (num, mult) = match raw.chars().last() {
+        Some('s') => (&raw[..raw.len() - 1], 1),
+        Some('m') => (&raw[..raw.len() - 1], 60),
+        Some('h') => (&raw[..raw.len() - 1], 3600),
+        _ => (raw, 1),
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("not a duration: {raw:?} (use e.g. 90m, 2h, 3600s)"))?;
+    if n == 0 {
+        return Err("the duration must be positive".to_string());
+    }
+    Ok(Duration::from_secs(n * mult))
+}
+
+/// When a `--max-runtime` budget runs out. Checked only BETWEEN batches.
+#[derive(Clone, Copy, Debug)]
+struct Deadline(Option<Instant>);
+
+impl Deadline {
+    fn expired(self) -> bool {
+        self.0.is_some_and(|d| Instant::now() >= d)
+    }
+}
+
+/// How a `run` ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RunEnd {
+    Complete,
+    /// `--max-runtime` stopped it between batches; everything committed so far
+    /// is kept and the cursors are persisted.
+    Partial,
+}
+
+/// The exit code for [`RunEnd::Partial`].
+const EXIT_PARTIAL: i32 = 3;
+
+/// How one cursored arm's walk ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Walk {
+    /// Nothing the mode stamps is left world-owned.
+    Done,
+    /// `--max-runtime` stopped it between batches; the cursor is persisted.
+    Partial,
+    /// A walk that covered the table FROM THE START still left this many rows
+    /// world-owned (an author that resolves to no group). The cursor is reset.
+    Residue(i64),
 }
 
 #[tokio::main]
@@ -253,12 +449,24 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             batch_size,
             dry_run,
+            entity,
+            max_runtime,
+            legacy_owner,
         } => {
-            run(&pool, batch_size, dry_run).await?;
+            let deadline = Deadline(max_runtime.map(|d| Instant::now() + d));
+            if run(&pool, batch_size, dry_run, entity, deadline, legacy_owner).await?
+                == RunEnd::Partial
+            {
+                eprintln!(
+                    "run: PARTIAL — stopped by --max-runtime between batches; every committed \
+                     batch is kept and its cursor persisted. Re-run the same command to resume."
+                );
+                std::process::exit(EXIT_PARTIAL);
+            }
             Ok(())
         }
-        Command::Verify => {
-            let failures = verify(&pool).await?;
+        Command::Verify { legacy_owner } => {
+            let failures = verify(&pool, legacy_owner).await?;
             if failures == 0 {
                 println!("verify: OK — every tier-A entity is fully declared.");
                 Ok(())
@@ -280,11 +488,19 @@ async fn main() -> anyhow::Result<()> {
 // run
 // =============================================================================
 
-async fn run(pool: &PgPool, batch_size: i64, dry_run: bool) -> anyhow::Result<()> {
+async fn run(
+    pool: &PgPool,
+    batch_size: i64,
+    dry_run: bool,
+    entity: Option<Entity>,
+    deadline: Deadline,
+    mode: LegacyOwner,
+) -> anyhow::Result<RunEnd> {
     if batch_size <= 0 {
         anyhow::bail!("--batch-size must be positive");
     }
     preflight(pool).await?;
+    let wants = |e: Entity| entity.is_none_or(|x| x == e);
 
     // PHASE 0 is not in the plan's *Files* line and is the single largest piece
     // of unlisted work in PR-12. D2 derives every claim's owner from
@@ -294,36 +510,109 @@ async fn run(pool: &PgPool, batch_size: i64, dry_run: bool) -> anyhow::Result<()
     // one-shot orphan agents that have never authenticated and therefore have
     // NO personal group. Without this phase the claims arm cannot resolve an
     // owner for their claims and the backfill stalls on batch 1.
-    materialize_personal_groups(pool, dry_run).await?;
-
-    if dry_run {
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE owner_group_id = $1")
-            .bind(WORLD)
-            .fetch_one(pool)
-            .await?;
-        println!("dry-run: {n} claims would be stamped; no writes performed.");
-        return Ok(());
+    // Only the `operator` decision falls back to an author's personal group;
+    // a `platform` run stamps live-linked authors to their operator only.
+    if mode == LegacyOwner::Operator
+        && (wants(Entity::Claims) || wants(Entity::Perspectives) || wants(Entity::RecallEvents))
+    {
+        materialize_personal_groups(pool, dry_run).await?;
     }
 
-    backfill_claims(pool, batch_size).await?;
-    backfill_communities(pool).await?;
-    backfill_agent_keyed(pool, "perspectives", "owner_agent_id").await?;
-    backfill_agent_keyed(pool, "recall_events", "agent_id").await?;
-    backfill_harvester_fragments(pool).await?;
+    if dry_run {
+        for (e, table) in [
+            (Entity::Claims, "claims"),
+            (Entity::Communities, "communities"),
+            (Entity::Perspectives, "perspectives"),
+            (Entity::RecallEvents, "recall_events"),
+            (Entity::HarvesterFragments, "harvester_fragments"),
+        ] {
+            if wants(e) {
+                let n = residual_for(pool, table, Some(mode)).await?;
+                println!(
+                    "dry-run: {n} {table} row(s) would be stamped under --legacy-owner \
+                     {mode:?}; no writes performed."
+                );
+            }
+        }
+        return Ok(RunEnd::Complete);
+    }
+
+    // A single-entity run reports its own residue by exit code (review C2): a
+    // runbook loop reading 0 as "this entity is done" must never read it after
+    // a walk that left rows behind. A full run reaches `verify`, which fails.
+    let settle = |table: &str, w: Walk| -> anyhow::Result<Option<RunEnd>> {
+        match w {
+            Walk::Partial => Ok(Some(RunEnd::Partial)),
+            Walk::Residue(n) if entity.is_some() => anyhow::bail!(
+                "{table}: the walk covered the table from the start and still left {n} \
+                 world-owned row(s) whose author resolves to no group; nothing more this \
+                 binary can stamp (docs/tenancy.md, 'When the backfill leaves rows behind')"
+            ),
+            Walk::Done | Walk::Residue(_) => Ok(None),
+        }
+    };
+    if wants(Entity::Claims) {
+        if let Some(end) = settle(
+            "claims",
+            backfill_claims(pool, batch_size, deadline, mode).await?,
+        )? {
+            return Ok(end);
+        }
+    }
+    if wants(Entity::Communities) {
+        backfill_communities(pool).await?;
+    }
+    if wants(Entity::Perspectives) {
+        let w = backfill_agent_keyed(
+            pool,
+            "perspectives",
+            "owner_agent_id",
+            batch_size,
+            deadline,
+            mode,
+        )
+        .await?;
+        if let Some(end) = settle("perspectives", w)? {
+            return Ok(end);
+        }
+    }
+    if wants(Entity::RecallEvents) {
+        let w = backfill_agent_keyed(
+            pool,
+            "recall_events",
+            "agent_id",
+            batch_size,
+            deadline,
+            mode,
+        )
+        .await?;
+        if let Some(end) = settle("recall_events", w)? {
+            return Ok(end);
+        }
+    }
+    if wants(Entity::HarvesterFragments) {
+        backfill_harvester_fragments(pool).await?;
+    }
+    if let Some(e) = entity {
+        println!(
+            "run: entity {e:?} done (no settle, no verify: run `verify` when every arm is done)."
+        );
+        return Ok(RunEnd::Complete);
+    }
 
     // The remaining entities are either trigger-propagated (the 17 claim-derived
     // tables and `edges`) or have nothing to derive from (`frames`, `contexts`).
     // Both are settled by measuring the residual, never by asserting.
-    settle_remaining(pool).await?;
+    settle_remaining(pool, mode).await?;
 
-    let failures = verify(pool).await?;
+    let failures = verify(pool, Some(mode)).await?;
     if failures == 0 {
         println!("run: complete — every tier-A entity is fully declared.");
     } else {
         eprintln!("run: finished with {failures} entity/entities still incomplete; see `verify`.");
         std::process::exit(1);
     }
-    Ok(())
+    Ok(RunEnd::Complete)
 }
 
 /// Refuse to run against a database that has not had migration 070 applied.
@@ -372,9 +661,12 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
     // repair conditional on unrelated state. An author whose rows are all
     // REVOKED is not "needing repair": that is an operator's decision, counted
     // and reported below, and this binary does not reverse it.
+    // Over DISTINCT authors, not over claims rows: the resolver is a correlated
+    // subquery, and evaluating it once per claim row was a full pass of it over
+    // the whole table (OB6).
     let needing_repair: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM (
-            SELECT DISTINCT c.agent_id FROM claims c
+            SELECT c.agent_id FROM (SELECT DISTINCT agent_id FROM claims) c
              WHERE {pg} IS NULL
                 OR NOT EXISTS (SELECT 1 FROM group_memberships m
                                 WHERE m.group_id = {pg}
@@ -386,7 +678,7 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
     .await?;
     let left_revoked: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM (
-            SELECT DISTINCT c.agent_id FROM claims c
+            SELECT c.agent_id FROM (SELECT DISTINCT agent_id FROM claims) c
              WHERE {pg} IS NOT NULL
                AND EXISTS (SELECT 1 FROM group_memberships m
                             WHERE m.group_id = {pg} AND m.agent_id = c.agent_id)
@@ -430,10 +722,10 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
     // must not be given a second one.
     sqlx::query(&format!(
         "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id)
-         SELECT DISTINCT 'personal:' || a.id::text,
+         SELECT 'personal:' || a.id::text,
                 'did:epigraph:personal:' || a.id::text,
                 ''::bytea, 'personal', a.id
-           FROM claims c JOIN agents a ON a.id = c.agent_id
+           FROM (SELECT DISTINCT agent_id FROM claims) c JOIN agents a ON a.id = c.agent_id
           WHERE {} IS NULL
          ON CONFLICT (did_key) DO UPDATE SET updated_at = now()",
         personal_group_sql("a.id")
@@ -491,7 +783,14 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
 /// Each batch is one transaction containing the row selection, the UPDATE
 /// (which fires arm (d) and propagates to 18 more tables), and the cursor
 /// advance. That grouping is what makes `kill -9` safe.
-async fn backfill_claims(pool: &PgPool, batch_size: i64) -> anyhow::Result<()> {
+///
+/// Returns `true` when `deadline` stopped the walk between batches (partial).
+async fn backfill_claims(
+    pool: &PgPool,
+    batch_size: i64,
+    deadline: Deadline,
+    mode: LegacyOwner,
+) -> anyhow::Result<Walk> {
     let mut cursor: Option<Uuid> = current_cursor(pool, "claims").await?;
     // SEEDED FROM THE PERSISTED COUNT, not from zero. `rows_done` is meant to
     // describe the BACKFILL, and re-initialising it on every process start made
@@ -499,99 +798,140 @@ async fn backfill_claims(pool: &PgPool, batch_size: i64) -> anyhow::Result<()> {
     // number describing only the last run.
     let mut total: i64 = persisted_rows_done(pool, "claims").await?;
 
-    loop {
-        let mut tx = pool.begin().await?;
+    // One pass per iteration: a pass that began from a cursor an EARLIER run
+    // left behind (an aborted run, or a run under the other --legacy-owner)
+    // never saw the rows below that cursor, so its residue is not proof of an
+    // unresolvable author. It is rewound and walked again from the start, in
+    // this run (review C2). Only a pass that began from the start can end in
+    // `Walk::Residue`.
+    'passes: loop {
+        let from_start = cursor.is_none();
+        loop {
+            if deadline.expired() {
+                tracing::warn!(
+                    total,
+                    "claims walk stopped by --max-runtime; cursor persisted"
+                );
+                return Ok(Walk::Partial);
+            }
+            let mut tx = pool.begin().await?;
 
-        // FOR UPDATE SKIP LOCKED per the acceptance line. The `id >` cursor and
-        // the ORDER BY make the walk total; SKIP LOCKED makes a second operator
-        // divide the work rather than block on it.
-        let rows = sqlx::query(
-            "SELECT c.id, c.agent_id FROM claims c
+            // FOR UPDATE SKIP LOCKED per the acceptance line. The `id >` cursor and
+            // the ORDER BY make the walk total; SKIP LOCKED makes a second operator
+            // divide the work rather than block on it.
+            let rows = sqlx::query(&format!(
+                "SELECT c.id, c.agent_id FROM claims c
               WHERE c.owner_group_id = $1
                 AND ($2::uuid IS NULL OR c.id > $2)
+                AND {}
               ORDER BY c.id
               LIMIT $3
               FOR UPDATE SKIP LOCKED",
-        )
-        .bind(WORLD)
-        .bind(cursor)
-        .bind(batch_size)
-        .fetch_all(&mut *tx)
-        .await?;
+                author_filter(mode, "c.agent_id")
+            ))
+            .bind(WORLD)
+            .bind(cursor)
+            .bind(batch_size)
+            .fetch_all(&mut *tx)
+            .await?;
 
-        if rows.is_empty() {
-            tx.rollback().await?;
-            break;
+            if rows.is_empty() {
+                tx.rollback().await?;
+                break;
+            }
+
+            let ids: Vec<Uuid> = rows.iter().map(|r| r.get::<Uuid, _>("id")).collect();
+            let last = *ids.last().expect("non-empty batch");
+
+            // Resolve the owner IN SQL, in the same statement as the write, so
+            // there is no window in which the binary holds a mapping the database
+            // disagrees with, and ONCE PER DISTINCT AUTHOR of the batch (the `map`
+            // CTE), not once per row (OB6). A claim whose author resolves to no
+            // group is LEFT ALONE rather than stamped to world or seed — `verify`
+            // will then fail and name it, which is the fail-closed outcome. Phase 0
+            // makes this set empty in the normal case.
+            let n = sqlx::query(&claims_batch_update_sql(mode))
+                .bind(&ids)
+                .bind(WORLD)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+
+            total += n as i64;
+            advance_cursor(&mut tx, "claims", Some(last), total).await?;
+            tx.commit().await?;
+
+            tracing::info!(batch = ids.len(), stamped = n, total, "claims batch");
+            cursor = Some(last);
         }
 
-        let ids: Vec<Uuid> = rows.iter().map(|r| r.get::<Uuid, _>("id")).collect();
-        let last = *ids.last().expect("non-empty batch");
-
-        // Resolve the owner IN SQL, in the same statement as the write, so
-        // there is no window in which the binary holds a mapping the database
-        // disagrees with. A claim whose author has no personal group is LEFT
-        // ALONE rather than stamped to world or seed — `verify` will then fail
-        // and name it, which is the fail-closed outcome. Phase 0 makes this
-        // set empty in the normal case.
-        let n = sqlx::query(&format!(
-            "UPDATE claims c
-                SET owner_group_id = {}, visibility = 'public'
-              WHERE c.id = ANY($1)
-                AND c.owner_group_id = $2
-                AND {} IS NOT NULL",
-            personal_group_sql("c.agent_id"),
-            personal_group_sql("c.agent_id")
-        ))
-        .bind(&ids)
-        .bind(WORLD)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-
-        total += n as i64;
-        advance_cursor(&mut tx, "claims", Some(last), total).await?;
-        tx.commit().await?;
-
-        tracing::info!(batch = ids.len(), stamped = n, total, "claims batch");
-        cursor = Some(last);
-    }
-
-    // ==================================================================
-    // THE CURSOR IS RESET WHEN THE WALK LEFT WORK BEHIND. THIS IS NOT
-    // BOOKKEEPING — WITHOUT IT A RE-RUN IS A SILENT NO-OP.
-    //
-    // The batch UPDATE above is guarded by `personal_group(agent_id) IS NOT
-    // NULL`, so a claim whose author cannot be resolved is SKIPPED — while the
-    // cursor advances to the last id SELECTED. `claims.agent_id` has no foreign
-    // key to `agents` in this schema (see `materialize_personal_groups`, and
-    // plan §9.1, which records that `routes/claims.rs` trusts a caller-supplied
-    // `request.agent_id`), so dangling authors are EXPECTED in production and
-    // phase 0 — which joins `agents` — cannot mint groups for them.
-    //
-    // Left alone, the second `run` would find nothing `> last_id`, break on
-    // batch 1, and exit 1 again, with the acceptance line's "resumable" and
-    // "every entity reaches complete" unreachable and no documented remedy.
-    // Resetting `last_id` to NULL makes a re-run genuinely retry — which still
-    // will not stamp an unresolvable author, but now fails LOUDLY and in the
-    // same place every time rather than looking like a completed walk.
-    //
-    // Note this also corrects `verify`'s old comment "A4: the derivation is
-    // total, because claims.agent_id is NOT NULL". NOT NULL does not imply
-    // RESOLVABLE without a foreign key, and that is exactly the hole.
-    // ==================================================================
-    let left_behind = residual(pool, "claims").await?;
-    if left_behind > 0 {
-        reset_cursor(pool, "claims").await?;
-        tracing::warn!(
-            residual = left_behind,
-            "claims walk finished with world-owned rows remaining (unresolvable author?); \
+        // ==================================================================
+        // THE CURSOR IS RESET WHEN THE WALK LEFT WORK BEHIND. THIS IS NOT
+        // BOOKKEEPING — WITHOUT IT A RE-RUN IS A SILENT NO-OP.
+        //
+        // The batch UPDATE above is guarded by `personal_group(agent_id) IS NOT
+        // NULL`, so a claim whose author cannot be resolved is SKIPPED — while the
+        // cursor advances to the last id SELECTED. `claims.agent_id` has no foreign
+        // key to `agents` in this schema (see `materialize_personal_groups`, and
+        // plan §9.1, which records that `routes/claims.rs` trusts a caller-supplied
+        // `request.agent_id`), so dangling authors are EXPECTED in production and
+        // phase 0 — which joins `agents` — cannot mint groups for them.
+        //
+        // Left alone, the second `run` would find nothing `> last_id`, break on
+        // batch 1, and exit 1 again, with the acceptance line's "resumable" and
+        // "every entity reaches complete" unreachable and no documented remedy.
+        // Resetting `last_id` to NULL makes a re-run genuinely retry — which still
+        // will not stamp an unresolvable author, but now fails LOUDLY and in the
+        // same place every time rather than looking like a completed walk.
+        //
+        // Note this also corrects `verify`'s old comment "A4: the derivation is
+        // total, because claims.agent_id is NOT NULL". NOT NULL does not imply
+        // RESOLVABLE without a foreign key, and that is exactly the hole.
+        // ==================================================================
+        let left_behind = residual_for(pool, "claims", Some(mode)).await?;
+        if left_behind > 0 {
+            reset_cursor(pool, "claims").await?;
+            if !from_start {
+                tracing::info!(
+                    residual = left_behind,
+                    "claims walk began from a cursor an earlier run left and found world-owned \
+                 rows below it; walking again from the start"
+                );
+                cursor = None;
+                continue 'passes;
+            }
+            tracing::warn!(
+                residual = left_behind,
+                "claims walk finished with world-owned rows remaining (unresolvable author?); \
              last_id has been reset to NULL so a re-run retries from the start. \
              See docs/tenancy.md 'When the backfill leaves rows behind'."
-        );
-    }
+            );
+            finish_entity(pool, "claims", total).await?;
+            return Ok(Walk::Residue(left_behind));
+        }
 
-    finish_entity(pool, "claims", total).await?;
-    Ok(())
+        finish_entity(pool, "claims", total).await?;
+        return Ok(Walk::Done);
+    }
+}
+
+/// The claims arm's per-batch UPDATE: `$1` the batch's claim ids, `$2` the
+/// world group. The owner is resolved once per distinct author of the batch.
+fn claims_batch_update_sql(mode: LegacyOwner) -> String {
+    format!(
+        "WITH batch AS MATERIALIZED (
+            SELECT c.id, c.agent_id FROM claims c
+             WHERE c.id = ANY($1) AND c.owner_group_id = $2),
+         map AS MATERIALIZED (
+            SELECT a.agent_id, {gid} AS gid
+              FROM (SELECT DISTINCT agent_id FROM batch) a)
+         UPDATE claims c
+            SET owner_group_id = m.gid, visibility = 'public'
+           FROM batch b JOIN map m ON m.agent_id = b.agent_id
+          WHERE c.id = b.id
+            AND m.gid IS NOT NULL",
+        gid = owner_sql(mode, "a.agent_id")
+    )
 }
 
 /// `communities` → `('public', communities.id)`.
@@ -626,23 +966,103 @@ async fn backfill_communities(pool: &PgPool) -> anyhow::Result<()> {
 /// as "keyed on the QUERYING agent, not on a claim". A NULL row therefore has
 /// no derivable owner and is left `('public', world)`: see `settle_remaining`
 /// for why that is legal.
-async fn backfill_agent_keyed(pool: &PgPool, table: &str, agent_col: &str) -> anyhow::Result<()> {
+///
+/// Batched and cursored like the claims arm (OB6: it used to be one unbounded
+/// UPDATE per table), with the owner resolved once per distinct agent of the
+/// batch. Returns `true` when `deadline` stopped it between batches.
+async fn backfill_agent_keyed(
+    pool: &PgPool,
+    table: &str,
+    agent_col: &str,
+    batch_size: i64,
+    deadline: Deadline,
+    mode: LegacyOwner,
+) -> anyhow::Result<Walk> {
     // `table` and `agent_col` are compile-time constants from this file, never
     // caller input, so the format! is not an injection surface.
-    let resolver = personal_group_sql(&format!("t.{agent_col}"));
-    let sql = format!(
-        "UPDATE {table} t SET owner_group_id = {resolver}, visibility = 'public'
-          WHERE t.{agent_col} IS NOT NULL
-            AND t.owner_group_id = $1
-            AND {resolver} IS NOT NULL"
+    let filter = author_filter(mode, &format!("t.{agent_col}"));
+    let select = format!(
+        "SELECT t.id FROM {table} t
+          WHERE t.owner_group_id = $1
+            AND t.{agent_col} IS NOT NULL
+            AND ($2::uuid IS NULL OR t.id > $2)
+            AND {filter}
+          ORDER BY t.id
+          LIMIT $3
+          FOR UPDATE SKIP LOCKED"
     );
-    let n = sqlx::query(&sql)
+    let update = format!(
+        "WITH batch AS MATERIALIZED (
+            SELECT t.id, t.{agent_col} AS agent_id FROM {table} t
+             WHERE t.id = ANY($1) AND t.owner_group_id = $2),
+         map AS MATERIALIZED (
+            SELECT a.agent_id, {gid} AS gid
+              FROM (SELECT DISTINCT agent_id FROM batch) a)
+         UPDATE {table} t
+            SET owner_group_id = m.gid, visibility = 'public'
+           FROM batch b JOIN map m ON m.agent_id = b.agent_id
+          WHERE t.id = b.id
+            AND m.gid IS NOT NULL",
+        gid = owner_sql(mode, "a.agent_id")
+    );
+    let mut cursor: Option<Uuid> = current_cursor(pool, table).await?;
+    let mut total: i64 = persisted_rows_done(pool, table).await?;
+    // Passes as in `backfill_claims` (review C2).
+    'passes: loop {
+        let from_start = cursor.is_none();
+        loop {
+            if deadline.expired() {
+                tracing::warn!(
+                    table,
+                    total,
+                    "walk stopped by --max-runtime; cursor persisted"
+                );
+                return Ok(Walk::Partial);
+            }
+            let mut tx = pool.begin().await?;
+            let ids: Vec<Uuid> = sqlx::query_scalar(&select)
+                .bind(WORLD)
+                .bind(cursor)
+                .bind(batch_size)
+                .fetch_all(&mut *tx)
+                .await?;
+            let Some(&last) = ids.last() else {
+                tx.rollback().await?;
+                break;
+            };
+            let n = sqlx::query(&update)
+                .bind(&ids)
+                .bind(WORLD)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            total += n as i64;
+            advance_cursor(&mut tx, table, Some(last), total).await?;
+            tx.commit().await?;
+            tracing::info!(table, batch = ids.len(), stamped = n, total, "batch");
+            cursor = Some(last);
+        }
+        // As for claims: a row the walk could not stamp (its agent resolves to no
+        // group) is left world-owned, so rewind the cursor and let a re-run retry.
+        let left: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} t WHERE t.owner_group_id = $1 AND t.{agent_col} IS NOT NULL \
+           AND {filter}"
+    ))
         .bind(WORLD)
-        .execute(pool)
-        .await?
-        .rows_affected();
-    finish_entity(pool, table, n as i64).await?;
-    Ok(())
+        .fetch_one(pool)
+        .await?;
+        if left > 0 {
+            reset_cursor(pool, table).await?;
+            if !from_start {
+                cursor = None;
+                continue 'passes;
+            }
+            finish_entity(pool, table, total).await?;
+            return Ok(Walk::Residue(left));
+        }
+        finish_entity(pool, table, total).await?;
+        return Ok(Walk::Done);
+    }
 }
 
 /// `harvester_fragments` → its claim's tenancy, via the provenance join.
@@ -725,12 +1145,81 @@ async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
 /// world-owned row that is `visibility = 'public'` is explicitly permitted, and
 /// that is exactly what these rows are. It also matches 070 arm (b), which
 /// stamps `('public', world)` for an edge between two public endpoints.
-async fn settle_remaining(pool: &PgPool) -> anyhow::Result<()> {
+/// Re-stamp every WORLD-OWNED edge that touches a non-public claim or evidence
+/// endpoint (the rows `verify`'s edge check fails on) to the meet of its
+/// endpoints, exactly as 070 arm (d) computes it (migration 122 section 8's
+/// set-based form, same CASE expressions and guards). Returns the rows changed.
+///
+/// Arm (d) repairs such an edge only when a claim UPDATE touches one of its
+/// endpoints. Under `--legacy-owner operator` every world-owned claim moves, so
+/// every stale edge is recomputed on the way; under `platform` the platform
+/// corpus never moves, so an edge between a platform-corpus claim and a
+/// group-private endpoint stayed world-owned, and `run` / `verify` failed on it
+/// with no command to fix it (review C4). Run in both modes: it touches only
+/// rows `verify` fails on.
+async fn settle_world_edges_with_private_endpoints(pool: &PgPool) -> anyhow::Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE edges e
+            SET owner_group_id    = m.g,
+                visibility        = m.v,
+                co_owner_group_id = m.co
+           FROM (
+             SELECT e2.id,
+                    CASE WHEN s.v = 'public' AND t.v = 'public'
+                              THEN '00000000-0000-0000-0000-000000000000'::uuid
+                         WHEN s.v = 'public' THEN t.g
+                         WHEN t.v = 'public' THEN s.g
+                         ELSE s.g END AS g,
+                    CASE WHEN s.v = 'public' AND t.v = 'public'
+                              THEN 'public'::character varying(16)
+                         ELSE 'group'::character varying(16) END AS v,
+                    CASE WHEN s.v = 'group' AND t.v = 'group' AND s.g <> t.g
+                              THEN t.g
+                         ELSE NULL END AS co
+               FROM edges e2
+               LEFT JOIN claims   sc ON e2.source_type = 'claim'    AND sc.id = e2.source_id
+               LEFT JOIN evidence se ON e2.source_type = 'evidence' AND se.id = e2.source_id
+               LEFT JOIN claims   tc ON e2.target_type = 'claim'    AND tc.id = e2.target_id
+               LEFT JOIN evidence te ON e2.target_type = 'evidence' AND te.id = e2.target_id
+               CROSS JOIN LATERAL (
+                 SELECT COALESCE(sc.owner_group_id, se.owner_group_id,
+                                 '00000000-0000-0000-0000-000000000000'::uuid) AS g,
+                        COALESCE(sc.visibility, se.visibility,
+                                 'public'::character varying(16)) AS v) s
+               CROSS JOIN LATERAL (
+                 SELECT COALESCE(tc.owner_group_id, te.owner_group_id,
+                                 '00000000-0000-0000-0000-000000000000'::uuid) AS g,
+                        COALESCE(tc.visibility, te.visibility,
+                                 'public'::character varying(16)) AS v) t
+              WHERE e2.owner_group_id = $1
+                AND (s.v <> 'public' OR t.v <> 'public')
+           ) m
+          WHERE e.id = m.id
+            AND m.g IS NOT NULL
+            AND m.v = 'group'
+            AND NOT (e.visibility = 'group' AND m.v = 'public')
+            AND (e.owner_group_id, e.visibility, e.co_owner_group_id)
+                IS DISTINCT FROM (m.g, m.v, m.co)",
+    )
+    .bind(WORLD)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()> {
+    let edges = settle_world_edges_with_private_endpoints(pool).await?;
+    if edges > 0 {
+        tracing::info!(
+            edges,
+            "re-stamped world-owned edges that touch a non-public endpoint to their endpoints' meet"
+        );
+    }
     for t in CLAIM_DERIVED
         .iter()
         .chain(["edges", "frames", "contexts"].iter())
     {
-        let n = residual(pool, t).await?;
+        let n = residual_for(pool, t, Some(mode)).await?;
         // `rows_done` means ROWS DECLARED, not table size. An earlier revision
         // stored `count(*)`, so an operator reading this table to judge
         // progress saw the table's size on all 20 of these entities.
@@ -942,8 +1431,9 @@ const DEFINER_FUNCTIONS: &[&str] = &[
     // missing 070 body is a finding" into "skipped".
     "epigraph_edges_tenancy",
     "epigraph_inherit_tenancy_stmt",
-    // Last redefined by migration 120 (114's body plus the `m.v = 'group'`
-    // conjunct on the edges statement); see the note above.
+    // Last redefined by migration 122 (120's body with the edges meet made
+    // set-based: two equi-joins and inlined endpoint reads, OB6); see the note
+    // above.
     "epigraph_propagate_tenancy",
     // `epigraph_ownership_transcribe` (071) was the sixth entry until PR-22.
     // Migration 084 drops the function with the table it wrote through, so an
@@ -1129,6 +1619,55 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // error, which a green pre-flight must not hide.
     ("epigraph_edge_writer_scope", 120),
     ("epigraph_reown_legacy_edges_to_signer", 120),
+    // 122, operator binding. The four reads fail OPEN in the dangerous
+    // direction under a non-member owner, which is why they are registered:
+    // `operator_links` is FORCEd and admits only a definer frame, so an
+    // unbypassed `epigraph_author_binding` reads no link and every linked
+    // agent reads as UNBOUND -- once armed, every claim write by an operated
+    // agent is refused (an outage, loud). `epigraph_is_human_operator` loses
+    // its operator arm the same way. The arming definer's INSERT is refused by
+    // the grant set, so arming fails loudly. The trigger body only calls the
+    // check, so its owner decides whether the check is reachable at all.
+    ("epigraph_is_human_operator", 122),
+    ("epigraph_author_binding", 122),
+    ("epigraph_operator_binding_enforced", 122),
+    ("epigraph_require_bound_author", 122),
+    ("epigraph_claims_require_operator_binding", 122),
+    ("epigraph_arm_operator_binding", 122),
+    // Section 1b (a linked agent writes only where its operator writes). Under
+    // a non-member owner `group_memberships` reads are filtered, so no operator
+    // "writes" any group and every linked agent's write is refused (loud).
+    ("epigraph_operator_writes_group", 122),
+    ("epigraph_operator_scope_exempt", 122),
+    ("epigraph_require_operator_scope", 122),
+    ("epigraph_group_memberships_operator_scope", 122),
+    // Section 1c (OB7): the human-operator registry. Under a non-member owner
+    // the registration INSERT and the audit row are refused (loud); the link
+    // record trigger reads no registry row and refuses every NEW link (loud).
+    ("epigraph_register_human_operator", 122),
+    ("epigraph_revoke_human_operator", 122),
+    ("epigraph_operator_links_operator_is_human", 122),
+    // The registry's own triggers (review SEC-8) and the link audit (SEC-12):
+    // under a non-member owner their `security_events` INSERTs are refused, so
+    // every registration, revoke and link fails CLOSED (loud).
+    ("epigraph_human_operators_guard_insert", 122),
+    ("epigraph_human_operators_guard_update", 122),
+    ("epigraph_human_operators_audit", 122),
+    ("epigraph_operator_links_audit", 122),
+    // The writer binding (review SEC-1/2/4/10). `epigraph_human_of` reads the
+    // FORCEd `operator_links`: unbypassed it finds no link, so every linked
+    // writer reads as belonging to no human (refused, loud) and a retired
+    // author's supersede by its human is refused. The rest only call it.
+    ("epigraph_human_of", 122),
+    ("epigraph_operator_binding_armed", 122),
+    ("epigraph_require_bound_writer", 122),
+    ("epigraph_require_writer_scope", 122),
+    ("epigraph_require_attributable", 122),
+    // The legacy-author tie: under a non-member owner its reads of the FORCEd
+    // tier-A tables and of `operator_links` are filtered and its link INSERT is
+    // refused by 107's definer-only policy, so it fails CLOSED (links nothing,
+    // or errors); the stake is the tie silently skipped.
+    ("epigraph_link_legacy_authors", 122),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -1361,6 +1900,90 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])",
             false,
         ),
+        // 122 (operator binding). `default_decl_for_author` calls the check on
+        // the request path, so a missing grant is 42501 on every default-decl
+        // claim write once armed; the three reads it and the trigger use are
+        // app-callable for the same reason. Arming is a maintenance act.
+        (
+            "epigraph_require_bound_author",
+            "public.epigraph_require_bound_author(uuid)",
+            true,
+        ),
+        (
+            "epigraph_author_binding",
+            "public.epigraph_author_binding(uuid)",
+            true,
+        ),
+        (
+            "epigraph_is_human_operator",
+            "public.epigraph_is_human_operator(uuid)",
+            true,
+        ),
+        (
+            "epigraph_operator_binding_enforced",
+            "public.epigraph_operator_binding_enforced()",
+            true,
+        ),
+        (
+            "epigraph_arm_operator_binding",
+            "public.epigraph_arm_operator_binding()",
+            false,
+        ),
+        (
+            "epigraph_operator_writes_group",
+            "public.epigraph_operator_writes_group(uuid, uuid)",
+            true,
+        ),
+        (
+            "epigraph_require_operator_scope",
+            "public.epigraph_require_operator_scope(uuid, uuid)",
+            true,
+        ),
+        // Registering a human is a maintenance act; the request DSN must not.
+        (
+            "epigraph_register_human_operator",
+            "public.epigraph_register_human_operator(uuid, text, uuid)",
+            false,
+        ),
+        // The writer binding the claims trigger applies (review SEC-1/2/4):
+        // the request path's workflow-ingest caller check calls the first two,
+        // and every read is app-callable for the trigger's own reason.
+        (
+            "epigraph_require_bound_writer",
+            "public.epigraph_require_bound_writer(uuid)",
+            true,
+        ),
+        (
+            "epigraph_require_writer_scope",
+            "public.epigraph_require_writer_scope(uuid, uuid)",
+            true,
+        ),
+        (
+            "epigraph_require_attributable",
+            "public.epigraph_require_attributable(uuid, uuid, boolean)",
+            true,
+        ),
+        (
+            "epigraph_human_of",
+            "public.epigraph_human_of(uuid, boolean)",
+            true,
+        ),
+        (
+            "epigraph_operator_binding_armed",
+            "public.epigraph_operator_binding_armed()",
+            true,
+        ),
+        (
+            "epigraph_revoke_human_operator",
+            "public.epigraph_revoke_human_operator(uuid, text)",
+            false,
+        ),
+        // A link function: the request DSN must never record links.
+        (
+            "epigraph_link_legacy_authors",
+            "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
+            false,
+        ),
     ];
 
     let app_exists: bool =
@@ -1428,6 +2051,45 @@ async fn residual(pool: &PgPool, table: &str) -> anyhow::Result<i64> {
     .await?)
 }
 
+/// World-owned rows of `table` that SHOULD have moved under `mode`.
+///
+/// * `None` / `operator`: every world-owned row ([`residual`], the strict
+///   check).
+/// * `platform`: a world-owned claim counts only if its author holds a LIVE
+///   link to a registered human; a world-owned derived row (or fragment) only
+///   if its claim is no longer world-owned (it should have followed); an
+///   agent-keyed row only if its agent is live-linked. The rest is the platform
+///   corpus, by decision.
+async fn residual_for(
+    pool: &PgPool,
+    table: &str,
+    mode: Option<LegacyOwner>,
+) -> anyhow::Result<i64> {
+    if mode != Some(LegacyOwner::Platform) {
+        return residual(pool, table).await;
+    }
+    let extra = match table {
+        "claims" => author_filter(LegacyOwner::Platform, "t.agent_id"),
+        "perspectives" => author_filter(LegacyOwner::Platform, "t.owner_agent_id"),
+        "recall_events" => author_filter(LegacyOwner::Platform, "t.agent_id"),
+        "harvester_fragments" => "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
+                                   JOIN claims c ON c.id = p.claim_id \
+                                  WHERE p.fragment_id = t.id AND c.owner_group_id <> $1)"
+            .to_string(),
+        t if t == "evidence" || CLAIM_DERIVED.contains(&t) => {
+            "EXISTS (SELECT 1 FROM claims c WHERE c.id = t.claim_id AND c.owner_group_id <> $1)"
+                .to_string()
+        }
+        _ => "TRUE".to_string(),
+    };
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} t WHERE t.owner_group_id = $1 AND {extra}"
+    ))
+    .bind(WORLD)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// The deploy pre-flight. Returns the number of FAILING checks.
 ///
 /// Live counts, per plan §3 (ops F16): the `SECURITY DEFINER` ownership
@@ -1441,7 +2103,7 @@ async fn residual(pool: &PgPool, table: &str) -> anyhow::Result<i64> {
 /// `settle_remaining` documents: a `('public', world)` row on those tables is a
 /// correct declaration, not an undeclared one. `edges` is exempt from the
 /// blanket residual but gets the sharper endpoint predicate instead.
-async fn verify(pool: &PgPool) -> anyhow::Result<usize> {
+async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usize> {
     let mut failures = 0usize;
 
     failures += verify_definer_ownership(pool).await?;
@@ -1453,18 +2115,31 @@ async fn verify(pool: &PgPool) -> anyhow::Result<usize> {
     // `agents`, so a dangling author yields no personal group and the claim is
     // deliberately left world-owned rather than mis-stamped. THIS check is what
     // catches that, by counting rather than by reasoning.
-    let world_claims = residual(pool, "claims").await?;
+    let platform = mode == Some(LegacyOwner::Platform);
+    let world_claims = residual_for(pool, "claims", mode).await?;
     if world_claims > 0 {
         failures += 1;
         eprintln!("FAIL: {world_claims} claims still owned by the world group.");
-        print_offenders(pool, "claims").await?;
+        if !platform {
+            print_offenders(pool, "claims").await?;
+        }
+    }
+    if platform {
+        let corpus = residual(pool, "claims").await? - world_claims;
+        eprintln!(
+            "REPORT: {corpus} world-owned claim(s) form the platform corpus \
+             (--legacy-owner platform: authors retired-linked or unlinked, and no human \
+             operator; not a failure)."
+        );
     }
 
-    let world_evidence = residual(pool, "evidence").await?;
+    let world_evidence = residual_for(pool, "evidence", mode).await?;
     if world_evidence > 0 {
         failures += 1;
         eprintln!("FAIL: {world_evidence} evidence rows still owned by the world group.");
-        print_offenders(pool, "evidence").await?;
+        if !platform {
+            print_offenders(pool, "evidence").await?;
+        }
     }
 
     // Two `ownership` checks lived here until PR-22: a non-public row whose
@@ -1606,11 +2281,32 @@ async fn verify(pool: &PgPool) -> anyhow::Result<usize> {
         if matches!(*t, "frames" | "contexts" | "edges" | "claims" | "evidence") {
             continue;
         }
-        let n = residual(pool, t).await?;
+        let n = residual_for(pool, t, mode).await?;
         if n > 0 {
             failures += 1;
             eprintln!("FAIL: {n} row(s) in {t} still owned by the world group.");
-            print_offenders(pool, t).await?;
+            if !platform {
+                print_offenders(pool, t).await?;
+            }
+        }
+    }
+
+    // REPORTED, never a failure: rows owned by an author's OWN personal group
+    // while that author has an operator link (any state). They are declared,
+    // so the tenancy gate is satisfied; operator binding wants them in the
+    // operator's group, and `epigraph-operator reown-linked` moves them.
+    for (table, agent_col) in [
+        ("claims", "agent_id"),
+        ("perspectives", "owner_agent_id"),
+        ("recall_events", "agent_id"),
+    ] {
+        let n = linked_author_personal_residue(pool, table, agent_col).await?;
+        if n > 0 {
+            eprintln!(
+                "REPORT: {n} row(s) in {table} are owned by their author's own personal group \
+                 although the author is linked to an operator; `epigraph-operator reown-linked` \
+                 moves the claims (not a failure)."
+            );
         }
     }
 
@@ -1628,6 +2324,26 @@ async fn verify(pool: &PgPool) -> anyhow::Result<usize> {
     }
 
     Ok(failures)
+}
+
+/// Rows of `table` owned by their author's own personal group (the canonical
+/// did_key, created by the author) while that author has an `operator_links`
+/// row of any state. `table` and `agent_col` are constants from this file.
+async fn linked_author_personal_residue(
+    pool: &PgPool,
+    table: &str,
+    agent_col: &str,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} t
+           JOIN operator_links l ON l.agent_id = t.{agent_col}
+           JOIN groups g ON g.id = t.owner_group_id
+          WHERE g.kind = 'personal'
+            AND g.created_by_agent_id = t.{agent_col}
+            AND g.did_key = 'did:epigraph:personal:' || t.{agent_col}::text"
+    ))
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Print up to 20 offending ids. Tables without an `id` column

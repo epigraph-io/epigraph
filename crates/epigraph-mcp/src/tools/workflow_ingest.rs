@@ -83,8 +83,12 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let extraction = &extraction;
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
 
-    let (_system_agent_id, mut tx) =
-        crate::claim_helper::begin_system_ingest_stamped_tx(server, "workflow_ingest").await?;
+    let (_system_agent_id, mut tx) = crate::claim_helper::begin_system_ingest_stamped_tx(
+        server,
+        "workflow_ingest",
+        caller.agent_id(),
+    )
+    .await?;
 
     // WHICH EXISTING ROWS THIS INGEST TOUCHES (batch H-b, H3 review): the exact
     // row (a re-ingest, which the executor short-circuits), the head of the
@@ -181,7 +185,13 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     // best-effort: a DS failure must not roll back a workflow that landed. Inside
     // it the per-entry work is SAVEPOINT-wrapped by `auto_wire_ds_batch` and
     // `auto_wire_edge_if_epistemic`, so one bad entry does not abort the rest.
-    match crate::claim_helper::begin_system_ingest_stamped_tx(server, "workflow_ingest_ds").await {
+    match crate::claim_helper::begin_system_ingest_stamped_tx(
+        server,
+        "workflow_ingest_ds",
+        caller.agent_id(),
+    )
+    .await
+    {
         Ok((_agent, mut ds_tx)) => {
             wire_ds_after_ingest(&mut ds_tx, viewer, &plan, &result).await;
             if let Err(e) = ds_tx.commit().await {

@@ -147,7 +147,7 @@ async fn humans_backlog_item(
 async fn a_human_oauth_callers_writes_are_authored_and_owned_by_the_human(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let signer = server.server_agent_id().await.expect("signer");
-    let (human, human_group) = fixture::seed_agent_with_group(&pool, "httpid-human").await;
+    let (human, human_group) = fixture::seed_human_operator(&pool, "httpid-human").await;
     let viewer = Viewer::resolve(&pool, human).await.expect("viewer");
     let token = human_token(human);
 
@@ -194,7 +194,7 @@ async fn a_human_oauth_callers_writes_are_authored_and_owned_by_the_human(pool: 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_human_retires_its_own_backlog_item_over_http(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
-    let (human, human_group) = fixture::seed_agent_with_group(&pool, "httpid-retire").await;
+    let (human, human_group) = fixture::seed_human_operator(&pool, "httpid-retire").await;
     let item = humans_backlog_item(&pool, &server, human, "HTTP-id: the human's item").await;
     let viewer = Viewer::resolve(&pool, human).await.expect("viewer");
 
@@ -265,7 +265,7 @@ async fn a_principal_less_caller_writes_nothing_by_default(pool: PgPool) {
 async fn a_principal_less_caller_cannot_retire_a_humans_item(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let signer = server.server_agent_id().await.expect("signer");
-    let (human, _) = fixture::seed_agent_with_group(&pool, "httpid-victim").await;
+    let (human, _) = fixture::seed_human_operator(&pool, "httpid-victim").await;
     let item = humans_backlog_item(&pool, &server, human, "HTTP-id: a human's open item").await;
     let viewer = Viewer::resolve(&pool, signer).await.expect("viewer");
 
@@ -345,7 +345,7 @@ async fn an_opt_in_principal_less_write_is_the_unlinked_signers(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_human_retires_a_former_signers_item_after_the_attested_link(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
-    let (human, human_group) = fixture::seed_agent_with_group(&pool, "httpid-operator").await;
+    let (human, human_group) = fixture::seed_human_operator(&pool, "httpid-operator").await;
     let (former_signer, _) = fixture::seed_agent_with_group(&pool, "httpid-old-signer").await;
     let (other, _) = fixture::seed_agent_with_group(&pool, "httpid-other-principal").await;
     for principal in [human, other] {

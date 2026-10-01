@@ -174,6 +174,16 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          transaction.",
     ),
     (
+        "epigraph-ingest-executor/src/system_agent.rs",
+        "default_decl_for_author",
+        1,
+        "`require_caller_write_authority` (migration 122, review SEC-3): the SYSTEM agent's \
+         declaration, on the transaction `begin_system_ingest_stamped_tx` stamped from that \
+         agent's own viewer after `system_agent_write_authority` proved its personal group \
+         live and writable, so the definer answers with that group and mints nothing. The same \
+         call the executor makes next.",
+    ),
+    (
         "epigraph-ingest-executor/src/workflow.rs",
         "default_decl_for_author",
         1,
@@ -364,6 +374,13 @@ const GUARDED_DEFINERS: &[(&str, usize, &[&str])] = &[
     // same no-revival contract.
     (
         "epigraph_link_retired_shared_signer",
+        0,
+        &["public.epigraph_ensure_personal_group(p_operator)"],
+    ),
+    // Migration 122's legacy-author tie resolves the OPERATOR's personal group
+    // through the same definer, once, and creates no membership at all.
+    (
+        "epigraph_link_legacy_authors",
         0,
         &["public.epigraph_ensure_personal_group(p_operator)"],
     ),

@@ -115,10 +115,22 @@ pub async fn create_hypothesis(
     // and the in-repo consumer that constrains any answer. Tracked as
     // `D-PR16-claim-authorship-is-not-a-credential` in
     // `docs/tenancy/progress.json`, with an owner.
+    //
+    // THE CLAIM IS WRITTEN ON A TRANSACTION STAMPED WITH THE VIEWER, so that
+    // migration 122's claims trigger binds the authenticated caller whenever
+    // the body's `agent_id` names someone else (the caller must be bound, and
+    // may name only an author of its own human). The frame bind and the prior
+    // (step 3) go on the SAME transaction: `claim_frames` and `mass_functions`
+    // admit a row only for an owner group in the session's writable set, so on
+    // the unstamped pool, after the claim had committed, they were refused by
+    // row security (a 500 after commit, and a retry duplicated the claim).
     let content_hash = epigraph_crypto::ContentHasher::hash(request.statement.as_bytes());
     let decl =
         epigraph_db::ClaimRepository::default_decl_for_author_pool(&state.db_pool, principal)
             .await?;
+    let mut tx = state
+        .begin_claim_write(&viewer, "create_hypothesis")
+        .await?;
     let claim_id: (Uuid,) = sqlx::query_as(
         r#"
         INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, embedding, visibility, owner_group_id)
@@ -137,16 +149,24 @@ pub async fn create_hypothesis(
     .bind(format_embedding(&embedding))
     .bind(decl.visibility_bind())
     .bind(decl.owner_group_bind())
-    .fetch_one(&state.db_pool)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to create hypothesis claim: {e}"),
+    .map_err(|e| {
+        let e = epigraph_db::DbError::from(e);
+        if e.is_write_authority_refusal() {
+            ApiError::from(e)
+        } else {
+            ApiError::InternalError {
+                message: format!("Failed to create hypothesis claim: {e}"),
+            }
+        }
     })?;
 
-    // 3. Add to hypothesis_assessment frame
+    // 3. Add to hypothesis_assessment frame, and submit a vacuous mass
+    //    function as the prior (m(Theta) = 1.0), on the claim's transaction.
     let frame_id: (Uuid,) =
         sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("hypothesis_assessment frame not found: {e}"),
@@ -157,10 +177,34 @@ pub async fn create_hypothesis(
     )
     .bind(claim_id.0)
     .bind(frame_id.0)
-    .execute(&state.db_pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to bind claim to frame: {e}"),
+    })?;
+
+    let vacuous_masses = serde_json::json!({"0,1": 1.0});
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &mut *tx,
+        claim_id.0,
+        frame_id.0,
+        Some(request.agent_id),
+        None,
+        &vacuous_masses,
+        None,
+        Some("prior"),
+        None,
+        None,
+        "unknown", // vacuous prior; no evidence yet (issue #197)
+        None,      // vacuous prior — no evidence row (issue #197 Phase 3)
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to store prior mass function: {e}"),
+    })?;
+
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to commit hypothesis claim: {e}"),
     })?;
 
     // 4. Compute VOI from neighborhood — only grounded claims count.
@@ -217,24 +261,6 @@ pub async fn create_hypothesis(
         .execute(&state.db_pool)
         .await
         .ok();
-
-    // 6. Submit vacuous mass function as prior (m(Theta) = 1.0)
-    let vacuous_masses = serde_json::json!({"0,1": 1.0});
-    epigraph_db::MassFunctionRepository::store(
-        &state.db_pool,
-        claim_id.0,
-        frame_id.0,
-        Some(request.agent_id),
-        &vacuous_masses,
-        None,
-        Some("prior"),
-        "unknown", // vacuous prior; no evidence yet (issue #197)
-        None,      // vacuous prior — no evidence row (issue #197 Phase 3)
-    )
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to store prior mass function: {e}"),
-    })?;
 
     Ok(Json(serde_json::json!({
         "hypothesis_id": claim_id.0,

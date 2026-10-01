@@ -129,13 +129,15 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "tools/evolve_step.rs",
         "ClaimRepository::evolve_step",
         1,
-        "`evolve_step`. Surfaced when `evolve` joined WRITE_TOKENS (batch H-a review); the site \
-         predates this register. MEASURED refused on a clean migrate (config A, 42501 on \
-         claims) and admitted on production's schema by the orphan `claims_privacy` policy. NOT \
-         converted, deliberately: its population is step claims authored by \
-         `workflow-ingest-system`, so the stamp that admits it is that SYSTEM agent's, and a \
-         system-stamped workflow mutation with no caller authority is H3 (backlog 84b2a98d), \
-         outside batch H-a. An R3 blocker, recorded in scripts/e2e/README.md.",
+        "`evolve_step`'s FALLBACK for a server built without a ScopedPool (test fixtures). On \
+         a scoped server (every deployed one) the tool now writes on \
+         `begin_author_stamped_tx` + `ClaimRepository::evolve_step_conn` (operator-binding \
+         delta review: migration 122 refuses a claim written by an application session with no \
+         principal once armed). History: surfaced when `evolve` joined WRITE_TOKENS (batch H-a \
+         review); MEASURED refused on a clean migrate (config A, 42501 on claims) unstamped. The \
+         stamp is the step's AUTHOR (the caller), so a parent owned by a group the caller does \
+         not write is still refused by row security there: the H3 question (backlog 84b2a98d) \
+         about system-owned workflow rows remains.",
     ),
     (
         "tools/ingestion.rs",
