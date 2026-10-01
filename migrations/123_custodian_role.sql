@@ -973,7 +973,18 @@ BEGIN
                        AND NOT COALESCE(p.is_current, true))
             AND NOT EXISTS (SELECT 1 FROM public.claims s
                              WHERE s.supersedes = NEW.supersedes AND s.id <> NEW.id
-                               AND COALESCE(s.is_current, true));
+                               AND COALESCE(s.is_current, true))
+            -- 123 (round 4 SEC-R4-1): on a non-privileged session a retired
+            -- identity's claim is restated AT MOST ONCE, ever. "No other
+            -- CURRENT successor" alone re-admitted a predecessor whose
+            -- successor had been retired, so retire-and-restate doubled the
+            -- current claims under the identity each round. A privileged
+            -- session keeps 122's rule: its custodial revision of a canonical
+            -- claim that retired duplicates point at must still work.
+            AND (public.epigraph_bypass()
+                 OR NOT EXISTS (SELECT 1 FROM public.claims s
+                                 WHERE s.supersedes = NEW.supersedes AND s.id <> NEW.id
+                                   AND s.agent_id IS NOT DISTINCT FROM NEW.agent_id));
     END IF;
     IF v_writer IS NULL OR v_writer = NEW.agent_id OR public.epigraph_bypass() THEN
         -- THE PLATFORM CORPUS'S EDIT PATH. A PRIVILEGED session (the

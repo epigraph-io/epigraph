@@ -1298,11 +1298,29 @@ async fn a_claim_that_becomes_current_again_is_checked_as_an_insert(pool: PgPool
     .expect("X supersedes its human's retired identity's claim")
     .0;
 
-    // The toggle: retire S1, add a second successor S2, re-open S1.
+    // The toggle: retire S1, add a second successor S2, re-open S1. Since
+    // 123 (SEC-R4-1) X itself may not add S2 (l1 was already restated once),
+    // so S2 is the privileged session's custodial restatement, which keeps
+    // 122's rule; the re-open check is what is measured here.
     update(RETIRE, s1, None).await.expect("retire S1");
-    let s2 = pose_successor(&pool, x, &ga, legacy, a_group, l1)
-        .await
-        .expect("S2: l1 has no current successor, so it is inherited");
+    assert_opl01(
+        pose_successor(&pool, x, &ga, legacy, a_group, l1).await,
+        "X restating l1 a second time",
+    );
+    let s2 = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, supersedes) \
+         VALUES ($1, 'privileged restatement of l1', $2, 0.5, $3, true, 'public', $4, $5)",
+    )
+    .bind(s2)
+    .bind(s2.as_bytes().repeat(2))
+    .bind(legacy)
+    .bind(a_group)
+    .bind(l1)
+    .execute(&pool)
+    .await
+    .expect("S2: a privileged session restates l1 (no current successor)");
     assert_opl01(
         update(REOPEN, s1, None).await.map(|_| s1),
         "re-opening S1 while S2 is l1's current successor",
@@ -2814,4 +2832,133 @@ async fn a_legacy_self_loop_retires_but_never_reopens_as_its_own_successor(pool:
         .map(|_| retired),
         "re-opening a retired legacy self-loop under the retired identity",
     );
+}
+
+/// Delta review round 4 SEC-R4-1 (migration 123): on an application session
+/// a retired identity's claim is RESTATED AT MOST ONCE, ever. 122's inherited
+/// test asked only for "no other CURRENT successor", so retiring a successor
+/// re-admitted its predecessor: retire S1, restate S1 (S2) AND restate P again
+/// (S3), and the count of current claims under the retired identity doubles
+/// every round with no re-open at all. Now a predecessor that already has a
+/// successor by the same author (current or retired) is not inherited. A
+/// privileged session keeps 122's rule, so a custodial revision of a
+/// canonical claim whose retired duplicates point at it still works.
+///
+/// Verified to fail: the new `NOT EXISTS` (any same-author successor) clause
+/// removed, i.e. 122's "no other CURRENT successor" alone -> the fork's
+/// second restatement of P lands and two current claims descend from P.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retired_identity_is_restated_at_most_once(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+    link_live(&pool, x, a).await;
+    let p = insert_claim(&pool, legacy, a_group).await.expect("P");
+    let q = insert_claim(&pool, legacy, a_group).await.expect("Q");
+    let canonical = insert_claim(&pool, legacy, Uuid::nil())
+        .await
+        .expect("a corpus canonical");
+    let dup = insert_claim(&pool, legacy, Uuid::nil())
+        .await
+        .expect("its duplicate");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy identity's retired tie to A");
+    }
+    // The dedup act's shape: the duplicate retired, pointing at the canonical.
+    sqlx::query("UPDATE claims SET supersedes = $2, is_current = false WHERE id = $1")
+        .bind(dup)
+        .bind(canonical)
+        .execute(&pool)
+        .await
+        .expect("mark the duplicate");
+    assert!(arm(&pool).await, "the database arms");
+    let ga = [a_group];
+    let current_under_legacy = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "WITH RECURSIVE d AS (SELECT id, is_current FROM claims WHERE supersedes = $1 \
+                 UNION SELECT c.id, c.is_current FROM claims c JOIN d ON c.supersedes = d.id) \
+                 SELECT count(*) FROM d JOIN claims c USING (id) \
+                  WHERE COALESCE(d.is_current, true) AND c.agent_id = $2",
+            )
+            .bind(p)
+            .bind(legacy)
+            .fetch_one(&pool)
+            .await
+            .expect("descendants")
+        }
+    };
+
+    // The fork, on X's application session.
+    let s1 = as_app_stamped(&pool, x, &ga, |mut conn| async move {
+        let r = supersede_on(&mut conn, p).await;
+        (conn, r)
+    })
+    .await
+    .expect("step 1: the real supersede act restates P")
+    .0;
+    update_as(
+        &pool,
+        x,
+        &ga,
+        "UPDATE claims SET is_current = false WHERE id = $1",
+        s1,
+    )
+    .await
+    .expect("step 2: retire S1");
+    pose_successor(&pool, x, &ga, legacy, a_group, s1)
+        .await
+        .expect("step 3: S1 has never been restated, so S2 is inherited");
+    assert_opl01(
+        pose_successor(&pool, x, &ga, legacy, a_group, p).await,
+        "step 4: P was already restated (S1, retired): a second restatement",
+    );
+    assert_eq!(
+        current_under_legacy().await,
+        1,
+        "at most one current restatement descends from P"
+    );
+
+    // A privileged session keeps 122's rule: Q, restated and retired, is
+    // restated again by the maintenance DSN.
+    let r1 = as_app_stamped(&pool, x, &ga, |mut conn| async move {
+        let r = supersede_on(&mut conn, q).await;
+        (conn, r)
+    })
+    .await
+    .expect("X restates Q")
+    .0;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(r1)
+        .execute(&pool)
+        .await
+        .expect("retire the restatement");
+    let again = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, supersedes) \
+         VALUES ($1, 'privileged second restatement', $2, 0.5, $3, true, 'public', $4, $5)",
+    )
+    .bind(again)
+    .bind(again.as_bytes().repeat(2))
+    .bind(legacy)
+    .bind(a_group)
+    .bind(q)
+    .execute(&pool)
+    .await
+    .expect("a privileged session restates Q again (custodial)");
+
+    // ...and a custodial revision of a canonical with a retired same-author
+    // duplicate pointing at it.
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        supersede_on(&mut conn, canonical)
+            .await
+            .expect("the maintenance session revises the canonical");
+        (conn, ())
+    })
+    .await;
 }
