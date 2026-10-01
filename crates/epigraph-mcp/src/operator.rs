@@ -43,7 +43,10 @@
 //! Both HTTP checks also refuse a signer that is anyone's OPERATOR
 //! (`AgentRepository::operates_agents`, migration 107 section 9): on
 //! `--allow-unauthenticated-http` every caller IS the signer, and would satisfy
-//! "caller is the operator of the claim's author" for every linked agent.
+//! "caller is the operator of the claim's author" for every linked agent. And
+//! both refuse a signer that is a registered HUMAN operator (migration 122),
+//! operating anyone or not: principal-less callers and admin-borrowed writes
+//! are written as the signer, so each would author claims as that person.
 //!
 //! ## Why the gate stays strict after batch HTTP-id
 //!
@@ -125,8 +128,11 @@ pub fn check_operator_transport(
 
 /// Refuse to serve HTTP when this process's signer agent already has an
 /// operator link of either kind (see the module doc for why the author record,
-/// retired links included, is the predicate), or is itself some agent's
-/// OPERATOR (migration 107 section 9).
+/// retired links included, is the predicate), is itself some agent's
+/// OPERATOR (migration 107 section 9), or is a registered HUMAN operator
+/// (migration 122): principal-less callers and admin-borrowed writes are
+/// written as the signer, so a human signer would put every such caller's
+/// words in that person's mouth, before it operates any agent.
 ///
 /// Read-only: the signer is looked up by public key and NOT created, so a
 /// listener whose signer has never been registered passes without writing.
@@ -176,7 +182,29 @@ pub async fn refuse_operated_http_signer(
     if operates {
         return Err(operator_http_signer_reason(agent_id));
     }
+    let binding = AgentRepository::author_binding(&mut conn, agent_id)
+        .await
+        .map_err(|e| {
+            format!(
+                "could not check whether this listener's signer agent {agent_id} is a registered \
+                 human operator (is migration 122 applied?): {e}"
+            )
+        })?;
+    if binding.as_deref() == Some("human_operator") {
+        return Err(human_http_signer_reason(agent_id));
+    }
     Ok(())
+}
+
+/// The refusal text for a signer that is a registered HUMAN OPERATOR
+/// (migration 122 section 1c).
+fn human_http_signer_reason(agent_id: Uuid) -> String {
+    format!(
+        "this HTTP listener's signer agent {agent_id} is a registered human operator. Every \
+         principal-less caller of this listener, and every admin-borrowed write, is written as \
+         the signer, so each would author claims as that human. Run the listener under a \
+         different --agent-key; a listener's signer is never a person."
+    )
 }
 
 /// The refusal text shared by the startup gate and the per-call guard.
@@ -251,13 +279,14 @@ pub async fn refuse_linked_http_signer(server: &EpiGraphMcpFull) -> Result<(), M
 }
 
 /// The operator half of [`refuse_linked_http_signer`]: refuse while this
-/// server's signer is anyone's OPERATOR (107 section 9). Fails closed.
+/// server's signer is anyone's OPERATOR (107 section 9), or a registered human
+/// operator (migration 122). Fails closed.
 async fn refuse_operator_http_signer(
     server: &EpiGraphMcpFull,
     agent_id: Uuid,
 ) -> Result<(), McpError> {
     match AgentRepository::operates_agents_pool(&server.pool, agent_id).await {
-        Ok(false) => Ok(()),
+        Ok(false) => refuse_human_http_signer(server, agent_id).await,
         Ok(true) => {
             let reason = operator_http_signer_reason(agent_id);
             tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
@@ -272,6 +301,37 @@ async fn refuse_operator_http_signer(
             Err(internal_error(format!(
                 "refused: could not verify that this HTTP listener's signer agent {agent_id} \
                  is no agent's operator: {e}"
+            )))
+        }
+    }
+}
+
+/// The human half of [`refuse_linked_http_signer`]: refuse while this server's
+/// signer is a registered human operator (migration 122). Fails closed.
+async fn refuse_human_http_signer(
+    server: &EpiGraphMcpFull,
+    agent_id: Uuid,
+) -> Result<(), McpError> {
+    let binding = match server.pool.acquire().await {
+        Ok(mut conn) => AgentRepository::author_binding(&mut conn, agent_id).await,
+        Err(e) => Err(epigraph_db::DbError::from(e)),
+    };
+    match binding {
+        Ok(b) if b.as_deref() == Some("human_operator") => {
+            let reason = human_http_signer_reason(agent_id);
+            tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
+            Err(internal_error(format!("refused: {reason}")))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::error!(
+                agent = %agent_id,
+                error = %e,
+                "refusing an HTTP tool call: could not check whether the signer is a human operator"
+            );
+            Err(internal_error(format!(
+                "refused: could not verify that this HTTP listener's signer agent {agent_id} \
+                 is not a registered human operator: {e}"
             )))
         }
     }

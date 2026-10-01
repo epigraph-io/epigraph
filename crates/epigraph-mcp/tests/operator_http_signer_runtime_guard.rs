@@ -38,6 +38,7 @@ const ACCEPT: &str = "application/json, text/event-stream";
 const SESSION_HEADER: &str = "Mcp-Session-Id";
 const REFUSAL: &str = "has an operator link to";
 const OPERATOR_REFUSAL: &str = "is the operator of linked agents";
+const HUMAN_REFUSAL: &str = "is a registered human operator";
 
 fn token() -> String {
     let (token, _) = JwtConfig::from_secret(SECRET)
@@ -186,6 +187,9 @@ enum LinkKind {
     Retired,
     /// The signer becomes some OTHER agent's operator (107 section 9).
     Operator,
+    /// The signer is registered as a HUMAN operator, operating nobody yet
+    /// (migration 122; delta review round 2 SEC-R2-6).
+    Human,
 }
 
 async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind: LinkKind) {
@@ -196,6 +200,7 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
         LinkKind::Acting => 0x71,
         LinkKind::Retired => 0x72,
         LinkKind::Operator => 0x73,
+        LinkKind::Human => 0x75,
     };
     let signer = AgentSigner::from_bytes(&[seed; 32]).expect("signer");
     let public_key = signer.public_key();
@@ -248,6 +253,9 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
                 .await
                 .expect("link an agent with the SIGNER as its operator");
         }
+        LinkKind::Human => {
+            fixture::make_human_operator(&pool, signer_agent).await;
+        }
     }
     drop(conn);
 
@@ -259,6 +267,9 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
         }
         LinkKind::Operator => {
             after.contains(OPERATOR_REFUSAL) && after.contains(&signer_agent.to_string())
+        }
+        LinkKind::Human => {
+            after.contains(HUMAN_REFUSAL) && after.contains(&signer_agent.to_string())
         }
     };
     assert!(
@@ -276,6 +287,26 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_signer_that_becomes_an_operator_after_startup_refuses_the_next_http_call(pool: PgPool) {
     a_link_recorded_after_startup_refuses_the_next_call(pool, LinkKind::Operator).await;
+}
+
+/// Delta review round 2 SEC-R2-6: a signer registered as a HUMAN operator
+/// that operates no agent yet (a second human, say). Principal-less callers and
+/// admin-borrowed writes are written as the signer, so each would author as
+/// that person: refused per call, and at startup.
+///
+/// Verified to fail: `refuse_human_http_signer` made to return `Ok(())` -> the
+/// next call is dispatched; the startup gate's `human_operator` check removed ->
+/// `refuse_operated_http_signer` returns `Ok`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_signer_registered_as_a_human_is_refused_per_call_and_at_startup(pool: PgPool) {
+    a_link_recorded_after_startup_refuses_the_next_call(pool.clone(), LinkKind::Human).await;
+    let key = AgentSigner::from_bytes(&[0x75; 32])
+        .expect("signer")
+        .public_key();
+    let refused = epigraph_mcp::operator::refuse_operated_http_signer(&pool, &key)
+        .await
+        .expect_err("a listener must not START as a registered human's signer");
+    assert!(refused.contains(HUMAN_REFUSAL), "{refused}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
