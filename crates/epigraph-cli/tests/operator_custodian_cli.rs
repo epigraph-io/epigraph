@@ -122,10 +122,14 @@ async fn grant_role_needs_an_explicit_window(pool: PgPool) {
 /// even its audit row); `--apply` writes one assignment that `list` shows; a
 /// grant to an agent is refused CUS01 (exit 1); an end is a dry run until
 /// `--apply`, and a second end reports ALREADY-ENDED and changes nothing.
+/// `list --role` narrows to one role, and an ended assignment is listed only
+/// with `--include-ended`.
 ///
 /// Verified to fail: `custodian::grant` committing on a dry run -> the dry run
 /// writes an assignment; `custodian::end` committing on a dry run -> the dry
-/// run ends it.
+/// run ends it; `RoleAssignmentRepository::list` ignoring its role filter ->
+/// the custodian appears under `--role role:auditor`; ignoring
+/// `include_ended` -> the ended assignment is listed by default.
 #[sqlx::test(migrations = "../../migrations")]
 async fn grant_list_and_end_a_custodian_assignment(pool: PgPool) {
     let (h, _) = fixture::seed_human_operator(&pool, "human").await;
@@ -197,7 +201,46 @@ async fn grant_list_and_end_a_custodian_assignment(pool: PgPool) {
     assert_eq!(refused.code, 1, "{}", refused.show());
     assert!(refused.stderr.contains("CUS01"), "{}", refused.show());
 
+    // `--role` narrows the listing (review TST-MTC-12).
+    let (h2, _) = fixture::seed_human_operator(&pool, "auditor").await;
+    let h2_s = h2.to_string();
+    let auditor = run_op(
+        &pool,
+        &[
+            "grant-role",
+            "--role",
+            "role:auditor",
+            "--holder",
+            &h2_s,
+            "--open-ended",
+            "--granted-by",
+            &holder,
+            "--reason",
+            "an auditor",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(auditor.code, 0, "{}", auditor.show());
     let id_s = id.to_string();
+    let auditors = run_op(&pool, &["list-role-assignments", "--role", "role:auditor"]).await;
+    assert_eq!(auditors.code, 0, "{}", auditors.show());
+    assert!(
+        auditors.stdout.contains(&h2_s) && !auditors.stdout.contains(&id_s),
+        "--role role:auditor lists the auditor only: {}",
+        auditors.show()
+    );
+    let custodians = run_op(
+        &pool,
+        &["list-role-assignments", "--role", "role:platform-custodian"],
+    )
+    .await;
+    assert!(
+        custodians.stdout.contains(&id_s) && !custodians.stdout.contains(&h2_s),
+        "--role role:platform-custodian lists the custodian only: {}",
+        custodians.show()
+    );
+
     let end = |apply: bool| {
         let mut args = vec![
             "end-role-assignment",
@@ -225,6 +268,20 @@ async fn grant_list_and_end_a_custodian_assignment(pool: PgPool) {
     let again = run_op(&pool, &end(true)).await;
     assert_eq!(again.code, 0, "{}", again.show());
     assert!(again.stdout.contains("ALREADY-ENDED"), "{}", again.show());
+
+    // An ended assignment is listed only with --include-ended.
+    let live_only = run_op(&pool, &["list-role-assignments"]).await;
+    assert!(
+        !live_only.stdout.contains(&id_s),
+        "the default listing omits an ended assignment: {}",
+        live_only.show()
+    );
+    let all = run_op(&pool, &["list-role-assignments", "--include-ended"]).await;
+    assert!(
+        all.stdout.contains(&id_s),
+        "--include-ended lists it: {}",
+        all.show()
+    );
 }
 
 /// `epigraph-instance-admin grant|revoke` refuse (exit 1) and name the

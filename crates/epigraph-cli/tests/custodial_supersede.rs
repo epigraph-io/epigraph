@@ -138,7 +138,8 @@ async fn supersede(pool: &PgPool, claim: &str, assignment: &str, actor: &str, ap
 /// predecessor, and one `platform.custodial_act` names the assignment. A dry
 /// run writes nothing. An assignment of another holder, an ended one and one
 /// not yet begun are CUS04 with nothing written; a claim the world group
-/// does not own is refused (exit 1) without `--allow-owned`.
+/// does not own is refused (exit 1) without `--allow-owned` and revised, under
+/// its own author and group, with it.
 ///
 /// Verified to fail: the edge migration skipped (`migrate_superseded_edges_conn`
 /// not called) -> the strengthening edge stays on the predecessor; the act
@@ -146,7 +147,8 @@ async fn supersede(pool: &PgPool, claim: &str, assignment: &str, actor: &str, ap
 /// then the record attempted) -> the CUS04 run with another holder's
 /// assignment leaves the predecessor retired; the assignment check skipped
 /// (`record_custodial_act` not called) -> the other holder's assignment
-/// revises the claim and no act is recorded.
+/// revises the claim and no act is recorded; the `--allow-owned` check made
+/// unconditional -> the owned claim is never revised.
 #[sqlx::test(migrations = "../../migrations")]
 async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
     let (a, a_group) = fixture::seed_human_operator(&pool, "custodian-a").await;
@@ -247,11 +249,49 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
     let unl = supersede(&pool, &c_unl_s, &ia_s, &a_s, true).await;
     assert_eq!(unl.code, 0, "{}", unl.show());
     assert!(!current(&pool, c_unl).await);
+    let unl_successor: (Uuid, Uuid, String, bool) = sqlx::query_as(
+        "SELECT agent_id, owner_group_id, visibility, COALESCE(is_current, true) \
+           FROM claims WHERE supersedes = $1",
+    )
+    .bind(c_unl)
+    .fetch_one(&pool)
+    .await
+    .expect("one successor of the unlinked author's claim");
+    assert_eq!(
+        (
+            unl_successor.0,
+            unl_successor.1,
+            unl_successor.2.as_str(),
+            unl_successor.3
+        ),
+        (unlinked, WORLD, "public", true),
+        "the unlinked author's successor: its author, world/public, current"
+    );
 
-    // Not platform corpus: refused without --allow-owned.
+    // Not platform corpus: refused without --allow-owned, revised with it
+    // (operator decision OQ-8's override; review TST-MTC-12).
     let owned = supersede(&pool, &c_own_s, &ia_s, &a_s, true).await;
     assert_eq!(owned.code, 1, "{}", owned.show());
     assert!(current(&pool, c_own).await);
+    let mut args = supersede_args(&c_own_s, &ia_s, &a_s, true);
+    args.push("--allow-owned".to_string());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let allowed = run_op(&pool, &refs).await;
+    assert_eq!(allowed.code, 0, "{}", allowed.show());
+    assert!(!current(&pool, c_own).await, "the owned claim is retired");
+    let own_successor: (Uuid, Uuid, bool) = sqlx::query_as(
+        "SELECT agent_id, owner_group_id, COALESCE(is_current, true) \
+           FROM claims WHERE supersedes = $1",
+    )
+    .bind(c_own)
+    .fetch_one(&pool)
+    .await
+    .expect("one successor of the owned claim");
+    assert_eq!(
+        own_successor,
+        (a, a_group, true),
+        "the owned claim's successor keeps its author and its group"
+    );
 
     // An ENDED assignment, and one not yet begun: CUS04, nothing written.
     let ended: bool =
@@ -278,5 +318,9 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
     let r = supersede(&pool, &c_more2_s, &future_s, &b_s, true).await;
     assert_eq!(r.code, 1, "an assignment not yet begun: {}", r.show());
     assert!(current(&pool, c_more).await && current(&pool, c_more2).await);
-    assert_eq!(acts(&pool).await.len(), 2, "only the two applied revisions");
+    assert_eq!(
+        acts(&pool).await.len(),
+        3,
+        "only the three applied revisions (two corpus, one --allow-owned)"
+    );
 }
