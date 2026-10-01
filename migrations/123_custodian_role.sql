@@ -316,6 +316,42 @@ CREATE TRIGGER role_assignments_guard_insert
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_role_assignments_guard_insert();
 
 -- ===================================================================
+-- 3. WHO HOLDS A ROLE: SUBJECT-BOUND READERS
+--
+-- `epigraph_role_assignment_for(principal, role, at)` names the live
+-- assignment (the earliest by valid_from, then id) of `role` held by
+-- `principal` at `at`; `epigraph_holds_role` is its two-valued boolean. Both
+-- are EXECUTE-able by the application role, so both BIND THE SUBJECT IN THE
+-- BODY exactly as 083 does for `epigraph_is_instance_admin`: the answer is
+-- NULL / false unless `principal` is the session principal or the session is
+-- privileged (`epigraph_bypass()`, which reads `session_user`). Never
+-- `epigraph_definer_bypass()`: it reads `current_user`, which inside this
+-- frame is the owner, so it is always true here and would turn the readers
+-- into a roster oracle.
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_role_assignment_for(
+    p_principal uuid, p_role text, p_at timestamptz)
+RETURNS uuid
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT CASE
+             WHEN p_principal IS NOT NULL
+              AND (p_principal = public.epigraph_principal_id() OR public.epigraph_bypass())
+             THEN public.epigraph_live_role_assignment(p_principal, p_role, p_at)
+           END
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_role_assignment_for(uuid, text, timestamptz) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION public.epigraph_holds_role(
+    p_principal uuid, p_role text, p_at timestamptz)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT public.epigraph_role_assignment_for(p_principal, p_role, p_at) IS NOT NULL
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_holds_role(uuid, text, timestamptz) FROM PUBLIC;
+
+-- ===================================================================
 -- OWNERSHIP AND GRANTS (guarded, as every such block since 060 is)
 --
 -- 077's default privileges hand the application role DML on every new
@@ -339,11 +375,21 @@ DO $$ BEGIN
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT SELECT, INSERT, UPDATE ON public.platform_roles, '
                 'public.role_assignments TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_role_assignment_for(uuid, text, timestamptz) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_holds_role(uuid, text, timestamptz) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_role_assignment_for(uuid, text, timestamptz), '
+                'public.epigraph_holds_role(uuid, text, timestamptz) TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'REVOKE ALL ON public.platform_roles, public.role_assignments FROM epigraph_app';
         EXECUTE 'GRANT SELECT ON public.platform_roles, public.role_assignments TO epigraph_app';
         EXECUTE 'REVOKE EXECUTE ON FUNCTION '
                 'public.epigraph_live_role_assignment(uuid, text, timestamptz) FROM epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_role_assignment_for(uuid, text, timestamptz), '
+                'public.epigraph_holds_role(uuid, text, timestamptz) TO epigraph_app';
     END IF;
 END $$;

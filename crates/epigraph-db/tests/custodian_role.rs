@@ -460,3 +460,195 @@ async fn the_grantor_rule(pool: PgPool) {
         "an auditor is no grantor",
     );
 }
+
+// =====================================================================
+// T4 / T5. Holding a role: bounded in time, bound to its subject.
+// =====================================================================
+
+/// `epigraph_holds_role(principal, role, at)` on a privileged session.
+async fn holds_at(pool: &PgPool, who: Uuid, role: &str, at: &str) -> bool {
+    sqlx::query_scalar(&format!(
+        "SELECT public.epigraph_holds_role($1, $2, {at})"
+    ))
+    .bind(who)
+    .bind(role)
+    .fetch_one(pool)
+    .await
+    .expect("holds_role")
+}
+
+/// An assignment confers the role on `[valid_from, valid_to)` and nowhere
+/// else; an ended assignment confers nothing at any time; and a holder whose
+/// human registration is revoked holds nothing, its assignment untouched.
+///
+/// Verified to fail: `p_at < ra.valid_to` widened to `<=` -> holds at
+/// valid_to; `ra.revoked_at IS NULL` dropped -> holds after the revoke; the
+/// `epigraph_is_human_operator` re-check dropped -> holds after the human is
+/// revoked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn holding_is_bounded_in_time(pool: PgPool) {
+    let (h, _) = fixture::seed_human_operator(&pool, "h").await;
+    let (h2, _) = fixture::seed_human_operator(&pool, "h2").await;
+    let id = maint_insert(&pool, CUSTODIAN, h, "0", Some("1 day"), None)
+        .await
+        .expect("grant h");
+    let id2 = maint_insert(&pool, CUSTODIAN, h2, "0", None, Some(h))
+        .await
+        .expect("grant h2");
+    let window = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT quote_literal(valid_from) || '::timestamptz', \
+                        quote_literal(valid_to) || '::timestamptz' \
+                   FROM role_assignments WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("window")
+        }
+    };
+    let (from, to) = window(id).await;
+    let to = to.expect("bounded");
+    let micro = " - interval '1 microsecond'";
+    assert!(
+        !holds_at(&pool, h, CUSTODIAN, &format!("{from}{micro}")).await,
+        "before"
+    );
+    assert!(holds_at(&pool, h, CUSTODIAN, &from).await, "at valid_from");
+    assert!(
+        holds_at(&pool, h, CUSTODIAN, &format!("{to}{micro}")).await,
+        "inside"
+    );
+    assert!(
+        !holds_at(&pool, h, CUSTODIAN, &to).await,
+        "at valid_to (exclusive)"
+    );
+    assert!(!holds_at(&pool, h, AUDITOR, &from).await, "another role");
+    let assignment: Option<Uuid> =
+        sqlx::query_scalar("SELECT public.epigraph_role_assignment_for($1, $2, now())")
+            .bind(h)
+            .bind(CUSTODIAN)
+            .fetch_one(&pool)
+            .await
+            .expect("assignment_for");
+    assert_eq!(assignment, Some(id), "the assignment is named");
+
+    // Ended: nothing, at any time inside the old window.
+    maint_exec(
+        &pool,
+        "UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
+                revoked_reason = 'ended' WHERE id = $1",
+        id,
+    )
+    .await
+    .expect("end");
+    assert!(
+        !holds_at(&pool, h, CUSTODIAN, "now()").await,
+        "after the revoke"
+    );
+    assert!(
+        !holds_at(&pool, h, CUSTODIAN, &from).await,
+        "the past is re-read too"
+    );
+
+    // The human registration revoked: the assignment confers nothing.
+    let (from2, _) = window(id2).await;
+    assert!(holds_at(&pool, h2, CUSTODIAN, &from2).await, "h2 holds");
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_revoke_human_operator($1, 'test')")
+            .bind(h2)
+            .execute(&mut *conn)
+            .await
+            .expect("revoke the human");
+        (conn, ())
+    })
+    .await;
+    assert!(
+        !holds_at(&pool, h2, CUSTODIAN, &from2).await,
+        "a revoked human holds nothing"
+    );
+    let still_live: bool =
+        sqlx::query_scalar("SELECT revoked_at IS NULL FROM role_assignments WHERE id = $1")
+            .bind(id2)
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+    assert!(still_live, "the assignment row itself is untouched");
+}
+
+/// The subject is bound in the body (083's rule): an application session
+/// learns only about its OWN principal, never about another agent; a
+/// privileged session asks about anyone. Unstamped, nothing.
+///
+/// Verified to fail: `epigraph_definer_bypass()` added as a disjunct of the
+/// subject test (it is always true in the definer frame) -> X learns Y's
+/// assignment; the principal test dropped -> the same.
+#[sqlx::test(migrations = "../../migrations")]
+async fn holds_role_is_subject_bound(pool: PgPool) {
+    let (x, xg) = fixture::seed_human_operator(&pool, "x").await;
+    let (y, yg) = fixture::seed_human_operator(&pool, "y").await;
+    let id = maint_insert(&pool, CUSTODIAN, y, "0", None, None)
+        .await
+        .expect("grant y");
+    let ask = |principal: Option<Uuid>, groups: Vec<Uuid>| {
+        let pool = pool.clone();
+        async move {
+            as_app(&pool, principal, &groups, |mut conn| async move {
+                let r: (bool, Option<Uuid>) = sqlx::query_as(
+                    "SELECT public.epigraph_holds_role($1, $2, now()), \
+                            public.epigraph_role_assignment_for($1, $2, now())",
+                )
+                .bind(y)
+                .bind(CUSTODIAN)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("ask");
+                (conn, r)
+            })
+            .await
+        }
+    };
+    assert_eq!(ask(Some(x), vec![xg]).await, (false, None), "X asks about Y");
+    assert_eq!(ask(None, vec![]).await, (false, None), "unstamped asks about Y");
+    assert_eq!(
+        ask(Some(y), vec![yg]).await,
+        (true, Some(id)),
+        "Y asks about itself"
+    );
+    let privileged: (bool, Option<Uuid>) = sqlx::query_as(
+        "SELECT public.epigraph_holds_role($1, $2, now()), \
+                public.epigraph_role_assignment_for($1, $2, now())",
+    )
+    .bind(y)
+    .bind(CUSTODIAN)
+    .fetch_one(&pool)
+    .await
+    .expect("privileged ask");
+    assert_eq!(
+        privileged,
+        (true, Some(id)),
+        "a privileged session asks about Y"
+    );
+
+    for (func, granted) in [
+        ("public.epigraph_holds_role(uuid, text, timestamptz)", true),
+        (
+            "public.epigraph_role_assignment_for(uuid, text, timestamptz)",
+            true,
+        ),
+        (
+            "public.epigraph_live_role_assignment(uuid, text, timestamptz)",
+            false,
+        ),
+    ] {
+        let has: bool =
+            sqlx::query_scalar("SELECT has_function_privilege('epigraph_app', $1, 'EXECUTE')")
+                .bind(func)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+        assert_eq!(has, granted, "epigraph_app EXECUTE on {func}");
+    }
+}
