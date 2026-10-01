@@ -569,8 +569,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// these, and any net growth fails here as well.
 /// 267 -> 264 in the operator-binding delta review: `create_claim`,
 /// `create_hypothesis` and `create_challenge` now write their claim on
-/// `AppState::begin_claim_write`.
-const HIGH_WATER: usize = 264;
+/// `AppState::begin_claim_write`. 264 -> 263 in its round 2: REST
+/// `evolve_step` authors as the caller's `ViewerExtractor` principal and no
+/// longer resolves a viewer on `state.db_pool`.
+const HIGH_WATER: usize = 263;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
