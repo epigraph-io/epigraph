@@ -362,9 +362,9 @@ authenticated principal is not the author, only when that WRITER is bound too
 (see "Who is checked" below; the supersede exceptions, restating a retired
 claim, are under "A linked agent writes only where its own operator
 writes"). `claims.agent_id` of an existing claim is changed
-only by a privileged session or a platform-custodian principal (migration 123,
-"The custodian role" below; the custodian's relief is audited), `OPL02` for
-anyone else, and is then checked like an insert. Bound means:
+only by a privileged session (since migration 123, not by a platform-custodian
+principal on an application session either: "The custodian role" below),
+`OPL02` for anyone else, and is then checked like an insert. Bound means:
 
 * (a) a **human operator**: an agent with a live row in the maintenance-only
   registry `human_operators` whose recorded OAuth client (the one client the
@@ -465,21 +465,19 @@ path a human is scoped like everyone). The
 same rule guards the membership door: a `writer`/`admin` row for a live-linked
 agent is refused unless its operator writes that group, so another human
 cannot enrol my agent to write evidence, edges or beliefs in their group. Both
-refusals are SQLSTATE **`OPL02`**. Only admin access crosses groups: a
-privileged (maintenance) session and a session whose principal holds
-`role:platform-custodian` (migration 123: a registered human's live
-assignment) are relieved of `OPL02`, and every relief a custodian principal
-receives writes one `platform.custodial_exempt` audit row naming the
-assignment and the check. Neither is relieved of `OPL01`, except for a
-supersede, whose successor inherits a retired predecessor's author and group.
-The privileged session's supersede is admitted whatever that author's
-binding, retired-linked or unlinked (the platform corpus's edit path,
-"Existing rows"). A custodian principal's supersede of another author's
-claim is admitted when that author is a RETIRED identity of any human, and
-refused `OPL01` when the author is unlinked. A custodian writing as itself is
-never relieved of its own binding, and since migration 123 its re-open of a
-claim, and any change of an existing claim's lineage, is checked exactly as an
-application session's (the relief there is the privileged session's alone). A consequence: an
+refusals are SQLSTATE **`OPL02`**. Only a privileged (maintenance) session
+crosses groups and humans. Since migration 123 (operator ruling OQ-1 (b)) a
+session whose principal holds `role:platform-custodian` is relieved of
+nothing on an application session: the principal is a stamp the application
+role sets, and holding the role is not using it. A custodial write is made on
+the maintenance DSN with `epigraph-operator custodial-supersede`, which
+records a `platform.custodial_act` against the actor's live assignment. The
+privileged session is not relieved of `OPL01` either, except for a supersede,
+whose successor inherits a retired predecessor's author and group: that
+supersede is admitted whatever the author's binding, retired-linked or
+unlinked (the platform corpus's edit path, "Existing rows"). A re-open of a
+claim, and any change of an existing claim's lineage, on an application
+session is checked exactly as that session's insert would be. A consequence: an
 agent whose membership in its operator's group was REVOKED writes nothing (its
 default declaration falls back to its own personal group, which `OPL02`
 refuses); ending an agent's writes is a revoke or a retire. Residual, named: a
@@ -600,8 +598,8 @@ application role itself, which is how `ScopedPool` stamps a request, and
 tenancy row security trusts the same stamp. A holder of the APPLICATION DSN
 that issues raw SQL can therefore stamp any identity it knows the id of (agent
 and human ids are not secrets: they author ordinary claims): a bound agent, a
-human, or a platform custodian, and with the last be relieved of `OPL02` (each
-relief audited, so the stamp is at least recorded). The
+human, or a platform custodian (since migration 123 the last gains it
+nothing: no application session is relieved of `OPL02`). The
 binding constrains the code paths that stamp from an authenticated viewer; it
 is not a defence against a process that holds the application DSN and
 misbehaves (a compromised request unit, or any agent container given that
@@ -747,9 +745,11 @@ timestamped assignment (`role_assignments`: holder, `valid_from`,
 reason, and an end stamp). It replaces `instance_admins` as the source of
 admin authority: `epigraph_is_instance_admin` keeps its name, signature and
 subject binding and answers "holds role:platform-custodian now", so every
-policy and check that asked it (privatization, the security-event read arm,
-the `OPL02` relief) switched at once. `role:auditor` reads the platform audit
-trail and confers nothing else.
+policy that asked it (privatization, the security-event read arm) switched at
+once. It no longer relieves `OPL02`: 122's `epigraph_operator_scope_exempt()`
+is re-bodied to the privileged session alone (operator ruling OQ-1 (b)), so
+the role confers no write authority on an application session. `role:auditor`
+reads the platform audit trail and confers nothing else.
 
 * **Agents never hold a role** (`CUS01`): the holder must be a registered human
   (`epigraph_is_human_operator`) that is not itself linked to a human as an
@@ -769,12 +769,9 @@ trail and confers nothing else.
   `end-role-assignment`, `list-role-assignments`. The application role reads
   only its own assignments. `epigraph-instance-admin grant|revoke` refuse and
   name these.
-* **Audited**: every grant and end, every custodial act and every `OPL02`
-  relief a custodian principal is granted is one `security_events` row whose
-  type starts with `platform.` (any case) and whose details name the
-  assignment. A relief row records the relief granted, not necessarily a
-  write: the request path's own pre-checks (workflow ingest binds its real
-  caller that way) are relief points too. No application session writes a
+* **Audited**: every grant and end and every custodial act is one
+  `security_events` row whose type starts with `platform.` (any case) and
+  whose details name the assignment. No application session writes a
   `platform.` row, and no row is ever edited, deleted or back-dated. The
   trail is NOT proof against a holder of the maintenance DSN: `granted_by`
   and an act's actor are UUIDs that login supplies, checked for a live
@@ -807,8 +804,9 @@ trail and confers nothing else.
 Not yet built (the elevation batch): activating the role per session
 (time-boxed, passkey-confirmed), per-act confirmation, audited READS,
 group-held assignments, and visibility of the trail to the persons it names.
-Until then a custodian principal's relief on an application session is
-standing (but audited), and every custodial write is a maintenance act.
+Until then the role confers no authority on an application session beyond
+the privatization routes' gate and the audit-trail read, and every custodial
+write is a maintenance act.
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 

@@ -836,16 +836,20 @@ Current reservation:
   (same signature, grants and subject binding). `security_events`'s
   `platform.` prefix reserved to definers (a RESTRICTIVE insert policy, 117/118's
   shape); every grant, end, custodial act (`epigraph_record_custodial_act`,
-  `CUS04` unless the actor's assignment is live) and custodian `OPL02` relief
-  (`epigraph_custodial_relief`) writes one, naming the assignment; reader
+  `CUS04` unless the actor's assignment is live) writes one, naming the
+  assignment; reader
   `epigraph_platform_audit`. Each assignment is projected as an `OCCUPIES` edge
   (never read for authority; ratchet-tested); the role nodes are refused as
   link or registry subjects. Live `instance_admins` rows of registered humans
   are carried over from their `granted_at`; others are skipped loudly; the table
   is then FROZEN for every role but a mirrored `revoked_at` stamp. 122's
-  `epigraph_require_operator_scope` / `_writer_scope` / `_attributable` (now
-  VOLATILE) and the claims trigger body are re-applied with the audited relief
-  and the round-4 fixes: a claim never supersedes itself (refused first, on
+  `epigraph_operator_scope_exempt` is re-bodied to `epigraph_bypass()` alone
+  (operator ruling OQ-1 (b): no `OPL02` relief for a role holder on an
+  application session; custodial writes go through `epigraph-operator
+  custodial-supersede` on the maintenance DSN). 122's
+  `epigraph_require_operator_scope` / `_writer_scope` / `_attributable` (still
+  STABLE; corrected HINTs) and the claims trigger body are re-applied with the
+  round-4 fixes: a claim never supersedes itself (refused first, on
   every session); a retired identity's claim is restated at most once on an
   application session; re-open and lineage relief is the privileged session's
   alone. Registered in

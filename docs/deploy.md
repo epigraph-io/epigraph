@@ -1580,7 +1580,12 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
    instance-admin authority REGISTERED (`register-human-operator`, step 2b
    above) before 123 runs: 123 carries a live `instance_admins` row into an
    assignment only for a registered human, and skips (loudly: a NOTICE and a
-   `platform.role_migration_skipped` event) every other live row.
+   `platform.role_migration_skipped` event) every other live row. On an ARMED
+   database, also measure which application paths rely on an instance-admin
+   principal writing across groups or humans: from 123 on, no application
+   session is relieved of `OPL02` (operator ruling OQ-1 (b)), so each such
+   write is refused and moves to the maintenance DSN
+   (`custodial-supersede`, step 5).
 2. **Migrate 123** (`epigraph-migrate`, migration DSN). New tables and
    function bodies, one restrictive policy on `security_events`, and small
    triggers on `instance_admins`, `human_operators` and `operator_links`;
@@ -1616,7 +1621,8 @@ one). Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
 transaction: it stamps every live `instance_admins` row whose agent holds no
 live custodian assignment (so 083's restored body resurrects no authority
 ended after 123), drops 123's triggers, re-applies 083's and 122's function
-bodies verbatim (the round-4 fixes revert with them), drops the `platform.`
+bodies verbatim (the round-4 fixes revert with them, and 122's
+instance-admin principal relief from `OPL02` comes back), drops the `platform.`
 policy and every 123 definer, and lists the holders granted after 123, which
 exist only in `role_assignments` and are re-granted in `instance_admins` by
 hand if they must survive. It leaves the role tables, the audit rows and the
