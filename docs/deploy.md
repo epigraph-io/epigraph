@@ -1596,8 +1596,10 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
    human's own agent> (--valid-to <RFC3339> | --open-ended) --reason <text>
    --apply` (no `--granted-by` only while no live custodian exists). Then
    confirm each request unit connects as `epigraph_app` with
-   `epigraph_bypass() = false`: its boot log must say ENFORCED, never the
-   privileged-DSN ERROR line.
+   `epigraph_bypass() = false`: its boot log must carry the line that starts
+   `operator binding ENFORCED:` (with the colon), never the ERROR line that
+   starts `operator binding NOT ENFORCED for the writer on this privileged
+   DSN:`. Grep the prefix, not the word: both lines contain "ENFORCED".
 5. **Custodial revisions** of the platform corpus use
    `epigraph-operator custodial-supersede --claim <id> --content-file <f>
    --truth <x> --assignment <the actor's live assignment> --actor <the

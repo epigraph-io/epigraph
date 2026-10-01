@@ -68,7 +68,11 @@ pub const ARMED_BOOT_INFO: &str = "operator binding ENFORCED: the database is ar
 /// author write as that author, while [`ARMED_BOOT_INFO`] said ENFORCED
 /// (delta review round 4 SEC-R4-3). Same rule as [`ARMED_BOOT_INFO`]: the code
 /// appears only in parentheses, never as a refusal's `OPL0x:` prefix.
-pub const PRIVILEGED_DSN_ERROR: &str = "operator binding NOT ENFORCED for the writer on this      privileged DSN: the database is armed, but this process connects as a privileged role      (epigraph_bypass() is true), so the claims trigger checks the author column only and      ignores the stamped principal (the writer binding, OPL01, does not apply). A request unit      must connect as epigraph_app (docs/deploy.md, \"Operator binding\").";
+pub const PRIVILEGED_DSN_ERROR: &str = "operator binding NOT ENFORCED for the writer on this \
+     privileged DSN: the database is armed, but this process connects as a privileged role \
+     (epigraph_bypass() is true), so the claims trigger checks the author column only and \
+     ignores the stamped principal (the writer binding, OPL01, does not apply). A request unit \
+     must connect as epigraph_app (docs/deploy.md, \"Operator binding\").";
 
 /// What [`log_boot_state`] reports, as a value a test can compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,42 +167,52 @@ pub async fn apply_valve(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Erro
     Ok(())
 }
 
+/// The boot WARN of an armed database whose process has the valve open.
+pub const VALVE_OFF_BOOT_WARNING: &str =
+    "the database is armed for operator binding, but this process's valve is OFF";
+
+/// The boot WARN of a migrated database that is not armed.
+pub const NOT_ARMED_BOOT_WARNING: &str = "operator binding is NOT ARMED on this database: claims \
+     by agents not bound to a human operator are accepted. Arm it with `epigraph-operator \
+     arm-operator-binding --apply` once every live writer is bound (docs/deploy.md)";
+
+/// The boot WARN of a database without migration 122.
+pub const NOT_MIGRATED_BOOT_WARNING: &str = "migration 122 (operator binding) is not applied to \
+     this database; claim writes through default declarations fail closed until it is";
+
+/// The level and the line [`log_boot_state`] emits for `state`: a pure
+/// mapping, so a test pins that a privileged DSN is an ERROR naming
+/// [`PRIVILEGED_DSN_ERROR`] (the SEC-R4-3 signal), not an INFO saying
+/// ENFORCED.
+#[must_use]
+pub fn boot_line(state: BootState) -> (tracing::Level, &'static str) {
+    match state {
+        BootState::Enforced => (tracing::Level::INFO, ARMED_BOOT_INFO),
+        BootState::PrivilegedDsn => (tracing::Level::ERROR, PRIVILEGED_DSN_ERROR),
+        BootState::ValveOff => (tracing::Level::WARN, VALVE_OFF_BOOT_WARNING),
+        BootState::NotArmed => (tracing::Level::WARN, NOT_ARMED_BOOT_WARNING),
+        BootState::NotMigrated => (tracing::Level::WARN, NOT_MIGRATED_BOOT_WARNING),
+    }
+}
+
 /// Log, once at boot, what this process will enforce: the valve state,
 /// whether the database is armed, and whether this connection is privileged
-/// ([`boot_state`]). Non-fatal: a read failure is logged, not returned, because
-/// the trigger enforces whatever this says. A privileged DSN on an armed
-/// database is an ERROR line, never [`ARMED_BOOT_INFO`]; it does not refuse to
-/// serve (the deploy runbook's per-unit DSN check is the gate).
+/// ([`boot_state`], mapped by [`boot_line`]). Non-fatal: a read failure is
+/// logged, not returned, because the trigger enforces whatever this says. A
+/// privileged DSN on an armed database is an ERROR line, never
+/// [`ARMED_BOOT_INFO`]; it does not refuse to serve (the deploy runbook's
+/// per-unit DSN check is the gate).
 pub async fn log_boot_state(pool: &sqlx::PgPool, unit: &str) {
     match boot_state(pool).await {
-        Ok(BootState::Enforced) => tracing::info!(
-            target: "tenancy.operator_binding",
-            unit,
-            "{ARMED_BOOT_INFO}"
-        ),
-        Ok(BootState::PrivilegedDsn) => tracing::error!(
-            target: "tenancy.operator_binding",
-            unit,
-            "{PRIVILEGED_DSN_ERROR}"
-        ),
-        Ok(BootState::ValveOff) => tracing::warn!(
-            target: "tenancy.operator_binding",
-            unit,
-            "the database is armed for operator binding, but this process's valve is OFF"
-        ),
-        Ok(BootState::NotArmed) => tracing::warn!(
-            target: "tenancy.operator_binding",
-            unit,
-            "operator binding is NOT ARMED on this database: claims by agents not bound to a \
-             human operator are accepted. Arm it with `epigraph-operator arm-operator-binding \
-             --apply` once every live writer is bound (docs/deploy.md)"
-        ),
-        Ok(BootState::NotMigrated) => tracing::warn!(
-            target: "tenancy.operator_binding",
-            unit,
-            "migration 122 (operator binding) is not applied to this database; claim writes \
-             through default declarations fail closed until it is"
-        ),
+        Ok(state) => match boot_line(state) {
+            (level, line) if level == tracing::Level::ERROR => {
+                tracing::error!(target: "tenancy.operator_binding", unit, "{line}");
+            }
+            (level, line) if level == tracing::Level::WARN => {
+                tracing::warn!(target: "tenancy.operator_binding", unit, "{line}");
+            }
+            (_, line) => tracing::info!(target: "tenancy.operator_binding", unit, "{line}"),
+        },
         Err(e) => tracing::warn!(
             target: "tenancy.operator_binding",
             unit,
@@ -210,7 +224,51 @@ pub async fn log_boot_state(pool: &sqlx::PgPool, unit: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Enforcement, ARMED_BOOT_INFO, PRIVILEGED_DSN_ERROR, VALVE_OFF_WARNING};
+    use super::{
+        boot_line, BootState, Enforcement, ARMED_BOOT_INFO, PRIVILEGED_DSN_ERROR, VALVE_OFF_WARNING,
+    };
+
+    /// SEC-R4-3's signal is the ERROR line, so its level, its text and the
+    /// prefix the deploy runbook greps are pinned here (review TST-MTC-11 and
+    /// COR-MTC-4: the literal once carried runs of spaces, so "on this
+    /// privileged DSN" matched nothing). Only `operator binding ENFORCED:`
+    /// marks the enforced state; the ERROR line starts `operator binding NOT
+    /// ENFORCED`.
+    #[test]
+    fn a_privileged_dsn_is_an_error_line_the_runbook_can_grep() {
+        assert_eq!(
+            boot_line(BootState::PrivilegedDsn),
+            (tracing::Level::ERROR, PRIVILEGED_DSN_ERROR)
+        );
+        assert_eq!(
+            boot_line(BootState::Enforced),
+            (tracing::Level::INFO, ARMED_BOOT_INFO)
+        );
+        for state in [
+            BootState::ValveOff,
+            BootState::NotArmed,
+            BootState::NotMigrated,
+        ] {
+            assert_eq!(boot_line(state).0, tracing::Level::WARN, "{state:?}");
+        }
+        assert!(PRIVILEGED_DSN_ERROR
+            .starts_with("operator binding NOT ENFORCED for the writer on this privileged DSN:"));
+        assert!(ARMED_BOOT_INFO.starts_with("operator binding ENFORCED:"));
+        assert!(!PRIVILEGED_DSN_ERROR.starts_with("operator binding ENFORCED:"));
+        for state in [
+            BootState::Enforced,
+            BootState::PrivilegedDsn,
+            BootState::ValveOff,
+            BootState::NotArmed,
+            BootState::NotMigrated,
+        ] {
+            let line = boot_line(state).1;
+            assert!(
+                !line.contains("  "),
+                "a boot line carries a run of spaces: {line:?}"
+            );
+        }
+    }
 
     /// The boot lines name the code but never in a refusal's `OPL0x:` form,
     /// which is what the deploy runbook counts as a refusal in the logs.
