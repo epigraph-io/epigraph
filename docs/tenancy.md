@@ -707,6 +707,12 @@ before arming.
   readability probe (`SET SESSION AUTHORIZATION`), which only a SUPERUSER may
   do: run them on the admin (superuser) DSN, not on a plain maintenance login,
   which they refuse before writing anything.
+* What a linked author's OWN personal group still holds afterwards (the
+  claims `reown-linked` HOLDS, and anything else `verify` REPORTS) is frozen
+  against that author once armed. A supersede of such a claim inherits the
+  personal group, and the author's human holds no writer row there, so the act
+  is refused `OPL02`, like a fresh claim into that group. Revise those claims
+  on a maintenance DSN, or move them before arming.
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 

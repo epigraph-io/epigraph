@@ -1510,6 +1510,9 @@ arming is one-way and every step before it must leave no live writer unbound.
    login is refused before anything is written.
 7. **Verify**: `epigraph-tenancy-backfill verify --legacy-owner <decision>` exits 0; its REPORT line for
    linked authors' personal-group rows should read zero (or be explained).
+   Rows left there, including those `reown-linked` held, cannot be superseded
+   by their author once armed (`OPL02`); they are revised on a maintenance DSN
+   (`docs/tenancy.md`, "Existing rows").
 8. **Deploy the new request binaries** (api, then mcp, as for 107), and the
    fleet host change (pass the operator id; run `link` at every spawn, on a
    maintenance DSN). Then **arm**: `epigraph-operator arm-operator-binding`
