@@ -1475,6 +1475,15 @@ arming is one-way and every step before it must leave no live writer unbound.
    `--revoke-foreign-writes` revoking them. Linking a SHARED system identity
    (the workflow-ingest agent) to one human makes that human own every
    workflow row; the request paths then refuse other humans' callers.
+   Resolve each identity to link by a value the code sets (its public key, or
+   the id a service is configured with), never by a display name: an identity
+   minted lazily by a shared code path can carry a generic name. Include every
+   service that writes claims on a PRIVILEGED DSN as a configured service
+   agent (a downstream product mounted through the MCP federation, for
+   example): such a session is checked on its author alone, so that agent must
+   be bound. Do this here, before step 4. A writer that step 4 finds quiet is
+   tied RETIRED, and a retired link is permanent and is never promoted to a
+   live one.
 4. **Tie the legacy authors**: register EVERY human first (step 2b; the
    other-human lineage skip consults the registry, so an agent operated by a
    not-yet-registered person would be tied to `--operator` for good; the
