@@ -1336,10 +1336,17 @@ async fn is_instance_admin_answers_from_the_role(pool: PgPool) {
 /// human) mirrors into it, so a rollback to 083's body cannot resurrect it.
 ///
 /// Verified to fail: the seed's human filter dropped -> the non-human gets an
-/// assignment; the skipped-row event removed -> no event; the freeze trigger
-/// not created -> the later INSERT lands; the role-end mirror removed -> the
-/// legacy row stays live; the human-revoke mirror trigger not created -> the
-/// same.
+/// assignment; the seed's `operator_links` test dropped -> the linked human
+/// is carried; the skipped-row event removed -> no event; the skip reason
+/// collapsed to one text -> the suspended human reads as "not registered"
+/// (review COR-MTC-3); the freeze trigger not created -> the later INSERT
+/// lands; the freeze's `= now()` test removed -> the back-dated stamp lands
+/// (review TST-MTC-10 (c)); the freeze's no-live-assignment test removed ->
+/// the N-1 revoke of a live custodian reports success (review COR-MTC-1);
+/// the role-end mirror removed -> the legacy row stays live; the mirror's
+/// "last un-ended assignment" test removed -> ending ONE of two assignments
+/// stamps it (review TST-MTC-10 (b)); the human-revoke mirror trigger not
+/// created -> the legacy row stays live.
 #[sqlx::test(migrations = false)]
 async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
     let mut ids = (Uuid::nil(), Uuid::nil(), Uuid::nil(), Uuid::nil());
@@ -1472,6 +1479,28 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
         .execute(&pool)
         .await;
     assert_code(&revive, "CUS05", "reviving a revoked legacy row");
+    let back_dated = sqlx::query(
+        "UPDATE instance_admins SET revoked_at = now() - interval '1 day' WHERE agent_id = $1",
+    )
+    .bind(agent)
+    .execute(&pool)
+    .await;
+    assert_code(&back_dated, "CUS05", "a back-dated revoked_at stamp");
+    // The N-1 `epigraph-instance-admin revoke` (083's repository SQL) on a
+    // LIVE custodian: refused, not a success the role contradicts.
+    let old_revoke = sqlx::query(
+        "UPDATE instance_admins SET revoked_at = now() WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(second)
+    .execute(&pool)
+    .await;
+    assert_code(&old_revoke, "CUS05", "an old revoke of a live custodian");
+    let still: bool = sqlx::query_scalar("SELECT public.epigraph_is_instance_admin($1)")
+        .bind(second)
+        .fetch_one(&pool)
+        .await
+        .expect("is_instance_admin");
+    assert!(still, "the refused revoke changed nothing");
     sqlx::query("UPDATE instance_admins SET revoked_at = now() WHERE agent_id = $1")
         .bind(agent)
         .execute(&pool)
@@ -1498,10 +1527,20 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
             .await
             .expect("carried");
     assert!(live_legacy(human).await);
+    // A second assignment for the same holder: ending ONE of the two leaves
+    // the legacy row live; ending the last stamps it.
+    let extra = grant_role(&pool, CUSTODIAN, human, Some(second))
+        .await
+        .expect("a second assignment for the carried holder");
     assert!(end_role(&pool, carried).await.expect("end"));
     assert!(
+        live_legacy(human).await,
+        "the holder still holds: its legacy row is not stamped"
+    );
+    assert!(end_role(&pool, extra).await.expect("end the last"));
+    assert!(
         !live_legacy(human).await,
-        "ending the role stamps the legacy row"
+        "ending the last assignment stamps the legacy row"
     );
     assert!(live_legacy(second).await);
     fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {

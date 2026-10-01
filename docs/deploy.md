@@ -1585,8 +1585,9 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
    function bodies, one restrictive policy on `security_events`, and small
    triggers on `instance_admins`, `human_operators` and `operator_links`;
    no backfill. `lock_timeout` is 3s; retry on a lock timeout. Old binaries
-   keep working against it, except `epigraph-instance-admin grant|revoke`,
-   which now fail (`CUS05`) by design.
+   keep working against it, except `epigraph-instance-admin grant` (always)
+   and `revoke` of a principal that holds a live custodian assignment, which
+   now fail (`CUS05`) by design: end the role with `end-role-assignment`.
 3. **Deploy** `epigraph-api`, `epigraph-mcp`, `epigraph-operator`,
    `epigraph-instance-admin` and `epigraph-tenancy-backfill` built from the
    same commit.

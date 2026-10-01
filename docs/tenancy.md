@@ -795,8 +795,10 @@ trail and confers nothing else.
   governance reader joins it to `role_assignments` on
   `properties->>'assignment_id'` before treating it as a holder.
 * **`instance_admins` is frozen**: no new row and no edit on any role, except
-  a `revoked_at` stamp, which ending a holder's last custodian assignment, or
-  revoking the human, writes into the holder's legacy row (so a rollback that
+  a `revoked_at` stamp on the row of a principal holding no live custodian
+  assignment (an old `revoke` of a live custodian fails `CUS05`), which ending
+  a holder's last custodian assignment, or revoking the human, writes into
+  the holder's legacy row (so a rollback that
   restores 083's body resurrects nobody). Migration 123 carried each LIVE row
   of a registered human into an assignment from its `granted_at`, and skipped
   every other live row loudly, naming why (an agent, a human linked as an

@@ -692,8 +692,11 @@ CREATE TRIGGER human_operators_refuse_role_node
 --     now". So a legacy row alone confers nothing from here on.
 -- (d) FREEZE. `instance_admins` takes no new row and no edit, on every role
 --     (a trigger: the superuser included), with one exception: a `revoked_at`
---     stamp (NULL -> now(), nothing else), plus the FK's own SET NULL of
---     `granted_by`. Ending a holder's last custodian assignment (section 4's
+--     stamp (NULL -> now(), nothing else) on the row of a principal that
+--     holds NO live custodian assignment, plus the FK's own SET NULL of
+--     `granted_by`. So an N-1 `epigraph-instance-admin revoke` (or a hand
+--     UPDATE) of a live custodian fails `CUS05` instead of reporting a revoke
+--     the role still contradicts; the role ends with `end-role-assignment`. Ending a holder's last custodian assignment (section 4's
 --     trigger) and revoking a human's registration (the trigger below)
 --     stamp the holder's live legacy row, so a rollback to 083's body (which
 --     reads this table) cannot resurrect an authority ended after 123. The
@@ -768,9 +771,12 @@ BEGIN
           (OLD.agent_id, OLD.granted_at, OLD.note)
        OR (NEW.granted_by IS DISTINCT FROM OLD.granted_by AND NEW.granted_by IS NOT NULL)
        OR (NEW.revoked_at IS DISTINCT FROM OLD.revoked_at
-           AND NOT (OLD.revoked_at IS NULL AND NEW.revoked_at = now())) THEN
+           AND NOT (OLD.revoked_at IS NULL AND NEW.revoked_at = now()
+                    AND public.epigraph_live_role_assignment(OLD.agent_id,
+                            'role:platform-custodian', now()) IS NULL)) THEN
         RAISE EXCEPTION 'CUS05: instance_admins is read-only from migration 123; the only change '
-                        'it takes is a revoked_at stamp'
+                        'it takes is a revoked_at stamp, on the row of a principal that holds '
+                        'no live role:platform-custodian assignment'
             USING ERRCODE = 'CUS05',
                   HINT = 'Grant role:platform-custodian with epigraph-operator grant-role, and '
                          'end it with epigraph-operator end-role-assignment.';
