@@ -359,9 +359,9 @@ subject to the same check; 071's shim was too, until PR-22 retired it.
 human account, and there may be many humans. Once a database is ARMED (below),
 a claim may be INSERTED only when its author is BOUND, and, when the session's
 authenticated principal is not the author, only when that WRITER is bound too
-(see "Who is checked" below; the one exception, a maintenance session
-restating a retired claim, is under "A linked agent writes only where its own
-operator writes"). `claims.agent_id` of an existing claim is changed
+(see "Who is checked" below; the supersede exceptions, restating a retired
+claim, are under "A linked agent writes only where its own operator
+writes"). `claims.agent_id` of an existing claim is changed
 only by a privileged session or an instance-admin principal (`OPL02` for
 anyone else), and is then checked like an insert. Bound means:
 
@@ -457,10 +457,14 @@ agent is refused unless its operator writes that group, so another human
 cannot enrol my agent to write evidence, edges or beliefs in their group. Both
 refusals are SQLSTATE **`OPL02`**. Only admin access crosses groups: a
 privileged (maintenance) session and a session whose principal is a live
-instance admin are exempt from `OPL02`. Neither is exempt from `OPL01`, with
-one exception for the privileged session alone: its supersede, whose successor
-inherits a retired predecessor's author and group, is admitted whatever that
-author's binding (the platform corpus's edit path, "Existing rows"). A consequence: an
+instance admin are exempt from `OPL02`. Neither is exempt from `OPL01`,
+except for a supersede, whose successor inherits a retired predecessor's author
+and group. The privileged session's supersede is admitted whatever that
+author's binding, retired-linked or unlinked (the platform corpus's edit path,
+"Existing rows"). An instance-admin principal's supersede of another author's
+claim is admitted when that author is a RETIRED identity of any human, and
+refused `OPL01` when the author is unlinked. An instance admin writing as
+itself is never relieved of its own binding. A consequence: an
 agent whose membership in its operator's group was REVOKED writes nothing (its
 default declaration falls back to its own personal group, which `OPL02`
 refuses); ending an agent's writes is a revoke or a retire. Residual, named: a
@@ -682,8 +686,9 @@ before arming.
   session sets, so it is not relieved of the binding). A fresh claim naming
   such an author is refused on every session. The "human supersedes its own
   legacy author's claim" admission applies to rows in the human's own group.
-  Revising the corpus IN PLACE (an UPDATE of content, truth value, labels or
-  `is_current`) is not governed by the binding trigger ("Scope" above): with
+  Revising the corpus IN PLACE (an UPDATE of content, truth value, labels, or
+  retiring a claim) is not governed by the binding trigger ("Scope" above;
+  re-opening a retired claim is, as an insert): with
   this series' policies only a session that writes the world group can do it,
   but a database that still carries the orphan permissive `*_privacy`
   policies admits it from any application session, so arming does not protect

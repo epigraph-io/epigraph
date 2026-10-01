@@ -15,7 +15,7 @@
 -- privileged session or an instance-admin principal may make: section 2) is
 -- admitted only when its author is BOUND, and, when the session's authenticated
 -- principal is not the author, only when that WRITER is bound too (section 2;
--- the one privileged-session exception, restating a retired claim, is in 1b):
+-- the supersede exceptions, restating a retired claim, are in 1b):
 --
 --   (a) a HUMAN OPERATOR (`epigraph_is_human_operator`): an agent with a live
 --       row in the maintenance-only registry `human_operators` (section 1c)
@@ -72,13 +72,20 @@
 -- maintenance role or a superuser, i.e. the operator CLIs and the audited
 -- admin definers) and a session whose principal is a live instance admin
 -- (`epigraph_is_instance_admin`, 083). Admin access crosses groups; nothing
--- else does. Neither is exempt from section 1's binding, with ONE exception
--- for the privileged session alone: its supersede, whose successor inherits a
--- retired predecessor's author and group (section 2), is admitted whatever
--- that author's binding. That is the platform corpus's edit path: world-owned
--- legacy rows are authored by retired-linked or unlinked identities by
--- construction. An instance-admin principal is not relieved of the binding,
--- because it is a stamp an application session sets (section 4).
+-- else does. Neither is exempt from section 1's binding, except for a
+-- supersede, whose successor inherits a retired predecessor's author and group
+-- (section 2):
+--
+--   * The PRIVILEGED session's supersede is admitted whatever that author's
+--     binding: retired-linked or unlinked. That is the platform corpus's edit
+--     path: world-owned legacy rows are authored by retired-linked or unlinked
+--     identities by construction.
+--   * An INSTANCE-ADMIN principal's supersede of ANOTHER author's claim is
+--     admitted when that author is a RETIRED identity of any human (the
+--     attribution check's inherited rule, `epigraph_require_attributable`),
+--     and refused OPL01 when the author is unlinked. An instance admin writing
+--     AS ITSELF is never relieved of its own binding, because the
+--     instance-admin stamp is one an application session sets (section 4).
 --
 -- ===================================================================
 -- 1c. WHO IS A HUMAN: AN EXPLICIT, AUDITED REGISTRY (OB7)
@@ -516,7 +523,9 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM
 -- may relieve it, and it stays inside one human). One that belongs to ANOTHER
 -- human, by a link of ANY state, is a cross-human attribution (OPL02, armed; an
 -- instance-admin principal and a privileged session are exempt for a live-bound
--- author, as everywhere in section 1b, and meet OPL01 for a retired one). So is
+-- author, as everywhere in section 1b, and for a retired one on an INHERITED
+-- author (a supersede restating a retired-linked claim, section 1b), while on a
+-- fresh claim a retired one meets OPL01). So is
 -- an author that belongs to a human while the WRITER belongs to none: with the
 -- valve closed the writer's own OPL01 comes first, and with it open (section 4)
 -- the valve relieves that OPL01 only, never lets an unbound writer (or another
@@ -706,8 +715,10 @@ BEGIN
         -- legacy rows are authored by retired-linked or unlinked identities by
         -- construction, so the author check would refuse every such supersede.
         -- Nothing else is relieved: a fresh claim, or a posed successor, is
-        -- checked on its author as always, and an instance-admin PRINCIPAL is
-        -- not relieved here (it is a stamp an application session sets).
+        -- checked on its author as always, and an instance-admin PRINCIPAL
+        -- writing as itself is not relieved here (it is a stamp an application
+        -- session sets). Its supersede of ANOTHER author's retired-linked claim
+        -- takes the ELSE branch: the attribution check's inherited rule.
         IF NOT (v_inherited AND public.epigraph_bypass()) THEN
             PERFORM public.epigraph_require_bound_author(NEW.agent_id);
         END IF;
