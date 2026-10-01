@@ -352,6 +352,132 @@ $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_holds_role(uuid, text, timestamptz) FROM PUBLIC;
 
 -- ===================================================================
+-- 4. THE PLATFORM AUDIT TRAIL
+--
+-- Every assignment change, every custodial act and every relief a custodian
+-- principal receives is one `security_events` row whose type starts with
+-- `platform.` and whose details name the assignment. The application role
+-- keeps INSERT on `security_events` (077: an actor never suppresses its own
+-- audit record), so the prefix is RESERVED, as 117 reserves `cascade.` and
+-- 118 reserves `oauth.`: a RESTRICTIVE insert policy admits a `platform.` row
+-- only from a privileged session or a maintenance-owned definer frame. 082's
+-- `security_events_no_mutate` trigger already makes every row immutable, on
+-- every role.
+-- ===================================================================
+DROP POLICY IF EXISTS security_events_platform_privileged ON public.security_events;
+CREATE POLICY security_events_platform_privileged ON public.security_events
+    AS RESTRICTIVE FOR INSERT TO PUBLIC
+    WITH CHECK (
+        left(event_type, 9) <> 'platform.'
+        OR (SELECT public.epigraph_bypass())
+        OR (SELECT public.epigraph_definer_bypass()));
+
+-- AFTER INSERT / UPDATE on `role_assignments`: whatever path wrote the row
+-- (a definer below, or a direct maintenance statement), one
+-- `platform.role_granted` or `platform.role_ended` row.
+CREATE OR REPLACE FUNCTION public.epigraph_role_assignments_audit()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('platform.role_granted', NEW.holder_person_id, true,
+                jsonb_build_object('assignment_id', NEW.id, 'role', NEW.role,
+                                   'holder', NEW.holder_person_id,
+                                   'valid_from', NEW.valid_from, 'valid_to', NEW.valid_to,
+                                   'granted_by', NEW.granted_by,
+                                   'granted_via', NEW.granted_via, 'reason', NEW.reason,
+                                   'migrated', NEW.granted_via = 'migration 123'));
+    ELSIF OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('platform.role_ended', NEW.holder_person_id, true,
+                jsonb_build_object('assignment_id', NEW.id, 'role', NEW.role,
+                                   'holder', NEW.holder_person_id,
+                                   'revoked_at', NEW.revoked_at, 'revoked_by', NEW.revoked_by,
+                                   'revoked_reason', NEW.revoked_reason));
+    END IF;
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_role_assignments_audit() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS role_assignments_audit ON public.role_assignments;
+CREATE TRIGGER role_assignments_audit
+    AFTER INSERT OR UPDATE ON public.role_assignments
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_role_assignments_audit();
+
+-- The maintenance verbs (`epigraph-operator grant-role` /
+-- `end-role-assignment`) call one function each. They add nothing to the
+-- table's own rules: the INSERT and UPDATE meet the guards and the audit
+-- above. `revoked_at` is stamped here, in SQL, so no caller supplies a time.
+CREATE OR REPLACE FUNCTION public.epigraph_grant_role(
+    p_role text, p_holder uuid, p_valid_from timestamptz, p_valid_to timestamptz,
+    p_granted_by uuid, p_reason text)
+RETURNS uuid
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_id uuid;
+BEGIN
+    IF p_role IS NULL OR p_holder IS NULL OR p_reason IS NULL OR length(btrim(p_reason)) = 0 THEN
+        RAISE EXCEPTION 'epigraph_grant_role: the role, the holder and a reason are required'
+            USING ERRCODE = '22004';
+    END IF;
+    INSERT INTO public.role_assignments (role, holder_person_id, valid_from, valid_to,
+                                         granted_by, reason)
+    VALUES (p_role, p_holder, COALESCE(p_valid_from, now()), p_valid_to, p_granted_by, p_reason)
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END $$;
+REVOKE EXECUTE ON FUNCTION
+    public.epigraph_grant_role(text, uuid, timestamptz, timestamptz, uuid, text) FROM PUBLIC;
+
+-- End an assignment now. False when it was already ended (or does not
+-- exist): an end is never repeated or re-dated.
+CREATE OR REPLACE FUNCTION public.epigraph_end_role_assignment(p_id uuid, p_reason text)
+RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_rows integer := 0;
+BEGIN
+    IF p_id IS NULL OR p_reason IS NULL OR length(btrim(p_reason)) = 0 THEN
+        RAISE EXCEPTION 'epigraph_end_role_assignment: the assignment and a reason are required'
+            USING ERRCODE = '22004';
+    END IF;
+    UPDATE public.role_assignments
+       SET revoked_at = now(), revoked_by = session_user, revoked_reason = p_reason
+     WHERE id = p_id AND revoked_at IS NULL;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    RETURN v_rows > 0;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_end_role_assignment(uuid, text) FROM PUBLIC;
+
+-- The trail's reader: every `platform.` row since `p_since` (newest first,
+-- at most `p_limit`, capped at 1000) for a session that holds a role which
+-- `reads_audit` NOW, as its own principal, or a privileged session. Anyone
+-- else gets no rows. A definer rather than a `security_events_read` arm, so
+-- reading the trail needs no DDL on that table and no change to who reads
+-- the rest of it.
+CREATE OR REPLACE FUNCTION public.epigraph_platform_audit(p_since timestamptz, p_limit integer)
+RETURNS SETOF public.security_events
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT e.*
+      FROM public.security_events e
+     WHERE left(e.event_type, 9) = 'platform.'
+       AND e.created_at >= COALESCE(p_since, '-infinity'::timestamptz)
+       AND (public.epigraph_bypass()
+            OR EXISTS (SELECT 1 FROM public.platform_roles r
+                        WHERE r.reads_audit
+                          AND public.epigraph_holds_role(public.epigraph_principal_id(),
+                                                         r.key, now())))
+     ORDER BY e.created_at DESC, e.id
+     LIMIT LEAST(GREATEST(COALESCE(p_limit, 100), 1), 1000)
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_platform_audit(timestamptz, integer) FROM PUBLIC;
+
+-- ===================================================================
 -- OWNERSHIP AND GRANTS (guarded, as every such block since 060 is)
 --
 -- 077's default privileges hand the application role DML on every new
@@ -382,6 +508,18 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_role_assignment_for(uuid, text, timestamptz), '
                 'public.epigraph_holds_role(uuid, text, timestamptz) TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_role_assignments_audit() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_grant_role(text, uuid, timestamptz, '
+                'timestamptz, uuid, text) OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_end_role_assignment(uuid, text) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_platform_audit(timestamptz, integer) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_grant_role(text, uuid, timestamptz, timestamptz, uuid, text), '
+                'public.epigraph_end_role_assignment(uuid, text), '
+                'public.epigraph_platform_audit(timestamptz, integer) TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'REVOKE ALL ON public.platform_roles, public.role_assignments FROM epigraph_app';
@@ -391,5 +529,10 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_role_assignment_for(uuid, text, timestamptz), '
                 'public.epigraph_holds_role(uuid, text, timestamptz) TO epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_grant_role(text, uuid, timestamptz, timestamptz, uuid, text), '
+                'public.epigraph_end_role_assignment(uuid, text) FROM epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_platform_audit(timestamptz, integer) TO epigraph_app';
     END IF;
 END $$;

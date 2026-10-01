@@ -1391,6 +1391,16 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              else.",
         ),
         (
+            "security_events_platform_privileged",
+            "platform.",
+            "123's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 9) <> \
+             'platform.'`) says WHICH rows the restriction applies to, and grants nothing. A \
+             restrictive policy is AND-ed with the permissive `security_events_append`, so every \
+             non-`platform.` row still needs 077's attribution arms; a `platform.*` row needs one \
+             of the two session arms beside it (`epigraph_bypass()` / \
+             `epigraph_definer_bypass()`), i.e. the maintenance session or one of 123's definers.",
+        ),
+        (
             "security_events_cascade_privileged",
             "cascade.",
             "117's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 8) <> \

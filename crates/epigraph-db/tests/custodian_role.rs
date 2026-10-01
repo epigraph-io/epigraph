@@ -652,3 +652,218 @@ async fn holds_role_is_subject_bound(pool: PgPool) {
         assert_eq!(has, granted, "epigraph_app EXECUTE on {func}");
     }
 }
+
+// =====================================================================
+// T9. Every assignment change is audited, and the audit is unforgeable.
+// =====================================================================
+
+/// `security_events` rows of `event_type` naming `assignment`.
+async fn events_for(pool: &PgPool, event_type: &str, assignment: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = $1 AND details->>'assignment_id' = $2::text",
+    )
+    .bind(event_type)
+    .bind(assignment)
+    .fetch_one(pool)
+    .await
+    .expect("events")
+}
+
+/// `epigraph_grant_role` on a maintenance session.
+async fn grant_role(
+    pool: &PgPool,
+    role: &str,
+    holder: Uuid,
+    granted_by: Option<Uuid>,
+) -> Result<Uuid, sqlx::Error> {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_grant_role($1, $2, NULL, NULL, $3, 'custodian test')",
+        )
+        .bind(&role)
+        .bind(holder)
+        .bind(granted_by)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// `epigraph_end_role_assignment` on a maintenance session.
+async fn end_role(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_scalar::<_, bool>(
+            "SELECT public.epigraph_end_role_assignment($1, 'custodian test end')",
+        )
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// One `platform.role_granted` per grant and one `platform.role_ended` per
+/// end, whichever path wrote it (the definers or a raw maintenance
+/// statement), naming the assignment. No application session writes a
+/// `platform.` row of its own, attributed or not, and no role edits or deletes
+/// one. The audit reader answers a role that reads the audit and nobody else.
+///
+/// Verified to fail: the `role_assignments_audit` trigger not created -> no
+/// events; the `security_events_platform_privileged` policy not created -> the
+/// application session's forged `platform.custodial_act` lands; the audit
+/// reader's role test dropped -> the plain human reads the trail.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_assignment_change_is_audited_and_unforgeable(pool: PgPool) {
+    let (a, ag) = fixture::seed_human_operator(&pool, "a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "b").await;
+    let (c, cg) = fixture::seed_human_operator(&pool, "c").await;
+    let (d, dg) = fixture::seed_human_operator(&pool, "d").await;
+
+    let via_definer = grant_role(&pool, CUSTODIAN, a, None)
+        .await
+        .expect("the definer grants");
+    let raw = maint_insert(&pool, CUSTODIAN, b, "0", None, Some(a))
+        .await
+        .expect("a raw maintenance INSERT");
+    let auditor = grant_role(&pool, AUDITOR, c, Some(a))
+        .await
+        .expect("an auditor");
+    for id in [via_definer, raw, auditor] {
+        assert_eq!(
+            events_for(&pool, "platform.role_granted", id).await,
+            1,
+            "one grant event for {id}"
+        );
+    }
+    let detail: (Uuid, String, String) = sqlx::query_as(
+        "SELECT agent_id, details->>'role', details->>'reason' FROM security_events \
+          WHERE event_type = 'platform.role_granted' AND details->>'assignment_id' = $1::text",
+    )
+    .bind(raw)
+    .fetch_one(&pool)
+    .await
+    .expect("detail");
+    assert_eq!(
+        detail,
+        (b, CUSTODIAN.to_string(), "custodian test".to_string()),
+        "the event names the holder, the role and the reason"
+    );
+
+    assert!(end_role(&pool, via_definer).await.expect("end"), "ended now");
+    assert!(
+        !end_role(&pool, via_definer).await.expect("end again"),
+        "an ended assignment reports false and is not re-ended"
+    );
+    maint_exec(
+        &pool,
+        "UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
+                revoked_reason = 'raw end' WHERE id = $1",
+        raw,
+    )
+    .await
+    .expect("a raw maintenance end");
+    for id in [via_definer, raw] {
+        assert_eq!(
+            events_for(&pool, "platform.role_ended", id).await,
+            1,
+            "one end event for {id}"
+        );
+    }
+
+    // Forgery: an application session stamped as a holder writes no
+    // `platform.` row, attributed to itself or unattributed.
+    let forged = as_app(&pool, Some(c), &[cg], |mut conn| async move {
+        let mine = sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ('platform.custodial_act', $1, true, '{}'::jsonb)",
+        )
+        .bind(c)
+        .execute(&mut *conn)
+        .await;
+        let anonymous = sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ('platform.role_granted', NULL, true, '{}'::jsonb)",
+        )
+        .execute(&mut *conn)
+        .await;
+        let ordinary = sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ('platform_lookalike', $1, true, '{}'::jsonb)",
+        )
+        .bind(c)
+        .execute(&mut *conn)
+        .await;
+        (conn, (mine, anonymous, ordinary))
+    })
+    .await;
+    assert_code(&forged.0, "42501", "an attributed platform. row from the app");
+    assert_code(&forged.1, "42501", "an unattributed platform. row from the app");
+    assert!(
+        forged.2.is_ok(),
+        "the prefix test is exact: other events still land: {:?}",
+        forged.2
+    );
+    for sql in [
+        "UPDATE security_events SET details = '{}'::jsonb \
+          WHERE event_type = 'platform.role_granted' AND details->>'assignment_id' = $1::text",
+        "DELETE FROM security_events \
+          WHERE event_type = 'platform.role_granted' AND details->>'assignment_id' = $1::text",
+    ] {
+        let r = sqlx::query(sql).bind(raw).execute(&pool).await;
+        assert!(r.is_err(), "the audit row is immutable, superuser included: {r:?}");
+    }
+
+    // The reader: a custodian or an auditor, as itself; nobody else.
+    let read = |who: Uuid, groups: Vec<Uuid>| {
+        let pool = pool.clone();
+        async move {
+            as_app(&pool, Some(who), &groups, |mut conn| async move {
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM public.epigraph_platform_audit(NULL, 1000)",
+                )
+                .fetch_one(&mut *conn)
+                .await
+                .expect("audit reader");
+                (conn, n)
+            })
+            .await
+        }
+    };
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type LIKE 'platform.%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert!(total >= 5, "the trail holds every change: {total}");
+    assert_eq!(read(c, vec![cg]).await, total, "the auditor reads the trail");
+    assert_eq!(read(d, vec![dg]).await, 0, "a plain human reads none of it");
+    assert_eq!(
+        read(a, vec![ag]).await,
+        0,
+        "an ENDED custodian reads none of it"
+    );
+
+    for (func, app) in [
+        (
+            "public.epigraph_grant_role(text, uuid, timestamptz, timestamptz, uuid, text)",
+            false,
+        ),
+        ("public.epigraph_end_role_assignment(uuid, text)", false),
+        ("public.epigraph_platform_audit(timestamptz, integer)", true),
+    ] {
+        let (has_app, has_maint): (bool, bool) = sqlx::query_as(
+            "SELECT has_function_privilege('epigraph_app', $1, 'EXECUTE'), \
+                    has_function_privilege('epigraph_maintenance', $1, 'EXECUTE')",
+        )
+        .bind(func)
+        .fetch_one(&pool)
+        .await
+        .expect("privilege");
+        assert_eq!((has_app, has_maint), (app, true), "EXECUTE on {func}");
+    }
+}
