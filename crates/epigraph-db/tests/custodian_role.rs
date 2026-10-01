@@ -786,8 +786,11 @@ async fn end_role(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 ///
 /// Verified to fail: the `role_assignments_audit` trigger not created -> no
 /// events; the `security_events_platform_privileged` policy not created -> the
-/// application session's forged `platform.custodial_act` lands; the audit
-/// reader's role test dropped -> the plain human reads the trail.
+/// application session's forged `platform.custodial_act` lands; the policy's
+/// prefix test made case-sensitive again (`left(event_type, 9)`) -> the
+/// `Platform.` rows land; its `created_at = now()` test removed -> the
+/// back-dated maintenance row lands; the audit reader's role test dropped ->
+/// the plain human reads the trail.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_assignment_change_is_audited_and_unforgeable(pool: PgPool) {
     let (a, ag) = fixture::seed_human_operator(&pool, "a").await;
@@ -872,9 +875,54 @@ async fn every_assignment_change_is_audited_and_unforgeable(pool: PgPool) {
         .bind(c)
         .execute(&mut *conn)
         .await;
-        (conn, (mine, anonymous, ordinary))
+        // The reserved prefix ignores case and surrounding blanks (review
+        // SEC-MTC-7): these are the prefix, not look-alikes.
+        let mut cased = Vec::new();
+        for event in [
+            "Platform.custodial_act",
+            "PLATFORM.role_ended",
+            " platform.role_granted",
+        ] {
+            cased.push(
+                sqlx::query(
+                    "INSERT INTO security_events (event_type, agent_id, success, details) \
+                     VALUES ($1, $2, true, '{}'::jsonb)",
+                )
+                .bind(event)
+                .bind(c)
+                .execute(&mut *conn)
+                .await
+                .map(|_| event),
+            );
+        }
+        (conn, (mine, anonymous, ordinary, cased))
     })
     .await;
+    for r in &forged.3 {
+        assert_code(
+            r,
+            "42501",
+            "a mixed-case or padded platform. row from the app",
+        );
+    }
+    // A privileged session's platform. row is stamped now(): never back-dated.
+    let back_dated = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details, created_at) \
+             VALUES ('platform.custodial_act', $1, true, '{}'::jsonb, \
+                     '2026-01-01T00:00:00Z'::timestamptz)",
+        )
+        .bind(a)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_code(
+        &back_dated,
+        "42501",
+        "a back-dated platform. row on the maintenance role",
+    );
     assert_code(
         &forged.0,
         "42501",

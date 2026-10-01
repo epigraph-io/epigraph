@@ -43,9 +43,19 @@
 --
 --   CUS01  the holder is not a registered human.
 --   CUS02  the row is not append-only: a revoke field set on INSERT, a
---          back-dated `valid_from` (more than a minute in the past), any
---          change but the one revoke, a revoke not stamped `now()` or with no
---          reason, or any change to an ended row.
+--          back-dated `valid_from` (more than a minute in the past), a
+--          provenance column the writer supplied (`granted_via` other than
+--          the writing login, `created_at` other than `now()`, a
+--          `grant_act_id`), any change but the one revoke, a revoke not
+--          stamped `now()` by the revoking login (`revoked_by =
+--          session_user`) or with no reason, or any change to an ended row.
+--
+-- WHAT THE TABLE CANNOT PROVE. `granted_by` and the actor of a custodial act
+-- are UUIDs the maintenance login supplies; the guards check that they name
+-- a live custodian, not that the person behind that custodian made the
+-- write. Whoever holds the maintenance DSN can write what the definers
+-- write. Binding them to a confirmed act is the elevation batch's work
+-- (DESIGN 6.2), not this migration's.
 --   CUS03  the grantor rule: once any live custodian exists, every grant
 --          names a LIVE custodian as `granted_by`, and a holder never extends
 --          itself while another holder exists. With no live custodian (the
@@ -228,6 +238,19 @@ BEGIN
                         NEW.valid_from
             USING ERRCODE = 'CUS02';
     END IF;
+    -- Provenance is the database's, never the writer's: the login that wrote
+    -- the row, when, and no confirmed-act id until one exists. So a direct
+    -- INSERT cannot pose as this migration's carry-over ('migration 123') or
+    -- as an older grant.
+    IF NEW.granted_via IS DISTINCT FROM session_user::text
+       OR NEW.created_at IS DISTINCT FROM now()
+       OR NEW.grant_act_id IS NOT NULL THEN
+        RAISE EXCEPTION 'CUS02: granted_via, created_at and grant_act_id are recorded by the '
+                        'database (the writing login, now(), none); a grant does not supply them'
+            USING ERRCODE = 'CUS02';
+    END IF;
+    -- A LIVE custodian is what `epigraph_live_role_assignment` answers: the
+    -- window, the end, and the holder re-checked (registered, not linked).
     SELECT EXISTS (SELECT 1 FROM public.role_assignments ra
                     WHERE ra.role = 'role:platform-custodian'
                       AND public.epigraph_live_role_assignment(ra.holder_person_id,
@@ -272,7 +295,7 @@ BEGIN
             USING ERRCODE = 'CUS02';
     END IF;
     IF NEW.revoked_at IS NULL OR NEW.revoked_at <> now()
-       OR NEW.revoked_by IS NULL
+       OR NEW.revoked_by IS DISTINCT FROM session_user::text
        OR NEW.revoked_reason IS NULL OR length(btrim(NEW.revoked_reason)) = 0
        OR (NEW.id, NEW.role, NEW.holder_person_id, NEW.holder_group_id, NEW.valid_from,
            NEW.valid_to, NEW.granted_by, NEW.granted_via, NEW.grant_act_id, NEW.reason,
@@ -282,7 +305,8 @@ BEGIN
            OLD.valid_to, OLD.granted_by, OLD.granted_via, OLD.grant_act_id, OLD.reason,
            OLD.created_at) THEN
         RAISE EXCEPTION 'CUS02: an assignment is only ever ended (revoked_at = now(), '
-                        'revoked_by and a revoked_reason), nothing else; nothing was changed'
+                        'revoked_by = the revoking login, and a revoked_reason), nothing '
+                        'else; nothing was changed'
             USING ERRCODE = 'CUS02',
                   HINT = 'End it with epigraph-operator end-role-assignment and grant a new one.';
     END IF;
@@ -365,17 +389,27 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_holds_role(uuid, text, timestamptz) F
 -- keeps INSERT on `security_events` (077: an actor never suppresses its own
 -- audit record), so the prefix is RESERVED, as 117 reserves `cascade.` and
 -- 118 reserves `oauth.`: a RESTRICTIVE insert policy admits a `platform.` row
--- only from a privileged session or a maintenance-owned definer frame. 082's
+-- only from a privileged session or a maintenance-owned definer frame, and
+-- only stamped `now()` (no back-dated row). The prefix test ignores case and
+-- surrounding blanks, so `Platform.custodial_act` is the reserved prefix too,
+-- not a look-alike an application session may write. 082's
 -- `security_events_no_mutate` trigger already makes every row immutable, on
 -- every role.
+--
+-- The two arms cannot tell a definer from the maintenance login that called
+-- it (`epigraph_definer_bypass()` reads `current_user`, and a maintenance
+-- login is a member of the maintenance role either way), so a holder of the
+-- maintenance DSN can still write a well-formed `platform.` row. The audit
+-- is unforgeable by the APPLICATION; provenance against the maintenance DSN
+-- waits for the elevation batch (header, "What the table cannot prove").
 -- ===================================================================
 DROP POLICY IF EXISTS security_events_platform_privileged ON public.security_events;
 CREATE POLICY security_events_platform_privileged ON public.security_events
     AS RESTRICTIVE FOR INSERT TO PUBLIC
     WITH CHECK (
-        left(event_type, 9) <> 'platform.'
-        OR (SELECT public.epigraph_bypass())
-        OR (SELECT public.epigraph_definer_bypass()));
+        lower(left(btrim(event_type), 9)) <> 'platform.'
+        OR (((SELECT public.epigraph_bypass()) OR (SELECT public.epigraph_definer_bypass()))
+            AND created_at = now()));
 
 -- AFTER INSERT / UPDATE on `role_assignments`: whatever path wrote the row
 -- (a definer below, or a direct maintenance statement), one
@@ -595,6 +629,13 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_platform_audit(timestamptz, integer) 
 -- The projection (like `role_assignments` row security) is not the
 -- disclosure boundary for who holds a role: the edge is world-readable,
 -- as the governance graph's other OCCUPIES edges are.
+--
+-- Nor is an OCCUPIES edge to a role node proof of the projection: a writer of
+-- the world group can add an edge of the same shape (this migration takes no
+-- lock on `edges`). A governance reader that must know who held a role joins
+-- the edge to `role_assignments` on `properties->>'assignment_id'` (holder
+-- and window equal), or asks `epigraph_role_assignment_for`; an edge with no
+-- such row is not a projection.
 --
 -- THE ROLE NODE NEVER BECOMES A WRITER. It is refused as the subject of a
 -- link (agent or operator) and of a human registration, so no session can

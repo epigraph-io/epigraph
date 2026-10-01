@@ -757,8 +757,10 @@ trail and confers nothing else.
   registration, suspending its recorded OAuth client, or linking it as an
   agent ends its authority at once.
 * **Append-only** (`CUS02`): an assignment is never edited or deleted; its only
-  change is its end (`revoked_at` stamped now, with who and why), and an ended
-  assignment is final. Nothing is back-dated.
+  change is its end (`revoked_at` stamped now, by the revoking login, with
+  why), and an ended assignment is final. Nothing is back-dated, and the
+  provenance columns (`granted_via`, `created_at`) are the database's, never
+  the writer's.
 * **The grantor rule** (`CUS03`): once any live custodian exists, every grant
   names a live custodian as its grantor, and a holder never extends its own
   assignment while another holder exists. The first grant (no live custodian)
@@ -767,11 +769,16 @@ trail and confers nothing else.
   `end-role-assignment`, `list-role-assignments`. The application role reads
   only its own assignments. `epigraph-instance-admin grant|revoke` refuse and
   name these.
-* **Audited, unforgeably**: every grant and end, every custodial act and every
-  `OPL02` relief a custodian principal actually receives is one
-  `security_events` row whose type starts with `platform.` and whose details
-  name the assignment. Only a privileged session or a maintenance-owned
-  definer may write a `platform.` row; no row is ever edited or deleted.
+* **Audited**: every grant and end, every custodial act and every `OPL02`
+  relief a custodian principal is granted is one `security_events` row whose
+  type starts with `platform.` (any case) and whose details name the
+  assignment. A relief row records the relief granted, not necessarily a
+  write: the request path's own pre-checks (workflow ingest binds its real
+  caller that way) are relief points too. No application session writes a
+  `platform.` row, and no row is ever edited, deleted or back-dated. The
+  trail is NOT proof against a holder of the maintenance DSN: `granted_by`
+  and an act's actor are UUIDs that login supplies, checked for a live
+  custodian but not bound to a confirmed act until the elevation batch.
   A holder of `role:auditor` (or the custodian role) reads the trail through
   `epigraph_platform_audit(since, limit)`.
 * **Custodial acts**: privatization plan writes (create, approve, abort,
@@ -783,7 +790,10 @@ trail and confers nothing else.
   assignment's window in the edge's `valid_from` / `valid_to`. It is never
   read for authority (a ratchet test fails if a policy, function or Rust
   source reads it), and, like the governance graph's other OCCUPIES edges,
-  it is world-readable: who holds the custodian role is public.
+  it is world-readable: who holds the custodian role is public. An edge of
+  the same shape can be written by any writer of the world group, so a
+  governance reader joins it to `role_assignments` on
+  `properties->>'assignment_id'` before treating it as a holder.
 * **`instance_admins` is frozen**: no new row and no edit on any role, except
   a `revoked_at` stamp, which ending a holder's last custodian assignment, or
   revoking the human, writes into the holder's legacy row (so a rollback that
