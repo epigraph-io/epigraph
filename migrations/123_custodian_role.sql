@@ -1034,11 +1034,15 @@ BEGIN
             USING ERRCODE = 'OPL02',
                   HINT = 'Supersede it with a new claim (the supersede act).';
     END IF;
+    IF TG_OP = 'UPDATE' THEN
+        -- A re-open is a re-open whatever else the statement changes: an
+        -- UPDATE that also re-attributes is checked as an INSERT of NEW too.
+        v_reopen := NOT COALESCE(OLD.is_current, true) AND COALESCE(NEW.is_current, true);
+    END IF;
     IF TG_OP = 'UPDATE' AND NEW.agent_id IS NOT DISTINCT FROM OLD.agent_id THEN
         -- Only `supersedes` / `is_current` (the trigger's other columns) can
         -- have changed. Cheap OLD/NEW tests first: a retire or an untouched
         -- column returns before any table is read.
-        v_reopen := NOT COALESCE(OLD.is_current, true) AND COALESCE(NEW.is_current, true);
         IF NOT v_reopen
            AND (NEW.supersedes IS NOT DISTINCT FROM OLD.supersedes OR OLD.supersedes IS NULL) THEN
             RETURN NEW;
@@ -1054,23 +1058,29 @@ BEGIN
         IF NOT public.epigraph_operator_binding_armed() OR public.epigraph_bypass() THEN
             RETURN NEW;
         END IF;
-        IF NEW.supersedes IS DISTINCT FROM OLD.supersedes AND OLD.supersedes IS NOT NULL
-           AND (NEW.supersedes IS NULL OR COALESCE(NEW.is_current, true)) THEN
-            RAISE EXCEPTION 'OPL02: claim % records that it supersedes %; an application session '
-                            'does not clear, or re-point on a current claim, the lineage of an '
-                            'existing claim', NEW.id, OLD.supersedes
-                USING ERRCODE = 'OPL02',
-                      HINT = 'Supersede the claim instead, or retire it in the same statement '
-                             '(the dedup act). Admin access crosses humans; nothing else does.';
-        END IF;
-        IF NOT v_reopen THEN
-            RETURN NEW;
-        END IF;
-        -- A RE-OPEN on a non-privileged session: checked below as an INSERT
-        -- of NEW.
     ELSIF NOT public.epigraph_operator_binding_armed() THEN
         RETURN NEW;
     END IF;
+    -- THE LINEAGE GUARD, on every non-privileged UPDATE that changes
+    -- `supersedes`, whatever the statement does to `agent_id` (review
+    -- COR-MTC-2: guarding only the same-author branch let a custodian clear a
+    -- lineage by re-attributing in the same statement).
+    IF TG_OP = 'UPDATE' AND NOT public.epigraph_bypass()
+       AND NEW.supersedes IS DISTINCT FROM OLD.supersedes AND OLD.supersedes IS NOT NULL
+       AND (NEW.supersedes IS NULL OR COALESCE(NEW.is_current, true)) THEN
+        RAISE EXCEPTION 'OPL02: claim % records that it supersedes %; an application session '
+                        'does not clear, or re-point on a current claim, the lineage of an '
+                        'existing claim', NEW.id, OLD.supersedes
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Supersede the claim instead, or retire it in the same statement '
+                         '(the dedup act). Admin access crosses humans; nothing else does.';
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW.agent_id IS NOT DISTINCT FROM OLD.agent_id
+       AND NOT v_reopen THEN
+        RETURN NEW;
+    END IF;
+    -- A RE-OPEN on a non-privileged session (and any re-attribution): checked
+    -- below as an INSERT of NEW.
     -- RE-ATTRIBUTION. Every check below reads the NEW author only, so an
     -- UPDATE that changes it would let a writer take over (or hand off) a
     -- claim someone else said, including another human's claim in a group
@@ -1078,7 +1088,7 @@ BEGIN
     -- only the exemption (a privileged session, an instance-admin principal)
     -- may, and it is then checked like an insert below. OPL02, keyed on the
     -- arming: it is attribution, which the valve never relieves.
-    IF TG_OP = 'UPDATE' AND NOT v_reopen
+    IF TG_OP = 'UPDATE' AND NEW.agent_id IS DISTINCT FROM OLD.agent_id
        AND NOT public.epigraph_custodial_relief('reattribute', NEW.agent_id, NEW.owner_group_id,
                                                 NEW.id) THEN
         RAISE EXCEPTION 'OPL02: claim % is attributed to %; an application session does not '
@@ -1126,7 +1136,35 @@ BEGIN
             AND (public.epigraph_bypass()
                  OR NOT EXISTS (SELECT 1 FROM public.claims s
                                  WHERE s.supersedes = NEW.supersedes AND s.id <> NEW.id
-                                   AND s.agent_id IS NOT DISTINCT FROM NEW.agent_id));
+                                   AND s.agent_id IS NOT DISTINCT FROM NEW.agent_id))
+            -- 123 (review SEC-MTC-3): the at-most-once rule bounds BRANCHING;
+            -- a RE-OPEN must not resurrect a version of a lineage that is
+            -- current elsewhere either. On a non-privileged session a
+            -- re-opened claim inherits nothing while ANY other version of its
+            -- lineage, an ancestor up its `supersedes` chain or a descendant
+            -- down it, is current. Testing only its own successor still let
+            -- alternate versions of a chain be re-opened (S1 while S2 is
+            -- retired and S3 current), one more current claim under the
+            -- retired identity per two versions. Retiring the head and
+            -- re-opening its predecessor (the undo) still works. UNION, not
+            -- UNION ALL, so a legacy cycle terminates.
+            AND (public.epigraph_bypass() OR NOT v_reopen
+                 OR NOT EXISTS (
+                     WITH RECURSIVE up(id, supersedes, cur) AS (
+                         SELECT c.id, c.supersedes, COALESCE(c.is_current, true)
+                           FROM public.claims c WHERE c.id = NEW.supersedes
+                         UNION
+                         SELECT c.id, c.supersedes, COALESCE(c.is_current, true)
+                           FROM public.claims c JOIN up ON c.id = up.supersedes),
+                     down(id, cur) AS (
+                         SELECT c.id, COALESCE(c.is_current, true)
+                           FROM public.claims c WHERE c.supersedes = NEW.id
+                         UNION
+                         SELECT c.id, COALESCE(c.is_current, true)
+                           FROM public.claims c JOIN down ON c.supersedes = down.id)
+                     SELECT 1 FROM up WHERE up.cur AND up.id <> NEW.id
+                     UNION ALL
+                     SELECT 1 FROM down WHERE down.cur AND down.id <> NEW.id));
     END IF;
     IF v_writer IS NULL OR v_writer = NEW.agent_id OR public.epigraph_bypass() THEN
         -- THE PLATFORM CORPUS'S EDIT PATH. A PRIVILEGED session (the

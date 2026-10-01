@@ -2542,9 +2542,15 @@ async fn update_as(
 /// retired identity. An unbound principal is refused as before. A privileged
 /// session still re-opens anything.
 ///
+/// The lineage guard holds whatever else the UPDATE changes: clearing or
+/// re-pointing an inherited successor's `supersedes` while re-attributing it
+/// in the SAME statement is the lineage guard's OPL02 too (review COR-MTC-2).
+///
 /// Verified to fail: the UPDATE branch's early return restored to
 /// `epigraph_operator_scope_exempt()` (round-4 mutation M4, which left 122's
-/// suite 27/27 green) -> the custodian's re-open and its lineage clearing land.
+/// suite 27/27 green) -> the custodian's re-open and its lineage clearing land;
+/// the lineage guard moved back inside the same-author branch -> the clear and
+/// the re-point that re-attribute in the same statement land.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
     let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
@@ -2599,12 +2605,16 @@ async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
     .await
     .expect("a privileged session restates P (S2)");
     // The superseded corpus claim: retired, with a current successor.
-    let corpus_next = as_app_stamped(&pool, b, &[b_group], |mut conn| async move {
+    let corpus_next = as_app_stamped(&pool, b, &[b_group, Uuid::nil()], |mut conn| async move {
         let r = supersede_on(&mut conn, corpus).await;
         (conn, r)
     })
     .await;
-    let _ = corpus_next;
+    assert!(
+        corpus_next.is_ok(),
+        "the custodian revises the corpus claim, so it is retired with a current \
+         successor: {corpus_next:?}"
+    );
     sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
         .bind(corpus)
         .execute(&pool)
@@ -2632,6 +2642,31 @@ async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
         Some("OPL02"),
         "a custodian clearing an inherited successor's lineage: {cleared:?}"
     );
+    // ...and the same lineage change folded into a re-attribution.
+    for (sql, what) in [
+        (
+            "UPDATE claims SET supersedes = NULL, \
+                    agent_id = current_setting('epigraph.principal_id')::uuid WHERE id = $1",
+            "clearing the lineage while re-attributing to itself",
+        ),
+        (
+            "UPDATE claims SET supersedes = (SELECT c.id FROM claims c \
+                                              WHERE c.id <> claims.id \
+                                                AND c.id <> claims.supersedes \
+                                                AND c.supersedes IS NULL \
+                                              ORDER BY c.id LIMIT 1), \
+                    agent_id = current_setting('epigraph.principal_id')::uuid WHERE id = $1",
+            "re-pointing the lineage while re-attributing to itself",
+        ),
+    ] {
+        let r = update_as(&pool, b, &custodian, sql, s2).await;
+        assert_eq!(code_of(&r).as_deref(), Some("OPL02"), "{what}: {r:?}");
+        let text = r.expect_err("refused").to_string();
+        assert!(
+            text.contains("records that it supersedes"),
+            "{what}: refused by the lineage guard: {text}"
+        );
+    }
     // An unbound principal re-opening a retired corpus claim: OPL01.
     assert_opl01(
         update_as(&pool, unbound, &[Uuid::nil()], REOPEN, corpus)
@@ -2729,10 +2764,12 @@ async fn a_claim_never_supersedes_itself(pool: PgPool) {
     .await;
     // `claims_require_tenancy` sorts first and already refuses it (the named
     // predecessor does not exist yet, 23503); the binding trigger's own
-    // refusal is the second line of defence for that shape.
-    assert!(
-        insert_self.is_err(),
-        "an INSERT naming itself is refused: {insert_self:?}"
+    // refusal is the second line of defence for that shape, unreachable
+    // behind it, so this arm pins the first line's code and nothing more.
+    assert_eq!(
+        code_of(&insert_self).as_deref(),
+        Some("23503"),
+        "an INSERT naming itself is refused by claims_require_tenancy: {insert_self:?}"
     );
 
     assert!(arm(&pool).await, "the database arms");
@@ -2965,6 +3002,127 @@ async fn a_retired_identity_is_restated_at_most_once(pool: PgPool) {
         (conn, ())
     })
     .await;
+}
+
+/// Review SEC-MTC-3 (migration 123): the at-most-once rule bounds BRANCHING;
+/// a RE-OPEN must not resurrect a version of a lineage that is current
+/// elsewhere either. A's live agent X restates P along a chain (P -> S1 -> S2
+/// -> S3, each retired by the next) and then re-opens versions: newest-first
+/// (S2 while S3 is current) and skipping one (S1 while S2 is retired and S3
+/// current) are both refused (OPL01: it inherits nothing, and the retired
+/// identity is no bound author), so the chain keeps ONE current claim. The
+/// custodian's re-open of a mid-chain version is refused the same way. Once
+/// the head is retired, re-opening its predecessor is the ordinary undo and
+/// still works; re-opening the old head while that predecessor is current is
+/// refused (an ancestor is current). A privileged session re-opens anything.
+///
+/// Verified to fail: the re-open's lineage clause removed -> S2 and S1
+/// re-open and three current claims descend from P; the clause reduced to
+/// "no current successor of its own" -> S1 (whose own successor S2 is
+/// retired) re-opens beside S3.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reopen_never_resurrects_a_superseded_restatement(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, b_group) = fixture::seed_human_operator(&pool, "custodian-b").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+    link_live(&pool, x, a).await;
+    let p = insert_claim(&pool, legacy, a_group).await.expect("P");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy identity's retired tie to A");
+    }
+    fixture::make_custodian(&pool, b).await;
+    assert!(arm(&pool).await, "the database arms");
+    let ga = [a_group];
+    let mut chain = vec![p];
+    for step in 1..=3 {
+        let prev = *chain.last().expect("chain");
+        let next = as_app_stamped(&pool, x, &ga, |mut conn| async move {
+            let r = supersede_on(&mut conn, prev).await;
+            (conn, r)
+        })
+        .await
+        .unwrap_or_else(|e| panic!("step {step}: X restates the chain's head: {e}"))
+        .0;
+        chain.push(next);
+    }
+    let (s1, s2, s3) = (chain[1], chain[2], chain[3]);
+    let current_in_chain = || {
+        let pool = pool.clone();
+        let chain = chain.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM claims WHERE id = ANY($1) AND COALESCE(is_current, true)",
+            )
+            .bind(&chain)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+    assert_eq!(
+        current_in_chain().await,
+        1,
+        "CALIBRATION: one current version"
+    );
+
+    const REOPEN: &str = "UPDATE claims SET is_current = true WHERE id = $1";
+    for (id, what) in [
+        (s2, "S2 while S3 is current"),
+        (s1, "S1 while S2 is retired, S3 current"),
+    ] {
+        assert_opl01(
+            update_as(&pool, x, &ga, REOPEN, id).await.map(|_| id),
+            &format!("X re-opening {what}"),
+        );
+    }
+    assert_opl01(
+        update_as(
+            &pool,
+            b,
+            &[a_group, b_group],
+            "UPDATE claims SET is_current = true, content = 'custodian words' WHERE id = $1",
+            s2,
+        )
+        .await
+        .map(|_| s2),
+        "the custodian re-opening a mid-chain version with its own words",
+    );
+    assert_eq!(current_in_chain().await, 1, "still one current version");
+
+    // The undo: retire the head, then re-open its predecessor.
+    update_as(
+        &pool,
+        x,
+        &ga,
+        "UPDATE claims SET is_current = false WHERE id = $1",
+        s3,
+    )
+    .await
+    .expect("retire S3");
+    update_as(&pool, x, &ga, REOPEN, s2)
+        .await
+        .expect("S2 has no current successor now: re-opening it is the undo");
+    assert_eq!(
+        current_in_chain().await,
+        1,
+        "one current version after the undo"
+    );
+    assert_opl01(
+        update_as(&pool, x, &ga, REOPEN, s3).await.map(|_| s3),
+        "X re-opening the old head S3 while its ancestor S2 is current",
+    );
+    assert_eq!(current_in_chain().await, 1, "still one");
+
+    // A privileged session re-opens anything.
+    sqlx::query(REOPEN)
+        .bind(s1)
+        .execute(&pool)
+        .await
+        .expect("a privileged session re-opens");
 }
 
 /// Delta review round 4 SEC-R4-3 (migration 123's batch): the writer binding
