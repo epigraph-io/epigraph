@@ -308,12 +308,9 @@ CREATE POLICY role_assignments_maintenance_update ON public.role_assignments
     USING ((SELECT public.epigraph_bypass()))
     WITH CHECK ((SELECT public.epigraph_bypass()));
 
--- The insert guard. Created after every row this migration itself writes
--- (none yet), so only a migration-time seed may carry a past `valid_from`.
-DROP TRIGGER IF EXISTS role_assignments_guard_insert ON public.role_assignments;
-CREATE TRIGGER role_assignments_guard_insert
-    BEFORE INSERT ON public.role_assignments
-    FOR EACH ROW EXECUTE FUNCTION public.epigraph_role_assignments_guard_insert();
+-- The insert guard's TRIGGER is created in section 6, after the rows this
+-- migration carries over from `instance_admins`: only that seed may carry a
+-- past `valid_from` (the legacy `granted_at`).
 
 -- ===================================================================
 -- 3. WHO HOLDS A ROLE: SUBJECT-BOUND READERS
@@ -421,6 +418,17 @@ BEGIN
          WHERE e.relationship = 'OCCUPIES' AND e.source_type = 'agent'
            AND e.source_id = NEW.holder_person_id
            AND e.properties @> jsonb_build_object('assignment_id', NEW.id::text);
+        -- Section 6: the end of the holder's LAST un-ended custodian
+        -- assignment is mirrored into a live legacy `instance_admins` row, so a
+        -- rollback to 083's body cannot resurrect an authority ended here.
+        IF NEW.role = 'role:platform-custodian'
+           AND NOT EXISTS (SELECT 1 FROM public.role_assignments ra
+                            WHERE ra.holder_person_id = NEW.holder_person_id
+                              AND ra.role = 'role:platform-custodian'
+                              AND ra.revoked_at IS NULL AND ra.id <> NEW.id) THEN
+            UPDATE public.instance_admins SET revoked_at = now()
+             WHERE agent_id = NEW.holder_person_id AND revoked_at IS NULL;
+        END IF;
         INSERT INTO public.security_events (event_type, agent_id, success, details)
         VALUES ('platform.role_ended', NEW.holder_person_id, true,
                 jsonb_build_object('assignment_id', NEW.id, 'role', NEW.role,
@@ -558,6 +566,126 @@ CREATE TRIGGER human_operators_refuse_role_node
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_refuse_role_node_subject();
 
 -- ===================================================================
+-- 6. FROM `instance_admins` TO THE ROLE
+--
+-- (a) CARRY OVER. Every LIVE `instance_admins` row whose agent is a
+--     registered human becomes a `role:platform-custodian` assignment from
+--     its `granted_at` (`granted_via = 'migration 123'`), audited
+--     (`platform.role_granted`, `migrated: true`) and projected by the
+--     trigger above. This seed is the only path that writes a past
+--     `valid_from`: the insert guard's trigger is created after it.
+-- (b) SKIP LOUDLY. A live row of anything else (an agent, a retired
+--     identity, a human not registered yet) is NOT carried: agents never
+--     hold the role. Each one raises a NOTICE and writes a
+--     `platform.role_migration_skipped` event naming it. A revoked row is
+--     not carried; it stays readable in the table as history.
+-- (c) ANSWER FROM THE ROLE. `epigraph_is_instance_admin(agent)` keeps its
+--     name, signature, grants and subject binding (083's policies, 087's and
+--     122's definers call it), and now answers "holds role:platform-custodian
+--     now". So a legacy row alone confers nothing from here on.
+-- (d) FREEZE. `instance_admins` takes no new row and no edit, on every role
+--     (a trigger: the superuser included), with one exception: a `revoked_at`
+--     stamp (NULL -> now(), nothing else), plus the FK's own SET NULL of
+--     `granted_by`. Ending a holder's last custodian assignment (section 4's
+--     trigger) and revoking a human's registration (the trigger below)
+--     stamp the holder's live legacy row, so a rollback to 083's body (which
+--     reads this table) cannot resurrect an authority ended after 123. The
+--     table and its read policy stay as they are, read-compatible.
+-- ===================================================================
+INSERT INTO public.role_assignments (role, holder_person_id, valid_from, granted_by,
+                                     granted_via, reason)
+SELECT 'role:platform-custodian', ia.agent_id, ia.granted_at, ia.granted_by, 'migration 123',
+       'migrated from instance_admins (083): ' || COALESCE(NULLIF(btrim(ia.note), ''), 'no note')
+  FROM public.instance_admins ia
+ WHERE ia.revoked_at IS NULL
+   AND public.epigraph_is_human_operator(ia.agent_id)
+   AND NOT EXISTS (SELECT 1 FROM public.role_assignments ra
+                    WHERE ra.holder_person_id = ia.agent_id
+                      AND ra.granted_via = 'migration 123');
+
+DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT ia.agent_id, ia.granted_at FROM public.instance_admins ia
+              WHERE ia.revoked_at IS NULL
+                AND NOT public.epigraph_is_human_operator(ia.agent_id)
+                AND NOT EXISTS (SELECT 1 FROM public.security_events e
+                                 WHERE e.event_type = 'platform.role_migration_skipped'
+                                   AND e.agent_id = ia.agent_id)
+              ORDER BY ia.granted_at, ia.agent_id LOOP
+        RAISE NOTICE 'migration 123: instance admin % is not a registered human operator; it is '
+                     'NOT carried over to role:platform-custodian (agents never hold a role)',
+                     r.agent_id;
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('platform.role_migration_skipped', r.agent_id, false,
+                jsonb_build_object('agent_id', r.agent_id, 'granted_at', r.granted_at,
+                                   'reason', 'not a registered human operator'));
+    END LOOP;
+END $$;
+
+DROP TRIGGER IF EXISTS role_assignments_guard_insert ON public.role_assignments;
+CREATE TRIGGER role_assignments_guard_insert
+    BEFORE INSERT ON public.role_assignments
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_role_assignments_guard_insert();
+
+CREATE OR REPLACE FUNCTION public.epigraph_is_instance_admin(p_agent uuid)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT COALESCE(
+        p_agent IS NOT NULL
+        AND (p_agent = public.epigraph_principal_id() OR public.epigraph_bypass())
+        AND public.epigraph_holds_role(p_agent, 'role:platform-custodian', now()),
+        false)
+$$;
+
+CREATE OR REPLACE FUNCTION public.epigraph_instance_admins_frozen()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF TG_OP = 'INSERT'
+       OR (NEW.agent_id, NEW.granted_at, NEW.note) IS DISTINCT FROM
+          (OLD.agent_id, OLD.granted_at, OLD.note)
+       OR (NEW.granted_by IS DISTINCT FROM OLD.granted_by AND NEW.granted_by IS NOT NULL)
+       OR (NEW.revoked_at IS DISTINCT FROM OLD.revoked_at
+           AND NOT (OLD.revoked_at IS NULL AND NEW.revoked_at = now())) THEN
+        RAISE EXCEPTION 'CUS05: instance_admins is read-only from migration 123; the only change '
+                        'it takes is a revoked_at stamp'
+            USING ERRCODE = 'CUS05',
+                  HINT = 'Grant role:platform-custodian with epigraph-operator grant-role, and '
+                         'end it with epigraph-operator end-role-assignment.';
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_instance_admins_frozen() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS instance_admins_frozen ON public.instance_admins;
+CREATE TRIGGER instance_admins_frozen
+    BEFORE INSERT OR UPDATE ON public.instance_admins
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_instance_admins_frozen();
+
+-- A human's revoke (122's `epigraph_revoke_human_operator`, or a direct
+-- maintenance UPDATE) stamps that human's live legacy row.
+CREATE OR REPLACE FUNCTION public.epigraph_human_operators_mirror_instance_admins()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL THEN
+        UPDATE public.instance_admins SET revoked_at = now()
+         WHERE agent_id = NEW.agent_id AND revoked_at IS NULL;
+    END IF;
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_human_operators_mirror_instance_admins() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS human_operators_mirror_instance_admins ON public.human_operators;
+CREATE TRIGGER human_operators_mirror_instance_admins
+    AFTER UPDATE ON public.human_operators
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_human_operators_mirror_instance_admins();
+
+-- ===================================================================
 -- OWNERSHIP AND GRANTS (guarded, as every such block since 060 is)
 --
 -- 077's default privileges hand the application role DML on every new
@@ -591,6 +719,10 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_role_assignments_audit() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_refuse_role_node_subject() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_instance_admins_frozen() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_human_operators_mirror_instance_admins() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_grant_role(text, uuid, timestamptz, '
                 'timestamptz, uuid, text) OWNER TO epigraph_maintenance';

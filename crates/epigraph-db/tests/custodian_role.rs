@@ -1086,3 +1086,256 @@ fn no_rust_source_queries_the_occupies_projection() {
     // CALIBRATION: the walk reaches this crate's sources.
     assert!(crates.join("epigraph-db/src/lib.rs").is_file());
 }
+
+// =====================================================================
+// T6 / T7. instance_admins: answered from the role, migrated, frozen.
+// =====================================================================
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// A plain agent row (no group): enough for an `instance_admins` key.
+async fn bare_agent(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    let pk: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(id)
+        .bind(&pk)
+        .execute(pool)
+        .await
+        .expect("agent");
+    id
+}
+
+/// A legacy `instance_admins` row, written while the schema is at 122.
+async fn legacy_admin(pool: &PgPool, agent: Uuid, granted_at: &str, revoked: bool, note: &str) {
+    sqlx::query(&format!(
+        "INSERT INTO instance_admins (agent_id, granted_at, revoked_at, note) \
+         VALUES ($1, {granted_at}, {}, $2)",
+        if revoked { "now()" } else { "NULL" }
+    ))
+    .bind(agent)
+    .bind(note)
+    .execute(pool)
+    .await
+    .expect("legacy instance_admins row");
+}
+
+/// `epigraph_is_instance_admin(agent)` and the number of `security_events`
+/// rows visible, on an application session stamped as `agent`.
+async fn admin_view(pool: &PgPool, agent: Uuid) -> (bool, i64) {
+    as_app(pool, Some(agent), &[], |mut conn| async move {
+        let r: (bool, i64) = sqlx::query_as(
+            "SELECT public.epigraph_is_instance_admin($1), \
+                    (SELECT count(*) FROM security_events)",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("admin view");
+        (conn, r)
+    })
+    .await
+}
+
+/// `epigraph_is_instance_admin` answers from `role:platform-custodian` alone.
+/// A legacy `instance_admins` row confers nothing (here: a live row of an
+/// agent that was not a registered human at migration time, so it was not
+/// carried over, and that is registered afterwards). An assignment confers
+/// it; its end takes it away. The 083 read arm that keys on the function
+/// (`security_events_read`) widens and narrows with it.
+///
+/// Verified to fail: 083's body left in place (reads `instance_admins`) -> the
+/// legacy row alone answers true.
+#[sqlx::test(migrations = false)]
+async fn is_instance_admin_answers_from_the_role(pool: PgPool) {
+    let mut legacy = Uuid::nil();
+    fixture::db_at_122_then_head(&pool, &MIGRATOR, |pool| {
+        let legacy = &mut legacy;
+        async move {
+            *legacy = bare_agent(&pool).await;
+            legacy_admin(&pool, *legacy, "now()", false, "legacy").await;
+        }
+    })
+    .await;
+    // Registered as a human only after 123: the legacy row was skipped.
+    fixture::make_human_operator(&pool, legacy).await;
+    let (other, _) = fixture::seed_human_operator(&pool, "other").await;
+    sqlx::query(
+        "INSERT INTO security_events (event_type, agent_id, success) \
+         VALUES ('probe.other', $1, true)",
+    )
+    .bind(other)
+    .execute(&pool)
+    .await
+    .expect("another principal's event");
+
+    let (admin, seen_before) = admin_view(&pool, legacy).await;
+    assert!(!admin, "a legacy instance_admins row alone confers nothing");
+    let id = grant_role(&pool, CUSTODIAN, legacy, None)
+        .await
+        .expect("grant");
+    let (admin, seen_admin) = admin_view(&pool, legacy).await;
+    assert!(admin, "the assignment confers it");
+    assert!(
+        seen_admin > seen_before,
+        "security_events_read widens for a custodian ({seen_before} -> {seen_admin})"
+    );
+    assert!(end_role(&pool, id).await.expect("end"));
+    let (admin, seen_after) = admin_view(&pool, legacy).await;
+    assert!(!admin, "the end takes it away");
+    assert!(
+        seen_after < seen_admin,
+        "and the read arm narrows again ({seen_admin} -> {seen_after})"
+    );
+}
+
+/// Migration 123 carries every LIVE `instance_admins` row of a REGISTERED
+/// HUMAN into a `role:platform-custodian` assignment that starts at the
+/// row's `granted_at` (and is audited and projected like any grant); a live
+/// row of anything else is skipped LOUDLY (a `platform.role_migration_skipped`
+/// event; nothing vanishes silently); a revoked row is not carried. After 123
+/// the table is frozen for every role, the superuser included, except one
+/// change: a `revoked_at` stamp, which ending the role (and revoking the
+/// human) mirrors into it, so a rollback to 083's body cannot resurrect it.
+///
+/// Verified to fail: the seed's human filter dropped -> the non-human gets an
+/// assignment; the skipped-row event removed -> no event; the freeze trigger
+/// not created -> the later INSERT lands; the role-end mirror removed -> the
+/// legacy row stays live; the human-revoke mirror trigger not created -> the
+/// same.
+#[sqlx::test(migrations = false)]
+async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
+    let mut ids = (Uuid::nil(), Uuid::nil(), Uuid::nil(), Uuid::nil());
+    fixture::db_at_122_then_head(&pool, &MIGRATOR, |pool| {
+        let ids = &mut ids;
+        async move {
+            let (human, _) = fixture::seed_human_operator(&pool, "legacy-human").await;
+            let (second, _) = fixture::seed_human_operator(&pool, "legacy-second").await;
+            let (revoked, _) = fixture::seed_human_operator(&pool, "legacy-revoked").await;
+            let agent = bare_agent(&pool).await;
+            legacy_admin(
+                &pool,
+                human,
+                "'2026-01-02T03:04:05Z'::timestamptz",
+                false,
+                "first operator",
+            )
+            .await;
+            legacy_admin(&pool, second, "now()", false, "second").await;
+            legacy_admin(&pool, revoked, "now()", true, "revoked").await;
+            legacy_admin(&pool, agent, "now()", false, "an agent").await;
+            *ids = (human, second, revoked, agent);
+        }
+    })
+    .await;
+    let (human, second, revoked, agent) = ids;
+
+    let migrated: Vec<(Uuid, String, bool, String)> = sqlx::query_as(
+        "SELECT holder_person_id, role, valid_from = '2026-01-02T03:04:05Z'::timestamptz, \
+                granted_via FROM role_assignments ORDER BY valid_from",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("assignments");
+    assert_eq!(
+        migrated.len(),
+        2,
+        "the two live human rows, nothing else: {migrated:?}"
+    );
+    assert_eq!(
+        migrated[0],
+        (human, CUSTODIAN.to_string(), true, "migration 123".to_string()),
+        "valid_from = granted_at"
+    );
+    assert_eq!(migrated[1].0, second);
+    let flagged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'platform.role_granted' \
+            AND (details->>'migrated')::boolean AND agent_id = $1",
+    )
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .expect("events");
+    assert_eq!(flagged, 1, "the carried row is audited as migrated");
+    let skipped: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT agent_id FROM security_events \
+          WHERE event_type = 'platform.role_migration_skipped'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("skipped");
+    assert_eq!(skipped, vec![agent], "the non-human row is skipped loudly");
+    assert_eq!(assignments_of(&pool, revoked).await, 0, "a revoked row is not carried");
+    let projected: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE relationship = 'OCCUPIES' AND source_id = $1",
+    )
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .expect("projection");
+    assert_eq!(projected, 1, "and projected");
+
+    // Frozen, the superuser included.
+    let fresh = bare_agent(&pool).await;
+    let insert = sqlx::query("INSERT INTO instance_admins (agent_id) VALUES ($1)")
+        .bind(fresh)
+        .execute(&pool)
+        .await;
+    assert_code(&insert, "CUS05", "a new instance_admins row");
+    let note = sqlx::query("UPDATE instance_admins SET note = 'edited' WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&pool)
+        .await;
+    assert_code(&note, "CUS05", "an edit of a legacy row");
+    let revive = sqlx::query("UPDATE instance_admins SET revoked_at = NULL WHERE agent_id = $1")
+        .bind(revoked)
+        .execute(&pool)
+        .await;
+    assert_code(&revive, "CUS05", "reviving a revoked legacy row");
+    sqlx::query("UPDATE instance_admins SET revoked_at = now() WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .expect("the one admitted change: a revoked_at stamp");
+
+    // The mirrors.
+    let live_legacy = |who: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT revoked_at IS NULL FROM instance_admins WHERE agent_id = $1",
+            )
+            .bind(who)
+            .fetch_one(&pool)
+            .await
+            .expect("legacy row")
+        }
+    };
+    let carried: Uuid = sqlx::query_scalar(
+        "SELECT id FROM role_assignments WHERE holder_person_id = $1",
+    )
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .expect("carried");
+    assert!(live_legacy(human).await);
+    assert!(end_role(&pool, carried).await.expect("end"));
+    assert!(
+        !live_legacy(human).await,
+        "ending the role stamps the legacy row"
+    );
+    assert!(live_legacy(second).await);
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_revoke_human_operator($1, 'test')")
+            .bind(second)
+            .execute(&mut *conn)
+            .await
+            .expect("revoke the human");
+        (conn, ())
+    })
+    .await;
+    assert!(
+        !live_legacy(second).await,
+        "revoking the human stamps the legacy row"
+    );
+}

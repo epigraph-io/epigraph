@@ -646,6 +646,60 @@ fn blake3_like(s: &str) -> Vec<u8> {
     out
 }
 
+/// A database at migration 122 (the head before the custodian role), seeded by
+/// `seed`, then migrated to the tree's head.
+///
+/// For state that only an OLDER schema can hold: 123 freezes
+/// `instance_admins` for every role (the superuser included), so a legacy row
+/// that a test needs to see migrated, skipped or ignored must be written
+/// before 123 runs. Use with `#[sqlx::test(migrations = false)]` and the
+/// caller's own `sqlx::migrate!` migrator (this file embeds none).
+/// `session_replication_role = replica` is deliberately NOT the shortcut: it
+/// would also silence the audit triggers under test.
+pub async fn db_at_122_then_head<F, Fut>(
+    pool: &PgPool,
+    migrator: &sqlx::migrate::Migrator,
+    seed: F,
+) where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 122)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    // On ONE connection, reset afterwards: 001 is a pg_dump whose header
+    // issues session-level SETs (`row_security = off`, an empty
+    // `search_path`) that outlive its transaction, so a pooled connection the
+    // migrator used would otherwise carry them into the seed and the test.
+    let mut conn = pool.acquire().await.expect("acquire");
+    before.run(&mut *conn).await.expect("migrate 001 -> 122");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    drop(conn);
+    seed(pool.clone()).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator
+        .run(&mut *conn)
+        .await
+        .expect("migrate 122 -> head");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+}
+
 /// CALIBRATION for migration 118's `match_candidates` stale guard, which the
 /// migrator applies: an `epigraph_app` session's flip of `candidate` into `stale` is refused with the guard's own
 /// `MC01`, not with a permission error that shares its SQLSTATE (42501). The
