@@ -324,6 +324,10 @@ async fn main() {
             "{}",
             epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
         );
+        // Operator binding (migration 122): say at boot whether the valve is
+        // open and whether the database is armed. Non-fatal; the trigger
+        // enforces whatever this reports.
+        epigraph_db::operator_binding::log_boot_state(scoped.inner(), "epigraph-api").await;
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
             .with_admin_cascade(false);

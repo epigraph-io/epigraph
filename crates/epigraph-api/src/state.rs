@@ -1334,6 +1334,50 @@ impl AppState {
         })
     }
 
+    /// Begin the ONE transaction a claim-writing handler writes its claim on,
+    /// stamped with the request's `viewer` so that migration 122's claims
+    /// trigger binds the principal the request AUTHENTICATED, not only the
+    /// author its body names.
+    ///
+    /// # Why this may fall back when [`Self::write_as`] refuses to
+    ///
+    /// Every server process is built through [`Self::with_scoped_pool`], so on
+    /// a server this is exactly `write_as`. The fallback to a plain
+    /// transaction on `db_pool` exists for the test-built states (no
+    /// `ScopedPool`) that the create-claim, packet and hypothesis suites drive
+    /// these handlers through. `write_as`'s objection to a fallback is that
+    /// an unstamped write would then pass every test and fail open in
+    /// production. That no longer holds for a CLAIM write: once the database
+    /// is armed, migration 122 refuses a claim written by an unstamped
+    /// application session (`OPL01`), so a process that somehow reached this
+    /// branch in production fails closed, loudly. The stamped branch is the
+    /// one the app-role suites (`claim_routes_bind_the_caller.rs`) measure.
+    ///
+    /// # Errors
+    /// `ApiError::InternalError` when `BEGIN` or the stamp fails.
+    #[cfg(feature = "db")]
+    pub async fn begin_claim_write(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        handler: &'static str,
+    ) -> Result<ClaimWriteTx<'_>, crate::errors::ApiError> {
+        if self.scoped.is_some() {
+            return Ok(ClaimWriteTx::Stamped(self.write_as(viewer, handler).await?));
+        }
+        let tx = self.db_pool.begin().await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                error = %e,
+                handler,
+                "could not begin a claim-write transaction"
+            );
+            crate::errors::ApiError::InternalError {
+                message: "Failed to begin transaction".to_string(),
+            }
+        })?;
+        Ok(ClaimWriteTx::Unscoped(tx))
+    }
+
     /// Create new application state with database pool and custom signature verification state
     #[cfg(feature = "db")]
     pub fn with_db_and_signature_state(
@@ -2470,5 +2514,52 @@ mod admin_cascade_gate_tests {
             MaintenanceDsnSource::FellBackToApplicationDsn,
             false
         ));
+    }
+}
+
+/// The transaction [`AppState::begin_claim_write`] hands a claim-writing
+/// handler: stamped with the request's viewer on every server, a plain one on
+/// a test-built state. Both deref to the connection the repository layer
+/// takes.
+#[cfg(feature = "db")]
+pub enum ClaimWriteTx<'a> {
+    /// Stamped with the request's viewer (`ScopedPool::begin_as`).
+    Stamped(epigraph_db::ScopedTx<'a>),
+    /// A test-built `AppState` with no `ScopedPool`.
+    Unscoped(sqlx::Transaction<'static, sqlx::Postgres>),
+}
+
+#[cfg(feature = "db")]
+impl ClaimWriteTx<'_> {
+    /// Commit the transaction.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the commit fails.
+    pub async fn commit(self) -> Result<(), epigraph_db::DbError> {
+        match self {
+            Self::Stamped(tx) => tx.commit().await,
+            Self::Unscoped(tx) => tx.commit().await.map_err(epigraph_db::DbError::from),
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::ops::Deref for ClaimWriteTx<'_> {
+    type Target = sqlx::PgConnection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Stamped(tx) => tx,
+            Self::Unscoped(tx) => tx,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::ops::DerefMut for ClaimWriteTx<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Stamped(tx) => &mut *tx,
+            Self::Unscoped(tx) => &mut *tx,
+        }
     }
 }

@@ -453,16 +453,26 @@ impl EpiGraphMcpFull {
         // from `cached`.
         match self.pool.acquire().await {
             Ok(mut conn) => {
-                if let Err(e) =
-                    epigraph_db::AgentRepository::ensure_personal_group(&mut conn, id).await
-                {
-                    tracing::warn!(
+                match epigraph_db::AgentRepository::ensure_personal_group(&mut conn, id).await {
+                    Ok(_) => {}
+                    // Migration 122 (armed): a LIVE-LINKED agent writes into its
+                    // operator's group, and a writer/admin row in its own
+                    // personal group is in a group its operator does not
+                    // write, so the membership door refuses it. Expected on
+                    // every boot of a correctly linked fleet agent, so neither
+                    // a warning nor an OPL02 line in the log (review C5).
+                    Err(epigraph_db::DbError::OperatorScopeRefused { .. }) => tracing::info!(
+                        agent_id = %id,
+                        "the server agent is live-linked and writes into its operator's group; \
+                         its own personal group is not provisioned"
+                    ),
+                    Err(e) => tracing::warn!(
                         agent_id = %id,
                         error = %e,
                         "did not provision the server agent's personal group (a revoked \
                          membership is refused, never restored); its viewer resolves to its \
                          remaining live groups only"
-                    );
+                    ),
                 }
             }
             Err(e) => tracing::warn!(

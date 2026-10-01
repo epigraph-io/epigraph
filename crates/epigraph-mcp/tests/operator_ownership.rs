@@ -68,6 +68,12 @@ async fn agent(pool: &PgPool, label: &str) -> Uuid {
     fixture::seed_agent_with_group(pool, label).await.0
 }
 
+/// A registered human operator (migration 122: a link can be recorded only to
+/// one).
+async fn operator_agent(pool: &PgPool, label: &str) -> Uuid {
+    fixture::seed_human_operator(pool, label).await.0
+}
+
 async fn link(pool: &PgPool, agent: Uuid, operator: Uuid) {
     let mut conn = pool.acquire().await.expect("acquire");
     let out = AgentRepository::link_operator(&mut conn, agent, operator)
@@ -219,7 +225,7 @@ async fn labels(pool: &PgPool, claim: Uuid) -> Vec<String> {
 /// DECLARED signer, where the pre-107 gate refused.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_sibling_agent_under_the_same_operator_may_retire_its_claims(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let (server, me) = server_with_seed(&pool, 0x51).await;
     let sibling = agent(&pool, "sibling").await;
     link(&pool, me, operator).await;
@@ -259,7 +265,7 @@ async fn a_sibling_agent_under_the_same_operator_may_retire_its_claims(pool: PgP
 /// only scope before OA1) the same supersede lands.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_operators_http_principal_may_retire_and_patch_its_agents_claims(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let (server, _unlinked_signer) = server_with_seed(&pool, 0x52).await;
     let operated = agent(&pool, "operated").await;
     link(&pool, operated, operator).await;
@@ -313,6 +319,9 @@ async fn the_operators_http_principal_may_retire_and_patch_its_agents_claims(poo
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operator_on_stdio_may_retire_its_agents_claims(pool: PgPool) {
     let (server, operator) = server_with_seed(&pool, 0x53).await;
+    // The server's own agent is the operator here, so it must be a registered
+    // human (migration 122: a link can be recorded only to one).
+    fixture::make_human_operator(&pool, operator).await;
     let operated = agent(&pool, "operated").await;
     link(&pool, operated, operator).await;
 
@@ -332,7 +341,7 @@ async fn an_operator_on_stdio_may_retire_its_agents_claims(pool: PgPool) {
 /// A human's other claims, of course, stay refused too.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_agent_does_not_own_its_operators_directly_authored_claims(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let other_human = agent(&pool, "other-human").await;
     let (server, me) = server_with_seed(&pool, 0x54).await;
     link(&pool, me, operator).await;
@@ -354,7 +363,7 @@ async fn an_operated_agent_does_not_own_its_operators_directly_authored_claims(p
 /// retired included.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_operator_and_an_actor_sibling_own_a_retired_agents_claims(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let (actor_server, actor) = server_with_seed(&pool, 0x5B).await;
     link(&pool, actor, operator).await;
     let retired = agent(&pool, "retired").await;
@@ -380,7 +389,7 @@ async fn the_operator_and_an_actor_sibling_own_a_retired_agents_claims(pool: PgP
 /// the CALLER side reads the actor record, which a retired link never is.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_retired_agent_cannot_act_for_its_operator(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let (retired_server, retired) = server_with_seed(&pool, 0x5D).await;
     link_retired(&pool, retired, operator).await;
     let actor = agent(&pool, "actor").await;
@@ -403,7 +412,7 @@ async fn a_retired_agent_cannot_act_for_its_operator(pool: PgPool) {
 /// HTTP principal may then retire it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_claim_from_an_operated_agent_is_owned_by_the_operator(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let (server, me) = server_with_seed(&pool, 0x55).await;
     link(&pool, me, operator).await;
 
@@ -484,7 +493,7 @@ async fn submit_claim_from_an_operated_agent_is_owned_by_the_operator(pool: PgPo
 /// `None == None` case: two unlinked agents share no operator.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unlinked_agent_is_still_refused(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let (server, _me) = server_with_seed(&pool, 0x57).await;
     let operated = agent(&pool, "operated").await;
     let unlinked = agent(&pool, "unlinked").await;
@@ -503,8 +512,8 @@ async fn an_unlinked_agent_is_still_refused(pool: PgPool) {
 /// An agent (stdio) or HTTP principal under a DIFFERENT operator is refused.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_different_operator_is_refused(pool: PgPool) {
-    let op_j = agent(&pool, "operator-j").await;
-    let op_k = agent(&pool, "operator-k").await;
+    let op_j = operator_agent(&pool, "operator-j").await;
+    let op_k = operator_agent(&pool, "operator-k").await;
     let (server, me) = server_with_seed(&pool, 0x58).await;
     let j_agent = agent(&pool, "j-agent").await;
     let k_http_agent = agent(&pool, "k-http-agent").await;
@@ -533,7 +542,7 @@ async fn a_different_operator_is_refused(pool: PgPool) {
 /// share — not the operator's HTTP principal, not its agents.
 #[sqlx::test(migrations = "../../migrations")]
 async fn world_owned_claims_do_not_become_ownable(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let (server, me) = server_with_seed(&pool, 0x59).await;
     link(&pool, me, operator).await;
     let legacy_author = agent(&pool, "legacy-author").await;
@@ -556,7 +565,7 @@ async fn world_owned_claims_do_not_become_ownable(pool: PgPool) {
 /// membership and the sibling arm closes with it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_revoked_link_grants_nothing(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let (server, me) = server_with_seed(&pool, 0x5A).await;
     let sibling = agent(&pool, "sibling").await;
     link(&pool, me, operator).await;
@@ -638,7 +647,7 @@ async fn an_undeclared_stdio_signer_keeps_its_pre_107_arm_when_the_operator_look
 ///   same claim, and still gets a viewer.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_agent_has_no_operator_authority_over_http(pool: PgPool) {
-    let operator = agent(&pool, "operator").await;
+    let operator = operator_agent(&pool, "operator").await;
     let (actor_server, actor) = server_with_seed(&pool, 0x5E).await;
     let sibling = agent(&pool, "sibling").await;
     link(&pool, actor, operator).await;

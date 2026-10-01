@@ -152,7 +152,11 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     // — none of these functions has a viewer parameter today.
     ("challenge.rs::update_state", "caller-supplied id"),
     ("claim.rs::batch_update_truth_values", "caller-supplied ids"),
-    ("claim.rs::evolve_step", "caller-supplied id"),
+    // Was `claim.rs::evolve_step`: the same statements moved, unchanged, into
+    // `evolve_step_conn` so the request paths can run them on a stamped
+    // transaction (operator-binding delta review); the pool form now only
+    // wraps it. A rename, not a new ungated write.
+    ("claim.rs::evolve_step_conn", "caller-supplied id"),
 
     ("claim.rs::merge_properties", "caller-supplied id"),
     ("claim.rs::patch_claim_atomic_conn", "caller-supplied id"),

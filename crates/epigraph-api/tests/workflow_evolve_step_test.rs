@@ -153,17 +153,24 @@ async fn evolve_step_supersedes_creates_new_claim_and_edge() {
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
 
-    // Issue a token bound to the seeded agent so agent_id FK on the new claim passes.
+    // A token in the shape `/oauth/token` mints: `sub` is the OAuth CLIENT
+    // row's id (an `oauth_clients.id`, never an agent), `owner_id` is absent
+    // for a service client, and the principal is `agent_id`. The handler must
+    // author as that principal: authoring as `owner_id` / `sub` (the pre-fix
+    // `auth.owner_id.unwrap_or(auth.client_id)`) wrote a claim whose author is
+    // no agent, which the agents foreign key refuses (and, once migration 122
+    // is armed, OPL01). A token whose `sub` IS an agent id hid that.
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
     let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let client_row_id = Uuid::new_v4();
     let (token, _) = cfg
         .issue_access_token(
-            agent_id,
+            client_row_id,
             vec!["claims:write".into()],
             "service",
             None,
-            None,
+            Some(agent_id),
             chrono::Duration::minutes(60),
         )
         .expect("test JWT");
@@ -189,6 +196,16 @@ async fn evolve_step_supersedes_creates_new_claim_and_edge() {
 
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
     let new_id: Uuid = json["claim_id"].as_str().unwrap().parse().unwrap();
+
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(new_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        author, agent_id,
+        "the evolved step is authored by the token's principal"
+    );
 
     let (parent_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
         .bind(parent)

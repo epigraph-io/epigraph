@@ -1423,7 +1423,10 @@ confirm each came from the token endpoint for a client that holds the grant.
 
   The command grants only to an `active` human client, so a revoked or
   suspended client must be reactivated first, through whatever reviewed path
-  the deployment uses for that. Because the check is live, a token that
+  the deployment uses for that. From migration 122 on, that path is a
+  privileged (maintenance or admin) session: the REST admin approval runs on
+  the application role and is refused (`42501`) for a client that is
+  `suspended` or `revoked`. Because the check is live, a token that
   already carries `claims:admin` in its scope lands again as soon as the
   grant is applied; a token minted without the scope needs a refresh (the
   refresh grant re-reads `granted_scopes`) before it reaches the borrow at all.
@@ -1437,3 +1440,118 @@ confirm each came from the token endpoint for a client that holds the grant.
   oauth_clients`; that is the unaudited path section 2 replaces.
 
 No migration.
+
+## Operator binding (migration 122) — deploy order
+
+Every claim must be authored, and written, by an agent bound to a human
+operator (a human operator, or the holder of a live `operator_links` row);
+anything else is refused with `OPL01`, and a write that crosses from one human
+into another's group or name with `OPL02`. The invariant, the error code and the valve are in
+`docs/tenancy.md` ("Operator binding"). This section is the ORDER, because
+arming is one-way and every step before it must leave no live writer unbound.
+
+1. **Build** every binary from the merged commit (api, mcp, `epigraph-migrate`,
+   `epigraph-operator`, `epigraph-tenancy-backfill`).
+2. **Migrate 122** (`epigraph-migrate`, on the migration DSN). It enforces
+   nothing: it adds the trigger, the arming table (empty), and the definers.
+   Old binaries keep working; the new binaries' default-declaration path needs
+   122 (it fails closed with `42883` without it), so migrate BEFORE they serve.
+2b. **Register the human operator(s)** (maintenance DSN, audited):
+   `epigraph-operator register-human-operator --agent <the human's own agent>
+   --client <that human's own OAuth client id> --reason <text> --apply`, then
+   read back `human_operators.client_id` and confirm it is the client you named.
+   `--client` is required, never inferred: the application role may insert
+   `oauth_clients` rows, so take the client id from an out-of-band record of
+   the person's own client, not from a listing of active `human` clients. Only the agent of an active human OAuth client can
+   be registered; from 122 on, no link can be recorded to anyone else, so this
+   precedes every link below. Check that no dynamically registered `human`
+   client's agent is in the registry. The registration records that one client:
+   suspending it later is what un-registers the human in effect.
+3. **Live-link the live writers** that are not human operators:
+   `epigraph-operator link --agent <id> --operator <human> --apply`, on the
+   maintenance DSN. `link` refuses an OAuth principal: see "HTTP principals" in
+   `docs/tenancy.md` and resolve those before step 8. Read its `FOREIGN-WRITE`
+   lines (writer rows in groups the operator does not write) and decide each,
+   `--revoke-foreign-writes` revoking them. Linking a SHARED system identity
+   (the workflow-ingest agent) to one human makes that human own every
+   workflow row; the request paths then refuse other humans' callers.
+   Resolve each identity to link by a value the code sets (its public key, or
+   the id a service is configured with), never by a display name: an identity
+   minted lazily by a shared code path can carry a generic name. Include every
+   service that writes claims on a PRIVILEGED DSN as a configured service
+   agent (a downstream product mounted through the MCP federation, for
+   example): such a session is checked on its author alone, so that agent must
+   be bound. Do this here, before step 4. A writer that step 4 finds quiet is
+   tied RETIRED, and a retired link is permanent and is never promoted to a
+   live one.
+4. **Tie the legacy authors**: register EVERY human first (step 2b; the
+   other-human lineage skip consults the registry, so an agent operated by a
+   not-yet-registered person would be tied to `--operator` for good; the
+   read-only query is in `docs/tenancy.md`, "Existing rows"), then
+   `epigraph-operator link-legacy-authors --operator <human>` (dry run, read
+   the SKIPPED lines), then `--apply`. Give every `recent_writer` it skips a
+   live link (step 3) or an explicit decision.
+5. **Backfill** as the maintenance login, ONLY after the operator has decided
+   who owns the legacy corpus (`--legacy-owner operator|platform`, required, no
+   default): `ANALYZE claims`, then `epigraph-tenancy-backfill run
+   --legacy-owner <decision> --dry-run`, then the same without `--dry-run`. Batched,
+   resumable, and boundable: `--max-runtime` stops between batches with exit 3,
+   `--entity` runs one arm. It rewrites claims and, through 070's arm (d), their
+   derived rows, so check free disk first (the write volume lands in WAL) and
+   `VACUUM (ANALYZE)` the rewritten tables between windows. Embedded claims
+   dominate the cost (each update inserts into the HNSW indexes); see
+   `docs/tenancy.md` "Running the backfill" for the cost model and the
+   drop-and-rebuild alternative.
+6. **Re-own** what linked authors' own groups still hold:
+   `epigraph-operator reown-linked --operator <human> --legacy-owner <decision> --manifest-out <path>`
+   (dry run), then `--apply` with a new manifest path. Keep the manifests.
+   `reown-linked` and its undo `reown-reverse` need a SUPERUSER DSN (their
+   probe switches the session to the application role); a plain maintenance
+   login is refused before anything is written.
+7. **Verify**: `epigraph-tenancy-backfill verify --legacy-owner <decision>` exits 0; its REPORT line for
+   linked authors' personal-group rows should read zero (or be explained).
+   Rows left there, including those `reown-linked` held, cannot be superseded
+   by their author once armed (`OPL02`); they are revised on a maintenance DSN
+   (`docs/tenancy.md`, "Existing rows").
+8. **Deploy the new request binaries** (api, then mcp, as for 107), and the
+   fleet host change (pass the operator id; run `link` at every spawn, on a
+   maintenance DSN). Then **arm**: `epigraph-operator arm-operator-binding`
+   (census), then `--apply`. The census must list no unbound recent writer you
+   intend to keep. The census lists AUTHORS; a writer that authors as someone
+   else (a service client posting on an agent's behalf, a listener acting under
+   a borrowed admin stamp) is bound on its own principal once armed and does
+   not appear there: inventory those separately. So is a claim written on an
+   application connection with NO principal (a CLI or job on the application
+   DSN): once armed it is refused `OPL01`. And so is a tool that registers a
+   FRESH agent per run (or per source) and authors as it: such an author does
+   not exist before the run, so it cannot be linked in advance, and once armed
+   its claims are refused; decide each such ingester before arming (author as
+   a bound identity, or stop it).
+   Arming binds claim INSERTs; claim UPDATEs other than a change of author stay
+   gated by row security alone, so while a database still carries orphan
+   permissive `*_privacy` policies, arming does not isolate claim updates
+   between humans (`docs/tenancy.md`, "Scope: claim INSERTs").
+9. **Smoke**: through the real HTTP route (not a hand-stamped SQL session), a
+   claim posted by an unbound principal naming a bound author is refused
+   (`OPL01`; HTTP 403); an INSERT on an unstamped application connection is
+   refused (`OPL01`); a claim by a live-linked agent and by the human succeeds;
+   the boot logs say "operator binding ENFORCED". Count refusals in the logs by
+   the refusal prefix `OPL01:` / `OPL02:` (with the colon): the boot lines name
+   the code without it.
+
+**Rollback.** Before step 8's arm: every step is reversible or harmless (links
+are permanent records but grant nothing new; `reown-reverse` undoes step 6).
+After arming: set `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off` on the affected
+units and restart them (new binaries only; old binaries do not carry the
+valve). The valve relieves `OPL01` only (including the refusal of an
+unstamped application session); `OPL02` stays in force, including for an
+unbound writer (or another human's agent) that names a bound author or a
+retired identity tied to a human. Removing the arming row, or dropping the trigger, is a superuser DDL
+act on the migration DSN. To remove migration 122's functions after step 8,
+first roll the MCP server back to its previous build. The new listener reads
+its signer's binding through a 122 function at startup and on every HTTP tool
+call, and fails closed without it: it refuses to start, and it refuses every
+call.
+
+No new environment variable is required; `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT`
+exists only as the emergency valve.

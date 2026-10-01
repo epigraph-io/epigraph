@@ -90,19 +90,46 @@ pub async fn evolve_step(
             "provide a parent step: either `parent_id`, or both `canonical_name` and `step_index`",
         ));
     };
-    let agent_id = server.write_identity(auth, viewer).await?.agent_id();
+    let identity = server.write_identity(auth, viewer).await?;
+    let agent_id = identity.agent_id();
+    let parent = epigraph_core::ClaimId::from_uuid(parent_uuid);
 
-    let result = epigraph_db::ClaimRepository::evolve_step(
-        &server.pool,
-        epigraph_core::ClaimId::from_uuid(parent_uuid),
-        &params.content,
-        &params.edge_type,
-        params.rationale.as_deref(),
-        level,
-        agent_id,
-    )
-    .await
-    .map_err(internal_error)?;
+    // The step claim is written on a transaction STAMPED with its author's
+    // viewer, so migration 122's claims trigger sees the writing principal:
+    // once the database is armed it refuses a claim written by an application
+    // session with no principal, which is what the raw pool is. The raw-pool
+    // form remains only for a server built without a ScopedPool (test
+    // fixtures); on such a process's application role the database refuses the
+    // write once armed, so it cannot fail open.
+    let result = if server.scoped.is_some() {
+        let mut tx =
+            crate::claim_helper::begin_author_stamped_tx(server, identity, "evolve_step").await?;
+        let r = epigraph_db::ClaimRepository::evolve_step_conn(
+            &mut tx,
+            parent,
+            &params.content,
+            &params.edge_type,
+            params.rationale.as_deref(),
+            level,
+            agent_id,
+        )
+        .await
+        .map_err(crate::errors::db_caller_error)?;
+        tx.commit().await.map_err(internal_error)?;
+        r
+    } else {
+        epigraph_db::ClaimRepository::evolve_step(
+            &server.pool,
+            parent,
+            &params.content,
+            &params.edge_type,
+            params.rationale.as_deref(),
+            level,
+            agent_id,
+        )
+        .await
+        .map_err(crate::errors::db_caller_error)?
+    };
 
     success_json(&EvolveStepResponse {
         claim_id: result.new_claim_id,
