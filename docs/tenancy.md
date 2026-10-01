@@ -689,7 +689,13 @@ before arming.
   privileged session or an instance-admin principal with the valve open can
   mint a fresh world-owned claim under a legacy identity, and only `OPL02`
   (the cross-human scope) still holds for everyone else. So keep the valve
-  out of maintenance units, and keep valve windows short. The "human supersedes its own
+  out of maintenance units, and keep valve windows short. No operator command
+  performs that custodial supersede yet, and a hand-written retire plus INSERT
+  is not one. The act also writes the `supersedes` edge from the successor to
+  its predecessor, moves the predecessor's strengthening edges to the
+  successor (weakening ones stay), and leaves the successor's embedding to the
+  embedding backfill. `ClaimRepository::supersede_conn` does all of this on a
+  privileged connection. The "human supersedes its own
   legacy author's claim" admission applies to rows in the human's own group.
   Revising the corpus IN PLACE (an UPDATE of content, truth value, labels, or
   retiring a claim) is not governed by the binding trigger ("Scope" above;
