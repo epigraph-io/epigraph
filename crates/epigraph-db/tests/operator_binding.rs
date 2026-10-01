@@ -1230,6 +1230,133 @@ async fn an_inherited_author_is_one_retired_predecessor_restated_in_its_group(po
         .expect("a privileged session may clear a lineage");
 }
 
+/// Delta review round 3 DIS-R3-1 (and the toggle SEC-R3-4 measured): the
+/// inherited-author rules are not per-statement. A claim that becomes current
+/// again on an application session is checked as if it were inserted now. So a
+/// live agent cannot hold two current successors of one retired predecessor
+/// under its human's retired identity by retiring the first, adding a second
+/// and re-opening the first. Nor can it re-point a successor's lineage while
+/// retiring it and then re-open it. The real shapes still work: an agent
+/// re-opens its own claim, a successor whose predecessor has no other current
+/// successor re-opens (it is inherited), and a privileged session re-opens
+/// anything.
+///
+/// Verified to fail, each alone: `is_current` dropped from the trigger's column
+/// list -> the toggled first successor re-opens ("two current successors");
+/// the re-open branch disabled (`v_reopen` never set) -> the same.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_that_becomes_current_again_is_checked_as_an_insert(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+    link_live(&pool, x, a).await;
+    let l1 = insert_claim(&pool, legacy, a_group).await.expect("l1");
+    let l2 = insert_claim(&pool, legacy, a_group).await.expect("l2");
+    let x_claim = insert_claim(&pool, x, a_group).await.expect("X's claim");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy identity's retired tie to A");
+    }
+    assert!(arm(&pool).await, "the database arms");
+    let ga = [a_group];
+    // One UPDATE on X's application session, stamped with A's group.
+    let update = |sql: &'static str, id: Uuid, other: Option<Uuid>| {
+        let pool = pool.clone();
+        async move {
+            as_app_stamped(&pool, x, &[a_group], |mut conn| async move {
+                let mut q = sqlx::query(sql).bind(id);
+                if let Some(o) = other {
+                    q = q.bind(o);
+                }
+                let r = q.execute(&mut *conn).await.map(|d| d.rows_affected());
+                (conn, r)
+            })
+            .await
+        }
+    };
+    let current_successors_of = |pred: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM claims WHERE supersedes = $1 AND agent_id = $2 \
+                    AND COALESCE(is_current, true)",
+            )
+            .bind(pred)
+            .bind(legacy)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+    const RETIRE: &str = "UPDATE claims SET is_current = false WHERE id = $1";
+    const REOPEN: &str = "UPDATE claims SET is_current = true WHERE id = $1";
+
+    // The real supersede act restates l1 under the retired identity: S1.
+    let s1 = as_app_stamped(&pool, x, &ga, |mut conn| async move {
+        let r = supersede_on(&mut conn, l1).await;
+        (conn, r)
+    })
+    .await
+    .expect("X supersedes its human's retired identity's claim")
+    .0;
+
+    // The toggle: retire S1, add a second successor S2, re-open S1.
+    update(RETIRE, s1, None).await.expect("retire S1");
+    let s2 = pose_successor(&pool, x, &ga, legacy, a_group, l1)
+        .await
+        .expect("S2: l1 has no current successor, so it is inherited");
+    assert_opl01(
+        update(REOPEN, s1, None).await.map(|_| s1),
+        "re-opening S1 while S2 is l1's current successor",
+    );
+    assert_eq!(
+        current_successors_of(l1).await,
+        1,
+        "two current successors of one retired predecessor under the retired identity"
+    );
+
+    // The two-step lineage: re-point S2 while retiring it (admitted, the
+    // consolidate shape), then re-open it: l2 is current, so not inherited.
+    update(
+        "UPDATE claims SET supersedes = $2, is_current = false WHERE id = $1",
+        s2,
+        Some(l2),
+    )
+    .await
+    .expect("re-point while retiring");
+    assert_opl01(
+        update(REOPEN, s2, None).await.map(|_| s2),
+        "re-opening a successor whose lineage was re-pointed while retired",
+    );
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(s2)
+        .fetch_one(&pool)
+        .await
+        .expect("read back");
+    assert!(!current, "S2 stays retired");
+
+    // Controls. l1 now has no current successor, so S1 re-opens as the one
+    // inherited restatement it is; X re-opens its own claim; a privileged
+    // session re-opens anything.
+    update(REOPEN, s1, None)
+        .await
+        .expect("S1 re-opens: l1's one restatement");
+    assert_eq!(current_successors_of(l1).await, 1);
+    update(RETIRE, x_claim, None)
+        .await
+        .expect("X retires its claim");
+    update(REOPEN, x_claim, None)
+        .await
+        .expect("X re-opens its own claim");
+    sqlx::query(REOPEN)
+        .bind(s2)
+        .execute(&pool)
+        .await
+        .expect("a privileged session re-opens");
+}
+
 /// The supersede act on `conn`, in its own transaction, committed on success.
 async fn supersede_on(
     conn: &mut sqlx::PgConnection,

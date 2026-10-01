@@ -124,8 +124,10 @@
 -- 2. WHERE IT IS ENFORCED: A TRIGGER, SO NO WRITE PATH CAN SKIP IT
 --
 -- `claims_require_tenancy_then_operator_binding` is a BEFORE INSERT OR UPDATE
--- OF agent_id, supersedes row trigger on `claims` (the `supersedes` half only
--- guards an existing claim's lineage; see the trigger body's comment). Every
+-- OF agent_id, supersedes, is_current row trigger on `claims` (the
+-- `supersedes` half guards an existing claim's lineage, and the `is_current`
+-- half checks a claim that becomes current again as an insert; see the
+-- trigger body's comment). Every
 -- claim write reaches it: REST, MCP over HTTP and stdio, the CLIs, workflow
 -- ingest, default and explicit
 -- declarations, and a raw INSERT on any role (a superuser included: triggers
@@ -594,9 +596,7 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, bool
 -- successor, or a different group is refused as a fresh claim naming that
 -- identity), and a group the writer cannot write is refused OPL02 before the
 -- predecessor's author is compared, so the answer never says who authored a
--- claim the writer could not read. One current successor is an INSERT-side
--- rule: claim UPDATEs outside `agent_id` / `supersedes` stay governed by row
--- security alone ("Scope" in docs/tenancy.md).
+-- claim the writer could not read.
 --
 -- LINEAGE. `supersedes` on an existing claim is also guarded (the trigger
 -- fires on UPDATE OF `supersedes`): once armed, a non-exempt session may not
@@ -605,6 +605,18 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, bool
 -- retired identity (OPL02, keyed on the arming). Setting it on a claim that
 -- had none, and re-pointing it on a claim retired in the same statement (the
 -- dedup and consolidate acts), are untouched.
+--
+-- RE-OPEN. A claim that becomes current again (`is_current` false -> true;
+-- the trigger fires on UPDATE OF `is_current`) on a non-exempt session is
+-- checked exactly as if it were INSERTed now, inherited test included. The
+-- rules above are then not per-statement: retiring a successor, adding a
+-- second one and re-opening the first, or re-pointing a successor while
+-- retiring it and re-opening it afterwards, meets the same refusal as the
+-- one-statement form (one current successor per retired predecessor, and no
+-- fresh current claim under a retired identity). No repository or route
+-- re-opens a claim. Retiring (true -> false), and every other column of a
+-- claim UPDATE, stay governed by row security alone ("Scope" in
+-- docs/tenancy.md).
 CREATE OR REPLACE FUNCTION public.epigraph_claims_require_operator_binding()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
@@ -612,15 +624,23 @@ SET search_path = public, pg_temp AS $$
 DECLARE
     v_writer uuid;
     v_inherited boolean := false;
+    v_reopen boolean := false;
 BEGIN
     IF TG_OP = 'UPDATE' AND NEW.agent_id IS NOT DISTINCT FROM OLD.agent_id THEN
-        -- Only `supersedes` (the trigger's other column) can have changed.
-        IF NEW.supersedes IS NOT DISTINCT FROM OLD.supersedes OR OLD.supersedes IS NULL
-           OR NOT public.epigraph_operator_binding_armed() THEN
+        -- Only `supersedes` / `is_current` (the trigger's other columns) can
+        -- have changed. Cheap OLD/NEW tests first: a retire or an untouched
+        -- column returns before any table is read.
+        v_reopen := NOT COALESCE(OLD.is_current, true) AND COALESCE(NEW.is_current, true);
+        IF NOT v_reopen
+           AND (NEW.supersedes IS NOT DISTINCT FROM OLD.supersedes OR OLD.supersedes IS NULL) THEN
             RETURN NEW;
         END IF;
-        IF (NEW.supersedes IS NULL OR COALESCE(NEW.is_current, true))
-           AND NOT public.epigraph_operator_scope_exempt() THEN
+        IF NOT public.epigraph_operator_binding_armed()
+           OR public.epigraph_operator_scope_exempt() THEN
+            RETURN NEW;
+        END IF;
+        IF NEW.supersedes IS DISTINCT FROM OLD.supersedes AND OLD.supersedes IS NOT NULL
+           AND (NEW.supersedes IS NULL OR COALESCE(NEW.is_current, true)) THEN
             RAISE EXCEPTION 'OPL02: claim % records that it supersedes %; an application session '
                             'does not clear, or re-point on a current claim, the lineage of an '
                             'existing claim', NEW.id, OLD.supersedes
@@ -628,9 +648,11 @@ BEGIN
                       HINT = 'Supersede the claim instead, or retire it in the same statement '
                              '(the dedup act). Admin access crosses humans; nothing else does.';
         END IF;
-        RETURN NEW;
-    END IF;
-    IF NOT public.epigraph_operator_binding_armed() THEN
+        IF NOT v_reopen THEN
+            RETURN NEW;
+        END IF;
+        -- A RE-OPEN on a non-exempt session: checked below as an INSERT of NEW.
+    ELSIF NOT public.epigraph_operator_binding_armed() THEN
         RETURN NEW;
     END IF;
     -- RE-ATTRIBUTION. Every check below reads the NEW author only, so an
@@ -640,7 +662,7 @@ BEGIN
     -- only the exemption (a privileged session, an instance-admin principal)
     -- may, and it is then checked like an insert below. OPL02, keyed on the
     -- arming: it is attribution, which the valve never relieves.
-    IF TG_OP = 'UPDATE' AND NOT public.epigraph_operator_scope_exempt() THEN
+    IF TG_OP = 'UPDATE' AND NOT v_reopen AND NOT public.epigraph_operator_scope_exempt() THEN
         RAISE EXCEPTION 'OPL02: claim % is attributed to %; an application session does not '
                         're-attribute an existing claim (here to %)', NEW.id, OLD.agent_id,
                         NEW.agent_id
@@ -665,7 +687,7 @@ BEGIN
                   HINT = 'Write on a transaction stamped with the request''s viewer '
                          '(ScopedPool::begin_as). See docs/tenancy.md "Operator binding".';
     END IF;
-    IF TG_OP = 'INSERT' AND NEW.supersedes IS NOT NULL THEN
+    IF (TG_OP = 'INSERT' OR v_reopen) AND NEW.supersedes IS NOT NULL THEN
         v_inherited :=
             EXISTS (SELECT 1 FROM public.claims p
                      WHERE p.id = NEW.supersedes
@@ -706,7 +728,7 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_claims_require_operator_binding() FRO
 DROP TRIGGER IF EXISTS claims_require_operator_binding ON public.claims;
 DROP TRIGGER IF EXISTS claims_require_tenancy_then_operator_binding ON public.claims;
 CREATE TRIGGER claims_require_tenancy_then_operator_binding
-    BEFORE INSERT OR UPDATE OF agent_id, supersedes ON public.claims
+    BEFORE INSERT OR UPDATE OF agent_id, supersedes, is_current ON public.claims
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_claims_require_operator_binding();
 
 -- Section 1b at the membership door: a writer/admin row for a live-linked agent

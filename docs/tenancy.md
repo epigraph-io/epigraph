@@ -427,7 +427,8 @@ a second successor). Nor can an existing claim's lineage be laundered: once
 armed, an application session may not clear `claims.supersedes`, nor re-point
 it on a claim that stays current (`OPL02`); setting it on a claim that had
 none, and re-pointing it while retiring the claim in the same statement (the
-dedup and consolidate acts), are unchanged. With a principal
+dedup and consolidate acts), are unchanged; re-opening such a claim later is
+checked as an insert ("Scope" below). With a principal
 equal to the author, or a privileged session, the author is the one checked.
 An APPLICATION session with NO principal (a write on an unstamped connection)
 is an unbound writer: refused `OPL01` once armed, so a path that forgot to
@@ -488,13 +489,17 @@ rather than writing into that human's group; a per-operator system identity is
 the follow-up that lets them ingest workflows.
 
 **Scope: claim INSERTs.** The trigger governs claim INSERTs, changes of
-`claims.agent_id`, and the clearing or re-pointing of an existing
-`claims.supersedes` (above). Every other claim UPDATE (content, truth value,
-labels, `is_current`, a first `supersedes`, properties, embedding: the retire
-half of a supersede, a dedup, a relabel, a re-score) is gated by tenancy row
-security alone, not by `OPL01` / `OPL02`. So "one current successor" is an
-INSERT-side rule: an update that re-opens a retired predecessor is row
-security's question, not this trigger's. On a schema with only this series' policies
+`claims.agent_id`, the clearing or re-pointing of an existing
+`claims.supersedes` (above), and a claim becoming current again
+(`is_current` false to true), which a non-exempt session's trigger checks as
+an INSERT of that row. The inherited-author rules therefore hold across
+statements: retiring a successor, adding a second one and re-opening the
+first, or re-pointing a successor while retiring it and then re-opening it,
+meets the same refusal as the one-statement form. No repository or route
+re-opens a claim. Every other claim UPDATE (content, truth value, labels,
+retiring a claim, a first `supersedes`, properties, embedding: the retire half
+of a supersede, a dedup, a relabel, a re-score) is gated by tenancy row
+security alone, not by `OPL01` / `OPL02`. On a schema with only this series' policies
 that is the owner-group rule: an update needs the row readable and its owner
 group in the session's writable set, so one human's agent cannot update
 another human's claim, but an UNBOUND agent can still update claims in a group
