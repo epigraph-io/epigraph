@@ -2639,3 +2639,179 @@ async fn a_custodian_reopen_is_checked_as_an_insert(pool: PgPool) {
         .await
         .expect("a privileged session re-opens");
 }
+
+fn assert_self_supersede_refused<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>, what: &str) {
+    assert_eq!(
+        code_of(r).as_deref(),
+        Some("OPL02"),
+        "{what}: expected OPL02, got {r:?}"
+    );
+    let text = r.as_ref().expect_err("refused").to_string();
+    assert!(
+        text.contains("never supersedes itself"),
+        "{what}: the refusal says why: {text}"
+    );
+}
+
+/// Delta review round 4 DIS-R4-1 (migration 123): a claim never supersedes
+/// ITSELF. In a BEFORE UPDATE trigger `p.id = NEW.supersedes` finds the row's
+/// own OLD version, so a retired identity's retired claim could be re-opened
+/// "as its own successor" and pass the inherited test. Refused on every
+/// session, armed or not, as the FIRST statement of the trigger body: both
+/// the one-statement shape (`is_current = true, supersedes = id`) and the
+/// two-statement one (`supersedes = id`, which the cheap early return would
+/// otherwise wave through, then a re-open), and an INSERT naming itself.
+///
+/// Verified to fail: the self-reference refusal removed -> the one-statement
+/// re-open lands (inherited from itself) and the first statement of the
+/// two-statement shape lands; the refusal placed after the cheap early return
+/// -> the two-statement first statement lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_never_supersedes_itself(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+    link_live(&pool, x, a).await;
+    let c = insert_claim(&pool, legacy, a_group).await.expect("c");
+    let d = insert_claim(&pool, legacy, a_group).await.expect("d");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy identity's retired tie to A");
+    }
+    sqlx::query("UPDATE claims SET is_current = false WHERE id IN ($1, $2)")
+        .bind(c)
+        .bind(d)
+        .execute(&pool)
+        .await
+        .expect("retire c and d");
+
+    // Unarmed: refused on every session, the superuser included.
+    let unarmed = sqlx::query("UPDATE claims SET supersedes = id WHERE id = $1")
+        .bind(c)
+        .execute(&pool)
+        .await;
+    assert_self_supersede_refused(&unarmed, "unarmed, superuser, two-statement first half");
+    let id = Uuid::new_v4();
+    let insert_self = sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, supersedes) \
+         VALUES ($1, 'self', $2, 0.5, $3, true, 'public', $4, $1)",
+    )
+    .bind(id)
+    .bind(id.as_bytes().repeat(2))
+    .bind(a)
+    .bind(a_group)
+    .execute(&pool)
+    .await;
+    // `claims_require_tenancy` sorts first and already refuses it (the named
+    // predecessor does not exist yet, 23503); the binding trigger's own
+    // refusal is the second line of defence for that shape.
+    assert!(
+        insert_self.is_err(),
+        "an INSERT naming itself is refused: {insert_self:?}"
+    );
+
+    assert!(arm(&pool).await, "the database arms");
+    let ga = [a_group];
+    let one = update_as(
+        &pool,
+        x,
+        &ga,
+        "UPDATE claims SET is_current = true, supersedes = id WHERE id = $1",
+        c,
+    )
+    .await;
+    assert_self_supersede_refused(&one, "armed, one statement: re-open as its own successor");
+    let two = update_as(
+        &pool,
+        x,
+        &ga,
+        "UPDATE claims SET supersedes = id WHERE id = $1",
+        d,
+    )
+    .await;
+    assert_self_supersede_refused(&two, "armed, two statements: the first half");
+    let privileged = sqlx::query("UPDATE claims SET supersedes = id WHERE id = $1")
+        .bind(d)
+        .execute(&pool)
+        .await;
+    assert_self_supersede_refused(&privileged, "armed, a privileged session");
+    let loops: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE supersedes = id")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(loops, 0, "no self-loop was written");
+}
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// DIS-R4-1's other half, on a self-loop written BEFORE 123 (none can be
+/// written after it): retiring such a claim is untouched (the refusal fires
+/// only when `supersedes` is SET to the row's own id), and re-opening it on
+/// an application session is checked as a FRESH claim, because the inherited
+/// test no longer matches the row's own OLD version (`p.id <> NEW.id`).
+///
+/// Verified to fail: `p.id <> NEW.id` removed -> the re-open of the retired
+/// self-loop is inherited from itself and lands; the self-reference refusal
+/// made unconditional (no `supersedes` change test) -> retiring the current
+/// self-loop is refused.
+#[sqlx::test(migrations = false)]
+async fn a_legacy_self_loop_retires_but_never_reopens_as_its_own_successor(pool: PgPool) {
+    let mut ids = (Uuid::nil(), Uuid::nil(), Uuid::nil(), Uuid::nil());
+    fixture::db_at_122_then_head(&pool, &MIGRATOR, |pool| {
+        let ids = &mut ids;
+        async move {
+            let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+            let (x, _) = fixture::seed_agent_with_group(&pool, "a-agent-x").await;
+            let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+            link_live(&pool, x, a).await;
+            let retired = insert_claim(&pool, legacy, a_group).await.expect("retired");
+            let current = insert_claim(&pool, legacy, a_group).await.expect("current");
+            sqlx::query("UPDATE claims SET supersedes = id WHERE id IN ($1, $2)")
+                .bind(retired)
+                .bind(current)
+                .execute(&pool)
+                .await
+                .expect("at 122 a self-loop can be written");
+            sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+                .bind(retired)
+                .execute(&pool)
+                .await
+                .expect("retire one");
+            {
+                let mut conn = pool.acquire().await.expect("acquire");
+                AgentRepository::link_retired_agent(&mut conn, legacy, a)
+                    .await
+                    .expect("the legacy identity's retired tie to A");
+            }
+            *ids = (x, a_group, retired, current);
+        }
+    })
+    .await;
+    let (x, a_group, retired, current) = ids;
+    assert!(arm(&pool).await, "the database arms");
+    let ga = [a_group];
+    update_as(
+        &pool,
+        x,
+        &ga,
+        "UPDATE claims SET is_current = false WHERE id = $1",
+        current,
+    )
+    .await
+    .expect("retiring a legacy self-loop is untouched");
+    assert_opl01(
+        update_as(
+            &pool,
+            x,
+            &ga,
+            "UPDATE claims SET is_current = true WHERE id = $1",
+            retired,
+        )
+        .await
+        .map(|_| retired),
+        "re-opening a retired legacy self-loop under the retired identity",
+    );
+}

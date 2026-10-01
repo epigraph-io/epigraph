@@ -878,6 +878,20 @@ DECLARE
     v_inherited boolean := false;
     v_reopen boolean := false;
 BEGIN
+    -- 123 (round 4 DIS-R4-1): A CLAIM NEVER SUPERSEDES ITSELF, on every
+    -- session, armed or not. The FIRST statement: the cheap early return
+    -- below waves through `SET supersedes = id` on a claim that had none,
+    -- which is exactly the first half of the two-statement self-loop. Only a
+    -- statement that SETS the self-reference is refused, so a self-loop
+    -- written before 123 can still be retired; its re-open is a fresh claim
+    -- (`p.id <> NEW.id` in the inherited test below).
+    IF NEW.supersedes = NEW.id
+       AND (TG_OP = 'INSERT' OR NEW.supersedes IS DISTINCT FROM OLD.supersedes) THEN
+        RAISE EXCEPTION 'OPL02: claim % names itself in supersedes; a claim never supersedes '
+                        'itself', NEW.id
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Supersede it with a new claim (the supersede act).';
+    END IF;
     IF TG_OP = 'UPDATE' AND NEW.agent_id IS NOT DISTINCT FROM OLD.agent_id THEN
         -- Only `supersedes` / `is_current` (the trigger's other columns) can
         -- have changed. Cheap OLD/NEW tests first: a retire or an untouched
@@ -953,6 +967,7 @@ BEGIN
         v_inherited :=
             EXISTS (SELECT 1 FROM public.claims p
                      WHERE p.id = NEW.supersedes
+                       AND p.id <> NEW.id  -- 123 (DIS-R4-1): never the row's own OLD version
                        AND p.agent_id IS NOT DISTINCT FROM NEW.agent_id
                        AND p.owner_group_id IS NOT DISTINCT FROM NEW.owner_group_id
                        AND NOT COALESCE(p.is_current, true))
