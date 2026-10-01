@@ -1548,10 +1548,73 @@ unstamped application session); `OPL02` stays in force, including for an
 unbound writer (or another human's agent) that names a bound author or a
 retired identity tied to a human. Removing the arming row, or dropping the trigger, is a superuser DDL
 act on the migration DSN. To remove migration 122's functions after step 8,
-first roll the MCP server back to its previous build. The new listener reads
-its signer's binding through a 122 function at startup and on every HTTP tool
-call, and fails closed without it: it refuses to start, and it refuses every
-call.
+first roll back EVERY binary built against them, not only the MCP server:
+
+* `epigraph-api`: every claim write through a default declaration calls
+  `epigraph_require_bound_author` and `epigraph_require_operator_scope`, and
+  every REST workflow write (`/api/v1/workflows/ingest|store|improve`,
+  `/steps`, `/steps/delete`) calls the writer-authority checks; without 122
+  each answers 500 (`42883`).
+* `epigraph-mcp`: the HTTP listener reads its signer's binding through a 122
+  function at startup and on every tool call, and fails closed without it (it
+  refuses to start, and it refuses every call).
+* `epigraph-tenancy-backfill`: `verify` inventories 122's definers (its
+  deferred list is presence-gated, so an older build is the safe one).
+* `epigraph-operator`: its binding verbs call 122's definers.
+
+Then drop the trigger and the functions. If migration 123 is applied, undo it
+FIRST (next section): its bodies call 122's.
 
 No new environment variable is required; `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT`
 exists only as the emergency valve.
+
+## The custodian role (migration 123) — deploy order and rollback
+
+Instance administration is `role:platform-custodian`, held by a registered
+human operator through a timestamped `role_assignments` row; agents never hold
+it. `epigraph_is_instance_admin` keeps its name and answers from the role. The
+model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
+("The custodian role").
+
+1. **Preconditions.** Migration 122 applied, and every human who should keep
+   instance-admin authority REGISTERED (`register-human-operator`, step 2b
+   above) before 123 runs: 123 carries a live `instance_admins` row into an
+   assignment only for a registered human, and skips (loudly: a NOTICE and a
+   `platform.role_migration_skipped` event) every other live row.
+2. **Migrate 123** (`epigraph-migrate`, migration DSN). New tables and
+   function bodies, one restrictive policy on `security_events`, and small
+   triggers on `instance_admins`, `human_operators` and `operator_links`;
+   no backfill. `lock_timeout` is 3s; retry on a lock timeout. Old binaries
+   keep working against it, except `epigraph-instance-admin grant|revoke`,
+   which now fail (`CUS05`) by design.
+3. **Deploy** `epigraph-api`, `epigraph-mcp`, `epigraph-operator`,
+   `epigraph-instance-admin` and `epigraph-tenancy-backfill` built from the
+   same commit.
+4. **Check.** `epigraph-operator list-role-assignments` shows the carried
+   rows. Bootstrap a custodian if none was carried:
+   `epigraph-operator grant-role --role role:platform-custodian --holder <the
+   human's own agent> (--valid-to <RFC3339> | --open-ended) --reason <text>
+   --apply` (no `--granted-by` only while no live custodian exists). Then
+   confirm each request unit connects as `epigraph_app` with
+   `epigraph_bypass() = false`: its boot log must say ENFORCED, never the
+   privileged-DSN ERROR line.
+5. **Custodial revisions** of the platform corpus use
+   `epigraph-operator custodial-supersede --claim <id> --content-file <f>
+   --truth <x> --assignment <the actor's live assignment> --actor <the
+   custodian> --reason <text> [--apply]` on the maintenance DSN; it records a
+   `platform.custodial_act` against the assignment in the same transaction.
+   The successor has no embedding until the next embedding backfill.
+
+**Rollback.** First roll back every binary that calls a 123 function:
+`epigraph-operator` (the role verbs and `custodial-supersede`),
+`epigraph-api` (privatization records a custodial act and reads the
+assignment), and `epigraph-tenancy-backfill` (an older `verify` is the safe
+one). Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
+transaction: it stamps every live `instance_admins` row whose agent holds no
+live custodian assignment (so 083's restored body resurrects no authority
+ended after 123), drops 123's triggers, re-applies 083's and 122's function
+bodies verbatim (the round-4 fixes revert with them), drops the `platform.`
+policy and every 123 definer, and lists the holders granted after 123, which
+exist only in `role_assignments` and are re-granted in `instance_admins` by
+hand if they must survive. It leaves the role tables, the audit rows and the
+OCCUPIES edges in place (history; forward-fix only).

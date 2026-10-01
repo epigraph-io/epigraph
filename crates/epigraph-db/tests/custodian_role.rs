@@ -1751,3 +1751,143 @@ fn every_123_object_is_registered() {
         );
     }
 }
+
+// =====================================================================
+// T18. The rollback restores 122 and 083, and resurrects nobody.
+// =====================================================================
+
+/// The functions `docs/runbooks/123-undo.sql` restores, by signature.
+const RESTORED: &[&str] = &[
+    "public.epigraph_is_instance_admin(uuid)",
+    "public.epigraph_operator_scope_exempt()",
+    "public.epigraph_require_operator_scope(uuid, uuid)",
+    "public.epigraph_require_writer_scope(uuid, uuid)",
+    "public.epigraph_require_attributable(uuid, uuid, boolean)",
+    "public.epigraph_claims_require_operator_binding()",
+];
+
+async fn functiondefs(pool: &PgPool) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in RESTORED {
+        let def: String = sqlx::query_scalar(&format!(
+            "SELECT pg_get_functiondef('{f}'::regprocedure) || \
+                    ' owner=' || (SELECT proowner::regrole::text FROM pg_proc \
+                                   WHERE oid = '{f}'::regprocedure)"
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{f}: {e}"));
+        out.push(def);
+    }
+    out
+}
+
+/// `docs/runbooks/123-undo.sql`, applied to a database that went 122 -> 123,
+/// leaves each function 123 re-bodied BYTE-EQUAL (`pg_get_functiondef`, owner
+/// included) to the same database's definition at 122, drops every 123
+/// definer, and resurrects no authority 123 ended: a custodian whose
+/// assignment was ended, and one whose human registration was revoked, are
+/// not instance admins under 083's restored body (their legacy rows were
+/// stamped by 123's mirrors), nor is an agent 123 skipped (the undo's own
+/// belt stamps its row), while a custodian still live keeps it.
+///
+/// Verified to fail: the undo's re-application of
+/// `epigraph_require_writer_scope` removed -> its 123 body (VOLATILE, the
+/// audited relief) stays and differs; 123's role-end mirror removed (and the
+/// undo's belt with it) -> the ended custodian is an instance admin again;
+/// the undo's belt alone removed -> the skipped agent is one again. (Each of
+/// the mirror and the belt alone is covered by the other here; the mirror
+/// alone is pinned by `instance_admins_is_migrated_then_frozen`.)
+#[sqlx::test(migrations = false)]
+async fn the_rollback_restores_122_and_083(pool: PgPool) {
+    let mut at_122: Vec<String> = Vec::new();
+    let mut ids = (Uuid::nil(), Uuid::nil(), Uuid::nil(), Uuid::nil());
+    fixture::db_at_122_then_head(&pool, &MIGRATOR, |pool| {
+        let (at_122, ids) = (&mut at_122, &mut ids);
+        async move {
+            *at_122 = functiondefs(&pool).await;
+            let (ended, _) = fixture::seed_human_operator(&pool, "ended").await;
+            let (revoked, _) = fixture::seed_human_operator(&pool, "revoked").await;
+            let (kept, _) = fixture::seed_human_operator(&pool, "kept").await;
+            let skipped = bare_agent(&pool).await;
+            for h in [ended, revoked, kept, skipped] {
+                legacy_admin(&pool, h, "now()", false, "pre-123 admin").await;
+            }
+            *ids = (ended, revoked, kept, skipped);
+        }
+    })
+    .await;
+    let (ended, revoked, kept, skipped) = ids;
+    let carried: Uuid =
+        sqlx::query_scalar("SELECT id FROM role_assignments WHERE holder_person_id = $1")
+            .bind(ended)
+            .fetch_one(&pool)
+            .await
+            .expect("the carried assignment");
+    assert!(end_role(&pool, carried).await.expect("end"));
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_revoke_human_operator($1, 'test')")
+            .bind(revoked)
+            .execute(&mut *conn)
+            .await
+            .expect("revoke the human");
+        (conn, ())
+    })
+    .await;
+    assert_ne!(
+        functiondefs(&pool).await,
+        at_122,
+        "CALIBRATION: 123 re-bodied these functions"
+    );
+
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/123-undo.sql"),
+    )
+    .expect("123-undo.sql");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("the undo script applies");
+
+    let restored = functiondefs(&pool).await;
+    for ((f, now), then) in RESTORED.iter().zip(&restored).zip(&at_122) {
+        assert_eq!(
+            now, then,
+            "{f} is not 122's (or 083's) definition after the undo"
+        );
+    }
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT proname::text FROM pg_proc WHERE pronamespace = 'public'::regnamespace \
+            AND proname IN ('epigraph_custodial_relief', 'epigraph_holds_role', \
+                            'epigraph_role_assignment_for', 'epigraph_grant_role', \
+                            'epigraph_record_custodial_act', 'epigraph_live_role_assignment', \
+                            'epigraph_instance_admins_frozen')",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("catalog");
+    assert!(left.is_empty(), "123 definers left behind: {left:?}");
+
+    for (who, expected, what) in [
+        (ended, false, "a custodian whose assignment was ended"),
+        (
+            revoked,
+            false,
+            "a custodian whose human registration was revoked",
+        ),
+        (kept, true, "a custodian still live"),
+        (
+            skipped,
+            false,
+            "an agent 123 skipped (agents never hold the role; only the undo's belt \
+             stamps its legacy row, since no assignment ever mirrored into it)",
+        ),
+    ] {
+        let admin: bool = sqlx::query_scalar("SELECT public.epigraph_is_instance_admin($1)")
+            .bind(who)
+            .fetch_one(&pool)
+            .await
+            .expect("083's body");
+        assert_eq!(admin, expected, "{what}");
+    }
+}
