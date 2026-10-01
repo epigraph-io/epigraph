@@ -107,7 +107,10 @@ DECLARE t text;
           'operator_links',
           -- ---- the evidence visibility pins (110) --------------------------
           -- FORCEd by 110 at creation, same precedent and reason.
-          'evidence_visibility_pins'];
+          'evidence_visibility_pins',
+          -- ---- the custodian role (123) ---------------------------------
+          -- FORCEd by 123 at creation, same precedent and reason.
+          'platform_roles','role_assignments'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c
