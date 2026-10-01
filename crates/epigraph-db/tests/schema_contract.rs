@@ -1462,10 +1462,13 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
             "s",
             false,
         ),
+        // VOLATILE since migration 123: its custodial relief writes the
+        // `platform.custodial_exempt` audit row, which a STABLE function must
+        // not (PostgreSQL does not refuse it, so this pin is the guard).
         (
             "epigraph_require_operator_scope",
             "public.epigraph_require_operator_scope(uuid, uuid)",
-            "s",
+            "v",
             true,
         ),
         (
@@ -1498,16 +1501,22 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
             "s",
             true,
         ),
+        // VOLATILE since migration 123: its custodial relief writes the
+        // `platform.custodial_exempt` audit row, which a STABLE function must
+        // not (PostgreSQL does not refuse it, so this pin is the guard).
         (
             "epigraph_require_writer_scope",
             "public.epigraph_require_writer_scope(uuid, uuid)",
-            "s",
+            "v",
             true,
         ),
+        // VOLATILE since migration 123: its custodial relief writes the
+        // `platform.custodial_exempt` audit row, which a STABLE function must
+        // not (PostgreSQL does not refuse it, so this pin is the guard).
         (
             "epigraph_require_attributable",
             "public.epigraph_require_attributable(uuid, uuid, boolean)",
-            "s",
+            "v",
             true,
         ),
         (

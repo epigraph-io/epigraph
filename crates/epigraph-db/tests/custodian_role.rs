@@ -1339,3 +1339,122 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
         "revoking the human stamps the legacy row"
     );
 }
+
+// =====================================================================
+// T11. A custodian's relief from the cross-human scope is audited.
+// =====================================================================
+
+/// Arm the operator binding as the maintenance role would.
+async fn arm(pool: &PgPool) {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_arm_operator_binding()")
+            .execute(&mut *conn)
+            .await
+            .expect("arm");
+        (conn, ())
+    })
+    .await;
+}
+
+/// A `('public', group)` claim by `author` on whatever connection `exec` is.
+async fn insert_claim<'e, E>(exec: E, author: Uuid, group: Uuid) -> Result<Uuid, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(format!("custodian probe {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(author)
+    .bind(group)
+    .execute(exec)
+    .await?;
+    Ok(id)
+}
+
+async fn relief_events(pool: &PgPool) -> Vec<(Option<Uuid>, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT agent_id, details->>'check', details->>'assignment_id' FROM security_events \
+          WHERE event_type = 'platform.custodial_exempt' ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("relief events")
+}
+
+/// Once armed, a principal that holds the custodian role is relieved of the
+/// cross-human scope (OPL02) on an application session, and EVERY relief it
+/// actually receives is one `platform.custodial_exempt` row naming the
+/// assignment and the check. A privileged session's relief is not audited
+/// (it is the operator's own login); a non-custodian is refused OPL02 and
+/// leaves nothing. A refused write's relief rolls back with it.
+///
+/// Verified to fail: the relief's audit INSERT removed -> no event; the
+/// bypass arm made to audit too -> a second event; the relief keyed on
+/// `epigraph_bypass()` only (OQ-1 (b)) -> the custodian is refused OPL02.
+/// NOT caught behaviourally: `epigraph_require_writer_scope` left STABLE.
+/// Measured on the test cluster, a STABLE plpgsql function that calls a
+/// VOLATILE one which INSERTs does not error; `schema_contract.rs` pins the
+/// `provolatile` of the three checks instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn custodial_relief_is_audited_with_the_assignment(pool: PgPool) {
+    let (a, _) = fixture::seed_human_operator(&pool, "custodian-a").await;
+    let (b, bg) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (c, cg) = fixture::seed_human_operator(&pool, "human-c").await;
+    let assignment = fixture::make_custodian(&pool, a).await;
+    arm(&pool).await;
+
+    let crossed = as_app(&pool, Some(a), &[bg], |mut conn| async move {
+        let r = insert_claim(&mut *conn, a, bg).await;
+        (conn, r)
+    })
+    .await;
+    assert!(
+        crossed.is_ok(),
+        "a custodian writes into a group its human does not write: {crossed:?}"
+    );
+    assert_eq!(
+        relief_events(&pool).await,
+        vec![(
+            Some(a),
+            "writer_scope".to_string(),
+            Some(assignment.to_string())
+        )],
+        "exactly one relief row, naming the assignment"
+    );
+
+    // A privileged session's relief is not a custodial act.
+    insert_claim(&pool, a, bg)
+        .await
+        .expect("the superuser writes A's claim into B's group");
+    assert_eq!(relief_events(&pool).await.len(), 1, "no row for bypass");
+
+    // A non-custodian is refused, and leaves nothing.
+    let refused = as_app(&pool, Some(c), &[cg, bg], |mut conn| async move {
+        let r = insert_claim(&mut *conn, c, bg).await;
+        (conn, r)
+    })
+    .await;
+    assert_code(&refused, "OPL02", "a human who is no custodian");
+    // A custodian's write refused for ANOTHER reason (an unbound author:
+    // OPL01, after the scope check already relieved it) rolls its relief row
+    // back with it.
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "unbound").await;
+    let rolled_back = as_app(&pool, Some(a), &[bg], |mut conn| async move {
+        let r = insert_claim(&mut *conn, unbound, bg).await;
+        (conn, r)
+    })
+    .await;
+    assert_code(&rolled_back, "OPL01", "an unbound author, even for a custodian");
+    assert_eq!(
+        relief_events(&pool).await.len(),
+        1,
+        "a refused write leaves no relief row"
+    );
+    let _ = b;
+}

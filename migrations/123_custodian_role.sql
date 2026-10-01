@@ -686,6 +686,298 @@ CREATE TRIGGER human_operators_mirror_instance_admins
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_human_operators_mirror_instance_admins();
 
 -- ===================================================================
+-- 7. THE 122 CHECKS, AMENDED (signatures unchanged; bodies are 122's, with the
+--    deltas each block's comment names)
+--
+-- RELIEF IS AUDITED. 122 relieves "the exemption" (a privileged session, or
+-- an instance-admin principal) of the cross-human scope (OPL02) at five
+-- points: the membership door, the claims-path writer scope, the two
+-- attribution arms, and a re-attribution. Each now asks
+-- `epigraph_custodial_relief(check, ...)`: true for a privileged session (not
+-- audited: that is the operator's own login, already accountable), and true
+-- for a principal that holds role:platform-custodian NOW, in which case it
+-- writes one `platform.custodial_exempt` row naming the assignment, the check
+-- and its subjects (at most one per transaction per check and subjects: the
+-- request path's own pre-check and the trigger reach the same point). A
+-- refused write rolls its relief row back with it, so a row means a relief
+-- that was used.
+--
+-- THE THREE CHECKS ARE NOW VOLATILE. A STABLE function must not write; the
+-- relief writes. (Measured: PostgreSQL does not refuse a STABLE plpgsql
+-- function that calls a VOLATILE writer, so the declaration, pinned by
+-- `schema_contract.rs`, is the guard.) Callers run them in a plain
+-- `SELECT f(...)`, which volatility does not change.
+--
+-- `epigraph_operator_scope_exempt()` is kept, unchanged; it reads the
+-- re-bodied `epigraph_is_instance_admin`.
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_custodial_relief(
+    p_check text, p_agent uuid, p_group uuid, p_claim uuid)
+RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_principal  uuid;
+    v_assignment uuid;
+BEGIN
+    IF public.epigraph_bypass() THEN
+        RETURN true;
+    END IF;
+    v_principal := public.epigraph_principal_id();
+    v_assignment := public.epigraph_role_assignment_for(v_principal, 'role:platform-custodian',
+                                                        now());
+    IF v_assignment IS NULL THEN
+        RETURN false;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.security_events e
+                    WHERE e.created_at = now()
+                      AND e.event_type = 'platform.custodial_exempt'
+                      AND e.agent_id = v_principal
+                      AND e.details->>'txid' = txid_current()::text
+                      AND e.details->>'check' = p_check
+                      AND e.details->>'agent' IS NOT DISTINCT FROM p_agent::text
+                      AND e.details->>'group' IS NOT DISTINCT FROM p_group::text
+                      AND e.details->>'claim' IS NOT DISTINCT FROM p_claim::text) THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('platform.custodial_exempt', v_principal, true,
+                jsonb_build_object('assignment_id', v_assignment,
+                                   'role', 'role:platform-custodian',
+                                   'check', p_check, 'agent', p_agent, 'group', p_group,
+                                   'claim', p_claim, 'txid', txid_current()::text));
+    END IF;
+    RETURN true;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_custodial_relief(text, uuid, uuid, uuid) FROM PUBLIC;
+
+-- 122's membership-door check; delta: VOLATILE, and the audited relief.
+CREATE OR REPLACE FUNCTION public.epigraph_require_operator_scope(p_agent uuid, p_group uuid)
+RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_operator uuid;
+BEGIN
+    IF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN;
+    END IF;
+    IF public.epigraph_is_human_operator(p_agent) THEN
+        RETURN;
+    END IF;
+    SELECT l.operator_id INTO v_operator
+      FROM public.operator_links l
+     WHERE l.agent_id = p_agent AND NOT l.retired;
+    IF v_operator IS NULL OR public.epigraph_operator_writes_group(v_operator, p_group) THEN
+        RETURN;
+    END IF;
+    IF public.epigraph_custodial_relief('operator_scope', p_agent, p_group, NULL) THEN
+        RETURN;
+    END IF;
+    RAISE EXCEPTION 'OPL02: agent % is linked to operator %, which holds no writer/admin '
+                    'membership in group %; a linked agent writes only where its own operator '
+                    'writes', p_agent, v_operator, p_group
+        USING ERRCODE = 'OPL02',
+              HINT = 'Write into a group the operator writes (its personal group is the '
+                     'default), or have the operator join the group first. Admin access '
+                     'crosses groups; nothing else does.';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_operator_scope(uuid, uuid) FROM PUBLIC;
+
+-- 122's claims-path writer scope; delta: VOLATILE, and the audited relief.
+CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, p_group uuid)
+RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_human uuid;
+BEGIN
+    IF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN;
+    END IF;
+    v_human := public.epigraph_human_of(p_agent, false);
+    IF v_human IS NULL OR public.epigraph_operator_writes_group(v_human, p_group) THEN
+        RETURN;
+    END IF;
+    IF public.epigraph_custodial_relief('writer_scope', p_agent, p_group, NULL) THEN
+        RETURN;
+    END IF;
+    IF v_human = p_agent THEN
+        RAISE EXCEPTION 'OPL02: human operator % holds no writer/admin membership in group %; '
+                        'a human writes only where it writes', p_agent, p_group
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Write into a group you write (your personal group is the default). '
+                         'Admin access crosses groups; nothing else does.';
+    END IF;
+    RAISE EXCEPTION 'OPL02: agent % is linked to operator %, which holds no writer/admin '
+                    'membership in group %; a linked agent writes only where its own operator '
+                    'writes', p_agent, v_human, p_group
+        USING ERRCODE = 'OPL02',
+              HINT = 'Write into a group the operator writes (its personal group is the '
+                     'default), or have the operator join the group first. Admin access '
+                     'crosses groups; nothing else does.';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM PUBLIC;
+
+-- 122's attribution check; delta: VOLATILE, and the audited relief at both
+-- of its relief points.
+CREATE OR REPLACE FUNCTION public.epigraph_require_attributable(
+    p_author uuid, p_writer uuid, p_inherited boolean)
+RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_author_human uuid;
+    v_writer_human uuid;
+BEGIN
+    IF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN;
+    END IF;
+    v_writer_human := public.epigraph_human_of(p_writer, true);
+    v_author_human := public.epigraph_human_of(p_author, NOT COALESCE(p_inherited, false));
+    IF v_author_human IS NULL THEN
+        -- No human for this row's kind. A RETIRED identity still belongs to
+        -- its human: a writer outside that human is refused below (OPL02,
+        -- whatever the valve), before the binding check the valve relieves.
+        v_author_human := public.epigraph_human_of(p_author, false);
+        IF v_author_human IS NULL OR v_author_human = v_writer_human
+           OR public.epigraph_custodial_relief('attribution_retired', p_author, NULL, NULL) THEN
+            PERFORM public.epigraph_require_bound_author(p_author);
+            RETURN;
+        END IF;
+    ELSIF v_writer_human = v_author_human THEN
+        RETURN;
+    ELSIF public.epigraph_custodial_relief('attribution', p_author, NULL, NULL) THEN
+        RETURN;
+    END IF;
+    IF v_writer_human IS NULL THEN
+        RAISE EXCEPTION 'OPL02: the writing principal % belongs to no human operator, and a claim '
+                        'it writes may not be attributed to %, which belongs to human operator %; '
+                        'an unbound writer names no bound author', p_writer, p_author,
+                        v_author_human
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Author the claim as the writing agent itself. The valve relieves the '
+                         'binding (OPL01) only; admin access crosses humans; nothing else does.';
+    END IF;
+    RAISE EXCEPTION 'OPL02: agent % writes a claim attributed to %, which belongs to human '
+                    'operator %, not to the writer''s operator %; a claim may name only an '
+                    'author of the writer''s own human', p_writer, p_author, v_author_human,
+                    v_writer_human
+        USING ERRCODE = 'OPL02',
+              HINT = 'Author the claim as the writing agent itself. Admin access crosses '
+                     'humans; nothing else does.';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_require_attributable(uuid, uuid, boolean) FROM PUBLIC;
+
+-- 122's claims trigger body; deltas: the audited relief on a
+-- re-attribution (and the round-4 fixes, each commented where it lands).
+CREATE OR REPLACE FUNCTION public.epigraph_claims_require_operator_binding()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_writer uuid;
+    v_inherited boolean := false;
+    v_reopen boolean := false;
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW.agent_id IS NOT DISTINCT FROM OLD.agent_id THEN
+        -- Only `supersedes` / `is_current` (the trigger's other columns) can
+        -- have changed. Cheap OLD/NEW tests first: a retire or an untouched
+        -- column returns before any table is read.
+        v_reopen := NOT COALESCE(OLD.is_current, true) AND COALESCE(NEW.is_current, true);
+        IF NOT v_reopen
+           AND (NEW.supersedes IS NOT DISTINCT FROM OLD.supersedes OR OLD.supersedes IS NULL) THEN
+            RETURN NEW;
+        END IF;
+        IF NOT public.epigraph_operator_binding_armed()
+           OR public.epigraph_operator_scope_exempt() THEN
+            RETURN NEW;
+        END IF;
+        IF NEW.supersedes IS DISTINCT FROM OLD.supersedes AND OLD.supersedes IS NOT NULL
+           AND (NEW.supersedes IS NULL OR COALESCE(NEW.is_current, true)) THEN
+            RAISE EXCEPTION 'OPL02: claim % records that it supersedes %; an application session '
+                            'does not clear, or re-point on a current claim, the lineage of an '
+                            'existing claim', NEW.id, OLD.supersedes
+                USING ERRCODE = 'OPL02',
+                      HINT = 'Supersede the claim instead, or retire it in the same statement '
+                             '(the dedup act). Admin access crosses humans; nothing else does.';
+        END IF;
+        IF NOT v_reopen THEN
+            RETURN NEW;
+        END IF;
+        -- A RE-OPEN on a non-exempt session: checked below as an INSERT of NEW.
+    ELSIF NOT public.epigraph_operator_binding_armed() THEN
+        RETURN NEW;
+    END IF;
+    -- RE-ATTRIBUTION. Every check below reads the NEW author only, so an
+    -- UPDATE that changes it would let a writer take over (or hand off) a
+    -- claim someone else said, including another human's claim in a group
+    -- both humans write. No repository or route changes `claims.agent_id`;
+    -- only the exemption (a privileged session, an instance-admin principal)
+    -- may, and it is then checked like an insert below. OPL02, keyed on the
+    -- arming: it is attribution, which the valve never relieves.
+    IF TG_OP = 'UPDATE' AND NOT v_reopen
+       AND NOT public.epigraph_custodial_relief('reattribute', NEW.agent_id, NEW.owner_group_id,
+                                                NEW.id) THEN
+        RAISE EXCEPTION 'OPL02: claim % is attributed to %; an application session does not '
+                        're-attribute an existing claim (here to %)', NEW.id, OLD.agent_id,
+                        NEW.agent_id
+            USING ERRCODE = 'OPL02',
+                  HINT = 'Supersede the claim instead: the successor is written, and attributed, '
+                         'by the writer. Admin access crosses humans; nothing else does.';
+    END IF;
+    v_writer := public.epigraph_principal_id();
+    -- NO PRINCIPAL on an application session is an unbound writer, not a
+    -- licence to be checked on the author column alone: a route that forgot
+    -- to stamp its viewer would otherwise write as whatever bound author its
+    -- request body named, into that author's group. Fail closed (OPL01, so
+    -- the valve relieves it and nothing else does); with the valve open the
+    -- author arm below still applies its OPL02.
+    IF v_writer IS NULL AND NOT public.epigraph_bypass()
+       AND public.epigraph_operator_binding_enforced() THEN
+        RAISE EXCEPTION 'OPL01: this application session carries no authenticated principal, '
+                        'so the writer of this claim (attributed to %) is not bound to a human '
+                        'operator; once armed, a claim is written only by a bound, stamped '
+                        'writer', NEW.agent_id
+            USING ERRCODE = 'OPL01',
+                  HINT = 'Write on a transaction stamped with the request''s viewer '
+                         '(ScopedPool::begin_as). See docs/tenancy.md "Operator binding".';
+    END IF;
+    IF (TG_OP = 'INSERT' OR v_reopen) AND NEW.supersedes IS NOT NULL THEN
+        v_inherited :=
+            EXISTS (SELECT 1 FROM public.claims p
+                     WHERE p.id = NEW.supersedes
+                       AND p.agent_id IS NOT DISTINCT FROM NEW.agent_id
+                       AND p.owner_group_id IS NOT DISTINCT FROM NEW.owner_group_id
+                       AND NOT COALESCE(p.is_current, true))
+            AND NOT EXISTS (SELECT 1 FROM public.claims s
+                             WHERE s.supersedes = NEW.supersedes AND s.id <> NEW.id
+                               AND COALESCE(s.is_current, true));
+    END IF;
+    IF v_writer IS NULL OR v_writer = NEW.agent_id OR public.epigraph_bypass() THEN
+        -- THE PLATFORM CORPUS'S EDIT PATH. A PRIVILEGED session (the
+        -- maintenance role or a superuser: `epigraph_bypass()`, which no
+        -- application session can forge) restating a retired predecessor
+        -- carries that predecessor's author whatever its binding: world-owned
+        -- legacy rows are authored by retired-linked or unlinked identities by
+        -- construction, so the author check would refuse every such supersede.
+        -- Nothing else is relieved: a fresh claim, or a posed successor, is
+        -- checked on its author as always, and an instance-admin PRINCIPAL
+        -- writing as itself is not relieved here (it is a stamp an application
+        -- session sets). Its supersede of ANOTHER author's retired-linked claim
+        -- takes the ELSE branch: the attribution check's inherited rule.
+        IF NOT (v_inherited AND public.epigraph_bypass()) THEN
+            PERFORM public.epigraph_require_bound_author(NEW.agent_id);
+        END IF;
+        PERFORM public.epigraph_require_writer_scope(NEW.agent_id, NEW.owner_group_id);
+    ELSE
+        PERFORM public.epigraph_require_bound_writer(v_writer);
+        PERFORM public.epigraph_require_writer_scope(v_writer, NEW.owner_group_id);
+        PERFORM public.epigraph_require_attributable(NEW.agent_id, v_writer, v_inherited);
+    END IF;
+    RETURN NEW;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_claims_require_operator_binding() FROM PUBLIC;
+
+-- ===================================================================
 -- OWNERSHIP AND GRANTS (guarded, as every such block since 060 is)
 --
 -- 077's default privileges hand the application role DML on every new
@@ -724,6 +1016,10 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_human_operators_mirror_instance_admins() '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_custodial_relief(text, uuid, uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_custodial_relief(text, uuid, uuid, uuid) TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_grant_role(text, uuid, timestamptz, '
                 'timestamptz, uuid, text) OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_end_role_assignment(uuid, text) '
@@ -748,5 +1044,7 @@ DO $$ BEGIN
                 'public.epigraph_end_role_assignment(uuid, text) FROM epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_platform_audit(timestamptz, integer) TO epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_custodial_relief(text, uuid, uuid, uuid) FROM epigraph_app';
     END IF;
 END $$;
