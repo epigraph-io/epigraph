@@ -557,7 +557,10 @@ scope (`OPL02`) keys on arming alone, so no valve lets one human's agent write
 into another human's group, and no valve lets an UNBOUND writer, or another
 human's agent, name a bound author (a human, any human's agent, or a RETIRED
 identity tied to a human): with the valve open an unbound writer may author
-only as itself or as another unbound identity. What the valve does relieve
+only as itself or as another unbound identity. A RETIRED identity stays scoped
+by its human too: stamped as itself, or named on an unstamped session, it
+writes only into a group its human writes, never into another human's group or
+the world group (`OPL02`). What the valve does relieve
 inside one human is the binding itself: a fresh claim naming the writer's own
 human's retired identity is `OPL01` with the valve closed and admitted with it
 open. Any other value, including a typo, leaves

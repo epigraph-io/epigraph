@@ -1692,6 +1692,104 @@ async fn no_valve_lets_a_writer_outside_its_human_name_a_retired_identity(pool: 
         .expect("valve open, A's agent X names its own human's retired identity");
 }
 
+/// Delta review round 3 SEC-R3-2: with the valve open, a RETIRED identity is
+/// still scoped by its human. Stamped as itself, or named on an unstamped
+/// application session, it does not write into another human's group or into
+/// the world group (OPL02, from the trigger, before row security). Within its
+/// own human the valve still relieves it.
+///
+/// Verified to fail: `epigraph_require_writer_scope` reading the live link only
+/// (`epigraph_human_of(p_agent, true)`, the round-2 body) -> the retired
+/// identity stamped as itself writes into B's group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_valve_never_lets_a_retired_identity_write_outside_its_human(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (_b, b_group) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "a-legacy").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, legacy, a)
+            .await
+            .expect("the legacy identity's retired tie to A");
+    }
+    let world = fixture::world_group(&pool).await;
+    assert!(arm(&pool).await, "the database arms");
+
+    // An application session with the valve OFF and `group` stamped readable
+    // and writable (so row security admits the row), stamped as `principal`
+    // or with no principal at all; it names the retired identity as author.
+    let write = |principal: Option<Uuid>, group: Uuid| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+                sqlx::query(
+                    "SELECT set_config('epigraph.principal_id', $1, false), \
+                            set_config('epigraph.group_ids', $2, false), \
+                            set_config('epigraph.writable_group_ids', $2, false), \
+                            set_config('epigraph.operator_link_enforcement', 'off', false)",
+                )
+                .bind(principal.map(|p| p.to_string()).unwrap_or_default())
+                .bind(group.to_string())
+                .execute(&mut *conn)
+                .await
+                .expect("stamp, valve off");
+                let r = insert_claim(&mut *conn, legacy, group).await;
+                sqlx::query(
+                    "SELECT set_config('epigraph.principal_id', '', false), \
+                            set_config('epigraph.group_ids', '', false), \
+                            set_config('epigraph.writable_group_ids', '', false), \
+                            set_config('epigraph.operator_link_enforcement', '', false)",
+                )
+                .execute(&mut *conn)
+                .await
+                .expect("unstamp");
+                (conn, r)
+            })
+            .await
+        }
+    };
+
+    for (principal, group, what) in [
+        (
+            Some(legacy),
+            b_group,
+            "the retired identity as itself, into B's group",
+        ),
+        (
+            None,
+            b_group,
+            "unstamped, naming the retired identity, into B's group",
+        ),
+        (
+            Some(legacy),
+            world,
+            "the retired identity as itself, into the world group",
+        ),
+        (
+            None,
+            world,
+            "unstamped, naming the retired identity, into the world group",
+        ),
+    ] {
+        let r = write(principal, group).await;
+        assert_eq!(code_of(&r).as_deref(), Some("OPL02"), "{what}: {r:?}");
+    }
+    let named: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE agent_id = $1")
+        .bind(legacy)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(named, 0, "{named} claim(s) by the retired identity landed");
+
+    // Controls: inside its own human the valve relieves it, stamped or not.
+    write(Some(legacy), a_group)
+        .await
+        .expect("valve open, the retired identity as itself into its human's group");
+    write(None, a_group)
+        .await
+        .expect("valve open, unstamped, the retired identity into its human's group");
+}
+
 /// Delta review SEC-D5: the checks read the NEW author only, so an UPDATE of
 /// `claims.agent_id` must not be a way to take over a claim another human
 /// said. Human B also writes A's group; B's claim sits there; A's live agent X,

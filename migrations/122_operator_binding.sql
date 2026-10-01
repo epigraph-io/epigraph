@@ -457,11 +457,15 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_require_operator_scope(uuid, uuid) FROM PUBLIC;
 
 -- Section 1b on the CLAIMS path: the agent that writes a claim owned by
--- `p_group` must belong to a human (itself, or its live link's operator) who
--- holds a live writer/admin row in `p_group`. Unlike the membership door, a
+-- `p_group` must belong to a human (itself, or its link's operator) who holds
+-- a live writer/admin row in `p_group`. A link of ANY state counts: a RETIRED
+-- identity still belongs to its human, so where the valve relieves its
+-- binding (section 4) it still writes only where that human writes, never
+-- into another human's group or the world group. Unlike the membership door, a
 -- HUMAN is not exempt here: a human writes only where it writes, like
--- everyone. Quiet for an unbound agent (section 1's OPL01 is the refusal for
--- it), an unarmed database, and the exemption; NOT for the valve (section 4).
+-- everyone. Quiet for an agent that belongs to no human (section 1's OPL01 is
+-- the refusal for it), an unarmed database, and the exemption; NOT for the
+-- valve (section 4).
 CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, p_group uuid)
 RETURNS void
 LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -472,7 +476,7 @@ BEGIN
     IF NOT public.epigraph_operator_binding_armed() THEN
         RETURN;
     END IF;
-    v_human := public.epigraph_human_of(p_agent, true);
+    v_human := public.epigraph_human_of(p_agent, false);
     IF v_human IS NULL OR public.epigraph_operator_writes_group(v_human, p_group) THEN
         RETURN;
     END IF;
