@@ -460,7 +460,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             );
             if !apply {
                 println!(
-                    "DRY RUN: the grant, its audit row and its OCCUPIES projection were rolled back."
+                    "DRY RUN: the grant, its audit row and its graph projection were rolled back."
                 );
             }
             Ok(0)

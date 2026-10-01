@@ -1391,6 +1391,24 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "INSERT INTO instance_admins",
         "UPDATE instance_admins",
         "DELETE FROM instance_admins",
+        // Migration 123: the authority is now a role assignment, and the same
+        // rule holds for it. Granting or ending one is an operator act on the
+        // maintenance DSN (`epigraph-operator grant-role` /
+        // `end-role-assignment`, in the CLI's LIBRARY module, which the
+        // allowance below names), never a route, tool or job.
+        "RoleAssignmentRepository::grant",
+        "RoleAssignmentRepository::end",
+        // The CALL shapes (a bind as the first argument), not the bare names:
+        // `tenancy_backfill.rs` names both definers in its ownership and grant
+        // registers, which is verification, not a write.
+        "epigraph_grant_role($",
+        "epigraph_end_role_assignment($",
+        "INSERT INTO role_assignments",
+        "UPDATE role_assignments",
+        "DELETE FROM role_assignments",
+        "INSERT INTO platform_roles",
+        "UPDATE platform_roles",
+        "DELETE FROM platform_roles",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //
@@ -1412,7 +1430,15 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
     // 18c's chartered surface — banning a read it may legitimately need would be
     // a rule written ahead of the decision that owns it. The write half scans
     // all four because a grant is never legitimate outside the operator CLI.
-    const BANNED_READS: &[&str] = &["InstanceAdminRepository::list", "FROM instance_admins"];
+    const BANNED_READS: &[&str] = &[
+        "InstanceAdminRepository::list",
+        "FROM instance_admins",
+        // 123: the roster of role holders, read only through the
+        // subject-bound definers on the request path.
+        "RoleAssignmentRepository::list",
+        "FROM role_assignments",
+        "epigraph_live_role_assignment",
+    ];
     const READ_ROOTS: usize = 2;
     // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision
     // scanned `epigraph-api/src` and `epigraph-mcp/src` only — the two APP-POOL
@@ -1438,7 +1464,13 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
     // The operator CLI: the one intended writer. The allowance is a path suffix
     // rather than a file name so a second `instance_admin.rs` elsewhere in the
     // scanned tree does not inherit it.
-    const ALLOWED: &str = "epigraph-cli/src/bin/instance_admin.rs";
+    const ALLOWED: &[&str] = &[
+        "epigraph-cli/src/bin/instance_admin.rs",
+        // 123: the operator's role verbs (`grant-role`, `end-role-assignment`,
+        // `list-role-assignments`), on the maintenance DSN.
+        "epigraph-cli/src/operator/custodian.rs",
+        "epigraph-cli/src/bin/operator.rs",
+    ];
 
     let mut offenders: Vec<String> = Vec::new();
     for (idx, root) in roots.into_iter().enumerate() {
@@ -1460,7 +1492,8 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         );
         for path in sources {
             let display = path.display().to_string();
-            if display.replace('\\', "/").contains(ALLOWED) {
+            let normalised = display.replace('\\', "/");
+            if ALLOWED.iter().any(|a| normalised.contains(a)) {
                 continue;
             }
             // Collapse runs of whitespace before matching. The needles are exact

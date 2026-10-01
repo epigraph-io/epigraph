@@ -1668,6 +1668,31 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // refused by 107's definer-only policy, so it fails CLOSED (links nothing,
     // or errors); the stake is the tie silently skipped.
     ("epigraph_link_legacy_authors", 122),
+    // 123, the custodian role. Every body reads a FORCEd table
+    // (`role_assignments`, `platform_roles`, `instance_admins`,
+    // `security_events`, `edges`) or writes one through a policy that admits
+    // only `epigraph_definer_bypass()`: under a non-member owner the role
+    // readers find no assignment (every custodian reads as none: authority
+    // fails CLOSED, loud), the guards and audit trigger are refused their
+    // reads and `platform.` rows (every grant and end fails, loud), and the
+    // relief and the custodial-act recorder are refused their audit INSERT.
+    // `epigraph_is_instance_admin` (83) and the 122 checks 123 re-bodies keep
+    // their entries above.
+    ("epigraph_platform_roles_guard_update", 123),
+    ("epigraph_live_role_assignment", 123),
+    ("epigraph_role_assignments_guard_insert", 123),
+    ("epigraph_role_assignments_guard_update", 123),
+    ("epigraph_role_assignment_for", 123),
+    ("epigraph_holds_role", 123),
+    ("epigraph_role_assignments_audit", 123),
+    ("epigraph_grant_role", 123),
+    ("epigraph_end_role_assignment", 123),
+    ("epigraph_record_custodial_act", 123),
+    ("epigraph_platform_audit", 123),
+    ("epigraph_refuse_role_node_subject", 123),
+    ("epigraph_instance_admins_frozen", 123),
+    ("epigraph_human_operators_mirror_instance_admins", 123),
+    ("epigraph_custodial_relief", 123),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -1982,6 +2007,50 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_link_legacy_authors",
             "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
+            false,
+        ),
+        // 123 (the custodian role): the request path reads its OWN role
+        // (subject-bound readers) and the audit trail; granting, ending,
+        // recording a custodial act, the unbound roster read and the audited
+        // relief are maintenance acts the request DSN must never call.
+        (
+            "epigraph_live_role_assignment",
+            "public.epigraph_live_role_assignment(uuid, text, timestamp with time zone)",
+            false,
+        ),
+        (
+            "epigraph_role_assignment_for",
+            "public.epigraph_role_assignment_for(uuid, text, timestamp with time zone)",
+            true,
+        ),
+        (
+            "epigraph_holds_role",
+            "public.epigraph_holds_role(uuid, text, timestamp with time zone)",
+            true,
+        ),
+        (
+            "epigraph_grant_role",
+            "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_end_role_assignment",
+            "public.epigraph_end_role_assignment(uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_record_custodial_act",
+            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb)",
+            false,
+        ),
+        (
+            "epigraph_platform_audit",
+            "public.epigraph_platform_audit(timestamp with time zone, integer)",
+            true,
+        ),
+        (
+            "epigraph_custodial_relief",
+            "public.epigraph_custodial_relief(text, uuid, uuid, uuid)",
             false,
         ),
     ];

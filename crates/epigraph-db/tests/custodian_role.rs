@@ -1687,3 +1687,67 @@ async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
         "B's only live-shaped assignment is not yet begun"
     );
 }
+
+// =====================================================================
+// T19. The registers know every 123 object.
+// =====================================================================
+
+/// Every SECURITY DEFINER migration 123 creates or re-bodies is on
+/// `epigraph-tenancy-backfill verify`'s ownership list (a silently no-opped
+/// `OWNER TO` is invisible to every behavioural test, because the harness
+/// migrates as a superuser), and both new tables are in the API's FORCE
+/// register and the 079 kill switch.
+///
+/// Verified to fail: one `("epigraph_holds_role", 123)` entry removed from
+/// `DEFERRED_DEFINER_FUNCTIONS` -> named here.
+#[test]
+fn every_123_object_is_registered() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let migration = read("migrations/123_custodian_role.sql");
+    let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let state = read("crates/epigraph-api/src/state.rs");
+    let undo = read("docs/runbooks/079-undo.sql");
+
+    let mut definers = Vec::new();
+    let mut rest = migration.as_str();
+    while let Some(i) = rest.find("CREATE OR REPLACE FUNCTION public.") {
+        let after = &rest[i + "CREATE OR REPLACE FUNCTION public.".len()..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let body_end = after.find("$$;").unwrap_or(after.len());
+        let header_end = after.find(" AS $$").unwrap_or(body_end);
+        if after[..header_end].contains("SECURITY DEFINER") {
+            definers.push(name);
+        }
+        rest = &after[body_end..];
+    }
+    definers.sort();
+    definers.dedup();
+    assert!(
+        definers.len() >= 15,
+        "CALIBRATION: the scan found only {definers:?}"
+    );
+    let missing: Vec<&String> = definers
+        .iter()
+        .filter(|n| !backfill.contains(&format!("(\"{n}\", ")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "migration 123 definers missing from tenancy_backfill.rs's ownership lists: {missing:?}"
+    );
+    for table in ["platform_roles", "role_assignments"] {
+        assert!(
+            state.contains(&format!("\"{table}\"")),
+            "state.rs FORCE_PROTECTED_SET lacks {table}"
+        );
+        assert!(
+            undo.contains(&format!("'{table}'")),
+            "079-undo.sql lacks {table}"
+        );
+    }
+}
