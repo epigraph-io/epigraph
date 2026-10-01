@@ -1392,7 +1392,9 @@ async fn supersede_on(
 /// the maintenance session's supersedes are refused OPL01; the guard widened to
 /// `v_inherited` alone -> the maintenance session still passes, and the
 /// principal-equals-author control (the retired identity stamped as itself,
-/// superseding its own retired world claim) lands.
+/// superseding its own retired world claim) lands; (round 3 COR-R3-6) the guard
+/// widened to `v_inherited AND public.epigraph_operator_scope_exempt()` -> the
+/// retired identity that is an instance admin, stamped as itself, lands.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_privileged_session_revises_the_platform_corpus_once_armed(pool: PgPool) {
     let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
@@ -1502,6 +1504,30 @@ async fn a_privileged_session_revises_the_platform_corpus_once_armed(pool: PgPoo
     assert!(
         matches!(r, Err(epigraph_db::DbError::OperatorLinkRequired { .. })),
         "an instance admin and an unlinked author's corpus claim: {r:?}"
+    );
+
+    // Round 3 COR-R3-6: the binding relief is the PRIVILEGED session's alone,
+    // not every OPL02-exempt session's. A retired identity that is itself a live
+    // instance admin (`instance_admins` is an ordinary table), stamped as
+    // itself, restating its own retired corpus claim stays OPL01: the
+    // instance-admin stamp exempts it from the cross-group scope, never from
+    // the binding.
+    sqlx::query("INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'round 3 probe')")
+        .bind(legacy)
+        .execute(&pool)
+        .await
+        .expect("the retired identity is an instance admin");
+    let admin_itself = as_app_stamped(&pool, legacy, &[world], |mut conn| async move {
+        let r = supersede_on(&mut conn, c_self).await;
+        (conn, r)
+    })
+    .await;
+    assert!(
+        matches!(
+            admin_itself,
+            Err(epigraph_db::DbError::OperatorLinkRequired { .. })
+        ),
+        "a retired identity that is an instance admin, as its own principal: {admin_itself:?}"
     );
 }
 
