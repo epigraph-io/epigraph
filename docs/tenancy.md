@@ -382,7 +382,11 @@ anyone else), and is then checked like an insert. Bound means:
   an application session planted before the human was registered. Register
   refuses a client that is not an active `human` client of that agent, and an
   agent already registered for a different client. Verify the recorded
-  `human_operators.client_id` after registering. The registry's rules and its audit live on
+  `human_operators.client_id` after registering. Match `--client` to an
+  out-of-band record of the person's own client (when and how it was created),
+  never to a listing of active `human` clients: `oauth_clients` carries no
+  provenance column, so a row an application session inserted (with an id,
+  name and timestamp of its choosing) looks the same as an administrator's. The registry's rules and its audit live on
   the table itself, so a direct maintenance `INSERT` / `UPDATE` meets the same
   checks and leaves the same `security_events` row as the command; revoke is
   final (a revoked row takes no change at all) and stops every agent
@@ -557,6 +561,19 @@ enforcement ON. It reaches only `ScopedPool` connections (every request unit
 and operator CLI); any other pool, and a transaction-mode pooler, stay
 enforced. The setting is a transport, not an authority boundary: any raw
 session can set a custom setting.
+
+**Trust boundary: the principal is a stamp, too.** The session principal the
+binding checks (`epigraph.principal_id`, with the group settings) is set by the
+application role itself, which is how `ScopedPool` stamps a request, and
+tenancy row security trusts the same stamp. A holder of the APPLICATION DSN
+that issues raw SQL can therefore stamp any identity it knows the id of (agent
+and human ids are not secrets: they author ordinary claims): a bound agent, a
+human, or a live instance admin, and with the last be exempt from `OPL02`. The
+binding constrains the code paths that stamp from an authenticated viewer; it
+is not a defence against a process that holds the application DSN and
+misbehaves (a compromised request unit, or any agent container given that
+DSN). That boundary is the DSN: who holds it, and a separate maintenance DSN
+for every privileged act. Arming is no substitute for it.
 
 ### Stdio agents under D9
 

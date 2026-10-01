@@ -1458,7 +1458,8 @@ arming is one-way and every step before it must leave no live writer unbound.
    --client <that human's own OAuth client id> --reason <text> --apply`, then
    read back `human_operators.client_id` and confirm it is the client you named.
    `--client` is required, never inferred: the application role may insert
-   `oauth_clients` rows. Only the agent of an active human OAuth client can
+   `oauth_clients` rows, so take the client id from an out-of-band record of
+   the person's own client, not from a listing of active `human` clients. Only the agent of an active human OAuth client can
    be registered; from 122 on, no link can be recorded to anyone else, so this
    precedes every link below. Check that no dynamically registered `human`
    client's agent is in the registry. The registration records that one client:
@@ -1506,7 +1507,11 @@ arming is one-way and every step before it must leave no live writer unbound.
    a borrowed admin stamp) is bound on its own principal once armed and does
    not appear there: inventory those separately. So is a claim written on an
    application connection with NO principal (a CLI or job on the application
-   DSN): once armed it is refused `OPL01`.
+   DSN): once armed it is refused `OPL01`. And so is a tool that registers a
+   FRESH agent per run (or per source) and authors as it: such an author does
+   not exist before the run, so it cannot be linked in advance, and once armed
+   its claims are refused; decide each such ingester before arming (author as
+   a bound identity, or stop it).
    Arming binds claim INSERTs; claim UPDATEs other than a change of author stay
    gated by row security alone, so while a database still carries orphan
    permissive `*_privacy` policies, arming does not isolate claim updates

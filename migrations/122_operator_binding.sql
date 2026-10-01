@@ -197,6 +197,17 @@
 -- agent; what the setting guards against is a CODE PATH forgetting the rule,
 -- which it does, because nothing sets it but the valve.
 --
+-- The same holds for the PRINCIPAL (section 2) and its exemption (section 1b).
+-- `epigraph.principal_id` and the group settings are session GUCs that the
+-- application role sets (that is how `ScopedPool` stamps a request), and
+-- tenancy row security trusts the same stamp. So a holder of the application
+-- DSN that issues raw SQL can stamp any identity: a bound agent's, a human's,
+-- or a live instance admin's (and so be exempt from OPL02). Agent and human ids
+-- are not secrets. The binding constrains the CODE PATHS that stamp from an
+-- authenticated viewer; it is not a boundary against a process that holds the
+-- application DSN and misbehaves. That boundary is the DSN itself (who holds
+-- it, and a maintenance-only DSN for everything privileged).
+--
 -- ===================================================================
 -- 5. DISCLOSURE, ACCEPTED
 --
