@@ -920,7 +920,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `AppState::read_as` + `ClaimRepository::get_by_id_with_labels` with the
     // caller's viewer (F-write-authz-reads-unfiltered). Read off this test's
     // failure output.
-    ("routes/workflows.rs", 15),
+    //
+    // 15 -> 14 (operator binding, round 2): REST `evolve_step` takes the
+    // caller's `ViewerExtractor` and authors as its principal, so its
+    // `Viewer::resolve(&state.db_pool, ..)` of an OAuth client row id is gone.
+    // Read off this test's failure output.
+    ("routes/workflows.rs", 14),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is
