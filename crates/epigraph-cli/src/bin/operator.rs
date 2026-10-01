@@ -37,11 +37,17 @@
 //!     epigraph-operator reown-linked --operator <uuid> --legacy-owner operator|platform \
 //!         --manifest-out reown-linked-1.jsonl [--apply]
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
+//!     epigraph-operator grant-role --role role:platform-custodian --holder <uuid> \
+//!         (--valid-to <RFC3339> | --open-ended) [--valid-from <RFC3339>] \
+//!         [--granted-by <uuid>] --reason TEXT [--apply]
+//!     epigraph-operator end-role-assignment --assignment <uuid> --reason TEXT [--apply]
+//!     epigraph-operator list-role-assignments [--role R] [--include-ended]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, arm, bind, client_scope, hide, human, legacy, link, reown, reown_linked, reverse,
+    self, arm, bind, client_scope, custodian, hide, human, legacy, link, reown, reown_linked,
+    reverse,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -60,6 +66,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Grant a platform role (migration 123) to a REGISTERED HUMAN for an
+    /// explicit window. Agents never hold a role (CUS01); once a custodian
+    /// exists every grant names a live custodian as --granted-by (CUS03).
+    GrantRole {
+        /// `role:platform-custodian` or `role:auditor`.
+        #[arg(long)]
+        role: String,
+        /// The human's own agent id (a registered human operator).
+        #[arg(long)]
+        holder: Uuid,
+        /// When the assignment starts (RFC 3339; default now; never in the past).
+        #[arg(long)]
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        /// When the assignment ends (RFC 3339). Exactly one of this and
+        /// --open-ended.
+        #[arg(long)]
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Grant with no end: it is ended only by end-role-assignment.
+        #[arg(long)]
+        open_ended: bool,
+        /// The granting custodian's agent id (required once any live custodian
+        /// exists; omitted only for the bootstrap grant).
+        #[arg(long)]
+        granted_by: Option<Uuid>,
+        /// Recorded on the assignment and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the grant, its audit row and its projection roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// End a role assignment now (its revoke stamp; an ended assignment is final).
+    EndRoleAssignment {
+        /// The assignment id (list-role-assignments).
+        #[arg(long)]
+        assignment: Uuid,
+        /// Recorded on the assignment and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the end and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// List role assignments (un-ended ones unless --include-ended).
+    ListRoleAssignments {
+        /// Only this role.
+        #[arg(long)]
+        role: Option<String>,
+        /// Include ended assignments.
+        #[arg(long)]
+        include_ended: bool,
+    },
     /// Register a HUMAN operator (migration 122's audited registry). Only the
     /// agent of an active human OAuth client can be registered.
     RegisterHumanOperator {
@@ -313,6 +371,24 @@ async fn main_inner() -> anyhow::Result<i32> {
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
         client_scope::validate_scope(&a.scope)?;
     }
+    // A grant names its window explicitly; refused before any connection.
+    let window = if let Command::GrantRole {
+        role,
+        valid_from,
+        valid_to,
+        open_ended,
+        ..
+    } = &cli.command
+    {
+        Some(custodian::Window::from_flags(
+            role,
+            *valid_from,
+            *valid_to,
+            *open_ended,
+        )?)
+    } else {
+        None
+    };
     if let Command::ReownClaims { batch_size, .. }
     | Command::ReownReverse { batch_size, .. }
     | Command::ReownLinked { batch_size, .. } = &cli.command
@@ -329,6 +405,65 @@ async fn main_inner() -> anyhow::Result<i32> {
     let mut conn = db.pool().acquire().await?;
     let mut stdout = std::io::stdout();
     match cli.command {
+        Command::GrantRole {
+            role,
+            holder,
+            granted_by,
+            reason,
+            apply,
+            ..
+        } => {
+            let window = window.expect("validated above");
+            let row =
+                custodian::grant(&mut conn, &role, holder, window, granted_by, &reason, apply)
+                    .await?;
+            println!(
+                "{}GRANTED\t{}",
+                if apply { "" } else { "WOULD BE " },
+                custodian::describe(&row)
+            );
+            if !apply {
+                println!(
+                    "DRY RUN: the grant, its audit row and its OCCUPIES projection were rolled back."
+                );
+            }
+            Ok(0)
+        }
+        Command::EndRoleAssignment {
+            assignment,
+            reason,
+            apply,
+        } => {
+            let (ended, row) = custodian::end(&mut conn, assignment, &reason, apply).await?;
+            println!(
+                "{}{}\t{}",
+                if apply || !ended { "" } else { "WOULD BE " },
+                if ended { "ENDED" } else { "ALREADY-ENDED" },
+                custodian::describe(&row)
+            );
+            if !apply {
+                println!("DRY RUN: the end and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::ListRoleAssignments {
+            role,
+            include_ended,
+        } => {
+            let rows = epigraph_db::RoleAssignmentRepository::list(
+                &mut conn,
+                role.as_deref(),
+                include_ended,
+            )
+            .await?;
+            if rows.is_empty() {
+                println!("no role assignments");
+            }
+            for row in &rows {
+                println!("{}", custodian::describe(row));
+            }
+            Ok(0)
+        }
         Command::RegisterHumanOperator {
             agent,
             client,
