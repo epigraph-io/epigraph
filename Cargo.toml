@@ -33,6 +33,12 @@ members = [
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
+# ADVISORY, not the build floor. The locked dependency graph already needs
+# Rust 1.88 (time 0.3.47, darling 0.23 and home 0.5.12 declare it; so does
+# webauthn-rs 0.5.5, which epigraph-passkey adds), so no toolchain older than
+# that builds this workspace whatever this line says. CI builds on `stable`.
+# Kept at 1.75 rather than raised because clippy reads it as the MSRV for its
+# version-gated lints; raising it is its own change, made with a clippy run.
 rust-version = "1.75"
 license = "Apache-2.0"
 repository = "https://github.com/epigraph-io/epigraph"
