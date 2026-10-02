@@ -293,32 +293,45 @@ pub fn recheck_interval_from_env_value(raw: Option<&str>) -> std::time::Duration
     std::time::Duration::from_secs(secs)
 }
 
+/// The stop text of a RUNNING request unit under operator ruling OQ-7 (b) for
+/// `state`, or `None` while it may serve ([`request_unit_may_serve`]). Logs
+/// the state's ERROR line ([`boot_line`]) when it stops. The rule
+/// [`watch_request_unit`] applies, public so a request unit with a further
+/// rule of its own can compose it into one [`watch_posture`] (two watches on
+/// one posture would race to name the reason).
+#[must_use]
+pub fn request_unit_stop(unit: &str, state: BootState) -> Option<String> {
+    if request_unit_may_serve(state).is_ok() {
+        return None;
+    }
+    let (_, line) = boot_line(state);
+    tracing::error!(target: "tenancy.operator_binding", unit, "{line}");
+    Some(format!("{PRIVILEGED_DSN_STOP}. {PRIVILEGED_DSN_ERROR}"))
+}
+
 /// Re-read this process's posture on `pool` every `interval`, for as long as
-/// it serves, and return the stop text once it is a state a request unit may
-/// not serve ([`request_unit_may_serve`]). The boot check
-/// ([`check_request_unit_boot`]) runs once, and the deploy order starts the
-/// request units BEFORE the database is armed (docs/deploy.md, "Operator
-/// binding"), so without this a unit started on a privileged DSN of an
-/// unarmed database kept serving once the database was armed (review
-/// R2-OQ-COR-1).
+/// it serves, and return the stop text once `stop_for` names one for the
+/// state read.
 ///
 /// A failed re-read is logged at WARN and the unit keeps serving: it already
-/// passed the fail-closed boot check, and a transient database error must not
+/// passed its fail-closed boot check, and a transient database error must not
 /// take every request unit down at once. Only a positive read of a refused
 /// state stops it.
-pub async fn watch_request_unit(
+pub async fn watch_posture<F>(
     pool: sqlx::PgPool,
     unit: &str,
     interval: std::time::Duration,
-) -> String {
+    stop_for: F,
+) -> String
+where
+    F: Fn(&str, BootState) -> Option<String>,
+{
     loop {
         tokio::time::sleep(interval).await;
         match boot_state(&pool).await {
             Ok(state) => {
-                if request_unit_may_serve(state).is_err() {
-                    let (_, line) = boot_line(state);
-                    tracing::error!(target: "tenancy.operator_binding", unit, "{line}");
-                    return format!("{PRIVILEGED_DSN_STOP}. {PRIVILEGED_DSN_ERROR}");
+                if let Some(stop) = stop_for(unit, state) {
+                    return stop;
                 }
             }
             Err(e) => tracing::warn!(
@@ -332,25 +345,53 @@ pub async fn watch_request_unit(
     }
 }
 
-/// Spawn [`watch_request_unit`] for a request unit's `main`, at the interval
-/// [`RECHECK_ENV`] sets, and EXIT the process (status 1, the stop text on
-/// stderr) when it returns. Call it right after [`check_request_unit_boot`]
-/// passes, on the same pool, on every transport.
-pub fn spawn_request_unit_watch(pool: sqlx::PgPool, unit: &'static str) {
+/// Re-read this process's posture on `pool` every `interval`, for as long as
+/// it serves, and return the stop text once it is a state a request unit may
+/// not serve ([`request_unit_may_serve`]). The boot check
+/// ([`check_request_unit_boot`]) runs once, and the deploy order starts the
+/// request units BEFORE the database is armed (docs/deploy.md, "Operator
+/// binding"), so without this a unit started on a privileged DSN of an
+/// unarmed database kept serving once the database was armed (review
+/// R2-OQ-COR-1). [`watch_posture`] with [`request_unit_stop`].
+pub async fn watch_request_unit(
+    pool: sqlx::PgPool,
+    unit: &str,
+    interval: std::time::Duration,
+) -> String {
+    watch_posture(pool, unit, interval, request_unit_stop).await
+}
+
+/// Spawn [`watch_posture`] with `stop_for` for a request unit's `main`, at the
+/// interval [`RECHECK_ENV`] sets, and EXIT the process (status 1, the stop
+/// text on stderr) when it returns. Call it right after the unit's boot
+/// checks pass, on the same pool, on every transport, and only once: one
+/// watch per process, so the stop names one reason.
+pub fn spawn_posture_watch<F>(pool: sqlx::PgPool, unit: &'static str, stop_for: F)
+where
+    F: Fn(&str, BootState) -> Option<String> + Send + Sync + 'static,
+{
     let interval = recheck_interval_from_env_value(std::env::var(RECHECK_ENV).ok().as_deref());
     tokio::spawn(async move {
-        let stop = watch_request_unit(pool, unit, interval).await;
+        let stop = watch_posture(pool, unit, interval, stop_for).await;
         eprintln!("ERROR: {stop}");
         std::process::exit(1);
     });
 }
 
+/// Spawn [`watch_request_unit`] for a request unit's `main`, at the interval
+/// [`RECHECK_ENV`] sets, and EXIT the process (status 1, the stop text on
+/// stderr) when it returns. Call it right after [`check_request_unit_boot`]
+/// passes, on the same pool, on every transport.
+pub fn spawn_request_unit_watch(pool: sqlx::PgPool, unit: &'static str) {
+    spawn_posture_watch(pool, unit, request_unit_stop);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        boot_line, recheck_interval_from_env_value, request_unit_may_serve, BootState, Enforcement,
-        ARMED_BOOT_INFO, PRIVILEGED_DSN_ERROR, PRIVILEGED_DSN_REFUSAL, PRIVILEGED_DSN_STOP,
-        VALVE_OFF_WARNING,
+        boot_line, recheck_interval_from_env_value, request_unit_may_serve, request_unit_stop,
+        BootState, Enforcement, ARMED_BOOT_INFO, PRIVILEGED_DSN_ERROR, PRIVILEGED_DSN_REFUSAL,
+        PRIVILEGED_DSN_STOP, VALVE_OFF_WARNING,
     };
 
     /// The re-read interval is tunable but never disabled: clamped to
@@ -433,6 +474,26 @@ mod tests {
         assert!(PRIVILEGED_DSN_REFUSAL.contains("OQ-7 (b)"));
         assert!(PRIVILEGED_DSN_REFUSAL.contains("epigraph_app"));
         assert!(!PRIVILEGED_DSN_REFUSAL.contains("  "));
+    }
+
+    /// The running rule [`request_unit_stop`] stops on exactly the state the
+    /// boot refuses, with the stop text (not the boot refusal) followed by the
+    /// reason. Mutation: a `Some` for `Enforced` (an armed application DSN)
+    /// -> the loop below fails.
+    #[test]
+    fn the_running_rule_stops_only_a_privileged_dsn() {
+        assert_eq!(
+            request_unit_stop("t", BootState::PrivilegedDsn),
+            Some(format!("{PRIVILEGED_DSN_STOP}. {PRIVILEGED_DSN_ERROR}"))
+        );
+        for state in [
+            BootState::Enforced,
+            BootState::ValveOff,
+            BootState::NotArmed,
+            BootState::NotMigrated,
+        ] {
+            assert_eq!(request_unit_stop("t", state), None, "{state:?}");
+        }
     }
 
     /// The boot lines name the code but never in a refusal's `OPL0x:` form,
