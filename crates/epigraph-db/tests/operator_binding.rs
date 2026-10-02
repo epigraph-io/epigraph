@@ -3257,3 +3257,35 @@ async fn the_boot_line_names_a_privileged_dsn(pool: PgPool) {
         "a request unit on the application role serves"
     );
 }
+
+/// The boot check FAILS CLOSED: when the arming or the DSN's privilege cannot
+/// be read, a request unit refuses to start, because it cannot show that its
+/// DSN is not privileged (review R2-OQ-TST-3). The fixture is a pool of the
+/// same database that is closed before the check, so every read fails.
+///
+/// Verified to fail: `check_request_unit_boot`'s read given a fallback
+/// (`boot_state(pool).await.unwrap_or(BootState::NotArmed)`, the old
+/// log-and-serve behaviour) -> `Ok(NotArmed)`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_boot_check_refuses_when_it_cannot_read(pool: PgPool) {
+    use epigraph_db::operator_binding::check_request_unit_boot;
+    let url = fixture::database_url_for(&pool).await;
+    let unreadable = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("a second pool of the same database");
+    assert!(
+        check_request_unit_boot(&unreadable, "test").await.is_ok(),
+        "CALIBRATION: while open, the same pool reads (an unarmed database serves)"
+    );
+    unreadable.close().await;
+    let r = check_request_unit_boot(&unreadable, "test").await;
+    assert!(
+        r.as_ref().is_err_and(|e| e.starts_with(
+            "refusing to start: could not read the operator-binding arming state or whether \
+             this DSN is privileged"
+        )),
+        "a failed read is a refusal, never a serve: {r:?}"
+    );
+}
