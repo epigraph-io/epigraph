@@ -44,6 +44,8 @@ pub mod crud;
 pub mod edges;
 #[cfg(feature = "db")]
 pub mod elevate;
+#[cfg(feature = "db")]
+pub mod elevation;
 pub mod embeddings;
 #[cfg(feature = "db")]
 pub mod entities;
@@ -738,6 +740,12 @@ pub fn create_router(state: AppState) -> Router {
             get(graph_neighborhood::claim_compound_neighborhood),
         )
         .route("/api/v1/admin/stats", get(admin::system_stats))
+        // Elevation (plan EL-5, rulings D2/D5): a human asks for a grant-mode
+        // ticket for ITSELF (the definer is principal-bound and refuses anyone
+        // without a live elevating-role assignment and a live passkey), and
+        // ends its own elevation. The ceremony itself is on the public router.
+        .route("/api/v1/elevation/tickets", post(elevation::create_ticket))
+        .route("/api/v1/elevation/end", post(elevation::end_elevation))
         .route(
             "/api/v1/clusters/boundary-claims",
             get(crud::get_boundary_claims),

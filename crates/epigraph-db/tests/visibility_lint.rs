@@ -531,6 +531,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          trigger's; nothing for a viewer to filter.",
     ),
     (
+        "elevation_ceremony.rs",
+        "create_ticket",
+        "WRITE through migration 125's PRINCIPAL-BOUND app-callable definer \
+         `epigraph_create_elevation_ticket` (EL-5): the caller passes its connection STAMPED with \
+         the requester's viewer, and the definer takes the person from `epigraph_principal_id()`, \
+         never from an argument. An authentication record about a principal, not a corpus row: \
+         no `visibility` / `owner_group_id`; the table's guard enforces who may elevate (ELV02).",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "end",
+        "WRITE through 125's principal-bound app-callable definer `epigraph_end_elevation`, on \
+         the requester's STAMPED connection: it ends only the stamped principal's own live \
+         session (a privileged session, any). Nothing for a viewer to filter.",
+    ),
+    (
         "role_assignment.rs",
         "grant",
         "WRITE through migration 123's maintenance-only definer `epigraph_grant_role` into \

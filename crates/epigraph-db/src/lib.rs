@@ -120,6 +120,7 @@ pub use repos::{
     WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use repos::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
+pub use repos::{ElevationCeremony, EndReason, TicketMode};
 pub use repos::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use visibility::{MaintenanceLease, SystemReason, Viewer};
