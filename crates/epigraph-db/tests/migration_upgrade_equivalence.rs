@@ -56,6 +56,18 @@ const PRODUCTION_HEAD: i64 = 106;
 /// together with [`PRODUCTION_HEAD`].
 const ON_PRODUCTION: usize = 95;
 
+/// The base the stacked elevation branch deploys on: migration 123 (the
+/// custodian role), which its own PR carries. The elevation migrations
+/// (124 on) are applied to a database at 123, never on a fresh install only.
+const STACK_BASE: i64 = 123;
+
+/// How many migration files are at or below [`STACK_BASE`] (measured: 111 at
+/// `feat/mt-c-custodian-role`). A new file numbered at or below the base would
+/// run on a database already at 123 AFTER 123, but on a fresh install before
+/// it: renumber it above the tree head instead. Raise it only with
+/// [`STACK_BASE`].
+const AT_STACK_BASE: usize = 111;
+
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 /// The embedded migrator, cut at `max` (inclusive).
@@ -318,6 +330,93 @@ async fn an_upgrade_from_the_production_head_equals_a_fresh_install(pool: PgPool
         "a database upgraded from the production head ({PRODUCTION_HEAD}) differs from a fresh \
          install.\nONLY ON THE UPGRADED DATABASE: {only_upgraded:#?}\nONLY ON THE FRESH \
          DATABASE: {only_fresh:#?}"
+    );
+    assert!(
+        upgraded.len() > 1000,
+        "PREMISE: the snapshot covers the schema ({} facts)",
+        upgraded.len()
+    );
+}
+
+/// The snapshot of a sibling database on the same cluster, migrated 001 ->
+/// tree head (a fresh install), dropped afterwards.
+async fn fresh_install_snapshot(pool: &PgPool) -> BTreeSet<String> {
+    let fresh_name = format!("upgrade_equiv_{}_test", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE \"{fresh_name}\""))
+        .execute(pool)
+        .await
+        .expect("create the fresh sibling");
+    let opts: PgConnectOptions = pool
+        .connect_options()
+        .as_ref()
+        .clone()
+        .database(&fresh_name);
+    let fresh = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(opts)
+        .await
+        .expect("connect to the fresh sibling");
+    MIGRATOR
+        .run(&fresh)
+        .await
+        .expect("migrate the fresh sibling 001 -> tree head");
+    let installed = snapshot(&fresh).await;
+    fresh.close().await;
+    sqlx::query(&format!("DROP DATABASE \"{fresh_name}\" WITH (FORCE)"))
+        .execute(pool)
+        .await
+        .expect("drop the fresh sibling");
+    installed
+}
+
+/// A database at the stack's base ([`STACK_BASE`], 123) that then applies the
+/// elevation migrations ends in the same schema as a fresh install: the same
+/// property as the production-head test, from the version the stacked branch
+/// is deployed on. The snapshot is the one that test calibrates.
+#[sqlx::test(migrations = false)]
+async fn an_upgrade_from_the_stack_base_equals_a_fresh_install(pool: PgPool) {
+    let tree_head = MIGRATOR
+        .migrations
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .expect("migrations");
+    assert!(
+        tree_head > STACK_BASE,
+        "PREMISE: the tree carries migrations above the stack base {STACK_BASE} \
+         (tree head {tree_head})"
+    );
+    let at_or_below = MIGRATOR
+        .migrations
+        .iter()
+        .filter(|m| m.version <= STACK_BASE)
+        .count();
+    assert_eq!(
+        at_or_below, AT_STACK_BASE,
+        "the tree carries {at_or_below} migrations at or below the stack base {STACK_BASE}, \
+         and a database at the base has applied {AT_STACK_BASE}: a new file numbered at or \
+         below the base runs there after 123 but on a fresh install before it. Renumber it \
+         above the tree head."
+    );
+    up_to(STACK_BASE)
+        .run(&pool)
+        .await
+        .expect("migrate 001 -> the stack base");
+    assert_eq!(head(&pool).await, STACK_BASE);
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("migrate the stack base -> tree head");
+    assert_eq!(head(&pool).await, tree_head);
+
+    let upgraded = snapshot(&pool).await;
+    let installed = fresh_install_snapshot(&pool).await;
+    let (only_upgraded, only_fresh) = diff(&upgraded, &installed);
+    assert!(
+        only_upgraded.is_empty() && only_fresh.is_empty(),
+        "a database upgraded from the stack base ({STACK_BASE}) differs from a fresh install.\n\
+         ONLY ON THE UPGRADED DATABASE: {only_upgraded:#?}\nONLY ON THE FRESH DATABASE: \
+         {only_fresh:#?}"
     );
     assert!(
         upgraded.len() > 1000,
