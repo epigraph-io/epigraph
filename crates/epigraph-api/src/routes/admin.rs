@@ -595,6 +595,8 @@ mod db_tests {
             client_type: ClientType::Service,
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
         }
     }
 
@@ -1104,6 +1106,8 @@ mod tests {
             client_type: epigraph_auth::ClientType::Service,
             scopes: vec!["claims:admin".to_string()],
             jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
         }
     }
 

@@ -208,6 +208,8 @@ async fn serve_api_hanging(
                     "edges:write".to_string(),
                 ],
                 jti: Uuid::new_v4(),
+                family_id: None,
+                elevation_claim: None,
             },
         ))
         .with_state(state);

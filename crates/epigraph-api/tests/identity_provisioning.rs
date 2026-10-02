@@ -355,6 +355,7 @@ async fn a_derived_key_is_refused_by_the_packet_verifier(pool: PgPool) {
             None,
             Some(agent.0),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .unwrap()
         .0
@@ -919,6 +920,7 @@ async fn a_revoked_author_packet_is_a_403_that_leaks_no_ids(pool: PgPool) {
             None,
             Some(author),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .unwrap()
         .0

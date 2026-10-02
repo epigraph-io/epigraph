@@ -32,6 +32,8 @@ fn admin() -> RequireScopeAdmin {
         client_type: ClientType::Service,
         scopes: vec!["claims:admin".to_string()],
         jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
     })
 }
 

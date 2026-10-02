@@ -773,6 +773,8 @@ mod tests {
                 client_type: crate::middleware::bearer::ClientType::Service,
                 scopes: vec!["claims:read".to_string()],
                 jti: uuid::Uuid::new_v4(),
+                family_id: None,
+                elevation_claim: None,
             }))
             .with_state(state)
     }

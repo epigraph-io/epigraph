@@ -122,6 +122,8 @@ fn token(agent: Uuid, client_type: ClientType) -> AuthContext {
         client_type,
         scopes: vec!["claims:write".to_string()],
         jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
     }
 }
 
@@ -544,6 +546,8 @@ async fn evolve_step_binds_the_authenticated_caller(pool: PgPool) {
                 client_type,
                 scopes: vec!["claims:write".to_string()],
                 jti: Uuid::new_v4(),
+                family_id: None,
+                elevation_claim: None,
             };
             let req: epigraph_api::routes::workflows::EvolveStepRequest =
                 serde_json::from_value(serde_json::json!({

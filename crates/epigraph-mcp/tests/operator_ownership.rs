@@ -134,6 +134,8 @@ fn http_auth(agent_id: Option<Uuid>) -> AuthContext {
         client_type: ClientType::Human,
         scopes: vec!["claims:write".to_string()],
         jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
     }
 }
 

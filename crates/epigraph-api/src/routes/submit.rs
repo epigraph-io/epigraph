@@ -2417,6 +2417,8 @@ mod signature_verification_tests {
                 "workflows:write".to_string(),
             ],
             jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
         }
     }
     use super::*;

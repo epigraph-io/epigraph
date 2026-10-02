@@ -49,6 +49,7 @@ fn token() -> String {
             None,
             None,
             ChronoDuration::minutes(5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("mint");
     token

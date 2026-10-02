@@ -64,6 +64,49 @@ pub struct EpiGraphClaims {
     pub client_type: String,
     pub owner_id: Option<Uuid>,
     pub agent_id: Option<Uuid>,
+    /// The refresh-token family this access token was minted with: the
+    /// `COALESCE(family_id, id)` of the refresh token issued or rotated in the
+    /// same response. Present only on human tokens minted alongside a refresh
+    /// token. A CLAIM, not authority: nothing grants anything on it alone.
+    ///
+    /// Optional both ways for N-1: a token without it decodes as `None`, and
+    /// it is omitted from the payload when `None`, so a binary that predates it
+    /// reads this binary's tokens (no `deny_unknown_fields` on this struct).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fam: Option<Uuid>,
+    /// The elevation session this token claims. Nothing mints it yet; when
+    /// something does, it is resolved against a live database row before it
+    /// means anything. Same N-1 shape as [`Self::fam`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elv: Option<Uuid>,
+}
+
+/// What an access token is bound to beyond its client: the refresh family it
+/// was minted with and the elevation session it claims. Every mint site passes
+/// one, so a site that should carry a family cannot drop it by omission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccessTokenBinding {
+    /// Becomes the `fam` claim.
+    pub family_id: Option<Uuid>,
+    /// Becomes the `elv` claim.
+    pub elevation_id: Option<Uuid>,
+}
+
+impl AccessTokenBinding {
+    /// No family, no elevation: the token's payload carries neither key.
+    pub const NONE: Self = Self {
+        family_id: None,
+        elevation_id: None,
+    };
+
+    /// Bound to one refresh family, with no elevation.
+    #[must_use]
+    pub const fn family(family_id: Uuid) -> Self {
+        Self {
+            family_id: Some(family_id),
+            elevation_id: None,
+        }
+    }
 }
 
 pub struct JwtConfig {
@@ -79,6 +122,11 @@ impl JwtConfig {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the binding is the one options struct; folding the client's own \
+                  claims into it too would touch every mint site for no gain"
+    )]
     pub fn issue_access_token(
         &self,
         client_id: Uuid,
@@ -87,6 +135,7 @@ impl JwtConfig {
         owner_id: Option<Uuid>,
         agent_id: Option<Uuid>,
         ttl: Duration,
+        binding: AccessTokenBinding,
     ) -> Result<(String, Uuid), jsonwebtoken::errors::Error> {
         let now = Utc::now();
         let jti = Uuid::new_v4();
@@ -102,6 +151,8 @@ impl JwtConfig {
             client_type: client_type.to_string(),
             owner_id,
             agent_id,
+            fam: binding.family_id,
+            elv: binding.elevation_id,
         };
         let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)?;
         Ok((token, jti))
@@ -129,6 +180,12 @@ pub struct AuthContext {
     pub client_type: ClientType,
     pub scopes: Vec<String>,
     pub jti: Uuid,
+    /// The token's `fam` claim: the refresh family it was minted with.
+    pub family_id: Option<Uuid>,
+    /// The token's `elv` claim, AS CLAIMED. Not authority: a request is
+    /// elevated only once this is resolved against a live elevation session
+    /// bound to this principal and family. Nothing resolves it yet.
+    pub elevation_claim: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +216,8 @@ impl From<EpiGraphClaims> for AuthContext {
             client_type,
             scopes: claims.scopes,
             jti: claims.jti,
+            family_id: claims.fam,
+            elevation_claim: claims.elv,
         }
     }
 }
@@ -188,6 +247,7 @@ mod tests {
                 None,
                 None,
                 Duration::minutes(5),
+                AccessTokenBinding::NONE,
             )
             .unwrap();
         let claims = cfg.validate_token(&token).unwrap();
@@ -206,6 +266,7 @@ mod tests {
                 None,
                 None,
                 Duration::seconds(-10),
+                AccessTokenBinding::NONE,
             )
             .unwrap();
         assert!(cfg.validate_token(&token).is_err());
@@ -223,6 +284,7 @@ mod tests {
                 None,
                 None,
                 Duration::minutes(5),
+                AccessTokenBinding::NONE,
             )
             .unwrap();
         assert!(b.validate_token(&token).is_err());
@@ -237,6 +299,8 @@ mod tests {
             client_type: ClientType::Service,
             scopes: vec!["claims:read".into()],
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
         };
         assert!(check_scopes(&auth, &["claims:read"]).is_ok());
         assert!(check_scopes(&auth, &["claims:write"]).is_err());

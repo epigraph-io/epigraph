@@ -263,6 +263,8 @@ pub fn unauthenticated_context(
         client_type: epigraph_auth::ClientType::Service,
         scopes,
         jti: uuid::Uuid::nil(),
+        family_id: None,
+        elevation_claim: None,
     }
 }
 
@@ -813,6 +815,7 @@ mod tests {
             None,
             None,
             chrono::Duration::minutes(-5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .unwrap()
         .0
@@ -827,6 +830,7 @@ mod tests {
             None,
             None,
             chrono::Duration::minutes(5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .unwrap()
         .0
@@ -954,6 +958,7 @@ mod tests {
                 None,
                 Some(uuid::Uuid::new_v4()),
                 chrono::Duration::minutes(5),
+                epigraph_auth::AccessTokenBinding::NONE,
             )
             .unwrap();
         let validated: AuthContext = cfg.validate_token(&token).unwrap().into();

@@ -583,6 +583,7 @@ async fn handle_client_credentials(
             client.owner_id,
             Some(agent_id),
             ttl,
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .map_err(|e| ApiError::InternalError {
             message: format!("JWT signing failed: {e}"),
@@ -787,6 +788,7 @@ async fn handle_refresh_token(
             client.owner_id,
             Some(agent_id),
             ttl,
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .map_err(|e| ApiError::InternalError {
             message: format!("JWT signing failed: {e}"),
@@ -1013,6 +1015,7 @@ async fn handle_authorization_code(
             client.owner_id,
             Some(agent_id),
             ttl,
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .map_err(|e| ApiError::InternalError {
             message: format!("JWT signing failed: {e}"),

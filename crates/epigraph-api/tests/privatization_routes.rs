@@ -845,6 +845,8 @@ fn auth_for(agent: Uuid) -> AuthContext {
         client_type: ClientType::Agent,
         scopes: vec!["instance:admin".to_string(), "claims:read".to_string()],
         jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
     }
 }
 

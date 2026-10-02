@@ -70,6 +70,8 @@ async fn admin(pool: &PgPool, grant: bool) -> Admin {
                 "claims:admin".into(),
             ],
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
         },
         viewer: Viewer::resolve(pool, agent).await.expect("admin viewer"),
     }

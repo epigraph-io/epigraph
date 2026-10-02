@@ -510,6 +510,8 @@ mod require_scope_tests {
             client_type: ClientType::Service,
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
             jti: uuid::Uuid::nil(),
+            family_id: None,
+            elevation_claim: None,
         });
         parts
     }
@@ -596,6 +598,8 @@ mod viewer_extractor_tests {
             client_type: ClientType::Service,
             scopes: vec!["claims:read".to_string()],
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
         }
     }
 

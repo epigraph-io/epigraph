@@ -26,6 +26,8 @@ async fn inject_dummy_auth(
         client_type: ClientType::Service,
         scopes: vec!["claims:read".into()],
         jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
     };
     req.extensions_mut().insert(auth);
     next.run(req).await

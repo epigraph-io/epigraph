@@ -2445,6 +2445,8 @@ mod scope_guard_tests {
             client_type: ClientType::Service,
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
         }
     }
 

@@ -199,6 +199,7 @@ pub async fn provision_external_user(
             client.owner_id,
             Some(agent_id),
             ttl,
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .map_err(|e| ApiError::InternalError {
             message: format!("JWT signing failed: {e}"),

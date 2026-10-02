@@ -47,6 +47,7 @@ fn mint_token(secret: &[u8], scopes: &[&str]) -> String {
             None,
             None,
             ChronoDuration::minutes(5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .unwrap();
     token
