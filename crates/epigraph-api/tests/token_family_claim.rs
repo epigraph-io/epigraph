@@ -658,3 +658,49 @@ async fn the_external_grant_stamps_the_family_of_the_refresh_it_issues(pool: PgP
     assert_eq!(claims.client_type, "human");
     assert_eq!(claims.fam, Some(family));
 }
+
+// ── Introspection ────────────────────────────────────────────────────────────
+
+/// `/oauth/introspect` echoes `fam` for a token that carries one, and omits
+/// it for one that does not.
+///
+/// Catches: an introspection response that drops the family (the field is
+/// never set), or one that invents one for an unbound token.
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspection_echoes_the_family(pool: PgPool) {
+    let (client_id, code) = seed_code(&pool).await;
+    let (app, jwt) = app(&pool).await;
+    let (status, body) =
+        post_json(app.clone(), "/oauth/token", code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    let family = claims_of(&jwt, &body).fam.expect("PREMISE: a bound token");
+
+    let (status, intro) = post_json(
+        app.clone(),
+        "/oauth/introspect",
+        json!({ "token": body["access_token"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{intro}");
+    assert_eq!(intro["active"], json!(true), "{intro}");
+    assert_eq!(intro["fam"], json!(family.to_string()), "{intro}");
+
+    let (unbound, _) = jwt
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec![],
+            "agent",
+            None,
+            Some(Uuid::new_v4()),
+            Duration::minutes(5),
+            AccessTokenBinding::NONE,
+        )
+        .expect("mint");
+    let (status, intro) = post_json(app, "/oauth/introspect", json!({ "token": unbound })).await;
+    assert_eq!(status, StatusCode::OK, "{intro}");
+    assert_eq!(intro["active"], json!(true), "{intro}");
+    assert!(
+        intro.as_object().is_some_and(|o| !o.contains_key("fam")),
+        "an unbound token's introspection carries no fam: {intro}"
+    );
+}
