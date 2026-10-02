@@ -361,6 +361,22 @@ async fn main() {
             "{}",
             epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
         );
+        // The TEST-ONLY software-attestation flag (elevation plan EL-3,
+        // EQ-1 (a)) is never served on a database armed for operator binding.
+        // Checked BEFORE OQ-7's refusal below, so on a privileged DSN of an
+        // armed database the flag, not the DSN, is the reason printed.
+        let allows_software = passkey_config
+            .as_ref()
+            .is_some_and(epigraph_passkey::PasskeyConfig::allows_software_attestation);
+        if let Err(refusal) = epigraph_api::passkey_boot::check_software_attestation_boot(
+            scoped.inner(),
+            allows_software,
+        )
+        .await
+        {
+            eprintln!("ERROR: {refusal}");
+            std::process::exit(1);
+        }
         // Operator binding (migration 122): say at boot whether the valve is
         // open and whether the database is armed, and REFUSE TO START on a
         // privileged DSN of an armed database (operator ruling OQ-7 (b): on
@@ -377,10 +393,13 @@ async fn main() {
         // And for as long as it serves: the deploy order starts this unit
         // before the database is armed, so the boot check alone would let a
         // privileged DSN keep serving once it is (review R2-OQ-COR-1). The
-        // watch re-reads the posture and exits the process on that state.
-        epigraph_db::operator_binding::spawn_request_unit_watch(
+        // watch re-reads the posture and exits the process on that state. ONE
+        // watch, with the software-attestation flag's rule ahead of OQ-7's
+        // (a second watch would race OQ-7's to name the reason).
+        epigraph_db::operator_binding::spawn_posture_watch(
             scoped.inner().clone(),
             "epigraph-api",
+            epigraph_api::passkey_boot::running_stop(allows_software),
         );
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)

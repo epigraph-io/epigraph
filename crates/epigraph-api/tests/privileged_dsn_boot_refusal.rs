@@ -26,6 +26,14 @@
 //! 4. armed with the valve open (`EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off`):
 //!    still refused; the valve never makes a privileged DSN a request DSN.
 //!
+//! The second test pins the elevation plan's EL-3 pairing on the same
+//! refusal path: the TEST-ONLY software-attestation flag
+//! (`EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION`, passkeys from a software
+//! authenticator) is refused at boot on an armed database, and a server
+//! serving with it stops once its database is armed. It is checked BEFORE
+//! OQ-7's refusal and composed into the same running watch ahead of it, so on
+//! this privileged DSN its own text, not OQ-7's, is what the process prints.
+//!
 //! The application-role control is NOT driven here: `epigraph_app` is NOLOGIN
 //! on a throwaway CI cluster, so a DSN for it does not exist there. The pure
 //! mapping (`request_unit_may_serve`, every other state serves) is unit-tested
@@ -59,6 +67,25 @@ const SERVING: &str = "Server listening on";
 /// of a database armed after it started. Spelled here, like [`REFUSAL`].
 const STOP: &str = "stopping: a request unit never serves an armed database on a privileged \
                     DSN (operator ruling OQ-7 (b))";
+
+/// The refusal of a server started with the software-attestation flag on an
+/// armed database (elevation plan EL-3). Its prefix, spelled here like
+/// [`REFUSAL`].
+const SOFTWARE_REFUSAL: &str =
+    "refusing to start: EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION accepts passkeys from a \
+     software authenticator";
+
+/// The stop of a SERVING server with that flag whose database is armed under
+/// it. Its prefix, spelled here.
+const SOFTWARE_STOP: &str = "stopping: EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION accepts \
+                             passkeys from a software authenticator";
+
+/// A complete passkey configuration under the TEST-ONLY software policy.
+const SOFTWARE_ENV: &[(&str, &str)] = &[
+    ("EPIGRAPH_WEBAUTHN_RP_ID", "auth.example.com"),
+    ("EPIGRAPH_WEBAUTHN_ORIGIN", "https://auth.example.com"),
+    ("EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION", "1"),
+];
 
 enum Outcome {
     Exited { code: Option<i32>, log: String },
@@ -197,7 +224,12 @@ fn a_marker_drained_after_the_exit_still_counts() {
 /// Run the server against `db_url` and wait until it either exits or logs
 /// [`PAST_THE_CHECK`]; kill it in the second case.
 fn run_server(db_url: &str, valve_off: bool) -> Outcome {
-    let (mut child, rx) = spawn_server(db_url, valve_off, &[]);
+    run_server_with(db_url, valve_off, &[])
+}
+
+/// [`run_server`] with `extra_env` set.
+fn run_server_with(db_url: &str, valve_off: bool, extra_env: &[(&str, &str)]) -> Outcome {
+    let (mut child, rx) = spawn_server(db_url, valve_off, extra_env);
     let mut log = String::new();
     let outcome = wait_for(&mut child, &rx, PAST_THE_CHECK, &mut log);
     let _ = child.kill();
@@ -336,5 +368,139 @@ async fn the_server_refuses_a_privileged_dsn_on_an_armed_database(pool: PgPool) 
                  DSN:\n{log}"
             ),
         }
+    }
+}
+
+/// `log` without its ANSI colour sequences (`ESC [ ... m`), which the
+/// tracing layer puts between a field's name, its `=` and its value.
+fn strip_ansi(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut chars = log.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Elevation plan EL-3 (EQ-1 (a)): the TEST-ONLY software-attestation flag is
+/// never served on a database armed for operator binding. One database, in
+/// order, because arming is one-way:
+///
+/// 1. CALIBRATION, unarmed, flag on: past the check, and the boot says the
+///    relying party took the software policy (the flag was read), so step 3's
+///    refusal is the arming;
+/// 2. a server serving with the flag exits 1 once the database is armed under
+///    it, with ITS stop, not OQ-7's (which this privileged DSN also earns);
+/// 3. armed, flag on: exit 1 with its refusal, not OQ-7's: it runs first;
+/// 4. CONTROL, armed, flag off: OQ-7's refusal and not this one, so the
+///    refusal is the flag's, not the arming's alone.
+///
+/// Verified to fail: the flag's boot check removed from `main` (step 3: OQ-7's
+/// refusal); placed after OQ-7's check (step 3); not gated on the flag (step
+/// 4: the flag's refusal without the flag); `spawn_request_unit_watch` in
+/// place of the composed watch (step 2: OQ-7's stop).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_server_refuses_software_attestation_on_an_armed_database(pool: PgPool) {
+    let db_url = fixture::database_url_for(&pool).await;
+
+    // 1. Unarmed, flag on: past the check, with the software policy.
+    let url = db_url.clone();
+    match tokio::task::spawn_blocking(move || run_server_with(&url, false, SOFTWARE_ENV))
+        .await
+        .expect("join")
+    {
+        Outcome::PastTheCheck { log } => {
+            let plain = strip_ansi(&log);
+            assert!(
+                plain.contains("passkey relying party configured")
+                    && plain.contains("software_attestation=true"),
+                "CALIBRATION: the server read the software policy:\n{log}"
+            );
+            assert!(!log.contains(SOFTWARE_REFUSAL), "{log}");
+        }
+        Outcome::Exited { code, log } => panic!(
+            "CALIBRATION: on an UNARMED database the flag must get past the boot check, or the \
+             refusal below proves nothing; exited {code:?}:\n{log}"
+        ),
+    }
+
+    // 2. Unarmed and SERVING with the flag, then armed under it.
+    let url = db_url.clone();
+    let (mut child, rx) = tokio::task::spawn_blocking(move || {
+        let mut env = SOFTWARE_ENV.to_vec();
+        env.push(("EPIGRAPH_REQUEST_UNIT_RECHECK_SECS", "1"));
+        let (mut child, rx) = spawn_server(&url, false, &env);
+        let mut log = String::new();
+        match wait_for(&mut child, &rx, SERVING, &mut log) {
+            Outcome::PastTheCheck { .. } => (child, rx),
+            Outcome::Exited { code, log } => panic!(
+                "CALIBRATION: on an UNARMED database the server must reach serving; exited \
+                 {code:?}:\n{log}"
+            ),
+        }
+    })
+    .await
+    .expect("join");
+    arm(&pool).await;
+    let (code, log) = tokio::task::spawn_blocking(move || {
+        let mut log = String::new();
+        let code = wait_for_exit(&mut child, &rx, &mut log, Duration::from_secs(30));
+        (code, log)
+    })
+    .await
+    .expect("join");
+    assert_eq!(
+        code,
+        Some(Some(1)),
+        "a server serving the software flag exits 1 once its database is armed:\n{log}"
+    );
+    assert!(log.contains(SOFTWARE_STOP), "it names the flag:\n{log}");
+    assert!(
+        !log.contains(STOP),
+        "the flag's stop, not OQ-7's, is what it prints:\n{log}"
+    );
+
+    // 3. Armed, flag on: refused, by the flag's check.
+    let url = db_url.clone();
+    match tokio::task::spawn_blocking(move || run_server_with(&url, false, SOFTWARE_ENV))
+        .await
+        .expect("join")
+    {
+        Outcome::Exited { code, log } => {
+            assert_eq!(code, Some(1), "a failing exit:\n{log}");
+            assert!(log.contains(SOFTWARE_REFUSAL), "it names the flag:\n{log}");
+            assert!(
+                !log.contains(REFUSAL),
+                "the flag is refused before OQ-7's check:\n{log}"
+            );
+        }
+        Outcome::PastTheCheck { log } => panic!(
+            "a request unit SERVED an armed database with software attestation accepted:\n{log}"
+        ),
+    }
+
+    // 4. CONTROL: armed, flag off: OQ-7's refusal, not the flag's.
+    let url = db_url.clone();
+    match tokio::task::spawn_blocking(move || run_server(&url, false))
+        .await
+        .expect("join")
+    {
+        Outcome::Exited { code, log } => {
+            assert_eq!(code, Some(1), "a failing exit:\n{log}");
+            assert!(log.contains(REFUSAL), "OQ-7 refuses:\n{log}");
+            assert!(
+                !log.contains(SOFTWARE_REFUSAL),
+                "without the flag, the flag's refusal never runs:\n{log}"
+            );
+        }
+        Outcome::PastTheCheck { log } => panic!("CONTROL: OQ-7 must refuse:\n{log}"),
     }
 }
