@@ -1645,3 +1645,33 @@ policy and every 123 definer, and lists the holders granted after 123, which
 exist only in `role_assignments` and are re-granted in `instance_admins` by
 hand if they must survive. It leaves the role tables, the audit rows and the
 OCCUPIES edges in place (history; forward-fix only).
+
+## Passkeys (migration 124) — deploy order and rollback
+
+A registered human's WebAuthn passkeys (`person_authenticators`) and the
+maintenance enrollment tickets that admit them (`passkey_enrollments`). Storage
+only: nothing reads a passkey for authority until the elevation ceremony
+lands, and nothing serves the enrollment page until the API that runs the
+WebAuthn ceremony is deployed.
+
+1. **Migrate 124** (`epigraph-migrate`, migration DSN). Two new tables, their
+   triggers and policies, and new functions; nothing existing changes, no
+   backfill. Old binaries are unaffected.
+2. **Deploy** `epigraph-operator` and `epigraph-tenancy-backfill` built from
+   the same commit (`verify` then checks the 124 definers' owner and grants).
+3. **Enroll** (only once the enrollment ceremony is deployed):
+   `epigraph-operator passkey-enroll --person <the human's own agent> --reason
+   <text> [--label <device>] --apply` on the maintenance DSN prints a ticket
+   live for 15 minutes and its ceremony path, `/elevate/enroll/<id>`; the
+   human opens it under the public base URL on the device that holds the
+   authenticator. `list-passkeys` shows the result. A lost device:
+   `revoke-passkey --id <passkey> --reason <text> --apply` (audited; final).
+
+**Rollback.** First roll back every binary that calls a 124 function
+(`epigraph-operator`, any `epigraph-api` serving the enrollment ceremony,
+`epigraph-tenancy-backfill`). Then run `docs/runbooks/124-undo.sql` on the
+migration DSN, in one transaction: it reports how many passkeys and tickets it
+drops, then drops both tables and every 124 function. The
+`platform.passkey_*` audit rows stay (history), and so does 124's
+`_sqlx_migrations` row: re-introducing passkeys is a new migration, and every
+human enrolls again.

@@ -860,3 +860,114 @@ async fn a_forged_passkey_event_is_refused(pool: PgPool) {
         }
     }
 }
+
+// =====================================================================
+// The undo takes 124 back out.
+// =====================================================================
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// The catalog facts 124 could leave behind, by name: relations, functions
+/// (body and owner), policies and triggers in `public`.
+async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT 'rel ' || c.relname || ' ' || c.relkind::text \
+           FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'fn ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') ' \
+                || md5(p.prosrc) || ' ' || p.proowner::regrole::text \
+           FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'pol ' || c.relname || '.' || pol.polname \
+           FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid \
+          WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'trg ' || c.relname || '.' || t.tgname \
+           FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+          WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("catalog");
+    rows.into_iter().collect()
+}
+
+/// `docs/runbooks/124-undo.sql`, applied to a database that went 123 -> 124
+/// and holds a live passkey, a consumed and an open ticket, returns its
+/// catalog (relations, function bodies and owners, policies, triggers) to the
+/// same database's at 123, and keeps the `platform.passkey_*` history.
+///
+/// Verified to fail: the undo's DROP of
+/// `epigraph_set_passkey_enrollment_challenge` removed -> that function is
+/// left behind; the table DROP narrowed to `person_authenticators` -> the
+/// enrollments table and its policies are left behind.
+#[sqlx::test(migrations = false)]
+async fn the_rollback_returns_the_catalog_to_123(pool: PgPool) {
+    let at_123 = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 123)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    // One connection, reset afterwards: 001's pg_dump header leaves
+    // session-level SETs behind (viewer_fixture::db_at_122_then_head).
+    let mut conn = pool.acquire().await.expect("acquire");
+    at_123.run(&mut *conn).await.expect("migrate 001 -> 123");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    drop(conn);
+    let before = catalog(&pool).await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    MIGRATOR.run(&mut *conn).await.expect("migrate 123 -> head");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    drop(conn);
+    let (human, _) = fixture::seed_human_operator(&pool, "human").await;
+    let key = registered_passkey(&pool, human, 1).await;
+    enroll(&pool, human).await.expect("an open ticket");
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 124 changed the catalog"
+    );
+
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/124-undo.sql"),
+    )
+    .expect("124-undo.sql");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("the undo script applies");
+
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the catalog is not 123's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    assert_eq!(
+        events(
+            &pool,
+            "platform.passkey_registered",
+            "authenticator_id",
+            key
+        )
+        .await,
+        1,
+        "the audit history stays"
+    );
+}
