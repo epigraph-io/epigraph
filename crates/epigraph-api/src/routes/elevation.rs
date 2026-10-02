@@ -39,7 +39,7 @@ use crate::middleware::bearer::{AuthContext, ViewerExtractor};
 use crate::state::AppState;
 
 /// The token endpoint's grant type that redeems a confirmed grant-mode ticket.
-pub const ELEVATE_GRANT_TYPE: &str = "urn:epigraph:grant:elevate";
+pub use crate::oauth::token::ELEVATE_GRANT_TYPE;
 
 /// The longest reason accepted, in characters. It is shown on the ceremony
 /// page and kept in the audit trail; a paragraph is plenty.

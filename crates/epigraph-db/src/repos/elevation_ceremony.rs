@@ -12,7 +12,9 @@
 //!   [`ElevationCeremony::passkeys`], [`ElevationCeremony::store_challenge`],
 //!   [`ElevationCeremony::confirm`]) run on an UNSTAMPED application
 //!   connection: the ceremony page is unauthenticated by design (the ticket id
-//!   in its URL and the authenticator are its credentials).
+//!   in its URL and the authenticator are its credentials). So does
+//!   [`ElevationCeremony::redeem`], the token endpoint's: the redeem secret is
+//!   its credential.
 //!
 //! # Why the SQL lives here
 //!
@@ -84,6 +86,23 @@ pub struct Confirmation {
     pub refusal: Option<String>,
     /// `ELV05` for a counter regression, else `ELV02`, on a refusal.
     pub code: Option<String>,
+}
+
+/// `epigraph_redeem_elevation_ticket`'s answer: `pending` (no ceremony yet),
+/// `issued` (ONCE, with the session), or `invalid` (one answer for every
+/// failure, so the token endpoint is no oracle).
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct Redemption {
+    /// `pending`, `issued` or `invalid`.
+    pub status: String,
+    /// The session an issue names.
+    pub session_id: Option<Uuid>,
+    /// Its person.
+    pub person_agent_id: Option<Uuid>,
+    /// Its refresh family.
+    pub family_id: Option<Uuid>,
+    /// When it expires: the elevated token's expiry is at most this.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// An assertion the ceremony hands the confirm definer.
@@ -266,6 +285,32 @@ impl ElevationCeremony {
         .bind(asserted.counter)
         .bind(asserted.backup_eligible)
         .bind(asserted.evidence)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(row)
+    }
+
+    /// Grant mode: redeem `ticket` for the token endpoint
+    /// (`epigraph_redeem_elevation_ticket`), presenting the SHA-256 of its
+    /// redeem secret and the requesting client's row id. `issued` marks it
+    /// redeemed: it is answered once.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the call fails.
+    #[instrument(skip(conn, secret_hash))]
+    pub async fn redeem(
+        conn: &mut sqlx::PgConnection,
+        ticket: Uuid,
+        secret_hash: &[u8; 32],
+        client: Uuid,
+    ) -> Result<Redemption, DbError> {
+        let row = sqlx::query_as::<_, Redemption>(
+            "SELECT status, session_id, person_agent_id, family_id, expires_at \
+               FROM public.epigraph_redeem_elevation_ticket($1, $2, $3)",
+        )
+        .bind(ticket)
+        .bind(secret_hash.as_slice())
+        .bind(client)
         .fetch_one(&mut *conn)
         .await?;
         Ok(row)

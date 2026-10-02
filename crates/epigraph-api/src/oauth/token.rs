@@ -4,6 +4,8 @@
 //! - client_credentials with Ed25519 proof (agents) or client_secret (services)
 //! - refresh_token (all client types)
 //! - external provider grant types (registered via providers.toml; e.g. google_id_token, cloudflare_access_jwt)
+//! - `urn:epigraph:grant:elevate`: a confirmed grant-mode elevation ticket, redeemed once
+//!   for a short, refreshless, elevated access token (elevation plan EL-5)
 
 // UNSCOPED-POOL-EXEMPT: Pre-authentication by definition, and the largest such site. Token issuance is
 // the step that MINTS the principal; a Viewer cannot precede it.
@@ -66,13 +68,27 @@ pub struct TokenRequest {
     pub code_verifier: Option<String>,
     /// For authorization_code grant: must equal the redirect_uri used at /authorize.
     pub redirect_uri: Option<String>,
+    /// For the elevate grant: the ticket `POST /api/v1/elevation/tickets` opened.
+    pub ticket_id: Option<String>,
+    /// For the elevate grant: the redeem secret shown once with that ticket (hex).
+    pub redeem_secret: Option<String>,
 }
+
+/// The grant that redeems a confirmed grant-mode elevation ticket.
+pub const ELEVATE_GRANT_TYPE: &str = "urn:epigraph:grant:elevate";
+
+/// The longest an elevated access token lives (migration 125: a session lasts
+/// at most 15 minutes; the token never outlives its session).
+pub const ELEVATED_TOKEN_MAX_SECS: i64 = 900;
 
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
     pub expires_in: i64,
+    /// Absent (not `null`) when the grant issues none: the elevate grant
+    /// never does. Every other grant issues one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
     pub scope: String,
 }
@@ -316,6 +332,7 @@ pub async fn token_endpoint(
         "client_credentials" => handle_client_credentials(&state, &req).await,
         "refresh_token" => handle_refresh_token(&state, &req).await,
         "authorization_code" => handle_authorization_code(&state, &req).await,
+        ELEVATE_GRANT_TYPE => handle_elevate_grant(&state, &req).await,
         other => {
             // Look up an external provider by grant_type.
             if let Some(provider) = state.providers.by_grant_type(other) {
@@ -1107,7 +1124,229 @@ async fn handle_authorization_code(
     ))
 }
 
+// ── The elevate grant (elevation plan EL-5) ─────────────────────────────────
+
+/// The scopes of an ELEVATED access token: the client's own `granted_scopes`
+/// with every standing admin scope ([`ADMIN_ONLY_SCOPES`]) removed, plus
+/// [`PLATFORM_ADMIN_SCOPE`] once. Elevation replaces the standing admin
+/// scopes; it does not stack on them.
+///
+/// [`ADMIN_ONLY_SCOPES`]: epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES
+/// [`PLATFORM_ADMIN_SCOPE`]: epigraph_core::canonical_scopes::PLATFORM_ADMIN_SCOPE
+#[cfg(feature = "db")]
+pub(crate) fn elevated_scopes(granted: &[String]) -> Vec<String> {
+    use epigraph_core::canonical_scopes::{ADMIN_ONLY_SCOPES, PLATFORM_ADMIN_SCOPE};
+    let mut out: Vec<String> = Vec::with_capacity(granted.len() + 1);
+    for s in granted {
+        if s == PLATFORM_ADMIN_SCOPE || ADMIN_ONLY_SCOPES.contains(&s.as_str()) {
+            continue;
+        }
+        if !out.contains(s) {
+            out.push(s.clone());
+        }
+    }
+    out.push(PLATFORM_ADMIN_SCOPE.to_string());
+    out
+}
+
+/// An RFC 6749 §5.2 error for the elevate grant.
+#[cfg(feature = "db")]
+fn elevate_error(error: &'static str, description: &str) -> ApiError {
+    ApiError::OAuthGrantError {
+        error,
+        description: description.to_string(),
+    }
+}
+
+/// `grant_type=urn:epigraph:grant:elevate`: redeem a confirmed grant-mode
+/// elevation ticket, ONCE, for an elevated access token.
+///
+/// The request names the ticket (`ticket_id`), presents the secret shown once
+/// when it was opened (`redeem_secret`) and the ticket's client (`client_id`,
+/// returned with the ticket; a per-user human client is a public client, so
+/// the secret is the credential and the client binding is that the two
+/// match). Migration 125's `epigraph_redeem_elevation_ticket` answers:
+///
+/// * `pending` while no ceremony has landed: `authorization_pending` (RFC 8628
+///   §3.5 style; the caller polls);
+/// * `invalid` for everything else (unknown ticket, wrong secret, another
+///   client, a connector-mode ticket, refused, expired before its assertion,
+///   already redeemed, or a session no longer live): one `invalid_grant`, so
+///   the endpoint is no oracle;
+/// * `issued` ONCE, with the session.
+///
+/// The token: the session's person as principal, `elv` = the session, `fam` =
+/// its refresh family, scopes per [`elevated_scopes`], expiry the session's
+/// (at most [`ELEVATED_TOKEN_MAX_SECS`], and never past the assignment's own
+/// window: the session's expiry already is LEAST of the two), and NO refresh
+/// token: an elevation is never renewed, it is asked for again.
+///
+/// Everything that can fail to answer (the client, its principal) runs BEFORE
+/// the redemption, which is the irreversible step; a failure after it (the
+/// signing) spends the ticket with no token, which fails closed.
+#[cfg(feature = "db")]
+async fn handle_elevate_grant(
+    state: &AppState,
+    req: &TokenRequest,
+) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
+    use epigraph_db::repos::oauth_client::OAuthClientRepository;
+    use sha2::Digest;
+
+    const INVALID: &str = "the elevation ticket is unknown, not yours, refused, expired or \
+                           already redeemed";
+
+    let ticket: uuid::Uuid = req
+        .ticket_id
+        .as_deref()
+        .ok_or_else(|| elevate_error("invalid_request", "ticket_id is required"))?
+        .parse()
+        .map_err(|_| elevate_error("invalid_grant", INVALID))?;
+    let secret = req
+        .redeem_secret
+        .as_deref()
+        .ok_or_else(|| elevate_error("invalid_request", "redeem_secret is required"))?;
+    let client_id = req
+        .client_id
+        .as_deref()
+        .ok_or_else(|| elevate_error("invalid_request", "client_id is required"))?;
+    let secret_hash: [u8; 32] = match hex::decode(secret) {
+        Ok(bytes) if bytes.len() == 32 => sha2::Sha256::digest(&bytes).into(),
+        _ => return Err(elevate_error("invalid_grant", INVALID)),
+    };
+
+    let client = OAuthClientRepository::get_by_client_id(&state.db_pool, client_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+        .ok_or_else(|| elevate_error("invalid_grant", INVALID))?;
+    if client.status != "active" || client.client_type != "human" {
+        return Err(elevate_error("invalid_grant", INVALID));
+    }
+    let agent_id = match principal_agent_id(state, client.id, client.agent_id).await {
+        Ok(a) => a,
+        Err(ApiError::Forbidden { .. }) => return Err(elevate_error("invalid_grant", INVALID)),
+        Err(other) => return Err(other),
+    };
+
+    let mut conn = state
+        .db_pool
+        .acquire()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to acquire a connection: {e}"),
+        })?;
+    let r = epigraph_db::ElevationCeremony::redeem(&mut conn, ticket, &secret_hash, client.id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
+    drop(conn);
+    match r.status.as_str() {
+        "pending" => {
+            return Err(elevate_error(
+                "authorization_pending",
+                "the elevation has not been confirmed yet: complete the passkey ceremony at the \
+                 ticket's page, then retry",
+            ))
+        }
+        "issued" => {}
+        _ => return Err(elevate_error("invalid_grant", INVALID)),
+    }
+    let (Some(session), Some(person), Some(family), Some(expires_at)) =
+        (r.session_id, r.person_agent_id, r.family_id, r.expires_at)
+    else {
+        return Err(ApiError::InternalError {
+            message: "the redemption issued no session".into(),
+        });
+    };
+    if person != agent_id {
+        tracing::error!(
+            target: "elevation",
+            ticket = %ticket,
+            session = %session,
+            "elevate grant: the session's person is not the client's principal; refused"
+        );
+        return Err(elevate_error("invalid_grant", INVALID));
+    }
+    let secs = (expires_at - Utc::now())
+        .num_seconds()
+        .min(ELEVATED_TOKEN_MAX_SECS);
+    if secs <= 0 {
+        return Err(elevate_error("invalid_grant", INVALID));
+    }
+    let ttl = Duration::seconds(secs);
+    let scopes = elevated_scopes(&client.granted_scopes);
+    let binding = epigraph_auth::AccessTokenBinding {
+        family_id: Some(family),
+        elevation_id: Some(session),
+    };
+    let (access_token, _jti) = state
+        .jwt_config
+        .issue_access_token(
+            client.id,
+            scopes.clone(),
+            &client.client_type,
+            client.owner_id,
+            Some(agent_id),
+            ttl,
+            binding,
+        )
+        .map_err(|e| ApiError::InternalError {
+            message: format!("JWT signing failed: {e}"),
+        })?;
+    tracing::info!(
+        target: "elevation",
+        ticket = %ticket,
+        session = %session,
+        client = %client.id,
+        expires_in = secs,
+        "elevated access token issued"
+    );
+    Ok((
+        StatusCode::OK,
+        Json(TokenResponse {
+            access_token,
+            token_type: "Bearer".to_string(),
+            expires_in: secs,
+            refresh_token: None,
+            scope: scopes.join(" "),
+        }),
+    ))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "db"))]
+mod elevate_scope_tests {
+    use super::elevated_scopes;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    /// Every standing admin scope is removed, `platform:admin` is added once
+    /// (even when the client already carries it), and the rest keep their
+    /// order. Mutations: the ADMIN_ONLY filter dropped -> `claims:admin`
+    /// survives; the dedup of a granted `platform:admin` dropped -> twice.
+    #[test]
+    fn elevation_replaces_the_standing_admin_scopes() {
+        assert_eq!(
+            elevated_scopes(&v(&[
+                "claims:read",
+                "claims:admin",
+                "platform:admin",
+                "groups:admin",
+                "claims:write",
+                "instance:admin",
+                "clients:admin",
+                "entity-types:write",
+            ])),
+            v(&["claims:read", "claims:write", "platform:admin"])
+        );
+        assert_eq!(elevated_scopes(&[]), v(&["platform:admin"]));
+    }
+}
 
 #[cfg(test)]
 mod assertion_tests {

@@ -120,8 +120,8 @@ pub use repos::{
     WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use repos::{
-    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, TicketMode,
-    TicketPasskey,
+    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, Redemption,
+    TicketMode, TicketPasskey,
 };
 pub use repos::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
 pub use repos::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};

@@ -446,7 +446,10 @@ async fn code_exchange_stamps_the_family_of_the_refresh_it_issues(pool: PgPool) 
         Some(r0_family),
         "the code grant's access token names the family of the refresh it issued"
     );
-    assert_eq!(claims.elv, None, "nothing mints elv yet");
+    assert_eq!(
+        claims.elv, None,
+        "the code grant never mints elv (only the elevate grant does)"
+    );
 }
 
 /// Rotation keeps the family: the access token minted by a refresh names the
@@ -657,6 +660,10 @@ async fn the_external_grant_stamps_the_family_of_the_refresh_it_issues(pool: PgP
     let claims = claims_of(&jwt, &body);
     assert_eq!(claims.client_type, "human");
     assert_eq!(claims.fam, Some(family));
+    assert_eq!(
+        claims.elv, None,
+        "the external grant never mints elv (only the elevate grant does)"
+    );
 }
 
 // ── Introspection ────────────────────────────────────────────────────────────

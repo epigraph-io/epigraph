@@ -1079,3 +1079,330 @@ async fn the_ceremony_fails_closed_unconfigured_and_on_an_unknown_ticket(pool: P
         StatusCode::NOT_FOUND
     );
 }
+
+// =====================================================================
+// /oauth/token, grant_type=urn:epigraph:grant:elevate
+// =====================================================================
+
+const ELEVATE: &str = "urn:epigraph:grant:elevate";
+
+impl Server {
+    async fn redeem(&self, ticket: Uuid, secret: &str, client_id: &str) -> (StatusCode, Value) {
+        self.post(
+            "/oauth/token",
+            None,
+            &json!({
+                "grant_type": ELEVATE,
+                "ticket_id": ticket,
+                "redeem_secret": secret,
+                "client_id": client_id,
+            }),
+        )
+        .await
+    }
+}
+
+fn grant_error(r: &(StatusCode, Value)) -> (StatusCode, &str) {
+    (r.0, r.1["error"].as_str().unwrap_or_default())
+}
+
+/// Give `p`'s human client these granted scopes.
+async fn grant_scopes(pool: &PgPool, p: &Person, scopes: &[&str]) {
+    sqlx::query("UPDATE oauth_clients SET granted_scopes = $2, allowed_scopes = $2 WHERE id = $1")
+        .bind(p.client)
+        .bind(scopes.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+        .execute(pool)
+        .await
+        .expect("granted scopes");
+}
+
+/// The grant mode end to end: `authorization_pending` until the ceremony
+/// lands, then ONE elevated token, then `invalid_grant`. The token: the
+/// holder as principal, `elv` = the session, `fam` = the ticket's family, the
+/// client's scopes minus every standing admin scope plus `platform:admin`, at
+/// most 15 minutes, and NO refresh token (the key is absent).
+///
+/// Mutations: "pending" answered as `invalid_grant` -> the first poll; the
+/// response built with a refresh token -> the key is present; the binding
+/// without `elv` -> the claim; `client.granted_scopes` minted unstripped ->
+/// `claims:admin` present; the redemption run before nothing else changed
+/// (second redeem answered `issued`) is the definer's, mutated in
+/// `elevation_sessions.rs`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevate_grant_waits_for_the_ceremony_then_issues_once(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    grant_scopes(&pool, &p, &["claims:read", "claims:admin", "groups:admin"]).await;
+    let (ticket, secret) = open(&s, &p, "grant mode").await;
+
+    let pending = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(
+        grant_error(&pending),
+        (StatusCode::BAD_REQUEST, "authorization_pending"),
+        "{pending:?}"
+    );
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, _, session) = ticket_row(&pool, ticket).await;
+    let session = session.expect("a session");
+
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.get("refresh_token").is_none(),
+        "no refresh token, not even null: {body}"
+    );
+    let claims = s
+        .jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .expect("a valid token");
+    assert_eq!(claims.elv, Some(session), "elv names the session");
+    assert_eq!(claims.fam, Some(p.family));
+    assert_eq!(claims.agent_id, Some(p.person));
+    assert_eq!(claims.sub, p.client);
+    let mut scopes = claims.scopes.clone();
+    scopes.sort();
+    assert_eq!(scopes, vec!["claims:read", "platform:admin"]);
+    assert_eq!(body["scope"], "claims:read platform:admin");
+    let lifetime = claims.exp - claims.iat;
+    assert!((880..=900).contains(&lifetime), "exp - iat = {lifetime}");
+    assert_eq!(body["expires_in"].as_i64(), Some(lifetime));
+
+    let again = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(
+        grant_error(&again),
+        (StatusCode::BAD_REQUEST, "invalid_grant")
+    );
+}
+
+/// The grant refuses, with one `invalid_grant` and WITHOUT spending the
+/// ticket: a wrong secret, a malformed one, another client's `client_id`, an
+/// unknown client; and a request missing a parameter is `invalid_request`.
+/// The right triple then still issues.
+///
+/// Mutations: the secret hashed as its hex text -> the right triple is
+/// refused; (125) the redemption's client clause dropped -> B's client
+/// issues.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevate_grant_binds_the_secret_and_the_client(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let b = person(&pool, "other").await;
+    let (ticket, secret) = open(&s, &p, "binding").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let wrong = hex::encode([0x5a_u8; 32]);
+    for (what, sec, client) in [
+        ("wrong secret", wrong.as_str(), p.client_id.as_str()),
+        ("malformed secret", "zz", p.client_id.as_str()),
+        ("short secret", "abcd", p.client_id.as_str()),
+        ("another client", secret.as_str(), b.client_id.as_str()),
+        ("unknown client", secret.as_str(), "no-such-client"),
+    ] {
+        let r = s.redeem(ticket, sec, client).await;
+        assert_eq!(
+            grant_error(&r),
+            (StatusCode::BAD_REQUEST, "invalid_grant"),
+            "{what}: {r:?}"
+        );
+    }
+    let r = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({"grant_type": ELEVATE, "redeem_secret": secret, "client_id": p.client_id}),
+        )
+        .await;
+    assert_eq!(
+        grant_error(&r),
+        (StatusCode::BAD_REQUEST, "invalid_request")
+    );
+
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "the refusals spent nothing: {body}");
+}
+
+/// A ticket whose 5 minutes pass with no ceremony is `invalid_grant`, no
+/// longer `authorization_pending`. Mutation: "invalid" answered as
+/// `authorization_pending` -> pending forever.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unconfirmed_ticket_expires_into_invalid_grant(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (ticket, secret) = open(&s, &p, "expiring").await;
+    {
+        use sqlx::Executor;
+        let mut conn = pool.acquire().await.unwrap();
+        conn.execute("SET session_replication_role = replica")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE elevation_tickets SET created_at = created_at - interval '10 minutes', \
+                                          expires_at = expires_at - interval '10 minutes' \
+              WHERE id = $1",
+        )
+        .bind(ticket)
+        .execute(&mut *conn)
+        .await
+        .expect("age the ticket");
+        conn.execute("SET session_replication_role = origin")
+            .await
+            .unwrap();
+    }
+    let r = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(grant_error(&r), (StatusCode::BAD_REQUEST, "invalid_grant"));
+}
+
+/// The elevated token never outlives the ASSIGNMENT: a custodian whose
+/// assignment ends in 5 minutes gets a session (and a token) of at most 5
+/// minutes, not 15. Mutation: the token's lifetime fixed at 15 minutes ->
+/// exp - iat = 900.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevated_token_never_outlives_the_assignment(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = person(&pool, "short-assignment").await;
+    let _assignment: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, \
+                now() + interval '5 minutes', NULL, 'test: a five-minute assignment')",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("a five-minute custodian");
+    enroll(&pool, &s, p.person, &mut auth).await;
+    let (ticket, secret) = open(&s, &p, "short").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let claims = s
+        .jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .unwrap();
+    let lifetime = claims.exp - claims.iat;
+    assert!(
+        (200..=300).contains(&lifetime),
+        "the token lives with the assignment: {lifetime}"
+    );
+}
+
+const REDIRECT_URI: &str = "https://claude.ai/api/mcp/auth_callback";
+const VERIFIER: &str = "el5-fixed-pkce-code-verifier-of-adequate-length-0123456789";
+
+/// One authorization code for `p`'s own human client.
+async fn code_for(pool: &PgPool, p: &Person) -> String {
+    use base64::Engine as _;
+    let code = format!("code_{}", Uuid::new_v4().simple());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(VERIFIER.as_bytes()));
+    epigraph_db::repos::authorization_code::AuthorizationCodeRepository::create(
+        pool,
+        blake3::hash(code.as_bytes()).as_bytes(),
+        &p.client_id,
+        p.client,
+        REDIRECT_URI,
+        &challenge,
+        &["claims:read".to_string()],
+        None,
+        chrono::Utc::now() + Duration::minutes(5),
+    )
+    .await
+    .expect("seed code");
+    code
+}
+
+/// No other grant mints `elv`: with the family ELEVATED (a live session from
+/// the real ceremony), a code exchange and a refresh of that very family each
+/// mint a token naming the family and NO elevation. (The external grant's
+/// token is pinned the same way in `token_family_claim.rs`.)
+///
+/// Mutation: the refresh grant's binding given `elevation_id` -> the
+/// refreshed token carries `elv`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_other_grant_mints_elv_even_while_the_family_is_elevated(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let code = code_for(&pool, &p).await;
+    let (status, first) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": p.client_id,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "code exchange: {first}");
+    let token = first["access_token"].as_str().unwrap().to_string();
+    let claims = s.jwt.validate_token(&token).unwrap();
+    assert_eq!(claims.elv, None);
+    let fam = claims.fam.expect("a family");
+
+    // Elevate that family through the real API.
+    let (status, t) = s
+        .post(
+            "/api/v1/elevation/tickets",
+            Some(&token),
+            &json!({"reason": "elevate the family"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{t}");
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, _, session) = ticket_row(&pool, ticket).await;
+    let live_fam: Uuid =
+        sqlx::query_scalar("SELECT family_id FROM elevation_sessions WHERE id = $1")
+            .bind(session.unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        live_fam, fam,
+        "CALIBRATION: the code grant's family is elevated"
+    );
+
+    let (status, refreshed) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({"grant_type": "refresh_token", "refresh_token": first["refresh_token"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "refresh: {refreshed}");
+    let rc = s
+        .jwt
+        .validate_token(refreshed["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!((rc.fam, rc.elv), (Some(fam), None));
+
+    let code = code_for(&pool, &p).await;
+    let (status, second) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": p.client_id,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let sc = s
+        .jwt
+        .validate_token(second["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(sc.elv, None);
+}

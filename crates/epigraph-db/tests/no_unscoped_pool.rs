@@ -519,7 +519,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        15,
+        17,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
@@ -530,7 +530,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          before minting, it reads the presented refresh token's rotation family (`id` and \
          `family_id` only, inside migration 118's column grant; `refresh_tokens` has no RLS) so a \
          human client's access token can name it — still before the principal is minted, the same \
-         reason again.",
+         reason again. The sixteenth and seventeenth are the elevate grant's (elevation plan \
+         EL-5): the client lookup by its `client_id`, as every other grant does, and the one \
+         connection for migration 125's `epigraph_redeem_elevation_ticket`, an app-callable \
+         definer keyed by the ticket and its redeem secret's hash (the credential), which needs \
+         no stamp. Both run before the elevated principal's token is minted.",
     ),
     (
         "routes/elevate.rs",

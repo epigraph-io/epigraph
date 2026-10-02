@@ -572,6 +572,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "elevation_ceremony.rs",
+        "redeem",
+        "WRITE through 125's app-callable definer `epigraph_redeem_elevation_ticket`, for the \
+         token endpoint's elevate grant (pre-authentication: the redeem secret's SHA-256 is the \
+         credential): it answers pending / issued ONCE / invalid for one grant-mode ticket and \
+         marks it redeemed. An authentication record, not a corpus row.",
+    ),
+    (
+        "elevation_ceremony.rs",
         "end",
         "WRITE through 125's principal-bound app-callable definer `epigraph_end_elevation`, on \
          the requester's STAMPED connection: it ends only the stamped principal's own live \

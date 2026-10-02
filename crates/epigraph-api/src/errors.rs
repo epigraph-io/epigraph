@@ -278,6 +278,17 @@ pub enum ApiError {
         claim_id: uuid::Uuid,
         message: String,
     },
+
+    /// `400` with an RFC 6749 §5.2 token-endpoint error body,
+    /// `{"error": <code>, "error_description": <text>}`, for a client that
+    /// must act on the code: the elevate grant's device-flow-style polling
+    /// (`authorization_pending`, then `invalid_grant`). The other grants keep
+    /// their historical `BadRequest` shape.
+    #[error("{error}: {description}")]
+    OAuthGrantError {
+        error: &'static str,
+        description: String,
+    },
 }
 
 impl ApiError {
@@ -373,6 +384,17 @@ impl IntoResponse for ApiError {
                     "edge_id": edge_id,
                     "rule": rule,
                     "retryable": false,
+                })),
+            )
+                .into_response();
+        }
+        // RFC 6749 §5.2: the token endpoint's own error body.
+        if let ApiError::OAuthGrantError { error, description } = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": error,
+                    "error_description": description,
                 })),
             )
                 .into_response();
@@ -487,6 +509,9 @@ impl IntoResponse for ApiError {
             ApiError::EdgeNotOwned { .. } | ApiError::ClaimNotWritable { .. } => {
                 (StatusCode::FORBIDDEN, "not_owner", None)
             }
+            // Answered above with its own body; kept here so the match stays
+            // exhaustive.
+            ApiError::OAuthGrantError { error, .. } => (StatusCode::BAD_REQUEST, *error, None),
         };
 
         // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a
