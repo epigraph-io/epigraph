@@ -60,6 +60,9 @@
 --          names a LIVE custodian as `granted_by`, and a holder never extends
 --          itself while another holder exists. With no live custodian (the
 --          bootstrap) only a grant with no grantor is admitted.
+--   CUS06  a grant (or a link of an agent, section 5) under REPEATABLE READ,
+--          where a concurrent link and grant of one principal could not
+--          see each other.
 --
 -- ===================================================================
 -- 3. UNDO
@@ -220,6 +223,16 @@ DECLARE
     v_any_live   boolean;
     v_other_live boolean;
 BEGIN
+    -- A grant and a link of the same principal see each other (CUS06 and the
+    -- shared lock: section 5, "A ROLE HOLDER IS NEVER LINKED AS AN AGENT").
+    IF current_setting('transaction_isolation') = 'repeatable read' THEN
+        RAISE EXCEPTION 'CUS06: a role assignment is not written under REPEATABLE READ: its '
+                        'snapshot predates the wait for a concurrent link of the holder, so '
+                        'neither would see the other'
+            USING ERRCODE = 'CUS06',
+                  HINT = 'Run it under READ COMMITTED (the default) or SERIALIZABLE.';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
     IF NOT public.epigraph_is_human_operator(NEW.holder_person_id)
        OR EXISTS (SELECT 1 FROM public.operator_links l
                    WHERE l.agent_id = NEW.holder_person_id) THEN
@@ -678,6 +691,18 @@ CREATE TRIGGER human_operators_refuse_role_node
 -- ends through `epigraph-operator end-role-assignment`, whose end is audited,
 -- and the link is made afterwards. `operator_links` takes no UPDATE (107: no
 -- policy, no grant), so the INSERT is the only way in.
+--
+-- A GRANT AND A LINK OF ONE PRINCIPAL SEE EACH OTHER (review R2-OQ-SEC-2 /
+-- R2-OQ-COR-2). Each side reads the other's table, and review measured both
+-- committing when they ran concurrently: an uncommitted grant is invisible
+-- to the link guard and the reverse, so the holder ended up linked with its
+-- assignment un-ended and no `platform.role_ended` row. Both guards therefore
+-- take 107 section 10's transaction-scoped advisory lock (every link function
+-- already does) BEFORE they read. Under READ COMMITTED the read that follows
+-- the wait takes a fresh snapshot and sees the other side's commit; under
+-- SERIALIZABLE the write skew is a serialization failure (40001). REPEATABLE
+-- READ has neither property (its snapshot is taken before the wait), so both
+-- guards refuse it: `CUS06`.
 CREATE OR REPLACE FUNCTION public.epigraph_operator_links_refuse_role_holder()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
@@ -686,6 +711,14 @@ DECLARE
     v_assignment uuid;
     v_role       text;
 BEGIN
+    IF current_setting('transaction_isolation') = 'repeatable read' THEN
+        RAISE EXCEPTION 'CUS06: an operator link is not written under REPEATABLE READ: its '
+                        'snapshot predates the wait for a concurrent role grant of the agent, '
+                        'so neither would see the other'
+            USING ERRCODE = 'CUS06',
+                  HINT = 'Run it under READ COMMITTED (the default) or SERIALIZABLE.';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
     SELECT ra.id, ra.role INTO v_assignment, v_role
       FROM public.role_assignments ra
      WHERE ra.holder_person_id = NEW.agent_id

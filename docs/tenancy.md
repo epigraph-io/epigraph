@@ -762,7 +762,12 @@ reads the platform audit trail and confers nothing else.
   registration or suspending its recorded OAuth client ends its authority at
   once. A HOLDER is never linked as an agent: a new `operator_links` row for a
   principal with a live or not-yet-begun assignment is refused `CUS01`, so its
-  holding ends through `end-role-assignment` (audited) before the link.
+  holding ends through `end-role-assignment` (audited) before the link. A
+  grant and a link of one principal running at once see each other: both
+  guards take the link writes' advisory lock before they read, so the second
+  is refused once the first commits. That holds under READ COMMITTED (the
+  default) and SERIALIZABLE (a serialization failure); REPEATABLE READ is
+  refused on both sides (`CUS06`), because its snapshot predates the wait.
 * **Append-only** (`CUS02`): an assignment is never edited or deleted; its only
   change is its end (`revoked_at` stamped now, by the revoking login, with
   why), and an ended assignment is final. Nothing is back-dated, and the

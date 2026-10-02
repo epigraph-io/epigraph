@@ -347,6 +347,226 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
     assert!(!admin, "nor is it an instance admin");
 }
 
+/// Whether some backend of THIS database waits on an advisory lock: polled
+/// until one does (true), or `task` finishes or 10 s pass (false). A fixed
+/// pause cannot tell "blocked" from "slow".
+async fn waits_on_an_advisory_lock<T>(pool: &PgPool, task: &tokio::task::JoinHandle<T>) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks l \
+                             WHERE l.locktype = 'advisory' AND NOT l.granted \
+                               AND l.database = (SELECT oid FROM pg_database \
+                                                  WHERE datname = current_database()))",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_locks");
+        if waiting {
+            return true;
+        }
+        if task.is_finished() || std::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// `epigraph_grant_role` inside an open transaction (superuser: privileged).
+async fn grant_in(
+    conn: &mut sqlx::PgConnection,
+    role: &str,
+    holder: Uuid,
+    granted_by: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT public.epigraph_grant_role($1, $2, NULL, NULL, $3, 'race test')",
+    )
+    .bind(role)
+    .bind(holder)
+    .bind(granted_by)
+    .fetch_one(conn)
+    .await
+}
+
+/// A direct maintenance `INSERT INTO operator_links` (no link function, so
+/// none of 107's locks): only the table's own triggers stand in its way.
+async fn raw_link_in(
+    conn: &mut sqlx::PgConnection,
+    agent: Uuid,
+    operator: Uuid,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) \
+         SELECT $1, $2, m.group_id FROM group_memberships m \
+          WHERE m.agent_id = $2 AND m.role = 'admin' AND m.revoked_at IS NULL \
+          ORDER BY m.group_id LIMIT 1",
+    )
+    .bind(agent)
+    .bind(operator)
+    .execute(conn)
+    .await
+    .map(|d| d.rows_affected())
+}
+
+/// `(un-ended assignments, operator_links rows as the agent)` of `who`.
+async fn holding_and_links(pool: &PgPool, who: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM role_assignments \
+                  WHERE holder_person_id = $1 AND revoked_at IS NULL), \
+                (SELECT count(*) FROM operator_links WHERE agent_id = $1)",
+    )
+    .bind(who)
+    .fetch_one(pool)
+    .await
+    .expect("holding and links")
+}
+
+/// A grant and a link of ONE principal, run concurrently, see each other
+/// (review R2-OQ-SEC-2 / R2-OQ-COR-2). Review measured both committing,
+/// under READ COMMITTED and REPEATABLE READ alike: the holder ended up linked
+/// as an agent with its assignment un-ended and no `platform.role_ended` row,
+/// the state the role-holder link guard exists to refuse.
+///
+/// Connection 1 holds one side uncommitted; connection 2's other side must
+/// WAIT (an ungranted advisory lock in `pg_locks`, polled), and once
+/// connection 1 commits it is refused `CUS01`. In every order, and for a
+/// direct `operator_links` INSERT that no link function wraps.
+/// REPEATABLE READ is refused `CUS06` on both sides; under SERIALIZABLE the
+/// race ends in a serialization failure, never in both rows.
+///
+/// Verified to fail: the grant guard's `pg_advisory_xact_lock` removed -> the
+/// link-first grant does not wait and is admitted; the role-holder link
+/// guard's lock removed -> the direct INSERT does not wait and is admitted;
+/// either `CUS06` test removed -> that side is admitted under REPEATABLE READ.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_concurrent_grant_and_link_see_each_other(pool: PgPool) {
+    let (custodian, _) = fixture::seed_human_operator(&pool, "race-custodian").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "race-operator").await;
+    maint_insert(&pool, CUSTODIAN, custodian, "0", None, None)
+        .await
+        .expect("bootstrap custodian");
+
+    // (a) Grant first; the link function waits, then is refused.
+    let (grant_first, _) = fixture::seed_human_operator(&pool, "grant-first").await;
+    let mut c1 = pool.begin().await.expect("begin connection 1");
+    grant_in(&mut c1, AUDITOR, grant_first, custodian)
+        .await
+        .expect("grant on connection 1");
+    let pool2 = pool.clone();
+    let link = tokio::spawn(async move {
+        let mut c2 = pool2.acquire().await.expect("acquire connection 2");
+        epigraph_db::AgentRepository::link_operator(&mut c2, grant_first, operator)
+            .await
+            .map(|_| ())
+    });
+    assert!(
+        waits_on_an_advisory_lock(&pool, &link).await,
+        "the link finished while the grant was uncommitted: they were not serialised"
+    );
+    c1.commit().await.expect("commit connection 1");
+    let r = link.await.expect("join connection 2");
+    assert!(
+        format!("{r:?}").contains("CUS01"),
+        "grant first: the link after the grant commits is refused CUS01: {r:?}"
+    );
+    assert_eq!(holding_and_links(&pool, grant_first).await, (1, 0));
+
+    // (b) Link first; the grant waits, then is refused.
+    let (link_first, _) = fixture::seed_human_operator(&pool, "link-first").await;
+    let mut c1 = pool.begin().await.expect("begin connection 1");
+    epigraph_db::AgentRepository::link_operator(&mut c1, link_first, operator)
+        .await
+        .expect("link on connection 1");
+    let pool2 = pool.clone();
+    let grant = tokio::spawn(async move {
+        let mut c2 = pool2.acquire().await.expect("acquire connection 2");
+        grant_in(&mut c2, AUDITOR, link_first, custodian).await
+    });
+    assert!(
+        waits_on_an_advisory_lock(&pool, &grant).await,
+        "the grant finished while the link was uncommitted: they were not serialised"
+    );
+    c1.commit().await.expect("commit connection 1");
+    let r = grant.await.expect("join connection 2");
+    assert_code(&r, "CUS01", "link first: the grant after the link commits");
+    assert_eq!(holding_and_links(&pool, link_first).await, (0, 1));
+
+    // (c) Grant first; a DIRECT link INSERT (no link function's lock) waits on
+    // the link guard's own lock, then is refused.
+    let (raw, _) = fixture::seed_human_operator(&pool, "raw-link").await;
+    let mut c1 = pool.begin().await.expect("begin connection 1");
+    grant_in(&mut c1, AUDITOR, raw, custodian)
+        .await
+        .expect("grant on connection 1");
+    let pool2 = pool.clone();
+    let insert = tokio::spawn(async move {
+        let mut c2 = pool2.acquire().await.expect("acquire connection 2");
+        raw_link_in(&mut c2, raw, operator).await
+    });
+    assert!(
+        waits_on_an_advisory_lock(&pool, &insert).await,
+        "the direct link INSERT finished while the grant was uncommitted"
+    );
+    c1.commit().await.expect("commit connection 1");
+    let r = insert.await.expect("join connection 2");
+    assert_code(&r, "CUS01", "grant first: the direct link INSERT");
+    assert_eq!(holding_and_links(&pool, raw).await, (1, 0));
+
+    // (d) REPEATABLE READ: refused on both sides, before anything is read.
+    let (rr, _) = fixture::seed_human_operator(&pool, "repeatable-read").await;
+    let mut c = pool.begin().await.expect("begin");
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *c)
+        .await
+        .expect("RR");
+    let r = grant_in(&mut c, AUDITOR, rr, custodian).await;
+    assert_code(&r, "CUS06", "a grant under REPEATABLE READ");
+    c.rollback().await.expect("rollback");
+    let mut c = pool.begin().await.expect("begin");
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *c)
+        .await
+        .expect("RR");
+    let r = raw_link_in(&mut c, rr, operator).await;
+    assert_code(&r, "CUS06", "a link under REPEATABLE READ");
+    c.rollback().await.expect("rollback");
+    assert_eq!(holding_and_links(&pool, rr).await, (0, 0));
+
+    // (e) SERIALIZABLE: grant first, the link waits, and the write skew ends
+    // in a serialization failure (or the refusal), never in both rows.
+    let (ser, _) = fixture::seed_human_operator(&pool, "serializable").await;
+    let mut c1 = pool.begin().await.expect("begin connection 1");
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .execute(&mut *c1)
+        .await
+        .expect("SERIALIZABLE");
+    grant_in(&mut c1, AUDITOR, ser, custodian)
+        .await
+        .expect("grant on connection 1");
+    let pool2 = pool.clone();
+    let link = tokio::spawn(async move {
+        let mut c2 = pool2.begin().await.expect("begin connection 2");
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .execute(&mut *c2)
+            .await
+            .expect("SERIALIZABLE");
+        raw_link_in(&mut c2, ser, operator).await?;
+        c2.commit().await.map(|()| 1)
+    });
+    assert!(
+        waits_on_an_advisory_lock(&pool, &link).await,
+        "SERIALIZABLE: the link finished while the grant was uncommitted"
+    );
+    c1.commit().await.expect("commit connection 1");
+    let r = link.await.expect("join connection 2");
+    assert!(
+        matches!(code_of(&r).as_deref(), Some("40001" | "CUS01")),
+        "SERIALIZABLE: the link is a serialization failure or the refusal: {r:?}"
+    );
+    assert_eq!(holding_and_links(&pool, ser).await, (1, 0));
+}
+
 // =====================================================================
 // T2. Assignments are append-only.
 // =====================================================================
