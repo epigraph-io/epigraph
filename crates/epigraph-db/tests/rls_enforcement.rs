@@ -232,6 +232,22 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          FORCE the absent DELETE policy default-denies every non-superuser role, and 124 \
          grants DELETE to nobody.",
     ),
+    (
+        "elevation_tickets",
+        "DELETE",
+        "An elevation ticket (125) is never deleted: it ends by expiring or by its one \
+         assertion (confirmed or refused), and a confirmed ticket's session names it (ON DELETE \
+         RESTRICT). Under FORCE the absent DELETE policy default-denies every non-superuser \
+         role, and 125 grants DELETE to nobody.",
+    ),
+    (
+        "elevation_sessions",
+        "DELETE",
+        "An elevation session (125) is ended by its one end stamp, never deleted: the row is \
+         the record of who read elevated, when, under which assignment and passkey. Under FORCE \
+         the absent DELETE policy default-denies every non-superuser role, and 125 grants \
+         DELETE to nobody.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -296,6 +312,8 @@ const PROTECTED: &[&str] = &[
     "role_assignments",
     "passkey_enrollments",
     "person_authenticators",
+    "elevation_tickets",
+    "elevation_sessions",
 ];
 
 // ===========================================================================

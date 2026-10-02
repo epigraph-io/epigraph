@@ -113,7 +113,10 @@ DECLARE t text;
           'platform_roles','role_assignments',
           -- ---- a human's passkeys and enrollments (124) ------------------
           -- FORCEd by 124 at creation, same precedent and reason.
-          'passkey_enrollments','person_authenticators'];
+          'passkey_enrollments','person_authenticators',
+          -- ---- a human's elevation tickets and sessions (125) ------------
+          -- FORCEd by 125 at creation, same precedent and reason.
+          'elevation_tickets','elevation_sessions'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

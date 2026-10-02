@@ -1008,8 +1008,24 @@ async fn the_rollback_returns_the_catalog_to_123(pool: PgPool) {
     drop(conn);
     let before = catalog(&pool).await;
 
+    // Cut at 124, NOT head: a later migration that references 124's tables
+    // (125's elevation tables name `person_authenticators`) is undone before
+    // 124-undo runs, never by it, so this test applies exactly 124.
+    let at_124 = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 124)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
     let mut conn = pool.acquire().await.expect("acquire");
-    MIGRATOR.run(&mut *conn).await.expect("migrate 123 -> head");
+    at_124.run(&mut *conn).await.expect("migrate 123 -> 124");
     sqlx::query("RESET ALL")
         .execute(&mut *conn)
         .await

@@ -596,6 +596,10 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // FORCEd by the migration that creates them, on the same precedent.
     "passkey_enrollments",
     "person_authenticators",
+    // A human's elevation tickets and elevation sessions (125), FORCEd by the
+    // migration that creates them, on the same precedent.
+    "elevation_tickets",
+    "elevation_sessions",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
