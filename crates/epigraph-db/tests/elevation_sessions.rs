@@ -1848,3 +1848,164 @@ async fn is_elevated_is_an_initplan(pool: PgPool) {
     .expect("provolatile");
     assert_eq!(vol, "s", "STABLE");
 }
+
+// =====================================================================
+// The undo takes 125 back out, and only 125.
+// =====================================================================
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// The embedded migrator, cut at `max` (inclusive).
+fn up_to(max: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= max)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+/// Run `migrator` on one connection and reset it: 001's pg_dump header leaves
+/// session-level SETs behind (viewer_fixture::db_at_122_then_head).
+async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+}
+
+/// The catalog facts 125 could leave behind, by name: relations, functions
+/// (body and owner), policies, triggers and constraints in `public`.
+async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT 'rel ' || c.relname || ' ' || c.relkind::text \
+           FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'fn ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') ' \
+                || md5(p.prosrc) || ' ' || p.proowner::regrole::text \
+           FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'pol ' || c.relname || '.' || pol.polname \
+           FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid \
+          WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'trg ' || c.relname || '.' || t.tgname \
+           FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+          WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'con ' || c.relname || '.' || k.conname \
+           FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid \
+          WHERE c.relnamespace = 'public'::regnamespace",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("catalog");
+    rows.into_iter().collect()
+}
+
+fn undo_125() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/125-undo.sql"),
+    )
+    .expect("125-undo.sql")
+}
+
+/// `docs/runbooks/125-undo.sql`, applied to a database that went 124 -> 125
+/// and holds a live session, a refused ticket and an open one, returns its
+/// catalog (relations, function bodies and owners, policies, triggers,
+/// constraints) to the same database's at 124, including the three end
+/// triggers 125 put on 118's, 122's and 123's tables; the `platform.elevat*`
+/// history stays. Cut at 125, not head: a later migration (the read arms read
+/// `epigraph_is_elevated()`) is undone before this one.
+///
+/// Verified to fail: the undo's DROP of the reuse end trigger removed -> the
+/// trigger still on `refresh_tokens` blocks its function's DROP (2BP01), so
+/// the undo does not apply; the DROP of `epigraph_end_expired_elevations`
+/// removed -> that function is left behind.
+#[sqlx::test(migrations = false)]
+async fn the_rollback_returns_the_catalog_to_124(pool: PgPool) {
+    migrate(&pool, &up_to(124)).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to(125)).await;
+
+    let p = holder(&pool, "P", 1).await;
+    let b = holder(&pool, "B", 2).await;
+    let sid = elevated(&pool, &p).await;
+    let refused = ticket(&pool, &b, "connector", None).await;
+    confirm(&pool, refused, &p.cred, 0, false)
+        .await
+        .expect("a refusal");
+    ticket(&pool, &b, "grant", Some(&[b'x'; 32])).await;
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 125 changed the catalog"
+    );
+
+    sqlx::raw_sql(&undo_125())
+        .execute(&pool)
+        .await
+        .expect("the undo script applies");
+
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the catalog is not 124's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    assert_eq!(
+        events(&pool, "platform.elevated", "session_id", sid).await,
+        1,
+        "the audit history stays"
+    );
+}
+
+/// The undo refuses while any row policy still reads `epigraph_is_elevated()`
+/// (the read arms of a later migration must be undone first), and changes
+/// nothing.
+///
+/// Verified to fail: the undo's policy refusal removed -> the DROP FUNCTION
+/// meets the policy's dependency instead (2BP01, not the undo's own refusal).
+#[sqlx::test(migrations = false)]
+async fn the_undo_refuses_while_a_policy_reads_is_elevated(pool: PgPool) {
+    migrate(&pool, &up_to(125)).await;
+    sqlx::query(
+        "CREATE POLICY elevation_undo_probe ON public.claims FOR SELECT TO PUBLIC \
+         USING ((SELECT public.epigraph_is_elevated()))",
+    )
+    .execute(&pool)
+    .await
+    .expect("a policy that reads epigraph_is_elevated()");
+    let before = catalog(&pool).await;
+    // One connection for the script and its ROLLBACK: the script's own BEGIN
+    // leaves the connection in an aborted transaction when it raises.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let undo = undo_125();
+    let r = sqlx::raw_sql(&undo).execute(&mut *conn).await;
+    let msg = r
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_database_error())
+        .map(|d| d.message().to_string())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("125-undo") && msg.contains("epigraph_is_elevated"),
+        "the undo's own refusal, not a dependency error: {r:?}"
+    );
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("end the aborted transaction");
+    drop(conn);
+    assert_eq!(catalog(&pool).await, before, "nothing changed");
+}
