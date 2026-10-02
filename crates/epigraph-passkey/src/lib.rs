@@ -188,6 +188,12 @@ pub struct Assertion {
     pub counter: u32,
     /// Always true: an assertion without user verification is refused.
     pub user_verified: bool,
+    /// The backup-eligible flag the authenticator ASSERTED. The library's
+    /// passkey path accepts a credential registered device-bound that now
+    /// asserts as syncable; a caller that must refuse that change (an
+    /// elevation: `backup_eligibility_changed`) compares this with the flag
+    /// it stored at registration.
+    pub backup_eligible: bool,
     /// What [`Passkeys::reverify`] needs to check this assertion again later:
     /// the challenge and the client's response, verbatim.
     pub evidence: Value,
@@ -427,6 +433,27 @@ impl Passkeys {
         self.start_authentication_inner(passkeys, challenge, false)
     }
 
+    /// [`Self::start_authentication`], with the signature counter left to the
+    /// CALLER: every credential's counter is taken as 0, so
+    /// [`Self::finish_authentication`] never refuses on it, and the caller
+    /// compares [`Assertion::counter`] with its stored counter itself.
+    ///
+    /// For a caller whose database is the counter's authority: it compares
+    /// under the row lock it updates the counter with (two concurrent
+    /// ceremonies cannot both pass), and it can audit a regression, which a
+    /// refusal here could not (the asserting credential and counter would
+    /// never reach it). Elevation's confirm definer is that caller (ELV05).
+    ///
+    /// # Errors
+    /// As [`Self::start_authentication`].
+    pub fn start_authentication_deferring_counter(
+        &self,
+        passkeys: &[StoredPasskey],
+        challenge: Option<&[u8]>,
+    ) -> Result<(Value, AuthenticationState), PasskeyError> {
+        self.start_authentication_inner(passkeys, challenge, true)
+    }
+
     fn start_authentication_inner(
         &self,
         passkeys: &[StoredPasskey],
@@ -508,6 +535,7 @@ impl Passkeys {
             credential_id: res.cred_id().as_slice().to_vec(),
             counter: res.counter(),
             user_verified: true,
+            backup_eligible: res.backup_eligible(),
             evidence: serde_json::json!({
                 "v": STATE_VERSION,
                 "challenge": URL_SAFE_NO_PAD.encode(&challenge),

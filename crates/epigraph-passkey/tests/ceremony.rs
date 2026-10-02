@@ -515,3 +515,71 @@ async fn evidence_reverifies_against_its_credential_only() {
         "another credential"
     );
 }
+
+/// The assertion reports the backup-eligible flag the AUTHENTICATOR asserted,
+/// so a caller can refuse a device-bound credential that now asserts as
+/// syncable (webauthn-rs's passkey path accepts that upgrade; elevation's
+/// confirm definer refuses it, `backup_eligibility_changed`). Mutations:
+/// `backup_eligible: false` hardcoded -> the synced case is red; `true`
+/// hardcoded -> the hardware case is red.
+#[tokio::test]
+async fn an_assertion_reports_the_asserted_backup_eligible_flag() {
+    let rp = software();
+    for (auth, expected) in [
+        (SoftAuthenticator::new(MODEL), true),
+        (SoftAuthenticator::new(MODEL).hardware(), false),
+    ] {
+        let mut auth = auth;
+        let (options, state) = start(&rp);
+        let response = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+        let reg = rp
+            .finish_registration(&response, &state)
+            .expect("registered");
+        assert_eq!(
+            reg.backup_eligible, expected,
+            "CALIBRATION: registered flag"
+        );
+        let stored = StoredPasskey {
+            passkey: reg.passkey,
+            sign_count: 0,
+        };
+        let (options, state) = rp
+            .start_authentication(std::slice::from_ref(&stored), None)
+            .unwrap();
+        let a = rp
+            .finish_authentication(&auth.authenticate(ORIGIN, options).await, &state)
+            .expect("verifies");
+        assert_eq!(a.backup_eligible, expected, "asserted flag");
+    }
+}
+
+/// The counter-deferring start leaves the signature counter to the CALLER:
+/// a stored counter the assertion does not advance past is NOT refused by the
+/// library, and the assertion's own counter is reported for the caller's
+/// database to compare under its row lock (elevation's confirm definer, ELV05,
+/// which also writes the audit row a library refusal could not). The counted
+/// start refuses the same assertion (the calibration). Mutation: the
+/// deferring start overlays the stored counter -> refused here.
+#[tokio::test]
+async fn the_counter_deferring_start_leaves_the_counter_to_the_caller() {
+    let rp = software();
+    let (mut auth, mut stored) = registered(&rp).await;
+    stored.sign_count = 5;
+    let (options, state) = rp
+        .start_authentication(std::slice::from_ref(&stored), None)
+        .unwrap();
+    let err = rp
+        .finish_authentication(&auth.authenticate(ORIGIN, options).await, &state)
+        .unwrap_err();
+    assert!(
+        matches!(err, PasskeyError::CounterRegressed),
+        "CALIBRATION: the counted start refuses: {err:?}"
+    );
+    let (options, state) = rp
+        .start_authentication_deferring_counter(std::slice::from_ref(&stored), None)
+        .unwrap();
+    let a = rp
+        .finish_authentication(&auth.authenticate(ORIGIN, options).await, &state)
+        .expect("the counter is the caller's to check");
+    assert_eq!(a.counter, 0, "the asserted counter is reported");
+}
