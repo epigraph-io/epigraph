@@ -281,8 +281,9 @@ async fn arm(pool: &PgPool) {
 
 /// Verified to fail: the server's boot check reverted to the log-only call
 /// (no refusal) -> the armed run passes the check and serves;
-/// `spawn_request_unit_watch` not called in `main` -> the server started
-/// unarmed keeps serving after the arming (step 2).
+/// no running posture watch in `main` (the `spawn_posture_watch` call, which
+/// carries OQ-7's rule behind the software-attestation flag's) -> the server
+/// started unarmed keeps serving after the arming (step 2).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_server_refuses_a_privileged_dsn_on_an_armed_database(pool: PgPool) {
     let db_url = fixture::database_url_for(&pool).await;
