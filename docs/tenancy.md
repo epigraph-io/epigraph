@@ -820,9 +820,17 @@ reads the platform audit trail and confers nothing else.
 Not yet built (the elevation batch): activating the role per session
 (time-boxed, passkey-confirmed), per-act confirmation, audited READS,
 group-held assignments, and visibility of the trail to the persons it names.
-Until then the role confers no authority on an application session beyond
-the privatization routes' gate and the audit-trail read, and every custodial
-write is a maintenance act.
+Until then the role confers no WRITE authority on an application session,
+and every custodial write is a maintenance act. It does confer standing READ
+authority there, keyed on the session's stamped principal (which any holder
+of the application DSN sets, so it is not a secret): 083's
+`security_events_read` arm admits EVERY `security_events` row (every agent's
+`oauth.`, `cascade.` and `platform.` events, not only the platform trail) to a
+principal holding the custodian role; the privatization plan and item reads
+admit it for the groups it administers, and the privatization audit read
+admits every plan-level row (entity ids only for those groups); and it passes
+the privatization routes' gate. Gating those reads behind a per-session elevation is the
+elevation batch's work (operator ruling OQ-12).
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 
