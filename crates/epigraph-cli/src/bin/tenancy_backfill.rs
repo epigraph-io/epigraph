@@ -1714,6 +1714,40 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_set_passkey_enrollment_challenge", 124),
     ("epigraph_complete_passkey_enrollment", 124),
     ("epigraph_revoke_passkey", 124),
+    // 125, elevation. Every body reads or writes a FORCEd table
+    // (`elevation_tickets`, `elevation_sessions`, `person_authenticators`,
+    // `role_assignments`, `security_events`) through a policy that admits only
+    // a privileged session or `epigraph_definer_bypass()`. Under a non-member
+    // owner the ticket guard reads no passkey and no assignment (every ticket
+    // refused ELV02, loud), the session guard reads no ticket (every
+    // confirmation refused ELV06, loud), and `epigraph_is_elevated` /
+    // `epigraph_elevation_live` read no session (never elevated: fail-closed)
+    // -- but the three END TRIGGERS would update no session and say nothing:
+    // a revoked assignment, registration or reused family would leave the row
+    // un-ended, the trail without its `platform.elevation_ended`, and the
+    // family's one-session slot taken. Authority still ends (the computed
+    // check re-reads the assignment), the record does not: the stake.
+    ("epigraph_live_elevating_assignment", 125),
+    ("epigraph_family_of_person_is_live", 125),
+    ("epigraph_elevation_tickets_guard_insert", 125),
+    ("epigraph_elevation_tickets_guard_update", 125),
+    ("epigraph_elevation_sessions_guard_insert", 125),
+    ("epigraph_elevation_sessions_guard_update", 125),
+    ("epigraph_elevation_tickets_audit", 125),
+    ("epigraph_elevation_sessions_audit", 125),
+    ("epigraph_end_elevations_on_assignment_revoke", 125),
+    ("epigraph_end_elevations_on_operator_revoke", 125),
+    ("epigraph_end_elevations_on_family_reuse", 125),
+    ("epigraph_end_expired_elevations", 125),
+    ("epigraph_create_elevation_ticket", 125),
+    ("epigraph_ticket_for_ceremony", 125),
+    ("epigraph_set_elevation_ticket_challenge", 125),
+    ("epigraph_passkeys_for_ticket", 125),
+    ("epigraph_confirm_elevation", 125),
+    ("epigraph_redeem_elevation_ticket", 125),
+    ("epigraph_elevation_live", 125),
+    ("epigraph_end_elevation", 125),
+    ("epigraph_is_elevated", 125),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2096,6 +2130,72 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_revoke_passkey",
             "public.epigraph_revoke_passkey(uuid, text)",
+            false,
+        ),
+        // 125 (elevation): the ticket API, the unauthenticated ceremony, the
+        // elevate grant and the viewer's liveness check all run on the request
+        // DSN, so the nine principal-bound or ticket-keyed definers are
+        // app-callable. The three unbound helpers are NOT: "who may elevate",
+        // "whose family is this" for any person would be a roster oracle, and
+        // ending another person's expired sessions is not the request DSN's.
+        (
+            "epigraph_create_elevation_ticket",
+            "public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea)",
+            true,
+        ),
+        (
+            "epigraph_ticket_for_ceremony",
+            "public.epigraph_ticket_for_ceremony(uuid)",
+            true,
+        ),
+        (
+            "epigraph_set_elevation_ticket_challenge",
+            "public.epigraph_set_elevation_ticket_challenge(uuid, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_passkeys_for_ticket",
+            "public.epigraph_passkeys_for_ticket(uuid)",
+            true,
+        ),
+        (
+            "epigraph_confirm_elevation",
+            "public.epigraph_confirm_elevation(uuid, bytea, bigint, boolean, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_redeem_elevation_ticket",
+            "public.epigraph_redeem_elevation_ticket(uuid, bytea, uuid)",
+            true,
+        ),
+        (
+            "epigraph_elevation_live",
+            "public.epigraph_elevation_live(uuid, uuid)",
+            true,
+        ),
+        (
+            "epigraph_end_elevation",
+            "public.epigraph_end_elevation(uuid, text)",
+            true,
+        ),
+        (
+            "epigraph_is_elevated",
+            "public.epigraph_is_elevated()",
+            true,
+        ),
+        (
+            "epigraph_live_elevating_assignment",
+            "public.epigraph_live_elevating_assignment(uuid, timestamp with time zone)",
+            false,
+        ),
+        (
+            "epigraph_family_of_person_is_live",
+            "public.epigraph_family_of_person_is_live(uuid, uuid, uuid)",
+            false,
+        ),
+        (
+            "epigraph_end_expired_elevations",
+            "public.epigraph_end_expired_elevations(uuid, uuid)",
             false,
         ),
     ];

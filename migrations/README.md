@@ -896,9 +896,49 @@ Current reservation:
   open PR branch carries a `124`. **Applied to a throwaway database only, NOT
   to any deployed database.**
 
-- **125+**: public next
+- **125**: public `elevation` — elevation tickets and elevation sessions,
+  and `epigraph_is_elevated()`. INERT: nothing stamps `epigraph.elevation_id`
+  / `epigraph.family_id` yet and no row policy reads the function.
+  `elevation_tickets`: one per request (the session principal, its human
+  client and refresh family, `grant` or `connector` mode, a reason, the
+  hashed grant-mode secret, the ceremony's stored challenge, ONE outcome:
+  `confirmed` with its session or `refused` with why; 5 minutes).
+  `elevation_sessions`: one per confirmed ticket (the person, the assignment
+  of an `elevates` role it rests on, client, family, passkey; CHECK at most
+  15 minutes; one end; a partial unique index allows one un-ended session per
+  family). Table triggers: `ELV02` the subject may not elevate (operator
+  ruling D2: a registered human that is no other human's agent, holding a
+  LIVE assignment of an `elevates` role, with a live passkey, on a live
+  family of its own human client; never `instance_admins`), `ELV03` not the
+  append-only shape, `ELV06` the ticket is not live or the family is already
+  elevated; the confirmation RETURNS its audited refusals (`ELV02`, `ELV05`
+  for a regressed signature counter) instead of raising them. End triggers on
+  `role_assignments` (revoke), `human_operators` (revoke) and
+  `refresh_tokens` (a family revoked for reuse); expiry is lazy. FORCE RLS on
+  both: the application role keeps SELECT but its policies show it no row,
+  and it holds no DML. App-callable definers: `epigraph_create_elevation_ticket`
+  (principal-bound), `epigraph_ticket_for_ceremony`,
+  `epigraph_set_elevation_ticket_challenge`, `epigraph_passkeys_for_ticket`,
+  `epigraph_confirm_elevation`, `epigraph_redeem_elevation_ticket`,
+  `epigraph_elevation_live` (principal-bound), `epigraph_end_elevation`,
+  `epigraph_is_elevated`; NOT app-callable: `epigraph_live_elevating_assignment`,
+  `epigraph_family_of_person_is_live`, `epigraph_end_expired_elevations`.
+  Audited from the tables: `platform.elevation_requested`, `_refused`,
+  `platform.elevated`, `platform.elevation_ended`, and
+  `platform.passkey_counter_regressed`. Registered in
+  `schema_contract.rs::migration_125_elevation_definers_are_owned_and_granted`,
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` (at 125) and the grant
+  register, the FORCE registers (state.rs, locked_decisions, rls_enforcement,
+  079-undo). Behaviour in `epigraph-db/tests/elevation_sessions.rs`. Undo:
+  `docs/runbooks/125-undo.sql` (refuses while a policy reads
+  `epigraph_is_elevated()`; drops the end triggers, both tables and every 125
+  function; run it BEFORE 124-undo). Checked before claiming: no open PR
+  branch carries a `125`. **Applied to a throwaway database only, NOT to any
+  deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `125` or
+- **126+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `126` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

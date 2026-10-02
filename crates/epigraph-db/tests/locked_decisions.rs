@@ -1441,6 +1441,21 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "INSERT INTO person_authenticators",
         "UPDATE person_authenticators",
         "DELETE FROM person_authenticators",
+        // Migration 125: an elevation ticket and an elevation session are
+        // written ONLY by 125's definers (the ticket API, the ceremony, the
+        // grant and the end calls, all app-callable and NOT banned here), so
+        // that every write meets the table guards' ELV02/ELV03/ELV06 through
+        // the one path that also writes the audit. A raw statement on the
+        // maintenance pool (jobs, CLI) would skip the definer's principal
+        // binding; ending other people's expired sessions is the definers'
+        // lazy expiry, never a sweep a route or job runs.
+        "INSERT INTO elevation_tickets",
+        "UPDATE elevation_tickets",
+        "DELETE FROM elevation_tickets",
+        "INSERT INTO elevation_sessions",
+        "UPDATE elevation_sessions",
+        "DELETE FROM elevation_sessions",
+        "epigraph_end_expired_elevations($",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //
@@ -1476,6 +1491,14 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "PasskeyRepository::get",
         "FROM person_authenticators",
         "FROM passkey_enrollments",
+        // 125: who elevated, when, on which family, and who MAY elevate, are
+        // read on the request path only through the principal-bound or
+        // ticket-keyed definers, never listed; the two unbound helpers answer
+        // for ANY person (a roster oracle) and are not even app-executable.
+        "FROM elevation_tickets",
+        "FROM elevation_sessions",
+        "epigraph_live_elevating_assignment",
+        "epigraph_family_of_person_is_live",
     ];
     const READ_ROOTS: usize = 2;
     // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision
