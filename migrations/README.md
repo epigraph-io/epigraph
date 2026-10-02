@@ -864,9 +864,41 @@ Current reservation:
   branch carries a `123`. **Applied to a throwaway database only, NOT to any
   deployed database.**
 
-- **124+**: public next
+- **124**: public `person_authenticators` — a registered human's WebAuthn
+  passkeys (`person_authenticators`: credential id, the library's serialized
+  credential, AAGUID and attestation format, user verification as a CHECK,
+  backup eligibility, an explicit signature counter) and the maintenance
+  enrollment tickets that admit them (`passkey_enrollments`: at most 15
+  minutes, the ceremony's stored challenge, consumed once by the passkey it
+  admitted). Table triggers: `ELV01` the subject is not a registered human or
+  is linked as another human's agent (checked when the ticket opens AND when
+  it completes), `ELV03` not the append-only shape (database-supplied
+  provenance; no confirmed-act path yet; a ticket takes only a challenge
+  while live and one consumption; a passkey takes only one revoke and its
+  use, the counter never going back; a revoked passkey is final), `ELV04` the
+  ticket is not live. FORCE RLS on both: the application role keeps SELECT
+  but its policies show it no row, and it holds no DML; writes admit a
+  privileged session or a maintenance-owned definer frame. Definers:
+  `epigraph_create_passkey_enrollment` and `epigraph_revoke_passkey`
+  (maintenance-only; `epigraph-operator passkey-enroll` / `revoke-passkey`),
+  and the three the unauthenticated ceremony calls on the request DSN,
+  `epigraph_enrollment_for_ceremony`,
+  `epigraph_set_passkey_enrollment_challenge`,
+  `epigraph_complete_passkey_enrollment`. Audited from the tables:
+  `platform.passkey_enrollment_created`, `_registered`, `_revoked`. Registered
+  in `schema_contract.rs::migration_124_passkey_definers_are_owned_and_granted`,
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` (at 124) and the grant
+  register, the FORCE registers (state.rs, locked_decisions, rls_enforcement,
+  079-undo). Behaviour in `epigraph-db/tests/person_authenticators.rs` and
+  `epigraph-cli/tests/operator_passkey_cli.rs`. Undo:
+  `docs/runbooks/124-undo.sql` (drops both tables and every 124 function;
+  roll back every binary that calls one first). Checked before claiming: no
+  open PR branch carries a `124`. **Applied to a throwaway database only, NOT
+  to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `124` or
+- **125+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `125` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

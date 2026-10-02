@@ -862,8 +862,89 @@ async fn a_forged_passkey_event_is_refused(pool: PgPool) {
 }
 
 // =====================================================================
-// The undo takes 124 back out.
+// The registers know every 124 object, and the undo takes it all back.
 // =====================================================================
+
+/// The SECURITY DEFINER functions migration 124 creates, read from the file.
+fn definers_of_124(migration: &str) -> (Vec<String>, Vec<String>) {
+    let mut definers = Vec::new();
+    let mut all = Vec::new();
+    let mut rest = migration;
+    while let Some(i) = rest.find("CREATE OR REPLACE FUNCTION public.") {
+        let after = &rest[i + "CREATE OR REPLACE FUNCTION public.".len()..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let body_end = after.find("$$;").unwrap_or(after.len());
+        let header_end = after.find(" AS $$").unwrap_or(body_end);
+        if after[..header_end].contains("SECURITY DEFINER") {
+            definers.push(name.clone());
+        }
+        all.push(name);
+        rest = &after[body_end..];
+    }
+    definers.sort();
+    definers.dedup();
+    all.sort();
+    all.dedup();
+    (definers, all)
+}
+
+/// Every SECURITY DEFINER migration 124 creates is on `epigraph-tenancy-backfill
+/// verify`'s ownership list at 124 (a silently no-opped `OWNER TO` is invisible
+/// to every behavioural test, because the harness migrates as a superuser),
+/// every function it creates is dropped by `docs/runbooks/124-undo.sql`, and
+/// both tables are in the API's FORCE register and the 079 kill switch.
+///
+/// Verified to fail: one `("epigraph_revoke_passkey", 124)` entry removed from
+/// `DEFERRED_DEFINER_FUNCTIONS` -> named here; the undo's DROP of
+/// `epigraph_person_authenticators_audit` removed -> named here.
+#[test]
+fn every_124_object_is_registered() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let migration = read("migrations/124_person_authenticators.sql");
+    let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let state = read("crates/epigraph-api/src/state.rs");
+    let kill_switch = read("docs/runbooks/079-undo.sql");
+    let undo = read("docs/runbooks/124-undo.sql");
+
+    let (definers, all) = definers_of_124(&migration);
+    assert!(
+        definers.len() >= 11,
+        "CALIBRATION: the scan found only {definers:?}"
+    );
+    let missing: Vec<&String> = definers
+        .iter()
+        .filter(|n| !backfill.contains(&format!("(\"{n}\", 124)")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "migration 124 definers missing from tenancy_backfill.rs's ownership list at 124: \
+         {missing:?}"
+    );
+    let undropped: Vec<&String> = all
+        .iter()
+        .filter(|n| !undo.contains(&format!("DROP FUNCTION IF EXISTS public.{n}(")))
+        .collect();
+    assert!(
+        undropped.is_empty(),
+        "124-undo.sql does not drop: {undropped:?}"
+    );
+    for table in ["passkey_enrollments", "person_authenticators"] {
+        assert!(
+            state.contains(&format!("\"{table}\"")),
+            "state.rs FORCE_PROTECTED_SET lacks {table}"
+        );
+        assert!(
+            kill_switch.contains(&format!("'{table}'")),
+            "079-undo.sql lacks {table}"
+        );
+    }
+}
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 

@@ -1808,3 +1808,139 @@ async fn migration_123_custodian_definers_are_owned_and_granted(pool: PgPool) {
         "epigraph_app keeps EXECUTE on epigraph_is_instance_admin"
     );
 }
+
+/// Migration 124 (passkeys): every definer it adds is a SECURITY DEFINER
+/// owned by `epigraph_maintenance` (each reads or writes a FORCEd table
+/// through `epigraph_definer_bypass()`, or writes a `platform.` audit row the
+/// restrictive policy admits only from such a frame), carries an explicit ACL
+/// that excludes PUBLIC, and grants `epigraph_app` exactly the three
+/// definers of the unauthenticated enrollment ceremony. The reader is
+/// STABLE; everything else writes. The application role holds SELECT on
+/// both tables (narrowed to no row by their policies) and no DML. The owner
+/// is pinned here because the harness migrates as a superuser, so a silently
+/// no-opped `OWNER TO` would still pass every behavioural test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_124_passkey_definers_are_owned_and_granted(pool: PgPool) {
+    for (name, signature, volatility, app_may_execute) in [
+        (
+            "epigraph_passkey_enrollments_guard_insert",
+            "public.epigraph_passkey_enrollments_guard_insert()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_passkey_enrollments_guard_update",
+            "public.epigraph_passkey_enrollments_guard_update()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_person_authenticators_guard_insert",
+            "public.epigraph_person_authenticators_guard_insert()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_person_authenticators_guard_update",
+            "public.epigraph_person_authenticators_guard_update()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_passkey_enrollments_audit",
+            "public.epigraph_passkey_enrollments_audit()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_person_authenticators_audit",
+            "public.epigraph_person_authenticators_audit()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_create_passkey_enrollment",
+            "public.epigraph_create_passkey_enrollment(uuid, text, text)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_enrollment_for_ceremony",
+            "public.epigraph_enrollment_for_ceremony(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_set_passkey_enrollment_challenge",
+            "public.epigraph_set_passkey_enrollment_challenge(uuid, jsonb)",
+            "v",
+            true,
+        ),
+        (
+            "epigraph_complete_passkey_enrollment",
+            "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean)",
+            "v",
+            true,
+        ),
+        (
+            "epigraph_revoke_passkey",
+            "public.epigraph_revoke_passkey(uuid, text)",
+            "v",
+            false,
+        ),
+    ] {
+        let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+               FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+               JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE n.nspname = 'public' AND p.proname = $1",
+        )
+        .bind(name)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl) =
+            meta.unwrap_or_else(|| panic!("public.{name} must exist (migration 124)"));
+        assert!(secdef, "{name} must be SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{name} owner");
+        assert_eq!(vol, volatility, "{name} volatility");
+        assert!(
+            acl.is_some(),
+            "{name} must carry an EXPLICIT ACL; a NULL proacl is the default grant, which \
+             includes EXECUTE to PUBLIC"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_may_execute),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE on {name}");
+        }
+    }
+    for table in ["passkey_enrollments", "person_authenticators"] {
+        for (privilege, expected) in [
+            ("SELECT", true),
+            ("INSERT", false),
+            ("UPDATE", false),
+            ("DELETE", false),
+            ("TRUNCATE", false),
+        ] {
+            let can: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege('epigraph_app', ('public.' || $1)::regclass, $2)",
+            )
+            .bind(table)
+            .bind(privilege)
+            .fetch_one(&pool)
+            .await
+            .expect("table privilege");
+            assert_eq!(can, expected, "epigraph_app {privilege} on {table}");
+        }
+    }
+}

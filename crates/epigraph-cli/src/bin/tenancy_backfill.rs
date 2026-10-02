@@ -1693,6 +1693,27 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_operator_links_refuse_role_holder", 123),
     ("epigraph_instance_admins_frozen", 123),
     ("epigraph_human_operators_mirror_instance_admins", 123),
+    // 124, passkeys. Every body reads or writes a FORCEd table
+    // (`passkey_enrollments`, `person_authenticators`, `operator_links`,
+    // `security_events`) through a policy that admits only a privileged
+    // session or `epigraph_definer_bypass()`. Under a non-member owner the
+    // completion guard reads no enrollment (every completion refused ELV04,
+    // loud), the audit triggers are refused their `platform.` rows (every
+    // ticket, completion and revoke fails, loud) and the ceremony reader
+    // serves nothing (loud) -- but both ELV01 guards read no `operator_links`
+    // row either, so a registered human linked as another human's agent would
+    // be ADMITTED (fail-OPEN): the stake that makes the owner a control here.
+    ("epigraph_passkey_enrollments_guard_insert", 124),
+    ("epigraph_passkey_enrollments_guard_update", 124),
+    ("epigraph_person_authenticators_guard_insert", 124),
+    ("epigraph_person_authenticators_guard_update", 124),
+    ("epigraph_passkey_enrollments_audit", 124),
+    ("epigraph_person_authenticators_audit", 124),
+    ("epigraph_create_passkey_enrollment", 124),
+    ("epigraph_enrollment_for_ceremony", 124),
+    ("epigraph_set_passkey_enrollment_challenge", 124),
+    ("epigraph_complete_passkey_enrollment", 124),
+    ("epigraph_revoke_passkey", 124),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2047,6 +2068,35 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_platform_audit",
             "public.epigraph_platform_audit(timestamp with time zone, integer)",
             true,
+        ),
+        // 124 (passkeys): the unauthenticated enrollment ceremony runs on the
+        // request DSN, so its three definers (the reader, the challenge store,
+        // the completion) are app-callable; opening a ticket and revoking a
+        // passkey are maintenance acts the request DSN must never call.
+        (
+            "epigraph_create_passkey_enrollment",
+            "public.epigraph_create_passkey_enrollment(uuid, text, text)",
+            false,
+        ),
+        (
+            "epigraph_enrollment_for_ceremony",
+            "public.epigraph_enrollment_for_ceremony(uuid)",
+            true,
+        ),
+        (
+            "epigraph_set_passkey_enrollment_challenge",
+            "public.epigraph_set_passkey_enrollment_challenge(uuid, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_complete_passkey_enrollment",
+            "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean)",
+            true,
+        ),
+        (
+            "epigraph_revoke_passkey",
+            "public.epigraph_revoke_passkey(uuid, text)",
+            false,
         ),
     ];
 

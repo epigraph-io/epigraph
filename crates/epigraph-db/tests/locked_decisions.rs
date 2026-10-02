@@ -1409,6 +1409,23 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "INSERT INTO platform_roles",
         "UPDATE platform_roles",
         "DELETE FROM platform_roles",
+        // Migration 124: opening a passkey enrollment ticket and revoking a
+        // passkey are operator acts on the maintenance DSN
+        // (`epigraph-operator passkey-enroll` / `revoke-passkey`), never a
+        // route, tool or job: a request path that could open a ticket would
+        // let a token mint the confirmation it is later checked against. The
+        // ceremony's three app-callable definers (reader, challenge store,
+        // completion) are NOT banned: the enrollment API calls them.
+        "PasskeyRepository::create_enrollment",
+        "PasskeyRepository::revoke",
+        "epigraph_create_passkey_enrollment($",
+        "epigraph_revoke_passkey($",
+        "INSERT INTO passkey_enrollments",
+        "UPDATE passkey_enrollments",
+        "DELETE FROM passkey_enrollments",
+        "INSERT INTO person_authenticators",
+        "UPDATE person_authenticators",
+        "DELETE FROM person_authenticators",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //
@@ -1438,6 +1455,12 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "RoleAssignmentRepository::list",
         "FROM role_assignments",
         "epigraph_live_role_assignment",
+        // 124: who holds which passkey is read on the request path only
+        // through the ceremony's own definers (by ticket), never listed.
+        "PasskeyRepository::list",
+        "PasskeyRepository::get",
+        "FROM person_authenticators",
+        "FROM passkey_enrollments",
     ];
     const READ_ROOTS: usize = 2;
     // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision
@@ -1470,6 +1493,8 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         // `list-role-assignments`), on the maintenance DSN.
         "epigraph-cli/src/operator/custodian.rs",
         "epigraph-cli/src/bin/operator.rs",
+        // 124: the operator's passkey verbs, on the maintenance DSN.
+        "epigraph-cli/src/operator/passkey.rs",
     ];
 
     let mut offenders: Vec<String> = Vec::new();
