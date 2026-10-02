@@ -156,17 +156,18 @@ fn passkeys(state: &AppState) -> Option<Arc<Passkeys>> {
     state.passkeys.clone()
 }
 
-/// Read the live enrollment `id` on an unstamped application connection.
-async fn live(state: &AppState, id: Uuid) -> Result<CeremonyEnrollment, Response> {
+/// Read the live enrollment `id` on an unstamped application connection. The
+/// refusal is the response to send, boxed (a `Response` is large).
+async fn live(state: &AppState, id: Uuid) -> Result<CeremonyEnrollment, Box<Response>> {
     let mut conn = state
         .db_pool
         .acquire()
         .await
-        .map_err(|e| internal("acquire", &e))?;
+        .map_err(|e| Box::new(internal("acquire", &e)))?;
     match PasskeyCeremony::live_enrollment(&mut conn, id).await {
         Ok(Some(e)) => Ok(e),
-        Ok(None) => Err(not_live()),
-        Err(e) => Err(internal("read the enrollment", &e)),
+        Ok(None) => Err(Box::new(not_live())),
+        Err(e) => Err(Box::new(internal("read the enrollment", &e))),
     }
 }
 
@@ -233,7 +234,7 @@ pub async fn enroll_page(State(state): State<AppState>, Path(id): Path<Uuid>) ->
     }
     let e = match live(&state, id).await {
         Ok(e) => e,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let mut resp = (StatusCode::OK, render_page(id, &e)).into_response();
     resp.headers_mut().insert(
@@ -250,7 +251,7 @@ pub async fn enroll_challenge(State(state): State<AppState>, Path(id): Path<Uuid
     };
     let e = match live(&state, id).await {
         Ok(e) => e,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let name = user_name(&e);
     let (options, ceremony) = match rp.start_registration(e.person_agent_id, &name, &name) {
@@ -280,7 +281,7 @@ pub async fn enroll_finish(
     };
     let e = match live(&state, id).await {
         Ok(e) => e,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let Some(stored) = e.challenge_state.clone() else {
         return json_error(
