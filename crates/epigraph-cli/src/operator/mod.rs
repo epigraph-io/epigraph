@@ -45,6 +45,14 @@
 //!   authority: the act, its edge migration and a `platform.custodial_act`
 //!   audit row naming the assignment, in one transaction.
 //!
+//! And a registered human's passkeys (migration 124; see [`passkey`]):
+//!
+//! * `passkey-enroll` — open a 15-minute enrollment ticket for a registered
+//!   human and print its ceremony path, which the human completes on the
+//!   device that holds the authenticator.
+//! * `list-passkeys` / `revoke-passkey` — list them, and the audited
+//!   break-glass revoke.
+//!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
 //!
@@ -90,6 +98,7 @@ pub mod human;
 pub mod legacy;
 pub mod link;
 pub mod manifest;
+pub mod passkey;
 pub mod reown;
 pub mod reown_linked;
 pub mod reverse;

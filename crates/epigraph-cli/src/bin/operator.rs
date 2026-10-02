@@ -45,11 +45,14 @@
 //!     epigraph-operator custodial-supersede --claim <uuid> (--content TEXT | --content-file F) \
 //!         --truth <0..1> --assignment <uuid> --actor <uuid> --reason TEXT [--allow-owned] [--apply]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
+//!     epigraph-operator passkey-enroll --person <uuid> --reason TEXT [--label TEXT] [--apply]
+//!     epigraph-operator list-passkeys [--person <uuid>] [--include-revoked]
+//!     epigraph-operator revoke-passkey --id <uuid> --reason TEXT [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, arm, bind, client_scope, custodian, hide, human, legacy, link, reown, reown_linked,
-    reverse,
+    self, arm, bind, client_scope, custodian, hide, human, legacy, link, passkey, reown,
+    reown_linked, reverse,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -142,6 +145,46 @@ enum Command {
         #[arg(long)]
         allow_owned: bool,
         /// Commit. Without it, the act and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Open a passkey ENROLLMENT TICKET (migration 124) for a REGISTERED
+    /// HUMAN, live for 15 minutes, and print its ceremony path
+    /// (`/elevate/enroll/<id>`, under the deployment's public base URL). The
+    /// human completes it on the device that holds the authenticator. Agents
+    /// never hold a passkey (ELV01).
+    PasskeyEnroll {
+        /// The human's own agent id (a registered human operator).
+        #[arg(long)]
+        person: Uuid,
+        /// Recorded on the ticket and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// A name for the passkey (e.g. the device), copied onto it.
+        #[arg(long)]
+        label: Option<String>,
+        /// Commit. Without it, the ticket and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// List passkeys (live ones unless --include-revoked).
+    ListPasskeys {
+        /// Only this human's passkeys.
+        #[arg(long)]
+        person: Option<Uuid>,
+        /// Include revoked passkeys.
+        #[arg(long)]
+        include_revoked: bool,
+    },
+    /// Revoke a passkey now (break-glass; audited; a revoked passkey is final).
+    RevokePasskey {
+        /// The passkey id (list-passkeys).
+        #[arg(long)]
+        id: Uuid,
+        /// Recorded on the passkey and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the revoke and its audit row roll back.
         #[arg(long)]
         apply: bool,
     },
@@ -544,6 +587,63 @@ async fn main_inner() -> anyhow::Result<i32> {
                     Ok(2)
                 }
             }
+        }
+        Command::PasskeyEnroll {
+            person,
+            reason,
+            label,
+            apply,
+        } => {
+            let row = passkey::enroll(&mut conn, person, &reason, label.as_deref(), apply).await?;
+            println!(
+                "{}ENROLLED\t{}",
+                if apply { "" } else { "WOULD BE " },
+                passkey::describe_enrollment(&row)
+            );
+            if apply {
+                println!(
+                    "Open the ceremony path under the deployment's public base URL, on the device \
+                     that holds the authenticator, before {}.",
+                    row.expires_at.to_rfc3339()
+                );
+            } else {
+                println!(
+                    "DRY RUN: the ticket and its audit row were rolled back; the ceremony path \
+                     above is not live."
+                );
+            }
+            Ok(0)
+        }
+        Command::ListPasskeys {
+            person,
+            include_revoked,
+        } => {
+            let rows =
+                epigraph_db::PasskeyRepository::list(&mut conn, person, include_revoked).await?;
+            if rows.is_empty() {
+                println!("no passkeys");
+            }
+            for row in &rows {
+                println!("{}", passkey::describe(row));
+            }
+            Ok(0)
+        }
+        Command::RevokePasskey { id, reason, apply } => {
+            let (revoked, row) = passkey::revoke(&mut conn, id, &reason, apply).await?;
+            println!(
+                "{}{}\t{}",
+                if apply || !revoked { "" } else { "WOULD BE " },
+                if revoked {
+                    "REVOKED"
+                } else {
+                    "ALREADY-REVOKED"
+                },
+                passkey::describe(&row)
+            );
+            if !apply {
+                println!("DRY RUN: the revoke and its audit row were rolled back.");
+            }
+            Ok(0)
         }
         Command::ListRoleAssignments {
             role,

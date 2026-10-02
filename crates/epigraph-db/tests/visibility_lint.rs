@@ -472,6 +472,40 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "passkey.rs",
+        "create_enrollment",
+        "WRITE through migration 124's maintenance-only definer \
+         `epigraph_create_passkey_enrollment` into `passkey_enrollments`, an authentication \
+         record about a registered human, not a corpus row: no `visibility` / \
+         `owner_group_id`, its own triggers enforce every rule (ELV01/ELV03) and write the \
+         `platform.passkey_enrollment_created` row. Nothing for a viewer to filter.",
+    ),
+    (
+        "passkey.rs",
+        "get_enrollment",
+        "READ of one `passkey_enrollments` row by id for the maintenance CLI. No tenancy \
+         columns; 124's FORCEd policy shows an application connection no row at all.",
+    ),
+    (
+        "passkey.rs",
+        "revoke",
+        "WRITE through 124's maintenance-only `epigraph_revoke_passkey`: the one revoke stamp \
+         on one `person_authenticators` row, an authentication record with no tenancy columns.",
+    ),
+    (
+        "passkey.rs",
+        "get",
+        "READ of one `person_authenticators` row by id for the maintenance CLI. No tenancy \
+         columns; 124's FORCEd policy shows an application connection no row at all.",
+    ),
+    (
+        "passkey.rs",
+        "list",
+        "READ of `person_authenticators` for the maintenance CLI (`list-passkeys`). No tenancy \
+         columns; on an application connection 124's policy returns nothing, which is why the \
+         CLI runs it on the maintenance connection.",
+    ),
+    (
         "role_assignment.rs",
         "grant",
         "WRITE through migration 123's maintenance-only definer `epigraph_grant_role` into \

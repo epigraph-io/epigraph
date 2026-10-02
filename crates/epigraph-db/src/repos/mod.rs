@@ -48,6 +48,7 @@ pub mod match_candidate;
 pub mod method;
 pub mod oauth_client;
 pub mod paper;
+pub mod passkey;
 pub mod pattern_template;
 pub mod perspective;
 pub mod political;
@@ -162,6 +163,7 @@ pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow, RotateOutcome};
 pub use group_membership::{GroupMembershipRepository, MembershipRow, RevokeOutcome};
 pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};
+pub use passkey::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use pattern_template::{PatternTemplateRepository, PatternTemplateRow};
 pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORIZER_ID};
 pub use refresh_token::{
