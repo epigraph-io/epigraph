@@ -18,6 +18,7 @@ members = [
     "crates/epigraph-embeddings",
     "crates/epigraph-engine",
     "crates/epigraph-auth",
+    "crates/epigraph-passkey",
     "crates/epigraph-api",
     "crates/epigraph-cli",
     "crates/epigraph-jobs",
@@ -74,6 +75,7 @@ curve25519-dalek = "4"
 epigraph-interfaces = { path = "crates/epigraph-interfaces" }  # Extension point traits (PolicyGate, LlmProvider)
 epigraph-authz = { path = "crates/epigraph-authz" }  # Fail-closed, resource-aware write gate (GroupPolicyGate)
 epigraph-auth = { path = "crates/epigraph-auth" }
+epigraph-passkey = { path = "crates/epigraph-passkey" }  # WebAuthn ceremonies (links OpenSSL; never an epigraph-mcp dependency)
 epigraph-core = { path = "crates/epigraph-core" }
 epigraph-crypto = { path = "crates/epigraph-crypto" }
 epigraph-privacy = { path = "crates/epigraph-privacy" }  # Client-side sealing (no DB, no key custody)

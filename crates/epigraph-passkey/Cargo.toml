@@ -1,0 +1,40 @@
+[package]
+name = "epigraph-passkey"
+description = "WebAuthn passkey ceremonies for EpiGraph: configuration, registration, assertion, and the evidence re-verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# NEVER a dependency of `epigraph-mcp`, and reached from `epigraph-api` only
+# through its `db` feature: this crate links OpenSSL (webauthn-rs-core), and
+# the fleet MCP image and the stdio server stay free of it.
+# `tests/dependency_boundary.rs` pins both halves with `cargo tree`.
+[dependencies]
+# MPL-2.0 (file-level copyleft), used unmodified as a dependency of this
+# Apache-2.0 crate. `danger-allow-state-serialisation` keeps a ceremony's
+# state in a database row between its two HTTP requests, which is the only
+# place an unauthenticated ceremony page can keep it.
+webauthn-rs = { version = "=0.5.5", features = ["danger-allow-state-serialisation"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+url = "2"
+base64 = "0.22"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The test authenticator (`tests/support/soft_authenticator.rs`) is written
+# from the WebAuthn and CTAP specifications on OpenSSL and ciborium, so it is
+# independent of webauthn-rs. NOT 1Password's passkey-client/-authenticator:
+# every passkey-types release enables `serde_json/preserve_order`, and
+# resolver 2 unifies dev-dependency features into the library whenever tests
+# or `--all-targets` are built, so the whole workspace would be TESTED with
+# insertion-ordered JSON maps and DEPLOYED with sorted ones.
+openssl = "0.10"
+ciborium = "0.2"
+tokio = { workspace = true }
+
+[lints]
+workspace = true
