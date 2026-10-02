@@ -443,6 +443,13 @@ pub struct AppState {
     /// read-through-on-miss in `entity_exists` / the admin write-through.
     #[cfg(feature = "db")]
     pub entity_type_cache: Arc<std::sync::RwLock<HashMap<String, epigraph_db::EntityTypeEntry>>>,
+
+    /// The WebAuthn relying party for the passkey ceremonies (elevation plan
+    /// EL-3), built once at boot from `EPIGRAPH_WEBAUTHN_*`. `None` when
+    /// passkeys are not configured: every enrollment endpoint then answers 503
+    /// (fail closed; dev and CI run this way).
+    #[cfg(feature = "db")]
+    pub passkeys: Option<Arc<epigraph_passkey::Passkeys>>,
 }
 
 /// API configuration options
@@ -1070,6 +1077,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            passkeys: None,
         }
     }
 
@@ -1418,6 +1426,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            passkeys: None,
         }
     }
 
@@ -1486,6 +1495,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            passkeys: None,
         }
     }
 
@@ -2052,6 +2062,15 @@ impl AppState {
     #[must_use]
     pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
         self.providers = providers;
+        self
+    }
+
+    /// Install the passkey relying party (`None`: passkeys off, the ceremony
+    /// endpoints answer 503).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_passkeys(mut self, passkeys: Option<Arc<epigraph_passkey::Passkeys>>) -> Self {
+        self.passkeys = passkeys;
         self
     }
 }

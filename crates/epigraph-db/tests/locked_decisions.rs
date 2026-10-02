@@ -843,15 +843,28 @@ fn d3_the_only_unrestricted_shape_costs_a_lease() {
 }
 
 /// D3, half three: the set of routes reachable with no `Authorization` header is
-/// an allowlist of exactly two application routes, in **both** `create_router`
-/// variants.
+/// an allowlist, in **both** `create_router` variants: two application routes,
+/// plus, in the `db` variant only, the passkey enrollment ceremony (elevation
+/// plan EL-3), which is anonymous by design (the enrollment id and the
+/// authenticator are its credentials; it needs the database).
 ///
 /// The `#[cfg(not(feature = "db"))]` variant is not built in any buildable
 /// configuration, so a source lint is the only mechanism that covers it at all.
 #[test]
 fn d3_anonymous_route_surface_is_the_allowlist() {
     let src = read(ROUTES_MOD_RS);
-    let expected: BTreeSet<&str> = ["/health", "/api/v1/openapi.json"].into_iter().collect();
+    let no_db: BTreeSet<&str> = ["/health", "/api/v1/openapi.json"].into_iter().collect();
+    let db: BTreeSet<&str> = no_db
+        .iter()
+        .copied()
+        .chain([
+            "/elevate/enroll/:id",
+            "/elevate/enroll/:id/challenge",
+            "/elevate/enroll/:id/finish",
+            "/elevate/assets/enroll.js",
+            "/elevate/assets/elevate.css",
+        ])
+        .collect();
 
     let chains: Vec<&str> = statement_starts(&src, "let public = Router::new()")
         .into_iter()
@@ -867,10 +880,12 @@ fn d3_anonymous_route_surface_is_the_allowlist() {
         chains.len()
     );
 
+    // The `db` variant comes first in the file.
     for (i, chain) in chains.iter().enumerate() {
         let routes: BTreeSet<&str> = route_literals(chain).into_iter().collect();
+        let expected = if i == 0 { &db } else { &no_db };
         assert_eq!(
-            routes, expected,
+            &routes, expected,
             "create_router variant #{i}: the anonymous surface is not the \
              allowlist. Registering a route on the `public` chain puts it back \
              on the unauthenticated internet — which under D3 is a decision that \

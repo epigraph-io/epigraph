@@ -131,6 +131,43 @@ async fn main() {
         }
     }
 
+    // The passkey relying party (elevation plan EL-3), read once. Unset is
+    // "off" (the enrollment endpoints answer 503); a partial or malformed
+    // configuration refuses to start rather than silently serving 503s.
+    #[cfg(feature = "db")]
+    let passkey_config = match epigraph_passkey::PasskeyConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+    #[cfg(feature = "db")]
+    let passkeys = match passkey_config.clone().map(epigraph_passkey::Passkeys::new) {
+        None => {
+            tracing::info!(
+                target: "elevate",
+                "passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the \
+                 enrollment ceremony answers 503"
+            );
+            None
+        }
+        Some(Ok(rp)) => {
+            tracing::info!(
+                target: "elevate",
+                rp_id = %rp.config().rp_id,
+                origin = %rp.config().origin,
+                software_attestation = rp.config().allows_software_attestation(),
+                "passkey relying party configured"
+            );
+            Some(Arc::new(rp))
+        }
+        Some(Err(e)) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // Configure API settings.
     //
     // `require_packet_signatures` enables the Ed25519 **payload** signature gate
@@ -347,7 +384,8 @@ async fn main() {
         );
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
-            .with_admin_cascade(false);
+            .with_admin_cascade(false)
+            .with_passkeys(passkeys);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the

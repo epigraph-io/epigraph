@@ -506,6 +506,31 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          CLI runs it on the maintenance connection.",
     ),
     (
+        "passkey_ceremony.rs",
+        "live_enrollment",
+        "READ of ONE enrollment by id through migration 124's app-callable SECURITY DEFINER \
+         `epigraph_enrollment_for_ceremony`, for the anonymous enrollment page (EL-3): it \
+         returns only that row's person, reason, label, expiry and challenge, and only while it \
+         is live, and enumerates nothing. An authentication record about a principal, not a \
+         corpus row: no `visibility` / `owner_group_id`, and the page has no principal a \
+         Viewer could carry.",
+    ),
+    (
+        "passkey_ceremony.rs",
+        "store_challenge",
+        "WRITE through 124's app-callable definer `epigraph_set_passkey_enrollment_challenge` \
+         (the ceremony state of one live enrollment, by id). The table's guard refuses a \
+         non-live enrollment (ELV04); nothing for a viewer to filter.",
+    ),
+    (
+        "passkey_ceremony.rs",
+        "complete",
+        "WRITE through 124's app-callable definer `epigraph_complete_passkey_enrollment`: the \
+         passkey a verified ceremony registered, consuming its enrollment. Every rule is the \
+         tables' (ELV01/ELV03/ELV04, user verification a CHECK) and the audit row their \
+         trigger's; nothing for a viewer to filter.",
+    ),
+    (
         "role_assignment.rs",
         "grant",
         "WRITE through migration 123's maintenance-only definer `epigraph_grant_role` into \

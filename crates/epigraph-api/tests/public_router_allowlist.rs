@@ -59,13 +59,37 @@ use std::collections::BTreeSet;
 
 const ROUTES_MOD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/mod.rs");
 
-/// The complete anonymous surface of the `db` build.
+/// The anonymous application surface of the `not(db)` build, and the part of
+/// the `db` build's it shares: `/health` (load balancers cannot mint a token)
+/// and the OpenAPI document (a client reads it to learn how to authenticate).
 ///
-/// Two application routes + the 11 OAuth/discovery routes = 13 paths reachable
-/// with no `Authorization` header. Note this is not the plan's flat 14: it
-/// counted `/metrics`, which PR-03 moved off the public listener entirely to
-/// the internal listener bound by `bin/server.rs`.
+/// Note this is not the plan's flat 14: it counted `/metrics`, which PR-03
+/// moved off the public listener entirely to the internal listener bound by
+/// `bin/server.rs`.
 const PUBLIC_ALLOWLIST: &[&str] = &["/health", "/api/v1/openapi.json"];
+
+/// The complete anonymous application surface of the `db` build:
+/// [`PUBLIC_ALLOWLIST`] plus the passkey enrollment ceremony (elevation plan
+/// EL-3), which is anonymous BY DESIGN. The operator opens the page on the
+/// device that holds the authenticator, with no bearer token to present; the
+/// enrollment id (random, live for at most 15 minutes, consumed once) and the
+/// authenticator are its credentials, every handler reads only that one
+/// enrollment through migration 124's ceremony definers, and all of it answers
+/// 503 when no relying party is configured. The two assets are static text
+/// from the binary, served here because the page's CSP admits script and style
+/// from its own origin only. `db` only: the ceremony needs the database.
+///
+/// Seven application routes + the 11 OAuth/discovery routes = 18 paths
+/// reachable with no `Authorization` header.
+const PUBLIC_ALLOWLIST_DB: &[&str] = &[
+    "/health",
+    "/api/v1/openapi.json",
+    "/elevate/enroll/:id",
+    "/elevate/enroll/:id/challenge",
+    "/elevate/enroll/:id/finish",
+    "/elevate/assets/enroll.js",
+    "/elevate/assets/elevate.css",
+];
 
 /// The OAuth/discovery router, `db` variant. Anonymous by construction —
 /// discovery and token issuance must precede authentication.
@@ -249,9 +273,12 @@ fn public_router_is_exactly_the_allowlist_in_both_variants() {
         starts.len()
     );
 
-    for (variant, start) in [("db", starts[0]), ("not(db)", starts[1])] {
+    for (variant, start, allowlist) in [
+        ("db", starts[0], PUBLIC_ALLOWLIST_DB),
+        ("not(db)", starts[1], PUBLIC_ALLOWLIST),
+    ] {
         let found = set(&routes_in(statement_at(&src, start)));
-        let want = expected(PUBLIC_ALLOWLIST);
+        let want = expected(allowlist);
         assert_eq!(
             found,
             want,
@@ -263,8 +290,8 @@ fn public_router_is_exactly_the_allowlist_in_both_variants() {
              header at all — `optional_bearer_auth_middleware` passes a \
              credential-less request straight through. If this route genuinely \
              must be anonymous, add it to PUBLIC_ALLOWLIST here and say why in \
-             the commit body. If it does not, move the registration into the \
-             `protected` chain.\n",
+             the commit body (PUBLIC_ALLOWLIST_DB for the db variant). If it \
+             does not, move the registration into the `protected` chain.\n",
             found.difference(&want).collect::<Vec<_>>(),
             want.difference(&found).collect::<Vec<_>>(),
         );
@@ -489,7 +516,7 @@ fn the_protected_router_is_where_the_routes_went() {
          vacuously green",
         protected.len()
     );
-    for allowlisted in PUBLIC_ALLOWLIST {
+    for allowlisted in PUBLIC_ALLOWLIST_DB {
         assert!(
             !protected.contains(&(*allowlisted).to_string()),
             "{allowlisted} is registered on BOTH routers. axum's merge would \
@@ -583,6 +610,43 @@ async fn allowlisted_routes_still_answer_anonymously() {
              to learn how to authenticate if reading the schema requires \
              authentication"
         );
+    }
+}
+
+/// The enrollment ceremony is reachable with no credential, and on a server
+/// with no relying party configured (as `spawn_app` builds it) it answers 503,
+/// never 401 and never a page: fail closed, without pretending the route needs
+/// a token it can never have. The assets are static and answer 200.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_enrollment_ceremony_answers_anonymously() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let client = reqwest::Client::new();
+    let id = uuid::Uuid::new_v4();
+    for (method, path) in [
+        ("GET", format!("/elevate/enroll/{id}")),
+        ("POST", format!("/elevate/enroll/{id}/challenge")),
+        ("POST", format!("/elevate/enroll/{id}/finish")),
+    ] {
+        let req = if method == "GET" {
+            client.get(format!("http://{addr}{path}"))
+        } else {
+            client.post(format!("http://{addr}{path}")).body("{}")
+        };
+        let resp = req.send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {path}: an unconfigured relying party is 503, anonymously"
+        );
+    }
+    for path in ["/elevate/assets/enroll.js", "/elevate/assets/elevate.css"] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "GET {path}");
     }
 }
 

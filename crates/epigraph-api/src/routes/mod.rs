@@ -42,6 +42,8 @@ pub mod conventions;
 pub mod cross_source;
 pub mod crud;
 pub mod edges;
+#[cfg(feature = "db")]
+pub mod elevate;
 pub mod embeddings;
 #[cfg(feature = "db")]
 pub mod entities;
@@ -972,14 +974,33 @@ pub fn create_router(state: AppState) -> Router {
     // The `/oauth/*` and `/.well-known/*` router below is the third anonymous
     // surface, and is anonymous by construction: discovery and token issuance
     // must precede authentication.
+    //
+    // The passkey enrollment ceremony (elevation plan EL-3) is the third
+    // anonymous application surface, and is anonymous BY DESIGN: the operator
+    // opens the page on the device that holds the authenticator, with no bearer
+    // token to present. The enrollment id (random, live for at most 15 minutes,
+    // consumed once) and the authenticator are its credentials; every handler
+    // reads only that one enrollment, through migration 124's ceremony
+    // definers, and answers 503 when no relying party is configured. The two
+    // assets are static text from this binary, served here because the page's
+    // CSP admits script and style from its own origin only. `db` variant only:
+    // the ceremony needs the database.
     let public = Router::new()
         .route("/health", get(health::health_check))
         .route(
             "/api/v1/openapi.json",
             get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
-        );
+        )
+        .route("/elevate/enroll/:id", get(elevate::enroll_page))
+        .route(
+            "/elevate/enroll/:id/challenge",
+            post(elevate::enroll_challenge),
+        )
+        .route("/elevate/enroll/:id/finish", post(elevate::enroll_finish))
+        .route("/elevate/assets/enroll.js", get(elevate::enroll_js))
+        .route("/elevate/assets/elevate.css", get(elevate::elevate_css));
 
-    // Layered on the two-route allowlist: a request with no Authorization
+    // Layered on the allowlist: a request with no Authorization
     // header passes through, a request with a present-but-invalid token still
     // 401s. Retained rather than dropped so an allowlisted handler can still
     // see who is calling when a token happens to be supplied.
