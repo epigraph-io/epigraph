@@ -186,7 +186,9 @@ async fn link_past_the_guard(pool: &PgPool, agent: Uuid, operator: Uuid) {
 /// linked registered humans are granted; the same test removed from
 /// `epigraph_live_role_assignment` -> the custodian linked past the guard
 /// still holds; the `operator_links` holder guard's trigger not created ->
-/// the custodian's link lands (review SEC-MTC-9's residual).
+/// the custodian's link lands (review SEC-MTC-9's residual); that guard's
+/// lapse clause (`valid_to > clock_timestamp()`) removed -> the lapsed
+/// holder's link is refused (review R2-OQ-TST-2).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_agent_never_holds_a_role(pool: PgPool) {
     let (human, _) = fixture::seed_human_operator(&pool, "custodian-human").await;
@@ -312,6 +314,29 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
     assert!(
         holds_at(&pool, later, CUSTODIAN, "now()").await,
         "the refused link changed nothing"
+    );
+
+    // A LAPSED assignment (past its valid_to, never ended) holds nothing, so
+    // it does not block a link (review R2-OQ-TST-2).
+    let (lapsing, _) = fixture::seed_human_operator(&pool, "lapsed-holder").await;
+    maint_insert(&pool, AUDITOR, lapsing, "0", Some("1 second"), Some(human))
+        .await
+        .expect("an auditor assignment for one second");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(
+        !holds_at(&pool, lapsing, AUDITOR, "now()").await,
+        "PREMISE: the assignment has lapsed"
+    );
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, lapsing, human)
+            .await
+            .expect("a holder whose assignment lapsed is linked");
+    }
+    assert_eq!(
+        holding_and_links(&pool, lapsing).await,
+        (1, 1),
+        "linked, its lapsed row untouched"
     );
 
     // The way out: end the assignment (audited), then link.
