@@ -12,10 +12,18 @@
 //!
 //! 1. CALIBRATION, unarmed: the same binary and DSN get PAST the check (the
 //!    log line the boot writes after it appears), so the refusal below is the
-//!    arming, not a process that cannot start for another reason;
-//! 2. armed: exit 1, the refusal on stderr, before the boot reaches the line
+//!    arming, not a process that cannot start for another reason. That an
+//!    unarmed database serves a privileged DSN is the CURRENT reading of
+//!    OQ-7 (b) (`request_unit_may_serve`: armed only), which review
+//!    R2-OQ-SEC-1 put back to the operator; it is pinned here as that
+//!    reading, not as a requirement;
+//! 2. a server started on that unarmed database and left SERVING exits 1
+//!    once the database is armed under it (review R2-OQ-COR-1: the deploy
+//!    order starts request units before arming, and the boot check alone let
+//!    such a unit keep serving);
+//! 3. armed: exit 1, the refusal on stderr, before the boot reaches the line
 //!    of step 1;
-//! 3. armed with the valve open (`EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off`):
+//! 4. armed with the valve open (`EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off`):
 //!    still refused; the valve never makes a privileged DSN a request DSN.
 //!
 //! The application-role control is NOT driven here: `epigraph_app` is NOLOGIN
@@ -44,15 +52,38 @@ const REFUSAL: &str = "refusing to start: a request unit never serves an armed d
 /// is loaded: its presence means the check was passed.
 const PAST_THE_CHECK: &str = "entity_types registry cache loaded";
 
+/// Logged once the listener is bound: the server is serving.
+const SERVING: &str = "Server listening on";
+
+/// Printed by a SERVING request unit that a re-read finds on a privileged DSN
+/// of a database armed after it started. Spelled here, like [`REFUSAL`].
+const STOP: &str = "stopping: a request unit never serves an armed database on a privileged \
+                    DSN (operator ruling OQ-7 (b))";
+
 enum Outcome {
     Exited { code: Option<i32>, log: String },
     PastTheCheck { log: String },
 }
 
-/// Run the server against `db_url` and wait until it either exits or logs
-/// [`PAST_THE_CHECK`]; kill it in the second case. stdout (the tracing
-/// layer) and stderr (the refusal) are read together.
-fn run_server(db_url: &str, valve_off: bool) -> Outcome {
+/// An empty (valid) providers file, so the test server boots past its
+/// providers registry instead of panicking there for want of one (review
+/// R2-OQ-TST-5) and can reach [`SERVING`].
+fn providers_file() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "privileged-dsn-providers-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, "# no external identity providers\n").expect("providers file");
+    path
+}
+
+/// Spawn the server against `db_url`, its stdout (the tracing layer) and
+/// stderr (the refusal) merged into one line channel.
+fn spawn_server(
+    db_url: &str,
+    valve_off: bool,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, mpsc::Receiver<String>) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_server"));
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -60,6 +91,7 @@ fn run_server(db_url: &str, valve_off: bool) -> Outcome {
         .env("EPIGRAPH_ENV", "test")
         .env("EPIGRAPH_PORT", "0")
         .env("EPIGRAPH_METRICS_ADDR", "127.0.0.1:0")
+        .env("EPIGRAPH_PROVIDERS_CONFIG", providers_file())
         .env("RUST_LOG", "info")
         .env("DATABASE_URL", db_url)
         .current_dir(std::env::temp_dir())
@@ -68,6 +100,9 @@ fn run_server(db_url: &str, valve_off: bool) -> Outcome {
         .stderr(Stdio::piped());
     if valve_off {
         cmd.env("EPIGRAPH_OPERATOR_LINK_ENFORCEMENT", "off");
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("spawn the server binary");
     let (tx, rx) = mpsc::channel::<String>();
@@ -85,18 +120,25 @@ fn run_server(db_url: &str, valve_off: bool) -> Outcome {
         });
     }
     drop(tx);
+    (child, rx)
+}
 
+/// Wait until `child` either exits or logs `marker` (left running in the
+/// second case).
+fn wait_for(
+    child: &mut std::process::Child,
+    rx: &mpsc::Receiver<String>,
+    marker: &str,
+    log: &mut String,
+) -> Outcome {
     let deadline = Instant::now() + Duration::from_secs(90);
-    let mut log = String::new();
     loop {
         while let Ok(line) = rx.try_recv() {
             log.push_str(&line);
             log.push('\n');
         }
-        if log.contains(PAST_THE_CHECK) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Outcome::PastTheCheck { log };
+        if log.contains(marker) {
+            return Outcome::PastTheCheck { log: log.clone() };
         }
         if let Some(status) = child.try_wait().expect("try_wait") {
             // Drain what the reader threads still hold.
@@ -106,13 +148,53 @@ fn run_server(db_url: &str, valve_off: bool) -> Outcome {
             }
             return Outcome::Exited {
                 code: status.code(),
-                log,
+                log: log.clone(),
             };
         }
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("the server neither exited nor passed the boot check within 90s:\n{log}");
+            panic!("the server neither exited nor logged {marker:?} within 90s:\n{log}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Run the server against `db_url` and wait until it either exits or logs
+/// [`PAST_THE_CHECK`]; kill it in the second case.
+fn run_server(db_url: &str, valve_off: bool) -> Outcome {
+    let (mut child, rx) = spawn_server(db_url, valve_off, &[]);
+    let mut log = String::new();
+    let outcome = wait_for(&mut child, &rx, PAST_THE_CHECK, &mut log);
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome
+}
+
+/// Wait up to `within` for `child` to exit; its code and the whole log.
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    rx: &mpsc::Receiver<String>,
+    log: &mut String,
+    within: Duration,
+) -> Option<Option<i32>> {
+    let deadline = Instant::now() + within;
+    loop {
+        while let Ok(line) = rx.try_recv() {
+            log.push_str(&line);
+            log.push('\n');
+        }
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            while let Ok(line) = rx.recv_timeout(Duration::from_millis(500)) {
+                log.push_str(&line);
+                log.push('\n');
+            }
+            return Some(status.code());
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -132,7 +214,9 @@ async fn arm(pool: &PgPool) {
 }
 
 /// Verified to fail: the server's boot check reverted to the log-only call
-/// (no refusal) -> the armed run passes the check and serves.
+/// (no refusal) -> the armed run passes the check and serves;
+/// `spawn_request_unit_watch` not called in `main` -> the server started
+/// unarmed keeps serving after the arming (step 2).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_server_refuses_a_privileged_dsn_on_an_armed_database(pool: PgPool) {
     let db_url = fixture::database_url_for(&pool).await;
@@ -158,8 +242,38 @@ async fn the_server_refuses_a_privileged_dsn_on_an_armed_database(pool: PgPool) 
         ),
     }
 
-    // 2. and 3. Armed, valve closed and open: refused.
+    // 2. Unarmed and SERVING, then armed under it: the re-read stops it.
+    let url = db_url.clone();
+    let (mut child, rx) = tokio::task::spawn_blocking(move || {
+        let (mut child, rx) =
+            spawn_server(&url, false, &[("EPIGRAPH_REQUEST_UNIT_RECHECK_SECS", "1")]);
+        let mut log = String::new();
+        match wait_for(&mut child, &rx, SERVING, &mut log) {
+            Outcome::PastTheCheck { .. } => (child, rx),
+            Outcome::Exited { code, log } => panic!(
+                "CALIBRATION: on an UNARMED database the server must reach serving; exited \
+                 {code:?}:\n{log}"
+            ),
+        }
+    })
+    .await
+    .expect("join");
     arm(&pool).await;
+    let (code, log) = tokio::task::spawn_blocking(move || {
+        let mut log = String::new();
+        let code = wait_for_exit(&mut child, &rx, &mut log, Duration::from_secs(30));
+        (code, log)
+    })
+    .await
+    .expect("join");
+    assert_eq!(
+        code,
+        Some(Some(1)),
+        "a server serving a privileged DSN exits 1 once its database is armed:\n{log}"
+    );
+    assert!(log.contains(STOP), "it names the ruling:\n{log}");
+
+    // 3. and 4. Armed, valve closed and open: refused.
     for valve_off in [false, true] {
         let url = db_url.clone();
         match tokio::task::spawn_blocking(move || run_server(&url, valve_off))

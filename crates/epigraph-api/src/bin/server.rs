@@ -337,6 +337,14 @@ async fn main() {
             eprintln!("ERROR: {refusal}");
             std::process::exit(1);
         }
+        // And for as long as it serves: the deploy order starts this unit
+        // before the database is armed, so the boot check alone would let a
+        // privileged DSN keep serving once it is (review R2-OQ-COR-1). The
+        // watch re-reads the posture and exits the process on that state.
+        epigraph_db::operator_binding::spawn_request_unit_watch(
+            scoped.inner().clone(),
+            "epigraph-api",
+        );
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
             .with_admin_cascade(false);

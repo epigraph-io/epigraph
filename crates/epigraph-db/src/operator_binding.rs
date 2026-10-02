@@ -262,12 +262,113 @@ pub async fn check_request_unit_boot(pool: &sqlx::PgPool, unit: &str) -> Result<
     Ok(state)
 }
 
+/// The environment variable a request unit reads once for the interval, in
+/// seconds, between its posture re-reads ([`watch_request_unit`]).
+pub const RECHECK_ENV: &str = "EPIGRAPH_REQUEST_UNIT_RECHECK_SECS";
+
+/// The re-read interval when [`RECHECK_ENV`] is unset or not a number.
+pub const RECHECK_DEFAULT_SECS: u64 = 30;
+
+/// The longest re-read interval [`RECHECK_ENV`] can set: the variable tunes
+/// the check, it never turns it off.
+pub const RECHECK_MAX_SECS: u64 = 300;
+
+/// What a RUNNING request unit prints to stderr before exiting non-zero when
+/// a re-read finds it serving a privileged DSN of an armed database (operator
+/// ruling OQ-7 (b)): the database was armed, or the login gained privilege,
+/// after the boot check passed. Followed by [`PRIVILEGED_DSN_ERROR`].
+pub const PRIVILEGED_DSN_STOP: &str = "stopping: a request unit never serves an armed database \
+     on a privileged DSN (operator ruling OQ-7 (b)), and this one's database was armed, or its \
+     login made privileged, after it started; connect it as epigraph_app";
+
+/// The re-read interval for `raw` (the value of [`RECHECK_ENV`]): a whole
+/// number of seconds clamped to `1..=`[`RECHECK_MAX_SECS`], or
+/// [`RECHECK_DEFAULT_SECS`] when absent or not a number. A pure mapping, so
+/// the clamp is unit-tested.
+#[must_use]
+pub fn recheck_interval_from_env_value(raw: Option<&str>) -> std::time::Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(RECHECK_DEFAULT_SECS, |s| s.clamp(1, RECHECK_MAX_SECS));
+    std::time::Duration::from_secs(secs)
+}
+
+/// Re-read this process's posture on `pool` every `interval`, for as long as
+/// it serves, and return the stop text once it is a state a request unit may
+/// not serve ([`request_unit_may_serve`]). The boot check
+/// ([`check_request_unit_boot`]) runs once, and the deploy order starts the
+/// request units BEFORE the database is armed (docs/deploy.md, "Operator
+/// binding"), so without this a unit started on a privileged DSN of an
+/// unarmed database kept serving once the database was armed (review
+/// R2-OQ-COR-1).
+///
+/// A failed re-read is logged at WARN and the unit keeps serving: it already
+/// passed the fail-closed boot check, and a transient database error must not
+/// take every request unit down at once. Only a positive read of a refused
+/// state stops it.
+pub async fn watch_request_unit(
+    pool: sqlx::PgPool,
+    unit: &str,
+    interval: std::time::Duration,
+) -> String {
+    loop {
+        tokio::time::sleep(interval).await;
+        match boot_state(&pool).await {
+            Ok(state) => {
+                if request_unit_may_serve(state).is_err() {
+                    let (_, line) = boot_line(state);
+                    tracing::error!(target: "tenancy.operator_binding", unit, "{line}");
+                    return format!("{PRIVILEGED_DSN_STOP}. {PRIVILEGED_DSN_ERROR}");
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "tenancy.operator_binding",
+                unit,
+                "could not re-read the operator-binding arming state or whether this DSN is \
+                 privileged ({e}); still serving, re-reading in {}s",
+                interval.as_secs()
+            ),
+        }
+    }
+}
+
+/// Spawn [`watch_request_unit`] for a request unit's `main`, at the interval
+/// [`RECHECK_ENV`] sets, and EXIT the process (status 1, the stop text on
+/// stderr) when it returns. Call it right after [`check_request_unit_boot`]
+/// passes, on the same pool, on every transport.
+pub fn spawn_request_unit_watch(pool: sqlx::PgPool, unit: &'static str) {
+    let interval = recheck_interval_from_env_value(std::env::var(RECHECK_ENV).ok().as_deref());
+    tokio::spawn(async move {
+        let stop = watch_request_unit(pool, unit, interval).await;
+        eprintln!("ERROR: {stop}");
+        std::process::exit(1);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        boot_line, request_unit_may_serve, BootState, Enforcement, ARMED_BOOT_INFO,
-        PRIVILEGED_DSN_ERROR, PRIVILEGED_DSN_REFUSAL, VALVE_OFF_WARNING,
+        boot_line, recheck_interval_from_env_value, request_unit_may_serve, BootState, Enforcement,
+        ARMED_BOOT_INFO, PRIVILEGED_DSN_ERROR, PRIVILEGED_DSN_REFUSAL, PRIVILEGED_DSN_STOP,
+        VALVE_OFF_WARNING,
     };
+
+    /// The re-read interval is tunable but never disabled: clamped to
+    /// 1..=300 s, 30 s when unset or not a number (review R2-OQ-COR-1).
+    #[test]
+    fn the_recheck_interval_is_clamped_never_disabled() {
+        let secs = |raw: Option<&str>| recheck_interval_from_env_value(raw).as_secs();
+        assert_eq!(secs(None), 30);
+        assert_eq!(secs(Some("")), 30);
+        assert_eq!(secs(Some("off")), 30);
+        assert_eq!(secs(Some("-5")), 30);
+        assert_eq!(secs(Some("0")), 1);
+        assert_eq!(secs(Some(" 7 ")), 7);
+        assert_eq!(secs(Some("999999")), 300);
+        assert!(PRIVILEGED_DSN_STOP.starts_with("stopping:"));
+        assert!(PRIVILEGED_DSN_STOP.contains("OQ-7 (b)"));
+        assert!(!PRIVILEGED_DSN_STOP.contains("  "));
+    }
 
     /// SEC-R4-3's signal is the ERROR line, so its level, its text and the
     /// prefix the deploy runbook greps are pinned here (review TST-MTC-11 and

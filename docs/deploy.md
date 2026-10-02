@@ -1519,6 +1519,12 @@ arming is one-way and every step before it must leave no live writer unbound.
    (census), then `--apply`. Before `--apply`, confirm no request unit or
    stdio MCP config connects on a privileged DSN: once armed, such a unit
    refuses to start (operator ruling OQ-7 (b); "The custodian role", step 4).
+   A unit ALREADY RUNNING on a privileged DSN when you arm does not wait for
+   a restart: it re-reads its posture every `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS`
+   (30 by default, 1 to 300) and exits 1 with `ERROR: stopping: ...` on
+   stderr, so an overlooked privileged unit goes down within that interval of
+   `--apply`. Restart every request unit after `--apply` anyway, and confirm
+   each boot log carries the `operator binding ENFORCED:` line.
    The census must list no unbound recent writer you intend to keep. The census lists AUTHORS; a writer that authors as someone
    else (a service client posting on an agent's behalf, a listener acting under
    a borrowed admin stamp) is bound on its own principal once armed and does
@@ -1613,7 +1619,8 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
    `ERROR: refusing to start:` on stderr. Grep the prefix, not the word: both
    lines contain "ENFORCED". Check every unit and every stdio MCP config's DSN
    BEFORE arming: arming turns a privileged request DSN into a unit that no
-   longer starts.
+   longer starts, and a running one into a unit that stops within its
+   re-read interval (`ERROR: stopping:` on stderr).
 5. **Custodial revisions** of the platform corpus use
    `epigraph-operator custodial-supersede --claim <id> --content-file <f>
    --truth <x> --assignment <the actor's live assignment> --actor <the

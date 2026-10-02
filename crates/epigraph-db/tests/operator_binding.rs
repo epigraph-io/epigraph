@@ -3258,6 +3258,52 @@ async fn the_boot_line_names_a_privileged_dsn(pool: PgPool) {
     );
 }
 
+/// A request unit that passed its boot check on an UNARMED database keeps
+/// re-reading its posture, and stops once the database is armed under its
+/// privileged DSN (review R2-OQ-COR-1: the deploy order starts the units
+/// before arming, and a boot-only check let such a unit serve an armed
+/// database). The application role on the same database keeps serving.
+///
+/// Verified to fail: `watch_request_unit`'s loop reading nothing (sleeping
+/// forever) -> the privileged watch never returns after the arming.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_running_unit_stops_when_its_privileged_database_is_armed(pool: PgPool) {
+    use epigraph_db::operator_binding::{check_request_unit_boot, watch_request_unit, BootState};
+    use std::time::Duration;
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    assert_eq!(
+        check_request_unit_boot(&pool, "test").await,
+        Ok(BootState::NotArmed),
+        "CALIBRATION: the privileged DSN passes the boot check while unarmed"
+    );
+    let interval = Duration::from_millis(200);
+    let privileged = tokio::spawn(watch_request_unit(pool.clone(), "privileged", interval));
+    let application = tokio::spawn(watch_request_unit(app.clone(), "application", interval));
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        !privileged.is_finished(),
+        "unarmed, the privileged unit keeps serving (the ruled boot behaviour)"
+    );
+    assert!(arm(&pool).await, "the database arms");
+    let stop = tokio::time::timeout(Duration::from_secs(10), privileged)
+        .await
+        .expect("the privileged unit stops within a few re-reads of the arming")
+        .expect("join");
+    assert!(
+        stop.starts_with(
+            "stopping: a request unit never serves an armed database on a \
+                          privileged DSN (operator ruling OQ-7 (b))"
+        ),
+        "{stop}"
+    );
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        !application.is_finished(),
+        "the application role on the armed database keeps serving"
+    );
+    application.abort();
+}
+
 /// The boot check FAILS CLOSED: when the arming or the DSN's privilege cannot
 /// be read, a request unit refuses to start, because it cannot show that its
 /// DSN is not privileged (review R2-OQ-TST-3). The fixture is a pool of the

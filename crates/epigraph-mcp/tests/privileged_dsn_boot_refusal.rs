@@ -9,9 +9,16 @@
 //! order, because arming is one-way:
 //!
 //! 1. CALIBRATION, unarmed: an HTTP listener on that DSN starts serving, so
-//!    the refusal below is the arming, not a listener that cannot start;
-//! 2. armed: the same listener exits non-zero with the refusal;
-//! 3. armed, stdio transport: refused too (stdin is closed, so a missing gate
+//!    the refusal below is the arming, not a listener that cannot start. That
+//!    an unarmed database serves a privileged DSN is the CURRENT reading of
+//!    OQ-7 (b) (`request_unit_may_serve`: armed only), which review
+//!    R2-OQ-SEC-1 put back to the operator; it is pinned here as that
+//!    reading, not as a requirement;
+//! 2. a listener and a stdio server started on that unarmed database and left
+//!    SERVING both exit 1 once the database is armed under them (review
+//!    R2-OQ-COR-1: the deploy order starts request units before arming);
+//! 3. armed: the same listener exits non-zero with the refusal;
+//! 4. armed, stdio transport: refused too (stdin is closed, so a missing gate
 //!    would serve and exit 0 on EOF instead).
 //!
 //! The application-role control is not driven here (`epigraph_app` is NOLOGIN
@@ -38,20 +45,54 @@ const REFUSAL: &str = "refusing to start: a request unit never serves an armed d
 /// A test-only HMAC secret, never used outside this file.
 const TEST_JWT_SECRET: &str = "privileged-dsn-boot-refusal-test-secret-not-for-any-deployment";
 
+/// Printed by a SERVING request unit that a re-read finds on a privileged DSN
+/// of a database armed after it started. Spelled here, like [`REFUSAL`].
+const STOP: &str = "stopping: a request unit never serves an armed database on a privileged \
+                    DSN (operator ruling OQ-7 (b))";
+
+/// Logged once the HTTP listener is up.
+const SERVING: &str = "Starting EpiGraph MCP server";
+
+/// Logged on both transports after the boot check, before stdio's handshake
+/// (which waits on stdin): a stdio server that logs it is past the check.
+const PAST_THE_CHECK: &str = "Agent identity ready";
+
 enum Outcome {
     Exited { code: Option<i32>, stderr: String },
     Serving { stderr: String },
 }
 
 /// Spawn `epigraph-mcp-full` against `db_url` signing as `key_hex` (an HTTP
-/// listener when `listen`, stdio otherwise, stdin closed), and wait until it
-/// exits or logs that it is serving; kill it in the second case.
+/// listener when `listen`, stdio otherwise), and wait until it exits or logs
+/// that it is serving; kill it in the second case. On stdio its stdin is
+/// closed, so a missing gate would serve and exit 0 on EOF.
 fn spawn_mcp(db_url: &str, key_hex: &str, listen: bool) -> Outcome {
+    let (mut child, rx) = start_mcp(db_url, key_hex, listen, Stdio::null(), &[]);
+    let mut log = String::new();
+    let outcome = wait_serving(&mut child, &rx, SERVING, &mut log);
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome
+}
+
+/// Spawn `epigraph-mcp-full` (see [`spawn_mcp`]) with `stdin`, its stderr
+/// as a line channel.
+fn start_mcp(
+    db_url: &str,
+    key_hex: &str,
+    listen: bool,
+    stdin: Stdio,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, mpsc::Receiver<String>) {
     let mut args = vec!["--database-url", db_url, "--agent-key", key_hex];
     if listen {
         args.extend(["--listen", "127.0.0.1:0", "--jwt-secret", TEST_JWT_SECRET]);
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"));
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .args(&args)
         .env_remove("EPIGRAPH_JWT_SECRET")
         .env_remove("EPIGRAPH_OPERATOR_ID")
@@ -61,7 +102,7 @@ fn spawn_mcp(db_url: &str, key_hex: &str, listen: bool) -> Outcome {
         .env_remove("MAINTENANCE_DATABASE_URL")
         .env_remove("OPENAI_API_KEY")
         .env("RUST_LOG", "info")
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -75,18 +116,26 @@ fn spawn_mcp(db_url: &str, key_hex: &str, listen: bool) -> Outcome {
             }
         }
     });
+    (child, rx)
+}
 
+/// Wait until `child` exits or logs `marker` (left running then).
+fn wait_serving(
+    child: &mut std::process::Child,
+    rx: &mpsc::Receiver<String>,
+    marker: &str,
+    log: &mut String,
+) -> Outcome {
     let deadline = Instant::now() + Duration::from_secs(90);
-    let mut log = String::new();
     loop {
         while let Ok(line) = rx.try_recv() {
             log.push_str(&line);
             log.push('\n');
         }
-        if log.contains("Starting EpiGraph MCP server") {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Outcome::Serving { stderr: log };
+        if log.contains(marker) {
+            return Outcome::Serving {
+                stderr: log.clone(),
+            };
         }
         if let Some(status) = child.try_wait().expect("try_wait") {
             while let Ok(line) = rx.recv_timeout(Duration::from_millis(500)) {
@@ -95,20 +144,52 @@ fn spawn_mcp(db_url: &str, key_hex: &str, listen: bool) -> Outcome {
             }
             return Outcome::Exited {
                 code: status.code(),
-                stderr: log,
+                stderr: log.clone(),
             };
         }
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("epigraph-mcp neither exited nor started serving within 90s:\n{log}");
+            panic!("epigraph-mcp neither exited nor logged {marker:?} within 90s:\n{log}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait up to `within` for `child` to exit; its code (`None`: still running,
+/// then killed).
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    rx: &mpsc::Receiver<String>,
+    log: &mut String,
+    within: Duration,
+) -> Option<Option<i32>> {
+    let deadline = Instant::now() + within;
+    loop {
+        while let Ok(line) = rx.try_recv() {
+            log.push_str(&line);
+            log.push('\n');
+        }
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            while let Ok(line) = rx.recv_timeout(Duration::from_millis(500)) {
+                log.push_str(&line);
+                log.push('\n');
+            }
+            return Some(status.code());
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
 /// Verified to fail: `main`'s boot check reverted to the log-only call (no
-/// refusal) -> the armed listener serves.
+/// refusal) -> the armed listener serves; `spawn_request_unit_watch` not
+/// called in `main` -> the listener and the stdio server started unarmed keep
+/// serving after the arming (step 2).
 #[sqlx::test(migrations = "../../migrations")]
 async fn epigraph_mcp_refuses_a_privileged_dsn_on_an_armed_database(pool: PgPool) {
     let db_url = fixture::database_url_for(&pool).await;
@@ -139,7 +220,34 @@ async fn epigraph_mcp_refuses_a_privileged_dsn_on_an_armed_database(pool: PgPool
         ),
     }
 
-    // 2. and 3. Armed: the listener and stdio are both refused.
+    // 2. Unarmed and running (a listener serving; a stdio server past the
+    // boot check, waiting on its open stdin for the handshake), then armed
+    // under them: the re-read stops both.
+    let (url, k) = (db_url.clone(), key.clone());
+    let running = tokio::task::spawn_blocking(move || {
+        [true, false].map(|listen| {
+            let (mut child, rx) = start_mcp(
+                &url,
+                &k,
+                listen,
+                Stdio::piped(),
+                &[("EPIGRAPH_REQUEST_UNIT_RECHECK_SECS", "1")],
+            );
+            let mut log = String::new();
+            let marker = if listen { SERVING } else { PAST_THE_CHECK };
+            match wait_serving(&mut child, &rx, marker, &mut log) {
+                Outcome::Serving { .. } => (listen, child, rx, log),
+                Outcome::Exited { code, stderr } => panic!(
+                    "CALIBRATION: listen={listen} on an UNARMED database must serve; exited \
+                     {code:?}:\n{stderr}"
+                ),
+            }
+        })
+    })
+    .await
+    .expect("join");
+
+    // 3. and 4. Armed: the listener and stdio are both refused.
     let armed: bool = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
         let armed: bool =
             sqlx::query_scalar("SELECT armed_now FROM public.epigraph_arm_operator_binding()")
@@ -150,6 +258,26 @@ async fn epigraph_mcp_refuses_a_privileged_dsn_on_an_armed_database(pool: PgPool
     })
     .await;
     assert!(armed, "the database arms");
+    let stopped = tokio::task::spawn_blocking(move || {
+        running.map(|(listen, mut child, rx, mut log)| {
+            let code = wait_for_exit(&mut child, &rx, &mut log, Duration::from_secs(30));
+            (listen, code, log)
+        })
+    })
+    .await
+    .expect("join");
+    for (listen, code, log) in stopped {
+        assert_eq!(
+            code,
+            Some(Some(1)),
+            "listen={listen}: a unit serving a privileged DSN exits 1 once its database is \
+             armed:\n{log}"
+        );
+        assert!(
+            log.contains(STOP),
+            "listen={listen}: it names the ruling:\n{log}"
+        );
+    }
     for listen in [true, false] {
         let (url, k) = (db_url.clone(), key.clone());
         match tokio::task::spawn_blocking(move || spawn_mcp(&url, &k, listen))

@@ -576,6 +576,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("ERROR: {refusal}");
         std::process::exit(1);
     }
+    // And for as long as it serves, on every transport: a unit started before
+    // the database was armed exits once a re-read finds it serving an armed
+    // database on a privileged DSN (review R2-OQ-COR-1).
+    epigraph_db::operator_binding::spawn_request_unit_watch(pool.clone(), "epigraph-mcp");
 
     // Create or restore agent signer. Precedence lives in `select_signer`
     // (unit-tested); here we only handle the side effects (secret-key print for

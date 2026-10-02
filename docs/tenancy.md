@@ -574,7 +574,13 @@ refusing to start: ...` on stderr) when their DSN is privileged
 (`epigraph_bypass()` is true) on an armed database, whatever the valve says:
 on such a DSN the trigger checks the author column alone and relieves the
 cross-human scope (operator ruling OQ-7 (b)). `epigraph-mcp` refuses on every
-transport, stdio included. An unarmed database is not refused.
+transport, stdio included. An unarmed database is not refused at boot, but a
+unit keeps re-reading its posture while it serves
+(`EPIGRAPH_REQUEST_UNIT_RECHECK_SECS`, 30 s by default, clamped to 1..300 s)
+and exits 1 (`ERROR: stopping: ...`) once it finds itself on a privileged DSN
+of an armed database, so arming under a running privileged unit stops it. A
+failed re-read is a WARN and the unit keeps serving; only the boot read fails
+closed.
 
 The only runtime relief is per process:
 `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off`. It is read once at boot, logs a WARN
