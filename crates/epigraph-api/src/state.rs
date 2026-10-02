@@ -585,6 +585,10 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // migration that creates them, on the same precedent.
     "platform_roles",
     "role_assignments",
+    // A registered human's passkeys and their enrollment tickets (124),
+    // FORCEd by the migration that creates them, on the same precedent.
+    "passkey_enrollments",
+    "person_authenticators",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.

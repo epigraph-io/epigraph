@@ -2117,6 +2117,8 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "evidence_visibility_pins",
     "platform_roles",
     "role_assignments",
+    "passkey_enrollments",
+    "person_authenticators",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2173,6 +2175,13 @@ const OPERATOR_TABLES: &[&str] = &["operator_links", "evidence_visibility_pins"]
 /// `visibility` / `owner_group_id` columns, so neither joins `tier_a`.
 const CUSTODIAN_TABLES: &[&str] = &["platform_roles", "role_assignments"];
 
+/// A registered human's passkeys and their enrollment tickets, which migration
+/// 124 creates and FORCEs. A SIXTH TERM for the reason the four above are
+/// separate: FORCEd by the migration that creates them, none of the earlier
+/// kinds, and carrying no `visibility` / `owner_group_id` columns, so neither
+/// joins `tier_a`.
+const PASSKEY_TABLES: &[&str] = &["passkey_enrollments", "person_authenticators"];
+
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
 /// reports.
@@ -2223,6 +2232,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .chain(PRIVATIZATION_TABLES.iter().map(|s| (*s).to_string()))
         .chain(OPERATOR_TABLES.iter().map(|s| (*s).to_string()))
         .chain(CUSTODIAN_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(PASSKEY_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()

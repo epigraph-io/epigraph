@@ -216,6 +216,22 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          pair is the template), 123 grants DELETE to nobody, and the update guard admits \
          only the one revoke.",
     ),
+    (
+        "passkey_enrollments",
+        "DELETE",
+        "An enrollment ticket (124) is never deleted: it ends by expiring or by its one \
+         consumption, and the passkey it admitted names it (ON DELETE RESTRICT). Under FORCE \
+         the absent DELETE policy default-denies every non-superuser role, and 124 grants \
+         DELETE to nobody.",
+    ),
+    (
+        "person_authenticators",
+        "DELETE",
+        "A passkey (124) is ended by its revoke stamp, never deleted: the row is the record \
+         of what the human could assert with, and later ceremonies' evidence names it. Under \
+         FORCE the absent DELETE policy default-denies every non-superuser role, and 124 \
+         grants DELETE to nobody.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -278,6 +294,8 @@ const PROTECTED: &[&str] = &[
     "evidence_visibility_pins",
     "platform_roles",
     "role_assignments",
+    "passkey_enrollments",
+    "person_authenticators",
 ];
 
 // ===========================================================================
