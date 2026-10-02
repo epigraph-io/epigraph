@@ -646,7 +646,11 @@ before arming.
   `--exclude-agents-file` ids, and agents that authored a claim within
   `--quiet-days` (30; they may still be running and want a live link), and
   agents holding write authority in a group the operator does not write
-  (`foreign_write_authority`: they act in someone else's group). `--operator`
+  (`foreign_write_authority`: they act in someone else's group), and, from
+  migration 123, principals still holding an un-ended, un-lapsed role
+  assignment (`role_holder`: typically a departed holder whose registration
+  was revoked; end the assignment with `end-role-assignment` and re-run, which
+  links it then). `--operator`
   is always explicit, and a run ties EVERY untied candidate to that one operator
   (there is no include list): with many humans, scope each run with
   `--exclude-agents-file` listing every agent that is not that human's (a later

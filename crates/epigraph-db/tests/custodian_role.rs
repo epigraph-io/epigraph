@@ -567,6 +567,134 @@ async fn a_concurrent_grant_and_link_see_each_other(pool: PgPool) {
     assert_eq!(holding_and_links(&pool, ser).await, (1, 0));
 }
 
+/// The legacy bulk link (`epigraph_link_legacy_authors`) skips a principal
+/// whose assignment the role-holder link guard would refuse to see linked,
+/// as `skipped:role_holder`, instead of letting that guard's `CUS01` roll the
+/// WHOLE call back (review R2-OQ-SEC-3 / R2-OQ-TST-1). The case: a holder
+/// whose human registration and client were revoked while nobody ended its
+/// assignment is no longer "a registered human", so the bulk link took it as
+/// a candidate; review measured the call abort and link nothing, the plain
+/// legacy author included.
+///
+/// The skip uses the guard's own predicate: an un-ended assignment, live or
+/// not yet begun, blocks; a LAPSED one (past `valid_to`) does not, so that
+/// former holder is linked.
+///
+/// Verified to fail: the `skipped:role_holder` arm removed -> the call
+/// aborts `CUS01`; its lapse clause removed -> the lapsed holder is skipped;
+/// its `revoked_at IS NULL` test removed -> the ended holder is skipped.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_departed_holder_never_aborts_the_legacy_bulk_link(pool: PgPool) {
+    let (operator, _) = fixture::seed_human_operator(&pool, "bulk-operator").await;
+    let (custodian, _) = fixture::seed_human_operator(&pool, "bulk-custodian").await;
+    maint_insert(&pool, CUSTODIAN, custodian, "0", None, None)
+        .await
+        .expect("bootstrap custodian");
+    let (live, _) = fixture::seed_human_operator(&pool, "departed-live").await;
+    let (future, _) = fixture::seed_human_operator(&pool, "departed-future").await;
+    let (lapsed, _) = fixture::seed_human_operator(&pool, "departed-lapsed").await;
+    let (ended, _) = fixture::seed_human_operator(&pool, "departed-ended").await;
+    maint_insert(&pool, AUDITOR, live, "0", None, Some(custodian))
+        .await
+        .expect("a live auditor");
+    maint_insert(&pool, AUDITOR, future, "1 day", None, Some(custodian))
+        .await
+        .expect("an auditor from tomorrow");
+    maint_insert(
+        &pool,
+        AUDITOR,
+        lapsed,
+        "0",
+        Some("1 second"),
+        Some(custodian),
+    )
+    .await
+    .expect("an auditor for one second");
+    let ended_asg = maint_insert(&pool, AUDITOR, ended, "0", None, Some(custodian))
+        .await
+        .expect("an auditor, ended below");
+    assert!(end_role(&pool, ended_asg).await.expect("end"), "ended");
+    let plain = bare_agent(&pool).await;
+    for who in [live, future, lapsed, ended, plain] {
+        fixture::seed_public_claim(&pool, who, &format!("legacy claim by {who}")).await;
+    }
+    // They leave: registration and client revoked, assignments NOT ended.
+    for who in [live, future, lapsed, ended] {
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            sqlx::query("SELECT * FROM public.epigraph_revoke_human_operator($1, 'departed')")
+                .bind(who)
+                .execute(&mut *conn)
+                .await
+                .expect("revoke the registration");
+            (conn, ())
+        })
+        .await;
+        sqlx::query("UPDATE oauth_clients SET status = 'revoked' WHERE agent_id = $1")
+            .bind(who)
+            .execute(&pool)
+            .await
+            .expect("revoke the client");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let un_ended: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM role_assignments \
+          WHERE holder_person_id = ANY($1) AND revoked_at IS NULL",
+    )
+    .bind(vec![live, future, lapsed])
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        un_ended, 3,
+        "PREMISE: the departed holders' rows are un-ended"
+    );
+
+    let rows: Result<Vec<(Uuid, String)>, sqlx::Error> =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let r = sqlx::query_as(
+                "SELECT agent_id, outcome FROM public.epigraph_link_legacy_authors($1, '{}', NULL)",
+            )
+            .bind(operator)
+            .fetch_all(&mut *conn)
+            .await;
+            (conn, r)
+        })
+        .await;
+    let rows = rows.expect("the bulk link completes; one departed holder never aborts it");
+    let outcome = |who: Uuid| {
+        rows.iter()
+            .find(|(a, _)| *a == who)
+            .map(|(_, o)| o.clone())
+            .unwrap_or_else(|| panic!("{who} is a candidate: {rows:?}"))
+    };
+    for (who, expected, what) in [
+        (live, "skipped:role_holder", "a departed live holder"),
+        (
+            future,
+            "skipped:role_holder",
+            "a departed not-yet-begun holder",
+        ),
+        (
+            lapsed,
+            "linked",
+            "a departed holder whose assignment lapsed",
+        ),
+        (
+            ended,
+            "linked",
+            "a departed holder whose assignment was ended",
+        ),
+        (plain, "linked", "a plain legacy author"),
+    ] {
+        assert_eq!(outcome(who), expected, "{what}");
+    }
+    assert_eq!(
+        holding_and_links(&pool, live).await,
+        (1, 0),
+        "the skipped holder is untouched"
+    );
+}
+
 // =====================================================================
 // T2. Assignments are append-only.
 // =====================================================================
@@ -2630,6 +2758,7 @@ const RESTORED: &[&str] = &[
     "public.epigraph_require_writer_scope(uuid, uuid)",
     "public.epigraph_require_attributable(uuid, uuid, boolean)",
     "public.epigraph_claims_require_operator_binding()",
+    "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
 ];
 
 async fn functiondefs(pool: &PgPool) -> Vec<String> {

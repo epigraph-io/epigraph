@@ -1219,6 +1219,168 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_claims_require_operator_binding() FROM PUBLIC;
 
+-- 122's legacy-author bulk link; delta: the `skipped:role_holder` arm
+-- (review R2-OQ-SEC-3 / R2-OQ-TST-1). Its INSERT meets section 5's role-holder
+-- link guard, and a CUS01 raised there is not caught per agent, so ONE
+-- candidate holding an un-ended, un-lapsed assignment rolled the WHOLE call
+-- back, every other legacy author with it. Such a candidate exists: a holder
+-- whose human registration (or client) was revoked while nobody ended its
+-- assignment is no longer a registered human, so 122's
+-- `skipped:human_operator` arm does not take it. The arm below classifies it
+-- by the guard's own predicate before the INSERT; its assignment still ends
+-- through `epigraph-operator end-role-assignment` (audited), and a re-run
+-- links it then. Owner and grants are 122's (CREATE OR REPLACE keeps both).
+CREATE OR REPLACE FUNCTION public.epigraph_link_legacy_authors(
+    p_operator    uuid,
+    p_exclude     uuid[] DEFAULT '{}',
+    p_quiet_since timestamptz DEFAULT NULL)
+RETURNS TABLE (agent_id uuid, outcome text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+#variable_conflict use_column
+DECLARE
+    v_group      uuid;
+    v_agent      uuid;
+    v_outcome    text;
+    v_counts     jsonb := '{}'::jsonb;
+    v_candidates integer := 0;
+    v_linked     integer := 0;
+    v_rows       integer;
+BEGIN
+    IF p_operator IS NULL THEN
+        RAISE EXCEPTION 'epigraph_link_legacy_authors: the operator is required'
+            USING ERRCODE = '22004';
+    END IF;
+    p_exclude := COALESCE(p_exclude, '{}');
+    IF array_position(p_exclude, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'epigraph_link_legacy_authors: the exclusion set contains a NULL'
+            USING ERRCODE = '22004';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+    IF NOT EXISTS (SELECT 1 FROM public.agents a WHERE a.id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_legacy_authors: operator % does not exist', p_operator
+            USING ERRCODE = '22023';
+    END IF;
+    IF NOT public.epigraph_is_human_operator(p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_legacy_authors: % is not a human operator (a live '
+                        'human_operators row and an active human OAuth client are both '
+                        'required); legacy authors are tied to a human or not at all', p_operator
+            USING ERRCODE = '55000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_legacy_authors: % is itself operated by another agent '
+                        'and cannot be an operator', p_operator
+            USING ERRCODE = '55000';
+    END IF;
+    -- No operator-side shared-signer fingerprint here (107 section 9 has one):
+    -- the operator was just proven a registered human operator, which no
+    -- shared HTTP signer is, and the OPERATED_BY edges that fingerprint counts
+    -- are writable by any application session. Counting them let any session
+    -- block every legacy tie to a human by forging two edges from it (review
+    -- SEC-5).
+
+    -- The operator's personal group, through 105's definer (RVK01 / RVK02
+    -- abort the call before anything is written).
+    v_group := public.epigraph_ensure_personal_group(p_operator);
+    PERFORM 1 FROM public.groups g WHERE g.id = v_group FOR UPDATE;
+
+    FOR v_agent IN
+        SELECT x.id
+          FROM (SELECT c.agent_id AS id FROM public.claims c
+                UNION SELECT v.signer_id FROM public.evidence v
+                UNION SELECT cv.created_by FROM public.claim_versions cv
+                UNION SELECT mf.source_agent_id FROM public.mass_functions mf
+                UNION SELECT ch.challenger_id FROM public.challenges ch
+                UNION SELECT ch.resolved_by FROM public.challenges ch
+                UNION SELECT r.revoked_by FROM public.claim_signature_revocations r
+                UNION SELECT p.owner_agent_id FROM public.perspectives p
+                UNION SELECT re.agent_id FROM public.recall_events re) x
+          JOIN public.agents a ON a.id = x.id
+         WHERE x.id <> p_operator
+           AND NOT EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = x.id)
+         ORDER BY x.id
+    LOOP
+        v_candidates := v_candidates + 1;
+        v_outcome := CASE
+            WHEN v_agent = ANY (p_exclude) THEN 'skipped:excluded'
+            WHEN public.epigraph_is_human_operator(v_agent) THEN 'skipped:human_operator'
+            -- 123's delta: the role-holder link guard's own predicate (an
+            -- un-ended assignment that has not lapsed), so a holder that is no
+            -- longer a registered human is skipped, not linked into CUS01.
+            WHEN EXISTS (SELECT 1 FROM public.role_assignments ra
+                          WHERE ra.holder_person_id = v_agent
+                            AND ra.revoked_at IS NULL
+                            AND (ra.valid_to IS NULL OR ra.valid_to > clock_timestamp()))
+                THEN 'skipped:role_holder'
+            WHEN EXISTS (SELECT 1 FROM public.oauth_clients c
+                          WHERE c.agent_id = v_agent AND c.status <> 'revoked')
+                THEN 'skipped:oauth_principal'
+            WHEN EXISTS (SELECT 1 FROM public.group_memberships m
+                          WHERE m.group_id = v_group AND m.agent_id = v_agent
+                            AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin'))
+                THEN 'skipped:write_authority'
+            WHEN EXISTS (SELECT 1 FROM public.group_memberships m
+                           JOIN public.groups g ON g.id = m.group_id
+                          WHERE m.agent_id = v_agent
+                            AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin')
+                            AND NOT (g.kind = 'personal' AND g.created_by_agent_id = v_agent)
+                            AND NOT public.epigraph_operator_writes_group(p_operator, m.group_id))
+                THEN 'skipped:foreign_write_authority'
+            WHEN (SELECT count(DISTINCT e.target_id) FROM public.edges e
+                   WHERE e.source_id = v_agent AND e.relationship = 'OPERATED_BY') > 1
+                THEN 'skipped:shared_signer'
+            WHEN EXISTS (SELECT 1 FROM public.edges e
+                          WHERE e.source_id = v_agent AND e.relationship = 'OPERATED_BY'
+                            AND e.target_id <> p_operator
+                            AND public.epigraph_is_human_operator(e.target_id))
+                THEN 'skipped:operated_by_other_human'
+            WHEN p_quiet_since IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM public.claims c
+                              WHERE c.agent_id = v_agent AND c.created_at >= p_quiet_since)
+                THEN 'skipped:recent_writer'
+            ELSE 'linked'
+        END;
+
+        IF v_outcome = 'linked' THEN
+            INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id, retired)
+            VALUES (v_agent, p_operator, v_group, true)
+            ON CONFLICT (agent_id) DO NOTHING;
+            GET DIAGNOSTICS v_rows = ROW_COUNT;
+            IF v_rows = 0 THEN
+                v_outcome := 'skipped:raced';
+            ELSE
+                v_linked := v_linked + 1;
+                INSERT INTO public.edges (source_id, source_type, target_id, target_type,
+                                          relationship, properties)
+                SELECT v_agent, 'agent', p_operator, 'agent', 'OPERATED_BY',
+                       jsonb_build_object('source', 'epigraph_link_legacy_authors')
+                 WHERE NOT EXISTS (SELECT 1 FROM public.edges e
+                                    WHERE e.source_id = v_agent AND e.target_id = p_operator
+                                      AND e.relationship = 'OPERATED_BY');
+            END IF;
+        END IF;
+
+        v_counts := jsonb_set(v_counts, ARRAY[v_outcome],
+                              to_jsonb(COALESCE((v_counts ->> v_outcome)::integer, 0) + 1));
+        agent_id := v_agent;
+        outcome := v_outcome;
+        RETURN NEXT;
+    END LOOP;
+
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('operator.legacy_authors_linked', p_operator, true,
+            jsonb_build_object('operator_id', p_operator,
+                               'operator_group_id', v_group,
+                               'candidates', v_candidates,
+                               'linked', v_linked,
+                               'outcomes', v_counts,
+                               'excluded', cardinality(p_exclude),
+                               'quiet_since', p_quiet_since,
+                               'recorded_by', session_user));
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_link_legacy_authors(uuid, uuid[], timestamptz)
+    FROM PUBLIC;
+
 -- ===================================================================
 -- OWNERSHIP AND GRANTS (guarded, as every such block since 060 is)
 --
