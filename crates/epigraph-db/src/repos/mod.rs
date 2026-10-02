@@ -104,7 +104,10 @@ pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;
-pub use elevation_ceremony::{ElevationCeremony, EndReason, TicketMode};
+pub use elevation_ceremony::{
+    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, TicketMode,
+    TicketPasskey,
+};
 pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventRepository, EventRow};

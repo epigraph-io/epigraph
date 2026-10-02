@@ -190,6 +190,7 @@ struct Credential {
 pub struct SoftAuthenticator {
     aaguid: Uuid,
     synced: bool,
+    not_backed_up: bool,
     counting: bool,
     counter: u32,
     credentials: Vec<Credential>,
@@ -225,6 +226,7 @@ impl SoftAuthenticator {
         Self {
             aaguid,
             synced: true,
+            not_backed_up: false,
             counting: false,
             counter: 0,
             credentials: Vec::new(),
@@ -235,6 +237,16 @@ impl SoftAuthenticator {
     #[must_use]
     pub fn hardware(mut self) -> Self {
         self.synced = false;
+        self
+    }
+
+    /// Backup-ELIGIBLE but not (yet) backed up: BE set, BS clear. The one
+    /// flag combination that lets a credential registered device-bound
+    /// "upgrade" to backup-eligible past webauthn-rs's passkey path (BS on a
+    /// non-eligible credential it refuses itself).
+    #[must_use]
+    pub fn eligible_not_backed_up(mut self) -> Self {
+        self.not_backed_up = true;
         self
     }
 
@@ -264,7 +276,10 @@ impl SoftAuthenticator {
             f |= UV;
         }
         if synced {
-            f |= BE | BS;
+            f |= BE;
+            if !self.not_backed_up {
+                f |= BS;
+            }
         }
         f
     }

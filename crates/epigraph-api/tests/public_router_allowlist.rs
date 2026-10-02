@@ -79,7 +79,15 @@ const PUBLIC_ALLOWLIST: &[&str] = &["/health", "/api/v1/openapi.json"];
 /// from the binary, served here because the page's CSP admits script and style
 /// from its own origin only. `db` only: the ceremony needs the database.
 ///
-/// Seven application routes + the 11 OAuth/discovery routes = 18 paths
+/// The ELEVATION ceremony (plan EL-5) is anonymous for the same reason: the
+/// human opens `/elevate/<ticket>` on the device that holds the passkey, with
+/// no bearer token to present. The ticket id (random, live for at most 5
+/// minutes, asserted once) and the passkey are its credentials; every handler
+/// reads only that one ticket through migration 125's ceremony definers, the
+/// challenge allows only the TICKET person's live passkeys, nothing here mints
+/// a token, and all of it answers 503 when no relying party is configured.
+///
+/// Eleven application routes + the 11 OAuth/discovery routes = 22 paths
 /// reachable with no `Authorization` header.
 const PUBLIC_ALLOWLIST_DB: &[&str] = &[
     "/health",
@@ -89,6 +97,10 @@ const PUBLIC_ALLOWLIST_DB: &[&str] = &[
     "/elevate/enroll/:id/finish",
     "/elevate/assets/enroll.js",
     "/elevate/assets/elevate.css",
+    "/elevate/:ticket",
+    "/elevate/:ticket/challenge",
+    "/elevate/:ticket/assert",
+    "/elevate/assets/elevate.js",
 ];
 
 /// The OAuth/discovery router, `db` variant. Anonymous by construction —
@@ -613,7 +625,8 @@ async fn allowlisted_routes_still_answer_anonymously() {
     }
 }
 
-/// The enrollment ceremony is reachable with no credential, and on a server
+/// The enrollment and elevation ceremonies are reachable with no credential,
+/// and on a server
 /// with no relying party configured (as `spawn_app` builds it) it answers 503,
 /// never 401 and never a page: fail closed, without pretending the route needs
 /// a token it can never have. The assets are static and answer 200.
@@ -627,6 +640,9 @@ async fn the_enrollment_ceremony_answers_anonymously() {
         ("GET", format!("/elevate/enroll/{id}")),
         ("POST", format!("/elevate/enroll/{id}/challenge")),
         ("POST", format!("/elevate/enroll/{id}/finish")),
+        ("GET", format!("/elevate/{id}")),
+        ("POST", format!("/elevate/{id}/challenge")),
+        ("POST", format!("/elevate/{id}/assert")),
     ] {
         let req = if method == "GET" {
             client.get(format!("http://{addr}{path}"))
@@ -640,7 +656,11 @@ async fn the_enrollment_ceremony_answers_anonymously() {
             "{method} {path}: an unconfigured relying party is 503, anonymously"
         );
     }
-    for path in ["/elevate/assets/enroll.js", "/elevate/assets/elevate.css"] {
+    for path in [
+        "/elevate/assets/enroll.js",
+        "/elevate/assets/elevate.css",
+        "/elevate/assets/elevate.js",
+    ] {
         let resp = client
             .get(format!("http://{addr}{path}"))
             .send()

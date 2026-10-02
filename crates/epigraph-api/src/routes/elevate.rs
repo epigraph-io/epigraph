@@ -1,4 +1,8 @@
-//! The passkey enrollment ceremony (elevation plan EL-3; operator ruling D5).
+//! The two passkey ceremonies served by the API itself: registering a passkey
+//! (elevation plan EL-3; operator ruling D5) and confirming an elevation with
+//! one (EL-5; ruling D2).
+//!
+//! # Enrollment: `/elevate/enroll/:id`
 //!
 //! `epigraph-operator passkey-enroll` opens an enrollment ticket on the
 //! maintenance DSN and prints its path, `/elevate/enroll/<id>`. The operator
@@ -7,20 +11,45 @@
 //! it back; this module verifies it with `epigraph-passkey` and records it
 //! through migration 124's completion definer.
 //!
+//! # Elevation: `/elevate/:ticket`
+//!
+//! `POST /api/v1/elevation/tickets` (`routes/elevation.rs`) opens a ticket for
+//! a human holding a live elevating-role assignment. Its page shows what is
+//! being confirmed (the reason, the client, the refresh family, the expiry);
+//! the challenge allows only the TICKET person's live passkeys, with user
+//! verification required; the assertion is verified with the library against
+//! those passkeys and handed to migration 125's confirm definer, which opens
+//! the session (at most 15 minutes) or RETURNS an audited refusal. The
+//! signature counter is the definer's to check (under its row lock, with an
+//! audit row), not the library's: the challenge is started with
+//! `Passkeys::start_authentication_deferring_counter`.
+//!
+//! An assertion naming a credential that is NOT one of the ticket person's
+//! live passkeys (unknown, another person's: the confused deputy, or revoked)
+//! cannot be verified here (no key is served for it), and is still handed to
+//! the definer so the refusal is audited (`platform.elevation_refused`) and the
+//! ticket burned: its evidence is marked unverified (the offline verifier
+//! flags it by design), and it runs in a transaction that is ROLLED BACK if the
+//! definer would ever confirm it, so an unverified assertion never opens a
+//! session. A malformed body, or an assertion by a live credential the library
+//! refuses (signature, origin, user verification), is a 400 that leaves the
+//! ticket live for a retry.
+//!
 //! # Unauthenticated by design
 //!
 //! These routes are on the PUBLIC router (`tests/public_router_allowlist.rs`
 //! names each with its reason). The page has no bearer token to present: the
-//! enrollment id (a random UUID, live for at most 15 minutes, consumed once)
-//! and the authenticator are its credentials. Every handler reads the
-//! enrollment through the ceremony definers, keyed by that id, on an
-//! UNSTAMPED application connection; none enumerates anything.
+//! id in its URL (a random UUID, live for at most 15 minutes for an
+//! enrollment and 5 for a ticket, used once) and the authenticator are its
+//! credentials. Every handler reads through the ceremony definers, keyed by
+//! that id, on an UNSTAMPED application connection; none enumerates anything.
 //!
-//! # What the page is careful about
+//! # What the pages are careful about
 //!
-//! * Every string from the database (the reason, the label) is HTML-escaped.
+//! * Every string from the database (the reason, the label, the client name)
+//!   is HTML-escaped.
 //! * A strict Content-Security-Policy ([`CSP`]): no inline script or style, no
-//!   framing, no form posts; the script and stylesheet are served from this
+//!   framing, no form posts; the scripts and stylesheet are served from this
 //!   binary (`include_str!`).
 //! * The URL carries the capability, so every response says
 //!   `Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
@@ -30,10 +59,11 @@
 //! With no relying party configured (`AppState::passkeys` is `None`), every
 //! route here answers 503: fail closed, never a default rp id.
 
-// UNSCOPED-POOL-EXEMPT: Pre-authentication. The enrollment page is anonymous by
-// design (the enrollment id and the authenticator are its credentials), so no
-// principal exists to stamp a connection from; each site calls one of
-// migration 124's ceremony definers keyed by that id, which need no stamp.
+// UNSCOPED-POOL-EXEMPT: Pre-authentication. The ceremony pages are anonymous by
+// design (the enrollment or ticket id and the authenticator are their
+// credentials), so no principal exists to stamp a connection from; each site
+// calls one of migration 124's or 125's ceremony definers keyed by that id,
+// which need no stamp.
 
 use std::sync::Arc;
 
@@ -44,8 +74,15 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use epigraph_db::{CeremonyEnrollment, DbError, PasskeyCeremony, VerifiedPasskey};
-use epigraph_passkey::{PasskeyError, Passkeys, RegistrationState};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use epigraph_db::{
+    AssertedCredential, CeremonyEnrollment, CeremonyTicket, Confirmation, DbError,
+    ElevationCeremony, PasskeyCeremony, VerifiedPasskey,
+};
+use epigraph_passkey::{
+    AuthenticationState, PasskeyError, Passkeys, RegistrationState, StoredPasskey,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -61,10 +98,14 @@ pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; 
 
 /// The enrollment page's script, served at [`ENROLL_JS_PATH`].
 pub const ENROLL_JS: &str = include_str!("elevate/enroll.js");
+/// The elevation page's script, served at [`ELEVATE_JS_PATH`].
+pub const ELEVATE_JS: &str = include_str!("elevate/elevate.js");
 /// The ceremony pages' stylesheet, served at [`CSS_PATH`].
 pub const CSS: &str = include_str!("elevate/elevate.css");
-/// Where the script is served.
+/// Where the enrollment script is served.
 pub const ENROLL_JS_PATH: &str = "/elevate/assets/enroll.js";
+/// Where the elevation script is served.
+pub const ELEVATE_JS_PATH: &str = "/elevate/assets/elevate.js";
 /// Where the stylesheet is served.
 pub const CSS_PATH: &str = "/elevate/assets/elevate.css";
 
@@ -368,6 +409,370 @@ pub async fn enroll_finish(
             _ => internal("record the passkey", &err),
         },
     }
+}
+
+// =====================================================================
+// The elevation ceremony (EL-5): `/elevate/:ticket`
+// =====================================================================
+
+fn ticket_not_live() -> Response {
+    json_error(
+        StatusCode::NOT_FOUND,
+        "ticket_not_live",
+        "no live elevation ticket with this id: it is unknown, expired or already used; ask \
+         for a new one",
+    )
+}
+
+/// An unstamped application connection for a ceremony definer.
+async fn ceremony_conn(
+    state: &AppState,
+) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, Box<Response>> {
+    state
+        .db_pool
+        .acquire()
+        .await
+        .map_err(|e| Box::new(internal("acquire", &e)))
+}
+
+/// Read the live ticket `id`. The refusal is the response to send, boxed.
+async fn live_ticket(
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+) -> Result<CeremonyTicket, Box<Response>> {
+    match ElevationCeremony::live_ticket(conn, id).await {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) => Err(Box::new(ticket_not_live())),
+        Err(e) => Err(Box::new(internal("read the ticket", &e))),
+    }
+}
+
+/// What a confirmed ticket means for whoever asked for it.
+fn mode_text(mode: &str) -> &'static str {
+    if mode == "connector" {
+        "this connector's conversations on the session family below"
+    } else {
+        "one token for the command line or console that asked, redeemed once"
+    }
+}
+
+/// The elevation page.
+fn render_ticket_page(id: Uuid, t: &CeremonyTicket) -> String {
+    let family = t.family_id.simple().to_string();
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Confirm an elevation</title>
+<link rel="stylesheet" href="{css}">
+</head>
+<body>
+<main id="ceremony" data-ticket="{id}">
+<h1>Confirm an elevation</h1>
+<p>A session signed in as the principal below asked to ELEVATE: for at most 15
+minutes it may READ every group's data on this instance (it cannot write while
+elevated), and every elevated read is logged for the people whose data it
+reads. Confirming asks your passkey to verify you (PIN or biometric).</p>
+<dl>
+<dt>Principal</dt><dd><code>{person}</code></dd>
+<dt>Reason</dt><dd id="reason">{reason}</dd>
+<dt>Client</dt><dd id="client">{client}</dd>
+<dt>Session family</dt><dd><code>{family_short}</code></dd>
+<dt>Elevates</dt><dd>{mode}</dd>
+<dt>Ticket expires</dt><dd>{expires}</dd>
+</dl>
+<p>Only confirm if you asked for this yourself, just now.</p>
+<button id="confirm" type="button">Confirm with passkey</button>
+<p id="status" role="status" aria-live="polite"></p>
+</main>
+<script src="{js}"></script>
+</body>
+</html>
+"#,
+        css = CSS_PATH,
+        js = ELEVATE_JS_PATH,
+        id = id,
+        person = t.person_agent_id,
+        reason = html_escape(&t.reason),
+        client = html_escape(&t.client_name),
+        family_short = &family[..8],
+        mode = mode_text(&t.mode),
+        expires = t.expires_at.format("%Y-%m-%d %H:%M:%S UTC"),
+    )
+}
+
+/// `GET /elevate/:ticket`: the elevation page.
+pub async fn ticket_page(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    if passkeys(&state).is_none() {
+        return not_configured();
+    }
+    let mut conn = match ceremony_conn(&state).await {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    let t = match live_ticket(&mut conn, id).await {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+    let mut resp = (StatusCode::OK, render_ticket_page(id, &t)).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    harden(resp)
+}
+
+/// `POST /elevate/:ticket/challenge`: start (or restart) the assertion. Only
+/// the ticket person's live passkeys are allowed; user verification is
+/// required; the counter is left to the confirm definer.
+pub async fn ticket_challenge(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    let Some(rp) = passkeys(&state) else {
+        return not_configured();
+    };
+    let mut conn = match ceremony_conn(&state).await {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = live_ticket(&mut conn, id).await {
+        return *resp;
+    }
+    let keys = match ElevationCeremony::passkeys(&mut conn, id).await {
+        Ok(k) => k,
+        Err(e) => return internal("read the ticket's passkeys", &e),
+    };
+    if keys.is_empty() {
+        return json_error(
+            StatusCode::CONFLICT,
+            "no_live_passkey",
+            "the person this ticket is for has no live passkey",
+        );
+    }
+    // The counter overlay is irrelevant here (the deferring start takes every
+    // counter as 0); the confirm definer compares the asserted counter with
+    // the stored one under its row lock.
+    let stored: Vec<StoredPasskey> = keys
+        .into_iter()
+        .map(|k| StoredPasskey {
+            passkey: k.passkey,
+            sign_count: 0,
+        })
+        .collect();
+    let (options, ceremony) = match rp.start_authentication_deferring_counter(&stored, None) {
+        Ok(v) => v,
+        Err(e) => return internal("start the assertion", &e),
+    };
+    match ElevationCeremony::store_challenge(&mut conn, id, &ceremony.to_json()).await {
+        Ok(()) => harden((StatusCode::OK, Json(options)).into_response()),
+        Err(e) if sqlstate(&e).as_deref() == Some("ELV06") => ticket_not_live(),
+        Err(e) => internal("store the challenge", &e),
+    }
+}
+
+/// The response to a confirm definer's answer.
+fn confirmation_response(id: Uuid, mode: &str, c: &Confirmation) -> Response {
+    if c.outcome == "confirmed" {
+        tracing::info!(
+            target: "elevate.ticket",
+            ticket = %id,
+            session = ?c.session_id,
+            "elevation confirmed"
+        );
+        let next = if mode == "connector" {
+            "Elevated. Return to your conversation."
+        } else {
+            "Elevated. Return to the command line: its waiting token request completes now."
+        };
+        harden(
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "outcome": "confirmed",
+                    "expires_at": c.expires_at,
+                    "detail": next,
+                })),
+            )
+                .into_response(),
+        )
+    } else {
+        tracing::warn!(
+            target: "elevate.ticket",
+            ticket = %id,
+            refusal = ?c.refusal,
+            code = ?c.code,
+            "elevation refused"
+        );
+        harden(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "elevation_refused",
+                    "refusal": c.refusal,
+                    "code": c.code,
+                    "detail": "the elevation was refused and this ticket is used up",
+                })),
+            )
+                .into_response(),
+        )
+    }
+}
+
+/// A confirm definer's raised refusal (ELV06: the ticket stopped being live,
+/// or its family is already elevated), or a failure.
+fn confirm_failed(e: &DbError) -> Response {
+    if sqlstate(e).as_deref() == Some("ELV06") {
+        json_error(
+            StatusCode::CONFLICT,
+            "elevation_not_possible",
+            "the ticket is no longer live, or its session family is already elevated",
+        )
+    } else {
+        internal("record the assertion", e)
+    }
+}
+
+/// `POST /elevate/:ticket/assert`: verify the authenticator's response and
+/// record it (module docs: what is verified, what is only audited).
+pub async fn ticket_assert(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Bytes,
+) -> Response {
+    let Some(rp) = passkeys(&state) else {
+        return not_configured();
+    };
+    let mut conn = match ceremony_conn(&state).await {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    let t = match live_ticket(&mut conn, id).await {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+    let Some(stored) = t.challenge_state.clone() else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "no_ceremony_started",
+            "request a challenge for this ticket first",
+        );
+    };
+    let response: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "malformed_response",
+                err.to_string(),
+            )
+        }
+    };
+    let Some(raw_id) = response
+        .get("rawId")
+        .and_then(Value::as_str)
+        .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
+        .filter(|id| !id.is_empty())
+    else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "malformed_response",
+            "the response names no credential (rawId)",
+        );
+    };
+    let keys = match ElevationCeremony::passkeys(&mut conn, id).await {
+        Ok(k) => k,
+        Err(e) => return internal("read the ticket's passkeys", &e),
+    };
+    let ceremony = AuthenticationState::from_json(stored);
+
+    if keys.iter().any(|k| k.credential_id == raw_id) {
+        // One of the ticket person's live passkeys: the library verifies it,
+        // and a refusal leaves the ticket live.
+        let a = match rp.finish_authentication(&response, &ceremony) {
+            Ok(a) => a,
+            Err(err) => {
+                tracing::warn!(
+                    target: "elevate.ticket",
+                    ticket = %id,
+                    error = %err,
+                    "assertion refused by the WebAuthn library"
+                );
+                let code = match err {
+                    PasskeyError::UserNotVerified => "user_not_verified",
+                    PasskeyError::State(_) => "ceremony_state_unusable",
+                    PasskeyError::Malformed { .. } => "malformed_response",
+                    _ => "assertion_refused",
+                };
+                return json_error(StatusCode::BAD_REQUEST, code, err.to_string());
+            }
+        };
+        let asserted = AssertedCredential {
+            credential_id: &a.credential_id,
+            counter: i64::from(a.counter),
+            backup_eligible: a.backup_eligible,
+            evidence: &a.evidence,
+        };
+        return match ElevationCeremony::confirm(&mut conn, id, asserted).await {
+            Ok(c) => confirmation_response(id, &t.mode, &c),
+            Err(e) => confirm_failed(&e),
+        };
+    }
+
+    // Not one of the ticket person's live passkeys: nothing to verify it with.
+    // Handed to the definer so the refusal is audited and the ticket burned,
+    // in a transaction rolled back should the definer ever confirm it.
+    let evidence = json!({
+        "v": 1,
+        "challenge": ceremony.challenge().ok().map(|c| URL_SAFE_NO_PAD.encode(c)),
+        "response": response,
+        "verified": false,
+        "unverified_reason": "the credential is not one of the ticket person's live passkeys; \
+                              the server held no key to verify it with",
+    });
+    let asserted = AssertedCredential {
+        credential_id: &raw_id,
+        counter: 0,
+        backup_eligible: false,
+        evidence: &evidence,
+    };
+    let mut tx = match sqlx::Connection::begin(&mut *conn).await {
+        Ok(tx) => tx,
+        Err(e) => return internal("begin", &e),
+    };
+    let c = match ElevationCeremony::confirm(&mut tx, id, asserted).await {
+        Ok(c) => c,
+        Err(e) => return confirm_failed(&e),
+    };
+    if c.outcome != "refused" {
+        // Never commit an unverified confirmation (a passkey registered between
+        // the read above and the definer's lock).
+        let _ = tx.rollback().await;
+        tracing::error!(
+            target: "elevate.ticket",
+            ticket = %id,
+            "an unverified assertion would have been confirmed; rolled back"
+        );
+        return json_error(
+            StatusCode::CONFLICT,
+            "retry",
+            "the ticket's passkeys changed during the ceremony; request a new challenge",
+        );
+    }
+    if let Err(e) = tx.commit().await {
+        return internal("commit the refusal", &e);
+    }
+    confirmation_response(id, &t.mode, &c)
+}
+
+/// `GET /elevate/assets/elevate.js`.
+pub async fn elevate_js() -> Response {
+    let mut resp = (StatusCode::OK, ELEVATE_JS).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/javascript; charset=utf-8"),
+    );
+    harden(resp)
 }
 
 /// `GET /elevate/assets/enroll.js`.

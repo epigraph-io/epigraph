@@ -993,6 +993,15 @@ pub fn create_router(state: AppState) -> Router {
     // assets are static text from this binary, served here because the page's
     // CSP admits script and style from its own origin only. `db` variant only:
     // the ceremony needs the database.
+    //
+    // The ELEVATION ceremony (plan EL-5) is the same kind of surface: the human
+    // opens `/elevate/<ticket>` on the device that holds the passkey, again
+    // with no bearer token to present. The ticket id (random, live for at most
+    // 5 minutes, asserted once) and the passkey are its credentials; every
+    // handler reads only that one ticket through migration 125's ceremony
+    // definers, the challenge allows only the TICKET person's live passkeys,
+    // and nothing here mints a token (the elevate grant at `/oauth/token`
+    // does, against the ticket's redeem secret).
     let public = Router::new()
         .route("/health", get(health::health_check))
         .route(
@@ -1006,7 +1015,14 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/elevate/enroll/:id/finish", post(elevate::enroll_finish))
         .route("/elevate/assets/enroll.js", get(elevate::enroll_js))
-        .route("/elevate/assets/elevate.css", get(elevate::elevate_css));
+        .route("/elevate/assets/elevate.css", get(elevate::elevate_css))
+        .route("/elevate/:ticket", get(elevate::ticket_page))
+        .route(
+            "/elevate/:ticket/challenge",
+            post(elevate::ticket_challenge),
+        )
+        .route("/elevate/:ticket/assert", post(elevate::ticket_assert))
+        .route("/elevate/assets/elevate.js", get(elevate::elevate_js));
 
     // Layered on the allowlist: a request with no Authorization
     // header passes through, a request with a present-but-invalid token still

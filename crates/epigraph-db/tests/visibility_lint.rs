@@ -541,6 +541,37 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "elevation_ceremony.rs",
+        "live_ticket",
+        "READ of ONE ticket by id through migration 125's app-callable SECURITY DEFINER \
+         `epigraph_ticket_for_ceremony`, for the anonymous elevation page (EL-5): only that \
+         ticket's person, client, family, mode, reason, expiry and challenge, only while it is \
+         live, no secret, and it enumerates nothing. An authentication record about a principal, \
+         not a corpus row, and the page has no principal a Viewer could carry.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "passkeys",
+        "READ through 125's app-callable definer `epigraph_passkeys_for_ticket`: the TICKET \
+         person's live passkeys (the ceremony's allowCredentials and verifying keys), only while \
+         the ticket is live, never anyone else's. Authentication records, not corpus rows.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "store_challenge",
+        "WRITE through 125's app-callable definer `epigraph_set_elevation_ticket_challenge` (the \
+         ceremony state of one live ticket, by id); the table's guard refuses a non-live ticket \
+         (ELV06). Nothing for a viewer to filter.",
+    ),
+    (
+        "elevation_ceremony.rs",
+        "confirm",
+        "WRITE through 125's app-callable definer `epigraph_confirm_elevation`: an assertion over \
+         one live ticket, which opens a session or RETURNS an audited refusal. Every rule (the \
+         credential is the ticket person's, the counter, the backup flag, D2 re-checked at use) \
+         is the definer's and the tables'; nothing for a viewer to filter.",
+    ),
+    (
+        "elevation_ceremony.rs",
         "end",
         "WRITE through 125's principal-bound app-callable definer `epigraph_end_elevation`, on \
          the requester's STAMPED connection: it ends only the stamped principal's own live \

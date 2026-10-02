@@ -845,8 +845,9 @@ fn d3_the_only_unrestricted_shape_costs_a_lease() {
 /// D3, half three: the set of routes reachable with no `Authorization` header is
 /// an allowlist, in **both** `create_router` variants: two application routes,
 /// plus, in the `db` variant only, the passkey enrollment ceremony (elevation
-/// plan EL-3), which is anonymous by design (the enrollment id and the
-/// authenticator are its credentials; it needs the database).
+/// plan EL-3) and the elevation ceremony (EL-5), which are anonymous by design
+/// (the enrollment or ticket id and the authenticator are their credentials;
+/// they need the database).
 ///
 /// The `#[cfg(not(feature = "db"))]` variant is not built in any buildable
 /// configuration, so a source lint is the only mechanism that covers it at all.
@@ -863,6 +864,10 @@ fn d3_anonymous_route_surface_is_the_allowlist() {
             "/elevate/enroll/:id/finish",
             "/elevate/assets/enroll.js",
             "/elevate/assets/elevate.css",
+            "/elevate/:ticket",
+            "/elevate/:ticket/challenge",
+            "/elevate/:ticket/assert",
+            "/elevate/assets/elevate.js",
         ])
         .collect();
 

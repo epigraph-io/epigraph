@@ -534,14 +534,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "routes/elevate.rs",
-        3,
+        4,
         "Pre-authentication, BY DESIGN rather than by sequence. The passkey enrollment ceremony \
          (elevation plan EL-3, migration 124) is a page the operator opens on the device that \
          holds the authenticator, with no bearer token to present: the enrollment id (random, \
          live for at most 15 minutes, consumed once) and the authenticator are its credentials, \
-         so there is no principal a Viewer could resolve and nothing to stamp. The three sites \
-         are one connection each for the reader, the challenge store and the completion, and \
-         each calls one of 124's ceremony definers, keyed by that id, which need no stamp: their \
+         so there is no principal a Viewer could resolve and nothing to stamp. The elevation \
+         ceremony (EL-5, migration 125) is the same: the ticket id (live for at most 5 minutes, \
+         asserted once) and the passkey are its credentials. Three sites are one connection each \
+         for the enrollment reader, challenge store and completion; the fourth is the one \
+         `ceremony_conn` acquire every ticket handler shares. Each calls one of 124's or 125's \
+         ceremony definers, keyed by that id, which need no stamp: their \
          SECURITY DEFINER frame is what the tables' policies admit, and the application role \
          holds no DML on either table. Unlike the OAuth entries this is not 'before a principal \
          is minted': no principal is ever minted here, which is why a later shard must not read \

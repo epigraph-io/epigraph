@@ -29,7 +29,7 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use support::{ClientUv, SoftAuthenticator, ORIGIN, RP_ID};
+use support::{hardware_bound, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -182,6 +182,19 @@ async fn family(pool: &PgPool, client: Uuid) -> Uuid {
 /// opened on a maintenance session (`epigraph-operator passkey-enroll`), then
 /// the page's challenge and finish over HTTP by `auth`.
 async fn enroll(pool: &PgPool, s: &Server, person: Uuid, auth: &mut SoftAuthenticator) {
+    enroll_with(pool, s, person, auth, Value::clone).await;
+}
+
+/// [`enroll`], with the authenticator's registration response passed through
+/// `shape` first (a packed attestation for an allowlist relying party, or a
+/// device-bound rewrite).
+async fn enroll_with(
+    pool: &PgPool,
+    s: &Server,
+    person: Uuid,
+    auth: &mut SoftAuthenticator,
+    shape: impl Fn(&Value) -> Value,
+) {
     let id = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
         let id: Uuid = sqlx::query_scalar(
             "SELECT public.epigraph_create_passkey_enrollment($1, 'elevation test', 'key')",
@@ -196,7 +209,7 @@ async fn enroll(pool: &PgPool, s: &Server, person: Uuid, auth: &mut SoftAuthenti
     let base = format!("/elevate/enroll/{id}");
     let (status, options) = s.post(&format!("{base}/challenge"), None, &json!({})).await;
     assert_eq!(status, StatusCode::OK, "enrollment challenge: {options}");
-    let response = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let response = shape(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
     let (status, body) = s.post(&format!("{base}/finish"), None, &response).await;
     assert_eq!(status, StatusCode::OK, "enrollment finish: {body}");
 }
@@ -580,4 +593,489 @@ async fn an_elevated_family_gets_no_second_ticket(pool: PgPool) {
     confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
     let (status, body) = s.open_ticket(&token, "second").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+// =====================================================================
+// The ceremony: /elevate/:ticket, /challenge, /assert
+// =====================================================================
+
+/// A grant-mode ticket for `p` (its id and redeem secret), through the API.
+async fn open(s: &Server, p: &Person, reason: &str) -> (Uuid, String) {
+    let (status, body) = s
+        .open_ticket(&s.human_token(p, Some(p.family), None), reason)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "ticket: {body}");
+    (
+        body["ticket_id"].as_str().unwrap().parse().unwrap(),
+        body["redeem_secret"].as_str().unwrap().to_string(),
+    )
+}
+
+impl Server {
+    async fn page(&self, ticket: Uuid) -> reqwest::Response {
+        self.http
+            .get(self.url(&format!("/elevate/{ticket}")))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn challenge(&self, ticket: Uuid) -> (StatusCode, Value) {
+        self.post(&format!("/elevate/{ticket}/challenge"), None, &json!({}))
+            .await
+    }
+
+    async fn options(&self, ticket: Uuid) -> Value {
+        let (status, options) = self.challenge(ticket).await;
+        assert_eq!(status, StatusCode::OK, "challenge: {options}");
+        options
+    }
+
+    async fn assert_raw(&self, ticket: Uuid, body: &str) -> (StatusCode, Value) {
+        let resp = self
+            .http
+            .post(self.url(&format!("/elevate/{ticket}/assert")))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn assert(&self, ticket: Uuid, response: &Value) -> (StatusCode, Value) {
+        self.assert_raw(ticket, &response.to_string()).await
+    }
+
+    /// The whole ceremony by `auth` over a fresh challenge.
+    async fn ceremony(&self, ticket: Uuid, auth: &mut SoftAuthenticator) -> (StatusCode, Value) {
+        let options = self.options(ticket).await;
+        let response = auth.authenticate(ORIGIN, options).await;
+        self.assert(ticket, &response).await
+    }
+}
+
+/// `(outcome, refusal, session_id)` of a ticket.
+async fn ticket_row(pool: &PgPool, ticket: Uuid) -> (Option<String>, Option<String>, Option<Uuid>) {
+    sqlx::query_as("SELECT outcome, refusal, session_id FROM elevation_tickets WHERE id = $1")
+        .bind(ticket)
+        .fetch_one(pool)
+        .await
+        .expect("the ticket")
+}
+
+async fn events(pool: &PgPool, event_type: &str, key: &str, id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = $1 AND details->>$2 = $3",
+    )
+    .bind(event_type)
+    .bind(key)
+    .bind(id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("events")
+}
+
+async fn sessions_of(pool: &PgPool, person: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM elevation_sessions WHERE person_agent_id = $1")
+        .bind(person)
+        .fetch_one(pool)
+        .await
+        .expect("count sessions")
+}
+
+/// The ceremony end to end: the page, a challenge allowing ONLY the ticket
+/// person's passkey with user verification required, the holder's assertion,
+/// a session on the ticket's family with `platform.elevated`, and the ticket
+/// used up (its page is gone).
+///
+/// Mutations: the confirm handed the library's counter as 0 or the BE flag as
+/// false are caught by the counter and BE tests below; the routes unregistered
+/// -> red here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ceremony_confirms_and_opens_a_session(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let (ticket, _) = open(&s, &p, "read a report").await;
+    assert_eq!(s.page(ticket).await.status(), StatusCode::OK);
+
+    let options = s.options(ticket).await;
+    assert_eq!(options["publicKey"]["userVerification"], "required");
+    let allowed: Vec<Vec<u8>> = options["publicKey"]["allowCredentials"]
+        .as_array()
+        .expect("allowCredentials")
+        .iter()
+        .map(|c| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                c["id"].as_str().unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(allowed, vec![credential_of(&pool, p.person).await]);
+
+    let response = auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.assert(ticket, &response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "confirmed");
+
+    let (outcome, _, session) = ticket_row(&pool, ticket).await;
+    assert_eq!(outcome.as_deref(), Some("confirmed"));
+    let session = session.expect("a session");
+    let (person, fam, mode): (Uuid, Uuid, String) = sqlx::query_as(
+        "SELECT person_agent_id, family_id, mode FROM elevation_sessions WHERE id = $1",
+    )
+    .bind(session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((person, fam, mode.as_str()), (p.person, p.family, "grant"));
+    assert_eq!(
+        events(&pool, "platform.elevated", "session_id", session).await,
+        1
+    );
+    assert_eq!(
+        s.page(ticket).await.status(),
+        StatusCode::NOT_FOUND,
+        "used up"
+    );
+}
+
+/// THE CONFUSED DEPUTY: P's passkey completing B's ticket (a hostile client
+/// ignoring `allowCredentials`) is REFUSED, the ticket is burned, no session
+/// opens for anyone, and `platform.elevation_refused` names the mismatch. B's
+/// own passkey cannot then complete the burned ticket.
+///
+/// Mutation: the assertion of a credential outside the ticket person's
+/// passkeys answered 400 without reaching the definer -> no refusal recorded,
+/// no event, and B's later assertion confirms.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_persons_passkey_is_refused_and_audited(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut p_auth = SoftAuthenticator::new(MODEL);
+    let _p = holder(&pool, &s, "custodian-p", &mut p_auth).await;
+    let mut b_auth = SoftAuthenticator::new(MODEL);
+    let b = holder(&pool, &s, "custodian-b", &mut b_auth).await;
+    let (ticket, _) = open(&s, &b, "B's request").await;
+
+    let mut options = s.options(ticket).await;
+    options["publicKey"]["allowCredentials"] = json!([]);
+    let response = p_auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.assert(ticket, &response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["refusal"], "person_mismatch");
+
+    let (outcome, refusal, session) = ticket_row(&pool, ticket).await;
+    assert_eq!(
+        (outcome.as_deref(), refusal.as_deref(), session),
+        (Some("refused"), Some("person_mismatch"), None)
+    );
+    assert_eq!(
+        events(&pool, "platform.elevation_refused", "ticket_id", ticket).await,
+        1
+    );
+    let evidence_verified: Option<bool> = sqlx::query_scalar(
+        "SELECT (assertion_evidence->>'verified')::boolean FROM elevation_tickets WHERE id = $1",
+    )
+    .bind(ticket)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(evidence_verified, Some(false), "recorded as unverified");
+
+    assert_eq!(
+        s.challenge(ticket).await.0,
+        StatusCode::NOT_FOUND,
+        "the burned ticket is not live"
+    );
+    let (status, _) = s.assert(ticket, &response).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "nor can it be asserted again"
+    );
+    let _ = &mut b_auth;
+    assert_eq!(sessions_of(&pool, b.person).await, 0);
+}
+
+/// ELV05 through the API: an authenticator that replays a counter the
+/// database already holds is refused AND audited
+/// (`platform.passkey_counter_regressed`), which needs the definer, not the
+/// library, to decide. Mutation: the challenge started COUNTED from the stored
+/// counter -> the library refuses first: 400, no event.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replayed_counter_is_refused_and_audited(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL).counting();
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let (first, _) = open(&s, &p, "first").await;
+    let (status, body) = s.ceremony(first, &mut auth).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: counter 1 confirms: {body}"
+    );
+    let (_, _, session) = ticket_row(&pool, first).await;
+    let (status, _) = s
+        .post(
+            "/api/v1/elevation/end",
+            Some(&s.human_token(&p, Some(p.family), None)),
+            &json!({ "elevation_id": session }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (second, _) = open(&s, &p, "second").await;
+    auth.set_counter(0); // the next assertion replays counter 1
+    let (status, body) = s.ceremony(second, &mut auth).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        (body["refusal"].as_str(), body["code"].as_str()),
+        (Some("counter_regressed"), Some("ELV05"))
+    );
+    assert_eq!(
+        events(
+            &pool,
+            "platform.passkey_counter_regressed",
+            "ticket_id",
+            second
+        )
+        .await,
+        1
+    );
+}
+
+/// A passkey registered DEVICE-BOUND (BE clear) that later asserts
+/// backup-eligible is refused, whichever layer catches it: BE with BS (backed
+/// up) the library refuses itself (400); BE WITHOUT BS the library's passkey
+/// path accepts as an "upgrade", so the asserted flag must reach the definer,
+/// which refuses (`backup_eligibility_changed`, 403, audited). No session
+/// either way.
+///
+/// Mutation: the confirm handed `backup_eligible: false` -> the BE-only case
+/// confirms.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_device_bound_passkey_asserting_backup_eligible_is_refused(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    for (label, auth, want_status, want_refusal) in [
+        (
+            "backed-up",
+            SoftAuthenticator::new(MODEL),
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+        (
+            "eligible-only",
+            SoftAuthenticator::new(MODEL).eligible_not_backed_up(),
+            StatusCode::FORBIDDEN,
+            Some("backup_eligibility_changed"),
+        ),
+    ] {
+        let mut auth = auth;
+        let p = person(&pool, label).await;
+        fixture::make_custodian(&pool, p.person).await;
+        enroll_with(&pool, &s, p.person, &mut auth, hardware_bound).await;
+        let stored_be: bool = sqlx::query_scalar(
+            "SELECT backup_eligible FROM person_authenticators WHERE person_agent_id = $1",
+        )
+        .bind(p.person)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!stored_be, "CALIBRATION: {label} registered device-bound");
+
+        let (ticket, _) = open(&s, &p, label).await;
+        let (status, body) = s.ceremony(ticket, &mut auth).await;
+        assert_eq!(status, want_status, "{label}: {body}");
+        assert_eq!(body["refusal"].as_str(), want_refusal, "{label}: {body}");
+        assert_eq!(sessions_of(&pool, p.person).await, 0, "{label}");
+    }
+}
+
+/// The protocol-level "no or garbage assertion" negative: an assertion before
+/// any challenge (409), a body that is not JSON or names no credential (400),
+/// and the holder's own assertion with a tampered signature (400, the
+/// library's refusal) each leave the ticket LIVE, unrefused and without a
+/// session; the genuine assertion then confirms.
+///
+/// Mutation: a library refusal falling through to the confirm definer -> the
+/// tampered assertion confirms (or burns) the ticket, and the genuine one
+/// does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_garbage_or_unverified_assertion_leaves_the_ticket_live(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let (ticket, _) = open(&s, &p, "garbage").await;
+
+    let (status, body) = s.assert(ticket, &json!({})).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("no_ceremony_started"))
+    );
+    let options = s.options(ticket).await;
+    assert_eq!(
+        s.assert_raw(ticket, "not json").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        s.assert(ticket, &json!({"id": "x", "type": "public-key"}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let genuine = auth.authenticate(ORIGIN, options).await;
+    let mut tampered = genuine.clone();
+    let sig = tampered["response"]["signature"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &sig).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    tampered["response"]["signature"] = Value::from(base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        &bytes,
+    ));
+    let (status, body) = s.assert(ticket, &tampered).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    assert_eq!(
+        ticket_row(&pool, ticket).await,
+        (None, None, None),
+        "still live"
+    );
+    assert_eq!(
+        events(&pool, "platform.elevation_refused", "ticket_id", ticket).await,
+        0
+    );
+    assert_eq!(s.page(ticket).await.status(), StatusCode::OK);
+    let (status, body) = s.assert(ticket, &genuine).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// EQ-1 (a) end to end: a passkey registered under the ALLOWLIST policy (an
+/// attested credential) elevates through the passkey-authentication path.
+/// The interop pin for the attested credential's serialized form, which the
+/// enrollment tests never asserted with.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attested_passkey_elevates(pool: PgPool) {
+    let att = TestAttestation::new("Allowlisted");
+    let rp = Passkeys::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: AttestationPolicy::Allowlist {
+            ca_pem: att.root_pem(),
+            aaguids: [MODEL].into_iter().collect(),
+        },
+    })
+    .expect("relying party");
+    let s = spawn(&pool, Some(rp)).await;
+    // A hardware key: `rewrap` clears BE/BS at registration, and a synced
+    // authenticator would then assert BE and be refused (as it should be).
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let p = person(&pool, "attested").await;
+    fixture::make_custodian(&pool, p.person).await;
+    enroll_with(&pool, &s, p.person, &mut auth, |r| att.rewrap(r)).await;
+    let fmt: String = sqlx::query_scalar(
+        "SELECT attestation_format FROM person_authenticators WHERE person_agent_id = $1",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fmt, "packed", "CALIBRATION: an attested registration");
+    let (ticket, _) = open(&s, &p, "attested").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The page escapes a hostile reason, loads only the binary's own script, and
+/// every ceremony response carries the CSP and capability-URL headers.
+/// Mutations: the reason interpolated without `html_escape` -> the raw tag;
+/// the ticket page not passed through `harden` -> no CSP.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ticket_page_escapes_and_carries_the_csp(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let hostile = r#"<script>alert(1)</script><img src=x onerror="y">"#;
+    let (ticket, _) = open(&s, &p, hostile).await;
+    let page = s.page(ticket).await;
+    let challenge = s
+        .http
+        .post(s.url(&format!("/elevate/{ticket}/challenge")))
+        .send()
+        .await
+        .unwrap();
+    let js = s
+        .http
+        .get(s.url("/elevate/assets/elevate.js"))
+        .send()
+        .await
+        .unwrap();
+    for (what, resp) in [("page", &page), ("challenge", &challenge), ("js", &js)] {
+        assert_eq!(resp.status(), StatusCode::OK, "{what}");
+        let h = resp.headers();
+        assert!(
+            h["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .starts_with("default-src 'none'; script-src 'self';"),
+            "{what}"
+        );
+        assert_eq!(h["referrer-policy"], "no-referrer", "{what}");
+        assert_eq!(h["cache-control"], "no-store", "{what}");
+    }
+    assert!(js.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/javascript"));
+    let html = page.text().await.unwrap();
+    assert!(!html.contains("<script>alert"), "{html}");
+    assert!(!html.contains("<img"), "{html}");
+    assert!(
+        html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{html}"
+    );
+    assert_eq!(html.matches("<script").count(), 1, "{html}");
+    assert!(html.contains(r#"<script src="/elevate/assets/elevate.js"></script>"#));
+}
+
+/// No relying party: every ticket ceremony endpoint answers 503 even for a
+/// live ticket. An unknown ticket is 404 on every endpoint.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ceremony_fails_closed_unconfigured_and_on_an_unknown_ticket(pool: PgPool) {
+    let configured = spawn(&pool, Some(software())).await;
+    let p = holder(
+        &pool,
+        &configured,
+        "holder",
+        &mut SoftAuthenticator::new(MODEL),
+    )
+    .await;
+    let (ticket, _) = open(&configured, &p, "unconfigured").await;
+    let s = spawn(&pool, None).await;
+    assert_eq!(
+        s.page(ticket).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(s.challenge(ticket).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        s.assert(ticket, &json!({})).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let unknown = Uuid::new_v4();
+    assert_eq!(
+        configured.page(unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(configured.challenge(unknown).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        configured.assert(unknown, &json!({})).await.0,
+        StatusCode::NOT_FOUND
+    );
 }
