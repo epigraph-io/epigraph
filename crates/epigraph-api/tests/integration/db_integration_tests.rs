@@ -1037,6 +1037,11 @@ async fn test_update_nonexistent_claim_returns_not_found(pool: PgPool) {
 /// Validates agent listing with pagination
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_list_agents_with_pagination(pool: PgPool) {
+    // Migrations may seed agent rows (123 seeds one node per platform role), so count relative to that baseline.
+    let baseline = AgentRepository::count(&pool)
+        .await
+        .expect("Count should succeed");
+
     // Create multiple agents
     for i in 0..5 {
         let mut public_key = [0u8; 32];
@@ -1062,7 +1067,7 @@ async fn test_list_agents_with_pagination(pool: PgPool) {
     let total = AgentRepository::count(&pool)
         .await
         .expect("Count should succeed");
-    assert_eq!(total, 5);
+    assert_eq!(total, baseline + 5);
 }
 
 // ============================================================================

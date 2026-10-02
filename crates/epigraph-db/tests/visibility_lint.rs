@@ -472,6 +472,48 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "role_assignment.rs",
+        "grant",
+        "WRITE through migration 123's maintenance-only definer `epigraph_grant_role` into \
+         `role_assignments`, an AUTHORITY record about a principal, not a corpus row: it has no \
+         `visibility` / `owner_group_id`, its own triggers enforce every rule (CUS01-03) and its \
+         audit trigger writes the `platform.role_granted` row. Nothing for a viewer to filter.",
+    ),
+    (
+        "role_assignment.rs",
+        "end",
+        "WRITE through 123's maintenance-only `epigraph_end_role_assignment`: the one revoke \
+         stamp on one `role_assignments` row, an authority record with no tenancy columns.",
+    ),
+    (
+        "role_assignment.rs",
+        "get",
+        "READ of one `role_assignments` row by id. No tenancy columns; 123's FORCEd \
+         self-or-definer policy already narrows an application connection to the caller's own \
+         assignments, and the operator CLI reads it on the maintenance connection.",
+    ),
+    (
+        "role_assignment.rs",
+        "list",
+        "READ of `role_assignments` for the maintenance CLI (`list-role-assignments`). No \
+         tenancy columns; on an application connection 123's self-or-definer policy narrows it \
+         to the caller's own rows, which is why the CLI runs it on the maintenance connection.",
+    ),
+    (
+        "role_assignment.rs",
+        "live_for",
+        "READ through 123's subject-bound `epigraph_role_assignment_for` (answers about the \
+         session principal, or anyone on a privileged session): one assignment id, an authority \
+         fact about the caller, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
+        "record_custodial_act",
+        "WRITE through 123's maintenance-only `epigraph_record_custodial_act`: one \
+         `platform.custodial_act` security_events row, refused (CUS04) unless the named \
+         assignment is live and held by the actor. An audit record, not a corpus row.",
+    ),
+    (
         "maintenance_lock.rs",
         "try_take",
         "NO TABLE. `SELECT pg_try_advisory_lock($1)` on the maintenance timer's own connection \

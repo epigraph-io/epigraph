@@ -36,7 +36,6 @@ pub mod viewer_fixture;
 
 use std::sync::Arc;
 
-use epigraph_db::repos::instance_admin::InstanceAdminRepository;
 use epigraph_db::repos::privatization::{
     ClosureDirection, ClosureRequest, NewPlan, PlanTransition, PrivatizationRepository,
     RESTATEMENT_EDGE_TYPES,
@@ -79,10 +78,8 @@ impl World {
         add_admin(pool, target_group, "d4-co-1").await;
         add_admin(pool, target_group, "d4-co-2").await;
 
-        let maint = viewer_fixture::downgraded_pool(pool, "epigraph_maintenance").await;
-        InstanceAdminRepository::grant(&maint, actor, None, Some("apply-test"))
-            .await
-            .expect("grant the actor instance admin");
+        // Since 123: a role:platform-custodian assignment of a registered human.
+        viewer_fixture::make_custodian(pool, actor).await;
 
         Self {
             actor,

@@ -320,6 +320,80 @@ pub async fn make_human_operator(pool: &PgPool, agent: Uuid) {
         .expect("human operator registry row");
 }
 
+/// Make `agent` a live PLATFORM CUSTODIAN (migration 123): a registered human
+/// ([`make_human_operator`], unless it already is one) holding an open
+/// `role:platform-custodian` assignment. Returns the assignment id (the live
+/// one it already holds, when it holds one).
+///
+/// Since 123 this is the ONLY way a fixture makes an instance administrator:
+/// `instance_admins` is frozen for every role, and `epigraph_is_instance_admin`
+/// answers from the role. Granted on the harness (superuser) connection
+/// through `epigraph_grant_role`, so the table's own guards apply: the grant
+/// names the first OTHER live custodian as its grantor (the grantor rule), or
+/// none at bootstrap.
+pub async fn make_custodian(pool: &PgPool, agent: Uuid) -> Uuid {
+    let human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("is_human_operator");
+    if !human {
+        let clients: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oauth_clients \
+              WHERE agent_id = $1 AND client_type = 'human' AND status = 'active'",
+        )
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("human clients");
+        if clients == 0 {
+            make_human_operator(pool, agent).await;
+        } else {
+            sqlx::query(
+                "INSERT INTO human_operators (agent_id, client_id, reason) \
+                 SELECT $1, c.id, 'test fixture' FROM oauth_clients c \
+                  WHERE c.agent_id = $1 AND c.client_type = 'human' AND c.status = 'active' \
+                  ORDER BY c.created_at LIMIT 1",
+            )
+            .bind(agent)
+            .execute(pool)
+            .await
+            .expect("register the agent's existing human client");
+        }
+    }
+    let held: Option<Uuid> = sqlx::query_scalar(
+        "SELECT public.epigraph_role_assignment_for($1, 'role:platform-custodian', now())",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("role_assignment_for");
+    if let Some(id) = held {
+        return id;
+    }
+    let grantor: Option<Uuid> = sqlx::query_scalar(
+        "SELECT ra.holder_person_id FROM role_assignments ra \
+          WHERE ra.role = 'role:platform-custodian' AND ra.revoked_at IS NULL \
+            AND ra.valid_from <= now() AND (ra.valid_to IS NULL OR now() < ra.valid_to) \
+            AND ra.holder_person_id <> $1 \
+            AND public.epigraph_is_human_operator(ra.holder_person_id) \
+          ORDER BY ra.valid_from, ra.id LIMIT 1",
+    )
+    .bind(agent)
+    .fetch_optional(pool)
+    .await
+    .expect("grantor");
+    sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, $2, \
+                                          'test fixture')",
+    )
+    .bind(agent)
+    .bind(grantor)
+    .fetch_one(pool)
+    .await
+    .expect("grant role:platform-custodian")
+}
+
 /// [`seed_agent_with_group`] for an agent that is a HUMAN OPERATOR
 /// ([`make_human_operator`]); returns `(agent_id, personal_group_id)`.
 pub async fn seed_human_operator(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
@@ -644,6 +718,54 @@ fn blake3_like(s: &str) -> Vec<u8> {
         out[i % 32] ^= *b;
     }
     out
+}
+
+/// A database at migration 122 (the head before the custodian role), seeded by
+/// `seed`, then migrated to the tree's head.
+///
+/// For state that only an OLDER schema can hold: 123 freezes
+/// `instance_admins` for every role (the superuser included), so a legacy row
+/// that a test needs to see migrated, skipped or ignored must be written
+/// before 123 runs. Use with `#[sqlx::test(migrations = false)]` and the
+/// caller's own `sqlx::migrate!` migrator (this file embeds none).
+/// `session_replication_role = replica` is deliberately NOT the shortcut: it
+/// would also silence the audit triggers under test.
+pub async fn db_at_122_then_head<F, Fut>(pool: &PgPool, migrator: &sqlx::migrate::Migrator, seed: F)
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 122)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    // On ONE connection, reset afterwards: 001 is a pg_dump whose header
+    // issues session-level SETs (`row_security = off`, an empty
+    // `search_path`) that outlive its transaction, so a pooled connection the
+    // migrator used would otherwise carry them into the seed and the test.
+    let mut conn = pool.acquire().await.expect("acquire");
+    before.run(&mut *conn).await.expect("migrate 001 -> 122");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    drop(conn);
+    seed(pool.clone()).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate 122 -> head");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
 }
 
 /// CALIBRATION for migration 118's `match_candidates` stale guard, which the

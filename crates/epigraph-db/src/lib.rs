@@ -119,6 +119,7 @@ pub use repos::{
     WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
     WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
+pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use visibility::{MaintenanceLease, SystemReason, Viewer};
 
 // Re-export sqlx types that users will need

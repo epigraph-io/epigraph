@@ -372,7 +372,7 @@ async fn walking_the_item_pages_one_at_a_time_names_no_id_the_actor_cannot_read(
 // The three-condition check, on the CREATE path and on a READ path.
 // ===========================================================================
 
-/// A caller with the scope but no `instance_admins` row is refused.
+/// A caller with the scope but no `role:platform-custodian` assignment is refused.
 ///
 /// Condition 1 is a claim the token makes about itself; condition 2 is the
 /// instance's own record, and it is what makes condition 1 insufficient rather
@@ -399,10 +399,10 @@ async fn the_scope_alone_does_not_authorise_a_plan(pool: PgPool) {
         Json(plan_body(world.target_group, vec![claim])),
     )
     .await
-    .expect_err("a caller with no instance_admins row must be refused");
+    .expect_err("a caller with no custodian assignment must be refused");
     assert!(
-        matches!(&err, ApiError::Forbidden { reason } if reason.contains("instance administrator")),
-        "expected the instance-admin refusal, got {err:?}"
+        matches!(&err, ApiError::Forbidden { reason } if reason == "not a platform custodian"),
+        "expected the condition-2 refusal (no role:platform-custodian assignment), got {err:?}"
     );
 }
 
@@ -432,10 +432,8 @@ async fn a_read_endpoint_refuses_an_instance_admin_who_does_not_administer_the_t
 
     // A live instance admin with no membership of the target group.
     let (outsider, _own) = seed_agent_with_group(&pool, "pr-outsider").await;
-    let maint = downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, outsider, None, Some("outsider"))
-        .await
-        .expect("grant the outsider");
+    // Since 123: a role:platform-custodian assignment of a registered human.
+    viewer_fixture::make_custodian(&pool, outsider).await;
     // CALIBRATION: the outsider really is an instance admin, so the refusal is
     // attributable to the target-group conditions and not to condition 2.
     assert!(
@@ -824,10 +822,8 @@ impl World {
         add_admin(pool, target_group, "pr-co-1").await;
         add_admin(pool, target_group, "pr-co-2").await;
 
-        let maint = downgraded_pool(pool, "epigraph_maintenance").await;
-        InstanceAdminRepository::grant(&maint, actor, None, Some("route-test"))
-            .await
-            .expect("grant the actor instance admin");
+        // Since 123: a role:platform-custodian assignment of a registered human.
+        viewer_fixture::make_custodian(pool, actor).await;
 
         Self {
             actor,
@@ -948,10 +944,8 @@ async fn approve_by_the_plans_own_author_is_refused_with_409(pool: PgPool) {
     // CAN approve. Without this the assertion above is satisfied by an approve
     // route that refuses everybody.
     let second = add_admin(&pool, world.target_group, "second-eyes").await;
-    let maint = downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, second, None, Some("route-test"))
-        .await
-        .expect("grant the second admin");
+    // Since 123: a role:platform-custodian assignment of a registered human.
+    viewer_fixture::make_custodian(&pool, second).await;
     let Json(approved) = approve_plan(
         ViewerExtractor(Viewer::resolve(&pool, second).await.expect("resolve")),
         State(state),
@@ -1308,10 +1302,8 @@ async fn an_instance_admin_who_does_not_administer_the_target_is_refused_but_not
 
     // An instance admin with no membership in the target group at all.
     let (outsider, _) = seed_agent_with_group(&pool, "outsider").await;
-    let maint = downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, outsider, None, Some("route-test"))
-        .await
-        .expect("grant the outsider instance admin");
+    // Since 123: a role:platform-custodian assignment of a registered human.
+    viewer_fixture::make_custodian(&pool, outsider).await;
 
     let err = approve_plan(
         ViewerExtractor(Viewer::resolve(&pool, outsider).await.expect("resolve")),
@@ -1340,5 +1332,222 @@ async fn an_instance_admin_who_does_not_administer_the_target_is_refused_but_not
     assert_eq!(
         plan_state, "previewed",
         "a refused approve must not move the plan"
+    );
+}
+
+/// Migration 123: every privatization plan WRITE is a custodial act. Creating
+/// a plan, approving, applying (the dispatch), aborting and reverting it each
+/// record one `platform.custodial_act` naming the acting custodian's live
+/// assignment, the act and the plan, in the write's own transaction; a caller
+/// whose assignment has ended is refused at condition 2 ("not a platform
+/// custodian") and writes nothing. An assignment that ends BETWEEN the
+/// authority check and the write (here: inside the dispatch's own
+/// transaction) is the record's `CUS04`, answered 403 with the whole dispatch
+/// rolled back (review TST-MTC-7).
+///
+/// Verified to fail: the create handler's `record_custodial_act` call removed
+/// -> no act for the plan; the approve handler's removed -> no transition act;
+/// the dispatch's removed -> no apply or revert act; the abort's removed -> no
+/// abort act; the helper's CUS04 arm removed (every error through
+/// `plan_write_error`) -> the race answers 500, not 403.
+#[sqlx::test(migrations = "../../migrations")]
+async fn plan_writes_are_recorded_as_custodial_acts(pool: PgPool) {
+    let world = World::seed(&pool).await;
+    let state = split_state(&pool).await;
+    let claim = seed_public_claim(&pool, world.actor, "custodial act subject").await;
+    let actor_assignment = viewer_fixture::make_custodian(&pool, world.actor).await;
+
+    let (_, Json(preview)) = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![claim])),
+    )
+    .await
+    .expect("create the plan");
+    let acts = |plan: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Uuid, String, String)>(
+                "SELECT agent_id, details->>'assignment_id', details->>'act' \
+                   FROM security_events \
+                  WHERE event_type = 'platform.custodial_act' AND details->>'target' = $1::text \
+                  ORDER BY created_at, id",
+            )
+            .bind(plan)
+            .fetch_all(&pool)
+            .await
+            .expect("acts")
+        }
+    };
+    assert_eq!(
+        acts(preview.plan_id).await,
+        vec![(
+            world.actor,
+            actor_assignment.to_string(),
+            "privatization.plan_create".to_string()
+        )],
+        "the create is one custodial act naming the actor's assignment"
+    );
+
+    let second = add_admin(&pool, world.target_group, "second-eyes").await;
+    let second_assignment = viewer_fixture::make_custodian(&pool, second).await;
+    let _ = approve_plan(
+        ViewerExtractor(Viewer::resolve(&pool, second).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(auth_for(second))),
+        Path(preview.plan_id),
+    )
+    .await
+    .expect("a second custodian approves");
+    let recorded = acts(preview.plan_id).await;
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(
+        recorded[1],
+        (
+            second,
+            second_assignment.to_string(),
+            "privatization.plan_transition".to_string()
+        ),
+        "the approval is a custodial act of the approver's assignment"
+    );
+
+    // Apply (the dispatch), abort, revert: one act each, by the actor.
+    let transitions = |plan: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Uuid, String, String)>(
+                "SELECT agent_id, details->>'assignment_id', details->'details'->>'transition' \
+                   FROM security_events \
+                  WHERE event_type = 'platform.custodial_act' AND details->>'target' = $1::text \
+                    AND details->>'act' = 'privatization.plan_transition' \
+                  ORDER BY created_at, id",
+            )
+            .bind(plan)
+            .fetch_all(&pool)
+            .await
+            .expect("transitions")
+        }
+    };
+    let digest = preview.plan_digest.clone();
+    let _ = apply_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+        Json(ApplyRequest {
+            plan_digest: digest.clone(),
+            acknowledge_author_loss: None,
+        }),
+    )
+    .await
+    .expect("apply");
+    let _ = abort_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+    )
+    .await
+    .expect("abort the running plan");
+    // The race: the assignment ends INSIDE the revert's dispatch transaction,
+    // after the authority check (a test trigger on the dispatch's audit row).
+    // The record refuses (CUS04): a 403, and nothing of the dispatch survives.
+    sqlx::raw_sql(
+        "CREATE FUNCTION test_end_on_dispatch() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF NEW.action = 'plan.dispatch' THEN \
+             UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
+                    revoked_reason = 'ended mid-dispatch' \
+              WHERE holder_person_id = NEW.actor_agent_id AND revoked_at IS NULL; \
+           END IF; \
+           RETURN NEW; \
+         END $$; \
+         CREATE TRIGGER test_end_on_dispatch AFTER INSERT ON privatization_audit \
+           FOR EACH ROW EXECUTE FUNCTION test_end_on_dispatch();",
+    )
+    .execute(&pool)
+    .await
+    .expect("a test trigger that ends the actor's assignment mid-dispatch");
+    let revert = || {
+        let (pool, state, digest) = (pool.clone(), state.clone(), digest.clone());
+        let (actor, auth, plan) = (world.actor, world.auth(), preview.plan_id);
+        async move {
+            epigraph_api::routes::privatization::revert_plan(
+                ViewerExtractor(Viewer::resolve(&pool, actor).await.expect("resolve")),
+                State(state),
+                Some(axum::Extension(auth)),
+                Path(plan),
+                Json(epigraph_api::routes::privatization::RevertRequest {
+                    plan_digest: digest,
+                }),
+            )
+            .await
+        }
+    };
+    let raced_err = revert()
+        .await
+        .expect_err("an assignment ended mid-dispatch refuses the dispatch");
+    assert!(
+        matches!(&raced_err, ApiError::Forbidden { reason } if reason == "not a platform custodian"),
+        "CUS04 is the caller's 403: {raced_err:?}"
+    );
+    sqlx::raw_sql(
+        "DROP TRIGGER test_end_on_dispatch ON privatization_audit; \
+         DROP FUNCTION test_end_on_dispatch();",
+    )
+    .execute(&pool)
+    .await
+    .expect("drop the test trigger");
+    let (raced_state, dispatch_rows, still_live): (String, i64, bool) = sqlx::query_as(
+        "SELECT (SELECT state FROM privatization_plans WHERE id = $1), \
+                (SELECT count(*) FROM privatization_audit \
+                  WHERE plan_id = $1 AND action = 'plan.dispatch'), \
+                (SELECT revoked_at IS NULL FROM role_assignments WHERE id = $2)",
+    )
+    .bind(preview.plan_id)
+    .bind(actor_assignment)
+    .fetch_one(&pool)
+    .await
+    .expect("read back");
+    assert_eq!(
+        (raced_state.as_str(), dispatch_rows, still_live),
+        ("failed", 1, true),
+        "the refused revert rolled back whole, the test's own end included"
+    );
+
+    let _ = revert().await.expect("revert the aborted plan");
+    let mine = actor_assignment.to_string();
+    assert_eq!(
+        transitions(preview.plan_id).await,
+        vec![
+            (second, second_assignment.to_string(), "approve".to_string()),
+            (world.actor, mine.clone(), "dispatch".to_string()),
+            (world.actor, mine.clone(), "abort".to_string()),
+            (world.actor, mine, "dispatch".to_string()),
+        ],
+        "apply, abort and revert are each one custodial act of the actor's assignment"
+    );
+
+    // An ended assignment: refused at condition 2, nothing written.
+    let ended: bool =
+        sqlx::query_scalar("SELECT public.epigraph_end_role_assignment($1, 'test end')")
+            .bind(actor_assignment)
+            .fetch_one(&pool)
+            .await
+            .expect("end the actor's assignment");
+    assert!(ended);
+    let other = seed_public_claim(&pool, world.actor, "a second subject").await;
+    let err = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![other])),
+    )
+    .await
+    .expect_err("an ended custodian creates nothing");
+    assert!(
+        matches!(&err, ApiError::Forbidden { reason } if reason == "not a platform custodian"),
+        "{err:?}"
     );
 }

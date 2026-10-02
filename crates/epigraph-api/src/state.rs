@@ -581,6 +581,10 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // The evidence visibility pins (110), FORCEd by the migration that creates
     // them, on the same precedent.
     "evidence_visibility_pins",
+    // The custodian role's catalog and assignments (123), FORCEd by the
+    // migration that creates them, on the same precedent.
+    "platform_roles",
+    "role_assignments",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.

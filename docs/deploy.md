@@ -1516,8 +1516,16 @@ arming is one-way and every step before it must leave no live writer unbound.
 8. **Deploy the new request binaries** (api, then mcp, as for 107), and the
    fleet host change (pass the operator id; run `link` at every spawn, on a
    maintenance DSN). Then **arm**: `epigraph-operator arm-operator-binding`
-   (census), then `--apply`. The census must list no unbound recent writer you
-   intend to keep. The census lists AUTHORS; a writer that authors as someone
+   (census), then `--apply`. Before `--apply`, confirm no request unit or
+   stdio MCP config connects on a privileged DSN: once armed, such a unit
+   refuses to start (operator ruling OQ-7 (b); "The custodian role", step 4).
+   A unit ALREADY RUNNING on a privileged DSN when you arm does not wait for
+   a restart: it re-reads its posture every `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS`
+   (30 by default, 1 to 300) and exits 1 with `ERROR: stopping: ...` on
+   stderr, so an overlooked privileged unit goes down within that interval of
+   `--apply`. Restart every request unit after `--apply` anyway, and confirm
+   each boot log carries the `operator binding ENFORCED:` line.
+   The census must list no unbound recent writer you intend to keep. The census lists AUTHORS; a writer that authors as someone
    else (a service client posting on an agent's behalf, a listener acting under
    a borrowed admin stamp) is bound on its own principal once armed and does
    not appear there: inventory those separately. So is a claim written on an
@@ -1548,10 +1556,92 @@ unstamped application session); `OPL02` stays in force, including for an
 unbound writer (or another human's agent) that names a bound author or a
 retired identity tied to a human. Removing the arming row, or dropping the trigger, is a superuser DDL
 act on the migration DSN. To remove migration 122's functions after step 8,
-first roll the MCP server back to its previous build. The new listener reads
-its signer's binding through a 122 function at startup and on every HTTP tool
-call, and fails closed without it: it refuses to start, and it refuses every
-call.
+first roll back EVERY binary built against them, not only the MCP server:
+
+* `epigraph-api`: every claim write through a default declaration calls
+  `epigraph_require_bound_author` and `epigraph_require_operator_scope`, and
+  every REST workflow write (`/api/v1/workflows/ingest|store|improve`,
+  `/steps`, `/steps/delete`) calls the writer-authority checks; without 122
+  each answers 500 (`42883`).
+* `epigraph-mcp`: the HTTP listener reads its signer's binding through a 122
+  function at startup and on every tool call, and fails closed without it (it
+  refuses to start, and it refuses every call).
+* `epigraph-tenancy-backfill`: `verify` inventories 122's definers (its
+  deferred list is presence-gated, so an older build is the safe one).
+* `epigraph-operator`: its binding verbs call 122's definers.
+
+Then drop the trigger and the functions. If migration 123 is applied, undo it
+FIRST (next section): its bodies call 122's.
 
 No new environment variable is required; `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT`
 exists only as the emergency valve.
+
+## The custodian role (migration 123) — deploy order and rollback
+
+Instance administration is `role:platform-custodian`, held by a registered
+human operator through a timestamped `role_assignments` row; agents never hold
+it. `epigraph_is_instance_admin` keeps its name and answers from the role. The
+model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
+("The custodian role").
+
+1. **Preconditions.** Migration 122 applied, and every human who should keep
+   instance-admin authority REGISTERED (`register-human-operator`, step 2b
+   above) before 123 runs: 123 carries a live `instance_admins` row into an
+   assignment only for a registered human, and skips (loudly: a NOTICE and a
+   `platform.role_migration_skipped` event) every other live row. On an ARMED
+   database, also measure which application paths rely on an instance-admin
+   principal writing across groups or humans: from 123 on, no application
+   session is relieved of `OPL02` (operator ruling OQ-1 (b)), so each such
+   write is refused and moves to the maintenance DSN
+   (`custodial-supersede`, step 5).
+2. **Migrate 123** (`epigraph-migrate`, migration DSN). New tables and
+   function bodies, one restrictive policy on `security_events`, and small
+   triggers on `instance_admins`, `human_operators` and `operator_links`;
+   no backfill. `lock_timeout` is 3s; retry on a lock timeout. Old binaries
+   keep working against it, except `epigraph-instance-admin grant` (always)
+   and `revoke` of a principal that holds a live custodian assignment, which
+   now fail (`CUS05`) by design: end the role with `end-role-assignment`.
+3. **Deploy** `epigraph-api`, `epigraph-mcp`, `epigraph-operator`,
+   `epigraph-instance-admin` and `epigraph-tenancy-backfill` built from the
+   same commit.
+4. **Check.** `epigraph-operator list-role-assignments` shows the carried
+   rows. Bootstrap a custodian if none was carried:
+   `epigraph-operator grant-role --role role:platform-custodian --holder <the
+   human's own agent> (--valid-to <RFC3339> | --open-ended) --reason <text>
+   --apply` (no `--granted-by` only while no live custodian exists). Then
+   confirm each request unit connects as `epigraph_app` with
+   `epigraph_bypass() = false`: its boot log must carry the line that starts
+   `operator binding ENFORCED:` (with the colon). On an armed database a
+   request unit (`epigraph-api`, and `epigraph-mcp` on every transport, a
+   stdio config included) on a privileged DSN REFUSES TO START (operator
+   ruling OQ-7 (b)): it exits 1 after the ERROR line that starts `operator
+   binding NOT ENFORCED for the writer on this privileged DSN:`, with
+   `ERROR: refusing to start:` on stderr. Grep the prefix, not the word: both
+   lines contain "ENFORCED". Check every unit and every stdio MCP config's DSN
+   BEFORE arming: arming turns a privileged request DSN into a unit that no
+   longer starts, and a running one into a unit that stops within its
+   re-read interval (`ERROR: stopping:` on stderr).
+5. **Custodial revisions** of the platform corpus use
+   `epigraph-operator custodial-supersede --claim <id> --content-file <f>
+   --truth <x> --assignment <the actor's live assignment> --actor <the
+   custodian> --reason <text> [--allow-owned] [--apply]` on the maintenance
+   DSN; it records a `platform.custodial_act` against the assignment in the
+   same transaction. A claim the world group does not own is refused unless
+   `--allow-owned` is given, and the act records whether it was (operator
+   ruling OQ-8 (a)).
+   The successor has no embedding until the next embedding backfill.
+
+**Rollback.** First roll back every binary that calls a 123 function:
+`epigraph-operator` (the role verbs and `custodial-supersede`),
+`epigraph-api` (privatization records a custodial act and reads the
+assignment), and `epigraph-tenancy-backfill` (an older `verify` is the safe
+one). Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
+transaction: it stamps every live `instance_admins` row whose agent holds no
+live custodian assignment (so 083's restored body resurrects no authority
+ended after 123), drops 123's triggers, re-applies 083's and 122's function
+bodies verbatim (the round-4 fixes revert with them, and 122's
+instance-admin principal relief from `OPL02` comes back), drops the `platform.`
+policy and every 123 definer, and lists the holders granted after 123, which
+exist only in `role_assignments` and are re-granted in `instance_admins` by
+hand if they must survive. It leaves the role tables, the audit rows and the
+OCCUPIES edges in place (history; forward-fix only).

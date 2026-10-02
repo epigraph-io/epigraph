@@ -823,9 +823,50 @@ Current reservation:
   is in the file's header. **Applied to a throwaway database only, NOT to any
   deployed database.**
 
-- **123+**: public next
+- **123**: public `custodian_role` — instance administration becomes
+  `role:platform-custodian`, held by a REGISTERED HUMAN through a timestamped,
+  append-only `role_assignments` row (catalog `platform_roles`, with
+  `role:auditor`). Table triggers: `CUS01` the holder is not a registered human
+  (agents never hold a role; re-checked at read time), `CUS02` not append-only
+  (no back-dating; the only change is one end stamped now; an ended row is
+  final), `CUS03` the grantor rule; FORCE RLS on both tables, 083's pattern
+  (self-or-definer reads, bypass-only writes, no DELETE policy). Subject-bound
+  readers `epigraph_role_assignment_for` / `epigraph_holds_role`;
+  `epigraph_is_instance_admin` RE-BODIED to "holds the custodian role now"
+  (same signature, grants and subject binding). `security_events`'s
+  `platform.` prefix reserved to definers (a RESTRICTIVE insert policy, 117/118's
+  shape); every grant, end, custodial act (`epigraph_record_custodial_act`,
+  `CUS04` unless the actor's assignment is live) writes one, naming the
+  assignment; reader
+  `epigraph_platform_audit`. Each assignment is projected as an `OCCUPIES` edge
+  (never read for authority; ratchet-tested); the role nodes are refused as
+  link or registry subjects, and a role holder is refused as a link's agent
+  (`CUS01`: end the assignment first, so the end is audited). Live `instance_admins` rows of registered humans
+  are carried over from their `granted_at`; others are skipped loudly; the table
+  is then FROZEN for every role but a mirrored `revoked_at` stamp. 122's
+  `epigraph_operator_scope_exempt` is re-bodied to `epigraph_bypass()` alone
+  (operator ruling OQ-1 (b): no `OPL02` relief for a role holder on an
+  application session; custodial writes go through `epigraph-operator
+  custodial-supersede` on the maintenance DSN). 122's
+  `epigraph_require_operator_scope` / `_writer_scope` / `_attributable` (still
+  STABLE; corrected HINTs) and the claims trigger body are re-applied with the
+  round-4 fixes: a claim never supersedes itself (refused first, on
+  every session); a retired identity's claim is restated at most once on an
+  application session; re-open and lineage relief is the privileged session's
+  alone. Registered in
+  `schema_contract.rs::migration_123_custodian_definers_are_owned_and_granted`,
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` (at 123) and the grant
+  register, the FORCE registers (state.rs, locked_decisions, rls_enforcement,
+  079-undo). Behaviour in `epigraph-db/tests/custodian_role.rs` and
+  `operator_binding.rs`. Undo: `docs/runbooks/123-undo.sql` (roll back every
+  binary that calls a 123 function first; docs/deploy.md). Checked before
+  claiming: 113 is held by an open PR that renumbers when it lands; no open PR
+  branch carries a `123`. **Applied to a throwaway database only, NOT to any
+  deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `123` or
+- **124+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `124` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

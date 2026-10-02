@@ -567,8 +567,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
     );
     // Operator binding (migration 122): the valve and the arming state, once
-    // at boot. Non-fatal; the trigger enforces whatever this reports.
-    epigraph_db::operator_binding::log_boot_state(&pool, "epigraph-mcp").await;
+    // at boot, and a REFUSAL TO START on a privileged DSN of an armed database
+    // (operator ruling OQ-7 (b)), on every transport: agents never elevate.
+    // To stderr, like the D9 refusal: on stdio, stdout is the JSON-RPC stream.
+    if let Err(refusal) =
+        epigraph_db::operator_binding::check_request_unit_boot(&pool, "epigraph-mcp").await
+    {
+        eprintln!("ERROR: {refusal}");
+        std::process::exit(1);
+    }
+    // And for as long as it serves, on every transport: a unit started before
+    // the database was armed exits once a re-read finds it serving an armed
+    // database on a privileged DSN (review R2-OQ-COR-1).
+    epigraph_db::operator_binding::spawn_request_unit_watch(pool.clone(), "epigraph-mcp");
 
     // Create or restore agent signer. Precedence lives in `select_signer`
     // (unit-tested); here we only handle the side effects (secret-key print for

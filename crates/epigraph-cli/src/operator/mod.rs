@@ -35,6 +35,16 @@
 //!   into its operator's group, through `reown-claims`' guarded batches (see
 //!   [`reown_linked`]).
 //!
+//! And the platform roles (migration 123; see [`custodian`]):
+//!
+//! * `grant-role` / `end-role-assignment` / `list-role-assignments` — grant a
+//!   registered human `role:platform-custodian` (or `role:auditor`) for an
+//!   explicit window, end an assignment, and list them. Every change is
+//!   audited by the table's own trigger.
+//! * `custodial-supersede` — revise a platform-corpus claim on the custodian's
+//!   authority: the act, its edge migration and a `platform.custodial_act`
+//!   audit row naming the assignment, in one transaction.
+//!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
 //!
@@ -74,6 +84,7 @@
 pub mod arm;
 pub mod bind;
 pub mod client_scope;
+pub mod custodian;
 pub mod hide;
 pub mod human;
 pub mod legacy;

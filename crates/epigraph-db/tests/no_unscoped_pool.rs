@@ -575,7 +575,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `create_hypothesis` reads its frame and writes the frame bind and the prior
 /// on the claim's stamped transaction (`routes/hypothesis.rs` 10 -> 7, read off
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure).
-const HIGH_WATER: usize = 260;
+/// 260 -> 259 in its round 4 (COR-R4-3, migration 123's batch):
+/// `create_hypothesis` caches its VOI score on that same transaction
+/// (`routes/hypothesis.rs` 7 -> 6).
+const HIGH_WATER: usize = 259;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -800,8 +803,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/graph_query.rs", 1),
     ("routes/groups.rs", 12),
     // 11 before the operator-binding delta review, which moved
-    // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`.
-    ("routes/hypothesis.rs", 7),
+    // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`;
+    // 6 since its VOI cache moved onto that same stamped transaction (round 4
+    // COR-R4-3).
+    ("routes/hypothesis.rs", 6),
     ("routes/isomorphism.rs", 3),
     // `routes/lineage.rs` was 7 and is GONE, not zeroed: PR-26, the first
     // conversion shard, moved all seven onto `AppState::read_as`. `measure()`

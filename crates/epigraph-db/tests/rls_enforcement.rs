@@ -199,6 +199,23 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          Under FORCE the absent UPDATE policy default-denies every non-superuser \
          role, and 110 grants UPDATE to nobody.",
     ),
+    (
+        "platform_roles",
+        "DELETE",
+        "The custodian role's catalog (123) is never shrunk: an assignment names its \
+         role by key (ON DELETE RESTRICT), and the audit trail names roles that must keep \
+         resolving. Under FORCE the absent DELETE policy default-denies every \
+         non-superuser role, and 123 grants DELETE to nobody.",
+    ),
+    (
+        "role_assignments",
+        "DELETE",
+        "An assignment is ended by its `revoked_at` stamp, never deleted: the row is the \
+         record that the authority existed, from when to when (123). The bypass-only \
+         INSERT and UPDATE pair stops short of FOR ALL on purpose (083's instance_admins \
+         pair is the template), 123 grants DELETE to nobody, and the update guard admits \
+         only the one revoke.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -259,6 +276,8 @@ const PROTECTED: &[&str] = &[
     "instance_admins",
     "operator_links",
     "evidence_visibility_pins",
+    "platform_roles",
+    "role_assignments",
 ];
 
 // ===========================================================================
@@ -1361,6 +1380,25 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              non-`oauth.` row still needs 077's attribution arms; an `oauth.*` row needs one of \
              the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
              i.e. the maintenance session or one of 118's definers.",
+        ),
+        (
+            "platform_roles_read",
+            "true",
+            "123's catalog of platform roles is public by design: two rows naming a role, \
+             whether it elevates and its projection node. It carries no holder (who holds a \
+             role is `role_assignments`, which is self-or-definer), and writes are \
+             bypass-only policies, so the constant arm grants a read of a catalog and nothing \
+             else.",
+        ),
+        (
+            "security_events_platform_privileged",
+            "platform.",
+            "123's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 9) <> \
+             'platform.'`) says WHICH rows the restriction applies to, and grants nothing. A \
+             restrictive policy is AND-ed with the permissive `security_events_append`, so every \
+             non-`platform.` row still needs 077's attribution arms; a `platform.*` row needs one \
+             of the two session arms beside it (`epigraph_bypass()` / \
+             `epigraph_definer_bypass()`), i.e. the maintenance session or one of 123's definers.",
         ),
         (
             "security_events_cascade_privileged",

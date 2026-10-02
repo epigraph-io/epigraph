@@ -438,6 +438,75 @@ async fn create_hypothesis_binds_the_authenticated_caller(pool: PgPool) {
     );
 }
 
+/// Delta review round 4 COR-R4-3: `create_hypothesis` caches its VOI score in
+/// the claim's `properties` on the claim's own stamped transaction. On a schema
+/// WITHOUT the orphan permissive `claims_privacy` policy (the repository's own
+/// clean schema, and production after its removal), the unstamped
+/// `.execute(&state.db_pool).ok()` UPDATE was refused by row security and the
+/// error discarded: the route answered 200 with a score it never stored.
+///
+/// Verified to fail: the unstamped `.ok()` UPDATE restored (after the commit,
+/// on `state.db_pool`) -> `properties.voi_score` is absent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_hypothesis_persists_voi_without_the_orphan_policy(pool: PgPool) {
+    use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+    let (a, _) = seed_human_operator(&pool, "human-a").await;
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses, visibility, owner_group_id) \
+         VALUES ('hypothesis_assessment', ARRAY['true','false'], 'public', \
+                 '00000000-0000-0000-0000-000000000000'::uuid) \
+         ON CONFLICT (name) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the hypothesis_assessment frame");
+    let orphans: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_policy WHERE polrelid = 'public.claims'::regclass \
+            AND polname = 'claims_privacy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("policies");
+    assert_eq!(
+        orphans, 0,
+        "CALIBRATION: the clean schema has no orphan policy"
+    );
+    let embedder: std::sync::Arc<dyn EmbeddingService> =
+        std::sync::Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+    let state = app_role_state(&pool).await.with_embedding_service(embedder);
+
+    let statement = format!("hypothesis: voi cache {}", Uuid::new_v4());
+    let viewer = Viewer::resolve(&pool, a).await.expect("viewer");
+    let req: epigraph_api::routes::hypothesis::CreateHypothesisRequest =
+        serde_json::from_value(serde_json::json!({ "statement": statement, "agent_id": a }))
+            .expect("request");
+    let resp = epigraph_api::routes::hypothesis::create_hypothesis(
+        ViewerExtractor(viewer),
+        State(state),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let (status, body) = body_text(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    let answered = body["voi"]["score"]
+        .as_f64()
+        .expect("voi.score in the body");
+    let stored: Option<f64> = sqlx::query_scalar(
+        "SELECT (properties->>'voi_score')::float8 FROM claims WHERE content = $1",
+    )
+    .bind(&statement)
+    .fetch_one(&pool)
+    .await
+    .expect("the claim");
+    assert_eq!(
+        stored,
+        Some(answered),
+        "properties.voi_score is stored and equals the answered score"
+    );
+}
+
 /// Delta review round 2 SEC-R2-3 / DIS-R2-3 / DIS-R2-4:
 /// `POST /api/v1/workflows/steps/:id/evolve` authors the step as the
 /// authenticated PRINCIPAL. The token is in the shape `/oauth/token` mints:
