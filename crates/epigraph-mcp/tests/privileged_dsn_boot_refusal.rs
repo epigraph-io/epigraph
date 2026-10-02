@@ -119,7 +119,9 @@ fn start_mcp(
     (child, rx)
 }
 
-/// Wait until `child` exits or logs `marker` (left running then).
+/// Wait until `child` exits or logs `marker` (left running then). An exit
+/// after `marker` was logged still counts as reaching it: the reader thread
+/// may deliver the line after `try_wait` sees the exit (review R2-OQ-TST-5).
 fn wait_serving(
     child: &mut std::process::Child,
     rx: &mpsc::Receiver<String>,
@@ -142,6 +144,11 @@ fn wait_serving(
                 log.push_str(&line);
                 log.push('\n');
             }
+            if log.contains(marker) {
+                return Outcome::Serving {
+                    stderr: log.clone(),
+                };
+            }
             return Outcome::Exited {
                 code: status.code(),
                 stderr: log.clone(),
@@ -153,6 +160,35 @@ fn wait_serving(
             panic!("epigraph-mcp neither exited nor logged {marker:?} within 90s:\n{log}");
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The harness itself (review R2-OQ-TST-5): a process that logged the
+/// marker and exited before its reader delivered the line is still past the
+/// marker, not a false "exited". Deterministic: the process has exited before
+/// `wait_serving` starts, and the line arrives 200 ms later, inside the drain.
+///
+/// Verified to fail: the re-check after the drain removed -> `Exited`.
+#[test]
+fn a_marker_drained_after_the_exit_still_counts() {
+    let mut child = Command::new("sh")
+        .args(["-c", "exit 101"])
+        .spawn()
+        .expect("spawn sh");
+    while child.try_wait().expect("try_wait").is_none() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = tx.send(SERVING.to_string());
+    });
+    let mut log = String::new();
+    match wait_serving(&mut child, &rx, SERVING, &mut log) {
+        Outcome::Serving { .. } => {}
+        Outcome::Exited { code, stderr } => {
+            panic!("a late marker line was read as an exit {code:?}:\n{stderr}")
+        }
     }
 }
 
