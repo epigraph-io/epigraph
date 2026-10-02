@@ -519,14 +519,18 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        14,
+        15,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
          whether the agent has ANY operator link record, through the \
          `epigraph_operator_of_author` SECURITY DEFINER read, which answers without a stamp and \
          returns only the named agent's operator — the same pre-authentication reason, re-read \
-         for it.",
+         for it. The fifteenth is the refresh grant's `RefreshTokenRepository::family_of` read: \
+         before minting, it reads the presented refresh token's rotation family (`id` and \
+         `family_id` only, inside migration 118's column grant; `refresh_tokens` has no RLS) so a \
+         human client's access token can name it — still before the principal is minted, the same \
+         reason again.",
     ),
     (
         "state.rs",

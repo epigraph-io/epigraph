@@ -95,6 +95,23 @@ impl RefreshTokenRepository {
         Ok(row.0)
     }
 
+    /// The rotation family of one refresh token: `COALESCE(family_id, id)`
+    /// (migration 118; a NULL `family_id` reads as the row's own id, so a row
+    /// that opened its chain is its own family). Rotation inserts the
+    /// successor in the presented token's family, so this is also the family
+    /// of the token a refresh is about to issue. `None` if no such row.
+    ///
+    /// Reads only `id` and `family_id`, both in 118's column grant to the
+    /// application role.
+    #[instrument(skip(pool))]
+    pub async fn family_of(pool: &PgPool, id: Uuid) -> Result<Option<Uuid>, DbError> {
+        sqlx::query_scalar("SELECT COALESCE(family_id, id) FROM refresh_tokens WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| DbError::QueryFailed { source: e })
+    }
+
     /// Read a live row by hash, `token_hash` included. Since migration 118 the
     /// application role cannot read `token_hash`, so this runs only on a
     /// privileged connection; no request path calls it (the refresh grant uses

@@ -211,6 +211,21 @@ pub(crate) async fn principal_agent_id(
     Ok(agent_id)
 }
 
+/// Whether an access token minted with a refresh token carries that refresh
+/// token's family (`fam`). Only for a HUMAN client: the family is what a
+/// later elevation session binds to, an agent never elevates, and a family on
+/// an agent or service token could only cost that resolution a database round
+/// trip that answers "no". A grant that issues no refresh token binds nothing.
+///
+/// The rule holds at every mint site, so a token's binding never depends on
+/// which grant minted it: `handle_authorization_code` and the external grant
+/// (`provision_external_user`, human by construction) bind to the refresh row
+/// they insert, `handle_refresh_token` to the chain it rotates, and
+/// `handle_client_credentials` (agent and service clients only) binds nothing.
+pub(crate) fn binds_refresh_family(client_type: &str) -> bool {
+    client_type == "human"
+}
+
 /// Refuse to mint a token for an agent with any operator link record. See
 /// [`principal_agent_id`]. A RETIRED link refuses too: `epigraph_link_retired_agent`
 /// creates no membership, but a writer row that predates the retire, or one a
@@ -574,6 +589,10 @@ async fn handle_client_credentials(
     // time (not at registration) so clients that predate PR-02 acquire theirs on
     // their next token, and so all four mint sites share one code path.
     let agent_id = principal_agent_id(state, client.id, client.agent_id).await?;
+    // No `fam`: this grant serves agent and service clients only (every other
+    // type is refused above), and [`binds_refresh_family`] binds humans only,
+    // although a refresh token is issued below.
+    let binding = epigraph_auth::AccessTokenBinding::NONE;
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(
@@ -583,7 +602,7 @@ async fn handle_client_credentials(
             client.owner_id,
             Some(agent_id),
             ttl,
-            epigraph_auth::AccessTokenBinding::NONE,
+            binding,
         )
         .map_err(|e| ApiError::InternalError {
             message: format!("JWT signing failed: {e}"),
@@ -775,6 +794,25 @@ async fn handle_refresh_token(
         Err(unanswered) => return Err(unanswered),
     };
 
+    // The family the rotation below keeps (118 inserts the successor in the
+    // presented token's family), read BEFORE the rotation so that it, too,
+    // is something that can fail to answer without spending the token. A
+    // human client's token names it; see [`binds_refresh_family`].
+    let binding = if binds_refresh_family(&client.client_type) {
+        match RefreshTokenRepository::family_of(&state.db_pool, stored.id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })? {
+            Some(family) => epigraph_auth::AccessTokenBinding::family(family),
+            // Valid a moment ago and gone now (expired-row cleanup): the
+            // same answer as any refresh that cannot proceed.
+            None => return Err(invalid_refresh()),
+        }
+    } else {
+        epigraph_auth::AccessTokenBinding::NONE
+    };
+
     // Everything that can fail to ANSWER (the checks above, the signing below)
     // runs before the old token is spent, so an outage never burns a chain.
     // The access token is signed first and simply dropped if the rotation
@@ -788,7 +826,7 @@ async fn handle_refresh_token(
             client.owner_id,
             Some(agent_id),
             ttl,
-            epigraph_auth::AccessTokenBinding::NONE,
+            binding,
         )
         .map_err(|e| ApiError::InternalError {
             message: format!("JWT signing failed: {e}"),
@@ -1006,23 +1044,13 @@ async fn handle_authorization_code(
     // time (not at registration) so clients that predate PR-02 acquire theirs on
     // their next token, and so all four mint sites share one code path.
     let agent_id = principal_agent_id(state, client.id, client.agent_id).await?;
-    let (access_token, _jti) = state
-        .jwt_config
-        .issue_access_token(
-            client.id,
-            effective_scopes.clone(),
-            &client.client_type,
-            client.owner_id,
-            Some(agent_id),
-            ttl,
-            epigraph_auth::AccessTokenBinding::NONE,
-        )
-        .map_err(|e| ApiError::InternalError {
-            message: format!("JWT signing failed: {e}"),
-        })?;
 
-    // Refresh token (reuse the existing rotation pattern).
-    let refresh_token = {
+    // Refresh token (reuse the existing rotation pattern). Inserted BEFORE the
+    // access token is signed, so the access token can name its family: a new
+    // row opens its own family (`family_id` NULL reads as its id, migration
+    // 118). If the signing below fails, the row is left unreturned; nobody
+    // holds its raw token, so it can never be presented.
+    let (refresh_token, refresh_id) = {
         use rand::Rng;
         let raw: [u8; 32] = rand::thread_rng().gen();
         let token_str = hex::encode(raw);
@@ -1033,7 +1061,7 @@ async fn handle_authorization_code(
             "service" => Duration::days(90),
             _ => Duration::hours(24),
         };
-        epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
+        let refresh_id = epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
             &state.db_pool,
             hash.as_bytes(),
             client.id,
@@ -1044,8 +1072,28 @@ async fn handle_authorization_code(
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
         })?;
-        token_str
+        (token_str, refresh_id)
     };
+
+    let binding = if binds_refresh_family(&client.client_type) {
+        epigraph_auth::AccessTokenBinding::family(refresh_id)
+    } else {
+        epigraph_auth::AccessTokenBinding::NONE
+    };
+    let (access_token, _jti) = state
+        .jwt_config
+        .issue_access_token(
+            client.id,
+            effective_scopes.clone(),
+            &client.client_type,
+            client.owner_id,
+            Some(agent_id),
+            ttl,
+            binding,
+        )
+        .map_err(|e| ApiError::InternalError {
+            message: format!("JWT signing failed: {e}"),
+        })?;
 
     Ok((
         StatusCode::OK,
