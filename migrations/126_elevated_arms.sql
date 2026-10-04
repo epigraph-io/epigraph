@@ -90,7 +90,13 @@
 --     (a later migration), not here.
 --   * jobs, rls_canary: bypass-only; the application reads and writes no
 --     row of either.
--- None of the excluded tables grants the application a write.
+-- No excluded table ADMITS an application write. All but two hold no
+-- application INSERT, UPDATE or DELETE grant at all; `jobs` and `rls_canary`
+-- DO keep the application's DML grants, and every write there is refused by
+-- their bypass-only policies (`epigraph_bypass()` / `epigraph_definer_bypass()`,
+-- both role-membership tests), not by a missing grant. A later change that
+-- let the application write either table must arm it here as well
+-- (elevation_arms_census.rs's privilege invariant names it until then).
 --
 -- ===================================================================
 -- 3. THE LOCK PLAN (why this file has no transaction, and what that buys)
