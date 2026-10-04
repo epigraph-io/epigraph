@@ -2066,8 +2066,8 @@ fn every_125_object_is_registered() {
     let (definers, all) = functions_of(&migration);
     assert_eq!(
         definers.len(),
-        21,
-        "CALIBRATION: 125 creates 21 SECURITY DEFINER functions; the scan found {definers:?}"
+        22,
+        "CALIBRATION: 125 creates 22 SECURITY DEFINER functions; the scan found {definers:?}"
     );
     assert_eq!(definers, all, "every function 125 creates is a definer");
     let missing: Vec<&String> = definers

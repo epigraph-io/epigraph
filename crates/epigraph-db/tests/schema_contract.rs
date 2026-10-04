@@ -1951,7 +1951,7 @@ async fn migration_124_passkey_definers_are_owned_and_granted(pool: PgPool) {
 /// restrictive policy admits only from such a frame), carries an explicit ACL
 /// that excludes PUBLIC, and grants `epigraph_app` exactly the nine
 /// principal-bound or ticket-keyed definers the request DSN calls; never the
-/// three unbound helpers (a roster oracle) nor a guard, audit or end trigger.
+/// four unbound helpers (a roster oracle) nor a guard, audit or end trigger.
 /// The readers are STABLE (`epigraph_is_elevated` among them, so a policy's
 /// `(SELECT ...)` wrapper is an InitPlan); everything else writes. The
 /// application role holds SELECT on both tables (narrowed to no row by their
@@ -1970,6 +1970,12 @@ async fn migration_125_elevation_definers_are_owned_and_granted(pool: PgPool) {
         (
             "epigraph_family_of_person_is_live",
             "public.epigraph_family_of_person_is_live(uuid, uuid, uuid)",
+            "s",
+            false,
+        ),
+        (
+            "epigraph_elevation_session_is_live",
+            "public.epigraph_elevation_session_is_live(uuid)",
             "s",
             false,
         ),

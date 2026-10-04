@@ -227,6 +227,27 @@ $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, uuid)
     FROM PUBLIC;
 
+-- Is session `p_session` LIVE: un-ended, unexpired, and its person's live
+-- elevating assignment still the one it stored? The ONE liveness test, shared
+-- by `epigraph_is_elevated()`, `epigraph_elevation_live` and the grant-mode
+-- redemption, so the three can never disagree about what "live" means. Not
+-- granted to the application role (it answers for any session); the
+-- principal-bound definers call it after their own binding.
+CREATE OR REPLACE FUNCTION public.epigraph_elevation_session_is_live(p_session uuid)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT EXISTS (
+        SELECT 1
+          FROM public.elevation_sessions s
+         WHERE s.id = p_session
+           AND s.ended_at IS NULL
+           AND now() < s.expires_at
+           AND public.epigraph_live_elevating_assignment(s.person_agent_id, now())
+               = s.assignment_id)
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_elevation_session_is_live(uuid) FROM PUBLIC;
+
 -- ===================================================================
 -- 3. THE GUARDS (section 2 of the header)
 -- ===================================================================
@@ -906,9 +927,7 @@ BEGIN
     END IF;
     SELECT * INTO v_session FROM public.elevation_sessions s WHERE s.id = v_ticket.session_id;
     IF v_ticket.outcome <> 'confirmed' OR v_ticket.redeemed_at IS NOT NULL
-       OR v_session.ended_at IS NOT NULL OR now() >= v_session.expires_at
-       OR public.epigraph_live_elevating_assignment(v_session.person_agent_id, now())
-          IS DISTINCT FROM v_session.assignment_id THEN
+       OR NOT public.epigraph_elevation_session_is_live(v_session.id) THEN
         RETURN QUERY SELECT 'invalid'::text, NULL::uuid, NULL::uuid, NULL::uuid,
                             NULL::timestamptz;
         RETURN;
@@ -937,10 +956,7 @@ SET search_path = public, pg_temp AS $$
        AND ((p_elv IS NOT NULL AND s.id = p_elv)
             OR (p_elv IS NULL AND s.mode = 'connector'))
        AND s.person_agent_id = public.epigraph_principal_id()
-       AND s.ended_at IS NULL
-       AND now() < s.expires_at
-       AND public.epigraph_live_elevating_assignment(s.person_agent_id, now())
-           = s.assignment_id
+       AND public.epigraph_elevation_session_is_live(s.id)
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_elevation_live(uuid, uuid) FROM PUBLIC;
 
@@ -1002,10 +1018,7 @@ BEGIN
          WHERE s.id = v_elv::uuid
            AND s.family_id = v_fam::uuid
            AND s.person_agent_id = v_who::uuid
-           AND s.ended_at IS NULL
-           AND now() < s.expires_at
-           AND public.epigraph_live_elevating_assignment(s.person_agent_id, now())
-               = s.assignment_id);
+           AND public.epigraph_elevation_session_is_live(s.id));
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_is_elevated() FROM PUBLIC;
 
@@ -1018,13 +1031,16 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_is_elevated() FROM PUBLIC;
 -- passes `epigraph_definer_bypass()`. The application role may EXECUTE the
 -- principal-bound definers and the ticket-keyed ceremony definers; never the
 -- unbound helpers (`epigraph_live_elevating_assignment`,
--- `epigraph_family_of_person_is_live`, `epigraph_end_expired_elevations`).
+-- `epigraph_family_of_person_is_live`, `epigraph_elevation_session_is_live`,
+-- `epigraph_end_expired_elevations`).
 -- ===================================================================
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'ALTER FUNCTION public.epigraph_live_elevating_assignment(uuid, timestamptz) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_elevation_session_is_live(uuid) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_elevation_tickets_guard_insert() '
                 'OWNER TO epigraph_maintenance';
@@ -1068,6 +1084,7 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_live_elevating_assignment(uuid, timestamptz), '
                 'public.epigraph_family_of_person_is_live(uuid, uuid, uuid), '
+                'public.epigraph_elevation_session_is_live(uuid), '
                 'public.epigraph_end_expired_elevations(uuid, uuid), '
                 'public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea), '
                 'public.epigraph_ticket_for_ceremony(uuid), '
@@ -1097,6 +1114,7 @@ DO $$ BEGIN
         EXECUTE 'REVOKE EXECUTE ON FUNCTION '
                 'public.epigraph_live_elevating_assignment(uuid, timestamptz), '
                 'public.epigraph_family_of_person_is_live(uuid, uuid, uuid), '
+                'public.epigraph_elevation_session_is_live(uuid), '
                 'public.epigraph_end_expired_elevations(uuid, uuid) FROM epigraph_app';
     END IF;
 END $$;
