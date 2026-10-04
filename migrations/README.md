@@ -951,7 +951,8 @@ Current reservation:
   elevation and passkey tables, the governance tables `epigraph_is_elevated()`
   reads, `instance_admins`, `evidence_visibility_pins`, the privatization
   plans, and the two bypass-only tables). Pinned from the catalog by
-  `epigraph-db/tests/elevation_arms_census.rs`. Lock plan: one table per `DO` block,
+  `epigraph-db/tests/elevation_arms_census.rs`; behaviour in
+  `epigraph-db/tests/elevated_arms.rs`. Lock plan: one table per `DO` block,
   each followed by `COMMIT;` (see the `-- no-transaction` section below),
   with a transaction-local 3 s lock timeout and drop-before-create, so a
   lock timeout fails the file at one table with the earlier tables armed and
