@@ -623,3 +623,110 @@ fn every_128_object_is_registered() {
         "128-undo.sql does not drop the switch's table"
     );
 }
+
+// =====================================================================
+// The Rust half (repos::admin_scope_enforcement)
+// =====================================================================
+
+/// `AdminScopeEnforcement::read` on the APPLICATION role: unarmed, then armed;
+/// a database whose switch function is gone (no 128) reads `Absent` (unarmed:
+/// it cannot have been armed); any OTHER failure (EXECUTE revoked) is an
+/// error, never a silent "unarmed", because the mint chokepoint fails closed
+/// on an error.
+///
+/// Verified to fail with `read` mapping every error to `Absent` (the revoked
+/// read is not an error) and with the 42883 arm removed (the dropped function
+/// is an error, not `Absent`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_repository_reads_absent_as_absent_and_a_refusal_as_an_error(pool: PgPool) {
+    use epigraph_db::{AdminScopeEnforcement, AdminScopeSwitch};
+    async fn read_as_app(pool: &PgPool) -> Result<AdminScopeSwitch, epigraph_db::DbError> {
+        fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+            let r = AdminScopeEnforcement::read(&mut *conn).await;
+            (conn, r)
+        })
+        .await
+    }
+    assert_eq!(
+        read_as_app(&pool).await.expect("unarmed read"),
+        AdminScopeSwitch::Unarmed
+    );
+    set_as_maintenance(&pool, true, "repository test").await;
+    let armed = read_as_app(&pool).await.expect("armed read");
+    assert_eq!(armed, AdminScopeSwitch::Armed);
+    assert!(armed.is_armed());
+
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION public.epigraph_admin_scopes_armed() FROM epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke");
+    let refused = read_as_app(&pool).await;
+    assert!(
+        refused.is_err(),
+        "a refused read is an error, not a state: {refused:?}"
+    );
+
+    sqlx::query("DROP FUNCTION public.epigraph_admin_scopes_armed() CASCADE")
+        .execute(&pool)
+        .await
+        .expect("drop");
+    let absent = read_as_app(&pool).await.expect("absent read");
+    assert_eq!(absent, AdminScopeSwitch::Absent);
+    assert!(!absent.is_armed(), "a database without 128 is unarmed");
+}
+
+/// `AdminScopeEnforcement::set` arms on a maintenance connection and reports
+/// the change; on the application role it is refused; `state` reads the row;
+/// `record_would_strip` records once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_repository_sets_only_on_maintenance_and_records_once(pool: PgPool) {
+    use epigraph_db::AdminScopeEnforcement;
+    let change = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let c = AdminScopeEnforcement::set(&mut conn, true, "repo arm").await;
+        let s = AdminScopeEnforcement::state(&mut conn).await;
+        (conn, (c, s))
+    })
+    .await;
+    let (c, s) = change;
+    let c = c.expect("maintenance arms");
+    assert!(c.changed && c.armed);
+    assert_eq!(c.changed_by, "epigraph_maintenance");
+    let s = s.expect("state");
+    assert!(s.armed);
+    assert_eq!(s.reason, "repo arm");
+
+    let refused = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let r = AdminScopeEnforcement::set(&mut conn, false, "app disarm").await;
+        (conn, r)
+    })
+    .await;
+    assert!(refused.is_err(), "the app cannot disarm: {refused:?}");
+    assert!(armed(&pool).await);
+
+    set_as_maintenance(&pool, false, "back to unarmed").await;
+    let client = client_with(&pool, &["claims:admin"]).await;
+    let recorded = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let one = AdminScopeEnforcement::record_would_strip(
+            &mut *conn,
+            client,
+            "client_credentials",
+            &["claims:admin".to_string()],
+        )
+        .await;
+        let two = AdminScopeEnforcement::record_would_strip(
+            &mut *conn,
+            client,
+            "client_credentials",
+            &["claims:admin".to_string()],
+        )
+        .await;
+        (conn, (one, two))
+    })
+    .await;
+    assert_eq!(
+        (recorded.0.expect("first"), recorded.1.expect("second")),
+        (true, false)
+    );
+}

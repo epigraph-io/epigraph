@@ -472,6 +472,21 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "admin_scope_enforcement.rs",
+        "state",
+        "READ of migration 128's one-row admin-scope switch (`admin_scope_enforcement`) for the \
+         maintenance CLI's report: control state with no `visibility` / `owner_group_id`, the \
+         same row for every caller; nothing for a viewer to filter.",
+    ),
+    (
+        "admin_scope_enforcement.rs",
+        "set",
+        "WRITE through migration 128's maintenance-only definer \
+         `epigraph_set_admin_scope_enforcement` (arm or disarm the admin-scope switch, with a \
+         reason): one control row, no tenancy columns; the definer refuses every login but the \
+         maintenance role (ADS02) and the table's own trigger audits the change.",
+    ),
+    (
         "passkey.rs",
         "create_enrollment",
         "WRITE through migration 124's maintenance-only definer \
@@ -1837,6 +1852,21 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    (
+        "admin_scope_enforcement.rs",
+        "read",
+        "READ of migration 128's admin-scope switch through its app-callable definer \
+         `epigraph_admin_scopes_armed()`: one boolean of control state, the same for every \
+         caller, read by the token endpoint BEFORE any principal exists. No tenancy to filter.",
+    ),
+    (
+        "admin_scope_enforcement.rs",
+        "record_would_strip",
+        "WRITE through migration 128's app-callable definer \
+         `epigraph_record_admin_scope_would_strip`: one `oauth.admin_scope_would_strip` \
+         measurement event about an OAuth client, at mint time, before any principal exists. \
+         The definer checks the client and its scopes itself (ADS03); not a corpus row.",
+    ),
     // ── Batch W10 (migration 117): the administrative cascade's audit row.
     (
         "admin_cascade.rs",
