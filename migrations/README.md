@@ -984,9 +984,34 @@ Current reservation:
   Checked before claiming: no open PR branch carries a `126`. **Applied to a
   throwaway database only, NOT to any deployed database.**
 
-- **127+**: public next
+- **127** `127_elevated_access.sql` (elevation plan EL-8): the ELEVATED-ACCESS
+  LOG. `elevated_access` (FORCE RLS; append-only: a BEFORE INSERT guard
+  binds each row to its session's person, assignment and reason, stamped now
+  by the inserting login, and a BEFORE UPDATE OR DELETE guard refuses every
+  login, `ELV03`). `epigraph_record_elevated_access(surface, args,
+  row_count, candidate_ids)` is refused (`ELV07`) unless THIS connection is
+  elevated (`epigraph_is_elevated()`); it takes the session, person,
+  assignment and reason from the session row and decides the OWNER GROUPS
+  itself: the private rows among the candidate ids that the elevator could
+  not read unelevated, by each table's own tenancy rule (the 126 read-armed
+  owner-group tables keyed by a uuid `id`, edges by owner AND co-owner,
+  another agent's `recall_events` by owner group, groups and memberships).
+  Read: `elevated_access_subject_read` admits a live ADMIN member of a named
+  group (`epigraph_admin_group_ids()`, principal-bound, argument-free);
+  `epigraph_elevated_access_audit(since, limit)` serves `reads_audit` holders,
+  an elevated session and privileged sessions (123's audit-reader pattern).
+  The recorder gate (`epigraph_elevated_access_ready()`, 125) is NOT opened:
+  the other opening conditions in 125's header are not met at 127, so no
+  session is live after it either. Registers: the census EXCLUDED list, the
+  FORCE registers (state.rs, locked_decisions, rls_enforcement, 079-undo),
+  rls_enforcement's session helpers. Behaviour in
+  `epigraph-db/tests/elevated_access.rs`. Checked before claiming: no open PR
+  branch carries a `127`. **Applied to a throwaway database only, NOT to any
+  deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `127` or
+- **128+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `128` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

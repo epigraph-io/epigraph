@@ -248,6 +248,21 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          the absent DELETE policy default-denies every non-superuser role, and 125 grants \
          DELETE to nobody.",
     ),
+    (
+        "elevated_access",
+        "UPDATE",
+        "The log of elevated reads (127) is append-only: a row is the subject's record of who \
+         read their group's rows, when and why, and nothing edits it. Under FORCE the absent \
+         UPDATE policy default-denies every non-superuser role, 127 grants UPDATE to nobody, and \
+         its change guard refuses (ELV03) even a superuser.",
+    ),
+    (
+        "elevated_access",
+        "DELETE",
+        "The log of elevated reads (127) is append-only, as for UPDATE. Under FORCE the absent \
+         DELETE policy default-denies every non-superuser role, 127 grants DELETE to nobody, and \
+         its change guard refuses (ELV03) even a superuser.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -314,6 +329,7 @@ const PROTECTED: &[&str] = &[
     "person_authenticators",
     "elevation_tickets",
     "elevation_sessions",
+    "elevated_access",
 ];
 
 // ===========================================================================
@@ -1383,6 +1399,11 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
         // when the elevation setting is empty, so an arm naming it is
         // session-derived (`elevation_sessions.rs` pins that body).
         "epigraph_is_elevated",
+        // 127's subject-read helper (`elevated_access_subject_read`). Argument-free
+        // and principal-bound: it returns the groups `epigraph_principal_id()` is
+        // a live ADMIN member of, so an arm naming it is session-derived
+        // (`elevated_access.rs` pins who reads through it).
+        "epigraph_admin_group_ids",
     ];
     // ARMS — not policies — that are row-only BY DESIGN, each with the reason.
     //

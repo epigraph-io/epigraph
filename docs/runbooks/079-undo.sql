@@ -116,7 +116,10 @@ DECLARE t text;
           'passkey_enrollments','person_authenticators',
           -- ---- a human's elevation tickets and sessions (125) ------------
           -- FORCEd by 125 at creation, same precedent and reason.
-          'elevation_tickets','elevation_sessions'];
+          'elevation_tickets','elevation_sessions',
+          -- ---- the log of elevated reads (127) ---------------------------
+          -- FORCEd by 127 at creation, same precedent and reason.
+          'elevated_access'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

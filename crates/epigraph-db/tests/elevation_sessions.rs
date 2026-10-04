@@ -1961,19 +1961,21 @@ async fn elevation_live_is_principal_bound(pool: PgPool) {
     );
 }
 
-/// NO SESSION IS LIVE UNTIL THE PER-ACCESS RECORDER IS INSTALLED (review cp2:
-/// SEC-01). The elevated read arms (126) let a live session read other
+/// NO SESSION IS LIVE WHILE THE RECORDER GATE IS CLOSED (review cp2: SEC-01;
+/// cp3: SEC-01). The elevated read arms (126) let a live session read other
 /// people's private rows, and the design requires every such read to be
-/// recorded, fail-closed, where the subject can read it; that recorder is a
-/// later migration. A deploy applies every embedded migration up to its head,
-/// in version order, so a prose "hold 126" cannot keep 126 off a database
-/// before the recorder lands. 125's gate, `epigraph_elevated_access_ready()`,
-/// ships `false` and is ANDed into the one liveness predicate: on a database
-/// at this tree's head a confirmed session is not elevated, `elevation_live`
-/// answers no row, the grant-mode redemption is `invalid`, and the elevated
-/// application session reads NONE of another tenant's private rows through
-/// 126's arms. With the gate opened (the recorder's stand-in), the same
-/// session and ticket are elevated, answered, redeemed, and read the row.
+/// recorded, fail-closed, where the subject can read it. A deploy applies
+/// every embedded migration up to its head, in version order, so a prose
+/// "hold 126" cannot keep 126 off a database. 125's gate,
+/// `epigraph_elevated_access_ready()`, ships `false` and is ANDed into the one
+/// liveness predicate. Migration 127 installs the recorder and LEAVES THE GATE
+/// CLOSED (its header: the other opening conditions are not met yet), so on a
+/// database at this tree's head a confirmed session is still not elevated,
+/// `elevation_live` answers no row, the grant-mode redemption is `invalid`,
+/// and the elevated application session reads NONE of another tenant's
+/// private rows through 126's arms. With the gate opened (the test stand-in
+/// for the opening migration), the same session and ticket are elevated,
+/// answered, redeemed, and read the row.
 ///
 /// Verified to fail with the gate's conjunct dropped from
 /// `epigraph_elevation_session_is_live` (the session is elevated, and reads B's
@@ -1984,7 +1986,7 @@ async fn elevation_live_is_principal_bound(pool: PgPool) {
 /// RECORDER" (review cp3: SEC-01); the closed-gate assertion below repeats
 /// them, so whoever flips it reads them.
 #[sqlx::test(migrations = "../../migrations")]
-async fn no_session_is_live_until_the_access_recorder_is_installed(pool: PgPool) {
+async fn no_session_is_live_while_the_recorder_gate_is_closed(pool: PgPool) {
     let h = holder_behind_a_closed_gate(&pool, "gate-holder", 1).await;
     let g = holder_behind_a_closed_gate(&pool, "gate-grant", 2).await;
     let (b, b_group) = fixture::seed_agent_with_group(&pool, "gate-b").await;
@@ -2041,13 +2043,13 @@ async fn no_session_is_live_until_the_access_recorder_is_installed(pool: PgPool)
         .expect("the gate");
     assert!(
         !shipped,
-        "125 ships the gate closed. A change that opens it must ALSO, in the same or an \
-         earlier change: (1) settle elevated reads of operator-hidden (pinned) evidence \
+        "125 ships the gate closed and 127 (the recorder) leaves it closed. A change that \
+         opens it must ALSO, in the same or an earlier change: (1) settle elevated reads of operator-hidden (pinned) evidence \
          (default: hidden, by a definer predicate in evidence_elevated_read plus the hide \
          tool's exemption and the 126 undo); (2) refuse elevated non-GET API requests (with \
          an allowlist) or measure that no route writes on an elevated read; (3) record \
-         recall_events accesses by owner group; and declare the recorder only where it is \
-         wired. See 125's header, OPENING IT WAITS ON MORE THAN THE RECORDER."
+         recall_events accesses by owner group (127 does); and declare the recorder only \
+         where it is wired. See 125's header, OPENING IT WAITS ON MORE THAN THE RECORDER."
     );
 
     fixture::open_elevated_access_gate(&pool).await;

@@ -600,6 +600,9 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // migration that creates them, on the same precedent.
     "elevation_tickets",
     "elevation_sessions",
+    // The log of elevated reads (127), FORCEd by the migration that creates
+    // it, on the same precedent.
+    "elevated_access",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.

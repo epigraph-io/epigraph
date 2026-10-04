@@ -85,6 +85,11 @@ const EXCLUDED: &[(&str, &str)] = &[
         "the elevation record itself (125); read by epigraph_is_elevated()",
     ),
     ("elevation_tickets", "the elevation record itself (125)"),
+    (
+        "elevated_access",
+        "the log of elevated reads (127): read by its subjects' admins and the audit reader, \
+         written by the recorder definer while the caller IS elevated",
+    ),
     ("person_authenticators", "passkey material (124)"),
     ("passkey_enrollments", "passkey enrollment state (124)"),
     (
@@ -153,6 +158,11 @@ const READ_PATH_WRITES: &[(&str, &str, &str)] = &[
     (
         "privatization_audit",
         "privatization read routes' audit appends",
+        "allowed",
+    ),
+    (
+        "elevated_access",
+        "the per-access recorder (API response layer, MCP tool-call wrapper; definer 127)",
         "allowed",
     ),
 ];
