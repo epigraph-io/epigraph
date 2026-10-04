@@ -48,10 +48,11 @@
 //!     epigraph-operator passkey-enroll --person <uuid> --reason TEXT [--label TEXT] [--apply]
 //!     epigraph-operator list-passkeys [--person <uuid>] [--include-revoked]
 //!     epigraph-operator revoke-passkey --id <uuid> --reason TEXT [--apply]
+//!     epigraph-operator end-elevation --session <uuid> [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, arm, bind, client_scope, custodian, hide, human, legacy, link, passkey, reown,
+    self, arm, bind, client_scope, custodian, elevation, hide, human, legacy, link, passkey, reown,
     reown_linked, reverse,
 };
 use std::path::PathBuf;
@@ -185,6 +186,16 @@ enum Command {
         #[arg(long)]
         reason: String,
         /// Commit. Without it, the revoke and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// End one live elevation session now (any person's; audited
+    /// `platform.elevation_ended`, ended_by = this maintenance login).
+    EndElevation {
+        /// The elevation session id (`elevation_sessions.id`, the `elv` claim).
+        #[arg(long)]
+        session: Uuid,
+        /// Commit. Without it, the end and its audit row roll back.
         #[arg(long)]
         apply: bool,
     },
@@ -642,6 +653,18 @@ async fn main_inner() -> anyhow::Result<i32> {
             );
             if !apply {
                 println!("DRY RUN: the revoke and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::EndElevation { session, apply } => {
+            let ended = elevation::end(&mut conn, session, apply).await?;
+            println!(
+                "{}{}\t{session}",
+                if apply || !ended { "" } else { "WOULD BE " },
+                if ended { "ENDED" } else { "NOT-LIVE" },
+            );
+            if !apply {
+                println!("DRY RUN: the end and its audit row were rolled back.");
             }
             Ok(0)
         }

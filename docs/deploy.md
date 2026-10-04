@@ -1695,8 +1695,11 @@ answers false and nothing reads more than before.
    (reuse, RFC 7009, a denied refresh, a client-wide revoke), its client
    leaves `active`, or the passkey that confirmed it is revoked
    (`epigraph-operator revoke-passkey` is therefore also the way to end a
-   live elevation that passkey opened). No backfill; nothing existing
-   changes shape. Old binaries are unaffected (they call none of it).
+   live elevation that passkey opened). To end one session without taking
+   anything else away, `epigraph-operator end-elevation --session <id>
+   --apply` on the maintenance DSN (audited `platform.elevation_ended`). No
+   backfill; nothing existing changes shape. Old binaries are unaffected
+   (they call none of it).
 2. **Deploy** `epigraph-tenancy-backfill` built from the same commit
    (`verify` then checks the 125 definers' owner and grants).
 3. Nothing else is deployed by this step: the ceremony, the ticket API and the

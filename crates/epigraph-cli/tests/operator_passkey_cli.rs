@@ -315,3 +315,130 @@ async fn list_and_revoke_a_passkey(pool: PgPool) {
     .await;
     assert_eq!(missing.code, 1, "{}", missing.show());
 }
+
+/// A live connector-mode elevation session for `person` (a registered human,
+/// made a custodian here) on a fresh refresh family of its human client,
+/// confirmed by a passkey registered for it, through migration 125's
+/// definers on the harness connection.
+async fn live_session(pool: &PgPool, person: Uuid, n: u8) -> Uuid {
+    fixture::make_custodian(pool, person).await;
+    registered_passkey(pool, person, n).await;
+    let client: Uuid = sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client");
+    let hash: Vec<u8> = [
+        Uuid::new_v4().as_bytes().to_vec(),
+        Uuid::new_v4().as_bytes().to_vec(),
+    ]
+    .concat();
+    let family: Uuid = sqlx::query_scalar(
+        "INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at) \
+         VALUES ($1, $2, ARRAY['claims:read'], now() + interval '1 day') RETURNING id",
+    )
+    .bind(&hash)
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .expect("a refresh family");
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+        .bind(person.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp");
+    let ticket: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_create_elevation_ticket($1, $2, 'connector', 'cli test', NULL)",
+    )
+    .bind(client)
+    .bind(family)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("a ticket");
+    sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+        .execute(&mut *conn)
+        .await
+        .expect("unstamp");
+    sqlx::query("SELECT public.epigraph_set_elevation_ticket_challenge($1, '{\"st\": 1}'::jsonb)")
+        .bind(ticket)
+        .execute(&mut *conn)
+        .await
+        .expect("challenge");
+    let mut cred = vec![0x5A_u8; 16];
+    cred[0] = n;
+    let (outcome, session): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT outcome, session_id \
+           FROM public.epigraph_confirm_elevation($1, $2, 0, false, '{\"ev\": 1}'::jsonb)",
+    )
+    .bind(ticket)
+    .bind(cred)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("confirm");
+    assert_eq!(outcome, "confirmed", "CALIBRATION: the ceremony confirms");
+    session.expect("a session")
+}
+
+async fn session_end(pool: &PgPool, session: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT ended_reason FROM elevation_sessions WHERE id = $1")
+        .bind(session)
+        .fetch_one(pool)
+        .await
+        .expect("the session")
+}
+
+/// `end-elevation` ends one live elevation session from the maintenance DSN:
+/// a dry run says WOULD BE ENDED and leaves the session live with no audit
+/// row; `--apply` ends it (`ended`, audited `platform.elevation_ended`); a
+/// second run, and an unknown id, answer NOT-LIVE and change nothing.
+///
+/// Verified to fail: `operator::elevation::end` committing on a dry run ->
+/// the dry run ends the session; rolling back under `--apply` -> the
+/// session stays live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn end_elevation_ends_one_session_only_under_apply(pool: PgPool) {
+    let (h, _) = fixture::seed_human_operator(&pool, "elevated human").await;
+    let sid = live_session(&pool, h, 7).await;
+    let id = sid.to_string();
+
+    let dry = run_op(&pool, &["end-elevation", "--session", &id]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("WOULD BE ENDED"), "{}", dry.show());
+    assert!(dry.stdout.contains("DRY RUN"), "{}", dry.show());
+    assert_eq!(
+        session_end(&pool, sid).await,
+        None,
+        "a dry run ends nothing"
+    );
+    assert_eq!(
+        platform_events(&pool, "platform.elevation_ended").await,
+        0,
+        "a dry run leaves no audit row"
+    );
+
+    let applied = run_op(&pool, &["end-elevation", "--session", &id, "--apply"]).await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    assert!(applied.stdout.contains("ENDED"), "{}", applied.show());
+    assert!(!applied.stdout.contains("WOULD BE"), "{}", applied.show());
+    assert_eq!(session_end(&pool, sid).await.as_deref(), Some("ended"));
+    assert_eq!(
+        platform_events(&pool, "platform.elevation_ended").await,
+        1,
+        "the end is audited"
+    );
+
+    let unknown = Uuid::new_v4().to_string();
+    for (what, target) in [("again", id.as_str()), ("unknown", unknown.as_str())] {
+        let r = run_op(&pool, &["end-elevation", "--session", target, "--apply"]).await;
+        assert_eq!(r.code, 0, "{what}: {}", r.show());
+        assert!(r.stdout.contains("NOT-LIVE"), "{what}: {}", r.show());
+    }
+    assert_eq!(
+        platform_events(&pool, "platform.elevation_ended").await,
+        1,
+        "nothing more was ended"
+    );
+}

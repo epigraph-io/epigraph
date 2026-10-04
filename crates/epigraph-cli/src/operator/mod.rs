@@ -51,7 +51,10 @@
 //!   human and print its ceremony path, which the human completes on the
 //!   device that holds the authenticator.
 //! * `list-passkeys` / `revoke-passkey` — list them, and the audited
-//!   break-glass revoke.
+//!   break-glass revoke (which also ends every live elevation that passkey
+//!   confirmed).
+//! * `end-elevation` — end one live elevation session now, any person's
+//!   (migration 125's privileged end; audited).
 //!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
@@ -93,6 +96,7 @@ pub mod arm;
 pub mod bind;
 pub mod client_scope;
 pub mod custodian;
+pub mod elevation;
 pub mod hide;
 pub mod human;
 pub mod legacy;
