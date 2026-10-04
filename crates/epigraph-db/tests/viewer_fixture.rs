@@ -320,6 +320,28 @@ pub async fn make_human_operator(pool: &PgPool, agent: Uuid) {
         .expect("human operator registry row");
 }
 
+/// Stand in for the per-access elevation recorder (elevation plan EL-8) by
+/// opening migration 125's gate, `epigraph_elevated_access_ready()`, on this
+/// test database only.
+///
+/// 125 ships the gate answering `false`, so NO elevation session is live
+/// (`epigraph_is_elevated()`, `epigraph_elevation_live`, the grant-mode
+/// redemption) until the migration that installs the recorder replaces it: a
+/// routine deploy of a tree without the recorder can never widen a read. A
+/// test of what a LIVE session does calls this first (before any pool is
+/// built, so no cached plan holds the old body); `CREATE OR REPLACE` keeps the
+/// function's owner and ACL, so the 125 register tests still hold. Idempotent.
+pub async fn open_elevated_access_gate(pool: &PgPool) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready() \
+         RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER \
+         SET search_path = public, pg_temp AS $$ SELECT true $$",
+    )
+    .execute(pool)
+    .await
+    .expect("open the elevated-access gate (test stand-in for the recorder)");
+}
+
 /// Make `agent` a live PLATFORM CUSTODIAN (migration 123): a registered human
 /// ([`make_human_operator`], unless it already is one) holding an open
 /// `role:platform-custodian` assignment. Returns the assignment id (the live

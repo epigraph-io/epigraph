@@ -261,6 +261,9 @@ async fn enroll_with(
 
 /// A platform custodian with one live passkey (on `auth`) and a family.
 async fn holder(pool: &PgPool, s: &Server, label: &str, auth: &mut SoftAuthenticator) -> Person {
+    // 125 ships no session live until the per-access recorder is installed;
+    // these tests are about what a LIVE session does.
+    fixture::open_elevated_access_gate(pool).await;
     let p = person(pool, label).await;
     fixture::make_custodian(pool, p.person).await;
     enroll(pool, s, p.person, auth).await;
@@ -1411,6 +1414,7 @@ async fn an_unconfirmed_ticket_expires_into_invalid_grant(pool: PgPool) {
 /// exp - iat = 900.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_elevated_token_never_outlives_the_assignment(pool: PgPool) {
+    fixture::open_elevated_access_gate(&pool).await;
     let s = spawn(&pool, Some(software())).await;
     let mut auth = SoftAuthenticator::new(MODEL);
     let p = person(&pool, "short-assignment").await;

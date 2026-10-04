@@ -57,6 +57,9 @@ where
 /// A custodian with one live passkey and one live refresh family of its own
 /// human client: `(client row id, family)`. `person` must already exist.
 async fn make_holder(pool: &PgPool, person: Uuid, n: u8) -> (Uuid, Uuid) {
+    // 125 ships no session live until the per-access recorder is installed;
+    // these tests are about what a LIVE session does.
+    fixture::open_elevated_access_gate(pool).await;
     fixture::make_custodian(pool, person).await;
     let client: Uuid = sqlx::query_scalar(
         "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human' \

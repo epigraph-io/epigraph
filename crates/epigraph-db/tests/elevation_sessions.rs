@@ -224,7 +224,16 @@ struct Holder {
     token_hash: Vec<u8>,
 }
 
+/// A holder, with the elevated-access gate OPEN (the recorder's stand-in,
+/// [`fixture::open_elevated_access_gate`]), so a session it confirms is live.
 async fn holder(pool: &PgPool, label: &str, n: u8) -> Holder {
+    fixture::open_elevated_access_gate(pool).await;
+    holder_behind_a_closed_gate(pool, label, n).await
+}
+
+/// A holder on a database whose gate is as 125 ships it (closed), unless an
+/// earlier call opened it.
+async fn holder_behind_a_closed_gate(pool: &PgPool, label: &str, n: u8) -> Holder {
     let (person, client) = human(pool, label).await;
     let assignment = fixture::make_custodian(pool, person).await;
     let passkey = passkey(pool, person, n).await;
@@ -1946,6 +1955,99 @@ async fn elevation_live_is_principal_bound(pool: PgPool) {
     );
 }
 
+/// NO SESSION IS LIVE UNTIL THE PER-ACCESS RECORDER IS INSTALLED (review cp2:
+/// SEC-01). The elevated read arms (126) let a live session read other
+/// people's private rows, and the design requires every such read to be
+/// recorded, fail-closed, where the subject can read it; that recorder is a
+/// later migration. A deploy applies every embedded migration up to its head,
+/// in version order, so a prose "hold 126" cannot keep 126 off a database
+/// before the recorder lands. 125's gate, `epigraph_elevated_access_ready()`,
+/// ships `false` and is ANDed into the one liveness predicate: on a database
+/// at this tree's head a confirmed session is not elevated, `elevation_live`
+/// answers no row, the grant-mode redemption is `invalid`, and the elevated
+/// application session reads NONE of another tenant's private rows through
+/// 126's arms. With the gate opened (the recorder's stand-in), the same
+/// session and ticket are elevated, answered, redeemed, and read the row.
+///
+/// Verified to fail with the gate's conjunct dropped from
+/// `epigraph_elevation_session_is_live` (the session is elevated, and reads B's
+/// row, behind the closed gate), and with the gate shipped `true`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_session_is_live_until_the_access_recorder_is_installed(pool: PgPool) {
+    let h = holder_behind_a_closed_gate(&pool, "gate-holder", 1).await;
+    let g = holder_behind_a_closed_gate(&pool, "gate-grant", 2).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "gate-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "gate: B's private claim").await;
+    let session = elevated(&pool, &h).await;
+    let secret = [b'g'; 32];
+    let t = ticket(&pool, &g, "grant", Some(&secret)).await;
+    let r = confirm(&pool, t, &g.cred, 0, false).await.expect("confirm");
+    assert_eq!(r.0, "confirmed", "CALIBRATION: the grant ceremony confirms");
+
+    let reads_b = || {
+        let pool = pool.clone();
+        let (person, family) = (h.person, h.family);
+        async move {
+            as_app(
+                &pool,
+                Some(person),
+                &session.to_string(),
+                &family.to_string(),
+                |mut conn| async move {
+                    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+                        .bind(claim)
+                        .fetch_one(&mut *conn)
+                        .await
+                        .expect("read B's claim");
+                    (conn, n)
+                },
+            )
+            .await
+        }
+    };
+
+    assert!(
+        !elevated_as(&pool, &h, session).await,
+        "behind the closed gate the session is not elevated"
+    );
+    assert!(
+        live_rows(&pool, &h, Some(session)).await.is_empty(),
+        "behind the closed gate elevation_live answers no session"
+    );
+    assert_eq!(
+        reads_b().await,
+        0,
+        "behind the closed gate the elevated session reads none of B's private rows"
+    );
+    assert_eq!(
+        redeem_as_login(&pool, Some("epigraph_app"), t, &secret, g.client).await,
+        "invalid",
+        "behind the closed gate the grant-mode ticket does not redeem"
+    );
+    let shipped: bool = sqlx::query_scalar("SELECT public.epigraph_elevated_access_ready()")
+        .fetch_one(&pool)
+        .await
+        .expect("the gate");
+    assert!(!shipped, "125 ships the gate closed");
+
+    fixture::open_elevated_access_gate(&pool).await;
+    assert!(
+        elevated_as(&pool, &h, session).await,
+        "CALIBRATION: with the recorder's stand-in the same session is elevated"
+    );
+    assert_eq!(live_rows(&pool, &h, Some(session)).await, vec![session]);
+    assert_eq!(
+        reads_b().await,
+        1,
+        "CALIBRATION: and reads B's private row through 126's arm"
+    );
+    assert_eq!(
+        redeem_as_login(&pool, Some("epigraph_app"), t, &secret, g.client).await,
+        "issued",
+        "CALIBRATION: and the same ticket redeems"
+    );
+}
+
 /// A role that bypasses row security without being a maintenance member: the
 /// login shape `epigraph_bypass()` alone does not see. NOLOGIN (a test role
 /// only ever reached by `SET SESSION AUTHORIZATION`); created once per
@@ -2180,7 +2282,7 @@ async fn end_elevation_is_principal_bound(pool: PgPool) {
 /// session's own holder, with its own GUC pair), writes neither table, and
 /// cannot call the four unbound helpers (an unbound "who may elevate",
 /// "whose family is this" or "is this session live" answer is a roster
-/// oracle).
+/// oracle) nor the recorder gate (no request-path caller needs it).
 ///
 /// Verified to fail: the sessions read policy widened to `USING (true)` ->
 /// the app reads the session; EXECUTE granted to the app (a GRANT appended
@@ -2222,6 +2324,7 @@ async fn the_app_reads_and_writes_no_row(pool: PgPool) {
         "SELECT public.epigraph_family_of_person_is_live(gen_random_uuid(), gen_random_uuid(), \
                                                          gen_random_uuid())",
         "SELECT public.epigraph_elevation_session_is_live(gen_random_uuid())",
+        "SELECT public.epigraph_elevated_access_ready()",
         "SELECT public.epigraph_end_expired_elevations(NULL, NULL)",
     ] {
         assert_code(&app_exec(&pool, Some(h.person), sql).await, "42501", sql);
@@ -2629,8 +2732,8 @@ fn every_125_object_is_registered() {
     let (definers, all) = functions_of(&migration);
     assert_eq!(
         definers.len(),
-        24,
-        "CALIBRATION: 125 creates 24 SECURITY DEFINER functions; the scan found {definers:?}"
+        25,
+        "CALIBRATION: 125 creates 25 SECURITY DEFINER functions; the scan found {definers:?}"
     );
     assert_eq!(definers, all, "every function 125 creates is a definer");
     let missing: Vec<&String> = definers

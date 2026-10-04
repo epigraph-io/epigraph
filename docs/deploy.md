@@ -1684,7 +1684,9 @@ read-only elevation of at most 15 minutes, bound to one refresh family of the
 human and to the live assignment of an `elevates` role), plus
 `epigraph_is_elevated()`. INERT on its own: no binary stamps the elevation
 session settings yet and no row policy reads the function, so every session
-answers false and nothing reads more than before.
+answers false and nothing reads more than before. And no session is live at
+all until the per-access elevation log's migration opens 125's gate
+(`epigraph_elevated_access_ready()`, shipped false; see the 126 section).
 
 1. **Migrate 125** (`epigraph-migrate`, migration DSN), after 124. Two new
    tables, their triggers and policies, new functions, and five new AFTER
@@ -1772,18 +1774,26 @@ an elevated session read other people's rows; it also makes the database,
 not only `begin_as`, refuse that session's writes. For every session that is
 not elevated nothing changes: the arm is false and every refusal is true.
 
-**HOLD: do not apply 126 to a production database, and open no elevation
-session for real use, until the per-access elevation log ships with it.**
-126 is what lets an elevated session read other people's private rows. The
-design requires every such read to be recorded, fail-closed (a response whose
-access cannot be recorded is not sent), in a log the SUBJECT can read ("an
-administrator read your group's rows at T, for reason R"). That log is a later
-migration of this stack and is not in this one. Until it is, the only trail of
-an elevation is session-level (`platform.elevated` / `platform.elevation_ended`
-in `security_events`: who elevated, why, when), which names no row and no
-group that was read, and nothing tells the owners of those rows. So the order
-is: the log's migration and binaries, then 126, then the first real elevation.
-On a test or staging database 126 may be applied on its own.
+**THE GATE: no elevation session is live until the per-access elevation log
+ships, and the database enforces it.** 126 is what lets an elevated session
+read other people's private rows. The design requires every such read to be
+recorded, fail-closed (a response whose access cannot be recorded is not
+sent), in a log the SUBJECT can read ("an administrator read your group's rows
+at T, for reason R"). That log is a later migration of this stack and is not
+in this one. A prose "hold 126" could not keep 126 off a database:
+`epigraph-migrate` (the supported path, also as `ExecStartPre=`) applies every
+embedded migration up to the binary's head, in version order, and takes no
+target. So migration 125 holds the line itself: `epigraph_elevated_access_ready()`
+ships answering `false` and is part of the one liveness test, so on a database
+at this tree's head no session is elevated, `epigraph_elevation_live` answers
+no session, and the grant-mode redemption refuses, whatever was applied. A
+ceremony still confirms and audits its session (`platform.elevated`); the
+session just never reads. Only the log's migration opens the gate, by
+replacing that function with its own readiness test; there is no operator
+switch, and the function must not be replaced by hand (replacing it takes its
+owner, so neither the application role nor an operator statement on the
+maintenance DSN can). Applying 126 before the log is therefore safe, and the
+first real elevation waits on the log by construction.
 
 1. **Deploy the elevated-viewer binaries first** (the section above) and
    migrate 125 before them. Without them nothing stamps an elevation, so the

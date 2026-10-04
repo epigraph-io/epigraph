@@ -468,6 +468,11 @@ impl Viewer {
     /// viewer carrying the session the database returned. Not live: the scoped
     /// viewer, and the request proceeds unelevated.
     ///
+    /// **Nothing elevates before the per-access recorder.** 125's gate
+    /// (`epigraph_elevated_access_ready()`) ships false, so until the
+    /// recorder's migration opens it no session is live and this returns the
+    /// scoped viewer.
+    ///
     /// **A privileged pool never elevates.** On a login that skips row
     /// security (a superuser, a BYPASSRLS role) or is a maintenance member,
     /// 125 answers no live session, so the scoped viewer comes back: there no

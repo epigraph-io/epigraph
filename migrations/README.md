@@ -921,7 +921,9 @@ Current reservation:
   that confirmed it revoked); expiry is lazy. Liveness is one predicate, `epigraph_elevation_session_is_live`,
   shared by `epigraph_is_elevated`, `epigraph_elevation_live` and the
   grant-mode redemption, judged on the statement's clock and re-checking the
-  assignment, the family and its client, and the passkey. FORCE RLS on
+  assignment, the family and its client, and the passkey; never live on a
+  privileged login (a superuser, a BYPASSRLS role or a maintenance member),
+  and never before the recorder gate opens. FORCE RLS on
   both: the application role keeps SELECT but its policies show it no row,
   and it holds no DML. App-callable definers: `epigraph_create_elevation_ticket`
   (principal-bound), `epigraph_ticket_for_ceremony`,
@@ -930,7 +932,9 @@ Current reservation:
   `epigraph_elevation_live` (principal-bound), `epigraph_end_elevation`,
   `epigraph_is_elevated`; NOT app-callable: `epigraph_live_elevating_assignment`,
   `epigraph_family_of_person_is_live`, `epigraph_elevation_session_is_live`,
-  `epigraph_end_expired_elevations`.
+  `epigraph_end_expired_elevations`, and the recorder gate
+  `epigraph_elevated_access_ready` (ships `false`: no session is live until
+  the per-access elevation log's migration replaces it; review cp2).
   Audited from the tables: `platform.elevation_requested`, `_refused`,
   `platform.elevated`, `platform.elevation_ended`, and
   `platform.passkey_counter_regressed`. Registered in

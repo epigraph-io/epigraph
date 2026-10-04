@@ -1729,6 +1729,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // check re-reads the assignment), the record does not: the stake.
     ("epigraph_live_elevating_assignment", 125),
     ("epigraph_family_of_person_is_live", 125),
+    ("epigraph_elevated_access_ready", 125),
     ("epigraph_elevation_session_is_live", 125),
     ("epigraph_elevation_tickets_guard_insert", 125),
     ("epigraph_elevation_tickets_guard_update", 125),
@@ -2194,6 +2195,11 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_family_of_person_is_live",
             "public.epigraph_family_of_person_is_live(uuid, uuid, uuid)",
+            false,
+        ),
+        (
+            "epigraph_elevated_access_ready",
+            "public.epigraph_elevated_access_ready()",
             false,
         ),
         (

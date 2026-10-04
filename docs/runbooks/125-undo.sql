@@ -80,6 +80,7 @@ DROP FUNCTION IF EXISTS public.epigraph_elevation_sessions_guard_insert();
 DROP FUNCTION IF EXISTS public.epigraph_elevation_tickets_guard_update();
 DROP FUNCTION IF EXISTS public.epigraph_elevation_tickets_guard_insert();
 DROP FUNCTION IF EXISTS public.epigraph_elevation_session_is_live(uuid);
+DROP FUNCTION IF EXISTS public.epigraph_elevated_access_ready();
 DROP FUNCTION IF EXISTS public.epigraph_family_of_person_is_live(uuid, uuid, uuid);
 DROP FUNCTION IF EXISTS public.epigraph_live_elevating_assignment(uuid, timestamptz);
 

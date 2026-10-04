@@ -50,6 +50,14 @@
 -- and no refusal would stop a write decided on it. A request unit on such a
 -- DSN therefore never elevates, whatever the operator binding's arming state.
 --
+-- NOT BEFORE THE PER-ACCESS RECORDER. An elevated read of someone else's row
+-- must be recorded, fail-closed, where the row's owner can read it; that
+-- recorder is a later migration. Until it is installed NO session is live:
+-- `epigraph_elevated_access_ready()` ships answering false and is part of the
+-- one liveness test, so a deploy that applies this file and the read arms
+-- after it (every embedded migration, in version order) widens nothing. The
+-- recorder's migration replaces that function; nothing else may.
+--
 -- REFUSALS THAT MUST BE AUDITED DO NOT RAISE. A ceremony completed with
 -- another person's credential (the confused deputy), a regressed signature
 -- counter (ELV05), and the other use-time refusals mark the ticket
@@ -237,8 +245,8 @@ $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, uuid)
     FROM PUBLIC;
 
--- Is session `p_session` LIVE: un-ended, unexpired, and its person's live
--- elevating assignment still the one it stored? The ONE liveness test, shared
+-- Is session `p_session` LIVE: the recorder gate open, un-ended, unexpired,
+-- and its person's live elevating assignment still the one it stored? The ONE liveness test, shared
 -- by `epigraph_is_elevated()`, `epigraph_elevation_live` and the grant-mode
 -- redemption, so the three can never disagree about what "live" means. Not
 -- granted to the application role (it answers for any session); the
@@ -265,6 +273,20 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, 
 -- break-glass for a lost or suspect authenticator) takes away every session
 -- that passkey confirmed, at the next statement (a primary-key probe).
 --
+-- THE RECORDER GATE (header, section 1). False until the migration that
+-- installs the per-access elevation recorder replaces this body with its own
+-- readiness test: that migration, and only it, opens elevation. A function,
+-- not a row, so no operator statement and no application session can open it
+-- (replacing it takes its owner); STABLE, so a replacement is read per
+-- statement like every other term of the liveness test.
+CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready()
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT false
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_elevated_access_ready() FROM PUBLIC;
+
 -- NEVER ON A PRIVILEGED LOGIN. An elevated viewer reads with an always-true
 -- fragment and leaves the narrowing to the row policies; on a login that
 -- skips row security (a superuser or a BYPASSRLS role) or passes
@@ -278,7 +300,8 @@ CREATE OR REPLACE FUNCTION public.epigraph_elevation_session_is_live(p_session u
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
-    SELECT NOT public.epigraph_bypass()
+    SELECT public.epigraph_elevated_access_ready()
+       AND NOT public.epigraph_bypass()
        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
                         WHERE r.rolname = session_user
                           AND (r.rolsuper OR r.rolbypassrls))
@@ -1136,13 +1159,16 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_is_elevated() FROM PUBLIC;
 -- principal-bound definers and the ticket-keyed ceremony definers; never the
 -- unbound helpers (`epigraph_live_elevating_assignment`,
 -- `epigraph_family_of_person_is_live`, `epigraph_elevation_session_is_live`,
--- `epigraph_end_expired_elevations`).
+-- `epigraph_end_expired_elevations`) nor the recorder gate
+-- (`epigraph_elevated_access_ready`).
 -- ===================================================================
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'ALTER FUNCTION public.epigraph_live_elevating_assignment(uuid, timestamptz) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_elevated_access_ready() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_elevation_session_is_live(uuid) '
                 'OWNER TO epigraph_maintenance';
@@ -1192,6 +1218,7 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_live_elevating_assignment(uuid, timestamptz), '
                 'public.epigraph_family_of_person_is_live(uuid, uuid, uuid), '
+                'public.epigraph_elevated_access_ready(), '
                 'public.epigraph_elevation_session_is_live(uuid), '
                 'public.epigraph_end_expired_elevations(uuid, uuid), '
                 'public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea), '
@@ -1222,6 +1249,7 @@ DO $$ BEGIN
         EXECUTE 'REVOKE EXECUTE ON FUNCTION '
                 'public.epigraph_live_elevating_assignment(uuid, timestamptz), '
                 'public.epigraph_family_of_person_is_live(uuid, uuid, uuid), '
+                'public.epigraph_elevated_access_ready(), '
                 'public.epigraph_elevation_session_is_live(uuid), '
                 'public.epigraph_end_expired_elevations(uuid, uuid) FROM epigraph_app';
     END IF;
