@@ -76,8 +76,8 @@ pub use pool::{
     probe_maintenance_privilege, probe_maintenance_privilege_conn,
     request_unit_maintenance_dsn_check, resolve_maintenance_url, MaintenanceConn,
     MaintenanceDsnSource, MaintenancePrivilege, MaintenanceSession, MaintenanceVerdict, ScopedConn,
-    ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, MAINTENANCE_DATABASE_URL,
-    MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
+    ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, ACCESS_RECORDER_GUC,
+    MAINTENANCE_DATABASE_URL, MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
 };
 pub use repos::{
     ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository,

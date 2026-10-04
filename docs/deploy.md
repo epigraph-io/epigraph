@@ -1686,7 +1686,8 @@ human and to the live assignment of an `elevates` role), plus
 session settings yet and no row policy reads the function, so every session
 answers false and nothing reads more than before. And no session is live at
 all until the per-access elevation log's migration opens 125's gate
-(`epigraph_elevated_access_ready()`, shipped false; see the 126 section).
+(`epigraph_elevated_access_ready()`, shipped false) AND the serving build
+declares that it writes the log (see "two keys" in the 126 section).
 
 1. **Migrate 125** (`epigraph-migrate`, migration DSN), after 124. Two new
    tables, their triggers and policies, new functions, and five new AFTER
@@ -1754,6 +1755,10 @@ operator and maintenance CLIs, the job drain) now stamps FIVE session settings
 per checkout instead of three: the tenancy three plus `epigraph.elevation_id`
 and `epigraph.family_id`, which are EMPTY for every viewer that is not
 elevated, and its release scrub clears all five. The boot probe checks all five.
+None of these binaries declares the per-access recorder
+(`epigraph.access_recorder`; see "two keys" in the 126 section), so none of
+them elevates a request on any database until the batch that writes the
+per-access log ships a build that declares it.
 
 1. **Migrate 125 first** (above). A binary from this batch on a database
    without 125 still serves: a failed liveness check is logged and the request
@@ -1808,8 +1813,26 @@ session just never reads. Only the log's migration opens the gate, by
 replacing that function with its own readiness test; there is no operator
 switch, and the function must not be replaced by hand (replacing it takes its
 owner, so neither the application role nor an operator statement on the
-maintenance DSN can). Applying 126 before the log is therefore safe, and the
-first real elevation waits on the log by construction.
+maintenance DSN can).
+
+**AND THE SERVING BUILD MUST RECORD: two keys, not one.** The gate is opened
+by a migration, but the log is written by the binaries (the API's response
+layer, the MCP tool-call wrapper), and a database function cannot tell
+whether the process serving a request writes it. So 125 also requires each
+connection to DECLARE the recorder (the session setting
+`epigraph.access_recorder` = `on`, stamped once per connection by a build that
+records); `epigraph_is_elevated()` and `epigraph_elevation_live` answer "not
+elevated" without it. No build of this tree declares it. A unit rolled back
+to, or left on, a build without the log therefore never elevates, even on a
+database whose gate the log's migration has opened, and the API and MCP
+units need not be upgraded in lockstep. The grant-mode redemption does not
+check the declaration: a token it mints elevates nothing until a declaring
+unit resolves it. What the two keys do NOT cover: a holder of the
+application DSN can set any session setting (see "Known limit" above), and
+behind a transaction-mode pooler the per-connection declaration does not
+survive, so elevation fails closed there. Applying 126 before the log is
+therefore safe, and the first real elevation waits on both the log's
+migration and a recording build.
 
 1. **Deploy the elevated-viewer binaries first** (the section above) and
    migrate 125 before them. Without them nothing stamps an elevation, so the

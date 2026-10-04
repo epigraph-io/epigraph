@@ -51,8 +51,12 @@ fn assert_code<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>, code: &str, what:
 
 /// Run `f` as `epigraph_app` with all five session GUCs stamped: the
 /// principal (empty when `None`), empty group sets, and the two elevation
-/// GUCs as given (an empty string is "unset"). All five are cleared
-/// afterwards, so nothing leaks to the next checkout of the connection.
+/// GUCs as given (an empty string is "unset"). The connection also DECLARES
+/// the per-access recorder (`epigraph.access_recorder`), standing in, with
+/// [`holder`]'s open gate, for a build that records elevated accesses (review
+/// cp3: COR-1; `elevated_viewer.rs` pins that an undeclared connection never
+/// elevates). All are cleared afterwards, so nothing leaks to the next
+/// checkout of the connection.
 async fn as_app<F, Fut, T>(pool: &PgPool, principal: Option<Uuid>, elv: &str, fam: &str, f: F) -> T
 where
     F: FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
@@ -66,7 +70,8 @@ where
                     set_config('epigraph.group_ids', '', false), \
                     set_config('epigraph.writable_group_ids', '', false), \
                     set_config('epigraph.elevation_id', $2, false), \
-                    set_config('epigraph.family_id', $3, false)",
+                    set_config('epigraph.family_id', $3, false), \
+                    set_config('epigraph.access_recorder', 'on', false)",
         )
         .bind(&principal)
         .bind(&elv)
@@ -78,7 +83,8 @@ where
         sqlx::query(
             "SELECT set_config('epigraph.principal_id', '', false), \
                     set_config('epigraph.elevation_id', '', false), \
-                    set_config('epigraph.family_id', '', false)",
+                    set_config('epigraph.family_id', '', false), \
+                    set_config('epigraph.access_recorder', '', false)",
         )
         .execute(&mut *conn)
         .await
@@ -2118,7 +2124,8 @@ async fn elevation_seen_by(
                 set_config('epigraph.group_ids', '', false), \
                 set_config('epigraph.writable_group_ids', '', false), \
                 set_config('epigraph.elevation_id', $2, false), \
-                set_config('epigraph.family_id', $3, false)",
+                set_config('epigraph.family_id', $3, false), \
+                set_config('epigraph.access_recorder', 'on', false)",
     )
     .bind(h.person.to_string())
     .bind(session.to_string())
@@ -2145,7 +2152,8 @@ async fn elevation_seen_by(
     sqlx::query(
         "SELECT set_config('epigraph.principal_id', '', false), \
                 set_config('epigraph.elevation_id', '', false), \
-                set_config('epigraph.family_id', '', false)",
+                set_config('epigraph.family_id', '', false), \
+                set_config('epigraph.access_recorder', '', false)",
     )
     .execute(&mut *conn)
     .await

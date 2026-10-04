@@ -180,14 +180,18 @@ async fn session(pool: &PgPool, h: &Holder) -> Uuid {
     .await
 }
 
+/// Declares the per-access recorder (`epigraph_db::ACCESS_RECORDER_GUC`),
+/// standing in, with [`holder`]'s open gate, for a build that records elevated
+/// accesses (review cp3: COR-1).
 async fn scoped(pool: &PgPool) -> ScopedPool {
-    ScopedPool::connect_with_options(
+    ScopedPool::connect_with_access_recorder_for_tests(
         &fixture::database_url_for(pool).await,
         SessionGucMode::Session,
         ScopedPoolOptions {
             max_connections: 2,
             ..ScopedPoolOptions::default()
         },
+        None,
     )
     .await
     .expect("ScopedPool")
@@ -197,10 +201,11 @@ async fn scoped(pool: &PgPool) -> ScopedPool {
 /// both RESOLVED on an application-role pool (`session_user` = `epigraph_app`):
 /// 125 answers "not live" to the superuser login of [`scoped`].
 async fn viewers(pool: &PgPool, p: &Holder, live: Uuid) -> (Viewer, Viewer) {
-    let s = &ScopedPool::connect_downgraded_for_tests(
+    let s = &ScopedPool::connect_with_access_recorder_for_tests(
         &fixture::database_url_for(pool).await,
         SessionGucMode::Session,
-        "epigraph_app",
+        ScopedPoolOptions::default(),
+        Some("epigraph_app"),
     )
     .await
     .expect("application-role ScopedPool");

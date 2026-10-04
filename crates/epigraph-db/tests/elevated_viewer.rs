@@ -193,15 +193,18 @@ async fn session(pool: &PgPool, h: &Holder, mode: &str) -> Uuid {
 }
 
 /// A `ScopedPool` over the test database (superuser login; reads that policies
-/// govern switch the stamped connection to `epigraph_app`).
+/// govern switch the stamped connection to `epigraph_app`). It DECLARES the
+/// per-access recorder (`epigraph_db::ACCESS_RECORDER_GUC`), standing in, with
+/// [`holder`]'s open gate, for a build that records elevated accesses.
 async fn scoped(pool: &PgPool, max_connections: u32) -> ScopedPool {
-    ScopedPool::connect_with_options(
+    ScopedPool::connect_with_access_recorder_for_tests(
         &fixture::database_url_for(pool).await,
         SessionGucMode::Session,
         ScopedPoolOptions {
             max_connections,
             ..ScopedPoolOptions::default()
         },
+        None,
     )
     .await
     .expect("ScopedPool")
@@ -210,12 +213,14 @@ async fn scoped(pool: &PgPool, max_connections: u32) -> ScopedPool {
 /// A `ScopedPool` whose every connection is DOWNGRADED to `epigraph_app`
 /// (`SET SESSION AUTHORIZATION`, so `session_user` moves): the login an
 /// elevation can be live on. 125 answers "not live" to the superuser login of
-/// [`scoped`], so every resolution runs here.
+/// [`scoped`], so every resolution runs here. Declares the recorder, as
+/// [`scoped`] does.
 async fn app_scoped(pool: &PgPool, mode: SessionGucMode) -> ScopedPool {
-    ScopedPool::connect_downgraded_for_tests(
+    ScopedPool::connect_with_access_recorder_for_tests(
         &fixture::database_url_for(pool).await,
         mode,
-        "epigraph_app",
+        ScopedPoolOptions::default(),
+        Some("epigraph_app"),
     )
     .await
     .expect("application-role ScopedPool")
@@ -437,6 +442,94 @@ async fn a_privileged_pool_never_resolves_elevated(pool: PgPool) {
             .is_elevated(),
         "CALIBRATION: the session is still live on the application role"
     );
+}
+
+/// THE SECOND KEY (review cp3: COR-1). The recorder gate is opened by a
+/// MIGRATION, but the per-access recorder lives in the BINARIES, and a
+/// database function cannot tell whether the process serving a request
+/// records. So on a database whose gate is OPEN, a pool that does not declare
+/// the recorder (every production pool of this tree, and any unit rolled back
+/// to or left on a build without the recorder) never elevates: it resolves
+/// the principal's scoped viewer, and even an elevated stamp on one of its
+/// connections is not elevated in the database and reads no foreign row. The
+/// same session on a declaring pool resolves elevated and reads B's private
+/// row through 126's arm (the calibration that the gate is open and the
+/// session live).
+///
+/// Verified to fail with the declaration conjunct dropped from
+/// `epigraph_elevation_live` (the bare pool resolves ELEVATED), with it
+/// dropped from `epigraph_is_elevated()` (the stamped bare connection is
+/// elevated and reads B's row), and with `ScopedPool` stamping the declaration
+/// whatever the constructor asked (both).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pool_that_declares_no_access_recorder_never_elevates(pool: PgPool) {
+    let p = holder(&pool, "no-recorder-p", 12).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "no-recorder-b").await;
+    let theirs = fixture::seed_group_claim(&pool, b, b_group, "B's private row").await;
+    let live = session(&pool, &p, "grant").await;
+    let url = fixture::database_url_for(&pool).await;
+
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
+    let v = resolve(&app, p.person, Some(live), p.family).await;
+    assert!(
+        v.is_elevated(),
+        "CALIBRATION: a declaring pool resolves the live session elevated"
+    );
+    let declaring = scoped(&pool, 1).await;
+    assert_eq!(
+        elevated_read_of(&declaring, &v, theirs).await,
+        (true, true),
+        "CALIBRATION: a declaring connection is elevated and reads B's private row"
+    );
+
+    let bare_app =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("application-role ScopedPool, no recorder");
+    let unrecorded = resolve(&bare_app, p.person, Some(live), p.family).await;
+    assert_scoped(&unrecorded, "a pool that declares no access recorder");
+
+    let bare = ScopedPool::connect_with_options(
+        &url,
+        SessionGucMode::Session,
+        ScopedPoolOptions {
+            max_connections: 1,
+            ..ScopedPoolOptions::default()
+        },
+    )
+    .await
+    .expect("ScopedPool, no recorder");
+    assert_eq!(
+        elevated_read_of(&bare, &v, theirs).await,
+        (false, false),
+        "an elevated stamp on a connection that declares no recorder is not elevated \
+         and reads no foreign row"
+    );
+}
+
+/// On a connection of `s` stamped with `v`, as `epigraph_app`: whether the
+/// database says the statement is elevated, and whether `claim` is read.
+async fn elevated_read_of(s: &ScopedPool, v: &Viewer, claim: Uuid) -> (bool, bool) {
+    let mut conn = s.acquire_as(v).await.expect("acquire_as");
+    conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("as epigraph_app");
+    let (is_elevated, role): (bool, String) =
+        sqlx::query_as("SELECT public.epigraph_is_elevated(), current_user::text")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("is_elevated");
+    let read = ClaimRepository::get_by_id(&mut *conn, v, claim.into())
+        .await
+        .expect("get_by_id");
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+    assert_eq!(
+        role, "epigraph_app",
+        "CALIBRATION: the read runs as the application role"
+    );
+    (is_elevated, read.is_some())
 }
 
 // =====================================================================

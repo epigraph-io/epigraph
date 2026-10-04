@@ -60,6 +60,18 @@
 -- after it (every embedded migration, in version order) widens nothing. The
 -- recorder's migration replaces that function; nothing else may.
 --
+-- THE SECOND KEY: THE SERVING PROCESS RECORDS. The gate is opened by a
+-- migration, but the recorder lives in the binaries (the API's response
+-- layer, the MCP tool-call wrapper), and a database function cannot tell
+-- whether the process serving a request records. So `epigraph_is_elevated()`
+-- and `epigraph_elevation_live` also require the connection to DECLARE the
+-- recorder (`epigraph.access_recorder` = 'on', stamped once per connection by
+-- a build that records): a unit rolled back to, or left on, a build without
+-- the recorder never elevates on a gate-opened database. The grant-mode
+-- redemption does not need it: it mints a token that elevates nothing until
+-- a declaring unit resolves it. Like every session setting this is a
+-- transport, not an authority boundary (the application DSN can set it).
+--
 -- REFUSALS THAT MUST BE AUDITED DO NOT RAISE. A ceremony completed with
 -- another person's credential (the confused deputy), a regressed signature
 -- counter (ELV05), and the other use-time refusals mark the ticket
@@ -1107,7 +1119,8 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_redeem_elevation_ticket(uuid, bytea, 
 -- by `p_elv` (any mode), or, when `p_elv` is NULL, the family's live
 -- CONNECTOR-mode session (a grant-mode session is reached only through the
 -- token that names it). No row when nothing is live. Principal-bound: an
--- unstamped session gets no row. The same test as `epigraph_is_elevated()`.
+-- unstamped session gets no row. The same test as `epigraph_is_elevated()`,
+-- the serving process's recorder declaration included.
 CREATE OR REPLACE FUNCTION public.epigraph_elevation_live(p_elv uuid, p_fam uuid)
 RETURNS TABLE (session_id uuid, assignment_id uuid, family_id uuid, mode text,
                expires_at timestamptz)
@@ -1120,6 +1133,7 @@ SET search_path = public, pg_temp AS $$
        AND ((p_elv IS NOT NULL AND s.id = p_elv)
             OR (p_elv IS NULL AND s.mode = 'connector'))
        AND s.person_agent_id = public.epigraph_principal_id()
+       AND COALESCE(current_setting('epigraph.access_recorder', true), '') = 'on'
        AND public.epigraph_elevation_session_is_live(s.id)
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_elevation_live(uuid, uuid) FROM PUBLIC;
@@ -1155,7 +1169,9 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_end_elevation(uuid, text) FROM PUBLIC
 -- named by `epigraph.elevation_id` is on `epigraph.family_id`, is the session
 -- principal's, is un-ended and unexpired, and the person's live elevating
 -- assignment is STILL the one it stored (registration, agent link, window and
--- revoke all re-checked, every statement). Never `instance_admins`.
+-- revoke all re-checked, every statement), and the connection declares the
+-- per-access recorder (`epigraph.access_recorder` = 'on'). Never
+-- `instance_admins`.
 CREATE OR REPLACE FUNCTION public.epigraph_is_elevated()
 RETURNS boolean
 LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -1171,6 +1187,11 @@ DECLARE
     v_re  constant text := '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
 BEGIN
     IF v_elv IS NULL OR v_elv = '' THEN
+        RETURN false;
+    END IF;
+    -- The serving process's recorder declaration (section 1, "THE SECOND
+    -- KEY"): without it this connection is never elevated.
+    IF COALESCE(current_setting('epigraph.access_recorder', true), '') <> 'on' THEN
         RETURN false;
     END IF;
     IF v_elv !~ v_re OR v_fam IS NULL OR v_fam !~ v_re OR v_who IS NULL OR v_who !~ v_re THEN

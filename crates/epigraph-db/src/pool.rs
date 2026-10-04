@@ -651,6 +651,45 @@ const SET_SESSION_GUCS: &str = "SELECT set_config('epigraph.group_ids',         
                                        set_config('epigraph.elevation_id',       $4, $6), \
                                        set_config('epigraph.family_id',          $5, $6)";
 
+/// The session setting by which a connection DECLARES that the process
+/// holding it records every elevated access (elevation plan EL-8, the
+/// per-access recorder). Migration 125's `epigraph_is_elevated()` and
+/// `epigraph_elevation_live` answer "not elevated" on a connection that does
+/// not carry it as `on`, whatever the database's recorder gate says.
+///
+/// Why a second key next to the gate (review cp3: COR-1): the gate is opened
+/// by a MIGRATION, but the recorder lives in the BINARIES (the API response
+/// layer and the MCP tool-call wrapper). A database function cannot tell
+/// whether the process serving a request records, so with the gate alone a
+/// unit whose build predates the recorder (a rollback, or units on different
+/// builds) would elevate on a gate-opened database and serve unrecorded
+/// foreign reads. With this key, a build that never declares never elevates.
+///
+/// No production constructor of this tree declares it: no build records yet.
+/// Stamped once per physical connection in `after_connect` (session scope,
+/// outside the release scrub, the operator-binding valve's transport), so
+/// behind a transaction-mode pooler it does not survive and the connection
+/// fails closed (not elevated). Like every custom setting it is a transport,
+/// not an authority boundary: a holder of the application DSN can set it,
+/// and can stamp any group set anyway.
+pub const ACCESS_RECORDER_GUC: &str = "epigraph.access_recorder";
+
+/// A role spliced into `SET SESSION AUTHORIZATION` (which takes no bind) must
+/// be a plain lower-case identifier.
+#[cfg(feature = "test-support")]
+fn plain_role_identifier(role: &str) -> Result<(), DbError> {
+    if role.is_empty()
+        || !role
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
+    {
+        return Err(DbError::QueryFailed {
+            source: sqlx::Error::Protocol(format!("not a plain role identifier: {role}")),
+        });
+    }
+    Ok(())
+}
+
 /// How a [`ScopedPool`] carries tenancy context to the database.
 ///
 /// The default, [`SessionGucMode::Session`], is the fast path: one extra
@@ -841,7 +880,7 @@ impl ScopedPool {
         mode: SessionGucMode,
         options: ScopedPoolOptions,
     ) -> Result<Self, DbError> {
-        Self::connect_inner(database_url, mode, options, None).await
+        Self::connect_inner(database_url, mode, options, None, false).await
     }
 
     /// TEST SUPPORT ONLY (the `test-support` feature, which only
@@ -870,16 +909,44 @@ impl ScopedPool {
         mode: SessionGucMode,
         role: &'static str,
     ) -> Result<Self, DbError> {
-        if role.is_empty()
-            || !role
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
-        {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!("not a plain role identifier: {role}")),
-            });
+        plain_role_identifier(role)?;
+        Self::connect_inner(
+            database_url,
+            mode,
+            ScopedPoolOptions::default(),
+            Some(role),
+            false,
+        )
+        .await
+    }
+
+    /// TEST SUPPORT ONLY (the `test-support` feature): a pool whose every
+    /// connection DECLARES the per-access elevation recorder
+    /// ([`ACCESS_RECORDER_GUC`]), optionally downgraded to `downgrade_to` as
+    /// [`Self::connect_downgraded_for_tests`] does.
+    ///
+    /// No build of this tree records elevated accesses yet (elevation plan
+    /// EL-8), so no production constructor declares the recorder, and a
+    /// production pool never elevates even on a database whose recorder gate
+    /// is open. A test of what a LIVE elevation does stands in for both
+    /// halves: the database's gate (`viewer_fixture::open_elevated_access_gate`)
+    /// and this declaration. The recorder's batch replaces this with a
+    /// production path at the one place the recorder is wired.
+    ///
+    /// # Errors
+    /// As [`Self::connect_downgraded_for_tests`].
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn connect_with_access_recorder_for_tests(
+        database_url: &str,
+        mode: SessionGucMode,
+        options: ScopedPoolOptions,
+        downgrade_to: Option<&'static str>,
+    ) -> Result<Self, DbError> {
+        if let Some(role) = downgrade_to {
+            plain_role_identifier(role)?;
         }
-        Self::connect_inner(database_url, mode, ScopedPoolOptions::default(), Some(role)).await
+        Self::connect_inner(database_url, mode, options, downgrade_to, true).await
     }
 
     async fn connect_inner(
@@ -887,6 +954,7 @@ impl ScopedPool {
         mode: SessionGucMode,
         options: ScopedPoolOptions,
         downgrade_to: Option<&'static str>,
+        access_recorder: bool,
     ) -> Result<Self, DbError> {
         let statement_timeout = options.statement_timeout;
         // Read the operator-binding valve (migration 122) now, so a process
@@ -910,6 +978,15 @@ impl ScopedPool {
                     // and untouched by the release scrub, which resets only
                     // the five tenancy GUCs.
                     crate::operator_binding::apply_valve(conn).await?;
+                    // The recorder declaration (see `ACCESS_RECORDER_GUC`):
+                    // the same once-per-physical-connection transport as the
+                    // valve, also untouched by the release scrub.
+                    if access_recorder {
+                        sqlx::query("SELECT set_config($1, 'on', false)")
+                            .bind(ACCESS_RECORDER_GUC)
+                            .execute(&mut *conn)
+                            .await?;
+                    }
                     Ok(())
                 })
             })

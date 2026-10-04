@@ -331,6 +331,12 @@ pub async fn make_human_operator(pool: &PgPool, agent: Uuid) {
 /// test of what a LIVE session does calls this first (before any pool is
 /// built, so no cached plan holds the old body); `CREATE OR REPLACE` keeps the
 /// function's owner and ACL, so the 125 register tests still hold. Idempotent.
+///
+/// That is only the DATABASE key. The connection must also declare the
+/// recorder (`epigraph_db::ACCESS_RECORDER_GUC`; review cp3: COR-1): build
+/// the pool with `ScopedPool::connect_with_access_recorder_for_tests`, or
+/// stamp the setting on a raw connection, standing in for a build that
+/// records.
 pub async fn open_elevated_access_gate(pool: &PgPool) {
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready() \

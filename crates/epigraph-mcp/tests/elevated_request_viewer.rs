@@ -171,16 +171,25 @@ async fn session(
     .await
 }
 
-/// A server whose `ScopedPool` is the application role.
+/// A server whose `ScopedPool` is the application role. The pool DECLARES the
+/// per-access recorder (`epigraph_db::ACCESS_RECORDER_GUC`), standing in, with
+/// `make_holder`'s open gate, for a build that records elevated accesses
+/// (review cp3: COR-1).
 async fn app_server(pool: &PgPool) -> EpiGraphMcpFull {
-    let scoped = ScopedPool::connect_downgraded_for_tests(
+    let scoped = app_scoped(pool).await;
+    build_scoped_test_server(pool.clone(), scoped)
+}
+
+/// An application-role `ScopedPool` that declares the per-access recorder.
+async fn app_scoped(pool: &PgPool) -> ScopedPool {
+    ScopedPool::connect_with_access_recorder_for_tests(
         &fixture::database_url_for(pool).await,
         SessionGucMode::Session,
-        "epigraph_app",
+        epigraph_db::ScopedPoolOptions::default(),
+        Some("epigraph_app"),
     )
     .await
-    .expect("app-role ScopedPool");
-    build_scoped_test_server(pool.clone(), scoped)
+    .expect("app-role ScopedPool")
 }
 
 fn http_auth(person: Uuid, client: Uuid, family: Uuid, elv: Option<Uuid>) -> AuthContext {
@@ -388,13 +397,7 @@ async fn mcp_reads_are_not_widened_by_the_arms_until_they_are_stamped(pool: PgPo
     let theirs = fixture::seed_group_claim(&pool, b, b_group, "B's private claim").await;
     let public = fixture::seed_public_claim(&pool, b, "B's public claim").await;
 
-    let scoped = ScopedPool::connect_downgraded_for_tests(
-        &fixture::database_url_for(&pool).await,
-        SessionGucMode::Session,
-        "epigraph_app",
-    )
-    .await
-    .expect("app-role ScopedPool");
+    let scoped = app_scoped(&pool).await;
     let app_pool = fixture::downgraded_pool(&pool, "epigraph_app").await;
     let server = build_scoped_test_server(app_pool, scoped.clone());
     let v = request_viewer(&server, Some(&http_auth(p, client, family, Some(live))))

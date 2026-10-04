@@ -925,7 +925,11 @@ Current reservation:
   privileged login (a superuser, a BYPASSRLS role or a maintenance member)
   nor on a connection switched to a superuser or BYPASSRLS role (the
   session's `role` setting; review cp3), and never before the recorder gate
-  opens. FORCE RLS on
+  opens. `epigraph_is_elevated` and `epigraph_elevation_live` also require the
+  connection to declare the per-access recorder (`epigraph.access_recorder` =
+  `on`, stamped by a build that records; no build of this tree does), so a
+  unit on a build without the recorder never elevates on a gate-opened
+  database (review cp3). FORCE RLS on
   both: the application role keeps SELECT but its policies show it no row,
   and it holds no DML. App-callable definers: `epigraph_create_elevation_ticket`
   (principal-bound), `epigraph_ticket_for_ceremony`,

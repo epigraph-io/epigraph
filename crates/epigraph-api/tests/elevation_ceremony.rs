@@ -53,7 +53,26 @@ struct Server {
     _stop: oneshot::Sender<()>,
 }
 
+/// Its pool DECLARES the per-access recorder (`epigraph_db::ACCESS_RECORDER_GUC`),
+/// standing in, with `holder`'s open gate, for a build that records elevated
+/// accesses (review cp3: COR-1; no build of this tree does yet).
 async fn spawn(pool: &PgPool, passkeys: Option<Passkeys>) -> Server {
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("app-role pool");
+    spawn_on(scoped, passkeys).await
+}
+
+/// The real router on an application-role pool that declares NO recorder:
+/// the shape of every request unit this tree builds, and of a unit rolled
+/// back to (or left on) a build without the recorder.
+async fn spawn_unrecorded(pool: &PgPool) -> Server {
     let url = fixture::database_url_for(pool).await;
     let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
         &url,
@@ -61,8 +80,8 @@ async fn spawn(pool: &PgPool, passkeys: Option<Passkeys>) -> Server {
         "epigraph_app",
     )
     .await
-    .expect("app-role pool");
-    spawn_on(scoped, passkeys).await
+    .expect("app-role pool, no recorder");
+    spawn_on(scoped, None).await
 }
 
 /// The real router on a PRIVILEGED pool: the harness's superuser login, the
@@ -1812,6 +1831,66 @@ async fn an_elevated_token_reads_foreign_private_rows_through_the_router(pool: P
             "{what}: CALIBRATION: P unelevated does not read B's private row ({status}): {body}"
         );
     }
+}
+
+/// A request unit whose build declares no per-access recorder never serves an
+/// elevated request, even on a database whose recorder gate is OPEN (review
+/// cp3: COR-1). The gate is opened by a migration and the recorder lives in
+/// the binaries, so a unit rolled back to (or left on) a build without the
+/// recorder would otherwise read B's private rows for an elevated token and
+/// record nothing. Here the token resolves the principal's scoped viewer: the
+/// read is 404. Calibrations with the same session: on a declaring unit the
+/// elevated token reads B's claim (before and after) and the plain token does
+/// not.
+///
+/// Verified to fail with `ScopedPool` stamping the declaration whatever the
+/// constructor asked, and with both declaration conjuncts dropped from 125
+/// (`epigraph_elevation_live`, `epigraph_is_elevated()`): the bare unit
+/// answers 200 with B's claim, the reviewer's repro.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_unit_that_declares_no_access_recorder_never_serves_an_elevated_read(pool: PgPool) {
+    let app = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &app, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "cp3-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "cp3 B private claim").await;
+    let (_, t) = app
+        .open_ticket(&app.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let read = format!("/api/v1/claims/{claim}");
+    let on_app = |app: &Server| app.scoped_token(&p, Some(session), &["claims:read"]);
+
+    let (status, seen) = app.get(&read, &on_app(&app)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the session elevates on a declaring unit: {seen}"
+    );
+    let (status, _) = app
+        .get(&read, &app.scoped_token(&p, None, &["claims:read"]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "CALIBRATION: unelevated, B's claim is private to P"
+    );
+
+    let bare = spawn_unrecorded(&pool).await;
+    let (status, seen) = bare.get(&read, &on_app(&bare)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a unit that declares no recorder reads nothing past P's groups for an elevated \
+         token: {seen}"
+    );
+
+    let (status, _) = app.get(&read, &on_app(&app)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the session is still live (the refusal was the unit's)"
+    );
 }
 
 /// A request unit on a PRIVILEGED DSN never serves an elevated request
