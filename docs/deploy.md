@@ -1685,7 +1685,7 @@ human and to the live assignment of an `elevates` role), plus
 `epigraph_is_elevated()`. INERT on its own: no binary stamps the elevation
 session settings yet and no row policy reads the function, so every session
 answers false and nothing reads more than before. And no session is live at
-all until the per-access elevation log's migration opens 125's gate
+all until a later migration of this stack opens 125's gate
 (`epigraph_elevated_access_ready()`, shipped false) AND the serving build
 declares that it writes the log (see "two keys" in the 126 section).
 
@@ -1809,8 +1809,11 @@ ships answering `false` and is part of the one liveness test, so on a database
 at this tree's head no session is elevated, `epigraph_elevation_live` answers
 no session, and the grant-mode redemption refuses, whatever was applied. A
 ceremony still confirms and audits its session (`platform.elevated`); the
-session just never reads. Only the log's migration opens the gate, by
-replacing that function with its own readiness test; there is no operator
+session just never reads. Only a migration opens the gate, by replacing that
+function with its own readiness test: the log's own, if the preconditions
+125's header lists under "OPENING IT WAITS ON MORE THAN THE RECORDER" (pinned
+evidence, elevated writes on the API, `recall_events` in the log) already
+hold, otherwise the first later migration by which they do. There is no operator
 switch, and the function must not be replaced by hand. What stops a hand
 replacement is NOT ownership alone. Replacing a function takes CREATE on its
 schema AND its ownership; the application role owns nothing, but the gate (and

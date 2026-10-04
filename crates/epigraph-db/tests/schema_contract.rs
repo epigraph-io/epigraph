@@ -1952,7 +1952,7 @@ async fn migration_124_passkey_definers_are_owned_and_granted(pool: PgPool) {
 /// that excludes PUBLIC, and grants `epigraph_app` exactly the nine
 /// principal-bound or ticket-keyed definers the request DSN calls; never the
 /// four unbound helpers (a roster oracle), the recorder gate
-/// (`epigraph_elevated_access_ready`, opened only by the recorder's migration)
+/// (`epigraph_elevated_access_ready`, opened only by the migration that opens elevation)
 /// nor a guard, audit or end trigger.
 /// The readers are STABLE (`epigraph_is_elevated` among them, so a policy's
 /// `(SELECT ...)` wrapper is an InitPlan); everything else writes. The

@@ -940,7 +940,9 @@ Current reservation:
   `epigraph_family_of_person_is_live`, `epigraph_elevation_session_is_live`,
   `epigraph_end_expired_elevations`, and the recorder gate
   `epigraph_elevated_access_ready` (ships `false`: no session is live until
-  the per-access elevation log's migration replaces it; review cp2).
+  the migration that opens elevation replaces it, which is the per-access
+  elevation log's only if the preconditions in 125's header already hold;
+  review cp2, cp3).
   Audited from the tables: `platform.elevation_requested`, `_refused`,
   `platform.elevated`, `platform.elevation_ended` (carrying the operator's
   `--reason` as `operator_reason` when a privileged login ended it), and

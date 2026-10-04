@@ -57,8 +57,10 @@
 -- recorder is a later migration. Until it is installed NO session is live:
 -- `epigraph_elevated_access_ready()` ships answering false and is part of the
 -- one liveness test, so a deploy that applies this file and the read arms
--- after it (every embedded migration, in version order) widens nothing. The
--- recorder's migration replaces that function; nothing else may.
+-- after it (every embedded migration, in version order) widens nothing. ONE
+-- migration of the stack opens elevation by replacing that function: the
+-- recorder's own if the preconditions below already hold, otherwise the first
+-- later one by which they do. Nothing else may replace it.
 --
 -- OPENING IT WAITS ON MORE THAN THE RECORDER (review cp3). While the gate is
 -- closed every elevated arm is inert, so several decisions are safe only
@@ -315,9 +317,10 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, 
 -- break-glass for a lost or suspect authenticator) takes away every session
 -- that passkey confirmed, at the next statement (a primary-key probe).
 --
--- THE RECORDER GATE (header, section 1). False until the migration that
--- installs the per-access elevation recorder replaces this body with its own
--- readiness test: that migration, and only it, opens elevation. A function,
+-- THE RECORDER GATE (header, section 1). False until the migration that opens
+-- elevation (the per-access recorder's, or a later one: header, "OPENING IT
+-- WAITS ON MORE THAN THE RECORDER") replaces this body with its own readiness
+-- test; only that migration opens it. A function,
 -- not a row: replacing it takes CREATE on schema `public` AND its ownership.
 -- The application role owns nothing; a maintenance member has the ownership
 -- half, so what stops an operator statement on the maintenance DSN is that the
