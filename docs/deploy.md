@@ -1710,3 +1710,36 @@ DSN, in one transaction: it reports how many tickets and sessions it drops
 125's `_sqlx_migrations` row: re-introducing elevation is a new migration.
 **Run 125-undo before 124-undo**: 125's tables reference
 `person_authenticators`, so 124-undo cannot run while they exist.
+
+## The elevated viewer (no migration) — the five session settings, deploy order and rollback
+
+The binaries that RESOLVE an elevated viewer: `epigraph-api` (a token carrying
+an elevation claim, minted only by the elevate grant) and `epigraph-mcp-full`
+(the same over HTTP; never over stdio). An elevated viewer is built only after
+migration 125's `epigraph_elevation_live` answers for a live session of that
+principal on that refresh family; it reads with the always-true fragment on
+the APPLICATION role, so until a migration adds row policies that read
+`epigraph_is_elevated()` it reads exactly what it read before, and it writes
+nothing (`begin_as` refuses it: HTTP 403 `ELEVATED READ-ONLY`, MCP
+`INVALID_REQUEST`).
+
+Every `ScopedPool` binary (api, both MCP transports, `decompose_claims`, the
+operator and maintenance CLIs, the job drain) now stamps FIVE session settings
+per checkout instead of three: the tenancy three plus `epigraph.elevation_id`
+and `epigraph.family_id`, which are EMPTY for every viewer that is not
+elevated, and its release scrub clears all five. The boot probe checks all five.
+
+1. **Migrate 125 first** (above). A binary from this batch on a database
+   without 125 still serves: a failed liveness check is logged and the request
+   is served UNELEVATED.
+2. **Deploy** the binaries in any order. Old binaries stamp three settings and
+   never elevate; the two new settings read empty to them, which is "not
+   elevated".
+3. **Connector mode stays OFF.** `epigraph-mcp-full` elevates a request with
+   no elevation claim (a connector-mode session found by its family) only when
+   `EPIGRAPH_MCP_CONNECTOR_ELEVATION=on`. Leave it unset: the connector's
+   refresh-family scope is an open operator question, and until it is decided
+   only the CLI elevate path elevates. Any other value leaves it off.
+
+**Rollback.** Redeploy the previous binaries; there is no data to undo. Roll
+these binaries back BEFORE running `125-undo.sql`.
