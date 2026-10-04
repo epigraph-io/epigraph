@@ -40,6 +40,13 @@
 -- answer names no row, so it is logged with an empty group list: the log says
 -- that an elevated count ran, not whose rows it counted.
 --
+-- ATTRIBUTION IS BY ID, SO IT CAN OVER-REPORT. The definer cannot tell an id
+-- the response READ from an id it merely MENTIONED: a group id carried as a
+-- field of a public row (its `owner_group_id`) attributes that group, and the
+-- memberless world group can be named the same way (no admin reads it). An
+-- error that names a private row's id (a "not found") attributes the row's
+-- group too. Each errs toward telling the subject more, never less.
+--
 -- WHO SEES A ROW. The subject: a live ADMIN member of a group the row names
 -- ("an elevated session read rows of your group G at T, for reason R"; the
 -- session's reason is copied onto the row, because the subject cannot read
