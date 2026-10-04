@@ -1882,3 +1882,39 @@ before 125-undo**: 125-undo refuses while any policy reads
 `epigraph_is_elevated()`. Undoing 126 while a session is live narrows that
 session's reads back to its own groups and leaves its write refusal to
 `begin_as` alone.
+
+## The elevated-access log (migration 127) — deploy order and rollback
+
+Migration 127 adds `elevated_access`, the per-access log of elevated reads,
+and its recorder `epigraph_record_elevated_access`: one row per elevated
+request (session, person, role assignment, the session's reason, the route or
+tool, the request's ids and filters, the response's row count, and the owner
+groups of the private rows it named that the reader could not read
+unelevated). The database decides the groups; the serving process only hands
+over the ids its response named. A live ADMIN member of a named group reads
+the row; holders of a `reads_audit` role read the whole log through
+`epigraph_elevated_access_audit`. Append-only for every login.
+
+**It does NOT open the gate.** 125's gate waits on more than the log (125's
+header, "OPENING IT WAITS ON MORE THAN THE RECORDER"): a ruling on elevated
+reads of operator-hidden evidence, and an API refusal of elevated non-GET
+requests, are not built at 127. So after 127, as before it, no session is
+live on any database, and every recorder call is refused (`ELV07`) because
+no connection is elevated. The opening is a later migration of this stack.
+
+1. **Migrate 127** (`epigraph-migrate`, migration DSN), after 126. One new
+   table (FORCE row security, the application role reads only), its two guard
+   triggers and two policies, five new functions. Nothing existing changes.
+   Old binaries are unaffected (they call none of it).
+2. **Deploy** `epigraph-tenancy-backfill` built from the same commit (`verify`
+   checks the 127 definers' owner and grants).
+
+**Rollback.** Roll back first every binary that records (the API and MCP HTTP
+builds that declare the recorder; without the recorder function they refuse
+every elevated request, which is safe but noisy). Then run
+`docs/runbooks/127-undo.sql` on the migration DSN, in one transaction: it
+copies every log row into `security_events` as a `platform.elevated_access`
+event (the subjects' record outlives the table), then drops the table and
+every 127 function. Its `_sqlx_migrations` row stays: re-introducing the log
+is a new migration. **Run 127-undo before 126-undo and 125-undo** (the log's
+rows name 125's sessions).

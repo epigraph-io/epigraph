@@ -21,6 +21,8 @@ mod fixture;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
 // =====================================================================
 // fixtures (the subset of elevated_arms.rs's this file needs)
 // =====================================================================
@@ -111,6 +113,12 @@ async fn holder(pool: &PgPool, label: &str, n: u8) -> Holder {
     // 125 ships the gate closed and 127 leaves it closed; these tests are
     // about what the recorder does for a LIVE session.
     fixture::open_elevated_access_gate(pool).await;
+    holder_behind_the_gate(pool, label, n).await
+}
+
+/// [`holder`] without opening the gate: its sessions confirm (and audit) but
+/// are never live.
+async fn holder_behind_the_gate(pool: &PgPool, label: &str, n: u8) -> Holder {
     let (person, group) = fixture::seed_human_operator(pool, label).await;
     let client: Uuid = sqlx::query_scalar(
         "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
@@ -850,4 +858,139 @@ async fn every_readable_owner_group_table_is_attributed(pool: PgPool) {
     for t in ["groups", "group_memberships", "recall_events", "edges"] {
         assert!(body.contains(&format!("public.{t}")), "{t} (its own rule)");
     }
+}
+
+// =====================================================================
+// The undo
+// =====================================================================
+
+/// The migrator cut at `max` (a later migration is undone before this one).
+fn up_to(max: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= max)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+/// Run `migrator` on one connection and reset it: 001's pg_dump header leaves
+/// session-level SETs behind (viewer_fixture::db_at_122_then_head).
+async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+}
+
+/// The catalog facts 127 could leave behind, by name: relations, functions
+/// (body and owner), policies, triggers and constraints in `public`.
+async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT 'rel ' || c.relname || ' ' || c.relkind::text \
+           FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'fn ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') ' \
+                || md5(p.prosrc) || ' ' || p.proowner::regrole::text \
+           FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'pol ' || c.relname || '.' || pol.polname \
+           FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid \
+          WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'trg ' || c.relname || '.' || t.tgname \
+           FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+          WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'con ' || c.relname || '.' || k.conname \
+           FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid \
+          WHERE c.relnamespace = 'public'::regnamespace",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("catalog");
+    rows.into_iter().collect()
+}
+
+fn undo_127() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/127-undo.sql"),
+    )
+    .expect("127-undo.sql")
+}
+
+/// `docs/runbooks/127-undo.sql`, applied to a database that went 126 -> 127
+/// and holds a log row, returns its catalog (relations, function bodies and
+/// owners, policies, triggers, constraints) to the same database's at 126;
+/// the row survives as one `platform.elevated_access` event carrying it; and a
+/// second run changes nothing. Cut at 127, not head: a later migration is
+/// undone before this one.
+///
+/// Verified to fail: the undo's DROP of `epigraph_admin_group_ids` removed
+/// (left behind); the archival INSERT removed (the history is lost).
+#[sqlx::test(migrations = false)]
+async fn the_rollback_returns_the_catalog_to_126_and_keeps_the_history(pool: PgPool) {
+    migrate(&pool, &up_to(126)).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to(127)).await;
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 127 changed the catalog"
+    );
+
+    // A log row, written directly (the gate stays closed here, so no session
+    // records; the insert guard still binds it to a real session).
+    let p = holder_behind_the_gate(&pool, "access-undo-p", 29).await;
+    let live = session(&pool, &p, "undo history").await;
+    let row: Uuid = sqlx::query_scalar(
+        "INSERT INTO elevated_access (elevation_id, person_agent_id, assignment_id, reason, \
+                                      surface, args, row_count, owner_group_ids) \
+         SELECT s.id, s.person_agent_id, s.assignment_id, s.reason, 'GET /x', '{}'::jsonb, 3, \
+                ARRAY[$2]::uuid[] \
+           FROM elevation_sessions s WHERE s.id = $1 RETURNING id",
+    )
+    .bind(live)
+    .bind(p.group)
+    .fetch_one(&pool)
+    .await
+    .expect("a log row");
+
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo_127())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the undo script applies (run {run}): {e}"));
+    }
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the catalog is not 126's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    let (n, reason, surface, by): (i64, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT count(*), max(details->>'reason'), max(details->>'surface'), \
+                    max(details->>'archived_by') \
+               FROM security_events \
+              WHERE event_type = 'platform.elevated_access' AND details->>'id' = $1",
+        )
+        .bind(row.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("the archived row");
+    assert_eq!(n, 1, "archived once, across two runs");
+    assert_eq!(reason.as_deref(), Some("undo history"));
+    assert_eq!(surface.as_deref(), Some("GET /x"));
+    assert_eq!(by.as_deref(), Some("127-undo"));
 }
