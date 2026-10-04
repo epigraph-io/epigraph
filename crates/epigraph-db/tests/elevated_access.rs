@@ -994,3 +994,89 @@ async fn the_rollback_returns_the_catalog_to_126_and_keeps_the_history(pool: PgP
     assert_eq!(surface.as_deref(), Some("GET /x"));
     assert_eq!(by.as_deref(), Some("127-undo"));
 }
+
+// =====================================================================
+// The registers know every 127 object.
+// =====================================================================
+
+/// The functions a migration file creates in `public`, read from its text:
+/// `(SECURITY DEFINER ones, all)`.
+fn functions_of(migration: &str) -> (Vec<String>, Vec<String>) {
+    let mut definers = Vec::new();
+    let mut all = Vec::new();
+    let mut rest = migration;
+    while let Some(i) = rest.find("CREATE OR REPLACE FUNCTION public.") {
+        let after = &rest[i + "CREATE OR REPLACE FUNCTION public.".len()..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let body_end = after.find("$$;").unwrap_or(after.len());
+        let header_end = after.find(" AS $$").unwrap_or(body_end);
+        if after[..header_end].contains("SECURITY DEFINER") {
+            definers.push(name.clone());
+        }
+        all.push(name);
+        rest = &after[body_end..];
+    }
+    definers.sort();
+    definers.dedup();
+    all.sort();
+    all.dedup();
+    (definers, all)
+}
+
+/// Every SECURITY DEFINER migration 127 creates is on
+/// `epigraph-tenancy-backfill verify`'s ownership list at 127 (a silently
+/// no-opped `OWNER TO` is invisible to every behavioural test, because the
+/// harness migrates as a superuser), every function it creates is dropped by
+/// `docs/runbooks/127-undo.sql`, and the table is in the API's FORCE register
+/// and the 079 kill switch.
+///
+/// Verified to fail: the `("epigraph_record_elevated_access", 127)` entry
+/// removed from `DEFERRED_DEFINER_FUNCTIONS` -> named here.
+#[test]
+fn every_127_object_is_registered() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let migration = read("migrations/127_elevated_access.sql");
+    let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let state = read("crates/epigraph-api/src/state.rs");
+    let kill_switch = read("docs/runbooks/079-undo.sql");
+    let undo = read("docs/runbooks/127-undo.sql");
+
+    let (definers, all) = functions_of(&migration);
+    assert_eq!(
+        definers.len(),
+        5,
+        "CALIBRATION: 127 creates 5 SECURITY DEFINER functions; the scan found {definers:?}"
+    );
+    assert_eq!(definers, all, "every function 127 creates is a definer");
+    let missing: Vec<&String> = definers
+        .iter()
+        .filter(|n| !backfill.contains(&format!("(\"{n}\", 127)")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "migration 127 definers missing from tenancy_backfill.rs's ownership list at 127: \
+         {missing:?}"
+    );
+    let undropped: Vec<&String> = all
+        .iter()
+        .filter(|n| !undo.contains(&format!("DROP FUNCTION IF EXISTS public.{n}(")))
+        .collect();
+    assert!(
+        undropped.is_empty(),
+        "127-undo.sql does not drop: {undropped:?}"
+    );
+    assert!(
+        state.contains("\"elevated_access\""),
+        "state.rs FORCE_PROTECTED_SET lacks elevated_access"
+    );
+    assert!(
+        kill_switch.contains("'elevated_access'"),
+        "079-undo.sql lacks elevated_access"
+    );
+}

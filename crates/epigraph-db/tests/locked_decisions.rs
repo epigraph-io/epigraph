@@ -1461,6 +1461,14 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "UPDATE elevation_sessions",
         "DELETE FROM elevation_sessions",
         "epigraph_end_expired_elevations($",
+        // Migration 127: the elevated-access log is written ONLY by its
+        // recorder definer (app-callable, NOT banned here: the API response
+        // layer and the MCP wrapper call it), which refuses an unelevated
+        // connection and decides the owner groups itself. A raw INSERT would
+        // skip both; nothing ever updates or deletes a row.
+        "INSERT INTO elevated_access",
+        "UPDATE elevated_access",
+        "DELETE FROM elevated_access",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //

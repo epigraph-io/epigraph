@@ -1752,6 +1752,22 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_elevation_live", 125),
     ("epigraph_end_elevation", 125),
     ("epigraph_is_elevated", 125),
+    // 127, the elevated-access log. Every body reads or writes FORCEd tables
+    // (`elevated_access`, `elevation_sessions`, `group_memberships`, every
+    // owner-group table the recorder attributes) through policies that admit
+    // only a privileged session or `epigraph_definer_bypass()`. Under a
+    // non-member owner the recorder reads no session (`SELECT ... STRICT`
+    // raises: every elevated request refused, loud and fail-closed), the
+    // insert guard reads no session (ELV03, loud), the admin-group helper
+    // returns no group (the subject reads nothing: fail-closed) and the audit
+    // reader returns no row -- but the recorder's ATTRIBUTION would read none
+    // of the rows it attributes and record every elevated request with an
+    // EMPTY group list, silently: the subjects would never see it. The stake.
+    ("epigraph_elevated_access_guard_insert", 127),
+    ("epigraph_elevated_access_guard_change", 127),
+    ("epigraph_admin_group_ids", 127),
+    ("epigraph_record_elevated_access", 127),
+    ("epigraph_elevated_access_audit", 127),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2211,6 +2227,27 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_end_expired_elevations",
             "public.epigraph_end_expired_elevations(uuid, uuid)",
             false,
+        ),
+        // 127 (the elevated-access log): the API's response layer and the MCP
+        // tool-call wrapper record on the request DSN, and the subject's read
+        // policy calls the admin-group helper as the application role, so all
+        // three are app-callable: the recorder refuses an unelevated
+        // connection (ELV07), the helper answers only for the caller, and the
+        // audit reader returns nothing to an unentitled caller.
+        (
+            "epigraph_record_elevated_access",
+            "public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])",
+            true,
+        ),
+        (
+            "epigraph_admin_group_ids",
+            "public.epigraph_admin_group_ids()",
+            true,
+        ),
+        (
+            "epigraph_elevated_access_audit",
+            "public.epigraph_elevated_access_audit(timestamp with time zone, integer)",
+            true,
         ),
     ];
 

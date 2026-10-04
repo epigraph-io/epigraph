@@ -2169,3 +2169,104 @@ async fn migration_125_elevation_definers_are_owned_and_granted(pool: PgPool) {
         }
     }
 }
+
+/// Migration 127 (the elevated-access log): every function it adds is a
+/// SECURITY DEFINER owned by `epigraph_maintenance` (each reads or writes a
+/// FORCEd table through `epigraph_definer_bypass()`), carries an explicit ACL
+/// that excludes PUBLIC, and grants `epigraph_app` exactly the recorder (it
+/// refuses an unelevated connection), the audit reader (empty to an
+/// unentitled caller) and the principal-bound admin-group helper the subject
+/// policy calls; never a guard. The two readers are STABLE; the recorder and
+/// the guards write. The application role holds SELECT on the table
+/// (narrowed by its subject policy) and no DML. The owner is pinned here
+/// because the harness migrates as a superuser, so a silently no-opped
+/// `OWNER TO` would still pass every behavioural test.
+///
+/// Verified to fail with the recorder's `OWNER TO` removed from 127's grant
+/// block (owner is the migrating superuser).
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_127_elevated_access_definers_are_owned_and_granted(pool: PgPool) {
+    for (name, signature, volatility, app_may_execute) in [
+        (
+            "epigraph_elevated_access_guard_insert",
+            "public.epigraph_elevated_access_guard_insert()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_elevated_access_guard_change",
+            "public.epigraph_elevated_access_guard_change()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_admin_group_ids",
+            "public.epigraph_admin_group_ids()",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_record_elevated_access",
+            "public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])",
+            "v",
+            true,
+        ),
+        (
+            "epigraph_elevated_access_audit",
+            "public.epigraph_elevated_access_audit(timestamp with time zone, integer)",
+            "s",
+            true,
+        ),
+    ] {
+        let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+               FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+               JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE n.nspname = 'public' AND p.proname = $1",
+        )
+        .bind(name)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl) =
+            meta.unwrap_or_else(|| panic!("public.{name} must exist (migration 127)"));
+        assert!(secdef, "{name} must be SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{name} owner");
+        assert_eq!(vol, volatility, "{name} volatility");
+        assert!(
+            acl.is_some(),
+            "{name} must carry an EXPLICIT ACL; a NULL proacl is the default grant, which \
+             includes EXECUTE to PUBLIC"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_may_execute),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE on {name}");
+        }
+    }
+    for (privilege, expected) in [
+        ("SELECT", true),
+        ("INSERT", false),
+        ("UPDATE", false),
+        ("DELETE", false),
+        ("TRUNCATE", false),
+    ] {
+        let can: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('epigraph_app', 'public.elevated_access', $1)",
+        )
+        .bind(privilege)
+        .fetch_one(&pool)
+        .await
+        .expect("table privilege");
+        assert_eq!(can, expected, "epigraph_app {privilege} on elevated_access");
+    }
+}
