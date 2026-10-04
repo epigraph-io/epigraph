@@ -1184,6 +1184,12 @@ fn elevate_error(error: &'static str, description: &str) -> ApiError {
 /// Everything that can fail to answer (the client, its principal) runs BEFORE
 /// the redemption, which is the irreversible step; a failure after it (the
 /// signing) spends the ticket with no token, which fails closed.
+///
+/// The principal is the client's EXISTING agent, checked only for an operator
+/// link: unlike the other grants this one never goes through
+/// [`principal_agent_id`], so it can never provision an agent or reach the
+/// personal-group mint (`personal_group_mint_ratchet`). An unlinked client is
+/// `invalid_grant`: it can hold no redeemable ticket.
 #[cfg(feature = "db")]
 async fn handle_elevate_grant(
     state: &AppState,
@@ -1223,11 +1229,20 @@ async fn handle_elevate_grant(
     if client.status != "active" || client.client_type != "human" {
         return Err(elevate_error("invalid_grant", INVALID));
     }
-    let agent_id = match principal_agent_id(state, client.id, client.agent_id).await {
-        Ok(a) => a,
+    // The principal is the client's EXISTING agent; this grant never provisions
+    // one (no `principal_agent_id`, whose cold path mints an agent and its
+    // personal group). A redeemable ticket names a family of a client already
+    // linked to the ticket's person (migration 125's family-liveness helper
+    // requires the client's agent to be the person), so an unlinked client
+    // holds no ticket and is answered here, before anything is written.
+    let Some(agent_id) = client.agent_id else {
+        return Err(elevate_error("invalid_grant", INVALID));
+    };
+    match refuse_operated_agent(state, agent_id).await {
+        Ok(()) => {}
         Err(ApiError::Forbidden { .. }) => return Err(elevate_error("invalid_grant", INVALID)),
         Err(other) => return Err(other),
-    };
+    }
 
     let mut conn = state
         .db_pool

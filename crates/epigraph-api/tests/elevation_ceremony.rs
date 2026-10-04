@@ -1225,6 +1225,59 @@ async fn the_elevate_grant_binds_the_secret_and_the_client(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "the refusals spent nothing: {body}");
 }
 
+/// The elevate grant never PROVISIONS a principal. A redeemable ticket names a
+/// family whose client is already linked to the ticket's person (125's
+/// `epigraph_family_of_person_is_live` requires `c.agent_id = p_person`), so a
+/// client with no agent can hold no ticket; the grant answers it
+/// `invalid_grant` from the client row alone and reaches neither the OAuth
+/// principal mint (`ensure_for_client`) nor, through it, the personal-group
+/// mint (`personal_group_mint_ratchet` registers exactly three
+/// `principal_agent_id` sites in `oauth/token.rs`, the three grants that
+/// legitimately provision). The client stays unlinked and no agent is created.
+///
+/// Mutation: the grant resolving its principal through `principal_agent_id`
+/// (the cold path materialises an agent and links the client) -> the client is
+/// linked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevate_grant_never_provisions_a_principal(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let client_id = format!("el5-unlinked-{}", Uuid::new_v4());
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id) \
+         VALUES ($1, 'el5-unlinked', 'human', ARRAY['claims:read'], ARRAY['claims:read'], \
+                 'active', NULL) RETURNING id",
+    )
+    .bind(&client_id)
+    .fetch_one(&pool)
+    .await
+    .expect("an unlinked human client");
+    let agents = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agents")
+            .fetch_one(&pool)
+            .await
+            .expect("count agents")
+    };
+    let before = agents().await;
+
+    let r = s
+        .redeem(Uuid::new_v4(), &hex::encode([0x11_u8; 32]), &client_id)
+        .await;
+    assert_eq!(
+        grant_error(&r),
+        (StatusCode::BAD_REQUEST, "invalid_grant"),
+        "{r:?}"
+    );
+    let linked: Option<Uuid> =
+        sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+            .bind(client)
+            .fetch_one(&pool)
+            .await
+            .expect("the client");
+    assert_eq!(linked, None, "the elevate grant linked a principal");
+    assert_eq!(agents().await, before, "the elevate grant created an agent");
+}
+
 /// A ticket whose 5 minutes pass with no ceremony is `invalid_grant`, no
 /// longer `authorization_pending`. Mutation: "invalid" answered as
 /// `authorization_pending` -> pending forever.
