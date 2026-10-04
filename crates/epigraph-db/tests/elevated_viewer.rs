@@ -23,7 +23,9 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::{ClaimRepository, ScopedPool, ScopedPoolOptions, SessionGucMode, Viewer};
+use epigraph_db::{
+    ClaimRepository, DbError, ScopedPool, ScopedPoolOptions, SessionGucMode, Viewer,
+};
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
@@ -569,4 +571,103 @@ async fn an_elevated_viewer_detaches_as_the_principals_scoped_viewer(pool: PgPoo
         own.is_some(),
         "the detached copy keeps the principal's own authority"
     );
+}
+
+// =====================================================================
+// The Rust write refusal
+// =====================================================================
+
+/// An INSERT on `conn`, answering the SQLSTATE it failed with (or `None`).
+async fn insert_sqlstate(conn: &mut sqlx::PgConnection) -> Option<String> {
+    let id = Uuid::new_v4();
+    let pk: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(id)
+        .bind(&pk)
+        .execute(&mut *conn)
+        .await
+        .err()
+        .and_then(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code())
+                .map(|c| c.to_string())
+        })
+}
+
+/// `begin_as` refuses an elevated viewer outright (`ElevatedReadOnly`), and
+/// the one transaction it may open, `begin_read_as`, is READ ONLY in the
+/// database: the INSERT fails with `25006` while the statement is elevated.
+/// Calibration: the principal's scoped viewer opens a writable transaction
+/// through `begin_as`, where the same INSERT succeeds.
+///
+/// Verified to fail with the elevated check removed from `begin_as` (it opens
+/// a transaction), and with `begin_read_as` issuing a plain `BEGIN` (the
+/// INSERT succeeds).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_viewer_gets_no_write_transaction(pool: PgPool) {
+    let p = holder(&pool, "write-p", 8).await;
+    let s = scoped(&pool, 2).await;
+    let live = session(&pool, &p, "grant").await;
+    let v = resolve(&s, p.person, Some(live), p.family).await;
+    assert!(v.is_elevated(), "CALIBRATION");
+
+    match s.begin_as(&v).await {
+        Err(DbError::ElevatedReadOnly) => {}
+        other => panic!("begin_as must refuse an elevated viewer: {other:?}"),
+    }
+
+    let mut tx = s.begin_read_as(&v).await.expect("begin_read_as");
+    let elevated: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("is_elevated");
+    assert!(elevated, "the read-only transaction is stamped elevated");
+    assert_eq!(insert_sqlstate(&mut tx).await.as_deref(), Some("25006"));
+    tx.rollback().await.expect("rollback");
+
+    let plain = Viewer::resolve(s.inner(), p.person).await.expect("resolve");
+    let mut tx = s
+        .begin_as(&plain)
+        .await
+        .expect("CALIBRATION: scoped begin_as");
+    assert_eq!(
+        insert_sqlstate(&mut tx).await,
+        None,
+        "CALIBRATION: the same INSERT succeeds in a writable transaction"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// In `Transaction` mode `read_as` serves an elevated viewer (the mode-dispatch
+/// helper must not route it to the refused `begin_as`), on the READ ONLY arm.
+///
+/// Verified to fail with `read_as` routing the elevated viewer to `begin_as`
+/// (the read is refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn read_as_serves_an_elevated_viewer_read_only_in_transaction_mode(pool: PgPool) {
+    let p = holder(&pool, "txmode-p", 9).await;
+    let s = ScopedPool::connect(
+        &fixture::database_url_for(&pool).await,
+        SessionGucMode::Transaction,
+    )
+    .await
+    .expect("transaction-mode ScopedPool");
+    let live = session(&pool, &p, "grant").await;
+    let v = resolve(&s, p.person, Some(live), p.family).await;
+    assert!(
+        v.is_elevated(),
+        "CALIBRATION: resolution works in transaction mode"
+    );
+
+    let mut r = s
+        .read_as(&v)
+        .await
+        .expect("read_as serves the elevated viewer");
+    assert_eq!(r.mode(), SessionGucMode::Transaction);
+    let elevated: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
+        .fetch_one(&mut *r)
+        .await
+        .expect("is_elevated");
+    assert!(elevated);
+    assert_eq!(insert_sqlstate(&mut r).await.as_deref(), Some("25006"));
 }

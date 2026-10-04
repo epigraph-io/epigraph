@@ -1082,10 +1082,55 @@ impl ScopedPool {
                     .to_string(),
             });
         }
+        // An elevated viewer writes nothing (elevation plan EL-6). Every write
+        // path begins here, so this is the Rust half of the refusal; the
+        // database's half is the restrictive policies of the elevated arms.
+        // A READ that must be transactional takes `begin_read_as`.
+        if v.is_elevated() {
+            return Err(DbError::ElevatedReadOnly);
+        }
+        self.begin_stamped(v, "BEGIN").await
+    }
 
+    /// [`Self::begin_as`] for a READ: `BEGIN READ ONLY`, then the identical
+    /// stamp with `is_local = true`.
+    ///
+    /// The one transaction an ELEVATED viewer may open, and the arm
+    /// [`Self::read_as`] takes for one in [`SessionGucMode::Transaction`]. The
+    /// database itself then refuses any write the read reaches (SQLSTATE
+    /// `25006`), a side-effect write through a definer included. Correct for
+    /// any non-bypass viewer.
+    ///
+    /// # Errors
+    /// * `DbError::InvalidData` if `v` is a bypass viewer (see
+    ///   [`Self::acquire_as`]).
+    /// * `DbError::ConnectionFailed` / `DbError::QueryFailed` on `BEGIN` or the
+    ///   stamp.
+    ///
+    /// # Panics
+    /// In debug builds only, as [`Self::begin_as`].
+    pub async fn begin_read_as(&self, v: &Viewer) -> Result<ScopedTx<'_>, DbError> {
+        if v.is_bypass() {
+            return Err(DbError::InvalidData {
+                reason: "begin_read_as refuses a Bypass viewer: an unrestricted viewer must come \
+                         from ScopedPool::unscoped_for_maintenance, on a maintenance connection."
+                    .to_string(),
+            });
+        }
+        self.begin_stamped(v, "BEGIN READ ONLY").await
+    }
+
+    /// `begin` (`BEGIN` or `BEGIN READ ONLY`), then the transaction-local
+    /// stamp from `v`, verified in debug builds. Shared by [`Self::begin_as`]
+    /// and [`Self::begin_read_as`], which have checked the viewer.
+    async fn begin_stamped(
+        &self,
+        v: &Viewer,
+        begin: &'static str,
+    ) -> Result<ScopedTx<'_>, DbError> {
         let mut tx = self
             .inner
-            .begin()
+            .begin_with(begin)
             .await
             .map_err(|source| DbError::ConnectionFailed { source })?;
         apply_session_gucs(&mut tx, v, true).await?;
@@ -1166,8 +1211,14 @@ impl ScopedPool {
         // `apply_session_gucs` is private with exactly two callers, and that is
         // the structural control behind plan §4.5 requirement 1 — becoming a
         // third caller would dissolve it while leaving every test green.
+        //
+        // An ELEVATED viewer's transaction arm is `begin_read_as`: `begin_as`
+        // refuses it, and a read is all it may do.
         match self.mode {
             SessionGucMode::Session => Ok(ScopedRead::Conn(self.acquire_as(v).await?)),
+            SessionGucMode::Transaction if v.is_elevated() => {
+                Ok(ScopedRead::Tx(self.begin_read_as(v).await?))
+            }
             SessionGucMode::Transaction => Ok(ScopedRead::Tx(self.begin_as(v).await?)),
         }
     }

@@ -1342,6 +1342,15 @@ impl AppState {
             }
         })?;
         scoped.begin_as(viewer).await.map_err(|e| {
+            // An elevated request asking to write is a DENIAL, not a fault.
+            if matches!(e, epigraph_db::DbError::ElevatedReadOnly) {
+                tracing::info!(
+                    target: "tenancy.scoped_write",
+                    handler,
+                    "write refused: the request is elevated (read-only)"
+                );
+                return crate::errors::ApiError::from(e);
+            }
             tracing::error!(
                 target: "tenancy.scoped_write",
                 error = %e,
@@ -1381,6 +1390,11 @@ impl AppState {
         viewer: &epigraph_db::visibility::Viewer,
         handler: &'static str,
     ) -> Result<ClaimWriteTx<'_>, crate::errors::ApiError> {
+        // Refused BEFORE the branch, so the unscoped fallback below cannot
+        // become a way for an elevated request to write.
+        if viewer.is_elevated() {
+            return Err(epigraph_db::DbError::ElevatedReadOnly.into());
+        }
         if self.scoped.is_some() {
             return Ok(ClaimWriteTx::Stamped(self.write_as(viewer, handler).await?));
         }

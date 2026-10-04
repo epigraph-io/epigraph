@@ -614,6 +614,11 @@ impl From<DbError> for ApiError {
             e @ DbError::WriteRefused { .. } => ApiError::Forbidden {
                 reason: e.to_string(),
             },
+            // An elevated request asked to write (elevation plan EL-6): a
+            // denial the caller fixes by writing unelevated.
+            e @ DbError::ElevatedReadOnly => ApiError::Forbidden {
+                reason: e.to_string(),
+            },
             // Migration 105's refusal to restore a revoked personal-group
             // membership. A denial, not a fault: 403 on the EXISTING variant
             // (a new `ApiError` variant would land in the no-db build with no
@@ -835,6 +840,25 @@ mod tests {
             ApiError::Forbidden { reason } => assert!(reason.starts_with("OPL02"), "{reason}"),
             other => panic!("OPL02 must be Forbidden: {other:?}"),
         }
+    }
+
+    /// An elevated request asking to write is a 403 denial naming the remedy,
+    /// not a 500. Mutation caught: the arm removed (it falls to the fault arm).
+    #[test]
+    fn an_elevated_write_is_a_403_denial() {
+        let api = ApiError::from(DbError::ElevatedReadOnly);
+        match &api {
+            ApiError::Forbidden { reason } => {
+                assert!(reason.contains("ELEVATED READ-ONLY"), "{reason}");
+                assert!(reason.contains("end the elevation"), "{reason}");
+            }
+            other => panic!("an elevated write must be Forbidden: {other:?}"),
+        }
+        assert_eq!(api.into_response().status(), StatusCode::FORBIDDEN);
+        assert!(
+            DbError::ElevatedReadOnly.is_write_authority_refusal(),
+            "every write surface maps this set to a denial"
+        );
     }
 
     #[test]
