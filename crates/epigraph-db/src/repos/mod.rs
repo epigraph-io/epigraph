@@ -105,8 +105,8 @@ pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;
 pub use elevation_ceremony::{
-    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, Redemption,
-    TicketMode, TicketPasskey,
+    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
+    Redemption, TicketMode, TicketPasskey,
 };
 pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};

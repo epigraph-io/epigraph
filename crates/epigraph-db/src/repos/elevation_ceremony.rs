@@ -54,6 +54,22 @@ pub struct CeremonyTicket {
     pub challenge_state: Option<serde_json::Value>,
 }
 
+/// A live elevation session as `epigraph_elevation_live` answers for it: the
+/// row `Viewer::resolve_elevated` builds an elevated viewer from.
+#[derive(Debug, Clone, FromRow)]
+pub struct LiveElevation {
+    /// The session.
+    pub session_id: Uuid,
+    /// The live elevating assignment it stores.
+    pub assignment_id: Uuid,
+    /// Its refresh family.
+    pub family_id: Uuid,
+    /// `grant` or `connector`.
+    pub mode: String,
+    /// When it stops, at the latest.
+    pub expires_at: DateTime<Utc>,
+}
+
 /// One live passkey of the ticket's person, as the ceremony needs it.
 #[derive(Debug, Clone, FromRow)]
 pub struct TicketPasskey {
@@ -312,6 +328,33 @@ impl ElevationCeremony {
         .bind(secret_hash.as_slice())
         .bind(client)
         .fetch_one(&mut *conn)
+        .await?;
+        Ok(row)
+    }
+
+    /// The STAMPED principal's live session on `family`
+    /// (`epigraph_elevation_live`): the one named `elv` (grant mode), or with
+    /// `elv` `None` the family's connector-mode session. `None` when there is
+    /// no such session, it is someone else's, ended, expired, or its elevating
+    /// assignment is no longer the live one. Principal-bound: on an unstamped
+    /// connection it answers `None`.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the call fails (for instance on a database
+    /// without migration 125; the caller degrades that to "not elevated").
+    #[instrument(skip(conn))]
+    pub async fn live(
+        conn: &mut sqlx::PgConnection,
+        elv: Option<Uuid>,
+        family: Uuid,
+    ) -> Result<Option<LiveElevation>, DbError> {
+        let row = sqlx::query_as::<_, LiveElevation>(
+            "SELECT session_id, assignment_id, family_id, mode, expires_at \
+               FROM public.epigraph_elevation_live($1, $2)",
+        )
+        .bind(elv)
+        .bind(family)
+        .fetch_optional(&mut *conn)
         .await?;
         Ok(row)
     }

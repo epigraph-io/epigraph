@@ -714,13 +714,26 @@ async fn apply_session_gucs(
     v: &Viewer,
     is_local: bool,
 ) -> Result<(), DbError> {
+    // `session_groups`, not `group_bind`: an elevated viewer binds no `$V`
+    // (its read fragment is always-true) but the row policies must still see
+    // its own groups. The elevation pair is the SESSION the database answered
+    // for at resolution, never a token claim; every other viewer stamps it
+    // empty.
+    let elevation = v.elevation();
     sqlx::query(SET_SESSION_GUCS)
-        .bind(join_uuids(v.group_bind()))
+        .bind(join_uuids(v.session_groups()))
         .bind(join_uuids(v.writable_bind()))
         .bind(v.principal().map(|p| p.to_string()).unwrap_or_default())
-        // No viewer is elevated yet: both elevation GUCs are stamped empty.
-        .bind("")
-        .bind("")
+        .bind(
+            elevation
+                .map(|e| e.session_id.to_string())
+                .unwrap_or_default(),
+        )
+        .bind(
+            elevation
+                .map(|e| e.family_id.to_string())
+                .unwrap_or_default(),
+        )
         .bind(is_local)
         .execute(conn)
         .await

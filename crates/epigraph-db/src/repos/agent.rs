@@ -1907,7 +1907,7 @@ impl AgentRepository {
         .bind(id)
         .bind(viewer.principal())
         .bind(viewer.group_bind().unwrap_or(&[]))
-        .bind(viewer.is_bypass())
+        .bind(viewer.bypass_bind())
         .fetch_optional(executor)
         .await?;
 

@@ -586,6 +586,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          session (a privileged session, any). Nothing for a viewer to filter.",
     ),
     (
+        "elevation_ceremony.rs",
+        "live",
+        "READ through 125's principal-bound app-callable definer `epigraph_elevation_live`, on a \
+         connection STAMPED with the requester's scoped viewer (EL-6, `Viewer::resolve_elevated`): \
+         the stamped principal's own live elevation session on one family, or nothing. It is the \
+         input that BUILDS a viewer, an authentication record about a principal rather than a \
+         corpus row, so there is no viewer yet to filter it by.",
+    ),
+    (
         "role_assignment.rs",
         "grant",
         "WRITE through migration 123's maintenance-only definer `epigraph_grant_role` into \
