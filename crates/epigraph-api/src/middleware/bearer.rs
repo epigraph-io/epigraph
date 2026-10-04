@@ -284,11 +284,28 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequirePrincipal {
 /// [`require_scope_extractor`] above), so the 401 lands before body parse —
 /// no 422-instead-of-401.
 ///
+/// # Elevation (elevation plan EL-6)
+///
+/// A token carrying an elevation claim (`elv`, minted only by the elevate
+/// grant) AND its refresh family (`fam`) resolves through
+/// `Viewer::resolve_elevated`: ELEVATED only when migration 125's
+/// principal-bound `epigraph_elevation_live` answers for a live session of
+/// this principal on this family, the plain scoped viewer otherwise (a forged,
+/// ended or expired claim, or a liveness check that fails). The request is
+/// never refused for it: the token still works, unelevated. The CLAIM is not
+/// authority; the viewer's [`epigraph_db::Viewer::elevation`] is. Connector
+/// mode (a session found by family alone) is the MCP server's, not this one's.
+///
+/// An elevated viewer reads with the always-true fragment on the application
+/// role (the row policies decide), and writes nothing: `AppState::write_as`
+/// answers 403 for it.
+///
 /// # Cost
 ///
 /// One indexed round trip per request (`Viewer::resolve` →
 /// `GroupMembershipRepository::list_live_for_agent`, served index-only by
-/// `idx_group_memberships_agent_live`). PR-03 defined the extractor; PR-06 and
+/// `idx_group_memberships_agent_live`), plus one stamped liveness check for a
+/// token that claims an elevation. PR-03 defined the extractor; PR-06 and
 /// PR-07 wired it to the read paths.
 #[cfg(feature = "db")]
 pub struct ViewerExtractor(pub epigraph_db::Viewer);
@@ -346,8 +363,33 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
         // read can say "not acting" while the agent's writer row in the
         // operator's group is live (see `oauth::token::principal_agent_id`).
         // Read concurrently with the resolve, so it adds no latency.
+        // An elevation claim WITH its family, on a process that can stamp a
+        // connection, is checked against the database; every other token
+        // resolves the plain scoped viewer exactly as before.
+        let resolve = async {
+            match (auth.elevation_claim, auth.family_id, state.scoped.as_ref()) {
+                (Some(elv), Some(family), Some(scoped)) => {
+                    let v =
+                        epigraph_db::Viewer::resolve_elevated(scoped, principal, Some(elv), family)
+                            .await;
+                    if let Ok(v) = &v {
+                        if !v.is_elevated() {
+                            tracing::info!(
+                                target: "elevation",
+                                route = %route,
+                                principal = %principal,
+                                "the token's elevation claim is not a live session; serving \
+                                 the request unelevated"
+                            );
+                        }
+                    }
+                    v
+                }
+                _ => epigraph_db::Viewer::resolve(&state.db_pool, principal).await,
+            }
+        };
         let (viewer, actor) = tokio::join!(
-            epigraph_db::Viewer::resolve(&state.db_pool, principal),
+            resolve,
             epigraph_db::AgentRepository::operator_of_author_pool(&state.db_pool, principal),
         );
         match actor {

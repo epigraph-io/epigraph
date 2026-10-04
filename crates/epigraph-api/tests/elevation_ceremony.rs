@@ -120,6 +120,37 @@ impl Server {
             .0
     }
 
+    /// [`Self::human_token`] with explicit scopes.
+    fn scoped_token(&self, p: &Person, elv: Option<Uuid>, scopes: &[&str]) -> String {
+        self.jwt
+            .issue_access_token(
+                p.client,
+                scopes.iter().map(|s| (*s).to_string()).collect(),
+                "human",
+                None,
+                Some(p.person),
+                Duration::minutes(30),
+                AccessTokenBinding {
+                    family_id: Some(p.family),
+                    elevation_id: elv,
+                },
+            )
+            .expect("mint")
+            .0
+    }
+
+    async fn get(&self, path: &str, token: &str) -> (StatusCode, Value) {
+        let resp = self
+            .http
+            .get(self.url(path))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
     async fn open_ticket(&self, token: &str, reason: &str) -> (StatusCode, Value) {
         self.post(
             "/api/v1/elevation/tickets",
@@ -1458,4 +1489,93 @@ async fn no_other_grant_mints_elv_even_while_the_family_is_elevated(pool: PgPool
         .validate_token(second["access_token"].as_str().unwrap())
         .unwrap();
     assert_eq!(sc.elv, None);
+}
+
+// =====================================================================
+// EL-6: what the elevated token's viewer may do through the real router
+// =====================================================================
+
+/// A body for `POST /api/v1/edges` that reaches the handler's write
+/// transaction (the scope check passes; nothing is validated before it).
+fn an_edge() -> Value {
+    json!({
+        "source_id": Uuid::new_v4(),
+        "target_id": Uuid::new_v4(),
+        "source_type": "claim",
+        "target_type": "claim",
+        "relationship": "supports",
+    })
+}
+
+fn refused_as_elevated(body: &Value) -> bool {
+    body.to_string().contains("ELEVATED READ-ONLY")
+}
+
+/// The elevated token (the elevate grant's: `elv` = a live session, `fam` =
+/// its family) resolves an ELEVATED viewer: a write is refused 403 ELEVATED
+/// READ-ONLY, a read of the caller's own private row still answers 200. The
+/// same principal's unelevated token, a forged claim, and the claim of an
+/// ENDED session all resolve the scoped viewer: the write is not refused for
+/// elevation, and the request is served.
+///
+/// Verified to fail with the extractor ignoring the claim (always the scoped
+/// viewer: the elevated write is not refused), and with `AppState::write_as`
+/// mapping the refusal to a 500 (the status).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_token_reads_and_writes_nothing(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let group: Uuid = sqlx::query_scalar(
+        "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("the personal group");
+    let mine = fixture::seed_group_claim(&pool, p.person, group, "P's private row").await;
+    let (_, t) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let scopes = ["claims:read", "edges:write"];
+    let elevated = s.scoped_token(&p, Some(session), &scopes);
+
+    let (status, body) = s.post("/api/v1/edges", Some(&elevated), &an_edge()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(refused_as_elevated(&body), "{body}");
+    let (status, body) = s.get(&format!("/api/v1/claims/{mine}"), &elevated).await;
+    assert_eq!(status, StatusCode::OK, "an elevated read is served: {body}");
+
+    for (what, token) in [
+        ("the unelevated token", s.scoped_token(&p, None, &scopes)),
+        (
+            "a forged claim",
+            s.scoped_token(&p, Some(Uuid::new_v4()), &scopes),
+        ),
+    ] {
+        let (status, body) = s.post("/api/v1/edges", Some(&token), &an_edge()).await;
+        assert!(
+            !refused_as_elevated(&body),
+            "{what}: refused as elevated ({status}): {body}"
+        );
+    }
+
+    // The elevated token ends its own session (the route acts as the
+    // principal), and its claim then resolves scoped: served, not refused.
+    let resp = s
+        .http
+        .post(s.url("/api/v1/elevation/end"))
+        .bearer_auth(&elevated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (status, body) = s.post("/api/v1/edges", Some(&elevated), &an_edge()).await;
+    assert!(
+        !refused_as_elevated(&body),
+        "an ended session's claim is not elevated ({status}): {body}"
+    );
+    let (status, body) = s.get(&format!("/api/v1/claims/{mine}"), &elevated).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

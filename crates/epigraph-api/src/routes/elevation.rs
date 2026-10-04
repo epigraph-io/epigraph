@@ -127,6 +127,18 @@ fn scoped<'a>(
     })
 }
 
+/// The caller's PLAIN scoped viewer, for the two routes that act on the
+/// caller's elevation (EL-6). An elevated request gets no write transaction,
+/// and these routes write: asking for a ticket and ending a session are the
+/// principal's acts, not the elevation's (both definers are bound to the
+/// stamped principal only), so they stamp the principal's own scoped viewer.
+/// That is what lets an elevated token end its own session.
+fn as_principal(viewer: &epigraph_db::Viewer) -> Result<epigraph_db::Viewer, ApiError> {
+    viewer.detach_scoped().ok_or_else(|| ApiError::Forbidden {
+        reason: "elevation: this request has no principal to act as".into(),
+    })
+}
+
 fn internal(handler: &'static str, what: &str, e: &dyn std::fmt::Display) -> ApiError {
     tracing::error!(target: "elevation", handler, error = %e, "{what}");
     ApiError::InternalError {
@@ -176,7 +188,7 @@ pub async fn create_ticket(
     let redeem_hash: [u8; 32] = sha2::Sha256::digest(secret).into();
 
     let mut tx = scoped(&state, "elevation::create_ticket")?
-        .begin_as(&viewer)
+        .begin_as(&as_principal(&viewer)?)
         .await
         .map_err(|e| {
             internal(
@@ -275,7 +287,7 @@ pub async fn end_elevation(
                     .into(),
             })?;
     let mut tx = scoped(&state, "elevation::end_elevation")?
-        .begin_as(&viewer)
+        .begin_as(&as_principal(&viewer)?)
         .await
         .map_err(|e| {
             internal(
