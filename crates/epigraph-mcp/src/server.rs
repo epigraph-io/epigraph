@@ -161,6 +161,9 @@ impl EpiGraphMcpFull {
         auth: Option<&epigraph_auth::AuthContext>,
         viewer: &epigraph_db::visibility::Viewer,
     ) -> Result<crate::write_identity::WriteIdentity, McpError> {
+        // An elevated request is read-only (elevation plan §1.4), on every
+        // transport, before anything else: nothing below would see it.
+        crate::write_identity::refuse_elevated(viewer)?;
         let Some(auth) = auth else {
             return Ok(crate::write_identity::WriteIdentity::from_resolved(
                 self.agent_id().await?,
@@ -747,6 +750,46 @@ impl EpiGraphMcpFull {
             });
         }
         Ok(())
+    }
+
+    /// Refuse a WRITE tool to an ELEVATED request, at dispatch (elevation plan
+    /// §1.4: the elevated viewer is read-only).
+    ///
+    /// A write tool is one whose `SCOPE_MAP` scope is not a `:read` scope (an
+    /// unmapped name counts as a write; `enforce_tool_scope` refuses it first
+    /// anyway). Only a request that CAN be elevated pays for the check: a token
+    /// carrying an elevation claim (`elv`), or, with the connector switch on, a
+    /// token carrying a family. Its viewer is resolved exactly as the tool
+    /// would resolve it (`tools::viewer::request_viewer`), and refused when
+    /// elevated, with the `ELEVATED READ-ONLY` refusal `begin_as` gives. An
+    /// ended or expired session's claim is not elevated, so its writes pass
+    /// here (as the REST router serves them).
+    ///
+    /// This is the chokepoint for EVERY write tool, including those that never
+    /// call `write_identity` (the admin maintenance tools, the sheaf and theme
+    /// writes); `write_identity` and the detached ingests refuse an elevated
+    /// viewer too, as a second layer for tools driven without dispatch.
+    /// stdio (`auth == None`) never elevates and is not checked.
+    ///
+    /// # Errors
+    /// The refusal, or the viewer resolution's own error.
+    pub async fn refuse_elevated_write(
+        &self,
+        auth: Option<&epigraph_auth::AuthContext>,
+        tool_name: &str,
+    ) -> Result<(), McpError> {
+        let Some(auth) = auth else {
+            return Ok(());
+        };
+        let writes = crate::scope_map::required_scope(tool_name)
+            .map_or(true, |scope| !scope.ends_with(":read"));
+        let may_be_elevated = auth.elevation_claim.is_some()
+            || (self.connector_elevation && auth.family_id.is_some());
+        if !writes || !may_be_elevated {
+            return Ok(());
+        }
+        let viewer = crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        crate::write_identity::refuse_elevated(&viewer)
     }
 
     /// Return an error if the server is in read-only mode.
@@ -2366,6 +2409,16 @@ impl ServerHandler for EpiGraphMcpFull {
         if is_http_call {
             if let Err(err) = Self::enforce_tool_scope(auth_owned.as_ref(), &request.name) {
                 // Emit a denial audit event so 403s show up alongside successes.
+                self.emit_tool_invoked(&format!("denied:{}", request.name))
+                    .await;
+                return Err(err);
+            }
+            // An elevated request is read-only: every write tool is refused
+            // here, before dispatch (elevation plan §1.4).
+            if let Err(err) = self
+                .refuse_elevated_write(auth_owned.as_ref(), &request.name)
+                .await
+            {
                 self.emit_tool_invoked(&format!("denied:{}", request.name))
                     .await;
                 return Err(err);

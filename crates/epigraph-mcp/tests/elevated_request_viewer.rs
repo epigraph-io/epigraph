@@ -429,3 +429,229 @@ async fn mcp_reads_are_not_widened_by_the_arms_until_they_are_stamped(pool: PgPo
         "CALIBRATION: a connection stamped from the same viewer reads it through the arm"
     );
 }
+
+// =====================================================================
+// Review cp1: an elevated request writes NOTHING through MCP (plan §1.4)
+// =====================================================================
+
+/// A token of `person` that carries the write scope, with or without an
+/// elevation claim (the elevate grant once minted write scopes; hand-minted
+/// here so the refusal under test is the elevation's, not the scope gate's).
+fn writer_auth(person: Uuid, client: Uuid, family: Uuid, elv: Option<Uuid>) -> AuthContext {
+    let mut a = http_auth(person, client, family, elv);
+    a.scopes = vec!["claims:read".to_string(), "claims:write".to_string()];
+    a
+}
+
+fn refused_as_elevated<T: std::fmt::Debug>(r: &Result<T, rmcp::model::ErrorData>) -> bool {
+    r.as_ref()
+        .err()
+        .is_some_and(|e| e.message.contains("ELEVATED READ-ONLY"))
+}
+
+fn inline_doc(doi: &str) -> epigraph_mcp::types::IngestDocumentInlineParams {
+    epigraph_mcp::types::IngestDocumentInlineParams {
+        extraction: serde_json::from_value(serde_json::json!({
+            "source": {"title": format!("Elevated ingest {doi}"), "doi": doi,
+                       "source_type": "Paper", "authors": []},
+            "thesis": format!("Elevated ingest thesis {doi}"),
+            "thesis_derivation": "TopDown",
+            "sections": [{"title": "S", "paragraphs": [{
+                "text": format!("Elevated ingest paragraph {doi}"),
+                "atoms": [format!("Elevated ingest atom {doi}")],
+                "generality": [3], "confidence": 0.8
+            }]}],
+            "relationships": []
+        }))
+        .expect("extraction"),
+    }
+}
+
+fn memorize_params(content: &str) -> epigraph_mcp::types::MemorizeParams {
+    epigraph_mcp::types::MemorizeParams {
+        content: content.to_string(),
+        confidence: Some(0.7),
+        tags: Some(vec![]),
+        novelty_threshold: Some(0.0),
+    }
+}
+
+async fn claims_with_content(pool: &PgPool, content: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
+/// An ELEVATED request's write tools, driven on the tool path as the
+/// application role, write nothing and answer `ELEVATED READ-ONLY`: a relabel
+/// of the principal's OWN claim, a `memorize`, and a DETACHED ingest
+/// (`ingest_document_inline`, whose viewer is downgraded by `detach_scoped`
+/// before its preflight). The MCP write path stamps its transaction from a
+/// freshly resolved SCOPED author viewer, so without its own refusal neither
+/// `begin_as`'s elevated refusal nor migration 126's restrictive policies
+/// ever see the elevation (review cp1: both writes committed).
+/// Calibration: the same principal's unelevated request memorizes.
+///
+/// Verified to fail with the refusal dropped from `write_identity` (the
+/// relabel and the memorize commit), and with the pre-detach refusal dropped
+/// from `ingest_document_inline` (the ingest is queued and its paper row
+/// lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_request_writes_nothing_through_the_tool_path(pool: PgPool) {
+    let (p, p_group) = fixture::seed_human_operator(&pool, "mcp-cp1-write-p").await;
+    let (client, family) = make_holder(&pool, p, 6).await;
+    let live = session(&pool, p, client, family, 6, "grant").await;
+    let mine = fixture::seed_group_claim(&pool, p, p_group, "cp1 elevated write target").await;
+    let server = app_server(&pool).await;
+    let auth = writer_auth(p, client, family, Some(live));
+    let v = request_viewer(&server, Some(&auth)).await.expect("viewer");
+    assert!(v.is_elevated(), "CALIBRATION: the request is elevated");
+
+    let relabel = epigraph_mcp::tools::claims::update_labels(
+        &server,
+        &v,
+        epigraph_mcp::types::UpdateLabelsParams {
+            claim_id: mine.to_string(),
+            add: vec!["written-while-elevated".to_string()],
+            remove: vec![],
+        },
+        Some(&auth),
+    )
+    .await;
+    assert!(refused_as_elevated(&relabel), "update_labels: {relabel:?}");
+    let labels: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(mine)
+        .fetch_one(&pool)
+        .await
+        .expect("labels");
+    assert!(
+        !labels.iter().any(|l| l == "written-while-elevated"),
+        "an elevated request relabelled a claim"
+    );
+
+    let content = format!("cp1 memorize while elevated {}", Uuid::new_v4());
+    let memo =
+        epigraph_mcp::tools::memory::memorize(&server, &v, memorize_params(&content), Some(&auth))
+            .await;
+    assert!(refused_as_elevated(&memo), "memorize: {memo:?}");
+    assert_eq!(
+        claims_with_content(&pool, &content).await,
+        0,
+        "an elevated request memorized a claim"
+    );
+
+    let doi = format!("10.9999/cp1-elevated-{}", Uuid::new_v4());
+    let ingest = epigraph_mcp::tools::ingestion::ingest_document_inline(
+        &server,
+        &v,
+        inline_doc(&doi),
+        Some(&auth),
+    )
+    .await;
+    assert!(
+        refused_as_elevated(&ingest),
+        "ingest_document_inline: {ingest:?}"
+    );
+    // Give a (wrongly) spawned task time to land before asserting it did not.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let papers: i64 = sqlx::query_scalar("SELECT count(*) FROM papers WHERE doi = $1")
+        .bind(&doi)
+        .fetch_one(&pool)
+        .await
+        .expect("papers");
+    assert_eq!(papers, 0, "an elevated request queued an ingest");
+
+    let plain = writer_auth(p, client, family, None);
+    let pv = request_viewer(&server, Some(&plain)).await.expect("viewer");
+    assert!(!pv.is_elevated(), "CALIBRATION: no claim, not elevated");
+    let content = format!("cp1 memorize unelevated {}", Uuid::new_v4());
+    epigraph_mcp::tools::memory::memorize(&server, &pv, memorize_params(&content), Some(&plain))
+        .await
+        .expect("CALIBRATION: the same principal, unelevated, memorizes");
+    assert_eq!(claims_with_content(&pool, &content).await, 1);
+}
+
+/// THE DISPATCH CHOKEPOINT, over the whole tool table: for an elevated
+/// request every tool whose `SCOPE_MAP` scope is not a read scope is refused
+/// `ELEVATED READ-ONLY` by `refuse_elevated_write` (which `call_tool` runs
+/// after the scope gate, before dispatch), and every read tool passes; for
+/// the same principal unelevated, nothing is refused. Connector mode: a
+/// family-only token with a live connector session is refused only when the
+/// server's connector switch is on (off, it is not elevated at all).
+///
+/// Verified to fail with `refuse_elevated_write` answering `Ok` for every
+/// call (each write tool passes), and with its write test inverted (each
+/// read tool is refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_write_tool_is_refused_to_an_elevated_request_at_dispatch(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "mcp-cp1-dispatch-p").await;
+    let (client, family) = make_holder(&pool, p, 8).await;
+    let live = session(&pool, p, client, family, 8, "grant").await;
+    let server = app_server(&pool).await;
+    let elevated = writer_auth(p, client, family, Some(live));
+    let plain = writer_auth(p, client, family, None);
+
+    let mut writes = 0;
+    for (tool, scope) in epigraph_mcp::scope_map::SCOPE_MAP {
+        let r = server.refuse_elevated_write(Some(&elevated), tool).await;
+        if scope.ends_with(":read") {
+            assert!(r.is_ok(), "{tool} ({scope}) is a read, refused: {r:?}");
+        } else {
+            writes += 1;
+            assert!(refused_as_elevated(&r), "{tool} ({scope}): {r:?}");
+        }
+        let r = server.refuse_elevated_write(Some(&plain), tool).await;
+        assert!(r.is_ok(), "{tool}: refused to an unelevated request: {r:?}");
+    }
+    assert!(
+        writes >= 40,
+        "CALIBRATION: the write half of SCOPE_MAP collapsed ({writes})"
+    );
+    assert!(
+        server.refuse_elevated_write(None, "memorize").await.is_ok(),
+        "stdio is never elevated"
+    );
+
+    let (_, connector_family) = make_holder(&pool, p, 9).await;
+    session(&pool, p, client, connector_family, 9, "connector").await;
+    let connector = writer_auth(p, client, connector_family, None);
+    assert!(
+        server
+            .refuse_elevated_write(Some(&connector), "memorize")
+            .await
+            .is_ok(),
+        "the connector switch is off: not elevated, not refused"
+    );
+    let on = server.clone().with_connector_elevation(true);
+    let r = on.refuse_elevated_write(Some(&connector), "memorize").await;
+    assert!(refused_as_elevated(&r), "connector mode on: {r:?}");
+}
+
+/// Source lock: `call_tool` runs `refuse_elevated_write` inside the HTTP
+/// gate, AFTER the scope gate and BEFORE `tool_router.call`, so no write tool
+/// body runs for an elevated request (no behavioural test in this crate can
+/// drive `call_tool`: it needs an rmcp `RequestContext`).
+///
+/// Verified to fail with the call removed from `call_tool`.
+#[test]
+fn call_tool_refuses_an_elevated_write_before_dispatch() {
+    let path: std::path::PathBuf = [env!("CARGO_MANIFEST_DIR"), "src", "server.rs"]
+        .iter()
+        .collect();
+    let src = std::fs::read_to_string(&path).expect("server.rs");
+    let body = &src[src.find("async fn call_tool(").expect("call_tool")..];
+    let scope = body
+        .find("Self::enforce_tool_scope(auth_owned.as_ref()")
+        .expect("the scope gate");
+    let refuse = body
+        .find(".refuse_elevated_write(auth_owned.as_ref()")
+        .expect("call_tool must call refuse_elevated_write");
+    let dispatch = body.find("self.tool_router.call(").expect("the dispatch");
+    assert!(
+        scope < refuse && refuse < dispatch,
+        "refuse_elevated_write must run after the scope gate and before dispatch \
+         (scope {scope}, refusal {refuse}, dispatch {dispatch})"
+    );
+}
