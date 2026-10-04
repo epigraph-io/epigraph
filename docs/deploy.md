@@ -1846,10 +1846,12 @@ migration and a recording build.
 
 1. **Deploy the elevated-viewer binaries first** (the section above) and
    migrate 125 before them. Without them nothing stamps an elevation, so the
-   arms do nothing; with them and without 126, an elevated session reads only
-   its own groups, on any DSN (a unit on a privileged DSN never elevates: see
-   the section above). Neither order is unsafe; 126 itself waits on the hold
-   above.
+   arms do nothing. At this tree's head no session is elevated at all, on any
+   unit (the gate and the recorder declaration above), so 126 widens nothing
+   in either order. Once both keys open, a session on a unit without 126 reads
+   only its own groups, and a unit on a privileged DSN still never elevates
+   (the section above). Neither order is unsafe: what keeps 126 from widening
+   a read before the per-access log is the enforced gate above, not a hold.
 2. **Migrate 126** (`epigraph-migrate`, migration DSN) under the lock plan.
    `CREATE POLICY` takes ACCESS EXCLUSIVE on its table, so it waits for every
    open reader of that table. The file arms ONE table per committed block with
