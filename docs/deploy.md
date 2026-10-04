@@ -1761,8 +1761,9 @@ elevated, and its release scrub clears all five. The boot probe checks all five.
 Only a binary that RECORDS every elevated access declares the per-access
 recorder (`epigraph.access_recorder`; see "two keys" in the 126 section and
 "The elevated-access log (migration 127)"): `epigraph-api` does, through its
-response layer. Every other binary listed here never elevates a request on
-any database.
+response layer, and `epigraph-mcp-full` does on its HTTP transport (`--listen`),
+through its tool-call wrapper. Every other binary listed here, and the MCP
+server on stdio, never elevates a request on any database.
 
 1. **Migrate 125 first** (above). A binary from this batch on a database
    without 125 still serves: a failed liveness check is logged and the request
@@ -1929,8 +1930,20 @@ migration of this stack.
      elevation routes (open a ticket, end an elevation) act as the person,
      not as the elevation, so they are never recorded. A token without an
      elevation claim pays nothing.
-   - An `epigraph-api` from before this batch declares nothing and never
-     elevates (it would serve an elevated token unelevated).
+   - `epigraph-mcp-full` RECORDS on its HTTP transport (`--listen`): for a
+     request that may be elevated, `call_tool` resolves the viewer once at
+     dispatch; elevated, the tool's result (or its error) is recorded before
+     it is returned, and a recording failure replaces it with an internal
+     error; not elevated, the token's claim and family are stripped before
+     the tool runs. Its HTTP pool is built by
+     `connect_recording_elevated_access`; on stdio (no token, never elevated)
+     it keeps the non-declaring pool. Two known limits: the MCP read tools
+     read on the unstamped pool, so an elevated MCP read is not widened by
+     the arms yet (it is still recorded); and a FEDERATED tool is proxied
+     under the caller's token before the wrapper, so its reads are the
+     extension's to record.
+   - A build from before this batch declares nothing and never elevates (it
+     would serve an elevated token unelevated).
 
 **Rollback.** Roll back first every binary that records (the builds that
 declare the recorder; without the recorder function they refuse every

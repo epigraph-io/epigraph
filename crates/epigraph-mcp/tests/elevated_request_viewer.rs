@@ -661,3 +661,322 @@ fn call_tool_refuses_an_elevated_write_before_dispatch() {
          (scope {scope}, refusal {refuse}, dispatch {dispatch})"
     );
 }
+
+// =====================================================================
+// EL-8: every elevated tool call is recorded through the REAL call_tool,
+// over the streamable-HTTP transport with the bearer middleware in front
+// =====================================================================
+
+const EL8_SECRET: &[u8] = b"el8-mcp-recorder-test-secret-at-least-32-bytes!!";
+
+/// The router `main` builds for `--listen --jwt-secret`, over an
+/// application-role `ScopedPool` that declares the recorder (the HTTP
+/// transport's pool), bound to an ephemeral port.
+async fn el8_listener(pool: &PgPool) -> String {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+    use std::sync::Arc;
+    let scoped = app_scoped(pool).await;
+    // The tools' own pool is the application role too, as in production (the
+    // MCP reads run on it unstamped: see
+    // `mcp_reads_are_not_widened_by_the_arms_until_they_are_stamped`).
+    let pool = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let signer = Arc::new(epigraph_crypto::AgentSigner::from_bytes(&[0x58; 32]).expect("signer"));
+    let embedder = Arc::new(
+        epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone()),
+    );
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(
+                EpiGraphMcpFull::new_shared(pool.clone(), signer.clone(), embedder.clone(), false)
+                    .with_scoped_pool(scoped.clone()),
+            )
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let state = epigraph_mcp::auth::McpAuthState {
+        jwt_config: Arc::new(epigraph_auth::JwtConfig::from_secret(EL8_SECRET)),
+        resource_metadata_url: None,
+    };
+    let router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(state, epigraph_mcp::auth::bearer_auth_middleware),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    format!("http://{addr}/mcp")
+}
+
+/// A human token for `person` on `client`/`family`, naming `elv`.
+fn el8_token(person: Uuid, client: Uuid, family: Uuid, elv: Option<Uuid>) -> String {
+    epigraph_auth::JwtConfig::from_secret(EL8_SECRET)
+        .issue_access_token(
+            client,
+            vec!["claims:read".to_string()],
+            "human",
+            None,
+            Some(person),
+            chrono::Duration::minutes(10),
+            epigraph_auth::AccessTokenBinding {
+                family_id: Some(family),
+                elevation_id: elv,
+            },
+        )
+        .expect("mint")
+        .0
+}
+
+async fn el8_post(
+    url: &str,
+    token: &str,
+    session: Option<&str>,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&body);
+    if let Some(s) = session {
+        req = req.header("Mcp-Session-Id", s);
+    }
+    req.send().await.expect("POST")
+}
+
+/// The first SSE `data:` payload of `resp`, parsed.
+async fn el8_data(mut resp: reqwest::Response) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut acc = String::new();
+    while let Ok(Ok(Some(bytes))) = tokio::time::timeout_at(deadline, resp.chunk()).await {
+        acc.push_str(&String::from_utf8_lossy(&bytes));
+        if let Some(line) = acc
+            .lines()
+            .find(|l| l.starts_with("data:") && l.trim_end().len() > 5)
+        {
+            return serde_json::from_str(line.trim_start_matches("data:").trim())
+                .unwrap_or_else(|e| panic!("SSE data is JSON ({e}): {line}"));
+        }
+    }
+    panic!("no SSE data: {acc}");
+}
+
+/// Initialize an MCP session on `url` with `token`; its id.
+async fn el8_session(url: &str, token: &str) -> String {
+    let resp = el8_post(
+        url,
+        token,
+        None,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "el8-recorder-test", "version": "0"}}
+        }),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200, "initialize");
+    let session = resp
+        .headers()
+        .get("Mcp-Session-Id")
+        .expect("session header")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let _ = el8_data(resp).await;
+    let notif = el8_post(
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    assert_eq!(notif.status().as_u16(), 202, "notifications/initialized");
+    session
+}
+
+/// `tools/call get_claim {claim_id}` through the real `call_tool`; the
+/// JSON-RPC answer.
+async fn el8_get_claim(url: &str, token: &str, claim: Uuid) -> serde_json::Value {
+    let session = el8_session(url, token).await;
+    let resp = el8_post(
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "get_claim", "arguments": {"claim_id": claim.to_string()}}
+        }),
+    )
+    .await;
+    el8_data(resp).await
+}
+
+async fn el8_log(pool: &PgPool) -> Vec<(String, i32, Vec<Uuid>, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT surface, row_count, owner_group_ids, args FROM elevated_access \
+          ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the log")
+}
+
+/// An elevated tool call through the real `call_tool` is recorded ONCE before
+/// its result returns: surface `mcp:get_claim`, the call's id-shaped argument,
+/// the token's jti, one row in the result, and no subject for a public row.
+/// A call whose result names B's private claim (the MCP read is not widened,
+/// so the tool answers "not found", naming the id) is recorded too, against
+/// B's group: the attempt is visible to B.
+///
+/// Verified to fail with `call_tool` returning the tool's result without
+/// recording it (no row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_tool_call_is_recorded_before_its_result_returns(pool: PgPool) {
+    let (p, p_group) = fixture::seed_human_operator(&pool, "mcp-el8-p").await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "mcp-el8-b").await;
+    let (client, family) = make_holder(&pool, p, 8).await;
+    let live = session(&pool, p, client, family, 8, "grant").await;
+    let mine = fixture::seed_public_claim(&pool, p, "mcp el8 P's public claim").await;
+    let _ = p_group;
+    let theirs = fixture::seed_group_claim(&pool, b, b_group, "mcp el8 B's claim").await;
+    let url = el8_listener(&pool).await;
+    let token = el8_token(p, client, family, Some(live));
+    let jti = epigraph_auth::JwtConfig::from_secret(EL8_SECRET)
+        .validate_token(&token)
+        .expect("decodes")
+        .jti;
+
+    let answer = el8_get_claim(&url, &token, mine).await;
+    assert!(answer.get("result").is_some(), "served: {answer}");
+    assert!(
+        answer.to_string().contains("mcp el8 P's public claim"),
+        "{answer}"
+    );
+    let log = el8_log(&pool).await;
+    assert_eq!(log.len(), 1, "{log:?}");
+    let (surface, rows, groups, args) = &log[0];
+    assert_eq!(surface, "mcp:get_claim");
+    assert_eq!(*rows, 1, "one row in the result");
+    assert!(
+        groups.is_empty(),
+        "a public row names no subject: {groups:?}"
+    );
+    assert_eq!(
+        args["arguments"]["claim_id"],
+        serde_json::json!([mine.to_string()])
+    );
+    assert_eq!(args["jti"], serde_json::json!(jti.to_string()));
+
+    let answer = el8_get_claim(&url, &token, theirs).await;
+    assert!(
+        !answer.to_string().contains("mcp el8 B's claim"),
+        "CALIBRATION: the MCP read is not widened: {answer}"
+    );
+    let log = el8_log(&pool).await;
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[1].2, vec![b_group], "the attempt is recorded for B");
+}
+
+/// FAIL-CLOSED: when the recorder cannot record (its EXECUTE revoked from the
+/// application role), the elevated call's result is WITHHELD: the caller gets
+/// an internal error naming the refusal and none of the row. The same call
+/// unelevated is served and writes no row.
+///
+/// Verified to fail with `record_elevated_call` returning the tool's result
+/// when the record fails (the claim is sent).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_record_withholds_the_tool_result(pool: PgPool) {
+    let (p, p_group) = fixture::seed_human_operator(&pool, "mcp-el8-fail-p").await;
+    let (client, family) = make_holder(&pool, p, 9).await;
+    let live = session(&pool, p, client, family, 9, "grant").await;
+    let mine = fixture::seed_public_claim(&pool, p, "mcp el8 withheld row").await;
+    let _ = p_group;
+    let url = el8_listener(&pool).await;
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION public.epigraph_record_elevated_access(text, jsonb, integer, \
+         uuid[]) FROM epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke");
+
+    let answer = el8_get_claim(&url, &el8_token(p, client, family, Some(live)), mine).await;
+    let text = answer.to_string();
+    assert!(
+        answer.get("error").is_some(),
+        "an error, not a result: {answer}"
+    );
+    assert!(text.contains("NOT RECORDED"), "{text}");
+    assert!(
+        !text.contains("mcp el8 withheld row"),
+        "none of the row: {text}"
+    );
+
+    let answer = el8_get_claim(&url, &el8_token(p, client, family, None), mine).await;
+    assert!(
+        answer.to_string().contains("mcp el8 withheld row"),
+        "CALIBRATION: the unelevated call is served: {answer}"
+    );
+    assert!(el8_log(&pool).await.is_empty());
+}
+
+/// A call that is not elevated writes no row and is served as before: a
+/// token with no claim, and a token whose claim names no live session
+/// (resolved scoped at dispatch, its claim stripped before the tool runs).
+///
+/// Verified to fail with `call_tool` treating every claim-carrying call as
+/// elevated (the forged claim's result goes to the recorder, which refuses
+/// it, and the result is withheld).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unelevated_tool_call_writes_no_row(pool: PgPool) {
+    let (p, p_group) = fixture::seed_human_operator(&pool, "mcp-el8-plain-p").await;
+    let (client, family) = make_holder(&pool, p, 10).await;
+    let mine = fixture::seed_public_claim(&pool, p, "mcp el8 plain row").await;
+    let _ = p_group;
+    let url = el8_listener(&pool).await;
+    for (what, elv) in [("no claim", None), ("forged claim", Some(Uuid::new_v4()))] {
+        let answer = el8_get_claim(&url, &el8_token(p, client, family, elv), mine).await;
+        assert!(
+            answer.to_string().contains("mcp el8 plain row"),
+            "{what}: served: {answer}"
+        );
+    }
+    assert!(el8_log(&pool).await.is_empty());
+}
+
+/// The binary builds its pool with the recording constructor on the HTTP
+/// transport only (`--listen`), and `call_tool` routes an elevated call's
+/// result through the recorder. Source lock: `main` is a binary no test
+/// constructs, and `call_tool` needs an rmcp request context.
+///
+/// Verified to fail with `main.rs` building the recording pool on every
+/// transport.
+#[test]
+fn the_http_transport_records_and_declares() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main = std::fs::read_to_string(root.join("src/main.rs")).unwrap();
+    let at = main
+        .find("ScopedPool::connect_recording_elevated_access(")
+        .expect("main.rs builds the recording pool");
+    let before = &main[..at];
+    assert!(
+        before
+            .rfind("if cli.listen.is_some()")
+            .is_some_and(|i| at - i < 200),
+        "only on the HTTP transport (--listen)"
+    );
+    let server = std::fs::read_to_string(root.join("src/server.rs")).unwrap();
+    let body = &server[server.find("async fn call_tool(").expect("call_tool")..];
+    assert!(
+        body.contains("crate::elevated_access::record_elevated_call("),
+        "call_tool records an elevated call's result"
+    );
+}

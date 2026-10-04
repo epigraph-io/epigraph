@@ -792,6 +792,38 @@ impl EpiGraphMcpFull {
         crate::write_identity::refuse_elevated(&viewer)
     }
 
+    /// Decide, ONCE at dispatch, whether an HTTP request is ELEVATED (elevation
+    /// plan EL-8, `crate::elevated_access`): only a request that may be (a
+    /// token carrying an elevation claim, or a family with the connector
+    /// switch on) pays for the resolution. Elevated: the viewer, whose call
+    /// `call_tool` then records before returning its result. Not elevated:
+    /// `None`, and the claim and family are STRIPPED from `auth` so the tool
+    /// cannot resolve an elevated viewer the recorder did not see. stdio
+    /// (`auth == None`) never elevates.
+    ///
+    /// # Errors
+    /// The viewer resolution's own error.
+    pub async fn elevation_at_dispatch(
+        &self,
+        auth: Option<&mut epigraph_auth::AuthContext>,
+    ) -> Result<Option<epigraph_db::Viewer>, McpError> {
+        let Some(auth) = auth else {
+            return Ok(None);
+        };
+        let may_be_elevated = auth.elevation_claim.is_some()
+            || (self.connector_elevation && auth.family_id.is_some());
+        if !may_be_elevated {
+            return Ok(None);
+        }
+        let viewer = crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        if viewer.is_elevated() {
+            return Ok(Some(viewer));
+        }
+        auth.elevation_claim = None;
+        auth.family_id = None;
+        Ok(None)
+    }
+
     /// Return an error if the server is in read-only mode.
     pub(crate) fn reject_if_read_only(&self) -> Result<(), McpError> {
         if self.read_only {
@@ -2308,7 +2340,7 @@ impl ServerHandler for EpiGraphMcpFull {
         // tower.rs:326/384/463). For stdio transport there is no `Parts` attached —
         // the stdio process boundary is the trust gate and no auth check applies.
         let is_http_call;
-        let auth_owned: Option<epigraph_auth::AuthContext>;
+        let mut auth_owned: Option<epigraph_auth::AuthContext>;
         // The verbatim caller bearer, present only on the HTTP path (stashed by
         // `auth::bearer_auth_middleware`). Needed to forward to a downstream
         // extension MCP on a federated call.
@@ -2439,6 +2471,21 @@ impl ServerHandler for EpiGraphMcpFull {
             }
         }
 
+        // THE PER-ACCESS RECORDER (elevation plan EL-8; `crate::elevated_access`).
+        // A request that MAY be elevated has its viewer resolved once, here:
+        // elevated, its result is recorded before it is returned (or withheld);
+        // not elevated, the claim and the family are stripped from the
+        // AuthContext the tool sees, so the tool cannot resolve an elevated
+        // viewer this wrapper did not see. Every other request pays nothing.
+        let elevated = self.elevation_at_dispatch(auth_owned.as_mut()).await?;
+        let recording = elevated.as_ref().map(|_| {
+            (
+                request.name.to_string(),
+                request.arguments.clone(),
+                auth_owned.as_ref().map(|a| a.jti).unwrap_or_default(),
+            )
+        });
+
         // Single chokepoint for every MCP tool invocation: emit a durable
         // tool.invoked event before dispatch, then forward to the
         // macro-built dispatcher.
@@ -2473,7 +2520,21 @@ impl ServerHandler for EpiGraphMcpFull {
         }
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        let result = self.tool_router.call(tcc).await;
+        match (elevated, recording) {
+            (Some(viewer), Some((tool, arguments, jti))) => {
+                crate::elevated_access::record_elevated_call(
+                    self,
+                    &viewer,
+                    &tool,
+                    arguments.as_ref(),
+                    jti,
+                    result,
+                )
+                .await
+            }
+            _ => result,
+        }
     }
 
     async fn list_tools(

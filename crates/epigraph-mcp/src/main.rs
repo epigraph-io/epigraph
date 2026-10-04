@@ -524,16 +524,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `ScopedPool::connect_with_options` exists for exactly this (PR-15 added it
     // so the job pool could keep its own sizing). `statement_timeout: None`
     // matches `create_pool`, which set none.
-    let scoped = epigraph_db::ScopedPool::connect_with_options(
-        &cli.database_url,
-        guc_mode,
-        epigraph_db::ScopedPoolOptions {
-            max_connections: 10,
-            acquire_timeout: std::time::Duration::from_secs(5),
-            statement_timeout: None,
-        },
-    )
-    .await?;
+    let pool_options = epigraph_db::ScopedPoolOptions {
+        max_connections: 10,
+        acquire_timeout: std::time::Duration::from_secs(5),
+        statement_timeout: None,
+    };
+    // The HTTP transport RECORDS every elevated tool call (`call_tool`'s
+    // per-access recorder, elevation plan EL-8), so its pool declares the
+    // recorder, migration 125's second key. stdio never elevates (it carries
+    // no token) and keeps the non-declaring pool.
+    let scoped = if cli.listen.is_some() {
+        epigraph_db::ScopedPool::connect_recording_elevated_access(
+            &cli.database_url,
+            guc_mode,
+            pool_options,
+        )
+        .await?
+    } else {
+        epigraph_db::ScopedPool::connect_with_options(&cli.database_url, guc_mode, pool_options)
+            .await?
+    };
     // The §0.5 boot probe, same as `epigraph-api/src/bin/server.rs`. Behind a
     // transaction-mode pooler a session-scoped `set_config` silently vanishes
     // between statements, so every policy collapses and the write path's

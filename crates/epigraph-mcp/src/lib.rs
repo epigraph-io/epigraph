@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod claim_helper;
+pub mod elevated_access;
 pub mod embed;
 pub mod errors;
 pub mod federation;
