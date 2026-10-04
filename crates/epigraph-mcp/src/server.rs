@@ -108,6 +108,18 @@ pub struct EpiGraphMcpFull {
     /// Defaults to `GroupPolicyGate` in every constructor;
     /// [`Self::with_policy_gate`] replaces it.
     pub(crate) policy_gate: Arc<dyn epigraph_interfaces::PolicyGate>,
+    /// Whether an HTTP request whose token carries NO elevation claim may
+    /// still resolve ELEVATED through a CONNECTOR-mode session on its refresh
+    /// family (elevation plan EL-6, the MCP `sudo` path).
+    ///
+    /// OFF by default in every constructor, and off unless `main` is told
+    /// otherwise (`EPIGRAPH_MCP_CONNECTOR_ELEVATION=on`). Operator ruling: the
+    /// connector family scope (plan EQ-7) is unruled and unmeasured (M-E2:
+    /// one refresh family may span every chat of a connector install), so
+    /// only the CLI elevate path (a token carrying `elv`) elevates until it
+    /// is. Off, a token without `elv` resolves the plain scoped viewer with no
+    /// liveness round trip at all.
+    pub(crate) connector_elevation: bool,
 }
 
 impl EpiGraphMcpFull {
@@ -794,6 +806,7 @@ impl EpiGraphMcpFull {
             signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
+            connector_elevation: false,
         }
     }
 
@@ -822,6 +835,14 @@ impl EpiGraphMcpFull {
     #[must_use]
     pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
         self.scoped = Some(scoped);
+        self
+    }
+
+    /// Switch connector-mode elevation on or off (see the field's doc; OFF is
+    /// the default and the operator ruling until plan EQ-7 is decided).
+    #[must_use]
+    pub fn with_connector_elevation(mut self, enabled: bool) -> Self {
+        self.connector_elevation = enabled;
         self
     }
 
@@ -889,6 +910,7 @@ impl EpiGraphMcpFull {
             signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
+            connector_elevation: false,
         }
     }
 

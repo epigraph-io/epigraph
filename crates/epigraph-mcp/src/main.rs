@@ -747,7 +747,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             federation,
             llm_identity.clone(),
         )
-        .with_scoped_pool(scoped.clone());
+        .with_scoped_pool(scoped.clone())
+        .with_connector_elevation(connector_elevation_from_env());
         let template = if identity_declared {
             template
         } else {
@@ -1314,6 +1315,61 @@ mod signer_selection_tests {
                 !msg.contains("'g'"),
                 "the error must not name the bad char: {msg}"
             );
+        }
+    }
+}
+
+/// `EPIGRAPH_MCP_CONNECTOR_ELEVATION`: whether an HTTP token with no elevation
+/// claim may resolve ELEVATED through a connector-mode session on its refresh
+/// family (elevation plan EL-6, MCP `sudo`). ONLY the exact value `on`
+/// (case-insensitive, trimmed) enables it; unset, empty, a typo or anything
+/// else leaves it OFF, the operator ruling until plan EQ-7 (the connector's
+/// family scope) is decided. The CLI elevate path (a token carrying `elv`) is
+/// unaffected.
+fn connector_elevation_from_env() -> bool {
+    let on = connector_elevation_switch(
+        std::env::var("EPIGRAPH_MCP_CONNECTOR_ELEVATION")
+            .ok()
+            .as_deref(),
+    );
+    if on {
+        tracing::warn!(
+            "EPIGRAPH_MCP_CONNECTOR_ELEVATION=on: connector-mode elevation is ENABLED; every \
+             request on an elevated refresh family resolves elevated"
+        );
+    }
+    on
+}
+
+/// The switch's parse, apart from the environment: only `on`.
+fn connector_elevation_switch(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("on"))
+}
+
+#[cfg(test)]
+mod connector_elevation_switch_tests {
+    use super::connector_elevation_switch;
+
+    /// OFF unless the value is exactly `on`: unset, empty, `true`, `1`, `yes`
+    /// and a typo all leave connector-mode elevation off (operator ruling,
+    /// plan EQ-7). Mutation caught: accepting any non-empty value.
+    #[test]
+    fn only_on_switches_connector_elevation_on() {
+        for off in [
+            None,
+            Some(""),
+            Some("true"),
+            Some("1"),
+            Some("yes"),
+            Some("onn"),
+        ] {
+            assert!(
+                !connector_elevation_switch(off),
+                "{off:?} must leave it off"
+            );
+        }
+        for on in [Some("on"), Some(" ON "), Some("On")] {
+            assert!(connector_elevation_switch(on), "{on:?}");
         }
     }
 }
