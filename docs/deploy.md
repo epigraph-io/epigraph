@@ -1763,11 +1763,24 @@ an elevated session read other people's rows; it also makes the database,
 not only `begin_as`, refuse that session's writes. For every session that is
 not elevated nothing changes: the arm is false and every refusal is true.
 
+**HOLD: do not apply 126 to a production database, and open no elevation
+session for real use, until the per-access elevation log ships with it.**
+126 is what lets an elevated session read other people's private rows. The
+design requires every such read to be recorded, fail-closed (a response whose
+access cannot be recorded is not sent), in a log the SUBJECT can read ("an
+administrator read your group's rows at T, for reason R"). That log is a later
+migration of this stack and is not in this one. Until it is, the only trail of
+an elevation is session-level (`platform.elevated` / `platform.elevation_ended`
+in `security_events`: who elevated, why, when), which names no row and no
+group that was read, and nothing tells the owners of those rows. So the order
+is: the log's migration and binaries, then 126, then the first real elevation.
+On a test or staging database 126 may be applied on its own.
+
 1. **Deploy the elevated-viewer binaries first** (the section above) and
    migrate 125 before them. Without them nothing stamps an elevation, so the
    arms do nothing; with them and without 126, an elevated session reads only
-   its own groups. Neither order is unsafe, but 126 should land before any
-   elevation session is opened for real use.
+   its own groups. Neither order is unsafe; 126 itself waits on the hold
+   above.
 2. **Migrate 126** (`epigraph-migrate`, migration DSN) under the lock plan.
    `CREATE POLICY` takes ACCESS EXCLUSIVE on its table, so it waits for every
    open reader of that table. The file arms ONE table per committed block with
