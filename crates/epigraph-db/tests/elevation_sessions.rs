@@ -1713,6 +1713,92 @@ async fn suspending_the_sessions_client_ends_the_session_for_good(pool: PgPool) 
     );
 }
 
+/// THE COMPUTED CHECK, passkey half: the passkey that confirmed the session
+/// is revoked with its end trigger off (row un-ended), and the session is no
+/// longer elevated. A revoked passkey (the operator's break-glass when one is
+/// lost or suspected) must take with it what it confirmed.
+///
+/// Verified to fail: the passkey re-check dropped from the liveness helper ->
+/// still elevated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn is_elevated_is_false_once_its_passkey_is_revoked(pool: PgPool) {
+    let h = holder(&pool, "holder", 1).await;
+    let sid = elevated(&pool, &h).await;
+    assert!(elevated_as(&pool, &h, sid).await, "CALIBRATION: elevated");
+    without_triggers(
+        &pool,
+        "UPDATE person_authenticators SET revoked_at = now(), revoked_by = session_user, \
+                                          revoked_reason = 'elevation test' WHERE id = $1",
+        h.passkey,
+    )
+    .await;
+    assert_eq!(
+        ended_reason(&pool, sid).await,
+        None,
+        "CALIBRATION: the row is un-ended"
+    );
+    assert!(
+        !elevated_as(&pool, &h, sid).await,
+        "a session confirmed by a revoked passkey"
+    );
+}
+
+/// THE END, passkey half, through 124's maintenance definer (the
+/// `epigraph-operator revoke-passkey` path): the session that passkey
+/// confirmed ends `passkey_revoked`, audited; a session of the SAME person
+/// confirmed by ANOTHER live passkey (on another family) is untouched.
+///
+/// Verified to fail: the passkey end trigger dropped -> the first session
+/// stays un-ended; the trigger widened to every session of the person -> the
+/// second session ends too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_a_passkey_ends_the_sessions_it_confirmed(pool: PgPool) {
+    let h = holder(&pool, "holder", 1).await;
+    let other_key = passkey(&pool, h.person, 2).await;
+    let (other_family, other_hash) = family(&pool, h.client).await;
+    let h2 = Holder {
+        passkey: other_key,
+        cred: credential(2),
+        family: other_family,
+        token_hash: other_hash,
+        ..h.clone()
+    };
+    let sid = elevated(&pool, &h).await;
+    let kept = elevated(&pool, &h2).await;
+    let revoked: bool = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| {
+        let key = h.passkey;
+        async move {
+            let r = sqlx::query_scalar("SELECT public.epigraph_revoke_passkey($1, 'lost')")
+                .bind(key)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("revoke the passkey");
+            (conn, r)
+        }
+    })
+    .await;
+    assert!(revoked, "CALIBRATION: the passkey was revoked");
+    assert_eq!(
+        ended_reason(&pool, sid).await.as_deref(),
+        Some("passkey_revoked")
+    );
+    assert_eq!(
+        events(&pool, "platform.elevation_ended", "session_id", sid).await,
+        1,
+        "the end is audited"
+    );
+    assert!(!elevated_as(&pool, &h, sid).await, "not elevated");
+    assert_eq!(
+        ended_reason(&pool, kept).await,
+        None,
+        "a session confirmed by another live passkey is untouched"
+    );
+    assert!(
+        elevated_as(&pool, &h2, kept).await,
+        "the other passkey's session is still elevated"
+    );
+}
+
 // =====================================================================
 // Grant mode, and the principal-bound readers.
 // =====================================================================
@@ -2194,7 +2280,7 @@ fn undo_125() -> String {
 /// and holds a live session, a refused ticket and an open one, returns its
 /// catalog (relations, function bodies and owners, policies, triggers,
 /// constraints) to the same database's at 124, including the end triggers
-/// 125 put on 118's, 122's, 123's and 001's tables; the `platform.elevat*`
+/// 125 put on 118's, 122's, 123's, 124's and 001's tables; the `platform.elevat*`
 /// history stays. Cut at 125, not head: a later migration (the read arms read
 /// `epigraph_is_elevated()`) is undone before this one.
 ///
@@ -2337,8 +2423,8 @@ fn every_125_object_is_registered() {
     let (definers, all) = functions_of(&migration);
     assert_eq!(
         definers.len(),
-        23,
-        "CALIBRATION: 125 creates 23 SECURITY DEFINER functions; the scan found {definers:?}"
+        24,
+        "CALIBRATION: 125 creates 24 SECURITY DEFINER functions; the scan found {definers:?}"
     );
     assert_eq!(definers, all, "every function 125 creates is a definer");
     let missing: Vec<&String> = definers

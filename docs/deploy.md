@@ -1687,14 +1687,16 @@ session settings yet and no row policy reads the function, so every session
 answers false and nothing reads more than before.
 
 1. **Migrate 125** (`epigraph-migrate`, migration DSN), after 124. Two new
-   tables, their triggers and policies, new functions, and four new AFTER
+   tables, their triggers and policies, new functions, and five new AFTER
    UPDATE triggers on existing tables (`role_assignments`, `human_operators`,
-   `refresh_tokens`, `oauth_clients`) that end a live elevation when its
-   assignment is revoked, its holder's registration is revoked, its refresh
-   family is revoked for any reason but a rotation (reuse, RFC 7009, a denied
-   refresh, a client-wide revoke), or its client leaves `active`. No
-   backfill; nothing existing changes shape. Old binaries are unaffected
-   (they call none of it).
+   `refresh_tokens`, `oauth_clients`, `person_authenticators`) that end a
+   live elevation when its assignment is revoked, its holder's registration
+   is revoked, its refresh family is revoked for any reason but a rotation
+   (reuse, RFC 7009, a denied refresh, a client-wide revoke), its client
+   leaves `active`, or the passkey that confirmed it is revoked
+   (`epigraph-operator revoke-passkey` is therefore also the way to end a
+   live elevation that passkey opened). No backfill; nothing existing
+   changes shape. Old binaries are unaffected (they call none of it).
 2. **Deploy** `epigraph-tenancy-backfill` built from the same commit
    (`verify` then checks the 125 definers' owner and grants).
 3. Nothing else is deployed by this step: the ceremony, the ticket API and the
@@ -1707,7 +1709,7 @@ binary that resolves an elevated viewer), and undo first any later migration
 whose row policies read `epigraph_is_elevated()`: `docs/runbooks/125-undo.sql`
 refuses while one does. Then run `docs/runbooks/125-undo.sql` on the migration
 DSN, in one transaction: it reports how many tickets and sessions it drops
-(live sessions counted), drops the four end triggers, both tables and every
+(live sessions counted), drops the five end triggers, both tables and every
 125 function. The `platform.elevat*` audit rows stay (history), and so does
 125's `_sqlx_migrations` row: re-introducing elevation is a new migration.
 **Run 125-undo before 124-undo**: 125's tables reference

@@ -40,8 +40,9 @@
 -- own active human client. That re-check runs on every statement, against
 -- the statement's clock: a revoked assignment, a revoked registration, a
 -- suspended human client (the recorded one or the session's own), a revoked
--- family, or a later link of the person as an agent turns it false at once,
--- whether or not a trigger has ended the row.
+-- family, a revoked passkey that confirmed it, or a later link of the person
+-- as an agent turns it false at once, whether or not a trigger has ended the
+-- row.
 --
 -- REFUSALS THAT MUST BE AUDITED DO NOT RAISE. A ceremony completed with
 -- another person's credential (the confused deputy), a regressed signature
@@ -154,7 +155,7 @@ CREATE TABLE IF NOT EXISTS public.elevation_sessions (
                          CHECK (ended_reason IN ('unsudo', 'ended', 'expired',
                                                  'assignment_revoked', 'operator_revoked',
                                                  'family_reuse', 'family_revoked',
-                                                 'client_revoked')),
+                                                 'client_revoked', 'passkey_revoked')),
     ended_by         text,
     -- THE BOUND (DESIGN 6.2): an elevation never outlives 15 minutes.
     CONSTRAINT elevation_sessions_ttl
@@ -253,6 +254,10 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, 
 -- (RFC 7009, client-wide, denied, reuse) and a suspension of the session's
 -- own client, recorded or not, take the elevation away at once, before the
 -- end triggers below make the row say so.
+--
+-- AND THE PASSKEY THAT CONFIRMED IT. Revoking a passkey (the operator's
+-- break-glass for a lost or suspect authenticator) takes away every session
+-- that passkey confirmed, at the next statement (a primary-key probe).
 CREATE OR REPLACE FUNCTION public.epigraph_elevation_session_is_live(p_session uuid)
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -266,7 +271,9 @@ SET search_path = public, pg_temp AS $$
            AND public.epigraph_live_elevating_assignment(s.person_agent_id, clock_timestamp())
                = s.assignment_id
            AND public.epigraph_family_of_person_is_live(s.person_agent_id, s.client_id,
-                                                        s.family_id))
+                                                        s.family_id)
+           AND EXISTS (SELECT 1 FROM public.person_authenticators a
+                        WHERE a.id = s.authenticator_id AND a.revoked_at IS NULL))
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_elevation_session_is_live(uuid) FROM PUBLIC;
 
@@ -660,6 +667,31 @@ CREATE TRIGGER oauth_clients_end_elevations
           OR NEW.agent_id IS DISTINCT FROM OLD.agent_id
           OR NEW.client_type IS DISTINCT FROM OLD.client_type)
     EXECUTE FUNCTION public.epigraph_end_elevations_on_client_revoke();
+
+-- A passkey revoke (124's `epigraph_revoke_passkey`, the operator's
+-- `revoke-passkey`) ends every session THAT passkey confirmed
+-- `passkey_revoked`. Sessions the same person opened with another live
+-- passkey are not touched: they were confirmed by a credential still trusted.
+CREATE OR REPLACE FUNCTION public.epigraph_end_elevations_on_passkey_revoke()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    UPDATE public.elevation_sessions s
+       SET ended_at = now(), ended_by = session_user,
+           ended_reason = CASE WHEN now() >= s.expires_at THEN 'expired'
+                               ELSE 'passkey_revoked' END
+     WHERE s.authenticator_id = NEW.id AND s.ended_at IS NULL;
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_end_elevations_on_passkey_revoke() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS person_authenticators_end_elevations ON public.person_authenticators;
+CREATE TRIGGER person_authenticators_end_elevations
+    AFTER UPDATE ON public.person_authenticators
+    FOR EACH ROW
+    WHEN (OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL)
+    EXECUTE FUNCTION public.epigraph_end_elevations_on_passkey_revoke();
 
 -- ===================================================================
 -- 6. ROW SECURITY: the application reads no row and writes none directly.
@@ -1113,6 +1145,8 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_end_elevations_on_family_revoke() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_end_elevations_on_client_revoke() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_end_elevations_on_passkey_revoke() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_end_expired_elevations(uuid, uuid) '
                 'OWNER TO epigraph_maintenance';

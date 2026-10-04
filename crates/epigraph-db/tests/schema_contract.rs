@@ -2040,6 +2040,12 @@ async fn migration_125_elevation_definers_are_owned_and_granted(pool: PgPool) {
             false,
         ),
         (
+            "epigraph_end_elevations_on_passkey_revoke",
+            "public.epigraph_end_elevations_on_passkey_revoke()",
+            "v",
+            false,
+        ),
+        (
             "epigraph_end_expired_elevations",
             "public.epigraph_end_expired_elevations(uuid, uuid)",
             "v",

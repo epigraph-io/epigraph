@@ -1723,7 +1723,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // confirmation refused ELV06, loud), and `epigraph_is_elevated` /
     // `epigraph_elevation_live` read no session (never elevated: fail-closed)
     // -- but the END TRIGGERS would update no session and say nothing: a
-    // revoked assignment, registration, family or client would leave the row
+    // revoked assignment, registration, family, client or passkey would leave the row
     // un-ended, the trail without its `platform.elevation_ended`, and the
     // family's one-session slot taken. Authority still ends (the computed
     // check re-reads the assignment), the record does not: the stake.
@@ -1740,6 +1740,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_end_elevations_on_operator_revoke", 125),
     ("epigraph_end_elevations_on_family_revoke", 125),
     ("epigraph_end_elevations_on_client_revoke", 125),
+    ("epigraph_end_elevations_on_passkey_revoke", 125),
     ("epigraph_end_expired_elevations", 125),
     ("epigraph_create_elevation_ticket", 125),
     ("epigraph_ticket_for_ceremony", 125),
