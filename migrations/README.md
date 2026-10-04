@@ -912,9 +912,16 @@ Current reservation:
   family of its own human client; never `instance_admins`), `ELV03` not the
   append-only shape, `ELV06` the ticket is not live or the family is already
   elevated; the confirmation RETURNS its audited refusals (`ELV02`, `ELV05`
-  for a regressed signature counter) instead of raising them. End triggers on
-  `role_assignments` (revoke), `human_operators` (revoke) and
-  `refresh_tokens` (a family revoked for reuse); expiry is lazy. FORCE RLS on
+  for a regressed signature counter) instead of raising them. Five end
+  triggers: `role_assignments` (the assignment revoked), `human_operators`
+  (the registration revoked), `refresh_tokens` (the family revoked for any
+  reason but a rotation: reuse, RFC 7009, a denied refresh, a client-wide
+  revoke), `oauth_clients` (the session's client leaves `active` or stops
+  being the person's human client) and `person_authenticators` (the passkey
+  that confirmed it revoked); expiry is lazy. Liveness is one predicate, `epigraph_elevation_session_is_live`,
+  shared by `epigraph_is_elevated`, `epigraph_elevation_live` and the
+  grant-mode redemption, judged on the statement's clock and re-checking the
+  assignment, the family and its client, and the passkey. FORCE RLS on
   both: the application role keeps SELECT but its policies show it no row,
   and it holds no DML. App-callable definers: `epigraph_create_elevation_ticket`
   (principal-bound), `epigraph_ticket_for_ceremony`,
@@ -922,7 +929,8 @@ Current reservation:
   `epigraph_confirm_elevation`, `epigraph_redeem_elevation_ticket`,
   `epigraph_elevation_live` (principal-bound), `epigraph_end_elevation`,
   `epigraph_is_elevated`; NOT app-callable: `epigraph_live_elevating_assignment`,
-  `epigraph_family_of_person_is_live`, `epigraph_end_expired_elevations`.
+  `epigraph_family_of_person_is_live`, `epigraph_elevation_session_is_live`,
+  `epigraph_end_expired_elevations`.
   Audited from the tables: `platform.elevation_requested`, `_refused`,
   `platform.elevated`, `platform.elevation_ended`, and
   `platform.passkey_counter_regressed`. Registered in
