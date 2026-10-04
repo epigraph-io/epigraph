@@ -190,8 +190,17 @@ async fn scoped(pool: &PgPool) -> ScopedPool {
     .expect("ScopedPool")
 }
 
-/// P elevated (a live session on its family) and P unelevated (no claim).
-async fn viewers(s: &ScopedPool, p: &Holder, live: Uuid) -> (Viewer, Viewer) {
+/// P elevated (a live session on its family) and P unelevated (no claim),
+/// both RESOLVED on an application-role pool (`session_user` = `epigraph_app`):
+/// 125 answers "not live" to the superuser login of [`scoped`].
+async fn viewers(pool: &PgPool, p: &Holder, live: Uuid) -> (Viewer, Viewer) {
+    let s = &ScopedPool::connect_downgraded_for_tests(
+        &fixture::database_url_for(pool).await,
+        SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("application-role ScopedPool");
     let elevated = Viewer::resolve_elevated(s, p.person, Some(live), p.family)
         .await
         .expect("resolve_elevated");
@@ -300,7 +309,7 @@ async fn an_elevated_session_reads_a_foreign_private_row_in_every_class(pool: Pg
     let rows = seed_b_world(&pool, b, b_group).await;
     let s = scoped(&pool).await;
     let live = session(&pool, &p).await;
-    let (elevated, plain) = viewers(&s, &p, live).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
 
     let mut conn = app_conn(&s, &plain).await;
     let mut unelevated = Vec::new();
@@ -347,7 +356,7 @@ async fn the_elevated_read_arm_admits_every_row_of_every_armed_table(pool: PgPoo
     seed_b_world(&pool, b, b_group).await;
     let s = scoped(&pool).await;
     let live = session(&pool, &p).await;
-    let (elevated, plain) = viewers(&s, &p, live).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
 
     let armed: Vec<String> = sqlx::query_scalar(
         "SELECT c.relname::text FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
@@ -493,7 +502,7 @@ async fn an_elevated_session_writes_nothing_until_it_ends(pool: PgPool) {
     fixture::seed_group_claim(&pool, p.person, p.group, "P claim to delete").await;
     let s = scoped(&pool).await;
     let live = session(&pool, &p).await;
-    let (elevated, plain) = viewers(&s, &p, live).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
 
     // Elevated: every write refused.
     let mut conn = app_conn(&s, &elevated).await;

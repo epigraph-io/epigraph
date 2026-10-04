@@ -62,6 +62,20 @@ async fn spawn(pool: &PgPool, passkeys: Option<Passkeys>) -> Server {
     )
     .await
     .expect("app-role pool");
+    spawn_on(scoped, passkeys).await
+}
+
+/// The real router on a PRIVILEGED pool: the harness's superuser login, the
+/// shape of a request unit whose DSN skips row security.
+async fn spawn_privileged(pool: &PgPool) -> Server {
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
+        .await
+        .expect("privileged pool");
+    spawn_on(scoped, None).await
+}
+
+async fn spawn_on(scoped: epigraph_db::ScopedPool, passkeys: Option<Passkeys>) -> Server {
     let state =
         epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default())
             .with_passkeys(passkeys.map(Arc::new));
@@ -1794,4 +1808,108 @@ async fn an_elevated_token_reads_foreign_private_rows_through_the_router(pool: P
             "{what}: CALIBRATION: P unelevated does not read B's private row ({status}): {body}"
         );
     }
+}
+
+/// A request unit on a PRIVILEGED DSN never serves an elevated request
+/// (review cp2: COR-1, SEC-02). The reviewer's measured failure: on such a
+/// unit an elevated token holding only `claims:read` POSTed
+/// `/api/v1/claims/{B's private claim}/assess`, the handler found the claim
+/// through the elevated viewer's always-true fragment on the unstamped pool
+/// and wrote a mass function and a new belief onto it (200), because no row
+/// policy or RESTRICTIVE refusal applies to a login that skips row security.
+/// Now the token resolves the principal's SCOPED viewer there: the read is
+/// 404 and nothing is written. Calibrations, all with the same session: on
+/// the application-role unit the elevated token READS B's claim (so the
+/// session is live and elevates, before and after) and the plain token does
+/// not (so the claim is private to P).
+///
+/// Verified to fail (the state it was written red against) with 125's
+/// privileged-login conjuncts dropped from
+/// `epigraph_elevation_session_is_live`: the privileged unit answers 200 to
+/// the elevated GET and writes the mass function.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_privileged_unit_never_serves_an_elevated_request(pool: PgPool) {
+    let app = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &app, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "cp2-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "cp2 B private claim").await;
+    let (_, t) = app
+        .open_ticket(&app.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let read = format!("/api/v1/claims/{claim}");
+    let assess = format!("/api/v1/claims/{claim}/assess");
+    let body = json!({"evidence_type": "empirical", "methodology": "instrumental",
+                      "confidence": 0.8, "supports": true});
+    let written = || {
+        let pool = pool.clone();
+        async move {
+            let mfs: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+                    .bind(claim)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let belief: Option<f64> = sqlx::query_scalar("SELECT belief FROM claims WHERE id = $1")
+                .bind(claim)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            (mfs, belief)
+        }
+    };
+    let before = written().await;
+
+    let (status, body_seen) = app
+        .get(
+            &read,
+            &app.scoped_token(&p, Some(session), &["claims:read"]),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the session elevates on the application-role unit: {body_seen}"
+    );
+    let (status, _) = app
+        .get(&read, &app.scoped_token(&p, None, &["claims:read"]))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "CALIBRATION: unelevated, B's claim is private to P"
+    );
+
+    let privileged = spawn_privileged(&pool).await;
+    let elevated = privileged.scoped_token(&p, Some(session), &["claims:read"]);
+    let (status, seen) = privileged.get(&read, &elevated).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a privileged unit reads nothing past P's groups for an elevated token: {seen}"
+    );
+    let (status, seen) = privileged.post(&assess, Some(&elevated), &body).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a privileged unit writes nothing for an elevated token: {seen}"
+    );
+    assert_eq!(
+        written().await,
+        before,
+        "no mass function and no belief written onto B's private claim"
+    );
+
+    let (status, _) = app
+        .get(
+            &read,
+            &app.scoped_token(&p, Some(session), &["claims:read"]),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the session is still live (the refusal was the login's)"
+    );
 }

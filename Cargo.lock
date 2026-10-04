@@ -1472,6 +1472,7 @@ dependencies = [
  "chrono",
  "epigraph-core",
  "epigraph-crypto",
+ "epigraph-db",
  "epigraph-ds",
  "epigraph-privacy",
  "futures",

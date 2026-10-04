@@ -468,6 +468,12 @@ impl Viewer {
     /// viewer carrying the session the database returned. Not live: the scoped
     /// viewer, and the request proceeds unelevated.
     ///
+    /// **A privileged pool never elevates.** On a login that skips row
+    /// security (a superuser, a BYPASSRLS role) or is a maintenance member,
+    /// 125 answers no live session, so the scoped viewer comes back: there no
+    /// row policy would narrow the elevated shape's always-true fragment, and
+    /// no refusal would stop a write decided on what it read.
+    ///
     /// **A failure of the liveness check degrades to the scoped viewer** (a
     /// warning, never an error): a database without migration 125 under a
     /// newer binary, a transient fault. Not elevating is the safe direction.

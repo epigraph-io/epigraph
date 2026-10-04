@@ -1946,6 +1946,199 @@ async fn elevation_live_is_principal_bound(pool: PgPool) {
     );
 }
 
+/// A role that bypasses row security without being a maintenance member: the
+/// login shape `epigraph_bypass()` alone does not see. NOLOGIN (a test role
+/// only ever reached by `SET SESSION AUTHORIZATION`); created once per
+/// cluster, tolerating a concurrent creator.
+const BYPASSRLS_PROBE: &str = "elevation_test_bypassrls";
+
+async fn bypassrls_probe_role(pool: &PgPool) {
+    sqlx::query(&format!(
+        "DO $$ BEGIN \
+             CREATE ROLE {BYPASSRLS_PROBE} NOLOGIN BYPASSRLS; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+    ))
+    .execute(pool)
+    .await
+    .expect("the BYPASSRLS probe role");
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION public.epigraph_is_elevated(), \
+                public.epigraph_elevation_live(uuid, uuid), \
+                public.epigraph_redeem_elevation_ticket(uuid, bytea, uuid) \
+            TO {BYPASSRLS_PROBE}"
+    ))
+    .execute(pool)
+    .await
+    .expect("grant the probe role the app-callable definers");
+}
+
+/// On a connection logged in as `login` (`None`: the harness's own superuser
+/// login; otherwise `SET SESSION AUTHORIZATION`, which moves `session_user`),
+/// stamped as `h.person` on `h.family` with `session`: what
+/// `epigraph_is_elevated()` and `epigraph_elevation_live` answer, and the
+/// login the database saw.
+async fn elevation_seen_by_login(
+    pool: &PgPool,
+    login: Option<&str>,
+    h: &Holder,
+    session: Uuid,
+) -> (bool, Vec<Uuid>, String) {
+    use sqlx::Executor;
+    let mut conn = pool.acquire().await.expect("acquire");
+    if let Some(role) = login {
+        conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+            .await
+            .expect("SET SESSION AUTHORIZATION");
+    }
+    sqlx::query(
+        "SELECT set_config('epigraph.principal_id', $1, false), \
+                set_config('epigraph.group_ids', '', false), \
+                set_config('epigraph.writable_group_ids', '', false), \
+                set_config('epigraph.elevation_id', $2, false), \
+                set_config('epigraph.family_id', $3, false)",
+    )
+    .bind(h.person.to_string())
+    .bind(session.to_string())
+    .bind(h.family.to_string())
+    .execute(&mut *conn)
+    .await
+    .expect("stamp");
+    let who: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("session_user");
+    let is: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("epigraph_is_elevated()");
+    let live: Vec<Uuid> =
+        sqlx::query_scalar("SELECT session_id FROM public.epigraph_elevation_live($1, $2)")
+            .bind(Some(session))
+            .bind(h.family)
+            .fetch_all(&mut *conn)
+            .await
+            .expect("elevation_live");
+    sqlx::query(
+        "SELECT set_config('epigraph.principal_id', '', false), \
+                set_config('epigraph.elevation_id', '', false), \
+                set_config('epigraph.family_id', '', false)",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("unstamp");
+    if login.is_some() {
+        conn.execute("RESET SESSION AUTHORIZATION")
+            .await
+            .expect("RESET SESSION AUTHORIZATION");
+    }
+    (is, live, who)
+}
+
+/// A PRIVILEGED LOGIN NEVER HOLDS AN ELEVATION (review cp2: SEC-02, COR-1).
+/// On a login that skips row security (a superuser, a `BYPASSRLS` role) or
+/// passes `epigraph_bypass()` (a maintenance member), no row policy narrows
+/// what the elevated viewer's always-true fragment reads, and no RESTRICTIVE
+/// refusal stops a write decided on it: the widening would be unbounded and
+/// unlogged. So the database answers "not elevated" there, whatever the
+/// session's own state: `epigraph_is_elevated()` false, `epigraph_elevation_live`
+/// no row, and the grant-mode redemption `invalid`, for each of the three
+/// login shapes; while the SAME session, stamped the same way on the
+/// application role, is elevated and redeems (the calibration that the
+/// refusal is the login's, not a dead session's).
+///
+/// Verified to fail: the `epigraph_bypass()` conjunct dropped from
+/// `epigraph_elevation_session_is_live` -> the maintenance login is elevated;
+/// the `rolsuper OR rolbypassrls` conjunct dropped -> the BYPASSRLS probe is
+/// elevated; both dropped -> every privileged login is elevated (the state
+/// this test was written red against).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_privileged_login_is_never_elevated(pool: PgPool) {
+    let h = holder(&pool, "privileged-login", 1).await;
+    let session = elevated(&pool, &h).await;
+    bypassrls_probe_role(&pool).await;
+    assert!(
+        elevated_as(&pool, &h, session).await,
+        "CALIBRATION: the application role is elevated by this session"
+    );
+    assert_eq!(
+        live_rows(&pool, &h, Some(session)).await,
+        vec![session],
+        "CALIBRATION: elevation_live answers the application role"
+    );
+
+    let harness: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(&pool)
+        .await
+        .expect("harness login");
+    for login in [None, Some("epigraph_maintenance"), Some(BYPASSRLS_PROBE)] {
+        let (is, live, who) = elevation_seen_by_login(&pool, login, &h, session).await;
+        assert_eq!(
+            who,
+            login.map_or(harness.clone(), str::to_string),
+            "CALIBRATION: the probe runs as the login it names"
+        );
+        assert!(!is, "{who}: a privileged login is never elevated");
+        assert!(
+            live.is_empty(),
+            "{who}: elevation_live answers no session to a privileged login: {live:?}"
+        );
+    }
+
+    // Grant mode: the redemption is `invalid` on every privileged login and
+    // `issued` (once) on the application role afterwards, so the refusal was
+    // the login's and consumed nothing.
+    let g = holder(&pool, "privileged-grant", 2).await;
+    let secret = [b'p'; 32];
+    let t = ticket(&pool, &g, "grant", Some(&secret)).await;
+    let r = confirm(&pool, t, &g.cred, 0, false).await.expect("confirm");
+    assert_eq!(r.0, "confirmed", "CALIBRATION: the grant ceremony confirms");
+    for login in [None, Some("epigraph_maintenance"), Some(BYPASSRLS_PROBE)] {
+        let status = redeem_as_login(&pool, login, t, &secret, g.client).await;
+        assert_eq!(
+            status, "invalid",
+            "{login:?}: a privileged login never redeems an elevation"
+        );
+    }
+    let status = redeem_as_login(&pool, Some("epigraph_app"), t, &secret, g.client).await;
+    assert_eq!(
+        status, "issued",
+        "CALIBRATION: the application role redeems the same ticket"
+    );
+}
+
+/// `epigraph_redeem_elevation_ticket` on a connection logged in as `login`
+/// (`None`: the harness superuser); its status.
+async fn redeem_as_login(
+    pool: &PgPool,
+    login: Option<&str>,
+    ticket: Uuid,
+    secret: &[u8],
+    client: Uuid,
+) -> String {
+    use sqlx::Executor;
+    let mut conn = pool.acquire().await.expect("acquire");
+    if let Some(role) = login {
+        conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+            .await
+            .expect("SET SESSION AUTHORIZATION");
+    }
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM public.epigraph_redeem_elevation_ticket($1, sha256($2::bytea), $3)",
+    )
+    .bind(ticket)
+    .bind(secret)
+    .bind(client)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("redeem");
+    if login.is_some() {
+        conn.execute("RESET SESSION AUTHORIZATION")
+            .await
+            .expect("RESET SESSION AUTHORIZATION");
+    }
+    status
+}
+
 /// `epigraph_end_elevation` ends only the principal's own session (false,
 /// nothing changed, for another's); a privileged session ends any.
 ///

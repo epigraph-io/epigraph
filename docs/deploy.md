@@ -1730,6 +1730,15 @@ the APPLICATION role, so until a migration adds row policies that read
 nothing (`begin_as` refuses it: HTTP 403 `ELEVATED READ-ONLY`, MCP
 `INVALID_REQUEST`).
 
+**A unit on a privileged DSN never elevates.** Migration 125 answers "no live
+session" to a login that skips row security (a superuser or a BYPASSRLS role)
+or is a member of `epigraph_maintenance`, so such a unit serves every elevated
+token with the principal's ordinary scoped viewer. That holds whether or not
+the operator binding is armed: without it, the always-true elevated fragment
+on a login no row policy narrows would read, and decide writes on, every
+tenant's rows. Elevation is therefore only ever served by a unit on the
+application-role DSN.
+
 Every `ScopedPool` binary (api, both MCP transports, `decompose_claims`, the
 operator and maintenance CLIs, the job drain) now stamps FIVE session settings
 per checkout instead of three: the tenancy three plus `epigraph.elevation_id`
@@ -1779,7 +1788,8 @@ On a test or staging database 126 may be applied on its own.
 1. **Deploy the elevated-viewer binaries first** (the section above) and
    migrate 125 before them. Without them nothing stamps an elevation, so the
    arms do nothing; with them and without 126, an elevated session reads only
-   its own groups. Neither order is unsafe; 126 itself waits on the hold
+   its own groups, on any DSN (a unit on a privileged DSN never elevates: see
+   the section above). Neither order is unsafe; 126 itself waits on the hold
    above.
 2. **Migrate 126** (`epigraph-migrate`, migration DSN) under the lock plan.
    `CREATE POLICY` takes ACCESS EXCLUSIVE on its table, so it waits for every

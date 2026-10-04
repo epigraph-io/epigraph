@@ -204,6 +204,20 @@ async fn scoped(pool: &PgPool, max_connections: u32) -> ScopedPool {
     .expect("ScopedPool")
 }
 
+/// A `ScopedPool` whose every connection is DOWNGRADED to `epigraph_app`
+/// (`SET SESSION AUTHORIZATION`, so `session_user` moves): the login an
+/// elevation can be live on. 125 answers "not live" to the superuser login of
+/// [`scoped`], so every resolution runs here.
+async fn app_scoped(pool: &PgPool, mode: SessionGucMode) -> ScopedPool {
+    ScopedPool::connect_downgraded_for_tests(
+        &fixture::database_url_for(pool).await,
+        mode,
+        "epigraph_app",
+    )
+    .await
+    .expect("application-role ScopedPool")
+}
+
 async fn resolve(s: &ScopedPool, who: Uuid, elv: Option<Uuid>, fam: Uuid) -> Viewer {
     Viewer::resolve_elevated(s, who, elv, fam)
         .await
@@ -238,10 +252,10 @@ fn assert_scoped(v: &Viewer, what: &str) {
 async fn only_a_live_session_of_this_principal_and_family_resolves_elevated(pool: PgPool) {
     let p = holder(&pool, "elevated-p", 1).await;
     let b = holder(&pool, "elevated-b", 2).await;
-    let s = scoped(&pool, 4).await;
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
     let live = session(&pool, &p, "grant").await;
 
-    let v = resolve(&s, p.person, Some(live), p.family).await;
+    let v = resolve(&app, p.person, Some(live), p.family).await;
     assert!(v.is_elevated(), "CALIBRATION: the live session elevates");
     let e = v.elevation().expect("an elevation");
     assert_eq!(
@@ -252,20 +266,20 @@ async fn only_a_live_session_of_this_principal_and_family_resolves_elevated(pool
     assert_eq!(v.principal(), Some(p.person));
 
     assert_scoped(
-        &resolve(&s, p.person, Some(Uuid::new_v4()), p.family).await,
+        &resolve(&app, p.person, Some(Uuid::new_v4()), p.family).await,
         "a forged session id",
     );
     let other_family = family(&pool, p.client).await;
     assert_scoped(
-        &resolve(&s, p.person, Some(live), other_family).await,
+        &resolve(&app, p.person, Some(live), other_family).await,
         "the right session on another family of the same person",
     );
     assert_scoped(
-        &resolve(&s, b.person, Some(live), p.family).await,
+        &resolve(&app, b.person, Some(live), p.family).await,
         "another principal presenting P's session and family",
     );
     assert_scoped(
-        &resolve(&s, p.person, None, p.family).await,
+        &resolve(&app, p.person, None, p.family).await,
         "no claim on a GRANT-mode session (only connector sessions are found by family)",
     );
 
@@ -281,7 +295,7 @@ async fn only_a_live_session_of_this_principal_and_family_resolves_elevated(pool
     .await;
     assert!(ended, "CALIBRATION: the session ended");
     assert_scoped(
-        &resolve(&s, p.person, Some(live), p.family).await,
+        &resolve(&app, p.person, Some(live), p.family).await,
         "an ended session",
     );
 }
@@ -298,10 +312,10 @@ async fn only_a_live_session_of_this_principal_and_family_resolves_elevated(pool
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_connector_session_resolves_by_family_and_not_once_expired(pool: PgPool) {
     let p = holder(&pool, "connector-p", 3).await;
-    let s = scoped(&pool, 2).await;
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
     let live = session(&pool, &p, "connector").await;
 
-    let v = resolve(&s, p.person, None, p.family).await;
+    let v = resolve(&app, p.person, None, p.family).await;
     let e = *v
         .elevation()
         .expect("a connector session elevates by family");
@@ -311,8 +325,8 @@ async fn a_connector_session_resolves_by_family_and_not_once_expired(pool: PgPoo
     );
 
     // The checkout stamps the SESSION the database returned, so the database
-    // agrees that this statement is elevated.
-    let mut conn = s.acquire_as(&v).await.expect("acquire_as");
+    // agrees that this statement is elevated (on the application role).
+    let mut conn = app.acquire_as(&v).await.expect("acquire_as");
     let (elv, fam, elevated): (String, String, bool) = sqlx::query_as(
         "SELECT current_setting('epigraph.elevation_id', true), \
                 current_setting('epigraph.family_id', true), \
@@ -345,7 +359,7 @@ async fn a_connector_session_resolves_by_family_and_not_once_expired(pool: PgPoo
         .expect("triggers on");
     drop(c);
     assert_scoped(
-        &resolve(&s, p.person, None, p.family).await,
+        &resolve(&app, p.person, None, p.family).await,
         "an expired connector session",
     );
 }
@@ -359,10 +373,10 @@ async fn a_connector_session_resolves_by_family_and_not_once_expired(pool: PgPoo
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_failed_liveness_check_serves_the_request_unelevated(pool: PgPool) {
     let p = holder(&pool, "degrade-p", 4).await;
-    let s = scoped(&pool, 2).await;
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
     let live = session(&pool, &p, "grant").await;
     assert!(
-        resolve(&s, p.person, Some(live), p.family)
+        resolve(&app, p.person, Some(live), p.family)
             .await
             .is_elevated(),
         "CALIBRATION: the session is live"
@@ -374,13 +388,51 @@ async fn a_failed_liveness_check_serves_the_request_unelevated(pool: PgPool) {
     )
     .await
     .expect("rename the liveness definer away");
-    let v = Viewer::resolve_elevated(&s, p.person, Some(live), p.family)
+    let v = Viewer::resolve_elevated(&app, p.person, Some(live), p.family)
         .await
         .expect("a failed liveness check is not an error");
     assert_scoped(&v, "a database without the liveness definer");
     assert!(
         v.group_bind().is_some_and(|g| g.contains(&p.group)),
         "the degraded viewer is the principal's full scoped viewer, not an empty one"
+    );
+}
+
+/// A pool on a PRIVILEGED login never resolves an elevated viewer (review
+/// cp2: SEC-02, COR-1). On such a login (here the harness superuser; a unit
+/// on a BYPASSRLS request DSN is the production shape) the elevated shape's
+/// always-true fragment would read and decide writes on every tenant's rows,
+/// with no row policy to narrow it. The same live session, the same claim,
+/// resolved on the application role is elevated (the calibration that the
+/// refusal is the login's, not the session's), and still is afterwards.
+///
+/// Verified to fail with 125's privileged-login conjuncts dropped from
+/// `epigraph_elevation_session_is_live` (the superuser pool resolves
+/// ELEVATED).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_privileged_pool_never_resolves_elevated(pool: PgPool) {
+    let p = holder(&pool, "privileged-pool-p", 10).await;
+    let privileged = scoped(&pool, 2).await;
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
+    let live = session(&pool, &p, "grant").await;
+    assert!(
+        resolve(&app, p.person, Some(live), p.family)
+            .await
+            .is_elevated(),
+        "CALIBRATION: the session elevates the application role"
+    );
+
+    let v = resolve(&privileged, p.person, Some(live), p.family).await;
+    assert_scoped(&v, "a privileged (superuser) pool");
+    assert!(
+        v.group_bind().is_some_and(|g| g.contains(&p.group)),
+        "the privileged pool's viewer is the principal's scoped viewer, not an empty one"
+    );
+    assert!(
+        resolve(&app, p.person, Some(live), p.family)
+            .await
+            .is_elevated(),
+        "CALIBRATION: the session is still live on the application role"
     );
 }
 
@@ -404,8 +456,9 @@ async fn a_failed_liveness_check_serves_the_request_unelevated(pool: PgPool) {
 async fn an_elevated_checkout_leaves_nothing_for_the_next_one(pool: PgPool) {
     let p = holder(&pool, "pool-p", 5).await;
     let s = scoped(&pool, 1).await;
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
     let live = session(&pool, &p, "grant").await;
-    let elevated = resolve(&s, p.person, Some(live), p.family).await;
+    let elevated = resolve(&app, p.person, Some(live), p.family).await;
     assert!(elevated.is_elevated(), "CALIBRATION");
 
     let pid: i32 = {
@@ -497,8 +550,9 @@ async fn elevated_reads_a_foreign_private_row_through_the_arm(pool: PgPool) {
     let mine = fixture::seed_group_claim(&pool, p.person, p.group, "P's private row").await;
     let theirs = fixture::seed_group_claim(&pool, b, b_group, "B's private row").await;
     let s = scoped(&pool, 2).await;
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
     let live = session(&pool, &p, "grant").await;
-    let v = resolve(&s, p.person, Some(live), p.family).await;
+    let v = resolve(&app, p.person, Some(live), p.family).await;
     assert!(v.is_elevated(), "CALIBRATION");
 
     let mut conn = s.acquire_as(&v).await.expect("acquire_as");
@@ -549,8 +603,9 @@ async fn an_elevated_viewer_detaches_as_the_principals_scoped_viewer(pool: PgPoo
     let p = holder(&pool, "detach-p", 7).await;
     let mine = fixture::seed_group_claim(&pool, p.person, p.group, "P's private row").await;
     let s = scoped(&pool, 2).await;
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
     let live = session(&pool, &p, "grant").await;
-    let v = resolve(&s, p.person, Some(live), p.family).await;
+    let v = resolve(&app, p.person, Some(live), p.family).await;
     assert!(v.is_elevated(), "CALIBRATION");
 
     let d = v.detach_scoped().expect("an elevated viewer detaches");
@@ -613,16 +668,17 @@ async fn insert_sqlstate(conn: &mut sqlx::PgConnection) -> Option<String> {
 async fn an_elevated_viewer_gets_no_write_transaction(pool: PgPool) {
     let p = holder(&pool, "write-p", 8).await;
     let s = scoped(&pool, 2).await;
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
     let live = session(&pool, &p, "grant").await;
-    let v = resolve(&s, p.person, Some(live), p.family).await;
+    let v = resolve(&app, p.person, Some(live), p.family).await;
     assert!(v.is_elevated(), "CALIBRATION");
 
-    match s.begin_as(&v).await {
+    match app.begin_as(&v).await {
         Err(DbError::ElevatedReadOnly) => {}
         other => panic!("begin_as must refuse an elevated viewer: {other:?}"),
     }
 
-    let mut tx = s.begin_read_as(&v).await.expect("begin_read_as");
+    let mut tx = app.begin_read_as(&v).await.expect("begin_read_as");
     let elevated: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
         .fetch_one(&mut *tx)
         .await
@@ -652,12 +708,7 @@ async fn an_elevated_viewer_gets_no_write_transaction(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn read_as_serves_an_elevated_viewer_read_only_in_transaction_mode(pool: PgPool) {
     let p = holder(&pool, "txmode-p", 9).await;
-    let s = ScopedPool::connect(
-        &fixture::database_url_for(&pool).await,
-        SessionGucMode::Transaction,
-    )
-    .await
-    .expect("transaction-mode ScopedPool");
+    let s = app_scoped(&pool, SessionGucMode::Transaction).await;
     let live = session(&pool, &p, "grant").await;
     let v = resolve(&s, p.person, Some(live), p.family).await;
     assert!(

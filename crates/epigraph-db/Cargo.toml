@@ -36,6 +36,11 @@ test-support = []
 
 [dev-dependencies]
 tokio-test = "0.4"
+# The crate's own integration tests reach `ScopedPool::connect_downgraded_for_tests`
+# (an application-role pool): an elevation is never live on the superuser
+# login a `#[sqlx::test]` DSN carries, so the elevated-viewer suites resolve on
+# the application role. Dev-only, so no production build links the feature.
+epigraph-db = { path = ".", features = ["test-support"] }
 serde = { workspace = true }
 epigraph-crypto = { workspace = true }
 # `tests/seal_side_channels.rs` only. The seal ceremony is client-side, so the

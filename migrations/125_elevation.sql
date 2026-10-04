@@ -44,6 +44,12 @@
 -- as an agent turns it false at once, whether or not a trigger has ended the
 -- row.
 --
+-- NEVER ON A PRIVILEGED LOGIN. No session is live to a login that skips row
+-- security (a superuser, a BYPASSRLS role) or passes `epigraph_bypass()` (a
+-- maintenance member): there no row policy would narrow an elevated read,
+-- and no refusal would stop a write decided on it. A request unit on such a
+-- DSN therefore never elevates, whatever the operator binding's arming state.
+--
 -- REFUSALS THAT MUST BE AUDITED DO NOT RAISE. A ceremony completed with
 -- another person's credential (the confused deputy), a regressed signature
 -- counter (ELV05), and the other use-time refusals mark the ticket
@@ -258,11 +264,25 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, 
 -- AND THE PASSKEY THAT CONFIRMED IT. Revoking a passkey (the operator's
 -- break-glass for a lost or suspect authenticator) takes away every session
 -- that passkey confirmed, at the next statement (a primary-key probe).
+--
+-- NEVER ON A PRIVILEGED LOGIN. An elevated viewer reads with an always-true
+-- fragment and leaves the narrowing to the row policies; on a login that
+-- skips row security (a superuser or a BYPASSRLS role) or passes
+-- `epigraph_bypass()` (a maintenance member) nothing narrows it, and no
+-- RESTRICTIVE refusal stops a write decided on what it read. So no session
+-- is live to such a login, whatever the session's own state and whatever
+-- the arming state of the operator binding. The test is on `session_user`
+-- (the LOGIN, which `SET SESSION AUTHORIZATION` moves and a definer frame
+-- does not), never `current_user` (this function's owner).
 CREATE OR REPLACE FUNCTION public.epigraph_elevation_session_is_live(p_session uuid)
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
-    SELECT EXISTS (
+    SELECT NOT public.epigraph_bypass()
+       AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = session_user
+                          AND (r.rolsuper OR r.rolbypassrls))
+       AND EXISTS (
         SELECT 1
           FROM public.elevation_sessions s
          WHERE s.id = p_session
