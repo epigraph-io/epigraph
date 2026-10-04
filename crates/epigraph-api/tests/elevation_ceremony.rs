@@ -1829,14 +1829,27 @@ async fn an_elevated_token_reads_foreign_private_rows_through_the_router(pool: P
 ///
 /// Verified to fail (the state it was written red against) with 125's
 /// privileged-login conjuncts dropped from
-/// `epigraph_elevation_session_is_live`: the privileged unit answers 200 to
-/// the elevated GET and writes the mass function.
+/// `epigraph_elevation_session_is_live`: the privileged unit writes the mass
+/// function (and answers 200 to the elevated GET).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_privileged_unit_never_serves_an_elevated_request(pool: PgPool) {
+    // `assess` loads `calibration.toml` relative to the working directory (the
+    // repository root in production); without it the handler answers 500
+    // before it writes, and the write-refusal assertion below would pass for
+    // the wrong reason. No other test in this file reads a relative path.
+    std::env::set_current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).unwrap();
     let app = spawn(&pool, Some(software())).await;
     let p = holder(&pool, &app, "holder", &mut SoftAuthenticator::new(MODEL)).await;
     let (b, b_group) = fixture::seed_agent_with_group(&pool, "cp2-b").await;
     let claim = fixture::seed_group_claim(&pool, b, b_group, "cp2 B private claim").await;
+    let p_group: Uuid = sqlx::query_scalar(
+        "SELECT group_id FROM group_memberships WHERE agent_id = $1 ORDER BY group_id LIMIT 1",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("P's own group");
+    let mine = fixture::seed_group_claim(&pool, p.person, p_group, "cp2 P own claim").await;
     let (_, t) = app
         .open_ticket(&app.human_token(&p, Some(p.family), None), "read")
         .await;
@@ -1887,22 +1900,33 @@ async fn a_privileged_unit_never_serves_an_elevated_request(pool: PgPool) {
 
     let privileged = spawn_privileged(&pool).await;
     let elevated = privileged.scoped_token(&p, Some(session), &["claims:read"]);
-    let (status, seen) = privileged.get(&read, &elevated).await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "a privileged unit reads nothing past P's groups for an elevated token: {seen}"
-    );
+    // CALIBRATION that the route CAN write here: P's unelevated assess of its
+    // OWN claim on the same privileged unit is served.
+    let (status, seen) = privileged
+        .post(
+            &format!("/api/v1/claims/{mine}/assess"),
+            Some(&privileged.scoped_token(&p, None, &["claims:read"])),
+            &body,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "CALIBRATION: assess writes: {seen}");
+    // The write first, so a regression shows the reviewer's failure itself.
     let (status, seen) = privileged.post(&assess, Some(&elevated), &body).await;
+    assert_eq!(
+        written().await,
+        before,
+        "no mass function and no belief written onto B's private claim ({status}): {seen}"
+    );
     assert_ne!(
         status,
         StatusCode::OK,
         "a privileged unit writes nothing for an elevated token: {seen}"
     );
+    let (status, seen) = privileged.get(&read, &elevated).await;
     assert_eq!(
-        written().await,
-        before,
-        "no mass function and no belief written onto B's private claim"
+        status,
+        StatusCode::NOT_FOUND,
+        "a privileged unit reads nothing past P's groups for an elevated token: {seen}"
     );
 
     let (status, _) = app
