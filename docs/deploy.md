@@ -1758,10 +1758,11 @@ operator and maintenance CLIs, the job drain) now stamps FIVE session settings
 per checkout instead of three: the tenancy three plus `epigraph.elevation_id`
 and `epigraph.family_id`, which are EMPTY for every viewer that is not
 elevated, and its release scrub clears all five. The boot probe checks all five.
-None of these binaries declares the per-access recorder
-(`epigraph.access_recorder`; see "two keys" in the 126 section), so none of
-them elevates a request on any database until the batch that writes the
-per-access log ships a build that declares it.
+Only a binary that RECORDS every elevated access declares the per-access
+recorder (`epigraph.access_recorder`; see "two keys" in the 126 section and
+"The elevated-access log (migration 127)"): `epigraph-api` does, through its
+response layer. Every other binary listed here never elevates a request on
+any database.
 
 1. **Migrate 125 first** (above). A binary from this batch on a database
    without 125 still serves: a failed liveness check is logged and the request
@@ -1838,7 +1839,8 @@ whether the process serving a request writes it. So 125 also requires each
 connection to DECLARE the recorder (the session setting
 `epigraph.access_recorder` = `on`, stamped once per connection by a build that
 records); `epigraph_is_elevated()` and `epigraph_elevation_live` answer "not
-elevated" without it. No build of this tree declares it. A unit rolled back
+elevated" without it. Only a recording build declares it (see "The
+elevated-access log (migration 127)" for which binaries). A unit rolled back
 to, or left on, a build without the log therefore never elevates, even on a
 database whose gate the log's migration has opened, and the API and MCP
 units need not be upgraded in lockstep. The grant-mode redemption does not
@@ -1908,10 +1910,25 @@ no connection is elevated. The opening is a later migration of this stack.
    Old binaries are unaffected (they call none of it).
 2. **Deploy** `epigraph-tenancy-backfill` built from the same commit (`verify`
    checks the 127 definers' owner and grants).
+3. **Deploy the recording binaries** after 127, in any order (the gate keeps
+   every session not live until a later migration opens it):
+   - `epigraph-api` RECORDS: its authenticated router carries a route layer
+     that, for every request whose viewer resolved ELEVATED, buffers the
+     response (at most 64 MiB), collects every id it names, and calls the
+     recorder on its own transaction stamped with that elevation BEFORE the
+     response leaves; if recording fails the client gets a 500 and none of
+     the body. Its pool is built by `ScopedPool::connect_recording_elevated_access`,
+     so its connections declare the recorder. The viewer extractor refuses
+     an elevated viewer to any request the layer does not wrap, and the two
+     elevation routes (open a ticket, end an elevation) act as the person,
+     not as the elevation, so they are never recorded. A token without an
+     elevation claim pays nothing.
+   - An `epigraph-api` from before this batch declares nothing and never
+     elevates (it would serve an elevated token unelevated).
 
-**Rollback.** Roll back first every binary that records (the API and MCP HTTP
-builds that declare the recorder; without the recorder function they refuse
-every elevated request, which is safe but noisy). Then run
+**Rollback.** Roll back first every binary that records (the builds that
+declare the recorder; without the recorder function they refuse every
+elevated request, which is safe but noisy). Then run
 `docs/runbooks/127-undo.sql` on the migration DSN, in one transaction: it
 copies every log row into `security_events` as a `platform.elevated_access`
 event (the subjects' record outlives the table), then drops the table and

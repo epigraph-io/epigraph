@@ -960,10 +960,23 @@ pub fn create_router(state: AppState) -> Router {
     // been deleted. `require_packet_signatures` survives under its new name and
     // gates PAYLOAD-level packet signatures inside `routes/submit.rs`, which is
     // a different mechanism at a different layer.
-    let protected = protected.layer(middleware::from_fn_with_state(
-        state.clone(),
-        bearer_auth_middleware,
-    ));
+    //
+    // THE PER-ACCESS RECORDER (elevation plan EL-8): a ROUTE layer, so it runs
+    // after routing (the matched route names the access) and inside the bearer
+    // layer (the `AuthContext` is known). Every request served to an ELEVATED
+    // viewer is recorded in migration 127's log before its response leaves, or
+    // the response is withheld; `ViewerExtractor` refuses an elevated viewer to
+    // a request this layer does not wrap. A token without an elevation claim
+    // passes straight through.
+    let protected = protected
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::middleware::elevated_access::record_elevated_access,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            bearer_auth_middleware,
+        ));
 
     // The anonymous allowlist. Adding a route here is a security decision;
     // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build

@@ -732,6 +732,15 @@ impl From<DbError> for ApiError {
                     message: "A database error occurred".to_string(),
                 }
             }
+            // Fail-closed (elevation plan EL-8): an elevated read that could
+            // not be recorded is withheld. A server-side failure, never the
+            // caller's; the reason is logged, not sent.
+            DbError::ElevatedAccessUnrecorded { reason } => {
+                tracing::error!(target: "elevation", reason = %reason, "elevated access not recorded");
+                ApiError::InternalError {
+                    message: "ELEVATED ACCESS NOT RECORDED: the response is withheld".to_string(),
+                }
+            }
             DbError::MigrationFailed { source } => {
                 tracing::error!(error = %source, "Database migration failed");
                 ApiError::DatabaseError {

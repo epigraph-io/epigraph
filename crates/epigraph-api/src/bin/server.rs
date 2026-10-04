@@ -269,9 +269,17 @@ async fn main() {
                 .unwrap_or_default()
                 .as_str(),
         );
-        let scoped = epigraph_db::ScopedPool::connect(&database_url, guc_mode)
-            .await
-            .expect("Failed to connect to PostgreSQL");
+        // `connect_recording_elevated_access`: this binary RECORDS every
+        // elevated access (the router's per-access recorder layer, elevation
+        // plan EL-8), so its pool declares the recorder, migration 125's second
+        // key. Sizing is `connect`'s (`ScopedPoolOptions::default()`).
+        let scoped = epigraph_db::ScopedPool::connect_recording_elevated_access(
+            &database_url,
+            guc_mode,
+            epigraph_db::ScopedPoolOptions::default(),
+        )
+        .await
+        .expect("Failed to connect to PostgreSQL");
         // PR-06 stops discarding the `ScopedPool`. `AppState` now carries it
         // alongside the inner `PgPool`, because `Viewer::system` requires a
         // `MaintenanceLease` and `ScopedPool::unscoped_for_maintenance` is the

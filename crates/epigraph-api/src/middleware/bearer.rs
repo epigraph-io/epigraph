@@ -310,6 +310,16 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequirePrincipal {
 #[cfg(feature = "db")]
 pub struct ViewerExtractor(pub epigraph_db::Viewer);
 
+/// [`ViewerExtractor`] for a route that never reads AS an elevated viewer:
+/// it resolves the principal's plain scoped viewer whatever the token's
+/// elevation claim, so the request is not an elevated access and is not
+/// recorded. For the elevation routes themselves (open a ticket, end an
+/// elevation): their definers are principal-bound and act as the person, not
+/// as the elevation, and an end must not be recorded by a session it has just
+/// ended (the recorder would refuse it, and the response would be withheld).
+#[cfg(feature = "db")]
+pub struct UnelevatedViewer(pub epigraph_db::Viewer);
+
 #[cfg(feature = "db")]
 #[axum::async_trait]
 impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
@@ -319,6 +329,39 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
         parts: &mut axum::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        extract_viewer(parts, state, true).await.map(Self)
+    }
+}
+
+#[cfg(feature = "db")]
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<AppState> for UnelevatedViewer {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        extract_viewer(parts, state, false).await.map(Self)
+    }
+}
+
+/// The two extractors' one body. `elevate`: resolve the token's elevation
+/// claim (ViewerExtractor) or ignore it (UnelevatedViewer).
+///
+/// An ELEVATED viewer is handed out only to a request the per-access
+/// recorder wraps (`middleware::elevated_access`, elevation plan EL-8): the
+/// recorder's slot must be in the request's extensions, and is marked here so
+/// the recorder records the response before it is sent. A request without the
+/// slot is refused (500): no route can serve an elevated read the recorder
+/// does not see.
+#[cfg(feature = "db")]
+async fn extract_viewer(
+    parts: &mut axum::http::request::Parts,
+    state: &AppState,
+    elevate: bool,
+) -> Result<epigraph_db::Viewer, ApiError> {
+    {
         // `visibility.viewer.rejected{reason, route}` is emitted as a
         // structured tracing event rather than a Prometheus counter:
         // `metrics::Metrics` is a fixed struct of unlabeled counter handles
@@ -367,7 +410,11 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
         // connection, is checked against the database; every other token
         // resolves the plain scoped viewer exactly as before.
         let resolve = async {
-            match (auth.elevation_claim, auth.family_id, state.scoped.as_ref()) {
+            match (
+                auth.elevation_claim.filter(|_| elevate),
+                auth.family_id,
+                state.scoped.as_ref(),
+            ) {
                 (Some(elv), Some(family), Some(scoped)) => {
                     let v =
                         epigraph_db::Viewer::resolve_elevated(scoped, principal, Some(elv), family)
@@ -433,7 +480,32 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
             ApiError::from(e)
         })?;
 
-        Ok(Self(viewer))
+        if let Some(elevation) = viewer.elevation() {
+            let Some(slot) = parts
+                .extensions
+                .get::<crate::middleware::elevated_access::ElevatedAccessSlot>()
+            else {
+                tracing::error!(
+                    target: "elevation",
+                    route = %route,
+                    principal = %principal,
+                    "an elevated viewer was resolved for a route the per-access recorder does \
+                     not wrap; refused"
+                );
+                return Err(ApiError::InternalError {
+                    message: "ELEVATED ACCESS NOT RECORDED: this route is not recorded; the \
+                              request is refused"
+                        .to_string(),
+                });
+            };
+            slot.mark(crate::middleware::elevated_access::ElevatedMark {
+                principal,
+                session_id: elevation.session_id,
+                family_id: elevation.family_id,
+            });
+        }
+
+        Ok(viewer)
     }
 }
 

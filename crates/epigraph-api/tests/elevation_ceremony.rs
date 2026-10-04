@@ -53,9 +53,12 @@ struct Server {
     _stop: oneshot::Sender<()>,
 }
 
-/// Its pool DECLARES the per-access recorder (`epigraph_db::ACCESS_RECORDER_GUC`),
-/// standing in, with `holder`'s open gate, for a build that records elevated
-/// accesses (review cp3: COR-1; no build of this tree does yet).
+/// Its pool DECLARES the per-access recorder (`epigraph_db::ACCESS_RECORDER_GUC`)
+/// on an application-role login, as the server binary's
+/// `ScopedPool::connect_recording_elevated_access` does on its own DSN (that
+/// constructor cannot downgrade the harness's superuser login); with
+/// `holder`'s open gate it stands in for a recording build on a database whose
+/// gate is open (review cp3: COR-1).
 async fn spawn(pool: &PgPool, passkeys: Option<Passkeys>) -> Server {
     let url = fixture::database_url_for(pool).await;
     let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
@@ -2026,5 +2029,384 @@ async fn a_privileged_unit_never_serves_an_elevated_request(pool: PgPool) {
         status,
         StatusCode::OK,
         "CALIBRATION: the session is still live (the refusal was the login's)"
+    );
+}
+
+// =====================================================================
+// EL-8: every elevated access is recorded, fail-closed, where its subject
+// can read it
+// =====================================================================
+
+/// Open and confirm a grant-mode session for `p` on `s`; its id.
+async fn elevate(pool: &PgPool, s: &Server, p: &Person) -> Uuid {
+    let (_, t) = s
+        .open_ticket(&s.human_token(p, Some(p.family), None), "el8 audit read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    confirm_directly(pool, ticket, credential_of(pool, p.person).await).await
+}
+
+/// The log rows (harness view): `(surface, row_count, owner_group_ids, args)`.
+async fn log_of(pool: &PgPool) -> Vec<(String, i32, Vec<Uuid>, Value)> {
+    sqlx::query_as(
+        "SELECT surface, row_count, owner_group_ids, args FROM elevated_access \
+          ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the log")
+}
+
+/// The log rows `who` reads as the application role (the subject policy).
+async fn log_seen_by(pool: &PgPool, who: Uuid) -> i64 {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(who.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM public.elevated_access")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read the log");
+        sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("unstamp");
+        (conn, n)
+    })
+    .await
+}
+
+/// An elevated read of B's private claim through the real router is recorded
+/// as exactly ONE log row before the response leaves: the matched route as the
+/// surface, the concrete path and the token's jti in the args, one row in the
+/// response, and B's group (and only B's) as the subject. B (the admin of its
+/// personal group) reads that row; an unrelated A does not, nor does P.
+///
+/// Verified to fail with the recorder layer removed from the router (the
+/// extractor refuses the elevated viewer: 500, no row), and with the layer
+/// sending the response without recording (no row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_through_the_router_is_recorded_for_its_subject(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el8-b").await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "el8-a").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "el8 B private claim").await;
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let jti = s
+        .jwt
+        .validate_token(&elevated)
+        .expect("the token decodes")
+        .jti;
+
+    let (status, body) = s.get(&format!("/api/v1/claims/{claim}"), &elevated).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the elevated read is served: {body}"
+    );
+    assert_eq!(body["id"], json!(claim.to_string()));
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "exactly one row: {log:?}");
+    let (surface, rows, groups, args) = &log[0];
+    assert_eq!(surface, "GET /api/v1/claims/:id");
+    assert_eq!(*rows, 1, "one row in the response");
+    assert_eq!(groups, &vec![b_group], "B's group, and only B's");
+    assert_eq!(args["path"], json!(format!("/api/v1/claims/{claim}")));
+    assert_eq!(args["jti"], json!(jti.to_string()));
+    assert_eq!(args["status"], json!(200));
+    assert!(
+        !args.to_string().contains("el8 B private claim"),
+        "no content in the args: {args}"
+    );
+
+    assert_eq!(log_seen_by(&pool, b).await, 1, "B reads the row naming it");
+    assert_eq!(log_seen_by(&pool, a).await, 0, "A does not");
+    assert_eq!(
+        log_seen_by(&pool, p.person).await,
+        0,
+        "P does not (not B's admin)"
+    );
+}
+
+/// A list's row count is the number of rows the response carried, and its
+/// subjects are every group whose private row it named; the request's own
+/// filters are in the args.
+///
+/// Verified to fail with the row count fixed at 1 (the list counts 3).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_list_records_its_row_count_and_every_subject(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el8-list-b").await;
+    let (c, c_group) = fixture::seed_agent_with_group(&pool, "el8-list-c").await;
+    for (who, g, n) in [(b, b_group, 2), (c, c_group, 1)] {
+        for i in 0..n {
+            fixture::seed_group_claim(&pool, who, g, &format!("quarvelline row {i}")).await;
+        }
+    }
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let (status, body) = s
+        .get("/claims?search=quarvelline&limit=100", &elevated)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        ids(&body).len(),
+        3,
+        "CALIBRATION: the list holds 3 rows: {body}"
+    );
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "{log:?}");
+    let (surface, rows, groups, args) = &log[0];
+    assert_eq!(surface, "GET /claims");
+    assert_eq!(*rows, 3, "three rows in the response");
+    let mut want = vec![b_group, c_group];
+    want.sort();
+    assert_eq!(groups, &want);
+    assert_eq!(args["query"], json!("search=quarvelline&limit=100"));
+}
+
+/// An AGGREGATE answer names no private row, so its elevated request is
+/// recorded with an EMPTY group list (the stated limit: the log says an
+/// elevated aggregate ran, not whose rows it counted). Here B's epistemic
+/// profile, computed over B's private claims.
+///
+/// Verified to fail with the layer skipping a response that carries no row
+/// object (no log row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_aggregate_is_recorded_with_no_groups(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el8-agg-b").await;
+    fixture::seed_group_claim(&pool, b, b_group, "el8 aggregate input").await;
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read", "agents:read"]);
+    let (status, body) = s
+        .get(&format!("/api/v1/agents/{b}/epistemic-profile"), &elevated)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "{log:?}");
+    let (surface, rows, groups, _) = &log[0];
+    assert_eq!(surface, "GET /api/v1/agents/:id/epistemic-profile");
+    assert!(groups.is_empty(), "no group named: {groups:?}");
+    assert_eq!(*rows, 0, "no row object in an aggregate");
+}
+
+/// FAIL-CLOSED: when the recorder cannot record (here its EXECUTE is revoked
+/// from the application role), the elevated response is WITHHELD: 500, and
+/// none of B's row reaches the caller. Calibrated by the same request served
+/// once the grant is back.
+///
+/// Verified to fail with the layer sending the handler's response when the
+/// record fails (200 with B's claim).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_record_withholds_the_elevated_response(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el8-fail-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "el8 withheld claim").await;
+    let session = elevate(&pool, &s, &p).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let grant = |on: bool| {
+        let pool = pool.clone();
+        async move {
+            let verb = if on { "GRANT" } else { "REVOKE" };
+            let dir = if on { "TO" } else { "FROM" };
+            sqlx::query(&format!(
+                "{verb} EXECUTE ON FUNCTION public.epigraph_record_elevated_access(text, jsonb, \
+                 integer, uuid[]) {dir} epigraph_app"
+            ))
+            .execute(&pool)
+            .await
+            .expect("grant change");
+        }
+    };
+
+    grant(false).await;
+    let resp = s
+        .http
+        .get(s.url(&format!("/api/v1/claims/{claim}")))
+        .bearer_auth(&elevated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let text = resp.text().await.unwrap();
+    assert!(
+        !text.contains(&claim.to_string()) && !text.contains("el8 withheld claim"),
+        "nothing of B's row is sent: {text}"
+    );
+    assert!(text.contains("NOT RECORDED"), "{text}");
+    assert!(log_of(&pool).await.is_empty());
+
+    grant(true).await;
+    let (status, body) = s.get(&format!("/api/v1/claims/{claim}"), &elevated).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: recorded, then served: {body}"
+    );
+    assert_eq!(log_of(&pool).await.len(), 1);
+}
+
+/// A request that is not elevated writes no row: the same principal's plain
+/// token, a token whose elevation claim names no live session (served
+/// unelevated), and the elevated token ENDING its own session (the end route
+/// acts as the principal, so it is not an elevated access; recording it would
+/// be refused by the session it just ended).
+///
+/// Verified to fail with the end route taking `ViewerExtractor` (its response
+/// is withheld: 500, the session ended anyway).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_request_that_is_not_elevated_writes_no_row(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let group: Uuid = sqlx::query_scalar(
+        "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("the personal group");
+    let mine = fixture::seed_group_claim(&pool, p.person, group, "el8 P's own row").await;
+    let session = elevate(&pool, &s, &p).await;
+    let read = format!("/api/v1/claims/{mine}");
+    for (what, token) in [
+        ("plain", s.scoped_token(&p, None, &["claims:read"])),
+        (
+            "forged claim",
+            s.scoped_token(&p, Some(Uuid::new_v4()), &["claims:read"]),
+        ),
+    ] {
+        let (status, body) = s.get(&read, &token).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {body}");
+    }
+    assert!(
+        log_of(&pool).await.is_empty(),
+        "no row for an unelevated request"
+    );
+
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let resp = s
+        .http
+        .post(s.url("/api/v1/elevation/end"))
+        .bearer_auth(&elevated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the end is answered");
+    assert_eq!(ended_reason(&pool, session).await.as_deref(), Some("ended"));
+    assert!(
+        log_of(&pool).await.is_empty(),
+        "the end is not an elevated access"
+    );
+}
+
+/// No route outside the recorder can hand a handler an elevated viewer: a
+/// router that serves a `ViewerExtractor` handler WITHOUT the recorder layer
+/// refuses the elevated token (500, NOT RECORDED) and serves the plain one.
+///
+/// Verified to fail with the extractor's slot check removed (the elevated
+/// token is served, unrecorded).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_viewer_is_refused_outside_the_recorder(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let session = elevate(&pool, &s, &p).await;
+
+    let url = fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("app-role pool");
+    let state =
+        epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default());
+    let jwt = state.jwt_config.clone();
+    async fn probe(
+        epigraph_api::middleware::bearer::ViewerExtractor(v): epigraph_api::middleware::bearer::ViewerExtractor,
+    ) -> String {
+        format!("elevated={}", v.is_elevated())
+    }
+    let app = axum::Router::new()
+        .route("/probe", axum::routing::get(probe))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            epigraph_api::middleware::bearer_auth_middleware,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let token = |elv: Option<Uuid>| {
+        jwt.issue_access_token(
+            p.client,
+            vec!["claims:read".into()],
+            "human",
+            None,
+            Some(p.person),
+            Duration::minutes(30),
+            AccessTokenBinding {
+                family_id: Some(p.family),
+                elevation_id: elv,
+            },
+        )
+        .expect("mint")
+        .0
+    };
+    let get = |t: String| async move {
+        let r = reqwest::Client::new()
+            .get(format!("http://{addr}/probe"))
+            .bearer_auth(t)
+            .send()
+            .await
+            .unwrap();
+        (r.status(), r.text().await.unwrap())
+    };
+    let (status, text) = get(token(None)).await;
+    assert_eq!((status, text.as_str()), (StatusCode::OK, "elevated=false"));
+    let (status, text) = get(token(Some(session))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    assert!(text.contains("NOT RECORDED"), "{text}");
+}
+
+/// The server binary builds its pool with the one constructor that declares
+/// the recorder (`epigraph-db`'s `only_the_recording_constructor_declares_the_recorder`
+/// pins what that constructor does), and the router installs the recorder
+/// layer on the authenticated routes. Source lock: `bin/server.rs` is a
+/// binary `main` no test can construct.
+///
+/// Verified to fail with `bin/server.rs` reverted to `ScopedPool::connect`.
+#[test]
+fn the_server_binary_records_and_declares() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let server = std::fs::read_to_string(root.join("src/bin/server.rs")).unwrap();
+    assert!(
+        server.contains("ScopedPool::connect_recording_elevated_access("),
+        "bin/server.rs must build the recording pool"
+    );
+    assert!(
+        !server.contains("ScopedPool::connect(&database_url"),
+        "bin/server.rs must not build a non-declaring request pool"
+    );
+    let routes = std::fs::read_to_string(root.join("src/routes/mod.rs")).unwrap();
+    assert!(
+        routes.contains("elevated_access::record_elevated_access"),
+        "the router must install the recorder layer"
     );
 }

@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::errors::ApiError;
-use crate::middleware::bearer::{AuthContext, ViewerExtractor};
+use crate::middleware::bearer::{AuthContext, UnelevatedViewer};
 use crate::state::AppState;
 
 /// The token endpoint's grant type that redeems a confirmed grant-mode ticket.
@@ -132,7 +132,11 @@ fn scoped<'a>(
 /// and these routes write: asking for a ticket and ending a session are the
 /// principal's acts, not the elevation's (both definers are bound to the
 /// stamped principal only), so they stamp the principal's own scoped viewer.
-/// That is what lets an elevated token end its own session.
+/// That is what lets an elevated token end its own session. Both routes take
+/// [`UnelevatedViewer`], which never resolves the elevation at all (so the
+/// per-access recorder does not record them: an end would otherwise be
+/// recorded by the session it just ended, and refused); this keeps the
+/// downgrade as the second layer.
 fn as_principal(viewer: &epigraph_db::Viewer) -> Result<epigraph_db::Viewer, ApiError> {
     viewer.detach_scoped().ok_or_else(|| ApiError::Forbidden {
         reason: "elevation: this request has no principal to act as".into(),
@@ -157,7 +161,7 @@ fn internal(handler: &'static str, what: &str, e: &dyn std::fmt::Display) -> Api
 pub async fn create_ticket(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    ViewerExtractor(viewer): ViewerExtractor,
+    UnelevatedViewer(viewer): UnelevatedViewer,
     Json(req): Json<CreateTicketRequest>,
 ) -> Result<(StatusCode, Json<CreateTicketResponse>), ApiError> {
     use sha2::Digest;
@@ -269,7 +273,7 @@ pub async fn create_ticket(
 pub async fn end_elevation(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    ViewerExtractor(viewer): ViewerExtractor,
+    UnelevatedViewer(viewer): UnelevatedViewer,
     body: Bytes,
 ) -> Result<Json<EndResponse>, ApiError> {
     let req: EndRequest = if body.iter().all(u8::is_ascii_whitespace) {
