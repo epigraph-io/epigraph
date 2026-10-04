@@ -85,12 +85,20 @@ async fn spawn_unrecorded(pool: &PgPool) -> Server {
 }
 
 /// The real router on a PRIVILEGED pool: the harness's superuser login, the
-/// shape of a request unit whose DSN skips row security.
+/// shape of a request unit whose DSN skips row security. It DECLARES the
+/// recorder, like [`spawn`], so a refusal there is the login's alone (an
+/// undeclared unit never elevates anyway; that is
+/// `a_unit_that_declares_no_access_recorder_never_serves_an_elevated_read`).
 async fn spawn_privileged(pool: &PgPool) -> Server {
     let url = fixture::database_url_for(pool).await;
-    let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
-        .await
-        .expect("privileged pool");
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        None,
+    )
+    .await
+    .expect("privileged pool");
     spawn_on(scoped, None).await
 }
 
