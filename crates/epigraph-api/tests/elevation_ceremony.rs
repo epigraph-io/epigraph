@@ -1207,6 +1207,57 @@ async fn the_elevate_grant_waits_for_the_ceremony_then_issues_once(pool: PgPool)
     );
 }
 
+/// The elevated token is sudo READ (D2): redeemed for a client that holds
+/// write scopes (`claims:write`, `agents:write`, `tasks:write`), it carries
+/// none of them, only the client's read scopes and `platform:admin`. So a
+/// route that authorizes a write on the token's SCOPES alone and writes on
+/// the unscoped pool (never meeting `begin_as` or 126's refusals), here
+/// `POST /api/v1/agents`, refuses it 403. Calibration: the same person's
+/// ordinary token with `agents:write` creates the agent.
+///
+/// Mutations: `elevated_scopes` keeping the write scopes (the pre-cp1 shape)
+/// -> the token carries `agents:write` and the agent is created.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevated_token_carries_no_write_scope(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    grant_scopes(
+        &pool,
+        &p,
+        &[
+            "claims:read",
+            "claims:write",
+            "agents:read",
+            "agents:write",
+            "tasks:write",
+        ],
+    )
+    .await;
+    let (ticket, secret) = open(&s, &p, "read only").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["access_token"].as_str().unwrap().to_string();
+    let mut scopes = s.jwt.validate_token(&token).expect("a valid token").scopes;
+    scopes.sort();
+    assert_eq!(scopes, vec!["agents:read", "claims:read", "platform:admin"]);
+
+    let agent = |key: u8| json!({ "public_key": hex::encode([key; 32]), "display_name": "cp1" });
+    let (status, body) = s.post("/api/v1/agents", Some(&token), &agent(0x11)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.to_string().contains("agents:write"), "{body}");
+
+    let plain = s.scoped_token(&p, None, &["agents:write"]);
+    let (status, body) = s.post("/api/v1/agents", Some(&plain), &agent(0x22)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: an ordinary token with agents:write creates it: {body}"
+    );
+}
+
 /// The grant refuses, with one `invalid_grant` and WITHOUT spending the
 /// ticket: a wrong secret, a malformed one, another client's `client_id`, an
 /// unknown client; and a request missing a parameter is `invalid_request`.

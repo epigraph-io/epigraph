@@ -99,8 +99,10 @@ pub const ADMIN_ONLY_SCOPES: &[&str] = &[
 /// (`urn:epigraph:grant:elevate`), after a passkey ceremony confirmed an
 /// elevation ticket of a person holding a live elevating-role assignment, on
 /// a token that expires with that elevation (at most 15 minutes) and has no
-/// refresh token. That grant strips every [`ADMIN_ONLY_SCOPES`] entry and adds
-/// this one: the standing admin scopes are what elevation replaces.
+/// refresh token. That grant keeps only the client's [`READ_SCOPES`] (so
+/// every [`ADMIN_ONLY_SCOPES`] entry and every write scope goes) and adds this
+/// one: the standing admin scopes are what elevation replaces, and elevation
+/// is sudo READ.
 ///
 /// Deliberately NOT in [`ADMIN_ONLY_SCOPES`] and in no canonical role or
 /// registration set. Nothing checks it yet: what an elevated request may do is

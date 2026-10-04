@@ -1127,18 +1127,28 @@ async fn handle_authorization_code(
 // ── The elevate grant (elevation plan EL-5) ─────────────────────────────────
 
 /// The scopes of an ELEVATED access token: the client's own `granted_scopes`
-/// with every standing admin scope ([`ADMIN_ONLY_SCOPES`]) removed, plus
+/// narrowed to its READ scopes ([`READ_SCOPES`], an allowlist), plus
 /// [`PLATFORM_ADMIN_SCOPE`] once. Elevation replaces the standing admin
-/// scopes; it does not stack on them.
+/// scopes ([`ADMIN_ONLY_SCOPES`] are never read scopes); it does not stack on
+/// them.
 ///
+/// Read only, because elevation is sudo READ (operator ruling D2) and the
+/// elevated viewer is read-only (plan §1.4). `begin_as` and migration 126
+/// refuse an elevated viewer's writes on the stamped paths, but a route that
+/// authorizes a write on the token's SCOPES alone and writes on the unscoped
+/// pool (`POST /api/v1/agents` under `agents:write`, for one) never meets
+/// either, so a write scope kept here would make a leaked elevated token a
+/// 15-minute write credential as well as a read-everything one.
+///
+/// [`READ_SCOPES`]: epigraph_core::canonical_scopes::READ_SCOPES
 /// [`ADMIN_ONLY_SCOPES`]: epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES
 /// [`PLATFORM_ADMIN_SCOPE`]: epigraph_core::canonical_scopes::PLATFORM_ADMIN_SCOPE
 #[cfg(feature = "db")]
 pub(crate) fn elevated_scopes(granted: &[String]) -> Vec<String> {
-    use epigraph_core::canonical_scopes::{ADMIN_ONLY_SCOPES, PLATFORM_ADMIN_SCOPE};
+    use epigraph_core::canonical_scopes::{PLATFORM_ADMIN_SCOPE, READ_SCOPES};
     let mut out: Vec<String> = Vec::with_capacity(granted.len() + 1);
     for s in granted {
-        if s == PLATFORM_ADMIN_SCOPE || ADMIN_ONLY_SCOPES.contains(&s.as_str()) {
+        if !READ_SCOPES.contains(&s.as_str()) {
             continue;
         }
         if !out.contains(s) {
@@ -1340,10 +1350,14 @@ mod elevate_scope_tests {
         s.iter().map(|x| (*x).to_string()).collect()
     }
 
-    /// Every standing admin scope is removed, `platform:admin` is added once
-    /// (even when the client already carries it), and the rest keep their
-    /// order. Mutations: the ADMIN_ONLY filter dropped -> `claims:admin`
-    /// survives; the dedup of a granted `platform:admin` dropped -> twice.
+    /// Elevation is sudo READ (operator ruling D2): only the client's READ
+    /// scopes survive, every standing admin scope AND every write scope is
+    /// removed, `platform:admin` is added once (even when the client already
+    /// carries it), and the kept scopes keep their order. An unknown scope is
+    /// dropped (an allowlist). Mutations: the ADMIN_ONLY filter dropped ->
+    /// `claims:admin` survives; the read allowlist dropped -> `claims:write`,
+    /// `agents:write` and the unknown scope survive; the dedup of a granted
+    /// `platform:admin` dropped -> twice.
     #[test]
     fn elevation_replaces_the_standing_admin_scopes() {
         assert_eq!(
@@ -1353,11 +1367,14 @@ mod elevate_scope_tests {
                 "platform:admin",
                 "groups:admin",
                 "claims:write",
+                "agents:write",
+                "evidence:read",
                 "instance:admin",
                 "clients:admin",
                 "entity-types:write",
+                "not-a-known:scope",
             ])),
-            v(&["claims:read", "claims:write", "platform:admin"])
+            v(&["claims:read", "evidence:read", "platform:admin"])
         );
         assert_eq!(elevated_scopes(&[]), v(&["platform:admin"]));
     }
