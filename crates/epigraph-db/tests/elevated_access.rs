@@ -1259,3 +1259,92 @@ async fn only_the_recording_constructor_declares_the_recorder(pool: PgPool) {
     .expect("sized pool");
     assert_eq!(probe(sized).await, (String::new(), false));
 }
+
+// =====================================================================
+// Pinned (operator-hidden) evidence (operator ruling 2026-10-04, interim)
+// =====================================================================
+
+/// Hide `evidence` the way `epigraph-operator hide-evidence --apply` leaves
+/// it (migration 110): pinned, then `('group', the hiding operator's group)`.
+async fn hide(pool: &PgPool, evidence: Uuid, group: Uuid, operator: Uuid) {
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'el8 test: hidden by the operator')",
+    )
+    .bind(evidence)
+    .bind(operator)
+    .execute(pool)
+    .await
+    .expect("pin");
+    sqlx::query("UPDATE evidence SET owner_group_id = $2, visibility = 'group' WHERE id = $1")
+        .bind(evidence)
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("hide");
+}
+
+/// The operator's interim ruling (2026-10-04): an elevated session that reads
+/// claims MAY read their evidence, operator-hidden (pinned) evidence included,
+/// and every such read is recorded where its owner sees it. An elevated read
+/// of a PINNED evidence row of a PUBLIC claim is recorded against the row's
+/// owning group (the hiding operator H's), and H, that group's admin, reads
+/// the row; B (the claim's author) does not. Calibrations: the elevated
+/// session reads the pinned row through 126's arm; P unelevated does not.
+///
+/// Verified to fail with `public.evidence` removed from the recorder's
+/// attribution (no group named).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_of_pinned_evidence_is_recorded_for_its_owner(pool: PgPool) {
+    let p = holder(&pool, "access-pin-p", 33).await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "access-pin-b").await;
+    let (h, h_group) = fixture::seed_agent_with_group(&pool, "access-pin-h").await;
+    let claim = fixture::seed_public_claim(&pool, b, "a public claim with hidden evidence").await;
+    let evidence = fixture::seed_evidence(&pool, claim, "observation").await;
+    hide(&pool, evidence, h_group, h).await;
+    let live = session(&pool, &p, "pinned evidence").await;
+
+    let read = |stamp: Stamp| {
+        let pool = pool.clone();
+        async move {
+            stamped(&pool, stamp, |mut conn| async move {
+                let n: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence WHERE id = $1")
+                    .bind(evidence)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .expect("read the evidence");
+                (conn, n)
+            })
+            .await
+        }
+    };
+    assert_eq!(
+        read(Stamp::plain(p.person)).await,
+        0,
+        "CALIBRATION: hidden from P"
+    );
+    assert_eq!(
+        read(Stamp::elevated(&p, live)).await,
+        1,
+        "CALIBRATION: the elevated session reads the pinned row (the ruling)"
+    );
+
+    let row = record(
+        &pool,
+        Stamp::elevated(&p, live),
+        "GET /api/v1/claims/:id/evidence",
+        1,
+        vec![claim, evidence],
+    )
+    .await
+    .expect("records");
+    let groups: Vec<Uuid> =
+        sqlx::query_scalar("SELECT owner_group_ids FROM elevated_access WHERE id = $1")
+            .bind(row)
+            .fetch_one(&pool)
+            .await
+            .expect("the row");
+    assert_eq!(groups, vec![h_group], "the pinned row's owning group");
+    assert_eq!(visible(&pool, h).await, vec![row], "H reads it");
+    assert!(visible(&pool, b).await.is_empty(), "B does not");
+}

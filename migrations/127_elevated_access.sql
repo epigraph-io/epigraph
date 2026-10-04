@@ -57,14 +57,22 @@
 -- Migration 125 ships `epigraph_elevated_access_ready()` answering false, so
 -- NO session is live until one migration of the stack opens it. This file
 -- installs the recorder, which is ONE of the conditions that opening waits on
--- (125's header, "OPENING IT WAITS ON MORE THAN THE RECORDER"). The others
--- are NOT met at this migration: whether an elevated session reads
--- operator-hidden (pinned) evidence is unsettled (its default, hide it, is not
--- built), and the API does not yet refuse elevated non-GET requests. So this
--- file does NOT replace the gate: after it, exactly as before it, no session
--- is live on any database. The opening moves to the stack's last migration
--- (the elevation plan's EL-8, binding). `recall_events` IS in the attribution
--- set here, which is the third condition.
+-- (125's header, "OPENING IT WAITS ON MORE THAN THE RECORDER"):
+--   (1) operator-hidden (pinned) evidence: SETTLED by the operator, as an
+--       INTERIM ruling ("for now"): an elevated session that reads claims MAY
+--       read their evidence, pinned rows included, so no hide predicate is
+--       added to 126's `evidence_elevated_read`. What the ruling requires is
+--       here: `evidence` is in the attribution set, so an elevated read of a
+--       pinned row is recorded against its owning group (the hiding
+--       operator's), whose admin reads the log row. A later ruling may
+--       restore hiding (a per-row definer predicate in the read arm; a plain
+--       `NOT EXISTS (pin)` would be a no-op, since the application role
+--       reads no pin);
+--   (2) the API refusing elevated non-GET requests: NOT built yet;
+--   (3) `recall_events` in the attribution set: here.
+-- (2) is unmet, so this file does NOT replace the gate: after it, exactly as
+-- before it, no session is live on any database. The opening moves to the
+-- stack's last migration (the elevation plan's EL-8, binding).
 --
 -- ===================================================================
 -- 3. REFUSALS

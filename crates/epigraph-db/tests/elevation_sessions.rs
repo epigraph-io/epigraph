@@ -2045,8 +2045,7 @@ async fn no_session_is_live_while_the_recorder_gate_is_closed(pool: PgPool) {
         !shipped,
         "125 ships the gate closed and 127 (the recorder) leaves it closed. A change that \
          opens it must ALSO, in the same or an earlier change: (1) settle elevated reads of operator-hidden (pinned) evidence \
-         (default: hidden, by a definer predicate in evidence_elevated_read plus the hide \
-         tool's exemption and the 126 undo); (2) refuse elevated non-GET API requests (with \
+         (settled for now by the operator: readable, and recorded for the row's owner, 127); (2) refuse elevated non-GET API requests (with \
          an allowlist) or measure that no route writes on an elevated read; (3) record \
          recall_events accesses by owner group (127 does); and declare the recorder only \
          where it is wired. See 125's header, OPENING IT WAITS ON MORE THAN THE RECORDER."

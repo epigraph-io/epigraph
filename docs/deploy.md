@@ -1897,12 +1897,18 @@ over the ids its response named. A live ADMIN member of a named group reads
 the row; holders of a `reads_audit` role read the whole log through
 `epigraph_elevated_access_audit`. Append-only for every login.
 
+**Operator-hidden evidence (interim ruling).** An elevated session that
+reads claims may read their evidence, rows hidden with `epigraph-operator
+hide-evidence` included ("for now"; revisit before a second person is
+invited). Every such read is recorded against the hidden row's owning group
+(the hiding operator's), whose admin sees it in the log.
+
 **It does NOT open the gate.** 125's gate waits on more than the log (125's
-header, "OPENING IT WAITS ON MORE THAN THE RECORDER"): a ruling on elevated
-reads of operator-hidden evidence, and an API refusal of elevated non-GET
-requests, are not built at 127. So after 127, as before it, no session is
-live on any database, and every recorder call is refused (`ELV07`) because
-no connection is elevated. The opening is a later migration of this stack.
+header, "OPENING IT WAITS ON MORE THAN THE RECORDER"): the API refusal of
+elevated non-GET requests is not built at 127. So after 127, as before it,
+no session is live on any database, and every recorder call is refused
+(`ELV07`) because no connection is elevated. The opening is a later
+migration of this stack.
 
 1. **Migrate 127** (`epigraph-migrate`, migration DSN), after 126. One new
    table (FORCE row security, the application role reads only), its two guard

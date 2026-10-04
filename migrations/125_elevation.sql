@@ -66,9 +66,9 @@
 -- closed every elevated arm is inert, so several decisions are safe only
 -- because of it. The migration that opens the gate may do so only once the
 -- same or an earlier change has: (1) settled whether an elevated session
--- reads operator-hidden (pinned) evidence, by default NOT (a per-row definer
--- predicate in `evidence_elevated_read`, with the operator hide tool's
--- policy exemption and the 126 undo updated to match); (2) refused elevated
+-- reads operator-hidden (pinned) evidence (settled by the operator, for now:
+-- it MAY, and every such read is recorded where the row's owner sees it; see
+-- migration 127's header); (2) refused elevated
 -- non-GET requests at the API (an explicit allowlist for read-only POSTs), or
 -- measured that no request route turns an elevated read into a write; and
 -- (3) put `recall_events` in the recorder's id-bearing table set, attributed

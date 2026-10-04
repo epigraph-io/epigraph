@@ -2410,3 +2410,65 @@ fn the_server_binary_records_and_declares() {
         "the router must install the recorder layer"
     );
 }
+
+/// The operator's interim ruling (2026-10-04) through the router: an elevated
+/// read of a claim's evidence returns the operator-HIDDEN (pinned) evidence
+/// row too, and that read is recorded against the row's owning group (the
+/// hiding operator H's), which H reads; the claim's author B does not.
+/// Calibration: P unelevated does not see the pinned row.
+///
+/// Verified to fail with `public.evidence` removed from the recorder's
+/// attribution (the row names no group).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_of_pinned_evidence_is_recorded_for_its_owner(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "el8-pin-b").await;
+    let (h, h_group) = fixture::seed_agent_with_group(&pool, "el8-pin-h").await;
+    let claim = fixture::seed_public_claim(&pool, b, "el8 public claim, hidden evidence").await;
+    let evidence = fixture::seed_evidence(&pool, claim, "observation").await;
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'el8 test: hidden by the operator')",
+    )
+    .bind(evidence)
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("pin");
+    sqlx::query("UPDATE evidence SET owner_group_id = $2, visibility = 'group' WHERE id = $1")
+        .bind(evidence)
+        .bind(h_group)
+        .execute(&pool)
+        .await
+        .expect("hide");
+    let session = elevate(&pool, &s, &p).await;
+    let scopes = ["claims:read", "evidence:read"];
+    let path = format!("/api/v1/claims/{claim}/evidence");
+
+    let (status, body) = s.get(&path, &s.scoped_token(&p, None, &scopes)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !ids(&body).contains(&evidence.to_string()),
+        "CALIBRATION: unelevated, the pinned row is hidden: {body}"
+    );
+    assert!(log_of(&pool).await.is_empty());
+
+    let (status, body) = s
+        .get(&path, &s.scoped_token(&p, Some(session), &scopes))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        ids(&body).contains(&evidence.to_string()),
+        "the elevated read returns the pinned row (the ruling): {body}"
+    );
+    let log = log_of(&pool).await;
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(
+        log[0].2,
+        vec![h_group],
+        "attributed to the pinned row's owner"
+    );
+    assert_eq!(log_seen_by(&pool, h).await, 1, "H reads it");
+    assert_eq!(log_seen_by(&pool, b).await, 0, "B does not");
+}

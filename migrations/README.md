@@ -1001,8 +1001,11 @@ Current reservation:
   `epigraph_elevated_access_audit(since, limit)` serves `reads_audit` holders,
   an elevated session and privileged sessions (123's audit-reader pattern).
   The recorder gate (`epigraph_elevated_access_ready()`, 125) is NOT opened:
-  the other opening conditions in 125's header are not met at 127, so no
-  session is live after it either. Registers: the census EXCLUDED list, the
+  of the opening conditions in 125's header, pinned evidence is settled (the
+  operator's interim ruling: an elevated session may read it, and the read is
+  recorded for the row's owner) and `recall_events` is attributed here, but
+  the API refusal of elevated non-GET requests is not built, so no session is
+  live after 127 either. Registers: the census EXCLUDED list, the
   FORCE registers (state.rs, locked_decisions, rls_enforcement, 079-undo),
   rls_enforcement's session helpers. Behaviour in
   `epigraph-db/tests/elevated_access.rs`. Checked before claiming: no open PR
