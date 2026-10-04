@@ -1542,6 +1542,76 @@ async fn no_other_grant_mints_elv_even_while_the_family_is_elevated(pool: PgPool
     assert_eq!(sc.elv, None);
 }
 
+/// `platform:admin` is minted ONLY by the elevate grant (review cp1: until the
+/// admin-scope chokepoints exist, nothing stripped it from the other grants,
+/// so a client whose `granted_scopes` held it would mint it on a code
+/// exchange or a refresh and pre-arm any later check of it). A client holding
+/// it gets neither a code-exchange token nor a refreshed token carrying it,
+/// and neither response's `scope` names it; its other scope survives. The
+/// auth crate's constant is the core crate's.
+///
+/// Mutations: the refresh site's strip dropped -> the refresh response's
+/// `scope` names it (the token itself is still stripped by
+/// `issue_access_token`, whose own mutation the auth crate's unit test
+/// catches); the code-exchange site's strip dropped -> that response names it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_grant_but_elevate_mints_platform_admin(pool: PgPool) {
+    use base64::Engine as _;
+    assert_eq!(
+        epigraph_auth::ELEVATED_ONLY_SCOPE,
+        epigraph_core::canonical_scopes::PLATFORM_ADMIN_SCOPE
+    );
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    grant_scopes(&pool, &p, &["claims:read", "platform:admin"]).await;
+    let code = format!("code_{}", Uuid::new_v4().simple());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(VERIFIER.as_bytes()));
+    epigraph_db::repos::authorization_code::AuthorizationCodeRepository::create(
+        &pool,
+        blake3::hash(code.as_bytes()).as_bytes(),
+        &p.client_id,
+        p.client,
+        REDIRECT_URI,
+        &challenge,
+        &["claims:read".to_string(), "platform:admin".to_string()],
+        None,
+        chrono::Utc::now() + Duration::minutes(5),
+    )
+    .await
+    .expect("seed code");
+    let (status, first) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": p.client_id,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "code exchange: {first}");
+    let (status, refreshed) = s
+        .post(
+            "/oauth/token",
+            None,
+            &json!({"grant_type": "refresh_token", "refresh_token": first["refresh_token"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "refresh: {refreshed}");
+    for (what, body) in [("code exchange", &first), ("refresh", &refreshed)] {
+        let claims = s
+            .jwt
+            .validate_token(body["access_token"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(claims.scopes, vec!["claims:read"], "{what}: the token");
+        assert_eq!(body["scope"], "claims:read", "{what}: the response");
+    }
+}
+
 // =====================================================================
 // EL-6: what the elevated token's viewer may do through the real router
 // =====================================================================

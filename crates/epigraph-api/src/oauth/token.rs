@@ -587,8 +587,9 @@ async fn handle_client_credentials(
         _ => Duration::minutes(15),
     };
 
-    // Effective scopes = intersection of requested and granted
-    let effective_scopes = {
+    // Effective scopes = intersection of requested and granted, never the
+    // elevation scope (only the elevate grant mints it).
+    let effective_scopes = epigraph_auth::without_elevated_only_scope({
         let granted = &client.granted_scopes;
         match &req.scope {
             Some(requested) => {
@@ -600,7 +601,7 @@ async fn handle_client_credentials(
             }
             None => granted.clone(),
         }
-    };
+    });
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
@@ -793,8 +794,11 @@ async fn handle_refresh_token(
         _ => Duration::minutes(15),
     };
 
-    // Use client's current granted_scopes (may have been updated since refresh token was issued)
-    let effective_scopes = client.granted_scopes.clone();
+    // Use client's current granted_scopes (may have been updated since refresh
+    // token was issued), never the elevation scope (only the elevate grant
+    // mints it).
+    let effective_scopes =
+        epigraph_auth::without_elevated_only_scope(client.granted_scopes.clone());
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
@@ -1056,7 +1060,8 @@ async fn handle_authorization_code(
         "service" => Duration::hours(1),
         _ => Duration::minutes(15),
     };
-    let effective_scopes = row.scopes.clone();
+    // Never the elevation scope (only the elevate grant mints it).
+    let effective_scopes = epigraph_auth::without_elevated_only_scope(row.scopes.clone());
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
     // their next token, and so all four mint sites share one code path.

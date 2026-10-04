@@ -107,9 +107,11 @@ pub const ADMIN_ONLY_SCOPES: &[&str] = &[
 /// Deliberately NOT in [`ADMIN_ONLY_SCOPES`] and in no canonical role or
 /// registration set. Nothing checks it yet: what an elevated request may do is
 /// decided by the live elevation session the token names (`elv`), re-checked
-/// by the database, not by this string. Until the mint chokepoint (a later
-/// batch) strips it from every other grant, an operator must not write it
-/// into a client's `granted_scopes`.
+/// by the database, not by this string. Every other grant strips it
+/// (`epigraph_auth::JwtConfig::issue_access_token` drops it from any token
+/// that names no elevation, and the token endpoint's grants leave it out of
+/// their response), so a client whose `granted_scopes` holds it mints it
+/// nowhere but the elevate grant.
 pub const PLATFORM_ADMIN_SCOPE: &str = "platform:admin";
 
 /// Read scopes. These are included in all three roles.

@@ -172,14 +172,15 @@ pub async fn provision_external_user(
     let client = provision_external_user_client(state, provider, identity).await?;
 
     let ttl = Duration::hours(1);
-    let effective_scopes = match requested_scope {
+    // Never the elevation scope (only the elevate grant mints it).
+    let effective_scopes = epigraph_auth::without_elevated_only_scope(match requested_scope {
         Some(req) => req
             .split(' ')
             .map(|s| s.to_string())
             .filter(|s| client.granted_scopes.contains(s))
             .collect::<Vec<_>>(),
         None => client.granted_scopes.clone(),
-    };
+    });
 
     // The FOURTH token-mint site (the other three are in oauth/token.rs). It
     // previously passed literal `None` for both owner_id and agent_id, so every

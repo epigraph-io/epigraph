@@ -109,6 +109,22 @@ impl AccessTokenBinding {
     }
 }
 
+/// The scope ONLY an elevated access token carries (elevation plan EL-5):
+/// `epigraph_core::canonical_scopes::PLATFORM_ADMIN_SCOPE`, spelled here
+/// because this crate does not depend on `epigraph-core` (a test in
+/// `epigraph-api` pins the two equal).
+pub const ELEVATED_ONLY_SCOPE: &str = "platform:admin";
+
+/// `scopes` without [`ELEVATED_ONLY_SCOPE`]: what any grant but the elevate
+/// grant may mint, whatever a client's `granted_scopes` hold. The token
+/// endpoint's grants build their response's `scope` with it, so the response
+/// names exactly what [`JwtConfig::issue_access_token`] puts in the token.
+#[must_use]
+pub fn without_elevated_only_scope(mut scopes: Vec<String>) -> Vec<String> {
+    scopes.retain(|s| s != ELEVATED_ONLY_SCOPE);
+    scopes
+}
+
 pub struct JwtConfig {
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
@@ -137,6 +153,14 @@ impl JwtConfig {
         ttl: Duration,
         binding: AccessTokenBinding,
     ) -> Result<(String, Uuid), jsonwebtoken::errors::Error> {
+        // THE MINT CHOKEPOINT for the elevation scope: only a token that
+        // names an elevation (the elevate grant's) may carry it, whatever the
+        // caller asked for.
+        let scopes = if binding.elevation_id.is_some() {
+            scopes
+        } else {
+            without_elevated_only_scope(scopes)
+        };
         let now = Utc::now();
         let jti = Uuid::new_v4();
         let claims = EpiGraphClaims {
@@ -235,6 +259,49 @@ pub fn check_scopes(auth: &AuthContext, required: &[&str]) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `platform:admin` reaches a token ONLY with an elevation claim: a token
+    /// minted without `elv` loses it whatever scopes it was asked for (so no
+    /// client whose `granted_scopes` holds it can pre-arm a later check of
+    /// it), and a token minted with `elv` keeps it. Other scopes pass
+    /// through in order. Mutation: the strip dropped from
+    /// `issue_access_token` -> the unelevated token carries it.
+    #[test]
+    fn only_an_elevated_token_carries_the_elevation_scope() {
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let asked = vec![
+            "claims:read".to_string(),
+            ELEVATED_ONLY_SCOPE.to_string(),
+            "claims:write".to_string(),
+        ];
+        let mint = |binding: AccessTokenBinding| {
+            let (token, _) = cfg
+                .issue_access_token(
+                    Uuid::new_v4(),
+                    asked.clone(),
+                    "human",
+                    None,
+                    Some(Uuid::new_v4()),
+                    Duration::minutes(5),
+                    binding,
+                )
+                .unwrap();
+            cfg.validate_token(&token).unwrap().scopes
+        };
+        let fam = Uuid::new_v4();
+        for binding in [AccessTokenBinding::NONE, AccessTokenBinding::family(fam)] {
+            assert_eq!(mint(binding), vec!["claims:read", "claims:write"]);
+        }
+        let elevated = AccessTokenBinding {
+            family_id: Some(fam),
+            elevation_id: Some(Uuid::new_v4()),
+        };
+        assert_eq!(mint(elevated), asked);
+        assert_eq!(
+            without_elevated_only_scope(asked.clone()),
+            vec!["claims:read", "claims:write"]
+        );
+    }
 
     #[test]
     fn jwt_roundtrip() {
