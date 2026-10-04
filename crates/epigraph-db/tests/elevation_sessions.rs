@@ -1978,6 +1978,11 @@ async fn elevation_live_is_principal_bound(pool: PgPool) {
 /// Verified to fail with the gate's conjunct dropped from
 /// `epigraph_elevation_session_is_live` (the session is elevated, and reads B's
 /// row, behind the closed gate), and with the gate shipped `true`.
+///
+/// THE CHANGE THAT OPENS THE GATE REWRITES THIS TEST, and must first meet the
+/// preconditions 125's header lists under "OPENING IT WAITS ON MORE THAN THE
+/// RECORDER" (review cp3: SEC-01); the closed-gate assertion below repeats
+/// them, so whoever flips it reads them.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_session_is_live_until_the_access_recorder_is_installed(pool: PgPool) {
     let h = holder_behind_a_closed_gate(&pool, "gate-holder", 1).await;
@@ -2034,7 +2039,16 @@ async fn no_session_is_live_until_the_access_recorder_is_installed(pool: PgPool)
         .fetch_one(&pool)
         .await
         .expect("the gate");
-    assert!(!shipped, "125 ships the gate closed");
+    assert!(
+        !shipped,
+        "125 ships the gate closed. A change that opens it must ALSO, in the same or an \
+         earlier change: (1) settle elevated reads of operator-hidden (pinned) evidence \
+         (default: hidden, by a definer predicate in evidence_elevated_read plus the hide \
+         tool's exemption and the 126 undo); (2) refuse elevated non-GET API requests (with \
+         an allowlist) or measure that no route writes on an elevated read; (3) record \
+         recall_events accesses by owner group; and declare the recorder only where it is \
+         wired. See 125's header, OPENING IT WAITS ON MORE THAN THE RECORDER."
+    );
 
     fixture::open_elevated_access_gate(&pool).await;
     assert!(

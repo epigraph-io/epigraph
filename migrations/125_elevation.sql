@@ -60,6 +60,20 @@
 -- after it (every embedded migration, in version order) widens nothing. The
 -- recorder's migration replaces that function; nothing else may.
 --
+-- OPENING IT WAITS ON MORE THAN THE RECORDER (review cp3). While the gate is
+-- closed every elevated arm is inert, so several decisions are safe only
+-- because of it. The migration that opens the gate may do so only once the
+-- same or an earlier change has: (1) settled whether an elevated session
+-- reads operator-hidden (pinned) evidence, by default NOT (a per-row definer
+-- predicate in `evidence_elevated_read`, with the operator hide tool's
+-- policy exemption and the 126 undo updated to match); (2) refused elevated
+-- non-GET requests at the API (an explicit allowlist for read-only POSTs), or
+-- measured that no request route turns an elevated read into a write; and
+-- (3) put `recall_events` in the recorder's id-bearing table set, attributed
+-- to its owner group. Before the first real elevation, also: the offline
+-- confirmation verifier, and the check that only request units hold the
+-- application DSN (section 2, WHAT THE TABLE CANNOT PROVE).
+--
 -- THE SECOND KEY: THE SERVING PROCESS RECORDS. The gate is opened by a
 -- migration, but the recorder lives in the binaries (the API's response
 -- layer, the MCP tool-call wrapper), and a database function cannot tell
