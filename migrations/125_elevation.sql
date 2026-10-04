@@ -46,9 +46,11 @@
 --
 -- NEVER ON A PRIVILEGED LOGIN. No session is live to a login that skips row
 -- security (a superuser, a BYPASSRLS role) or passes `epigraph_bypass()` (a
--- maintenance member): there no row policy would narrow an elevated read,
--- and no refusal would stop a write decided on it. A request unit on such a
--- DSN therefore never elevates, whatever the operator binding's arming state.
+-- maintenance member), nor to a connection switched to such a role (`SET
+-- ROLE`, a DSN role option, a per-login default role): there no row policy
+-- would narrow an elevated read, and no refusal would stop a write decided on
+-- it. A request unit on such a DSN therefore never elevates, whatever the
+-- operator binding's arming state.
 --
 -- NOT BEFORE THE PER-ACCESS RECORDER. An elevated read of someone else's row
 -- must be recorded, fail-closed, where the row's owner can read it; that
@@ -309,7 +311,15 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_elevated_access_ready() FROM PUBLIC;
 -- is live to such a login, whatever the session's own state and whatever
 -- the arming state of the operator binding. The test is on `session_user`
 -- (the LOGIN, which `SET SESSION AUTHORIZATION` moves and a definer frame
--- does not), never `current_user` (this function's owner).
+-- does not), never `current_user` (this function's owner), AND on the
+-- session's `role` setting: PostgreSQL decides the row-security bypass on the
+-- role a connection RUNS AS, and an unprivileged login switched to a
+-- BYPASSRLS or superuser role (`SET ROLE`, a DSN's `options=-c role=...`, a
+-- per-login `ALTER ROLE ... SET role`) skips every policy just as a
+-- privileged login does. The setting names the outer role inside a definer
+-- frame too, and reads 'none' (no role is named that) when nothing switched.
+-- A switch to a maintenance member needs the login to be one already, which
+-- `epigraph_bypass()` sees.
 CREATE OR REPLACE FUNCTION public.epigraph_elevation_session_is_live(p_session uuid)
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -317,7 +327,7 @@ SET search_path = public, pg_temp AS $$
     SELECT public.epigraph_elevated_access_ready()
        AND NOT public.epigraph_bypass()
        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
-                        WHERE r.rolname = session_user
+                        WHERE r.rolname IN (session_user, current_setting('role'))
                           AND (r.rolsuper OR r.rolbypassrls))
        AND EXISTS (
         SELECT 1

@@ -2085,12 +2085,33 @@ async fn elevation_seen_by_login(
     h: &Holder,
     session: Uuid,
 ) -> (bool, Vec<Uuid>, String) {
+    let (is, live, who, _) = elevation_seen_by(pool, login, None, h, session).await;
+    (is, live, who)
+}
+
+/// [`elevation_seen_by_login`], with the connection then switched to `role`
+/// by `SET ROLE` (what a DSN's `options=-c role=...` or a per-login default
+/// `ALTER ROLE <login> SET role` does at connect): `current_user`, and so the
+/// row-security decision, is `role`'s while `session_user` stays the login.
+/// Also returns the `current_user` the database saw.
+async fn elevation_seen_by(
+    pool: &PgPool,
+    login: Option<&str>,
+    role: Option<&str>,
+    h: &Holder,
+    session: Uuid,
+) -> (bool, Vec<Uuid>, String, String) {
     use sqlx::Executor;
     let mut conn = pool.acquire().await.expect("acquire");
-    if let Some(role) = login {
-        conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+    if let Some(login) = login {
+        conn.execute(format!("SET SESSION AUTHORIZATION {login}").as_str())
             .await
             .expect("SET SESSION AUTHORIZATION");
+    }
+    if let Some(role) = role {
+        conn.execute(format!("SET ROLE {role}").as_str())
+            .await
+            .expect("SET ROLE");
     }
     sqlx::query(
         "SELECT set_config('epigraph.principal_id', $1, false), \
@@ -2105,10 +2126,11 @@ async fn elevation_seen_by_login(
     .execute(&mut *conn)
     .await
     .expect("stamp");
-    let who: String = sqlx::query_scalar("SELECT session_user::text")
-        .fetch_one(&mut *conn)
-        .await
-        .expect("session_user");
+    let (who, current): (String, String) =
+        sqlx::query_as("SELECT session_user::text, current_user::text")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("session_user");
     let is: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
         .fetch_one(&mut *conn)
         .await
@@ -2128,12 +2150,15 @@ async fn elevation_seen_by_login(
     .execute(&mut *conn)
     .await
     .expect("unstamp");
+    if role.is_some() {
+        conn.execute("RESET ROLE").await.expect("RESET ROLE");
+    }
     if login.is_some() {
         conn.execute("RESET SESSION AUTHORIZATION")
             .await
             .expect("RESET SESSION AUTHORIZATION");
     }
-    (is, live, who)
+    (is, live, who, current)
 }
 
 /// A PRIVILEGED LOGIN NEVER HOLDS AN ELEVATION (review cp2: SEC-02, COR-1).
@@ -2206,6 +2231,89 @@ async fn a_privileged_login_is_never_elevated(pool: PgPool) {
         status, "issued",
         "CALIBRATION: the application role redeems the same ticket"
     );
+}
+
+/// A login that is not privileged itself but whose connection RUNS AS a role
+/// that skips row security (review cp3: SEC-02). PostgreSQL decides the
+/// row-security bypass on `current_user`, so a `SET ROLE` to a BYPASSRLS role
+/// (or a DSN's `options=-c role=...`, or `ALTER ROLE <login> SET role`, which
+/// set the same `role` setting at connect) skips every row policy and every
+/// RESTRICTIVE refusal exactly as a privileged login does. The liveness test
+/// therefore reads the session's `role` setting as well as `session_user`
+/// (the setting survives the definer frame; `current_user` there is the
+/// function's owner). The same login without the switch is elevated (the
+/// calibration that the refusal is the switch's).
+///
+/// Verified to fail with the liveness test back on `session_user` alone: the
+/// switched connection is elevated and `elevation_live` answers it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_connection_switched_to_a_privileged_role_is_never_elevated(pool: PgPool) {
+    let h = holder(&pool, "role-switch", 1).await;
+    let session = elevated(&pool, &h).await;
+    bypassrls_probe_role(&pool).await;
+    role_switch_probe_login(&pool).await;
+
+    let (is, live, who, current) =
+        elevation_seen_by(&pool, Some(ROLE_SWITCH_PROBE), None, &h, session).await;
+    assert_eq!(
+        (who.as_str(), current.as_str()),
+        (ROLE_SWITCH_PROBE, ROLE_SWITCH_PROBE),
+        "CALIBRATION: the probe login runs as itself"
+    );
+    assert!(
+        is,
+        "CALIBRATION: the unprivileged probe login is elevated by this session"
+    );
+    assert_eq!(
+        live,
+        vec![session],
+        "CALIBRATION: elevation_live answers the unprivileged probe login"
+    );
+
+    let (is, live, who, current) = elevation_seen_by(
+        &pool,
+        Some(ROLE_SWITCH_PROBE),
+        Some(BYPASSRLS_PROBE),
+        &h,
+        session,
+    )
+    .await;
+    assert_eq!(
+        (who.as_str(), current.as_str()),
+        (ROLE_SWITCH_PROBE, BYPASSRLS_PROBE),
+        "CALIBRATION: the login is unchanged and the connection runs as the BYPASSRLS role"
+    );
+    assert!(
+        !is,
+        "a connection running as a BYPASSRLS role is never elevated, whatever its login"
+    );
+    assert!(
+        live.is_empty(),
+        "elevation_live answers no session to a connection running as a BYPASSRLS role: {live:?}"
+    );
+}
+
+/// An UNPRIVILEGED login (a member of `epigraph_app`, so it may call what the
+/// application role calls) that is also a member of [`BYPASSRLS_PROBE`], so it
+/// may `SET ROLE` to it. NOLOGIN, reached by `SET SESSION AUTHORIZATION`;
+/// created once per cluster, tolerating a concurrent creator.
+const ROLE_SWITCH_PROBE: &str = "elevation_test_role_switch";
+
+async fn role_switch_probe_login(pool: &PgPool) {
+    sqlx::query(&format!(
+        "DO $$ BEGIN \
+             CREATE ROLE {ROLE_SWITCH_PROBE} NOLOGIN; \
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
+    ))
+    .execute(pool)
+    .await
+    .expect("the role-switch probe login");
+    sqlx::query(&format!(
+        "GRANT epigraph_app, {BYPASSRLS_PROBE} TO {ROLE_SWITCH_PROBE}"
+    ))
+    .execute(pool)
+    .await
+    .expect("the probe login's memberships");
 }
 
 /// `epigraph_redeem_elevation_ticket` on a connection logged in as `login`

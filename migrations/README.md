@@ -922,8 +922,10 @@ Current reservation:
   shared by `epigraph_is_elevated`, `epigraph_elevation_live` and the
   grant-mode redemption, judged on the statement's clock and re-checking the
   assignment, the family and its client, and the passkey; never live on a
-  privileged login (a superuser, a BYPASSRLS role or a maintenance member),
-  and never before the recorder gate opens. FORCE RLS on
+  privileged login (a superuser, a BYPASSRLS role or a maintenance member)
+  nor on a connection switched to a superuser or BYPASSRLS role (the
+  session's `role` setting; review cp3), and never before the recorder gate
+  opens. FORCE RLS on
   both: the application role keeps SELECT but its policies show it no row,
   and it holds no DML. App-callable definers: `epigraph_create_elevation_ticket`
   (principal-bound), `epigraph_ticket_for_ceremony`,

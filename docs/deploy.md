@@ -1737,8 +1737,13 @@ nothing (`begin_as` refuses it: HTTP 403 `ELEVATED READ-ONLY`, MCP
 
 **A unit on a privileged DSN never elevates.** Migration 125 answers "no live
 session" to a login that skips row security (a superuser or a BYPASSRLS role)
-or is a member of `epigraph_maintenance`, so such a unit serves every elevated
-token with the principal's ordinary scoped viewer. That holds whether or not
+or is a member of `epigraph_maintenance`, and to a connection that RUNS AS a
+superuser or BYPASSRLS role through a role switch (`SET ROLE`, a DSN's
+`options=-c role=...`, or a per-login `ALTER ROLE <login> SET role`), so such a
+unit serves every elevated token with the principal's ordinary scoped viewer.
+The boot posture checks (`epigraph_bypass()`, the row-security probe) read the
+LOGIN only, so they do not flag a role switch; elevation refuses it anyway, and
+a request DSN should carry no role switch at all. That holds whether or not
 the operator binding is armed: without it, the always-true elevated fragment
 on a login no row policy narrows would read, and decide writes on, every
 tenant's rows. Elevation is therefore only ever served by a unit on the
