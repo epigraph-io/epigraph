@@ -1579,3 +1579,98 @@ async fn an_elevated_token_reads_and_writes_nothing(pool: PgPool) {
     let (status, body) = s.get(&format!("/api/v1/claims/{mine}"), &elevated).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+// =====================================================================
+// EL-7: what the elevated token reads through the real router once
+// migration 126's arms are in
+// =====================================================================
+
+fn ids(v: &Value) -> Vec<String> {
+    let items = v
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|i| i.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
+/// A REPRESENTATIVE read set through the real router (plan EL-7: one list and
+/// one by-id route per armed class the REST surface stamps): the claim by id
+/// and in a list (T-OWN), its evidence (T-OWN, derived by 070), and an edge
+/// between two of B's private claims (T-EDGE). The elevated token reads B's
+/// private row on each, served 200 with no `ELEVATED READ-ONLY`, so no read
+/// route here writes on the elevated connection; the same principal's
+/// unelevated token reads none of them (the calibration that the rows ARE
+/// private to P).
+///
+/// Verified to fail with each of 126's `claims_elevated_read`,
+/// `evidence_elevated_read` and `edges_elevated_read` made USING (false) (the
+/// elevated token no longer reads that row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_token_reads_foreign_private_rows_through_the_router(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "el7-b").await;
+    let claim = fixture::seed_group_claim(&pool, b, b_group, "zentrovium private claim").await;
+    let other = fixture::seed_group_claim(&pool, b, b_group, "zentrovium other claim").await;
+    let evidence = fixture::seed_evidence(&pool, claim, "observation").await;
+    let edge = fixture::seed_edge(&pool, claim, other).await;
+    let (_, t) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let scopes = ["claims:read", "edges:read", "evidence:read"];
+    let elevated = s.scoped_token(&p, Some(session), &scopes);
+    let plain = s.scoped_token(&p, None, &scopes);
+
+    let reads: [(&str, String, Uuid); 4] = [
+        ("claim by id", format!("/api/v1/claims/{claim}"), claim),
+        (
+            "claim list",
+            "/claims?search=zentrovium&limit=100".to_string(),
+            claim,
+        ),
+        (
+            "claim evidence",
+            format!("/api/v1/claims/{claim}/evidence"),
+            evidence,
+        ),
+        (
+            "edge list",
+            format!("/api/v1/edges?source_id={claim}"),
+            edge,
+        ),
+    ];
+    for (what, path, want) in &reads {
+        let (status, body) = s.get(path, &elevated).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{what}: an elevated read is served: {body}"
+        );
+        assert!(!refused_as_elevated(&body), "{what}: {body}");
+        let seen = if *what == "claim by id" {
+            body.get("id").and_then(Value::as_str).map(str::to_string) == Some(want.to_string())
+        } else {
+            ids(&body).contains(&want.to_string())
+        };
+        assert!(
+            seen,
+            "{what}: the elevated token reads B's private row: {body}"
+        );
+
+        let (status, body) = s.get(path, &plain).await;
+        let seen = status == StatusCode::OK
+            && (body.get("id").and_then(Value::as_str) == Some(&want.to_string())
+                || ids(&body).contains(&want.to_string()));
+        assert!(
+            !seen,
+            "{what}: CALIBRATION: P unelevated does not read B's private row ({status}): {body}"
+        );
+    }
+}

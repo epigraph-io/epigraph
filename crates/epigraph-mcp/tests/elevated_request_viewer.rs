@@ -283,3 +283,149 @@ async fn stdio_never_elevates(pool: PgPool) {
     );
     assert!(!stdio.is_elevated(), "stdio must never resolve elevated");
 }
+
+// =====================================================================
+// EL-7: an elevated request's reads through the tool path
+// =====================================================================
+
+fn recall_params(query: &str) -> epigraph_mcp::types::RecallParams {
+    epigraph_mcp::types::RecallParams {
+        query: query.to_string(),
+        min_truth: Some(0.0),
+        limit: Some(10),
+        tags: vec![],
+        agent_id: None,
+        frame_id: None,
+        perspective_id: None,
+        include_workflows: false,
+        exclude_contested: false,
+        since: None,
+        theme_id: None,
+        theme_label: None,
+        offset: None,
+        epistemic_partition: false,
+        diversity_radius: None,
+    }
+}
+
+/// An ELEVATED request's read tools are served (no `ElevatedReadOnly`), and
+/// the one read tool the read-path write census flags, `recall`, still writes
+/// its audit row: that write runs detached, on a transaction stamped from the
+/// principal's own SCOPED viewer (`tools::recall::write_recall_audit`), so
+/// migration 126's refusal on `recall_events` and `begin_as`'s elevated
+/// refusal never meet it. The row is attributed to the elevated principal.
+///
+/// Verified to fail with the audit gated on a write transaction opened for
+/// the REQUEST's (elevated) viewer in `tools::memory::recall` (`begin_as`
+/// refuses it with `ElevatedReadOnly`, and the audit row never lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_read_is_served_and_its_recall_audit_lands(pool: PgPool) {
+    let (p, p_group) = fixture::seed_human_operator(&pool, "mcp-el7-p").await;
+    let (client, family) = make_holder(&pool, p, 4).await;
+    let live = session(&pool, p, client, family, 4, "grant").await;
+    let mine = fixture::seed_group_claim(&pool, p, p_group, "quorvalium elevated fixture").await;
+    let server = app_server(&pool).await;
+    let v = request_viewer(&server, Some(&http_auth(p, client, family, Some(live))))
+        .await
+        .expect("viewer");
+    assert!(v.is_elevated(), "CALIBRATION: the request is elevated");
+
+    epigraph_mcp::tools::claims::get_claim(
+        &server,
+        &v,
+        epigraph_mcp::types::GetClaimParams {
+            claim_id: mine.to_string(),
+            frame_id: None,
+            perspective_id: None,
+        },
+    )
+    .await
+    .expect("an elevated get_claim is served");
+    epigraph_mcp::tools::memory::recall(&server, &v, recall_params("quorvalium"))
+        .await
+        .expect("an elevated recall is served");
+
+    let mut landed = 0_i64;
+    for _ in 0..100 {
+        landed = sqlx::query_scalar(
+            "SELECT count(*) FROM recall_events WHERE agent_id = $1 AND query_text = 'quorvalium'",
+        )
+        .bind(p)
+        .fetch_one(&pool)
+        .await
+        .expect("audit count");
+        if landed > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        landed, 1,
+        "the elevated recall's audit row lands, attributed to the principal"
+    );
+}
+
+/// PINNED GAP (hand-off to the `sudo` and acceptance batches): the MCP read
+/// tools read on the server's UNSTAMPED pool with the viewer's fragment, so on
+/// the application role an elevated request is NOT widened by migration 126:
+/// the arm needs the elevation settings stamped on the connection, and these
+/// reads stamp nothing (RLS then admits public rows only). An elevated
+/// `get_claim` of another person's private claim therefore answers "not
+/// found" today. Calibrations: the same server serves a public claim to the
+/// same viewer, and an application connection stamped from the same elevated
+/// viewer DOES read that private claim through the arm. Plan §6.2's "after
+/// sudo reads all" over MCP needs the MCP reads stamped first; flip this test
+/// when they are.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mcp_reads_are_not_widened_by_the_arms_until_they_are_stamped(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "mcp-el7-gap-p").await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "mcp-el7-gap-b").await;
+    let (client, family) = make_holder(&pool, p, 5).await;
+    let live = session(&pool, p, client, family, 5, "grant").await;
+    let theirs = fixture::seed_group_claim(&pool, b, b_group, "B's private claim").await;
+    let public = fixture::seed_public_claim(&pool, b, "B's public claim").await;
+
+    let scoped = ScopedPool::connect_downgraded_for_tests(
+        &fixture::database_url_for(&pool).await,
+        SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let app_pool = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let server = build_scoped_test_server(app_pool, scoped.clone());
+    let v = request_viewer(&server, Some(&http_auth(p, client, family, Some(live))))
+        .await
+        .expect("viewer");
+    assert!(v.is_elevated(), "CALIBRATION: the request is elevated");
+
+    let get = |id: Uuid| {
+        epigraph_mcp::tools::claims::get_claim(
+            &server,
+            &v,
+            epigraph_mcp::types::GetClaimParams {
+                claim_id: id.to_string(),
+                frame_id: None,
+                perspective_id: None,
+            },
+        )
+    };
+    get(public)
+        .await
+        .expect("CALIBRATION: the tool serves a public claim on this server");
+    assert!(
+        get(theirs).await.is_err(),
+        "the unstamped MCP read does not see a foreign private claim, elevated or not"
+    );
+
+    let mut conn = scoped.acquire_as(&v).await.expect("stamped checkout");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = $1")
+        .bind(theirs)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("stamped read");
+    assert_eq!(
+        n, 1,
+        "CALIBRATION: a connection stamped from the same viewer reads it through the arm"
+    );
+}
