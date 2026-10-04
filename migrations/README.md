@@ -1013,9 +1013,29 @@ Current reservation:
   branch carries a `127`. **Applied to a throwaway database only, NOT to any
   deployed database.**
 
-- **128+**: public next
+- **128** `128_admin_scope_enforcement.sql` (elevation plan EL-9): the
+  ADMIN-SCOPE ARMING SWITCH, shipped UNARMED. `admin_scope_enforcement` (one
+  row, seeded unarmed; no row security, 122's arming-record precedent: the
+  application holds SELECT only, the maintenance role SELECT and UPDATE of
+  `armed` and `reason`). A BEFORE guard (`ADS01`) refuses INSERT and DELETE for
+  every login, refuses an UPDATE that does not change `armed` or carries no
+  reason, and stamps `changed_at` / `changed_by`; an AFTER UPDATE trigger
+  writes `platform.admin_scopes_armed` / `platform.admin_scopes_disarmed` for
+  every change, a direct maintenance statement's too.
+  `epigraph_admin_scopes_armed()` (app-callable) is read by the token
+  endpoint's mint chokepoint, registration, client approval and the operator
+  CLI. `epigraph_set_admin_scope_enforcement(armed, reason)` arms or disarms
+  (maintenance only, `ADS02`). `epigraph_record_admin_scope_would_strip(client,
+  grant, scopes)` (app-callable: `oauth.` is a privileged event prefix since
+  118) records the ROL-11b measurement while unarmed: a fixed grant label,
+  scopes the client holds, at most one event per client per hour (`ADS03`
+  otherwise). Behaviour in `epigraph-db/tests/admin_scope_enforcement.rs`.
+  Checked before claiming: no remote branch carries a `128`. **Applied to a
+  throwaway database only, NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `128` or
+- **129+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `129` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
