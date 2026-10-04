@@ -304,9 +304,14 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, 
 -- THE RECORDER GATE (header, section 1). False until the migration that
 -- installs the per-access elevation recorder replaces this body with its own
 -- readiness test: that migration, and only it, opens elevation. A function,
--- not a row, so no operator statement and no application session can open it
--- (replacing it takes its owner); STABLE, so a replacement is read per
--- statement like every other term of the liveness test.
+-- not a row: replacing it takes CREATE on schema `public` AND its ownership.
+-- The application role owns nothing; a maintenance member has the ownership
+-- half, so what stops an operator statement on the maintenance DSN is that the
+-- DSN is a NON-superuser member with no CREATE on `public` (PUBLIC has none
+-- since PostgreSQL 15; an upgraded cluster may keep the old grant, and
+-- `epigraph-tenancy-backfill verify` fails while one does). STABLE, so a
+-- replacement is read per statement like every other term of the liveness
+-- test.
 CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready()
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER

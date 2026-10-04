@@ -2331,11 +2331,76 @@ async fn residual_for(
 /// `settle_remaining` documents: a `('public', world)` row on those tables is a
 /// correct declaration, not an undeclared one. `edges` is exempt from the
 /// blanket residual but gets the sharper endpoint predicate instead.
+/// No NON-superuser maintenance role may CREATE in schema `public` (review
+/// cp3: SEC-03).
+///
+/// Every definer is owned by `epigraph_maintenance`, migration 125's recorder
+/// gate (`epigraph_elevated_access_ready()`, shipped answering false) among
+/// them. `CREATE OR REPLACE FUNCTION` needs CREATE on the schema AND ownership,
+/// and a member of the owning role has the ownership half, so a maintenance
+/// login that may CREATE in `public` can open the gate (or rewrite the
+/// liveness test) with one statement before the per-access recorder exists.
+/// The barrier is therefore this ACL, not ownership: PUBLIC holds no CREATE on
+/// `public` by default since PostgreSQL 15, but a cluster upgraded from an
+/// older default keeps the old grant. A superuser is not checked: no ACL binds
+/// it, which is why the maintenance DSN must not be the superuser either
+/// (`docs/deploy.md`, the 126 section).
+async fn verify_no_maintenance_create_on_public(pool: &PgPool) -> anyhow::Result<usize> {
+    let role_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(MAINTENANCE_ROLE)
+            .fetch_one(pool)
+            .await?;
+    if !role_exists {
+        // `verify_definer_ownership` already failed on the missing role.
+        return Ok(0);
+    }
+    let public_may_create: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege('public', 'public', 'CREATE')")
+            .fetch_one(pool)
+            .await?;
+    let offenders: Vec<String> = sqlx::query_scalar(
+        "SELECT r.rolname::text FROM pg_roles r
+          WHERE NOT r.rolsuper
+            AND pg_has_role(r.oid, $1, 'MEMBER')
+            AND has_schema_privilege(r.oid, 'public', 'CREATE')
+          ORDER BY 1",
+    )
+    .bind(MAINTENANCE_ROLE)
+    .fetch_all(pool)
+    .await?;
+    if offenders.is_empty() {
+        return Ok(0);
+    }
+    eprintln!(
+        "FAIL: non-superuser role(s) {offenders:?} (members of '{MAINTENANCE_ROLE}') hold CREATE \
+         on schema public{}. A member of the role that owns every definer, migration 125's \
+         recorder gate included, needs only that privilege to replace one, so an operator \
+         statement on the maintenance DSN could open elevation before the per-access recorder \
+         exists. Revoke it: {}.",
+        if public_may_create {
+            " (through PUBLIC: the pre-PostgreSQL-15 default, kept by an upgraded cluster)"
+        } else {
+            ""
+        },
+        if public_may_create {
+            "REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_string()
+        } else {
+            format!(
+                "REVOKE CREATE ON SCHEMA public FROM {}",
+                offenders.join(", ")
+            )
+        }
+    );
+    Ok(1)
+}
+
 async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usize> {
     let mut failures = 0usize;
 
     failures += verify_definer_ownership(pool).await?;
     failures += verify_operator_function_grants(pool).await?;
+    failures += verify_no_maintenance_create_on_public(pool).await?;
 
     // A4. NOT the plan's rationale: an earlier revision of this comment said
     // "the derivation is total, because claims.agent_id is NOT NULL". NOT NULL

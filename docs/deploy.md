@@ -1811,9 +1811,19 @@ no session, and the grant-mode redemption refuses, whatever was applied. A
 ceremony still confirms and audits its session (`platform.elevated`); the
 session just never reads. Only the log's migration opens the gate, by
 replacing that function with its own readiness test; there is no operator
-switch, and the function must not be replaced by hand (replacing it takes its
-owner, so neither the application role nor an operator statement on the
-maintenance DSN can).
+switch, and the function must not be replaced by hand. What stops a hand
+replacement is NOT ownership alone. Replacing a function takes CREATE on its
+schema AND its ownership; the application role owns nothing, but the gate (and
+every elevation definer) is owned by `epigraph_maintenance`, so a member of it
+has the ownership half. The barrier for the maintenance DSN is therefore that
+it is a NON-superuser member of `epigraph_maintenance` holding no CREATE on
+schema `public`. PostgreSQL 15 and later grant PUBLIC no CREATE there; a
+cluster upgraded from an older default keeps the old grant, and a superuser
+(the fallback maintenance login of section 1c-ter, until `epigraph_admin` is
+granted the role) passes every check. Before the first real elevation,
+`epigraph-tenancy-backfill verify` must pass (it fails while a non-superuser
+maintenance role may CREATE in `public`, and names the `REVOKE`), and the
+maintenance DSN must not be the superuser.
 
 **AND THE SERVING BUILD MUST RECORD: two keys, not one.** The gate is opened
 by a migration, but the log is written by the binaries (the API's response
