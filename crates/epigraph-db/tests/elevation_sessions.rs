@@ -2241,6 +2241,81 @@ async fn redeem_as_login(
     status
 }
 
+/// The end's free-text reason (the operator's `end-elevation --reason`,
+/// review cp2: SEC-05) reaches the `platform.elevation_ended` row ONLY from a
+/// privileged login. The maintenance end carries it as `operator_reason`; an
+/// application session that sets the same transaction setting and ends its own
+/// session gets no `operator_reason` (a person cannot annotate their own trail
+/// as if an operator had), and neither does a trigger-driven end.
+///
+/// Verified to fail with the privileged-login condition dropped from the
+/// session audit (the application's text lands as `operator_reason`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_privileged_end_records_an_operator_reason(pool: PgPool) {
+    let h = holder(&pool, "reason-holder", 1).await;
+    let own = elevated(&pool, &h).await;
+    let (ended, _) = as_app(&pool, Some(h.person), "", "", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.elevation_end_reason', 'forged note', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("set");
+        let ended: bool = sqlx::query_scalar("SELECT public.epigraph_end_elevation($1, 'unsudo')")
+            .bind(own)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("end own");
+        sqlx::query("SELECT set_config('epigraph.elevation_end_reason', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("unset");
+        (conn, (ended, ()))
+    })
+    .await;
+    assert!(ended, "CALIBRATION: the person ends their own session");
+    let note = |session: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT details->>'operator_reason' FROM security_events \
+                  WHERE event_type = 'platform.elevation_ended' AND details->>'session_id' = $1",
+            )
+            .bind(session.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("the end row")
+        }
+    };
+    assert_eq!(
+        note(own).await,
+        None,
+        "the application's text is not an operator reason"
+    );
+
+    let other = holder(&pool, "reason-other", 2).await;
+    let theirs = elevated(&pool, &other).await;
+    let ended = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+        sqlx::query("SELECT set_config('epigraph.elevation_end_reason', 'incident drill', true)")
+            .execute(&mut *tx)
+            .await
+            .expect("set");
+        let ended: bool = sqlx::query_scalar("SELECT public.epigraph_end_elevation($1, 'ended')")
+            .bind(theirs)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("maintenance end");
+        tx.commit().await.expect("commit");
+        (conn, ended)
+    })
+    .await;
+    assert!(ended, "CALIBRATION: the maintenance login ends any session");
+    assert_eq!(
+        note(theirs).await.as_deref(),
+        Some("incident drill"),
+        "the privileged end records the operator's reason"
+    );
+}
+
 /// `epigraph_end_elevation` ends only the principal's own session (false,
 /// nothing changed, for another's); a privileged session ends any.
 ///

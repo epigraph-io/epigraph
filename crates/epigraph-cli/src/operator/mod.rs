@@ -53,8 +53,9 @@
 //! * `list-passkeys` / `revoke-passkey` — list them, and the audited
 //!   break-glass revoke (which also ends every live elevation that passkey
 //!   confirmed).
-//! * `end-elevation` — end one live elevation session now, any person's
-//!   (migration 125's privileged end; audited).
+//! * `end-elevation` — end one live elevation session now, or every un-ended
+//!   session of a person, any person's (migration 125's privileged end;
+//!   audited with the required `--reason`); `list-elevations` — find them.
 //!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:

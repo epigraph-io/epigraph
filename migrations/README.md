@@ -936,7 +936,8 @@ Current reservation:
   `epigraph_elevated_access_ready` (ships `false`: no session is live until
   the per-access elevation log's migration replaces it; review cp2).
   Audited from the tables: `platform.elevation_requested`, `_refused`,
-  `platform.elevated`, `platform.elevation_ended`, and
+  `platform.elevated`, `platform.elevation_ended` (carrying the operator's
+  `--reason` as `operator_reason` when a privileged login ended it), and
   `platform.passkey_counter_regressed`. Registered in
   `schema_contract.rs::migration_125_elevation_definers_are_owned_and_granted`,
   `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` (at 125) and the grant

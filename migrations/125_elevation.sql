@@ -589,6 +589,8 @@ CREATE OR REPLACE FUNCTION public.epigraph_elevation_sessions_audit()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
+DECLARE
+    v_note text;
 BEGIN
     IF TG_OP = 'INSERT' THEN
         INSERT INTO public.security_events (event_type, agent_id, success, details)
@@ -601,6 +603,15 @@ BEGIN
                                    'authenticator_id', NEW.authenticator_id,
                                    'started_at', NEW.started_at, 'expires_at', NEW.expires_at));
     ELSIF OLD.ended_at IS NULL AND NEW.ended_at IS NOT NULL THEN
+        -- The operator's free-text WHY (`epigraph-operator end-elevation
+        -- --reason`), carried in the transaction setting
+        -- `epigraph.elevation_end_reason`, is recorded ONLY for a privileged
+        -- ender (`epigraph_bypass()`: the maintenance login): an application
+        -- session may set the same setting, and must not annotate its own end
+        -- as if an operator had.
+        v_note := CASE WHEN public.epigraph_bypass()
+                       THEN NULLIF(btrim(current_setting('epigraph.elevation_end_reason', true)), '')
+                  END;
         INSERT INTO public.security_events (event_type, agent_id, success, details)
         VALUES ('platform.elevation_ended', NEW.person_agent_id, true,
                 jsonb_build_object('session_id', NEW.id, 'person', NEW.person_agent_id,
@@ -608,7 +619,9 @@ BEGIN
                                    'family_id', NEW.family_id,
                                    'ended_reason', NEW.ended_reason, 'ended_by', NEW.ended_by,
                                    'started_at', NEW.started_at, 'expires_at', NEW.expires_at,
-                                   'ended_at', NEW.ended_at));
+                                   'ended_at', NEW.ended_at)
+                || CASE WHEN v_note IS NULL THEN '{}'::jsonb
+                        ELSE jsonb_build_object('operator_reason', v_note) END);
     END IF;
     RETURN NULL;
 END $$;

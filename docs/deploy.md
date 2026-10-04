@@ -1697,9 +1697,12 @@ all until the per-access elevation log's migration opens 125's gate
    (reuse, RFC 7009, a denied refresh, a client-wide revoke), its client
    leaves `active`, or the passkey that confirmed it is revoked
    (`epigraph-operator revoke-passkey` is therefore also the way to end a
-   live elevation that passkey opened). To end one session without taking
-   anything else away, `epigraph-operator end-elevation --session <id>
-   --apply` on the maintenance DSN (audited `platform.elevation_ended`). No
+   live elevation that passkey opened). To end sessions without taking
+   anything else away, `epigraph-operator end-elevation (--session <id> |
+   --person <agent>) --reason <text> --apply` on the maintenance DSN (each
+   end audited `platform.elevation_ended`, the reason as `operator_reason`);
+   `epigraph-operator list-elevations [--person <agent>] [--live]` finds
+   them. No
    backfill; nothing existing changes shape. Old binaries are unaffected
    (they call none of it).
 2. **Deploy** `epigraph-tenancy-backfill` built from the same commit

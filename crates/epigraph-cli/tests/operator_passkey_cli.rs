@@ -404,7 +404,11 @@ async fn end_elevation_ends_one_session_only_under_apply(pool: PgPool) {
     let sid = live_session(&pool, h, 7).await;
     let id = sid.to_string();
 
-    let dry = run_op(&pool, &["end-elevation", "--session", &id]).await;
+    let dry = run_op(
+        &pool,
+        &["end-elevation", "--session", &id, "--reason", "cli test"],
+    )
+    .await;
     assert_eq!(dry.code, 0, "{}", dry.show());
     assert!(dry.stdout.contains("WOULD BE ENDED"), "{}", dry.show());
     assert!(dry.stdout.contains("DRY RUN"), "{}", dry.show());
@@ -419,7 +423,18 @@ async fn end_elevation_ends_one_session_only_under_apply(pool: PgPool) {
         "a dry run leaves no audit row"
     );
 
-    let applied = run_op(&pool, &["end-elevation", "--session", &id, "--apply"]).await;
+    let applied = run_op(
+        &pool,
+        &[
+            "end-elevation",
+            "--session",
+            &id,
+            "--reason",
+            "cli test",
+            "--apply",
+        ],
+    )
+    .await;
     assert_eq!(applied.code, 0, "{}", applied.show());
     assert!(applied.stdout.contains("ENDED"), "{}", applied.show());
     assert!(!applied.stdout.contains("WOULD BE"), "{}", applied.show());
@@ -432,7 +447,18 @@ async fn end_elevation_ends_one_session_only_under_apply(pool: PgPool) {
 
     let unknown = Uuid::new_v4().to_string();
     for (what, target) in [("again", id.as_str()), ("unknown", unknown.as_str())] {
-        let r = run_op(&pool, &["end-elevation", "--session", target, "--apply"]).await;
+        let r = run_op(
+            &pool,
+            &[
+                "end-elevation",
+                "--session",
+                target,
+                "--reason",
+                "cli test",
+                "--apply",
+            ],
+        )
+        .await;
         assert_eq!(r.code, 0, "{what}: {}", r.show());
         assert!(r.stdout.contains("NOT-LIVE"), "{what}: {}", r.show());
     }
@@ -441,4 +467,168 @@ async fn end_elevation_ends_one_session_only_under_apply(pool: PgPool) {
         1,
         "nothing more was ended"
     );
+}
+
+/// The `details` of every `platform.elevation_ended` row for `session`.
+async fn end_details(pool: &PgPool, session: Uuid) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT details FROM security_events \
+          WHERE event_type = 'platform.elevation_ended' AND details->>'session_id' = $1",
+    )
+    .bind(session.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("end audit rows")
+}
+
+/// The break-glass end records WHY (review cp2: SEC-05): `--reason` is
+/// required (clap refuses the verb without it, exit 2, nothing ended), and the
+/// text lands in the end's `platform.elevation_ended` audit row as
+/// `operator_reason`, with `ended_by` the operator's login, as every other
+/// audited operator verb records its reason. `--session` and `--person` are
+/// one target or the other, never both.
+///
+/// Verified to fail: the `--reason` argument made optional (the reasonless
+/// end succeeds); the reason not stamped before the end (no
+/// `operator_reason` in the row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn end_elevation_requires_and_records_a_reason(pool: PgPool) {
+    let (h, _) = fixture::seed_human_operator(&pool, "reasoned end").await;
+    let sid = live_session(&pool, h, 11).await;
+    let id = sid.to_string();
+
+    let bare = run_op(&pool, &["end-elevation", "--session", &id, "--apply"]).await;
+    assert_eq!(
+        bare.code,
+        2,
+        "no --reason is a usage error: {}",
+        bare.show()
+    );
+    assert_eq!(session_end(&pool, sid).await, None, "nothing was ended");
+    let both = run_op(
+        &pool,
+        &[
+            "end-elevation",
+            "--session",
+            &id,
+            "--person",
+            &h.to_string(),
+            "--reason",
+            "x",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(both.code, 2, "--session with --person: {}", both.show());
+    assert_eq!(session_end(&pool, sid).await, None, "nothing was ended");
+
+    let r = run_op(
+        &pool,
+        &[
+            "end-elevation",
+            "--session",
+            &id,
+            "--reason",
+            "suspected token theft, incident drill",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(session_end(&pool, sid).await.as_deref(), Some("ended"));
+    let details = end_details(&pool, sid).await;
+    assert_eq!(details.len(), 1, "one end audit row: {details:?}");
+    assert_eq!(
+        details[0]["operator_reason"],
+        serde_json::json!("suspected token theft, incident drill"),
+        "the reason is in the audit row: {}",
+        details[0]
+    );
+    assert_eq!(details[0]["ended_reason"], serde_json::json!("ended"));
+}
+
+/// `end-elevation --person` ends EVERY un-ended session of that person (one
+/// per refresh family), each audited with the reason, and no other person's;
+/// a dry run ends none. `list-elevations` shows them: `--live` lists only
+/// un-ended, unexpired sessions (by the row's own columns), plain lists ended
+/// ones too, `--person` narrows to one person (review cp2: SEC-05).
+///
+/// Verified to fail: `--person` ending only the first session (the second
+/// stays un-ended); `--live` not filtering ended sessions (an ended one is
+/// listed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn end_elevation_by_person_and_list_elevations(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "person p").await;
+    let (q, _) = fixture::seed_human_operator(&pool, "person q").await;
+    let p1 = live_session(&pool, p, 21).await;
+    let p2 = live_session(&pool, p, 22).await;
+    let q1 = live_session(&pool, q, 23).await;
+    let (ps, qs) = (p.to_string(), q.to_string());
+
+    let listed = run_op(&pool, &["list-elevations", "--live"]).await;
+    assert_eq!(listed.code, 0, "{}", listed.show());
+    for s in [p1, p2, q1] {
+        assert!(listed.stdout.contains(&s.to_string()), "{}", listed.show());
+    }
+    let only_q = run_op(&pool, &["list-elevations", "--live", "--person", &qs]).await;
+    assert!(only_q.stdout.contains(&q1.to_string()), "{}", only_q.show());
+    assert!(
+        !only_q.stdout.contains(&p1.to_string()),
+        "{}",
+        only_q.show()
+    );
+
+    let dry = run_op(
+        &pool,
+        &["end-elevation", "--person", &ps, "--reason", "offboarding"],
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("DRY RUN"), "{}", dry.show());
+    for s in [p1, p2] {
+        assert_eq!(session_end(&pool, s).await, None, "a dry run ends nothing");
+    }
+
+    let r = run_op(
+        &pool,
+        &[
+            "end-elevation",
+            "--person",
+            &ps,
+            "--reason",
+            "offboarding",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    for s in [p1, p2] {
+        assert_eq!(session_end(&pool, s).await.as_deref(), Some("ended"));
+        let details = end_details(&pool, s).await;
+        assert_eq!(details.len(), 1, "each end is audited once: {details:?}");
+        assert_eq!(
+            details[0]["operator_reason"],
+            serde_json::json!("offboarding")
+        );
+    }
+    assert_eq!(
+        session_end(&pool, q1).await,
+        None,
+        "Q's session is untouched"
+    );
+
+    let live = run_op(&pool, &["list-elevations", "--live"]).await;
+    assert!(live.stdout.contains(&q1.to_string()), "{}", live.show());
+    for s in [p1, p2] {
+        assert!(
+            !live.stdout.contains(&s.to_string()),
+            "an ended session is not live: {}",
+            live.show()
+        );
+    }
+    let all = run_op(&pool, &["list-elevations", "--person", &ps]).await;
+    for s in [p1, p2] {
+        assert!(all.stdout.contains(&s.to_string()), "{}", all.show());
+    }
+    assert!(all.stdout.contains("ended"), "{}", all.show());
 }

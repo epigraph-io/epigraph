@@ -48,7 +48,8 @@
 //!     epigraph-operator passkey-enroll --person <uuid> --reason TEXT [--label TEXT] [--apply]
 //!     epigraph-operator list-passkeys [--person <uuid>] [--include-revoked]
 //!     epigraph-operator revoke-passkey --id <uuid> --reason TEXT [--apply]
-//!     epigraph-operator end-elevation --session <uuid> [--apply]
+//!     epigraph-operator end-elevation (--session <uuid> | --person <uuid>) --reason TEXT [--apply]
+//!     epigraph-operator list-elevations [--person <uuid>] [--live]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
@@ -189,15 +190,33 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// End one live elevation session now (any person's; audited
-    /// `platform.elevation_ended`, ended_by = this maintenance login).
+    /// End live elevation sessions now: one by id, or every un-ended session
+    /// of a person (any person's; each audited `platform.elevation_ended` with
+    /// the reason, ended_by = this maintenance login).
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["session", "person"])))]
     EndElevation {
-        /// The elevation session id (`elevation_sessions.id`, the `elv` claim).
+        /// The elevation session id (`list-elevations`; the `elv` claim).
         #[arg(long)]
-        session: Uuid,
-        /// Commit. Without it, the end and its audit row roll back.
+        session: Option<Uuid>,
+        /// End every un-ended session of this person instead.
+        #[arg(long)]
+        person: Option<Uuid>,
+        /// Why. Recorded in each end's audit row (`operator_reason`).
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the end and its audit rows roll back.
         #[arg(long)]
         apply: bool,
+    },
+    /// List elevation sessions, newest first (all of them unless --live).
+    ListElevations {
+        /// Only this person's sessions.
+        #[arg(long)]
+        person: Option<Uuid>,
+        /// Only un-ended, unexpired sessions (the row's own columns; the
+        /// per-statement liveness re-checks are not evaluated here).
+        #[arg(long)]
+        live: bool,
     },
     /// List role assignments (un-ended ones unless --include-ended).
     ListRoleAssignments {
@@ -656,15 +675,40 @@ async fn main_inner() -> anyhow::Result<i32> {
             }
             Ok(0)
         }
-        Command::EndElevation { session, apply } => {
-            let ended = elevation::end(&mut conn, session, apply).await?;
-            println!(
-                "{}{}\t{session}",
-                if apply || !ended { "" } else { "WOULD BE " },
-                if ended { "ENDED" } else { "NOT-LIVE" },
-            );
+        Command::EndElevation {
+            session,
+            person,
+            reason,
+            apply,
+        } => {
+            let target = match (session, person) {
+                (Some(id), _) => elevation::Target::Session(id),
+                (None, Some(p)) => elevation::Target::Person(p),
+                (None, None) => unreachable!("clap requires --session or --person"),
+            };
+            let outcomes = elevation::end(&mut conn, target, &reason, apply).await?;
+            if outcomes.is_empty() {
+                println!("NOT-LIVE\tno un-ended session");
+            }
+            for (session, ended) in &outcomes {
+                println!(
+                    "{}{}\t{session}",
+                    if apply || !ended { "" } else { "WOULD BE " },
+                    if *ended { "ENDED" } else { "NOT-LIVE" },
+                );
+            }
             if !apply {
-                println!("DRY RUN: the end and its audit row were rolled back.");
+                println!("DRY RUN: the end and its audit rows were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::ListElevations { person, live } => {
+            let rows = elevation::list(&mut conn, person, live).await?;
+            if rows.is_empty() {
+                println!("no elevation sessions");
+            }
+            for row in &rows {
+                println!("{}", elevation::describe(row));
             }
             Ok(0)
         }
