@@ -1498,12 +1498,14 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "FROM passkey_enrollments",
         // 125: who elevated, when, on which family, and who MAY elevate, are
         // read on the request path only through the principal-bound or
-        // ticket-keyed definers, never listed; the two unbound helpers answer
-        // for ANY person (a roster oracle) and are not even app-executable.
+        // ticket-keyed definers, never listed; the three unbound helpers answer
+        // for ANY person or session (a roster oracle) and are not even
+        // app-executable.
         "FROM elevation_tickets",
         "FROM elevation_sessions",
         "epigraph_live_elevating_assignment",
         "epigraph_family_of_person_is_live",
+        "epigraph_elevation_session_is_live",
     ];
     const READ_ROOTS: usize = 2;
     // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision

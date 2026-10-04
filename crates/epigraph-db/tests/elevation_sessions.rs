@@ -1985,14 +1985,16 @@ async fn end_elevation_is_principal_bound(pool: PgPool) {
 
 /// The application role reads no ticket and no session (stamped as the
 /// session's own holder, with its own GUC pair), writes neither table, and
-/// cannot call the three unbound helpers (an unbound "who may elevate" or
-/// "whose family is this" answer is a roster oracle).
+/// cannot call the four unbound helpers (an unbound "who may elevate",
+/// "whose family is this" or "is this session live" answer is a roster
+/// oracle).
 ///
 /// Verified to fail: the sessions read policy widened to `USING (true)` ->
 /// the app reads the session; EXECUTE granted to the app (a GRANT appended
 /// after the migration's own REVOKE) on each of
-/// `epigraph_live_elevating_assignment`, `epigraph_family_of_person_is_live`
-/// and `epigraph_end_expired_elevations` -> that call lands.
+/// `epigraph_live_elevating_assignment`, `epigraph_family_of_person_is_live`,
+/// `epigraph_elevation_session_is_live` and `epigraph_end_expired_elevations`
+/// -> that call lands.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_app_reads_and_writes_no_row(pool: PgPool) {
     let h = holder(&pool, "holder", 1).await;
@@ -2026,6 +2028,7 @@ async fn the_app_reads_and_writes_no_row(pool: PgPool) {
         "SELECT public.epigraph_live_elevating_assignment(gen_random_uuid(), now())",
         "SELECT public.epigraph_family_of_person_is_live(gen_random_uuid(), gen_random_uuid(), \
                                                          gen_random_uuid())",
+        "SELECT public.epigraph_elevation_session_is_live(gen_random_uuid())",
         "SELECT public.epigraph_end_expired_elevations(NULL, NULL)",
     ] {
         assert_code(&app_exec(&pool, Some(h.person), sql).await, "42501", sql);

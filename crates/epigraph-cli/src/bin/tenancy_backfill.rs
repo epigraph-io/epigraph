@@ -2197,6 +2197,11 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             false,
         ),
         (
+            "epigraph_elevation_session_is_live",
+            "public.epigraph_elevation_session_is_live(uuid)",
+            false,
+        ),
+        (
             "epigraph_end_expired_elevations",
             "public.epigraph_end_expired_elevations(uuid, uuid)",
             false,
