@@ -1707,7 +1707,10 @@ declares that it writes the log (see "two keys" in the 126 section).
    backfill; nothing existing changes shape. Old binaries are unaffected
    (they call none of it).
 2. **Deploy** `epigraph-tenancy-backfill` built from the same commit
-   (`verify` then checks the 125 definers' owner and grants).
+   (`verify` then checks the 125 definers' owner and grants, and FAILS while a
+   non-superuser member of `epigraph_maintenance` may CREATE in schema
+   `public`, e.g. through the pre-PostgreSQL-15 PUBLIC grant an upgraded
+   cluster keeps: run the `REVOKE` it prints).
 3. Nothing else is deployed by this step: the ceremony, the ticket API and the
    elevate grant, and the binaries that stamp an elevated viewer, come with
    their own batches.
