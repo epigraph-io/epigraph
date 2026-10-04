@@ -1954,3 +1954,39 @@ event (the subjects' record outlives the table), then drops the table and
 every 127 function. Its `_sqlx_migrations` row stays: re-introducing the log
 is a new migration. **Run 127-undo before 126-undo and 125-undo** (the log's
 rows name 125's sessions).
+
+## The admin-scope arming switch (migration 128) — shipped unarmed
+
+Migration 128 adds `admin_scope_enforcement`, one row that says whether the
+admin-only scopes (`claims:admin`, `clients:admin`, `entity-types:write`,
+`groups:admin`, `instance:admin`) are still STANDING authority (unarmed, the
+shipped state) or only reachable through elevation (armed). Applying it
+changes no mint, route or CLI outcome: everything reads the switch and finds
+it unarmed.
+
+1. **Migrate 128** (`epigraph-migrate`, migration DSN), after 127. One new
+   table (no row security; the application role reads only, the maintenance
+   role may change `armed` and `reason` only), its guard and audit triggers,
+   five functions (two of them the triggers'). Nothing existing changes. Old binaries never read it, and
+   a binary built with it reads a database WITHOUT it as unarmed, so the
+   deploy order between the two is free.
+2. **Deploy** `epigraph-tenancy-backfill` built from the same commit (`verify`
+   checks the 128 definers' owner and grants).
+
+**Every change is audited.** Arming and disarming are maintenance acts with a
+reason; each writes one `platform.admin_scopes_armed` or
+`platform.admin_scopes_disarmed` security event, whether it came from the
+setter (`epigraph_set_admin_scope_enforcement`) or from a direct UPDATE on the
+maintenance DSN. The row is never inserted again or deleted, by any login.
+
+**Arming is NOT part of the deploy.** It is a separate operator step, after
+the consumers that still rely on a standing admin scope have moved off it
+and the would-strip measurement (`oauth.admin_scope_would_strip` events, at
+most one per client per hour, written while unarmed) has read zero for a
+soak window.
+
+**Rollback.** Disarming is the first rollback and needs no DDL. To remove the
+switch itself, run `docs/runbooks/128-undo.sql` on the migration DSN, in one
+transaction: if the switch is armed it first disarms it through the table's
+own audit (reason `128-undo`), then drops the table and every 128 function.
+The events stay. Run it before 127-undo.

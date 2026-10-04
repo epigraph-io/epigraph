@@ -420,3 +420,116 @@ async fn the_application_cannot_write_the_would_strip_event_itself(pool: PgPool)
     .await;
     assert_eq!(code_of(&r).as_deref(), Some("42501"), "{r:?}");
 }
+
+// =====================================================================
+// The rollback (docs/runbooks/128-undo.sql)
+// =====================================================================
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// The repository's migrations up to and including `max`.
+fn up_to(max: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= max)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+}
+
+/// The catalog facts 128 could leave behind, by name: relations, functions
+/// (body and owner), policies, triggers and constraints in `public`.
+async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT 'rel ' || c.relname || ' ' || c.relkind::text \
+           FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'fn ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') ' \
+                || md5(p.prosrc) || ' ' || p.proowner::regrole::text \
+           FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'pol ' || c.relname || '.' || pol.polname \
+           FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid \
+          WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'trg ' || c.relname || '.' || t.tgname \
+           FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+          WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'con ' || c.relname || '.' || k.conname \
+           FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid \
+          WHERE c.relnamespace = 'public'::regnamespace",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("catalog");
+    rows.into_iter().collect()
+}
+
+fn undo_128() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/128-undo.sql"),
+    )
+    .expect("128-undo.sql")
+}
+
+/// `docs/runbooks/128-undo.sql`, applied to a database that went 127 -> 128
+/// and was then ARMED, returns its catalog (relations, function bodies and
+/// owners, policies, triggers, constraints) to the same database's at 127,
+/// records the removal as exactly one `platform.admin_scopes_disarmed` event
+/// (an undo must not silently end enforcement), and changes nothing on a
+/// second run. Cut at 128, not head: a later migration is undone first.
+///
+/// Verified to fail: the undo's disarm UPDATE removed (no disarm event); the
+/// DROP of `epigraph_admin_scopes_armed` removed (left behind).
+#[sqlx::test(migrations = false)]
+async fn the_rollback_returns_the_catalog_to_127_and_records_the_disarm(pool: PgPool) {
+    migrate(&pool, &up_to(127)).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to(128)).await;
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 128 changed the catalog"
+    );
+    set_as_maintenance(&pool, true, "armed before the undo").await;
+
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo_128())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the undo script applies (run {run}): {e}"));
+    }
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the catalog is not 127's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    let disarms = events(&pool, "platform.admin_scopes_disarmed").await;
+    assert_eq!(disarms.len(), 1, "one disarm, across two runs: {disarms:?}");
+    assert!(
+        disarms[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("128-undo")),
+        "{disarms:?}"
+    );
+    assert_eq!(events(&pool, "platform.admin_scopes_armed").await.len(), 1);
+}
