@@ -936,9 +936,35 @@ Current reservation:
   branch carries a `125`. **Applied to a throwaway database only, NOT to any
   deployed database.**
 
-- **126+**: public next
+- **126** `126_elevated_arms.sql` (elevation plan EL-7, `-- no-transaction`):
+  the ELEVATED READ ARMS and the elevated WRITE REFUSAL. Per armed table, one
+  PERMISSIVE `<t>_elevated_read FOR SELECT TO epigraph_app USING ((SELECT
+  epigraph_is_elevated()))` and three RESTRICTIVE `<t>_elevated_no_insert` /
+  `_update` / `_delete TO epigraph_app` with `NOT (SELECT
+  epigraph_is_elevated())`; no existing policy body changes. `TO
+  epigraph_app` so definers (which run as `epigraph_maintenance`) are not
+  refused and `epigraph_is_elevated()` cannot recurse. The census (every
+  row-security table in exactly one list): read + refusal for T-OWN,
+  T-OWN-PRIV, T-DER, T-EDGE, T-AGENT, T-GROUP (25 tables); read only for the
+  two T-AUDIT tables (`security_events`, `privatization_audit`); refusal
+  only for the eight T-DROP tables; 13 excluded with a reason (the
+  elevation and passkey tables, the governance tables `epigraph_is_elevated()`
+  reads, `instance_admins`, `evidence_visibility_pins`, the privatization
+  plans, and the two bypass-only tables). Pinned from the catalog by
+  `epigraph-db/tests/elevation_arms_census.rs`. Lock plan: one table per `DO` block,
+  each followed by `COMMIT;` (see the `-- no-transaction` section below),
+  with a transaction-local 3 s lock timeout and drop-before-create, so a
+  lock timeout fails the file at one table with the earlier tables armed and
+  no `_sqlx_migrations` row, and a rerun resumes. Undo:
+  `docs/runbooks/126-undo.sql` (run it BEFORE 125-undo, which refuses while
+  any policy reads `epigraph_is_elevated()`). Inert until a session is
+  elevated: for every other session the arm is false and every refusal true.
+  Checked before claiming: no open PR branch carries a `126`. **Applied to a
+  throwaway database only, NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `126` or
+- **127+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `127` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
@@ -956,7 +982,10 @@ migration. It is not: sqlx-core 0.8.6 honours a leading `-- no-transaction` line
 (`src/migrate/source.rs:127`) and sqlx-macros-core propagates the flag into the
 compile-time `migrate!()` literal, so `epigraph-migrate` honours it too.
 
-### THE RULE: one statement per `-- no-transaction` file
+### THE RULE: one statement per `-- no-transaction` INDEX file
+
+(A second, different shape exists for per-table policy DDL: see "Per-table
+policy files" below. It applies to `126_elevated_arms.sql` only.)
 
 Not style. sqlx-postgres 0.8.6's `execute_migration` runs
 `conn.execute(&*migration.sql)` (`src/migrate.rs:280`) — the **simple query
@@ -979,7 +1008,33 @@ Two further constraints:
   this tree opens with one; these four must not).
 * A `-- no-transaction` file's `_sqlx_migrations` bookkeeping is **not atomic**
   with its DDL (`sqlx-postgres/src/migrate.rs:214`). Keep such files to index
-  statements only, all `IF NOT EXISTS`, so a failure can never strand a column.
+  statements only, all `IF NOT EXISTS`, so a failure can never strand a column
+  (or to the idempotent per-table policy shape below).
+
+### Per-table policy files (`126_elevated_arms.sql`)
+
+`CREATE POLICY` takes ACCESS EXCLUSIVE on its table, so a file arming many
+tables in one transaction holds every one of those locks until the end. The
+implicit block above is the trap: a multi-statement `-- no-transaction` file
+is STILL one transaction unless it commits along the way. Unlike `CREATE INDEX
+CONCURRENTLY`, a `DO` block does not refuse the implicit block, and an
+interleaved `COMMIT;` DOES end it (measured on the test cluster: with a
+`COMMIT;` after each table's block, a later table's lock timeout left the
+earlier tables' policies in place; without it, it rolled all of them back).
+PostgreSQL answers each such `COMMIT` with `WARNING: there is no transaction
+in progress`; that is expected and the COMMIT commits. The shape, pinned by
+`tenancy_migration_shape.rs::a_policy_arm_no_transaction_file_commits_each_table`:
+
+* every statement is a `DO $$ … $$` block followed by its own `COMMIT;`;
+* every block bounds its lock wait with `set_config('lock_timeout', '3s',
+  true)` (transaction-local; a plain `SET` would outlive the file on the
+  migrator's connection and apply to the next migration in the same run);
+* every `CREATE POLICY` is preceded by its `DROP POLICY IF EXISTS`, so a rerun
+  after a lock timeout is a no-op on the armed tables and resumes at the
+  first unarmed one.
+
+A failure leaves no `_sqlx_migrations` row and the tables before it armed;
+rerun the migration.
 
 ### Recovery from a failed `CREATE INDEX CONCURRENTLY`
 

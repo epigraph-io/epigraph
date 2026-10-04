@@ -1,6 +1,6 @@
 //! The elevated viewer (elevation plan EL-6): how it is resolved, what it
-//! stamps, and what it reads BEFORE any row policy reads
-//! `epigraph_is_elevated()`.
+//! stamps, and what it reads through migration 126's elevated read arm (EL-7;
+//! the per-table census of arms and refusals is `elevation_arms_census.rs`).
 //!
 //! `Viewer::resolve_elevated` is the only constructor of the elevated shape
 //! (`no_anonymous_viewer.rs` counts the construction sites). These tests pin
@@ -474,23 +474,24 @@ async fn an_elevated_checkout_leaves_nothing_for_the_next_one(pool: PgPool) {
     );
 }
 
-/// BEFORE any row policy reads `epigraph_is_elevated()` (migration 126, EL-7),
-/// the elevated shape alone grants NO row: on an application connection with
-/// its GUCs stamped, an elevated viewer reads its own group-private row and
-/// NOT another person's. The always-true fragment returns exactly what the
-/// policies admit.
+/// THROUGH migration 126's elevated read arm (EL-7), an elevated viewer on an
+/// APPLICATION connection with its GUCs stamped reads another person's
+/// group-private row, and its own. Before 126 the same test asserted the
+/// opposite for the foreign row (`elevated_reads_nothing_foreign_before_arms`:
+/// the elevated shape alone granted no row, so the always-true fragment
+/// returned exactly what the policies admitted); 126's commit flipped that last
+/// arm, as the EL-6 hand-off required.
 ///
-/// Three arms on the same connection, so none passes for a wrong reason: the
+/// Four arms on the same connection, so none passes for a wrong reason: the
+/// connection IS the application role (not the BYPASSRLS harness login), the
 /// database says the statement IS elevated (the stamp landed), the viewer's
-/// own private row is visible (its groups were stamped), and B's private row
-/// is not. EL-7 rewrites the last arm, in the same commit as 126, to "reads
-/// B's private row".
+/// own private row is visible (its groups were stamped), and B's private row is
+/// visible too, which only the elevated arm admits.
 ///
-/// Verified to fail with the elevated checkout handed a maintenance (here:
-/// superuser) connection instead of the application one (B's row is read),
-/// and with the stamp binding `group_bind()` (P's own row disappears).
+/// Verified to fail with 126's `claims_elevated_read` dropped (B's row is not
+/// read) and with the stamp binding `group_bind()` (P's own row disappears).
 #[sqlx::test(migrations = "../../migrations")]
-async fn elevated_reads_nothing_foreign_before_arms(pool: PgPool) {
+async fn elevated_reads_a_foreign_private_row_through_the_arm(pool: PgPool) {
     let p = holder(&pool, "arms-p", 6).await;
     let (b, b_group) = fixture::seed_agent_with_group(&pool, "arms-b").await;
     let mine = fixture::seed_group_claim(&pool, p.person, p.group, "P's private row").await;
@@ -504,10 +505,11 @@ async fn elevated_reads_nothing_foreign_before_arms(pool: PgPool) {
     conn.execute("SET SESSION AUTHORIZATION epigraph_app")
         .await
         .expect("as epigraph_app");
-    let is_elevated: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
-        .fetch_one(&mut *conn)
-        .await
-        .expect("is_elevated");
+    let (is_elevated, role): (bool, String) =
+        sqlx::query_as("SELECT public.epigraph_is_elevated(), current_user::text")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("is_elevated");
     let own = ClaimRepository::get_by_id(&mut *conn, &v, mine.into())
         .await
         .expect("get_by_id");
@@ -518,15 +520,19 @@ async fn elevated_reads_nothing_foreign_before_arms(pool: PgPool) {
         .await
         .expect("reset");
 
+    assert_eq!(
+        role, "epigraph_app",
+        "the read runs as the application role"
+    );
     assert!(is_elevated, "the statement is elevated in the database");
     assert!(
         own.is_some(),
         "the elevated viewer reads its own private row"
     );
     assert!(
-        foreign.is_none(),
-        "before migration 126 no policy admits a foreign private row for an elevated \
-         session: the always-true fragment must return only what RLS admits"
+        foreign.is_some(),
+        "migration 126's elevated read arm admits another person's private row to an \
+         elevated session"
     );
 }
 

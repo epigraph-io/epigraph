@@ -372,13 +372,20 @@ async fn every_protected_relation_is_enabled_and_forced(pool: PgPool) {
 /// Read from the catalog, never from the migration text. A test that parsed
 /// `077_rls_policies.sql` would agree with the migration by construction,
 /// including when the migration is wrong.
+///
+/// Only PERMISSIVE policies count as coverage. A RESTRICTIVE policy grants
+/// nothing (PostgreSQL ANDs it onto the permissive ones, and a command with no
+/// permissive policy stays default-denied), so counting one would report a
+/// default-denied command as covered. Migration 126 is what made this exact:
+/// its `agents_elevated_no_delete` refusal is a RESTRICTIVE delete policy on a
+/// table whose deletes are default-denied on purpose (`DELIBERATELY_UNCOVERED`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_protected_relation_covers_every_command_or_records_why(pool: PgPool) {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT c.relname, p.polname, p.polcmd::text \
            FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
            JOIN pg_namespace n ON n.oid = c.relnamespace \
-          WHERE n.nspname = 'public'",
+          WHERE n.nspname = 'public' AND p.polpermissive",
     )
     .fetch_all(&pool)
     .await
@@ -1369,6 +1376,13 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
         // Its body compares the node's owner with `epigraph_writable_groups()`,
         // i.e. the CALLER's writable set, so an arm naming it is session-derived.
         "epigraph_session_writes_node",
+        // 125's elevation predicate, read by 126's elevated read arms and
+        // write refusals. Its body binds the session row it looks up to
+        // `epigraph_principal_id()` and to the two elevation settings
+        // (`epigraph.elevation_id`, `epigraph.family_id`), and answers false
+        // when the elevation setting is empty, so an arm naming it is
+        // session-derived (`elevation_sessions.rs` pins that body).
+        "epigraph_is_elevated",
     ];
     // ARMS — not policies — that are row-only BY DESIGN, each with the reason.
     //
