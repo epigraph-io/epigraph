@@ -90,6 +90,20 @@
 -- verify a signature. The evidence is stored so an offline verifier can
 -- re-check every confirmation later.
 --
+-- So a holder of the application DSN can forge a confirmation (the ceremony
+-- definers are ticket-keyed and take the caller's word for the assertion)
+-- and open a session of a person who may elevate. For most rows that adds no
+-- read authority beyond the DSN itself, which can already stamp any
+-- principal and any group. It is NOT nothing: a row that no principal or
+-- group stamp reaches is admitted by an elevated read arm (126). The known
+-- class is a `recall_events` row whose agent is gone (its `agent_id` is set
+-- NULL when the agent is deleted, and its tenancy policy admits only the
+-- row's own agent). So the offline verification of every confirmation must
+-- run before the first real elevation, and only the request units may hold
+-- the application DSN. The recorder gate (section 1) narrows the window: until
+-- the per-access recorder is installed no session reads anything more, and
+-- once it is, every such read is recorded.
+--
 -- ===================================================================
 -- 3. UNDO
 --

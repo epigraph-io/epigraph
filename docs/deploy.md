@@ -1774,6 +1774,14 @@ an elevated session read other people's rows; it also makes the database,
 not only `begin_as`, refuse that session's writes. For every session that is
 not elevated nothing changes: the arm is false and every refusal is true.
 
+**Known limit (forged confirmations).** The database cannot verify a WebAuthn
+signature, so a holder of the application DSN can forge an elevation
+confirmation. For most rows that reads nothing the DSN could not already read
+by stamping a principal and a group, but an elevated read arm also admits rows
+no stamp reaches (a `recall_events` row whose agent was deleted). Before the
+first real elevation: run the offline confirmation verifier, and confirm that
+only the request units hold the application DSN.
+
 **THE GATE: no elevation session is live until the per-access elevation log
 ships, and the database enforces it.** 126 is what lets an elevated session
 read other people's private rows. The design requires every such read to be
