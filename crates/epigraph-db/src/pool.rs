@@ -5,7 +5,9 @@
 //! [`ScopedPool`] is the newtype that owns connection acquisition for
 //! tenancy-aware work. It exists because the session GUCs the RLS policies read
 //! (`epigraph.group_ids`, `epigraph.writable_group_ids`,
-//! `epigraph.principal_id`) must be stamped from the **same** [`Viewer`] value
+//! `epigraph.principal_id`, and since the elevation stack
+//! `epigraph.elevation_id` / `epigraph.family_id`) must be stamped from the
+//! **same** [`Viewer`] value
 //! that supplies the in-query `$V` bind, and because the release-time scrub that
 //! keeps a recycled connection from carrying one tenant's group set to the next
 //! can only be installed at pool-construction time
@@ -17,7 +19,7 @@
 //!
 //! ## CLAUDE.md and "all SQL lives in `repos/`"
 //!
-//! The one statement this module emits — the `set_config` triple — is
+//! The one statement this module emits — the five-GUC `set_config` — is
 //! deliberately here and not under `repos/`. It is not a query against a domain
 //! table; it is connection *configuration*, the transport for the predicate the
 //! repo layer binds. Putting it in a repository would mean a repository function
@@ -588,7 +590,7 @@ pub async fn apply_statement_timeout(
 /// the bound therefore applies to whatever runs next on it. `after_connect`
 /// cannot undo it: that hook fires once when a physical connection is
 /// established, not on each checkout. [`ScopedPool`]'s `after_release` scrub is
-/// [`SET_SESSION_GUCS`] and covers the three tenancy GUCs only.
+/// [`SET_SESSION_GUCS`] and covers the five tenancy GUCs only.
 ///
 /// So a caller that bounds one piece of work rather than a whole pool must
 /// read the prior value, and restore it with [`restore_statement_timeout`] on
@@ -628,12 +630,26 @@ pub async fn restore_statement_timeout(
 // ScopedPool — plan §0.5
 // =============================================================================
 
-/// The three session GUCs the RLS policies (migration 077) read, and the one
-/// statement that stamps them. Kept as a `const` so the scrub and both stamping
+/// The five session GUCs the row policies read, and the one statement that
+/// stamps them. Kept as a `const` so the scrub, the probe and both stamping
 /// paths are provably the *same* statement.
-const SET_SESSION_GUCS: &str = "SELECT set_config('epigraph.group_ids',          $1, $4), \
-                                       set_config('epigraph.writable_group_ids', $2, $4), \
-                                       set_config('epigraph.principal_id',       $3, $4)";
+///
+/// The first three are the tenancy context (migration 077). The last two are
+/// the elevation pair migration 125's `epigraph_is_elevated()` reads:
+/// `epigraph.elevation_id` (the live elevation session) and
+/// `epigraph.family_id` (its refresh family). Every viewer that is not
+/// elevated stamps both EMPTY, and the release scrub empties all five, so a
+/// recycled connection can never carry one request's elevation into the next
+/// checkout. The database stays authoritative either way: a stamped pair with
+/// no live session behind it evaluates false.
+///
+/// `$6` is `is_local`, LAST, so every caller binds the five values in GUC
+/// order and then the scope.
+const SET_SESSION_GUCS: &str = "SELECT set_config('epigraph.group_ids',          $1, $6), \
+                                       set_config('epigraph.writable_group_ids', $2, $6), \
+                                       set_config('epigraph.principal_id',       $3, $6), \
+                                       set_config('epigraph.elevation_id',       $4, $6), \
+                                       set_config('epigraph.family_id',          $5, $6)";
 
 /// How a [`ScopedPool`] carries tenancy context to the database.
 ///
@@ -684,7 +700,7 @@ fn join_uuids(ids: Option<&[uuid::Uuid]>) -> String {
         .join(",")
 }
 
-/// Stamp the three session GUCs from **this** viewer.
+/// Stamp the five session GUCs from **this** viewer.
 ///
 /// Plan §4.5 requirement 1 is enforced structurally rather than by review: this
 /// function is private, takes the `&Viewer` itself, and has exactly two callers
@@ -702,6 +718,9 @@ async fn apply_session_gucs(
         .bind(join_uuids(v.group_bind()))
         .bind(join_uuids(v.writable_bind()))
         .bind(v.principal().map(|p| p.to_string()).unwrap_or_default())
+        // No viewer is elevated yet: both elevation GUCs are stamped empty.
+        .bind("")
+        .bind("")
         .bind(is_local)
         .execute(conn)
         .await
@@ -876,18 +895,21 @@ impl ScopedPool {
                     // The valve's transport (`crate::operator_binding`): a
                     // session setting, stamped once per physical connection
                     // and untouched by the release scrub, which resets only
-                    // the three tenancy GUCs.
+                    // the five tenancy GUCs.
                     crate::operator_binding::apply_valve(conn).await?;
                     Ok(())
                 })
             })
             .after_release(|conn, _meta| {
                 Box::pin(async move {
-                    // The identical triple, three empty strings, session scope.
+                    // The identical statement, five empty strings, session
+                    // scope: the elevation pair is scrubbed with the rest.
                     // `Ok(false)` makes sqlx CLOSE the connection instead of
                     // returning it to the pool: a connection whose group set we
                     // failed to clear must never be reused.
                     match sqlx::query(SET_SESSION_GUCS)
+                        .bind("")
+                        .bind("")
                         .bind("")
                         .bind("")
                         .bind("")
@@ -1022,7 +1044,7 @@ impl ScopedPool {
         Ok(ScopedConn(conn, PhantomData))
     }
 
-    /// Transactional variant: `BEGIN`, then the identical triple with
+    /// Transactional variant: `BEGIN`, then the identical statement with
     /// `is_local = true`.
     ///
     /// Required in [`SessionGucMode::Transaction`], and correct in either mode
@@ -1243,14 +1265,14 @@ impl ScopedPool {
     /// synchronous and receives a possibly-lazy pool — the same wall PR-02 hit,
     /// and the reason `load_entity_type_cache` is a separate async call.
     ///
-    /// ## Why it stamps the REAL three, and not a scratch GUC
+    /// ## Why it stamps the REAL five, and not a scratch GUC
     ///
     /// An earlier draft set `epigraph.probe` in the first half and then checked
     /// that the three tenancy GUCs were empty in the second. That second check
     /// was **vacuous**: nothing in this pool had ever set those three, so they
     /// read empty whether or not `after_release` was installed, and the "scrub
     /// is not running" branch was unreachable. The probe now stamps
-    /// [`PROBE_SENTINEL`] into all three through the *same* [`SET_SESSION_GUCS`]
+    /// [`PROBE_SENTINEL`] into all five through the *same* [`SET_SESSION_GUCS`]
     /// statement the request path uses, so the emptiness check after release is
     /// a genuine observation about the scrub.
     ///
@@ -1274,6 +1296,8 @@ impl ScopedPool {
                 .bind(PROBE_SENTINEL)
                 .bind(PROBE_SENTINEL)
                 .bind(PROBE_SENTINEL)
+                .bind(PROBE_SENTINEL)
+                .bind(PROBE_SENTINEL)
                 .bind(false)
                 .execute(&mut *conn)
                 .await
@@ -1287,7 +1311,7 @@ impl ScopedPool {
             observed.0
         }; // drop -> release -> the after_release scrub runs
 
-        // Second half: the SAME three GUCs, on a fresh checkout, must be empty.
+        // Second half: the SAME five GUCs, on a fresh checkout, must be empty.
         // Non-vacuous precisely because the block above set them.
         let mut conn = self
             .inner
@@ -1306,16 +1330,21 @@ impl ScopedPool {
     }
 }
 
-/// The sentinel the boot probe stamps into the three tenancy GUCs. A valid UUID
+/// The sentinel the boot probe stamps into the five tenancy GUCs. A valid UUID
 /// (so `epigraph_principal_id()` would parse it) that is not, and must never
 /// be, a real group or principal.
 const PROBE_SENTINEL: &str = "00000000-0000-0000-0000-00000000b0be";
 
-/// Reads all three tenancy GUCs back as one concatenated string. Shared by both
+/// Reads all five tenancy GUCs back as one concatenated string. Shared by both
 /// halves of the probe so they observe exactly the same thing.
 const READ_SESSION_GUCS: &str = "SELECT COALESCE(current_setting('epigraph.group_ids', true), '') \
      || COALESCE(current_setting('epigraph.writable_group_ids', true), '') \
-     || COALESCE(current_setting('epigraph.principal_id', true), '')";
+     || COALESCE(current_setting('epigraph.principal_id', true), '') \
+     || COALESCE(current_setting('epigraph.elevation_id', true), '') \
+     || COALESCE(current_setting('epigraph.family_id', true), '')";
+
+/// How many GUCs [`SET_SESSION_GUCS`] stamps (and the probe reads back).
+const SESSION_GUC_COUNT: usize = 5;
 
 /// The boot probe's verdict, factored out of the I/O.
 ///
@@ -1325,7 +1354,7 @@ const READ_SESSION_GUCS: &str = "SELECT COALESCE(current_setting('epigraph.group
 /// the diagnosis and the remedy it names are covered by a unit test; only the
 /// pooler's behaviour remains unproven.
 fn probe_verdict(persisted: &str, after_release: &str) -> Result<(), DbError> {
-    let expected: String = PROBE_SENTINEL.repeat(3);
+    let expected: String = PROBE_SENTINEL.repeat(SESSION_GUC_COUNT);
     if persisted != expected {
         return Err(DbError::InvalidData {
             reason: format!(
@@ -1467,7 +1496,7 @@ impl ScopedRead<'_> {
     pub async fn commit(self) -> Result<(), DbError> {
         match self {
             // Dropping a `ScopedConn` returns it to the pool, where
-            // `after_release` scrubs the three GUCs. There is nothing to commit.
+            // `after_release` scrubs the five GUCs. There is nothing to commit.
             ScopedRead::Conn(_) => Ok(()),
             ScopedRead::Tx(tx) => tx.commit().await,
         }
@@ -1761,14 +1790,14 @@ mod tests {
 
     #[test]
     fn probe_verdict_accepts_a_session_mode_observation() {
-        let stamped = PROBE_SENTINEL.repeat(3);
+        let stamped = PROBE_SENTINEL.repeat(SESSION_GUC_COUNT);
         assert!(probe_verdict(&stamped, "").is_ok());
     }
 
     #[test]
     fn probe_verdict_refuses_when_gucs_do_not_persist() {
         // What a transaction-mode pooler produces: the stamp is discarded with
-        // the implicit transaction, so the second statement reads three empties.
+        // the implicit transaction, so the second statement reads five empties.
         let err = probe_verdict("", "").expect_err("a lost stamp must refuse");
         let msg = err.to_string();
         assert!(
@@ -1783,7 +1812,7 @@ mod tests {
 
     #[test]
     fn probe_verdict_refuses_when_the_scrub_did_not_run() {
-        let stamped = PROBE_SENTINEL.repeat(3);
+        let stamped = PROBE_SENTINEL.repeat(SESSION_GUC_COUNT);
         let err = probe_verdict(&stamped, &stamped).expect_err("a live scrub must refuse");
         let msg = err.to_string();
         assert!(
