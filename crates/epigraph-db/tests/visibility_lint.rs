@@ -531,6 +531,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          trigger's; nothing for a viewer to filter.",
     ),
     (
+        "elevated_access.rs",
+        "record",
+        "WRITE through migration 127's app-callable definer `epigraph_record_elevated_access` \
+         (EL-8), on a connection `ScopedPool::record_elevated_access` has STAMPED with the \
+         ELEVATED viewer (it refuses any other): the definer refuses an unelevated connection \
+         (ELV07), takes the person and session from the stamped elevation, and decides the \
+         owner groups itself. The row is the log of a read, not a corpus row; there is nothing \
+         for a viewer to filter, and the viewer is spent on the stamp.",
+    ),
+    (
         "elevation_ceremony.rs",
         "create_ticket",
         "WRITE through migration 125's PRINCIPAL-BOUND app-callable definer \

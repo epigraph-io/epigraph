@@ -18,6 +18,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+use epigraph_db::{DbError, ElevatedAccess, ScopedPool, ScopedPoolOptions, SessionGucMode, Viewer};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -1079,4 +1080,182 @@ fn every_127_object_is_registered() {
         kill_switch.contains("'elevated_access'"),
         "079-undo.sql lacks elevated_access"
     );
+}
+
+// =====================================================================
+// The Rust recording path (ScopedPool::record_elevated_access)
+// =====================================================================
+
+/// An application-role pool that declares the recorder (the test stand-in for
+/// a recording build), in `mode`.
+async fn recording_pool(pool: &PgPool, mode: SessionGucMode) -> ScopedPool {
+    ScopedPool::connect_with_access_recorder_for_tests(
+        &fixture::database_url_for(pool).await,
+        mode,
+        ScopedPoolOptions {
+            max_connections: 2,
+            ..ScopedPoolOptions::default()
+        },
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("a recording application-role pool")
+}
+
+fn access(ids: Vec<Uuid>) -> ElevatedAccess {
+    ElevatedAccess {
+        surface: "GET /api/v1/claims/:id".to_string(),
+        args: serde_json::json!({"path": "/api/v1/claims/x"}),
+        row_count: 1,
+        candidate_ids: ids,
+    }
+}
+
+/// `ScopedPool::record_elevated_access` records an elevated viewer's access in
+/// ONE row, attributed by the database, in BOTH session-setting modes (in
+/// transaction mode an elevated viewer otherwise gets only `BEGIN READ ONLY`,
+/// where the recorder's insert would fail with 25006).
+///
+/// Verified to fail with the record path opening `BEGIN READ ONLY` (25006 in
+/// both modes) and with its stamp skipped (ELV07: the connection is not
+/// elevated).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_recording_path_writes_one_row_in_both_modes(pool: PgPool) {
+    let p = holder(&pool, "access-path-p", 31).await;
+    let (b, b_group) = fixture::seed_agent_with_group(&pool, "access-path-b").await;
+    let b_claim = fixture::seed_group_claim(&pool, b, b_group, "B's private claim").await;
+    let live = session(&pool, &p, "recording path").await;
+    for mode in [SessionGucMode::Session, SessionGucMode::Transaction] {
+        let s = recording_pool(&pool, mode).await;
+        assert!(s.records_elevated_access(), "CALIBRATION: a recording pool");
+        let v = Viewer::resolve_elevated(&s, p.person, Some(live), p.family)
+            .await
+            .expect("resolve");
+        assert!(
+            v.is_elevated(),
+            "CALIBRATION: P resolves elevated ({mode:?})"
+        );
+        let row = s
+            .record_elevated_access(&v, &access(vec![b_claim]))
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        let (groups, surface, rows): (Vec<Uuid>, String, i32) = sqlx::query_as(
+            "SELECT owner_group_ids, surface, row_count FROM elevated_access WHERE id = $1",
+        )
+        .bind(row)
+        .fetch_one(&pool)
+        .await
+        .expect("the row");
+        assert_eq!(groups, vec![b_group], "{mode:?}");
+        assert_eq!(surface, "GET /api/v1/claims/:id");
+        assert_eq!(rows, 1);
+    }
+    assert_eq!(log_rows(&pool).await, 2);
+}
+
+/// The recording path refuses, and writes nothing, for a viewer that is not
+/// elevated, on a pool that does not declare the recorder (even with an
+/// elevated viewer in hand), and for a session ended between its resolution
+/// and the record (the database's ELV07, surfaced as
+/// `ElevatedAccessUnrecorded`): the caller withholds the response.
+///
+/// Verified to fail with the pool's declaration check removed (the
+/// non-declaring pool's connection is not elevated, so the definer refuses
+/// with ELV07 instead: caught by the reason assertion) and with the viewer
+/// check removed (the plain viewer reaches the definer: caught likewise).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_recording_path_refuses_what_it_cannot_record(pool: PgPool) {
+    let p = holder(&pool, "access-refuse-p", 32).await;
+    let live = session(&pool, &p, "refusals").await;
+    let s = recording_pool(&pool, SessionGucMode::Session).await;
+    let elevated = Viewer::resolve_elevated(&s, p.person, Some(live), p.family)
+        .await
+        .expect("resolve");
+    let plain = Viewer::resolve_elevated(&s, p.person, None, p.family)
+        .await
+        .expect("resolve");
+    assert!(
+        elevated.is_elevated() && !plain.is_elevated(),
+        "CALIBRATION"
+    );
+
+    let reason = |r: Result<Uuid, DbError>| match r {
+        Err(DbError::ElevatedAccessUnrecorded { reason }) => reason,
+        other => panic!("expected ElevatedAccessUnrecorded, got {other:?}"),
+    };
+    assert_eq!(
+        reason(s.record_elevated_access(&plain, &access(vec![])).await),
+        "the viewer is not elevated"
+    );
+    let bare = ScopedPool::connect_downgraded_for_tests(
+        &fixture::database_url_for(&pool).await,
+        SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("a non-recording pool");
+    assert!(!bare.records_elevated_access(), "CALIBRATION");
+    assert_eq!(
+        reason(
+            bare.record_elevated_access(&elevated, &access(vec![]))
+                .await
+        ),
+        "this pool does not declare the per-access recorder"
+    );
+    stamped(&pool, Stamp::plain(p.person), |mut conn| async move {
+        sqlx::query("SELECT public.epigraph_end_elevation($1, 'ended')")
+            .bind(live)
+            .execute(&mut *conn)
+            .await
+            .expect("end");
+        (conn, ())
+    })
+    .await;
+    let ended = reason(s.record_elevated_access(&elevated, &access(vec![])).await);
+    assert!(ended.contains("ELV07"), "the database's refusal: {ended}");
+    assert_eq!(log_rows(&pool).await, 0, "nothing recorded");
+}
+
+/// Only `ScopedPool::connect_recording_elevated_access` among the PRODUCTION
+/// constructors declares the recorder: its connections carry
+/// `epigraph.access_recorder = on`, `connect` and `connect_with_options` leave
+/// it unset.
+///
+/// Verified to fail with the recording constructor passing `false` to the
+/// shared builder.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_recording_constructor_declares_the_recorder(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let probe = |s: ScopedPool| async move {
+        let v = Viewer::resolve(s.inner(), Uuid::new_v4())
+            .await
+            .expect("an empty viewer");
+        let mut conn = s.acquire_as(&v).await.expect("acquire_as");
+        let declared: String = sqlx::query_scalar("SELECT COALESCE(current_setting($1, true), '')")
+            .bind(epigraph_db::ACCESS_RECORDER_GUC)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the declaration");
+        (declared, s.records_elevated_access())
+    };
+    let recording = ScopedPool::connect_recording_elevated_access(
+        &url,
+        SessionGucMode::Session,
+        ScopedPoolOptions::default(),
+    )
+    .await
+    .expect("recording pool");
+    assert_eq!(probe(recording).await, ("on".to_string(), true));
+    let plain = ScopedPool::connect(&url, SessionGucMode::Session)
+        .await
+        .expect("plain pool");
+    assert_eq!(probe(plain).await, (String::new(), false));
+    let sized = ScopedPool::connect_with_options(
+        &url,
+        SessionGucMode::Session,
+        ScopedPoolOptions::default(),
+    )
+    .await
+    .expect("sized pool");
+    assert_eq!(probe(sized).await, (String::new(), false));
 }

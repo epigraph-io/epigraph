@@ -209,6 +209,14 @@ pub enum DbError {
     )]
     ElevatedReadOnly,
 
+    /// An elevated request could not be RECORDED in the per-access log
+    /// (elevation plan EL-8, migration 127): the viewer is not elevated, the
+    /// pool does not declare the recorder, or the recorder refused or failed.
+    /// The serving process WITHHOLDS the response (HTTP 500, MCP internal
+    /// error): an elevated read that is not recorded is never sent.
+    #[error("ELEVATED ACCESS NOT RECORDED: {reason}; the response is withheld")]
+    ElevatedAccessUnrecorded { reason: String },
+
     /// Migration failed
     #[error("Migration failed: {source}")]
     MigrationFailed {

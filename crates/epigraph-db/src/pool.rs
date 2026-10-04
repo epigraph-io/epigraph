@@ -665,8 +665,11 @@ const SET_SESSION_GUCS: &str = "SELECT set_config('epigraph.group_ids',         
 /// builds) would elevate on a gate-opened database and serve unrecorded
 /// foreign reads. With this key, a build that never declares never elevates.
 ///
-/// No production constructor of this tree declares it: no build records yet.
-/// Stamped once per physical connection in `after_connect` (session scope,
+/// One production constructor declares it,
+/// [`ScopedPool::connect_recording_elevated_access`], for the binaries that
+/// record every elevated access (the API server, the MCP server's HTTP
+/// transport); every other constructor leaves it unset. Stamped once per
+/// physical connection in `after_connect` (session scope,
 /// outside the release scrub, the operator-binding valve's transport), so
 /// behind a transaction-mode pooler it does not survive and the connection
 /// fails closed (not elevated). Like every custom setting it is a transport,
@@ -833,6 +836,12 @@ pub struct ScopedPool {
     /// `#[sqlx::test]` database has exactly one DSN and one role) and because
     /// it is sound for as long as no table is FORCEd.
     maintenance: Option<PgPool>,
+    /// Whether every connection of this pool DECLARES the per-access recorder
+    /// ([`ACCESS_RECORDER_GUC`]), i.e. whether it was built by
+    /// [`ScopedPool::connect_recording_elevated_access`] (or the test-support
+    /// constructor). [`ScopedPool::record_elevated_access`] refuses on a pool
+    /// that does not.
+    records_elevated_access: bool,
 }
 
 impl ScopedPool {
@@ -925,13 +934,12 @@ impl ScopedPool {
     /// ([`ACCESS_RECORDER_GUC`]), optionally downgraded to `downgrade_to` as
     /// [`Self::connect_downgraded_for_tests`] does.
     ///
-    /// No build of this tree records elevated accesses yet (elevation plan
-    /// EL-8), so no production constructor declares the recorder, and a
-    /// production pool never elevates even on a database whose recorder gate
-    /// is open. A test of what a LIVE elevation does stands in for both
-    /// halves: the database's gate (`viewer_fixture::open_elevated_access_gate`)
-    /// and this declaration. The recorder's batch replaces this with a
-    /// production path at the one place the recorder is wired.
+    /// The production declaring constructor is
+    /// [`Self::connect_recording_elevated_access`], which cannot downgrade. A
+    /// test of what a LIVE elevation does stands in for both keys: the
+    /// database's gate (`viewer_fixture::open_elevated_access_gate`, until the
+    /// migration that opens it) and this declaration, on a pool it can
+    /// downgrade to the application role.
     ///
     /// # Errors
     /// As [`Self::connect_downgraded_for_tests`].
@@ -947,6 +955,80 @@ impl ScopedPool {
             plain_role_identifier(role)?;
         }
         Self::connect_inner(database_url, mode, options, downgrade_to, true).await
+    }
+
+    /// [`Self::connect_with_options`] for a process that RECORDS every
+    /// elevated access (elevation plan EL-8): every connection DECLARES the
+    /// per-access recorder ([`ACCESS_RECORDER_GUC`]), the second key without
+    /// which migration 125 never elevates a connection.
+    ///
+    /// The ONE production constructor that declares it. Only a binary whose
+    /// every elevated response passes through [`Self::record_elevated_access`]
+    /// before it is sent may build it: the API server (its response layer
+    /// records, and its viewer extractor refuses to hand an elevated viewer to
+    /// a request the layer is not recording) and the MCP server's HTTP
+    /// transport (its tool-call wrapper records). Every other binary builds
+    /// its pool with [`Self::connect`] / [`Self::connect_with_options`] and so
+    /// never elevates, whatever the database's gate says.
+    ///
+    /// # Errors
+    /// Returns `DbError::ConnectionFailed` if the pool cannot be established.
+    #[instrument(skip(database_url))]
+    pub async fn connect_recording_elevated_access(
+        database_url: &str,
+        mode: SessionGucMode,
+        options: ScopedPoolOptions,
+    ) -> Result<Self, DbError> {
+        Self::connect_inner(database_url, mode, options, None, true).await
+    }
+
+    /// Whether this pool declares the per-access recorder (built by
+    /// [`Self::connect_recording_elevated_access`] or the test-support
+    /// constructor): the only kind of pool on which a viewer can be elevated.
+    #[must_use]
+    pub fn records_elevated_access(&self) -> bool {
+        self.records_elevated_access
+    }
+
+    /// RECORD one elevated request in the per-access log (migration 127's
+    /// `epigraph_record_elevated_access`), on its own transaction stamped
+    /// with `v`, BEFORE the caller sends the response. Works in either
+    /// [`SessionGucMode`].
+    ///
+    /// The one write an ELEVATED viewer's connection makes: [`Self::begin_as`]
+    /// refuses it every other transaction, and this one runs exactly the
+    /// recorder (a definer, which the elevated write refusals of migration
+    /// 126 do not apply to) and commits. Fail-closed: on ANY error the caller
+    /// withholds the response.
+    ///
+    /// # Errors
+    /// * `DbError::ElevatedAccessUnrecorded` if `v` is not elevated, if this
+    ///   pool does not declare the recorder, or if the recorder refused
+    ///   (`ELV07`: the session is no longer live) or the statement failed.
+    pub async fn record_elevated_access(
+        &self,
+        v: &Viewer,
+        access: &crate::repos::ElevatedAccess,
+    ) -> Result<uuid::Uuid, DbError> {
+        if !v.is_elevated() {
+            return Err(DbError::ElevatedAccessUnrecorded {
+                reason: "the viewer is not elevated".to_string(),
+            });
+        }
+        if !self.records_elevated_access {
+            return Err(DbError::ElevatedAccessUnrecorded {
+                reason: "this pool does not declare the per-access recorder".to_string(),
+            });
+        }
+        let unrecorded = |e: DbError| DbError::ElevatedAccessUnrecorded {
+            reason: e.to_string(),
+        };
+        let mut tx = self.begin_stamped(v, "BEGIN").await.map_err(unrecorded)?;
+        let id = crate::repos::elevated_access::record(&mut tx, access)
+            .await
+            .map_err(unrecorded)?;
+        tx.commit().await.map_err(unrecorded)?;
+        Ok(id)
     }
 
     async fn connect_inner(
@@ -1032,6 +1114,7 @@ impl ScopedPool {
             inner,
             mode,
             maintenance: None,
+            records_elevated_access: access_recorder,
         })
     }
 
@@ -1199,7 +1282,9 @@ impl ScopedPool {
 
     /// `begin` (`BEGIN` or `BEGIN READ ONLY`), then the transaction-local
     /// stamp from `v`, verified in debug builds. Shared by [`Self::begin_as`]
-    /// and [`Self::begin_read_as`], which have checked the viewer.
+    /// and [`Self::begin_read_as`], which have checked the viewer, and by
+    /// [`Self::record_elevated_access`], whose transaction runs only the
+    /// recorder.
     async fn begin_stamped(
         &self,
         v: &Viewer,

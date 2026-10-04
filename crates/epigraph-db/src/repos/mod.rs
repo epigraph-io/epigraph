@@ -25,6 +25,7 @@ pub mod decomposition_priority;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
+pub mod elevated_access;
 pub mod elevation_ceremony;
 pub mod entity;
 pub mod entity_type;
@@ -104,6 +105,7 @@ pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;
+pub use elevated_access::ElevatedAccess;
 pub use elevation_ceremony::{
     AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
     Redemption, TicketMode, TicketPasskey,
