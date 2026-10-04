@@ -1743,3 +1743,45 @@ elevated, and its release scrub clears all five. The boot probe checks all five.
 
 **Rollback.** Redeploy the previous binaries; there is no data to undo. Roll
 these binaries back BEFORE running `125-undo.sql`.
+
+## The elevated read arms (migration 126) — deploy order, lock plan and rollback
+
+Migration 126 gives every owner-isolated table (and the agent, group,
+derived and edge tables) an elevated READ arm and an elevated WRITE refusal:
+a PERMISSIVE `<t>_elevated_read` and RESTRICTIVE `<t>_elevated_no_insert` /
+`_update` / `_delete`, all `TO epigraph_app` and all reading
+`epigraph_is_elevated()`. The two audit tables get the read arm only; the
+retired (T-DROP) tables get the refusals only. It is the migration that makes
+an elevated session read other people's rows; it also makes the database,
+not only `begin_as`, refuse that session's writes. For every session that is
+not elevated nothing changes: the arm is false and every refusal is true.
+
+1. **Deploy the elevated-viewer binaries first** (the section above) and
+   migrate 125 before them. Without them nothing stamps an elevation, so the
+   arms do nothing; with them and without 126, an elevated session reads only
+   its own groups. Neither order is unsafe, but 126 should land before any
+   elevation session is opened for real use.
+2. **Migrate 126** (`epigraph-migrate`, migration DSN) under the lock plan.
+   `CREATE POLICY` takes ACCESS EXCLUSIVE on its table, so it waits for every
+   open reader of that table. The file arms ONE table per committed block with
+   a 3 s lock timeout (about 35 tables, in the order the file lists them):
+   - stop the timers and confirm no transaction older than a few seconds
+     (`SELECT max(now() - xact_start) FROM pg_stat_activity WHERE state <>
+     'idle'`), outside the backup windows;
+   - PostgreSQL prints `WARNING: there is no transaction in progress` once per
+     table; that is expected;
+   - a lock timeout (SQLSTATE `55P03`) fails the migration at one table, with
+     the tables before it armed and NO `_sqlx_migrations` row. Rerun the
+     migration: it is idempotent and resumes. (An API booting with
+     `EPIGRAPH_MIGRATE_ON_BOOT` set would retry it too; prefer the explicit
+     `epigraph-migrate` run, under the lock plan.)
+3. Nothing is deployed by this step.
+
+**Rollback.** No binary names these policies, so nothing must roll back
+first. Run `docs/runbooks/126-undo.sql` on the migration DSN (the same
+per-table, resumable form; one `WARNING` per table under `psql`). Its
+`_sqlx_migrations` row stays: re-arming is a new migration. **Run 126-undo
+before 125-undo**: 125-undo refuses while any policy reads
+`epigraph_is_elevated()`. Undoing 126 while a session is live narrows that
+session's reads back to its own groups and leaves its write refusal to
+`begin_as` alone.

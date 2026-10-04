@@ -635,3 +635,106 @@ async fn a_held_lock_fails_one_table_and_a_rerun_resumes(pool: PgPool) {
         .expect("the rerun finishes");
     assert_eq!(observed(&mut migrator).await, full, "the rerun resumed");
 }
+
+// =====================================================================
+// The undo
+// =====================================================================
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+fn up_to(max: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= max)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+/// Run `migrator` on one connection and reset it: 001's pg_dump header leaves
+/// session-level SETs behind.
+async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+}
+
+/// Every policy in `public`, by table and name, with its kind, command,
+/// roles and both expressions.
+async fn policies(pool: &PgPool) -> BTreeSet<String> {
+    sqlx::query_scalar(
+        "SELECT c.relname || '.' || p.polname || ' ' || p.polcmd::text || ' ' || \
+                p.polpermissive::text || ' ' || p.polroles::regrole[]::text || ' ' || \
+                coalesce(pg_get_expr(p.polqual, p.polrelid), '-') || ' ' || \
+                coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '-') \
+           FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+          WHERE c.relnamespace = 'public'::regnamespace",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("policies")
+    .into_iter()
+    .collect()
+}
+
+fn runbook(name: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/runbooks")
+            .join(name),
+    )
+    .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// `docs/runbooks/126-undo.sql`, applied to a database that went 125 -> 126,
+/// returns its policy set exactly to the same database's at 125; a rerun is a
+/// no-op; and 125's undo, which refuses while any policy reads
+/// `epigraph_is_elevated()`, then applies (the deploy order: 126-undo BEFORE
+/// 125-undo). Cut at 126, not head, so a later migration cannot break it.
+///
+/// Verified to fail with one table's DROP of its read arm removed from the
+/// undo (the policy is left behind, and 125-undo refuses).
+#[sqlx::test(migrations = false)]
+async fn the_undo_returns_the_policies_to_125_and_unblocks_its_undo(pool: PgPool) {
+    migrate(&pool, &up_to(125)).await;
+    let at_125 = policies(&pool).await;
+    migrate(&pool, &up_to(126)).await;
+    assert_ne!(
+        policies(&pool).await,
+        at_125,
+        "CALIBRATION: 126 changed the policy set"
+    );
+
+    let undo = runbook("126-undo.sql");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("the undo applies");
+    let after = policies(&pool).await;
+    let left: Vec<&String> = after.difference(&at_125).collect();
+    let lost: Vec<&String> = at_125.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the policies are not 125's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("the undo reruns");
+    assert_eq!(policies(&pool).await, at_125, "a rerun is a no-op");
+
+    sqlx::raw_sql(&runbook("125-undo.sql"))
+        .execute(&pool)
+        .await
+        .expect("125-undo applies once 126 is undone");
+}
