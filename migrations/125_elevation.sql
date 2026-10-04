@@ -131,8 +131,8 @@
 -- row's own agent). So the offline verification of every confirmation must
 -- run before the first real elevation, and only the request units may hold
 -- the application DSN. The recorder gate (section 1) narrows the window: until
--- the per-access recorder is installed no session reads anything more, and
--- once it is, every such read is recorded.
+-- it opens no session reads anything more, and once it is open every such
+-- read is recorded (migration 127's log).
 --
 -- ===================================================================
 -- 3. UNDO

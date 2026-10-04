@@ -291,7 +291,8 @@ async fn enroll_with(
 
 /// A platform custodian with one live passkey (on `auth`) and a family.
 async fn holder(pool: &PgPool, s: &Server, label: &str, auth: &mut SoftAuthenticator) -> Person {
-    // 125 ships no session live until the per-access recorder is installed;
+    // 125 ships the recorder gate closed and 127 (the recorder) leaves it
+    // closed, so no session is live until the migration that opens it;
     // these tests are about what a LIVE session does.
     fixture::open_elevated_access_gate(pool).await;
     let p = person(pool, label).await;

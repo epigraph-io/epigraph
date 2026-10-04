@@ -326,8 +326,9 @@ pub async fn make_human_operator(pool: &PgPool, agent: Uuid) {
 ///
 /// 125 ships the gate answering `false`, so NO elevation session is live
 /// (`epigraph_is_elevated()`, `epigraph_elevation_live`, the grant-mode
-/// redemption) until the migration that installs the recorder replaces it: a
-/// routine deploy of a tree without the recorder can never widen a read. A
+/// redemption) until the migration that OPENS elevation replaces it (127, the
+/// recorder's, leaves it closed; 125's header lists what the opening waits
+/// on): a routine deploy can never widen a read before then. A
 /// test of what a LIVE session does calls this first (before any pool is
 /// built, so no cached plan holds the old body); `CREATE OR REPLACE` keeps the
 /// function's owner and ACL, so the 125 register tests still hold. Idempotent.

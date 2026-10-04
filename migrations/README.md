@@ -927,7 +927,8 @@ Current reservation:
   session's `role` setting; review cp3), and never before the recorder gate
   opens. `epigraph_is_elevated` and `epigraph_elevation_live` also require the
   connection to declare the per-access recorder (`epigraph.access_recorder` =
-  `on`, stamped by a build that records; no build of this tree does), so a
+  `on`, stamped only by a build that records: the API server and the MCP
+  HTTP transport, through `ScopedPool::connect_recording_elevated_access`), so a
   unit on a build without the recorder never elevates on a gate-opened
   database (review cp3). FORCE RLS on
   both: the application role keeps SELECT but its policies show it no row,
