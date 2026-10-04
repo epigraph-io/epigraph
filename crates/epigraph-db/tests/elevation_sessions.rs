@@ -1097,7 +1097,10 @@ async fn is_elevated_judges_expiry_by_the_statements_clock(pool: PgPool) {
         })
         .await;
     assert_eq!(current_user, "epigraph_app", "CALIBRATION: the app role");
-    assert!(first, "CALIBRATION: elevated at the transaction's first statement");
+    assert!(
+        first,
+        "CALIBRATION: elevated at the transaction's first statement"
+    );
     assert!(
         !second,
         "an elevated READ ONLY transaction kept its elevation past the session's expiry"
@@ -1659,11 +1662,18 @@ async fn revoking_the_family_ends_the_session(pool: PgPool) {
                 .fetch_one(&mut *conn)
                 .await
                 .expect("revoke the client's tokens");
-        assert!(by_hash && by_id && by_client >= 1, "CALIBRATION: each revoked");
+        assert!(
+            by_hash && by_id && by_client >= 1,
+            "CALIBRATION: each revoked"
+        );
         (conn, ())
     })
     .await;
-    for (what, h, sid) in [("by hash", &a, sa), ("by id", &b, sb), ("by client", &c, sc)] {
+    for (what, h, sid) in [
+        ("by hash", &a, sa),
+        ("by id", &b, sb),
+        ("by client", &c, sc),
+    ] {
         assert_eq!(
             ended_reason(&pool, sid).await.as_deref(),
             Some("family_revoked"),
