@@ -1469,6 +1469,14 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "INSERT INTO elevated_access",
         "UPDATE elevated_access",
         "DELETE FROM elevated_access",
+        // Migration 128: the admin-scope arming switch is changed ONLY by
+        // its maintenance setter (`epigraph-operator arm-admin-scopes`), and
+        // the request path has no grant to change it anyway; a raw statement
+        // on any of these crates would be a second, unreviewed way to arm.
+        "UPDATE admin_scope_enforcement",
+        "INSERT INTO admin_scope_enforcement",
+        "DELETE FROM admin_scope_enforcement",
+        "epigraph_set_admin_scope_enforcement($",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //

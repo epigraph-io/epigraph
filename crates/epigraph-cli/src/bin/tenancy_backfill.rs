@@ -1768,6 +1768,23 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_admin_group_ids", 127),
     ("epigraph_record_elevated_access", 127),
     ("epigraph_elevated_access_audit", 127),
+    // 128, the admin-scope arming switch. The guard, the audit trigger and
+    // the setter only need the owner's grant on `admin_scope_enforcement`
+    // (UPDATE of armed and reason, granted to the maintenance role) and
+    // `security_events`; under a non-member owner they fail LOUD (42501 on
+    // every arm or disarm). The armed read fails loud too, which the mint
+    // chokepoint treats as armed (it strips). The stake is the would-strip
+    // recorder: it reads `oauth_clients` and the rate-limit window in
+    // `security_events` through policies that admit only a privileged
+    // session or `epigraph_definer_bypass()`, so under a non-member owner it
+    // finds no client and refuses every record (ADS03), and the token
+    // endpoint only WARNS on a failed record: the measurement that gates
+    // arming would read zero, silently.
+    ("epigraph_admin_scope_enforcement_guard", 128),
+    ("epigraph_admin_scope_enforcement_audit", 128),
+    ("epigraph_admin_scopes_armed", 128),
+    ("epigraph_set_admin_scope_enforcement", 128),
+    ("epigraph_record_admin_scope_would_strip", 128),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2248,6 +2265,24 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_elevated_access_audit",
             "public.epigraph_elevated_access_audit(timestamp with time zone, integer)",
             true,
+        ),
+        // 128 (the admin-scope arming switch): the token endpoint reads the
+        // switch and records the would-strip measurement on the request DSN,
+        // so both are app-callable; arming and disarming are maintenance acts.
+        (
+            "epigraph_admin_scopes_armed",
+            "public.epigraph_admin_scopes_armed()",
+            true,
+        ),
+        (
+            "epigraph_record_admin_scope_would_strip",
+            "public.epigraph_record_admin_scope_would_strip(uuid, text, text[])",
+            true,
+        ),
+        (
+            "epigraph_set_admin_scope_enforcement",
+            "public.epigraph_set_admin_scope_enforcement(boolean, text)",
+            false,
         ),
     ];
 

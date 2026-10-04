@@ -533,3 +533,93 @@ async fn the_rollback_returns_the_catalog_to_127_and_records_the_disarm(pool: Pg
     );
     assert_eq!(events(&pool, "platform.admin_scopes_armed").await.len(), 1);
 }
+
+// =====================================================================
+// The registers know every 128 object.
+// =====================================================================
+
+/// The functions a migration file creates in `public`, read from its text:
+/// `(SECURITY DEFINER ones, all)`.
+fn functions_of(migration: &str) -> (Vec<String>, Vec<String>) {
+    let mut definers = Vec::new();
+    let mut all = Vec::new();
+    let mut rest = migration;
+    while let Some(i) = rest.find("CREATE OR REPLACE FUNCTION public.") {
+        let after = &rest[i + "CREATE OR REPLACE FUNCTION public.".len()..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let body_end = after.find("$$;").unwrap_or(after.len());
+        let header_end = after.find(" AS $$").unwrap_or(body_end);
+        if after[..header_end].contains("SECURITY DEFINER") {
+            definers.push(name.clone());
+        }
+        all.push(name);
+        rest = &after[body_end..];
+    }
+    definers.sort();
+    definers.dedup();
+    all.sort();
+    all.dedup();
+    (definers, all)
+}
+
+/// Every SECURITY DEFINER migration 128 creates is on
+/// `epigraph-tenancy-backfill verify`'s ownership list at 128 (a silently
+/// no-opped `OWNER TO` is invisible to every behavioural test, because the
+/// harness migrates as a superuser), every app-callable one is on its grant
+/// register, and every function it creates is dropped by
+/// `docs/runbooks/128-undo.sql`.
+///
+/// Verified to fail: the `("epigraph_record_admin_scope_would_strip", 128)`
+/// entry removed from `DEFERRED_DEFINER_FUNCTIONS` -> named here.
+#[test]
+fn every_128_object_is_registered() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let migration = read("migrations/128_admin_scope_enforcement.sql");
+    let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let undo = read("docs/runbooks/128-undo.sql");
+
+    let (definers, all) = functions_of(&migration);
+    assert_eq!(
+        definers.len(),
+        5,
+        "CALIBRATION: 128 creates 5 SECURITY DEFINER functions; the scan found {definers:?}"
+    );
+    assert_eq!(definers, all, "every function 128 creates is a definer");
+    let missing: Vec<&String> = definers
+        .iter()
+        .filter(|n| !backfill.contains(&format!("(\"{n}\", 128)")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "migration 128 definers missing from tenancy_backfill.rs's ownership list at 128: \
+         {missing:?}"
+    );
+    for callable in [
+        "public.epigraph_admin_scopes_armed()",
+        "public.epigraph_record_admin_scope_would_strip(uuid, text, text[])",
+        "public.epigraph_set_admin_scope_enforcement(boolean, text)",
+    ] {
+        assert!(
+            backfill.contains(&format!("\"{callable}\"")),
+            "{callable} is missing from tenancy_backfill.rs's grant register"
+        );
+    }
+    let undropped: Vec<&String> = all
+        .iter()
+        .filter(|n| !undo.contains(&format!("DROP FUNCTION IF EXISTS public.{n}(")))
+        .collect();
+    assert!(
+        undropped.is_empty(),
+        "128-undo.sql does not drop: {undropped:?}"
+    );
+    assert!(
+        undo.contains("DROP TABLE IF EXISTS public.admin_scope_enforcement;"),
+        "128-undo.sql does not drop the switch's table"
+    );
+}
