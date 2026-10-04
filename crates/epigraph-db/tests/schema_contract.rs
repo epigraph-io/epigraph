@@ -2028,8 +2028,14 @@ async fn migration_125_elevation_definers_are_owned_and_granted(pool: PgPool) {
             false,
         ),
         (
-            "epigraph_end_elevations_on_family_reuse",
-            "public.epigraph_end_elevations_on_family_reuse()",
+            "epigraph_end_elevations_on_family_revoke",
+            "public.epigraph_end_elevations_on_family_revoke()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_end_elevations_on_client_revoke",
+            "public.epigraph_end_elevations_on_client_revoke()",
             "v",
             false,
         ),

@@ -387,6 +387,46 @@ async fn age_session(pool: &PgPool, session: Uuid) {
     .await;
 }
 
+/// `epigraph_elevation_live(elv, family)` on an app session stamped as
+/// `h.person`: the session ids it returns.
+async fn live_rows(pool: &PgPool, h: &Holder, elv: Option<Uuid>) -> Vec<Uuid> {
+    let fam = h.family;
+    as_app(pool, Some(h.person), "", "", |mut conn| async move {
+        let r: Vec<Uuid> =
+            sqlx::query_scalar("SELECT session_id FROM public.epigraph_elevation_live($1, $2)")
+                .bind(elv)
+                .bind(fam)
+                .fetch_all(&mut *conn)
+                .await
+                .expect("elevation_live");
+        (conn, r)
+    })
+    .await
+}
+
+/// The same holder on a SECOND active human client of its own (not the one
+/// its registration records), with a live family there.
+async fn on_a_second_client(pool: &PgPool, h: &Holder) -> Holder {
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id) \
+         VALUES ($1, 'second human client', 'human', ARRAY['claims:read'], 'active', $2) \
+         RETURNING id",
+    )
+    .bind(format!("second-human-{}", h.person))
+    .bind(h.person)
+    .fetch_one(pool)
+    .await
+    .expect("a second human client");
+    let (family, token_hash) = family(pool, client).await;
+    Holder {
+        client,
+        family,
+        token_hash,
+        ..h.clone()
+    }
+}
+
 /// Link `agent` to `operator` as its agent (superuser; every
 /// `operator_links` trigger runs).
 async fn link_as_agent(pool: &PgPool, agent: Uuid, operator: Uuid) {
@@ -1509,6 +1549,170 @@ async fn a_deregistration_ends_the_persons_session(pool: PgPool) {
     );
 }
 
+/// THE COMPUTED CHECK, family half: the session's refresh family loses its
+/// last live token (revoked with the end trigger off, so the row is still
+/// un-ended) and the session is no longer elevated, nor returned by
+/// `epigraph_elevation_live`. The elevation is bound to that family (125's
+/// header); a family the operator or the user has killed must not keep it.
+///
+/// Verified to fail: the family re-check dropped from the liveness helper ->
+/// still elevated and still returned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn is_elevated_is_false_once_the_family_is_revoked(pool: PgPool) {
+    let h = holder(&pool, "holder", 1).await;
+    let sid = elevated(&pool, &h).await;
+    assert!(elevated_as(&pool, &h, sid).await, "CALIBRATION: elevated");
+    without_triggers(
+        &pool,
+        "UPDATE refresh_tokens SET revoked_at = now(), revoked_reason = 'revoked' WHERE id = $1",
+        h.family,
+    )
+    .await;
+    assert_eq!(
+        ended_reason(&pool, sid).await,
+        None,
+        "CALIBRATION: the row is un-ended"
+    );
+    assert!(!elevated_as(&pool, &h, sid).await, "a revoked family");
+    assert!(
+        live_rows(&pool, &h, Some(sid)).await.is_empty(),
+        "elevation_live returns a session whose family is revoked"
+    );
+}
+
+/// THE COMPUTED CHECK, client half: the session runs on a SECOND human client
+/// of the person, not the one the registration records, so 122's
+/// human-operator test (which reads the recorded client) still says "human"
+/// after that second client is suspended (triggers off). The session's own
+/// client is re-checked, so it is no longer elevated.
+///
+/// Verified to fail: the family re-check dropped from the liveness helper
+/// (its client test is the only one that reads the SESSION's client) ->
+/// still elevated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn is_elevated_is_false_once_the_sessions_client_is_suspended(pool: PgPool) {
+    let first = holder(&pool, "holder", 1).await;
+    let h = on_a_second_client(&pool, &first).await;
+    let sid = elevated(&pool, &h).await;
+    assert!(elevated_as(&pool, &h, sid).await, "CALIBRATION: elevated");
+    without_triggers(
+        &pool,
+        "UPDATE oauth_clients SET status = 'suspended' WHERE id = $1",
+        h.client,
+    )
+    .await;
+    let human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
+        .bind(h.person)
+        .fetch_one(&pool)
+        .await
+        .expect("is_human_operator");
+    assert!(
+        human,
+        "CALIBRATION: the person is still a registered human (the recorded client is live)"
+    );
+    assert_eq!(
+        ended_reason(&pool, sid).await,
+        None,
+        "CALIBRATION: the row is un-ended"
+    );
+    assert!(
+        !elevated_as(&pool, &h, sid).await,
+        "a session on a suspended client"
+    );
+}
+
+/// THE END, family half, through 118's own definers as the application role:
+/// an RFC 7009 revoke (by hash), a denied/revoked revoke (by id) and a
+/// client-wide revoke each end the family's session `family_revoked`,
+/// audited (a rotation does not: `a_family_reuse_ends_the_session_and_a_rotation_does_not`).
+///
+/// Verified to fail: the refresh-token end trigger back on `reuse` only ->
+/// each session stays un-ended.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_the_family_ends_the_session(pool: PgPool) {
+    let a = holder(&pool, "by-hash", 1).await;
+    let b = holder(&pool, "by-id", 2).await;
+    let c = holder(&pool, "by-client", 3).await;
+    let (sa, sb, sc) = (
+        elevated(&pool, &a).await,
+        elevated(&pool, &b).await,
+        elevated(&pool, &c).await,
+    );
+    let hash = a.token_hash.clone();
+    let (fam_b, client_c) = (b.family, c.client);
+    as_app(&pool, None, "", "", |mut conn| async move {
+        let by_hash: bool =
+            sqlx::query_scalar("SELECT public.epigraph_refresh_token_revoke_by_hash($1)")
+                .bind(&hash)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("revoke by hash");
+        let by_id: bool =
+            sqlx::query_scalar("SELECT public.epigraph_refresh_token_revoke($1, 'denied')")
+                .bind(fam_b)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("revoke by id");
+        let by_client: i64 =
+            sqlx::query_scalar("SELECT public.epigraph_refresh_token_revoke_client($1)")
+                .bind(client_c)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("revoke the client's tokens");
+        assert!(by_hash && by_id && by_client >= 1, "CALIBRATION: each revoked");
+        (conn, ())
+    })
+    .await;
+    for (what, h, sid) in [("by hash", &a, sa), ("by id", &b, sb), ("by client", &c, sc)] {
+        assert_eq!(
+            ended_reason(&pool, sid).await.as_deref(),
+            Some("family_revoked"),
+            "{what}"
+        );
+        assert_eq!(
+            events(&pool, "platform.elevation_ended", "session_id", sid).await,
+            1,
+            "{what}: the end is audited"
+        );
+        assert!(!elevated_as(&pool, h, sid).await, "{what}: not elevated");
+    }
+}
+
+/// THE END, client half: suspending the session's client ends it
+/// `client_revoked`, audited, and the end LATCHES: the client re-activated
+/// (by a privileged session, the only one 122 lets do it) inside what was the
+/// window does not revive the session.
+///
+/// Verified to fail: the client end trigger dropped -> the session stays
+/// un-ended, and is elevated again once the client is re-activated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn suspending_the_sessions_client_ends_the_session_for_good(pool: PgPool) {
+    let first = holder(&pool, "holder", 1).await;
+    let h = on_a_second_client(&pool, &first).await;
+    let sid = elevated(&pool, &h).await;
+    for status in ["suspended", "active"] {
+        sqlx::query("UPDATE oauth_clients SET status = $2 WHERE id = $1")
+            .bind(h.client)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("client -> {status}: {e}"));
+    }
+    assert_eq!(
+        ended_reason(&pool, sid).await.as_deref(),
+        Some("client_revoked")
+    );
+    assert_eq!(
+        events(&pool, "platform.elevation_ended", "session_id", sid).await,
+        1,
+        "the end is audited"
+    );
+    assert!(
+        !elevated_as(&pool, &h, sid).await,
+        "a re-activated client revived the session"
+    );
+}
+
 // =====================================================================
 // Grant mode, and the principal-bound readers.
 // =====================================================================
@@ -1989,8 +2193,8 @@ fn undo_125() -> String {
 /// `docs/runbooks/125-undo.sql`, applied to a database that went 124 -> 125
 /// and holds a live session, a refused ticket and an open one, returns its
 /// catalog (relations, function bodies and owners, policies, triggers,
-/// constraints) to the same database's at 124, including the three end
-/// triggers 125 put on 118's, 122's and 123's tables; the `platform.elevat*`
+/// constraints) to the same database's at 124, including the end triggers
+/// 125 put on 118's, 122's, 123's and 001's tables; the `platform.elevat*`
 /// history stays. Cut at 125, not head: a later migration (the read arms read
 /// `epigraph_is_elevated()`) is undone before this one.
 ///
@@ -2115,7 +2319,7 @@ fn functions_of(migration: &str) -> (Vec<String>, Vec<String>) {
 /// `docs/runbooks/125-undo.sql`, and both tables are in the API's FORCE
 /// register and the 079 kill switch.
 ///
-/// Verified to fail: the `("epigraph_end_elevations_on_family_reuse", 125)`
+/// Verified to fail: the `("epigraph_end_elevations_on_family_revoke", 125)`
 /// entry removed from `DEFERRED_DEFINER_FUNCTIONS` -> named here; the undo's
 /// DROP of `epigraph_family_of_person_is_live` removed -> named here.
 #[test]
@@ -2133,8 +2337,8 @@ fn every_125_object_is_registered() {
     let (definers, all) = functions_of(&migration);
     assert_eq!(
         definers.len(),
-        22,
-        "CALIBRATION: 125 creates 22 SECURITY DEFINER functions; the scan found {definers:?}"
+        23,
+        "CALIBRATION: 125 creates 23 SECURITY DEFINER functions; the scan found {definers:?}"
     );
     assert_eq!(definers, all, "every function 125 creates is a definer");
     let missing: Vec<&String> = definers

@@ -13,9 +13,10 @@
 -- WHAT IT DOES
 --   1. Refuses if a policy still reads `epigraph_is_elevated()`; lists (NOTICE)
 --      how many tickets and sessions it drops, live sessions included.
---   2. Drops the three end triggers on 123's / 122's / 118's tables (their
---      tables stay exactly as those migrations left them), both tables, and
---      every 125 function.
+--   2. Drops the four end triggers on 123's / 122's / 118's / 001's tables
+--      (role_assignments, human_operators, refresh_tokens, oauth_clients;
+--      their tables stay exactly as those migrations left them), both tables,
+--      and every 125 function.
 --
 -- WHAT IT LEAVES: the `platform.elevat*` rows in `security_events` (history),
 -- and 125's `_sqlx_migrations` row. Re-introducing elevation is a NEW
@@ -51,6 +52,7 @@ END $$;
 DROP TRIGGER IF EXISTS role_assignments_end_elevations ON public.role_assignments;
 DROP TRIGGER IF EXISTS human_operators_end_elevations ON public.human_operators;
 DROP TRIGGER IF EXISTS refresh_tokens_end_elevations ON public.refresh_tokens;
+DROP TRIGGER IF EXISTS oauth_clients_end_elevations ON public.oauth_clients;
 
 -- The tables reference each other; both go in one statement.
 DROP TABLE IF EXISTS public.elevation_sessions, public.elevation_tickets;
@@ -65,7 +67,8 @@ DROP FUNCTION IF EXISTS public.epigraph_set_elevation_ticket_challenge(uuid, jso
 DROP FUNCTION IF EXISTS public.epigraph_ticket_for_ceremony(uuid);
 DROP FUNCTION IF EXISTS public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea);
 DROP FUNCTION IF EXISTS public.epigraph_end_expired_elevations(uuid, uuid);
-DROP FUNCTION IF EXISTS public.epigraph_end_elevations_on_family_reuse();
+DROP FUNCTION IF EXISTS public.epigraph_end_elevations_on_client_revoke();
+DROP FUNCTION IF EXISTS public.epigraph_end_elevations_on_family_revoke();
 DROP FUNCTION IF EXISTS public.epigraph_end_elevations_on_operator_revoke();
 DROP FUNCTION IF EXISTS public.epigraph_end_elevations_on_assignment_revoke();
 DROP FUNCTION IF EXISTS public.epigraph_elevation_sessions_audit();

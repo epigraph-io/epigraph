@@ -34,12 +34,14 @@
 -- gets a ticket.
 --
 -- `epigraph_is_elevated()` is true only for the session principal's own
--- un-ended, unexpired session named by BOTH GUCs, and only while the person's
--- live elevating assignment is still the one the session stored. That
--- re-check runs on every statement: a revoked assignment, a revoked
--- registration, a suspended human client, or a later link of the person as
--- an agent turns it false at once, whether or not a trigger has ended the
--- row.
+-- un-ended, unexpired session named by BOTH GUCs, only while the person's
+-- live elevating assignment is still the one the session stored, and only
+-- while the session's refresh family still has a live token on the person's
+-- own active human client. That re-check runs on every statement, against
+-- the statement's clock: a revoked assignment, a revoked registration, a
+-- suspended human client (the recorded one or the session's own), a revoked
+-- family, or a later link of the person as an agent turns it false at once,
+-- whether or not a trigger has ended the row.
 --
 -- REFUSALS THAT MUST BE AUDITED DO NOT RAISE. A ceremony completed with
 -- another person's credential (the confused deputy), a regressed signature
@@ -151,7 +153,8 @@ CREATE TABLE IF NOT EXISTS public.elevation_sessions (
     ended_reason     text CONSTRAINT elevation_sessions_ended_reason
                          CHECK (ended_reason IN ('unsudo', 'ended', 'expired',
                                                  'assignment_revoked', 'operator_revoked',
-                                                 'family_reuse')),
+                                                 'family_reuse', 'family_revoked',
+                                                 'client_revoked')),
     ended_by         text,
     -- THE BOUND (DESIGN 6.2): an elevation never outlives 15 minutes.
     CONSTRAINT elevation_sessions_ttl
@@ -240,6 +243,16 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, 
 -- transaction opened a second before expiry would keep reading every tenant
 -- until it ended. The caller wraps this in a per-statement InitPlan, so the
 -- clock is read once per statement, at that statement.
+--
+-- THE FAMILY AND ITS CLIENT, EVERY STATEMENT. The session is bound to one
+-- refresh family of the person's own active human client; it is live only
+-- while that family still has a live token on that client, and that client is
+-- still the person's, human and active (`epigraph_family_of_person_is_live`,
+-- the test the ticket and the confirmation already made, on the
+-- `refresh_tokens_live_family_idx` index). So any revocation of the family
+-- (RFC 7009, client-wide, denied, reuse) and a suspension of the session's
+-- own client, recorded or not, take the elevation away at once, before the
+-- end triggers below make the row say so.
 CREATE OR REPLACE FUNCTION public.epigraph_elevation_session_is_live(p_session uuid)
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -251,7 +264,9 @@ SET search_path = public, pg_temp AS $$
            AND s.ended_at IS NULL
            AND clock_timestamp() < s.expires_at
            AND public.epigraph_live_elevating_assignment(s.person_agent_id, clock_timestamp())
-               = s.assignment_id)
+               = s.assignment_id
+           AND public.epigraph_family_of_person_is_live(s.person_agent_id, s.client_id,
+                                                        s.family_id))
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_elevation_session_is_live(uuid) FROM PUBLIC;
 
@@ -590,11 +605,13 @@ CREATE TRIGGER human_operators_end_elevations
     WHEN (OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL)
     EXECUTE FUNCTION public.epigraph_end_elevations_on_operator_revoke();
 
--- 118's reuse detector revokes every live token of the family with
--- `revoked_reason = 'reuse'`; that, and only that, ends the family's
--- elevation (a rotation is not an end: the family lives on). Amends nothing
--- in 118.
-CREATE OR REPLACE FUNCTION public.epigraph_end_elevations_on_family_reuse()
+-- Every revocation of a family's token except a ROTATION ends the family's
+-- elevation: 118's reuse detector (`reuse`, ended `family_reuse`), and an
+-- RFC 7009 revoke, a denied refresh or a client-wide revoke (`revoked`,
+-- `denied`, `client`; ended `family_revoked`). A rotation is not an end: it
+-- revokes the old token `rotated` and the family lives on in its successor.
+-- Amends nothing in 118.
+CREATE OR REPLACE FUNCTION public.epigraph_end_elevations_on_family_revoke()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
@@ -602,19 +619,47 @@ BEGIN
     UPDATE public.elevation_sessions s
        SET ended_at = now(), ended_by = session_user,
            ended_reason = CASE WHEN now() >= s.expires_at THEN 'expired'
-                               ELSE 'family_reuse' END
+                               WHEN NEW.revoked_reason = 'reuse' THEN 'family_reuse'
+                               ELSE 'family_revoked' END
      WHERE s.family_id = COALESCE(NEW.family_id, NEW.id) AND s.ended_at IS NULL;
     RETURN NULL;
 END $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_end_elevations_on_family_reuse() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.epigraph_end_elevations_on_family_revoke() FROM PUBLIC;
 
 DROP TRIGGER IF EXISTS refresh_tokens_end_elevations ON public.refresh_tokens;
 CREATE TRIGGER refresh_tokens_end_elevations
     AFTER UPDATE ON public.refresh_tokens
     FOR EACH ROW
     WHEN (OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL
-          AND NEW.revoked_reason = 'reuse')
-    EXECUTE FUNCTION public.epigraph_end_elevations_on_family_reuse();
+          AND NEW.revoked_reason IS DISTINCT FROM 'rotated')
+    EXECUTE FUNCTION public.epigraph_end_elevations_on_family_revoke();
+
+-- A session's CLIENT leaving `active` (suspended, revoked), or ceasing to be
+-- that person's human client, ends every session on it `client_revoked`. The
+-- per-statement check already answers false; the end makes it final, so a
+-- later re-activation of the client does not revive a session it took away.
+CREATE OR REPLACE FUNCTION public.epigraph_end_elevations_on_client_revoke()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    UPDATE public.elevation_sessions s
+       SET ended_at = now(), ended_by = session_user,
+           ended_reason = CASE WHEN now() >= s.expires_at THEN 'expired'
+                               ELSE 'client_revoked' END
+     WHERE s.client_id = NEW.id AND s.ended_at IS NULL;
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_end_elevations_on_client_revoke() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS oauth_clients_end_elevations ON public.oauth_clients;
+CREATE TRIGGER oauth_clients_end_elevations
+    AFTER UPDATE ON public.oauth_clients
+    FOR EACH ROW
+    WHEN ((OLD.status = 'active' AND NEW.status IS DISTINCT FROM 'active')
+          OR NEW.agent_id IS DISTINCT FROM OLD.agent_id
+          OR NEW.client_type IS DISTINCT FROM OLD.client_type)
+    EXECUTE FUNCTION public.epigraph_end_elevations_on_client_revoke();
 
 -- ===================================================================
 -- 6. ROW SECURITY: the application reads no row and writes none directly.
@@ -1065,7 +1110,9 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_end_elevations_on_operator_revoke() '
                 'OWNER TO epigraph_maintenance';
-        EXECUTE 'ALTER FUNCTION public.epigraph_end_elevations_on_family_reuse() '
+        EXECUTE 'ALTER FUNCTION public.epigraph_end_elevations_on_family_revoke() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_end_elevations_on_client_revoke() '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_end_expired_elevations(uuid, uuid) '
                 'OWNER TO epigraph_maintenance';
