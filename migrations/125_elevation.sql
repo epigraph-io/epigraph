@@ -233,6 +233,13 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_family_of_person_is_live(uuid, uuid, 
 -- redemption, so the three can never disagree about what "live" means. Not
 -- granted to the application role (it answers for any session); the
 -- principal-bound definers call it after their own binding.
+--
+-- TIME IS THE STATEMENT'S CLOCK (`clock_timestamp()`), never `now()`. `now()`
+-- is the TRANSACTION's start, and an elevated read in transaction mode is one
+-- `BEGIN READ ONLY` that may outlive the session: judged by `now()`, a
+-- transaction opened a second before expiry would keep reading every tenant
+-- until it ended. The caller wraps this in a per-statement InitPlan, so the
+-- clock is read once per statement, at that statement.
 CREATE OR REPLACE FUNCTION public.epigraph_elevation_session_is_live(p_session uuid)
 RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
@@ -242,8 +249,8 @@ SET search_path = public, pg_temp AS $$
           FROM public.elevation_sessions s
          WHERE s.id = p_session
            AND s.ended_at IS NULL
-           AND now() < s.expires_at
-           AND public.epigraph_live_elevating_assignment(s.person_agent_id, now())
+           AND clock_timestamp() < s.expires_at
+           AND public.epigraph_live_elevating_assignment(s.person_agent_id, clock_timestamp())
                = s.assignment_id)
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_elevation_session_is_live(uuid) FROM PUBLIC;

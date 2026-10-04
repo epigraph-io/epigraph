@@ -1001,6 +1001,73 @@ async fn is_elevated_is_false_once_expired(pool: PgPool) {
     assert!(!elevated_as(&pool, &h, sid).await, "expired");
 }
 
+/// THE STATEMENT'S CLOCK, NOT THE TRANSACTION'S. An elevated read in
+/// transaction mode runs inside ONE application `BEGIN READ ONLY`
+/// (`ScopedPool::begin_read_as`), and `now()` is that transaction's START.
+/// Here the session expires between two statements of one such transaction
+/// (moved to expire 1.5 s later on another connection, triggers off, after
+/// the first statement), and the second statement answers false: the
+/// 15-minute bound is wall-clock, not "15 minutes from the start of the last
+/// transaction opened inside it". After the transaction a fresh statement is
+/// false too (calibration).
+///
+/// Verified to fail: the liveness helper's expiry comparison on `now()`
+/// (the transaction's start) -> the second statement is still elevated.
+/// The assignment window's comparison is not separately red: a confirmation
+/// caps `expires_at` at the assignment's `valid_to`, so the window cannot
+/// close before the expiry does (an equivalent mutant for this test).
+#[sqlx::test(migrations = "../../migrations")]
+async fn is_elevated_judges_expiry_by_the_statements_clock(pool: PgPool) {
+    let h = holder(&pool, "holder", 1).await;
+    let sid = elevated(&pool, &h).await;
+    let (elv, fam) = (sid.to_string(), h.family.to_string());
+    let p2 = pool.clone();
+    let (first, second, current_user) =
+        as_app(&pool, Some(h.person), &elv, &fam, |mut conn| async move {
+            sqlx::query("BEGIN READ ONLY")
+                .execute(&mut *conn)
+                .await
+                .expect("begin read only");
+            let who: String = sqlx::query_scalar("SELECT current_user::text")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("current_user");
+            let first: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("first statement");
+            without_triggers(
+                &p2,
+                "UPDATE elevation_sessions \
+                    SET expires_at = clock_timestamp() + interval '1500 milliseconds' \
+                  WHERE id = $1",
+                sid,
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+            let second: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("second statement");
+            sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .expect("commit");
+            (conn, (first, second, who))
+        })
+        .await;
+    assert_eq!(current_user, "epigraph_app", "CALIBRATION: the app role");
+    assert!(first, "CALIBRATION: elevated at the transaction's first statement");
+    assert!(
+        !second,
+        "an elevated READ ONLY transaction kept its elevation past the session's expiry"
+    );
+    assert!(
+        !elevated_as(&pool, &h, sid).await,
+        "CALIBRATION: expired in a fresh transaction"
+    );
+}
+
 /// False once the holder ends the session (`unsudo`), which is audited
 /// `platform.elevation_ended`.
 ///
