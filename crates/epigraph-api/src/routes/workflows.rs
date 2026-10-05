@@ -2180,7 +2180,9 @@ struct ApiWorkflowGrant {
 /// recorded, in this order, the submitter, its operator, or the AUDITED admin
 /// arm — `claims:admin` in the token AND a live grant on the token's client
 /// record (migration 111's predicate), never the scope alone. A workflow with
-/// no record (written before batch H-b) keeps today's behaviour, with a WARN.
+/// no record (written before batch H-b) is platform corpus (U005, default
+/// decision A): only the audited admin arm admits it, and a caller with no
+/// token is refused.
 #[cfg(feature = "db")]
 async fn workflow_authority(
     conn: &mut sqlx::PgConnection,
@@ -2193,16 +2195,27 @@ async fn workflow_authority(
         .map_err(|e| ApiError::InternalError {
             message: format!("could not read the workflow's submitter: {e}"),
         })?;
+    // U005 (default decision A): a workflow with NO recorded submitter
+    // (written before batch H-b) is platform corpus. There is no submitter to
+    // match and no operator to derive, so the only arm is the audited admin
+    // arm; with no token there is none, and the caller is refused. When the
+    // custodian role lands (#529), its check replaces `claims:admin` here.
     let Some(owner) = owner else {
-        tracing::warn!(
-            workflow_id = %workflow_id,
-            caller = ?caller,
-            "workflow mutation on a workflow with no recorded submitter (written before batch \
-             H-b): allowed, as before"
+        let subject = format!(
+            "workflow {workflow_id} has no recorded submitter (legacy platform workflow, \
+             written before batch H-b)"
         );
-        return Ok(ApiWorkflowGrant {
-            owner: None,
-            admin: false,
+        if api_admin_arm(conn, auth, caller, &subject).await? {
+            return Ok(ApiWorkflowGrant {
+                owner: None,
+                admin: true,
+            });
+        }
+        return Err(ApiError::Forbidden {
+            reason: format!(
+                "{subject}; it is mutable only through the audited claims:admin path, and the \
+                 caller holds no claims:admin. Nothing was written."
+            ),
         });
     };
     let allowed = ApiWorkflowGrant {
@@ -2223,38 +2236,56 @@ async fn workflow_authority(
             return Ok(allowed);
         }
     }
-    if let (Some(a), Some(caller)) = (auth, caller) {
-        if a.has_scope("claims:admin") {
-            let live = epigraph_db::SecurityEventRepository::admin_grant_is_live(
-                &mut *conn,
-                a.client_id,
-                caller,
-            )
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("could not re-check the admin grant: {e}"),
-            })?;
-            if live {
-                return Ok(ApiWorkflowGrant {
-                    owner: Some(owner),
-                    admin: true,
-                });
-            }
-            return Err(ApiError::Forbidden {
-                reason: format!(
-                    "workflow {workflow_id} was submitted by agent {owner}; the token carries \
-                     claims:admin, but its client record grants no live claims:admin to this \
-                     principal, so the audited admin path refused it (ADM02). Nothing was \
-                     written."
-                ),
-            });
-        }
+    let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
+    if api_admin_arm(conn, auth, caller, &subject).await? {
+        return Ok(ApiWorkflowGrant {
+            owner: Some(owner),
+            admin: true,
+        });
     }
     Err(ApiError::Forbidden {
         reason: format!(
             "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
              submitter, its submitter's operator, nor a live claims:admin holder. Nothing was \
              written."
+        ),
+    })
+}
+
+/// The AUDITED admin arm of [`workflow_authority`], shared by a submitted
+/// workflow (after its submitter and operator arms) and a legacy one (its only
+/// arm): `claims:admin` in the token AND a live grant on the token's client
+/// record (migration 111's predicate), never the scope alone. `Ok(true)`:
+/// admitted. `Ok(false)`: no token, no principal, or no `claims:admin` scope.
+/// A `claims:admin` token whose client record grants none is refused ADM02,
+/// with `subject` naming the workflow.
+#[cfg(feature = "db")]
+async fn api_admin_arm(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&crate::middleware::bearer::AuthContext>,
+    caller: Option<Uuid>,
+    subject: &str,
+) -> Result<bool, ApiError> {
+    let (Some(a), Some(caller)) = (auth, caller) else {
+        return Ok(false);
+    };
+    if !a.has_scope("claims:admin") {
+        return Ok(false);
+    }
+    let live =
+        epigraph_db::SecurityEventRepository::admin_grant_is_live(&mut *conn, a.client_id, caller)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("could not re-check the admin grant: {e}"),
+            })?;
+    if live {
+        return Ok(true);
+    }
+    Err(ApiError::Forbidden {
+        reason: format!(
+            "{subject}; the token carries claims:admin, but its client record grants no live \
+             claims:admin to this principal, so the audited admin path refused it (ADM02). \
+             Nothing was written."
         ),
     })
 }
