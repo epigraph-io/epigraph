@@ -980,7 +980,11 @@ pub async fn get_claim(
 /// contract; `epigraph_mcp::tools::ingestion` binds it verbatim). For that class
 /// `blake3(content) != stored` holds on *untampered* rows, and the seed is not
 /// carried on the claim, so the comparison decides nothing — reported as
-/// [`HashCheck::NotApplicable`] rather than as a mismatch.
+/// [`HashCheck::NotApplicable`] rather than as a mismatch. Workflow thesis,
+/// phase and step rows written since backlog 6178a205 bind the same kind of
+/// digest (seed `canonical_name`) and carry a `content_hash_scope` marker; rows
+/// written before it keep the plain digest, carry no marker, and are compared
+/// normally.
 ///
 /// The seed is deliberately NOT guessed back. `verify_claim` was filed as
 /// theatre (backlog `49c17386`) for asserting certainty it did not have;
