@@ -2010,4 +2010,33 @@ arms. Armed, `epigraph-operator grant-client-scope` refuses too
 switch itself, run `docs/runbooks/128-undo.sql` on the migration DSN, in one
 transaction: if the switch is armed it first disarms it through the table's
 own audit (reason `128-undo`), then drops the table and every 128 function.
-The events stay. Run it before 127-undo.
+The events stay. Run it AFTER `129-undo.sql` (129's policies call
+`epigraph_admin_scopes_armed()`, so 128-undo refuses while they exist) and
+before 127-undo.
+
+## The standing admin read arms follow the switch (migration 129)
+
+Migration 129 rewrites the four read policies that carry a STANDING
+instance-admin arm (`security_events_read`, `privatization_audit_read`,
+`privatization_plans_read`, `privatization_plan_items_read`): the arm that
+answered `epigraph_is_instance_admin(principal)` (a live custodian
+assignment, 123) now answers `CASE WHEN epigraph_admin_scopes_armed() THEN
+epigraph_is_elevated() ELSE epigraph_is_instance_admin(principal) END`.
+Every other conjunct is unchanged, the plans' group-admin conjunct included.
+Unarmed, every read is exactly as before. Armed, a custodian reads the whole
+actor log, and the plans and audit of the groups it administers, only while
+ELEVATED; arming stays one row change (`arm-admin-scopes --apply`), never
+policy DDL.
+
+1. **Migrate 129** (`epigraph-migrate`, migration DSN), after 128. Policy DDL
+   on `security_events` (busy) and the three privatization tables, in ONE
+   transaction with a 3 s `lock_timeout`: apply it outside the backup windows
+   with the timers stopped and no transaction older than a few seconds (the
+   126 lock plan, smaller). A lock timeout rolls the whole file back; rerun it.
+   Old binaries are unaffected (the policies are the database's), so the
+   order against the binaries is free.
+
+**Rollback.** `docs/runbooks/129-undo.sql` on the migration DSN, in one
+transaction, recreates the four bodies exactly as 083 and 087 left them. Run
+it BEFORE `128-undo.sql`. On an ARMED database it returns the standing
+custodian reads at once; disarm first if that is not intended.

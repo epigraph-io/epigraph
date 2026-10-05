@@ -730,3 +730,112 @@ async fn the_repository_sets_only_on_maintenance_and_records_once(pool: PgPool) 
         (true, false)
     );
 }
+
+// =====================================================================
+// Migration 129: the standing admin read arms follow this switch
+// =====================================================================
+
+/// The four standing-arm policies 129 rewrites.
+const STANDING_ARMS: [&str; 4] = [
+    "security_events_read",
+    "privatization_audit_read",
+    "privatization_plans_read",
+    "privatization_plan_items_read",
+];
+
+/// Each standing-arm policy's command and qualifier as the catalog prints it.
+async fn standing_arm_bodies(pool: &PgPool) -> Vec<(String, String, String)> {
+    sqlx::query_as(
+        "SELECT pol.polname::text, pol.polcmd::text, pg_get_expr(pol.polqual, pol.polrelid) \
+           FROM pg_policy pol \
+          WHERE pol.polname = ANY($1) ORDER BY 1",
+    )
+    .bind(STANDING_ARMS.to_vec())
+    .fetch_all(pool)
+    .await
+    .expect("standing arm bodies")
+}
+
+fn undo_129() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/129-undo.sql"),
+    )
+    .expect("129-undo.sql")
+}
+
+/// 129 rewrites exactly the four standing arms into the switch form (each one
+/// calls `epigraph_admin_scopes_armed()` and `epigraph_is_elevated()` and still
+/// calls `epigraph_is_instance_admin`), and `docs/runbooks/129-undo.sql`
+/// returns every one of them, byte for byte as the catalog prints it, and the
+/// whole catalog, to the database's state at 128, twice over. The order the
+/// undo states holds: 128-undo refuses while 129's policies exist (its
+/// `DROP FUNCTION` has no CASCADE) and applies once 129-undo has run. Cut at
+/// 129, not head: a later migration is undone first.
+///
+/// Verified to fail: the undo's `security_events_read` recreated with the 129
+/// body (the qualifier differs from 128's); one DROP/CREATE pair removed from
+/// the undo (that policy keeps 129's body).
+#[sqlx::test(migrations = false)]
+async fn the_129_rollback_restores_the_standing_arms_and_runs_before_128s(pool: PgPool) {
+    migrate(&pool, &up_to(128)).await;
+    let bodies_128 = standing_arm_bodies(&pool).await;
+    let catalog_128 = catalog(&pool).await;
+    assert_eq!(
+        bodies_128.len(),
+        4,
+        "CALIBRATION: the four arms exist at 128"
+    );
+    for (name, _, qual) in &bodies_128 {
+        assert!(
+            qual.contains("epigraph_is_instance_admin") && !qual.contains("admin_scopes_armed"),
+            "CALIBRATION: {name} is the standing form at 128: {qual}"
+        );
+    }
+
+    migrate(&pool, &up_to(129)).await;
+    let bodies_129 = standing_arm_bodies(&pool).await;
+    assert_eq!(bodies_129.len(), 4, "129 keeps the four arms");
+    for ((name, cmd, qual), (_, cmd_128, _)) in bodies_129.iter().zip(&bodies_128) {
+        assert_eq!(cmd, cmd_128, "{name} stays a {cmd_128} policy");
+        assert!(
+            qual.contains("epigraph_admin_scopes_armed()")
+                && qual.contains("epigraph_is_elevated()")
+                && qual.contains("epigraph_is_instance_admin"),
+            "{name} is the switch form after 129: {qual}"
+        );
+    }
+    let mut conn = pool.acquire().await.expect("acquire");
+    let early = sqlx::raw_sql(&undo_128()).execute(&mut *conn).await;
+    let refusal = early
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("end the refused undo's transaction");
+    drop(conn);
+    assert!(
+        refusal.contains("depend"),
+        "128-undo must refuse while 129's policies call the switch: {early:?}"
+    );
+
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo_129())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the 129 undo applies (run {run}): {e}"));
+    }
+    assert_eq!(
+        standing_arm_bodies(&pool).await,
+        bodies_128,
+        "after 129-undo every standing arm reads exactly as at 128"
+    );
+    let after = catalog(&pool).await;
+    assert_eq!(after, catalog_128, "after 129-undo the catalog is 128's");
+    sqlx::raw_sql(&undo_128())
+        .execute(&pool)
+        .await
+        .expect("128-undo applies once 129-undo has run");
+}

@@ -17,6 +17,10 @@
 --      silently end enforcement.
 --   2. Drops the table (its two triggers with it) and every 128 function.
 --
+-- ORDER: run `129-undo.sql` FIRST. Migration 129's four read policies call
+-- `epigraph_admin_scopes_armed()`, and the `DROP FUNCTION` below has no
+-- CASCADE, so this script refuses (and changes nothing) while they exist.
+--
 -- WHAT IT LEAVES: every `platform.admin_scopes_*` and
 -- `oauth.admin_scope_would_strip` event (history), and 128's
 -- `_sqlx_migrations` row. Re-introducing the switch is a NEW migration, never
