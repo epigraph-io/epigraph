@@ -1195,3 +1195,89 @@ async fn d9_every_cascading_route_defers_on_the_app_role_without_a_maintenance_p
         vec![Some("epigraph_record_cascade_deferral".to_string())]
     );
 }
+
+/// Wait until another backend of this test database is blocked on a lock while
+/// running a statement matching `pattern` (an ILIKE pattern): proof that the
+/// request under test read its row BEFORE the competing transaction commits.
+async fn wait_until_blocked(watcher: &mut sqlx::PgConnection, pattern: &str, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND pid <> pg_backend_pid()
+               AND wait_event_type = 'Lock'
+               AND query ILIKE $1",
+        )
+        .bind(pattern)
+        .fetch_one(&mut *watcher)
+        .await
+        .expect("pg_stat_activity");
+        if waiting >= 1 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "calibration: {what} never blocked on a lock (pattern {pattern})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The HTTP twin of the MCP race test, roles swapped: a `promote` that read the
+/// candidate as `pending` loses the race to an operator's `reject` that commits
+/// first. `promote_and_reject_still_refuse_an_already_decided_candidate` pins
+/// the sequential case; this pins the concurrent one, which the read-then-gate
+/// check cannot see.
+///
+/// An unconditional status write waits for the reject's row lock, then
+/// overwrites it to `promoted` and writes a matcher edge over a pair an
+/// operator just rejected. The promote must be refused with the same 409 and
+/// write nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promote_racing_a_committed_reject_is_refused_with_409(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+    let token = decide_bearer_token(Uuid::new_v4(), Some(agent), "agent");
+    let mut watcher = pool.acquire().await.expect("watcher connection");
+
+    // An operator's reject that has passed its gate and written, NOT committed:
+    // it holds the candidate's row lock while the committed version is still
+    // `pending`.
+    let mut other = pool.begin().await.expect("competing transaction");
+    sqlx::query(
+        "UPDATE match_candidates SET status = 'rejected', decided_at = now() WHERE id = $1",
+    )
+    .bind(candidate)
+    .execute(&mut *other)
+    .await
+    .expect("competing reject");
+
+    let promote = post_decide(pool.clone(), candidate, &token, "promote");
+    let commit_once_blocked = async {
+        wait_until_blocked(&mut watcher, "%UPDATE match_candidates%", "the promote").await;
+        other.commit().await.expect("commit the competing reject");
+    };
+    let (resp, ()) = tokio::join!(promote, commit_once_blocked);
+
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a promote that lost the race to a committed reject must 409: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        status_of(&pool, candidate).await,
+        "rejected",
+        "the operator's reject stands"
+    );
+    assert_eq!(
+        matcher_edge_footprint(&pool, a, b).await.0,
+        0,
+        "no matcher edge may be written over a rejected pair"
+    );
+}

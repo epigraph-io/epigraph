@@ -1158,3 +1158,222 @@ async fn retire_without_an_admin_connection_defers_the_whole_retirement(pool: Pg
         )
     );
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent decides (backlog b3f95bea's end state, reached by a race).
+//
+// The already-decided gate above is check-then-act: it reads the row, gates on
+// the in-memory status, then writes. These tests interleave a second writer
+// BETWEEN the read and the write with real Postgres row locks -- no sleeps, no
+// mocks -- and pin what the write must do when it finally runs.
+// ---------------------------------------------------------------------------
+
+/// Wait until another backend of this test database is blocked on a lock while
+/// running a statement matching `pattern` (an ILIKE pattern). This is what makes
+/// the race tests deterministic: it proves the decide under test read its row
+/// BEFORE the competing transaction commits.
+async fn wait_until_blocked(watcher: &mut sqlx::PgConnection, pattern: &str, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND pid <> pg_backend_pid()
+               AND wait_event_type = 'Lock'
+               AND query ILIKE $1",
+        )
+        .bind(pattern)
+        .fetch_one(&mut *watcher)
+        .await
+        .expect("pg_stat_activity");
+        if waiting >= 1 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "calibration: {what} never blocked on a lock (pattern {pattern})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Interleaving A: a promote and a reject on the same pending row. The reject
+/// reads `pending` and passes the gate; a concurrent promote commits `promoted`
+/// and its matcher edge; then the reject's write runs.
+///
+/// An unconditional `UPDATE ... WHERE id = $1` waits for the promote's row lock
+/// and then overwrites it to `rejected`, leaving a live matcher edge under a
+/// rejected candidate -- the orphan of b3f95bea. The write must instead be
+/// conditional on the row still being `pending` and refuse the loser.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reject_racing_a_committed_promote_does_not_overwrite_it(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    let mut watcher = pool.acquire().await.expect("watcher connection");
+
+    // A promote that has already passed its gate, mid-flight: status flipped
+    // and the edge written (same shape `create_symmetric_if_absent` writes),
+    // NOT committed. It holds the candidate's row lock; the committed version
+    // is still `pending`.
+    let mut other = pool.begin().await.expect("competing transaction");
+    sqlx::query(
+        "UPDATE match_candidates SET status = 'promoted', decided_at = now() WHERE id = $1",
+    )
+    .bind(cand)
+    .execute(&mut *other)
+    .await
+    .expect("competing promote: status");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+         VALUES ($1, 'claim', $2, 'claim', 'CORROBORATES', $3)",
+    )
+    .bind(a)
+    .bind(b)
+    .bind(Json(serde_json::json!({
+        "source": "cross_source_matcher",
+        "candidate_id": cand,
+    })))
+    .execute(&mut *other)
+    .await
+    .expect("competing promote: edge");
+
+    let reject = tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "reject".into(),
+        },
+        None,
+    );
+    let commit_once_blocked = async {
+        wait_until_blocked(&mut watcher, "%UPDATE match_candidates%", "the reject").await;
+        other.commit().await.expect("commit the competing promote");
+    };
+    let (result, ()) = tokio::join!(reject, commit_once_blocked);
+
+    let err = result.expect_err(
+        "a reject that lost the race to a committed promote must be refused, not overwrite it",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("already decided"),
+        "the race loser gets the same refusal as a sequential replay: {msg}"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status, "promoted",
+        "the committed promotion stands; `rejected` here is the orphan state"
+    );
+    assert_eq!(
+        edge_relationships(&pool, a, b).await,
+        vec!["CORROBORATES".to_string()],
+        "the promotion's matcher edge is still in force"
+    );
+}
+
+/// Interleaving B: a promote must not publish `promoted` before its matcher
+/// edge exists.
+///
+/// When the status flip and the edge INSERT are two autocommit statements, a
+/// promote whose INSERT is still in flight has already committed `promoted`
+/// with no edge -- and holds no lock on the candidate, so a retirement
+/// (`mark_retired_on`'s `SELECT ... FOR UPDATE`) runs straight through, finds
+/// no edge to retract, and the edge lands afterwards under a `stale` row.
+///
+/// The promote's edge INSERT is held mid-flight deterministically: a competing
+/// transaction holds an uncommitted copy of the same matcher edge, so the
+/// INSERT waits on migration 090's `edges_symmetric_relationship_uniq`. While
+/// it waits, another connection must see the candidate still `pending` and
+/// still row-locked. Rolling the competitor back lets the promote finish.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promote_does_not_publish_promoted_before_its_edge_commits(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    let mut watcher = pool.acquire().await.expect("watcher connection");
+    let mut observer = pool.acquire().await.expect("observer connection");
+
+    let mut other = pool.begin().await.expect("competing transaction");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+         VALUES ($1, 'claim', $2, 'claim', 'CORROBORATES', $3)",
+    )
+    .bind(a)
+    .bind(b)
+    .bind(Json(serde_json::json!({"source": "cross_source_matcher"})))
+    .execute(&mut *other)
+    .await
+    .expect("competing uncommitted matcher edge");
+
+    let promote = tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+        None,
+    );
+    let observe_then_release = async {
+        wait_until_blocked(
+            &mut watcher,
+            "%INSERT INTO edges%",
+            "the promote's edge write",
+        )
+        .await;
+        let status_mid: String =
+            sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+                .bind(cand)
+                .fetch_one(&mut *observer)
+                .await
+                .expect("status mid-promote");
+        let lock_mid =
+            sqlx::query("SELECT 1 FROM match_candidates WHERE id = $1 FOR UPDATE NOWAIT")
+                .bind(cand)
+                .execute(&mut *observer)
+                .await;
+        other.rollback().await.expect("release the competing edge");
+        (status_mid, lock_mid.map(|_| ()))
+    };
+    let (result, (status_mid, lock_mid)) = tokio::join!(promote, observe_then_release);
+
+    assert_eq!(
+        status_mid, "pending",
+        "while its edge INSERT is in flight the promote must not have published `promoted`: \
+         a committed `promoted` with no edge is the window a retirement slips through"
+    );
+    let lock_err = lock_mid.expect_err(
+        "the in-flight promote must hold the candidate's row lock until its edge commits, so a \
+         retirement's SELECT ... FOR UPDATE waits for it",
+    );
+    let code = lock_err
+        .as_database_error()
+        .and_then(|e| e.code())
+        .map(|c| c.into_owned());
+    assert_eq!(code.as_deref(), Some("55P03"), "lock_not_available: {lock_err}");
+
+    result.expect("the promote completes once the competing edge is rolled back");
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "promoted");
+    assert_eq!(
+        edge_relationships(&pool, a, b).await,
+        vec!["CORROBORATES".to_string()],
+        "exactly one matcher edge, written by the promote itself"
+    );
+}
