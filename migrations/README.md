@@ -1137,6 +1137,25 @@ Current reservation:
   Undo is in the file's header. **Deploy order:** after 123-129 have been
   applied (sqlx would otherwise apply them out of order after 140).
 
+- **141**: public `access_token_revocation` (backlog drain U003; slot from the
+  drain block 140-159, so 123-139 stay free for the in-flight custodian and
+  elevation series). Adds `revoked_access_tokens` (a `jti` denylist; no
+  tenancy, no row security) and its only write path, the maintenance-owned
+  definer `epigraph_access_token_revoke(jti, client, exp)`, which also prunes
+  rows whose token expired over 24 hours ago (a clock-skew margin on the
+  database clock; the same margin bounds which already expired tokens it still
+  records). `epigraph_app` keeps SELECT and
+  loses INSERT/UPDATE/DELETE/TRUNCATE. Written by `/oauth/revoke` (signature
+  verified first), read by both API bearer middlewares, `/oauth/introspect` and
+  the MCP bearer middleware. Pinned by `app_role_table_lockdown.rs` (its
+  `CLOSED` list and `::access_token_revocations_go_through_the_definer`,
+  `::access_token_revocation_prune_keeps_a_day_of_clock_skew_margin`,
+  `::a_token_expired_inside_the_skew_margin_is_still_recorded`) and
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`.
+  Undo is in the file's header. **Deploy order:** with the API and MCP binaries
+  that read it (they fail closed without it), and after 123-129 have been
+  applied (sqlx would otherwise apply them out of order after 141).
+
 Next public migration **outside both reserved tenancy ranges** must be `133` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.

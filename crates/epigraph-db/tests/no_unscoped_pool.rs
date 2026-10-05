@@ -460,7 +460,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "middleware/bearer.rs",
-        2,
+        3,
         "STRUCTURALLY non-exemptable, not merely unconverted. The first site is Viewer::resolve, \
          which BUILDS the viewer every scoped acquire needs; ScopedPool::acquire_as takes the very \
          Viewer this call constructs, so stamping the connection first is circular. Recorded as \
@@ -470,7 +470,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          `epigraph_operator_of_author` SECURITY DEFINER read of the link RECORD, which must \
          answer BEFORE there is a viewer (it decides whether the principal gets one: a linked \
          agent is stdio-only), reads no tenancy-partitioned row, and returns only the named \
-         principal's own link.",
+         principal's own link. The third is access_token_is_revoked (migration 141): the \
+         RFC 7009 denylist lookup both middlewares and /oauth/introspect run after verifying a \
+         token's signature and BEFORE any principal exists (a revoked token gets none), keyed by \
+         that signature-verified jti, on a non-tenant credential table read by primary key.",
     ),
     (
         "middleware/rate_limit.rs",
@@ -516,9 +519,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/revoke.rs",
-        1,
+        2,
         "Pre-authentication. RFC 7009 revocation authenticates the token being revoked rather than \
-         a session principal, and is reachable on the anonymous OAuth router.",
+         a session principal, and is reachable on the anonymous OAuth router. Two sites, one per \
+         token type: the refresh-token definer (118) and the access-token denylist definer \
+         (141), the second reached only with a jti read from a signature-verified token.",
     ),
     (
         "oauth/scopes.rs",

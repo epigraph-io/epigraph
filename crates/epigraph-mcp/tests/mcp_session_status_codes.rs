@@ -35,6 +35,12 @@ use rmcp::transport::streamable_http_server::session::local::{
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use uuid::Uuid;
 
+// Valid tokens on a deliberately DEAD pool: the production DB-backed
+// revocation store would fail closed and 401 every one of them, so this suite
+// (whose subject is not revocation) uses the in-memory "none revoked" store.
+#[path = "support/static_revocation.rs"]
+mod static_revocation;
+
 const SECRET: &[u8] = b"this-secret-is-at-least-32-bytes-long!!";
 const WRONG_SECRET: &[u8] = b"a-completely-different-32-byte-key!!xx";
 const RESOURCE_METADATA_URL: &str = "https://mcp.example.test/.well-known/oauth-protected-resource";
@@ -100,6 +106,7 @@ async fn spawn_server() -> Server {
             McpAuthState {
                 jwt_config: Arc::new(JwtConfig::from_secret(SECRET)),
                 resource_metadata_url: Some(RESOURCE_METADATA_URL.to_string()),
+                revocation: static_revocation::StaticRevocation::none(),
             },
             bearer_auth_middleware,
         ))

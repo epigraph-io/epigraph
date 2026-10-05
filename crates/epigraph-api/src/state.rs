@@ -2,7 +2,7 @@
 // the entity-type cache load, the tenancy-trigger and RLS-posture assertions and the
 // maintenance-viewer path all run at startup or on the maintenance connection. Scoping the probe
 // to a Viewer would make it prove a property of that viewer instead of the pool.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -409,12 +409,6 @@ pub struct AppState {
     ///
     /// Stored once at startup via `Arc` to avoid recreating per request.
     pub jwt_config: Arc<crate::oauth::JwtConfig>,
-    /// In-memory set of revoked access tokens (JWTs)
-    ///
-    /// Bounded by token TTL — entries auto-expire when the token would have expired.
-    /// Used by the /oauth/revoke and bearer middleware.
-    revoked_tokens: Arc<std::sync::RwLock<HashSet<String>>>,
-
     /// Write-authorization gate.
     ///
     /// Defaults to [`epigraph_authz::GroupPolicyGate`], which denies unless the
@@ -434,8 +428,8 @@ pub struct AppState {
     ///
     /// The single source of truth (in-process) for BOTH edge entity-type
     /// validity (`is_valid_entity_type` = `contains_key`) and existence
-    /// checking (`entity_exists`). Uses a `std::sync::RwLock` (like
-    /// `revoked_tokens`) so reads stay synchronous on the hot path.
+    /// checking (`entity_exists`). Uses a `std::sync::RwLock` so reads stay
+    /// synchronous on the hot path.
     ///
     /// Primed by [`AppState::load_entity_type_cache`] at startup (the sync
     /// `with_db` constructors can't `SELECT`, so it starts empty and is loaded
@@ -1044,7 +1038,6 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
@@ -1091,7 +1084,6 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -1123,7 +1115,6 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
@@ -1455,7 +1446,6 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -1489,7 +1479,6 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
@@ -1525,7 +1514,6 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -1544,13 +1532,6 @@ impl AppState {
                 .expect("DEV_JWT_SECRET is valid UTF-8")
         });
         Arc::new(crate::oauth::JwtConfig::from_secret(secret.as_bytes()))
-    }
-
-    /// Add a JWT token to the revocation set.
-    pub fn revoke_access_token(&self, token: &str) {
-        if let Ok(mut set) = self.revoked_tokens.write() {
-            set.insert(token.to_string());
-        }
     }
 
     /// The admin-scope switch for one request (elevation plan EL-10): read on
@@ -1575,14 +1556,6 @@ impl AppState {
     pub fn with_admin_scope_arming_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.admin_scope_arming = Arc::new(epigraph_db::AdminScopeArmingCache::with_ttl(ttl));
         self
-    }
-
-    /// Check if a JWT token has been revoked.
-    pub fn is_token_revoked(&self, token: &str) -> bool {
-        self.revoked_tokens
-            .read()
-            .map(|set| set.contains(token))
-            .unwrap_or(false)
     }
 
     /// Get a reference to the audit log for logging security events

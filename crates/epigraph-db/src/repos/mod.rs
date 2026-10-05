@@ -63,6 +63,7 @@ pub mod provenance;
 pub mod provenance_chain;
 pub mod recall_event;
 pub mod refresh_token;
+pub mod revoked_access_token;
 pub mod role_assignment;
 pub mod scoped_belief;
 pub mod security_event;
@@ -188,6 +189,7 @@ pub use refresh_token::{
     RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
     RefreshTokenRow,
 };
+pub use revoked_access_token::RevokedAccessTokenRepository;
 pub use role_assignment::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
 pub use span::{SpanRepository, SpanRow};
