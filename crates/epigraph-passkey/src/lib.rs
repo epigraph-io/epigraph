@@ -23,7 +23,8 @@
 //!
 //! # Where this crate is linked
 //!
-//! `epigraph-api` (feature `db`) and, later, the maintenance CLI's verifier.
+//! `epigraph-api` (feature `db`) and the maintenance CLI's offline confirmation
+//! verifier ([`Verifier`]).
 //! NEVER `epigraph-mcp`: `webauthn-rs-core` links OpenSSL, and the fleet MCP
 //! image and the stdio server stay free of it
 //! (`tests/dependency_boundary.rs`).
@@ -41,7 +42,7 @@ use webauthn_rs::prelude::{
     Webauthn, WebauthnBuilder, WebauthnError,
 };
 
-pub use config::{AttestationPolicy, ConfigError, PasskeyConfig};
+pub use config::{AttestationPolicy, ConfigError, PasskeyConfig, RelyingParty};
 
 /// The shortest challenge [`Passkeys::start_authentication`] accepts as an
 /// override (WebAuthn recommends at least 16 random bytes).
@@ -573,6 +574,45 @@ impl Passkeys {
             true,
         )?;
         self.finish_authentication(response, &state)
+    }
+}
+
+/// A relying party that only RE-VERIFIES stored assertions: the offline
+/// confirmation verifier's (`epigraph-operator verify-confirmations`). It is
+/// built from the rp id and the origin alone and offers
+/// [`Verifier::reverify`] and nothing else, so it can start no ceremony and
+/// register nothing (the attestation policy, which only registration reads,
+/// is therefore never configured for it).
+#[derive(Debug)]
+pub struct Verifier(Passkeys);
+
+impl Verifier {
+    /// A verifier for `rp`.
+    ///
+    /// # Errors
+    /// [`PasskeyError::Config`]: the origin does not belong to the rp id.
+    pub fn new(rp: RelyingParty) -> Result<Self, PasskeyError> {
+        Passkeys::new(PasskeyConfig {
+            rp_id: rp.rp_id,
+            origin: rp.origin,
+            // Read only by a registration, which this type cannot start.
+            policy: AttestationPolicy::SoftwareAllowed,
+        })
+        .map(Self)
+    }
+
+    /// [`Passkeys::reverify`]: `evidence` against the credential `snapshot`,
+    /// this relying party's rp id and origin, and the challenge recorded in
+    /// the evidence (the signature counter is not re-checked).
+    ///
+    /// # Errors
+    /// The evidence does not verify, or is malformed.
+    pub fn reverify(
+        &self,
+        evidence: &Value,
+        snapshot: &StoredPasskey,
+    ) -> Result<Assertion, PasskeyError> {
+        self.0.reverify(evidence, snapshot)
     }
 }
 

@@ -11,7 +11,8 @@ mod support;
 use std::collections::BTreeSet;
 
 use epigraph_passkey::{
-    AttestationPolicy, PasskeyConfig, PasskeyError, Passkeys, RegistrationState, StoredPasskey,
+    AttestationPolicy, PasskeyConfig, PasskeyError, Passkeys, RegistrationState, RelyingParty,
+    StoredPasskey, Verifier,
 };
 use serde_json::Value;
 use support::{hardware_bound, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID};
@@ -514,6 +515,59 @@ async fn evidence_reverifies_against_its_credential_only() {
         rp.reverify(&a.evidence, &other).is_err(),
         "another credential"
     );
+}
+
+/// The offline verifier, built from the relying party alone (no attestation
+/// policy: it registers nothing), re-verifies what the ceremony's relying
+/// party verified, and refuses it under another origin or rp id and with a
+/// tampered signature. Mutations: `Verifier::reverify` answers Ok without
+/// verifying (the tampered case is accepted); `Verifier::new` ignores the
+/// configured origin (the other-origin verifier accepts).
+#[tokio::test]
+async fn a_verifier_reverifies_what_the_ceremony_verified() {
+    let rp = software();
+    let (mut auth, stored) = registered(&rp).await;
+    let (options, state) = rp
+        .start_authentication(std::slice::from_ref(&stored), None)
+        .unwrap();
+    let a = rp
+        .finish_authentication(&auth.authenticate(ORIGIN, options).await, &state)
+        .expect("verifies");
+    let verifier = |rp_id: &str, origin: &str| {
+        Verifier::new(RelyingParty {
+            rp_id: rp_id.into(),
+            origin: origin.parse().unwrap(),
+        })
+        .expect("verifier")
+    };
+    let v = verifier(RP_ID, ORIGIN);
+    let again = v.reverify(&a.evidence, &stored).expect("genuine evidence");
+    assert_eq!(again.credential_id, a.credential_id);
+    assert!(
+        verifier(RP_ID, "https://auth.example.com:8443")
+            .reverify(&a.evidence, &stored)
+            .is_err(),
+        "another origin"
+    );
+    assert!(
+        verifier("example.com", "https://auth.example.com")
+            .reverify(&a.evidence, &stored)
+            .is_err(),
+        "another rp id"
+    );
+    let mut sig = a.evidence.clone();
+    let s = sig["response"]["response"]["signature"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &s).unwrap();
+    bytes[0] ^= 0x01;
+    sig["response"]["response"]["signature"] = Value::from(base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        &bytes,
+    ));
+    assert!(v.reverify(&sig, &stored).is_err(), "a tampered signature");
 }
 
 /// The assertion reports the backup-eligible flag the AUTHENTICATOR asserted,

@@ -210,11 +210,7 @@ impl PasskeyConfig {
             }
         };
 
-        let rp_id = rp_id.trim().to_ascii_lowercase();
-        if rp_id.contains(['/', ':', ' ']) || rp_id.starts_with('.') || rp_id.ends_with('.') {
-            return Err(ConfigError::RpId(rp_id));
-        }
-        let origin = parse_origin(origin.trim())?;
+        let RelyingParty { rp_id, origin } = RelyingParty::checked(&rp_id, &origin)?;
 
         let software = match val(ENV_ALLOW_SOFTWARE_ATTESTATION) {
             Some(raw) => parse_flag(&raw)?,
@@ -272,6 +268,63 @@ impl PasskeyConfig {
     #[must_use]
     pub fn allows_software_attestation(&self) -> bool {
         matches!(self.policy, AttestationPolicy::SoftwareAllowed)
+    }
+}
+
+/// The relying party alone: the rp id and the origin, without an attestation
+/// policy. What an OFFLINE VERIFIER of stored assertions needs
+/// ([`crate::Verifier`]): the attestation policy governs registration, which a
+/// verifier never runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelyingParty {
+    /// See [`ENV_RP_ID`].
+    pub rp_id: String,
+    /// See [`ENV_ORIGIN`].
+    pub origin: Url,
+}
+
+impl RelyingParty {
+    /// Read [`ENV_RP_ID`] and [`ENV_ORIGIN`] from the process environment.
+    ///
+    /// # Errors
+    /// See [`RelyingParty::from_lookup`].
+    pub fn from_env() -> Result<Option<Self>, ConfigError> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Read [`ENV_RP_ID`] and [`ENV_ORIGIN`] through `get` (empty counts as
+    /// unset), checked exactly as [`PasskeyConfig::from_lookup`] checks them.
+    /// Every other passkey variable is ignored: with neither of the two set
+    /// this answers `Ok(None)`, whatever else is set.
+    ///
+    /// # Errors
+    /// [`ConfigError::Partial`] (one of the two is set),
+    /// [`ConfigError::RpId`] or [`ConfigError::Origin`].
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, ConfigError> {
+        let val = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+        match (val(ENV_RP_ID), val(ENV_ORIGIN)) {
+            (None, None) => Ok(None),
+            (Some(rp_id), Some(origin)) => Self::checked(&rp_id, &origin).map(Some),
+            (Some(_), None) => Err(ConfigError::Partial {
+                set: ENV_RP_ID.to_string(),
+            }),
+            (None, Some(_)) => Err(ConfigError::Partial {
+                set: ENV_ORIGIN.to_string(),
+            }),
+        }
+    }
+
+    /// The rp id (trimmed, lower-cased, a bare host name) and the origin (a
+    /// bare origin), or why not.
+    fn checked(rp_id: &str, origin: &str) -> Result<Self, ConfigError> {
+        let rp_id = rp_id.trim().to_ascii_lowercase();
+        if rp_id.contains(['/', ':', ' ']) || rp_id.starts_with('.') || rp_id.ends_with('.') {
+            return Err(ConfigError::RpId(rp_id));
+        }
+        Ok(Self {
+            rp_id,
+            origin: parse_origin(origin.trim())?,
+        })
     }
 }
 
@@ -440,6 +493,52 @@ mod tests {
             read(&v).unwrap().unwrap().origin.as_str(),
             "https://auth.example.com:8443/"
         );
+    }
+
+    /// An offline verifier needs the relying party alone: the rp id and the
+    /// origin, checked exactly as the full configuration checks them. The
+    /// attestation variables configure REGISTRATION, which a verifier never
+    /// runs, so they neither complete nor break its configuration (a CA file
+    /// that does not exist is never read). Mutations: the attestation
+    /// variables read (the missing CA file refuses the `full()` case); the
+    /// origin check skipped (the path-bearing origin is accepted); a partial
+    /// relying party read as off (the rp-id-only case answers `Ok(None)`).
+    #[test]
+    fn a_verifier_reads_the_relying_party_alone() {
+        let rp = |vars: &[(&str, &str)]| {
+            let map: HashMap<String, String> = vars
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            RelyingParty::from_lookup(|k| map.get(k).cloned())
+        };
+        assert_eq!(rp(&[]), Ok(None));
+        assert_eq!(
+            rp(&[(ENV_AAGUIDS, AAGUID), (ENV_ALLOW_SOFTWARE_ATTESTATION, "1")]),
+            Ok(None),
+            "attestation variables alone configure no relying party"
+        );
+        let mut v = full();
+        v[0] = (ENV_RP_ID, " Auth.Example.COM ");
+        v[3] = (ENV_ATTESTATION_CA_FILE, "/missing.pem");
+        let got = rp(&v).unwrap().unwrap();
+        assert_eq!(got.rp_id, "auth.example.com");
+        assert_eq!(got.origin.as_str(), "https://auth.example.com/");
+        for vars in [
+            vec![(ENV_RP_ID, "auth.example.com")],
+            vec![(ENV_ORIGIN, "https://auth.example.com")],
+        ] {
+            match rp(&vars) {
+                Err(ConfigError::Partial { set }) => assert_eq!(set, vars[0].0),
+                other => panic!("{vars:?}: {other:?}"),
+            }
+        }
+        let mut v = full()[..2].to_vec();
+        v[1] = (ENV_ORIGIN, "https://auth.example.com/elevate");
+        assert!(matches!(rp(&v), Err(ConfigError::Origin(_))));
+        let mut v = full()[..2].to_vec();
+        v[0] = (ENV_RP_ID, "auth.example.com:443");
+        assert!(matches!(rp(&v), Err(ConfigError::RpId(_))));
     }
 
     #[test]
