@@ -1033,9 +1033,27 @@ Current reservation:
   Checked before claiming: no remote branch carries a `128`. **Applied to a
   throwaway database only, NOT to any deployed database.**
 
-- **129+**: public next
+- **129** `129_standing_admin_arms_follow_the_switch.sql` (elevation plan
+  EL-10): the four STANDING instance-admin read arms (`security_events_read`,
+  `privatization_audit_read`, `privatization_plans_read`,
+  `privatization_plan_items_read`) follow 128's switch. Each policy is
+  recreated with its `epigraph_is_instance_admin(principal)` conjunct replaced
+  by `(SELECT CASE WHEN epigraph_admin_scopes_armed() THEN
+  epigraph_is_elevated() ELSE epigraph_is_instance_admin(principal) END)`;
+  every other conjunct is byte-identical (the plans' and audit's group-admin
+  conjunct stays, so an elevated custodian reads only the plans of groups it
+  administers). Unarmed, nothing changes; arming is one row change. One
+  transaction, 3 s `lock_timeout` (083/087's form). Behaviour in
+  `epigraph-db/tests/elevated_arms.rs`; undo
+  (`docs/runbooks/129-undo.sql`, BEFORE 128-undo, whose `DROP FUNCTION`
+  refuses while these policies call the switch) in
+  `epigraph-db/tests/admin_scope_enforcement.rs`. The recorder gate stays
+  CLOSED. Checked before claiming: no remote branch carries a `129`.
+  **Applied to a throwaway database only, NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `129` or
+- **130+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `130` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

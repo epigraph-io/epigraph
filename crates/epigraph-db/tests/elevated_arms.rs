@@ -337,9 +337,9 @@ async fn an_elevated_session_reads_a_foreign_private_row_in_every_class(pool: Pg
     for (t, n) in &unelevated {
         // `security_events` keeps 083's STANDING read arm for an instance
         // admin, which 123 answers from the custodian role P holds: P reads
-        // B's security event unelevated today. That arm becomes an elevated
-        // arm behind the admin-scope arming switch (plan EL-10), which must
-        // flip this to 0.
+        // B's security event unelevated while the admin-scope switch is
+        // UNARMED (this test's state). Armed, 129 turns that arm into an
+        // elevated one: `arming_turns_the_standing_admin_read_arms_into_elevated_ones`.
         let want = i64::from(*t == "security_events");
         assert_eq!(
             *n, want,
@@ -582,4 +582,199 @@ async fn an_elevated_session_writes_nothing_until_it_ends(pool: PgPool) {
     let got = outcome(&mut conn, WRITES[0].1, p.person, p.group).await;
     release(conn).await;
     assert_eq!(got, Ok(1), "P writes again once the session has ended");
+}
+
+// =====================================================================
+// The standing admin read arms follow the admin-scope switch (migration 129)
+// =====================================================================
+
+/// Arm (`true`) or disarm the admin-scope switch (128) as the maintenance role.
+async fn set_switch(pool: &PgPool, armed: bool) {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT changed FROM public.epigraph_set_admin_scope_enforcement($1, $2)")
+            .bind(armed)
+            .bind("elevated arms test")
+            .execute(&mut *conn)
+            .await
+            .expect("set the admin-scope switch");
+        (conn, ())
+    })
+    .await;
+}
+
+/// What `conn` reads of the four standing-arm tables: B's security event, the
+/// plan on the group P administers, its item and its entity audit row, and
+/// the plan on a group P does NOT administer.
+async fn standing_reads(
+    conn: &mut sqlx::PgConnection,
+    event: Uuid,
+    plan: Uuid,
+    audit: i64,
+    foreign_plan: Uuid,
+) -> [i64; 5] {
+    let mut out = [0_i64; 5];
+    out[0] = sqlx::query_scalar("SELECT count(*) FROM public.security_events WHERE id = $1")
+        .bind(event)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read security_events");
+    out[1] = sqlx::query_scalar("SELECT count(*) FROM public.privatization_plans WHERE id = $1")
+        .bind(plan)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read privatization_plans");
+    out[2] = sqlx::query_scalar(
+        "SELECT count(*) FROM public.privatization_plan_items WHERE plan_id = $1",
+    )
+    .bind(plan)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("read privatization_plan_items");
+    out[3] = sqlx::query_scalar("SELECT count(*) FROM public.privatization_audit WHERE id = $1")
+        .bind(audit)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read privatization_audit");
+    out[4] = sqlx::query_scalar("SELECT count(*) FROM public.privatization_plans WHERE id = $1")
+        .bind(foreign_plan)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read the foreign plan");
+    out
+}
+
+/// A mature group with three live admins (081's plurality and maturity
+/// conditions), `extra_admin` among them when given, and a `restrict` plan on
+/// it with one claim item and one entity audit row. `(plan, audit id)`.
+async fn plan_on_a_group(pool: &PgPool, label: &str, extra_admin: Option<Uuid>) -> (Uuid, i64) {
+    let (owner, group) = fixture::seed_agent_with_group(pool, label).await;
+    let mut admins: Vec<Uuid> = Vec::new();
+    for i in 0..2 {
+        let (a, _) = fixture::seed_agent_with_group(pool, &format!("{label}-co-{i}")).await;
+        admins.push(a);
+    }
+    admins.extend(extra_admin);
+    for a in admins {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'admin')",
+        )
+        .bind(group)
+        .bind(a)
+        .execute(pool)
+        .await
+        .expect("a co-admin");
+    }
+    sqlx::query("UPDATE groups SET created_at = now() - interval '48 hours' WHERE id = $1")
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("mature the group");
+    let claim = fixture::seed_group_claim(pool, owner, group, &format!("{label} claim")).await;
+    let plan: Uuid = sqlx::query_scalar(
+        "INSERT INTO privatization_plans (mode, target_group_id, selector, created_by) \
+         VALUES ('restrict', $1, '{}'::jsonb, $2) RETURNING id",
+    )
+    .bind(group)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("a plan");
+    sqlx::query(
+        "INSERT INTO privatization_plan_items (plan_id, kind, entity_id, depth, via, \
+             before_visibility, before_owner_group_id, before_had_embedding) \
+         SELECT $1, 'claim', id, 0, 'seed', visibility, owner_group_id, false \
+           FROM claims WHERE id = $2",
+    )
+    .bind(plan)
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("a plan item");
+    let audit: i64 = sqlx::query_scalar(
+        "INSERT INTO privatization_audit (plan_id, actor_agent_id, action, kind, entity_id) \
+         VALUES ($1, $2, 'plan.create', 'claim', $3) RETURNING id",
+    )
+    .bind(plan)
+    .bind(owner)
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("an entity audit row");
+    (plan, audit)
+}
+
+/// Migration 129 (plan EL-10): the four STANDING instance-admin read arms
+/// (`security_events_read`, `privatization_audit_read`,
+/// `privatization_plans_read`, `privatization_plan_items_read`) follow the
+/// admin-scope switch. UNARMED, custodian P reads B's security event and the
+/// plan, item and entity audit row of a group P administers, unelevated, as
+/// before. ARMED, P unelevated reads none of them, and P ELEVATED reads all
+/// four (the plan and its item only through 129: 126 excludes both tables).
+/// The group-admin conjunct stays: P elevated still reads no plan on a group
+/// it does not administer. Disarming restores the unarmed reads (one row
+/// change, no DDL).
+///
+/// Verified to fail with: `security_events_read`'s CASE never armed (P
+/// unelevated reads B's event armed); `privatization_plans_read`'s THEN arm
+/// made `false` (P elevated reads no plan, and so no item); the plans'
+/// group-admin conjunct dropped (the foreign plan is read). An items-only
+/// mutation of the THEN arm is EQUIVALENT here: the item's target group is
+/// read through `privatization_plans_read` (087's "doubly stated" conjunct),
+/// so the plans arm decides the item too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn arming_turns_the_standing_admin_read_arms_into_elevated_ones(pool: PgPool) {
+    let p = holder(&pool, "arms-armed-p", 21).await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "arms-armed-b").await;
+    let event: Uuid = sqlx::query_scalar(
+        "INSERT INTO security_events (event_type, agent_id, success, details) \
+         VALUES ('test.standing_arm', $1, true, '{}'::jsonb) RETURNING id",
+    )
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("B's security event");
+    let (plan, audit) = plan_on_a_group(&pool, "arms-armed-g", Some(p.person)).await;
+    let (foreign_plan, _) = plan_on_a_group(&pool, "arms-armed-h", None).await;
+    let s = scoped(&pool).await;
+    let live = session(&pool, &p).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
+
+    let mut conn = app_conn(&s, &plain).await;
+    let unarmed_plain = standing_reads(&mut conn, event, plan, audit, foreign_plan).await;
+    release(conn).await;
+    assert_eq!(
+        unarmed_plain,
+        [1, 1, 1, 1, 0],
+        "CALIBRATION: unarmed, the standing arms show custodian P (unelevated) B's event and \
+         the plan, item and audit row of the group P administers, and no other group's plan"
+    );
+
+    set_switch(&pool, true).await;
+    let mut conn = app_conn(&s, &plain).await;
+    let armed_plain = standing_reads(&mut conn, event, plan, audit, foreign_plan).await;
+    release(conn).await;
+    assert_eq!(
+        armed_plain,
+        [0, 0, 0, 0, 0],
+        "armed, P unelevated reads nothing through the standing arms"
+    );
+    let mut conn = app_conn(&s, &elevated).await;
+    let armed_elevated = standing_reads(&mut conn, event, plan, audit, foreign_plan).await;
+    release(conn).await;
+    assert_eq!(
+        armed_elevated,
+        [1, 1, 1, 1, 0],
+        "armed, P elevated reads B's event and its own group's plan, item and audit row, and \
+         still no plan on a group it does not administer"
+    );
+
+    set_switch(&pool, false).await;
+    let mut conn = app_conn(&s, &plain).await;
+    let disarmed_plain = standing_reads(&mut conn, event, plan, audit, foreign_plan).await;
+    release(conn).await;
+    assert_eq!(
+        disarmed_plain, unarmed_plain,
+        "disarmed, the standing arms answer as before"
+    );
 }

@@ -167,6 +167,25 @@ const READ_PATH_WRITES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The four STANDING admin read arms migration 129 rewrites so that, once the
+/// admin-scope switch (128) is armed, they admit an elevated session instead of
+/// a standing instance admin (plan EL-10). They read `epigraph_is_elevated()`
+/// ONLY as the armed branch of `CASE WHEN epigraph_admin_scopes_armed()`, are
+/// not elevated arms in 126's sense, and are pinned apart by
+/// [`the_standing_admin_arms_read_elevation_only_through_the_switch`].
+const SWITCH_ARMS: &[(&str, &str)] = &[
+    ("security_events", "security_events_read"),
+    ("privatization_audit", "privatization_audit_read"),
+    ("privatization_plans", "privatization_plans_read"),
+    ("privatization_plan_items", "privatization_plan_items_read"),
+];
+
+/// How the armed branch of a [`SWITCH_ARMS`] policy prints (whitespace
+/// collapsed).
+const SWITCH_BRANCH: &str = "CASE WHEN epigraph_admin_scopes_armed() THEN epigraph_is_elevated() \
+                             ELSE epigraph_is_instance_admin(( SELECT epigraph_principal_id() AS \
+                             epigraph_principal_id)) END";
+
 const READ_ARM: &str = "( SELECT epigraph_is_elevated() AS epigraph_is_elevated)";
 const REFUSAL: &str = "(NOT ( SELECT epigraph_is_elevated() AS epigraph_is_elevated))";
 
@@ -252,10 +271,12 @@ fn expected() -> BTreeMap<String, BTreeSet<Pol>> {
 }
 
 /// Every policy in `public` that names `epigraph_is_elevated` in either
-/// expression, or whose name says it is an elevated policy, by table.
+/// expression, or whose name says it is an elevated policy, by table; the
+/// [`SWITCH_ARMS`] aside.
 async fn observed<'e, E: Executor<'e, Database = sqlx::Postgres>>(
     e: E,
 ) -> BTreeMap<String, BTreeSet<Pol>> {
+    let switch_arms: Vec<String> = SWITCH_ARMS.iter().map(|(_, p)| (*p).to_string()).collect();
     let rows: Vec<PolRow> = sqlx::query_as(
         "SELECT c.relname::text, p.polname::text, p.polcmd::text, p.polpermissive, \
                 ARRAY(SELECT CASE WHEN r = 0 THEN 'public' ELSE r::regrole::text END \
@@ -263,11 +284,13 @@ async fn observed<'e, E: Executor<'e, Database = sqlx::Postgres>>(
                 pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid) \
            FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
           WHERE c.relnamespace = 'public'::regnamespace \
+            AND p.polname <> ALL($1) \
             AND (p.polname LIKE '%\\_elevated\\_%' \
                  OR coalesce(pg_get_expr(p.polqual, p.polrelid), '') \
                     || coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') \
                     LIKE '%epigraph_is_elevated%')",
     )
+    .bind(switch_arms)
     .fetch_all(e)
     .await
     .expect("the elevated policy catalog");
@@ -376,6 +399,68 @@ async fn every_armed_table_carries_exactly_its_elevated_policies(pool: PgPool) {
         "the elevated policies differ from the census:\n  {}",
         wrong.join("\n  ")
     );
+}
+
+/// The [`SWITCH_ARMS`] (migration 129) are the only other policies that read
+/// `epigraph_is_elevated()`, and each reads it exactly once, as the ARMED
+/// branch of the admin-scope switch with the standing instance-admin call as
+/// the unarmed one; each stays a PERMISSIVE `SELECT` policy `TO PUBLIC` on its
+/// table. So excluding them from [`observed`] hides no elevated arm.
+///
+/// Verified to fail with `security_events_read`'s CASE replaced by a bare
+/// `epigraph_is_elevated()` (no switch), and with the CASE's branches swapped
+/// (`privatization_plans_read`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_standing_admin_arms_read_elevation_only_through_the_switch(pool: PgPool) {
+    let rows: Vec<(String, String, String, bool, Vec<String>, Option<String>)> = sqlx::query_as(
+        "SELECT c.relname::text, p.polname::text, p.polcmd::text, p.polpermissive, \
+                ARRAY(SELECT CASE WHEN r = 0 THEN 'public' ELSE r::regrole::text END \
+                        FROM unnest(p.polroles) r ORDER BY 1), \
+                pg_get_expr(p.polqual, p.polrelid) \
+           FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+          WHERE c.relnamespace = 'public'::regnamespace \
+            AND p.polname = ANY($1)",
+    )
+    .bind(
+        SWITCH_ARMS
+            .iter()
+            .map(|(_, p)| (*p).to_string())
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the switch arms");
+    assert_eq!(
+        rows.len(),
+        SWITCH_ARMS.len(),
+        "every switch arm exists: {rows:?}"
+    );
+    for (t, name, cmd, permissive, roles, qual) in rows {
+        assert!(
+            SWITCH_ARMS.contains(&(t.as_str(), name.as_str())),
+            "{name} is on {t}, not where the census lists it"
+        );
+        assert_eq!(
+            (cmd.as_str(), permissive, roles),
+            ("r", true, vec!["public".to_string()]),
+            "{name} stays a permissive SELECT policy TO PUBLIC"
+        );
+        let qual = qual.unwrap_or_default();
+        let flat = qual.split_whitespace().collect::<Vec<_>>().join(" ");
+        let want = SWITCH_BRANCH
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            flat.matches("epigraph_is_elevated").count(),
+            1,
+            "{name} reads epigraph_is_elevated() exactly once: {flat}"
+        );
+        assert!(
+            flat.contains(&want),
+            "{name} reads elevation only as the armed branch of the switch: {flat}"
+        );
+    }
 }
 
 /// The privilege invariant behind the census: every row-security table on
