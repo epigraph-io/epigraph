@@ -27,6 +27,32 @@ pub fn list_tools() -> serde_json::Value {
     EpiGraphMcpFull::all_tools_json()
 }
 
+/// The REST catalog's tools as `auth` may see them (elevation plan EL-11):
+/// the static router minus `sudo`/`unsudo`, and minus every admin-only-scoped
+/// tool the caller's scope gate would refuse (`AuthContext::has_scope`, with
+/// the switch and the database-checked elevation already stamped by the
+/// API's bearer and recorder layers).
+///
+/// `sudo`/`unsudo` are left out for EVERY caller: they act on an MCP
+/// connection's own refresh family, the API process cannot see whether an
+/// MCP listener serves connector mode, and leaving them out is the
+/// fail-closed side of "listed only to role holders". The MCP manifest
+/// (`EpiGraphMcpFull::manifest_for`) is where a holder sees them.
+#[must_use]
+pub fn catalog_for(auth: &epigraph_auth::AuthContext) -> serde_json::Value {
+    let caller = tools::elevation::ManifestCaller {
+        http: true,
+        auth: Some(auth),
+        holds_elevating_role: false,
+        connector_elevation: false,
+    };
+    let tools: Vec<_> = EpiGraphMcpFull::static_tools()
+        .into_iter()
+        .filter(|t| tools::elevation::listed(t.name.as_ref(), &caller))
+        .collect();
+    serde_json::to_value(tools).unwrap_or(serde_json::Value::Array(vec![]))
+}
+
 /// Does this `--listen` spec name a Unix-domain socket rather than a TCP address?
 ///
 /// The single discriminator between the two listener kinds, shared by

@@ -625,8 +625,14 @@ impl EpiGraphMcpFull {
     /// discovery endpoint so agents can introspect available tools at runtime.
     #[must_use]
     pub fn all_tools_json() -> serde_json::Value {
-        let tools = Self::tool_router().list_all();
+        let tools = Self::static_tools();
         serde_json::to_value(tools).unwrap_or(serde_json::Value::Array(vec![]))
+    }
+
+    /// Every kernel tool the static router registers, unfiltered.
+    #[must_use]
+    pub fn static_tools() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
     }
 
     /// Look up the required scope for `tool_name` and verify the
