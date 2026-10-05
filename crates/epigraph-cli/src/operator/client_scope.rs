@@ -13,11 +13,15 @@
 //! verbatim. Neither validates the scope, neither checks what kind of client it
 //! is, and neither leaves an audit row. This command replaces the raw path.
 //!
-//! A human's agents act through that human's OAuth client, so they carry
-//! exactly that human's scopes: the refresh grant re-reads
-//! `oauth_clients.granted_scopes` on every refresh. A grant here therefore
-//! reaches the human's agents at their next token refresh, and a revocation
-//! leaves an already-minted access token valid until it expires.
+//! A human's agents act through that human's OAuth client, so they carry at
+//! most that human's scopes. The refresh grant issues the refresh token's own
+//! scopes (the consent it was minted from) narrowed to
+//! `oauth_clients.granted_scopes` as read at each refresh (migration 140, RFC
+//! 6749 section 6). A REVOCATION here therefore leaves the human's agents at
+//! their next token refresh (an already-minted access token stays valid until
+//! it expires). A GRANT does not widen an existing refresh chain: it reaches a
+//! connector only once the human re-authorizes it (a new authorization-code
+//! grant, e.g. reconnecting the connector), whose consent can then include it.
 //!
 //! # The rules
 //!

@@ -1365,13 +1365,17 @@ a HUMAN's own client an admin-only scope:
   no-op `--apply` is recorded too (`changed: false`), which is how a grant made
   some other way is ratified. A dry run writes nothing.
 
-**A human's agents carry that human's scopes.** Agents acting through the
-human's OAuth client hold what that client is granted, because the refresh
-grant re-reads `granted_scopes`: a grant reaches them at their next refresh. A
-revocation also takes effect at the next refresh; an access token minted before
-it keeps the scope until it expires, except on the paths that re-read the
-grant on every call: the audited admin writes (migrations 111 and 112) and the
-MCP server-stamp borrow in section 3.
+**A human's agents carry at most that human's scopes.** Agents acting through
+the human's OAuth client hold what the human CONSENTED to, narrowed to what the
+client is still granted: since migration 140 the refresh grant issues the
+refresh token's own scopes intersected with `granted_scopes`, and never widens
+them (RFC 6749 section 6). A grant made here therefore does NOT reach an
+existing connector at its next refresh: the human must re-authorize it (a new
+authorization-code grant, e.g. reconnecting the connector) so the consent can
+include the new scope. A revocation does take effect at the next refresh; an
+access token minted before it keeps the scope until it expires, except on the
+paths that re-read the grant on every call: the audited admin writes
+(migrations 111 and 112) and the MCP server-stamp borrow in section 3.
 
 ### 3. BREAKING for hand-minted and de-scoped admin tokens — the MCP server-stamp borrow re-checks the live grant (`ADM02`)
 
@@ -1428,8 +1432,11 @@ confirm each came from the token endpoint for a client that holds the grant.
   the application role and is refused (`42501`) for a client that is
   `suspended` or `revoked`. Because the check is live, a token that
   already carries `claims:admin` in its scope lands again as soon as the
-  grant is applied; a token minted without the scope needs a refresh (the
-  refresh grant re-reads `granted_scopes`) before it reaches the borrow at all.
+  grant is applied; a token minted without the scope never gains it by
+  refreshing (migration 140: a refresh only keeps or narrows the scopes the
+  refresh token was consented with), so the human must re-authorize the
+  connector (a new authorization-code grant) before it reaches the borrow at
+  all.
 * A hand-minted token cannot be re-granted: there is no client row, or no
   row for its agent, to grant. Replace it with a token issued by the token
   endpoint to a client that holds the grant, then grant that client as above
