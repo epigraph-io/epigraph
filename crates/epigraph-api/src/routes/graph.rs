@@ -231,16 +231,22 @@ pub async fn overview(
     Query(_params): Query<OverviewParams>,
 ) -> Result<Json<OverviewResponse>, (axum::http::StatusCode, String)> {
     let pool: &PgPool = &state.db_pool;
-    let latest: Option<(Uuid, chrono::DateTime<chrono::Utc>, bool)> = sqlx::query_as(
-        "SELECT run_id, completed_at, degraded
-         FROM graph_cluster_runs
-         ORDER BY completed_at DESC
-         LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(internal)?;
-    let Some((run_id, generated_at, degraded)) = latest else {
+    // The latest-run lookup lives in `ClusterRunRepository::latest`, not here.
+    // The SQL is byte-identical to the copy that used to be inlined, so no
+    // request can tell them apart today — which is exactly why the copy was
+    // dangerous: the day the shared one changes (migration 028's `algo` filter,
+    // or a tie-break on `run_id`), the first symptom is
+    // `GET /claims/:id/placement` handing out an id this route no longer
+    // recognises, and no behavioural test would have caught the drift.
+    let latest = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal_db)?;
+    let Some(epigraph_db::ClusterRunRow {
+        run_id,
+        completed_at: generated_at,
+        degraded,
+    }) = latest
+    else {
         return Ok(Json(OverviewResponse {
             run_id: None,
             generated_at: None,
@@ -314,12 +320,13 @@ pub async fn expand(
             "failed to acquire a scoped connection".to_string(),
         )
     })?;
-    let latest_run: Option<(Uuid,)> =
-        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
-            .fetch_optional(&mut *read)
-            .await
-            .map_err(internal)?;
-    let Some((run_id,)) = latest_run else {
+    // Shared lookup, fed this handler's viewer-stamped connection so main's
+    // one-connection property survives. `graph_cluster_runs` carries no
+    // tenancy columns, so `latest` takes no viewer; see its doc.
+    let latest_run = epigraph_db::ClusterRunRepository::latest(&mut *read)
+        .await
+        .map_err(internal_db)?;
+    let Some(run_id) = latest_run.map(|r| r.run_id) else {
         return Err((StatusCode::NOT_FOUND, "no completed run".into()));
     };
     let cluster_exists: Option<(i64,)> =
@@ -529,12 +536,10 @@ pub async fn themes_expand(
         return Err((StatusCode::NOT_FOUND, "theme not found".into()));
     }
 
-    let latest_run: Option<(Uuid,)> =
-        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
-    let Some((run_id,)) = latest_run else {
+    let latest_run = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal_db)?;
+    let Some(run_id) = latest_run.map(|r| r.run_id) else {
         return Ok(Json(synthesize_pre_run_response(theme_id)));
     };
 

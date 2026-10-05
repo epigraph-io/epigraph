@@ -89,6 +89,27 @@ impl CorpusStatsRepository {
         viewer: &Viewer,
         detailed: bool,
     ) -> Result<CorpusCounts, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::tenant_counts_conn(&mut conn, viewer, detailed).await
+    }
+
+    /// [`Self::tenant_counts`] on a caller-supplied connection.
+    ///
+    /// The `&PgPool` form cannot serve a converted HTTP handler: that handler
+    /// holds a [`crate::ScopedRead`] carrying the viewer's tenancy GUCs, and
+    /// reaching past it to the raw pool makes the RLS policy and the in-query
+    /// predicate disagree — which hides rows from their own owners with no
+    /// error. On the `detailed` path this runs two statements, so they must
+    /// share one connection to report one corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if either query fails.
+    pub async fn tenant_counts_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        detailed: bool,
+    ) -> Result<CorpusCounts, DbError> {
         // `WHERE true` gives every marker a preceding predicate to append
         // ` AND (...)` to; `predicate_fragment` deliberately starts with AND.
         let base = r"
@@ -114,7 +135,7 @@ impl CorpusStatsRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let (claims, evidence, edges, frames) = q.fetch_one(pool).await?;
+        let (claims, evidence, edges, frames) = q.fetch_one(&mut *conn).await?;
 
         let mut out = CorpusCounts {
             claims,
@@ -141,7 +162,7 @@ impl CorpusStatsRepository {
             if let Some(g) = viewer.group_bind() {
                 dq = dq.bind(g);
             }
-            let (workflow_claims, challenges, embedded_claims) = dq.fetch_one(pool).await?;
+            let (workflow_claims, challenges, embedded_claims) = dq.fetch_one(&mut *conn).await?;
             out.workflow_claims = Some(workflow_claims);
             out.challenges = Some(challenges);
             out.embedded_claims = Some(embedded_claims);
