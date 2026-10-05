@@ -70,12 +70,17 @@ async fn platform_events(pool: &PgPool, event_type: &str) -> i64 {
 }
 
 /// A live passkey for `person`, registered through 124's definers on the
-/// harness connection (standing in for the ceremony, which is the API's).
+/// harness connection (standing in for the ceremony, which is the API's). A
+/// LATER passkey of the same person is opened on a confirmed
+/// `passkey.register` act since migration 130
+/// (`viewer_fixture::passkey_register_act`).
 async fn registered_passkey(pool: &PgPool, person: Uuid, n: u8) -> Uuid {
+    let act = fixture::passkey_register_act(pool, person, "cli test", "cli key").await;
     let e: Uuid = sqlx::query_scalar(
-        "SELECT public.epigraph_create_passkey_enrollment($1, 'cli test', 'cli key')",
+        "SELECT public.epigraph_create_passkey_enrollment($1, 'cli test', 'cli key', $2)",
     )
     .bind(person)
+    .bind(act)
     .fetch_one(pool)
     .await
     .expect("enroll");

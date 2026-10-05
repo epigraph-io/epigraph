@@ -49,7 +49,8 @@
 //!         --truth <0..1> --assignment <uuid> --actor <uuid> --reason TEXT [--allow-owned] \
 //!         [--act <uuid>] [--apply]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
-//!     epigraph-operator passkey-enroll --person <uuid> --reason TEXT [--label TEXT] [--apply]
+//!     epigraph-operator passkey-enroll --person <uuid> --reason TEXT [--label TEXT] \
+//!         [--act <uuid>] [--apply]
 //!     epigraph-operator list-passkeys [--person <uuid>] [--include-revoked]
 //!     epigraph-operator revoke-passkey --id <uuid> --reason TEXT [--apply]
 //!     epigraph-operator end-elevation (--session <uuid> | --person <uuid>) --reason TEXT [--apply]
@@ -185,6 +186,11 @@ enum Command {
         /// A name for the passkey (e.g. the device), copied onto it.
         #[arg(long)]
         label: Option<String>,
+        /// A CONFIRMED `passkey.register` admin act (migration 130) of this
+        /// person, whose args are exactly these flags. Required for a LATER
+        /// passkey (ELV10 otherwise).
+        #[arg(long)]
+        act: Option<Uuid>,
         /// Commit. Without it, the ticket and its audit row roll back.
         #[arg(long)]
         apply: bool,
@@ -712,9 +718,26 @@ async fn main_inner() -> anyhow::Result<i32> {
             person,
             reason,
             label,
+            act,
             apply,
         } => {
-            let row = passkey::enroll(&mut conn, person, &reason, label.as_deref(), apply).await?;
+            if let Some(act) = act {
+                let args = passkey::register_act_args(person, label.as_deref(), &reason);
+                if let Some(why) = custodian::act_refusal(
+                    &mut conn,
+                    act,
+                    epigraph_db::admin_act::PASSKEY_REGISTER,
+                    &args,
+                    Some(person),
+                )
+                .await?
+                {
+                    eprintln!("epigraph-operator: REFUSED: {why}. Nothing was changed.");
+                    return Ok(1);
+                }
+            }
+            let row =
+                passkey::enroll(&mut conn, person, &reason, label.as_deref(), act, apply).await?;
             println!(
                 "{}ENROLLED\t{}",
                 if apply { "" } else { "WOULD BE " },

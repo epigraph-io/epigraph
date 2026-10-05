@@ -522,3 +522,101 @@ async fn custodial_supersede_executes_its_confirmed_act(pool: PgPool) {
             .expect("the act");
     assert!(spent, "the act is spent");
 }
+
+/// A LATER passkey: `passkey-enroll` for a person who already holds a live
+/// passkey is refused by the database (ELV10, no ticket); on a confirmed
+/// `passkey.register` act whose label differs from the flags the verb refuses
+/// before writing; on the exact act the ticket opens `confirmed_act` and the
+/// act is spent. The break-glass: once the person's only passkey is revoked,
+/// a maintenance enrollment opens again with no act.
+///
+/// Verified to fail: the enroll verb dropping `--act` (the 124 definer) ->
+/// the confirmed run is refused ELV10.
+#[sqlx::test(migrations = "../../migrations")]
+async fn passkey_enroll_a_later_passkey_needs_the_confirmed_act(pool: PgPool) {
+    let (p, _) = custodian_with_passkey(&pool, "custodian", 1).await;
+    let ps = p.to_string();
+    let enroll = |extra: &[&str]| {
+        let mut args: Vec<String> = [
+            "passkey-enroll",
+            "--person",
+            &ps,
+            "--reason",
+            "a second key",
+            "--label",
+            "laptop",
+            "--apply",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        args.extend(extra.iter().map(ToString::to_string));
+        let pool = pool.clone();
+        async move {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_op(&pool, &refs).await
+        }
+    };
+    let tickets = |pool: PgPool| async move {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM passkey_enrollments WHERE person_agent_id = $1",
+        )
+        .bind(p)
+        .fetch_one(&pool)
+        .await
+        .expect("tickets");
+        n
+    };
+    let before = tickets(pool.clone()).await;
+    let bare = enroll(&[]).await;
+    assert_eq!(bare.code, 1, "{}", bare.show());
+    assert!(bare.stderr.contains("ELV10"), "{}", bare.show());
+    assert_eq!(tickets(pool.clone()).await, before, "no ticket");
+
+    let other = fixture::confirmed_act(
+        &pool,
+        "passkey.register",
+        &format!("{{\"person\": \"{p}\", \"label\": \"phone\", \"reason\": \"a second key\"}}"),
+        p,
+    )
+    .await;
+    let other_s = other.to_string();
+    let run = enroll(&["--act", &other_s]).await;
+    assert_eq!(run.code, 1, "{}", run.show());
+    assert!(run.stderr.contains("REFUSED"), "{}", run.show());
+
+    let act = fixture::confirmed_act(
+        &pool,
+        "passkey.register",
+        &format!("{{\"person\": \"{p}\", \"label\": \"laptop\", \"reason\": \"a second key\"}}"),
+        p,
+    )
+    .await;
+    let act_s = act.to_string();
+    let run = enroll(&["--act", &act_s]).await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    let (via, spent): (String, bool) = sqlx::query_as(
+        "SELECT e.created_via, a.consumed_at IS NOT NULL FROM passkey_enrollments e \
+           JOIN pending_admin_acts a ON a.id = e.act_id WHERE e.act_id = $1",
+    )
+    .bind(act)
+    .fetch_one(&pool)
+    .await
+    .expect("the enrollment");
+    assert_eq!((via.as_str(), spent), ("confirmed_act", true));
+
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query(
+            "SELECT public.epigraph_revoke_passkey(k.id, 'lost') FROM person_authenticators k \
+              WHERE k.person_agent_id = $1 AND k.revoked_at IS NULL",
+        )
+        .bind(p)
+        .execute(&mut *conn)
+        .await
+        .expect("revoke");
+        (conn, ())
+    })
+    .await;
+    let again = enroll(&[]).await;
+    assert_eq!(again.code, 0, "the break-glass: {}", again.show());
+}

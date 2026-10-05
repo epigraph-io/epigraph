@@ -14,6 +14,14 @@
 //! (`platform.passkey_revoked`), final, and the way back to the bootstrap
 //! path if a passkey is lost.
 //!
+//! A LATER passkey (the person already holds a live one) is enrolled only on
+//! a confirmed `passkey.register` admin act of the person's own (migration
+//! 130; ELV10 otherwise): `passkey-enroll --act <id>` rebuilds the act's args
+//! from its own flags (person, label, reason) and refuses before writing when
+//! they are not the act's; the enrollment's guard consumes the act. Lost the
+//! only passkey? `revoke-passkey` first: with no live passkey the maintenance
+//! enrollment is the bootstrap again.
+//!
 //! Every write goes through a 124 definer, whose table triggers enforce the
 //! rules (ELV01 a passkey belongs only to a registered human that is no
 //! other human's agent, ELV03 append-only) and write one `platform.` audit
@@ -22,7 +30,7 @@
 //! what the definer did and leaves nothing.
 
 use chrono::{DateTime, Utc};
-use epigraph_db::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
+use epigraph_db::{admin_act, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
@@ -32,22 +40,37 @@ pub fn ceremony_path(enrollment: Uuid) -> String {
     format!("/elevate/enroll/{enrollment}")
 }
 
+/// The canonical args of the `passkey.register` act these enroll flags
+/// execute.
+#[must_use]
+pub fn register_act_args(person: Uuid, label: Option<&str>, reason: &str) -> serde_json::Value {
+    admin_act::passkey_register_args(person, label, reason)
+}
+
 /// Open an enrollment ticket for `person` in one transaction (committed under
-/// `apply`). Returns the ticket as written.
+/// `apply`), on the confirmed `passkey.register` act `act` when given (a later
+/// passkey). Returns the ticket as written.
 ///
 /// # Errors
 /// The table's guard refused it (ELV01 a subject that is not a registered
-/// human, or is another human's agent), the reason is empty, or a statement
-/// failed.
+/// human, or is another human's agent; ELV10 a later passkey with no act;
+/// ELV08 / ELV09 an act that does not authorize it), the reason is empty, or
+/// a statement failed.
 pub async fn enroll(
     conn: &mut PgConnection,
     person: Uuid,
     reason: &str,
     label: Option<&str>,
+    act: Option<Uuid>,
     apply: bool,
 ) -> anyhow::Result<PasskeyEnrollmentRow> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-    let id = PasskeyRepository::create_enrollment(&mut tx, person, reason, label).await?;
+    let id = match act {
+        None => PasskeyRepository::create_enrollment(&mut tx, person, reason, label).await?,
+        Some(act) => {
+            PasskeyRepository::create_enrollment_on_act(&mut tx, person, reason, label, act).await?
+        }
+    };
     let row = PasskeyRepository::get_enrollment(&mut tx, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("enrollment {id} not readable after it was opened"))?;
