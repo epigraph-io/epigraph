@@ -1769,11 +1769,12 @@ async fn access_token_revocation_prune_keeps_a_day_of_clock_skew_margin(pool: Pg
     );
 }
 
-/// Clock skew, the write side: `/oauth/revoke` runs on an API host that has
-/// just verified the token as unexpired on ITS clock. If the definer then
-/// declined it as expired on the database clock, a host lagging the database
-/// would keep admitting a token whose revocation was answered 200. The definer
-/// therefore records any token less than the 24 h margin past its expiry. The
+/// Clock skew, the write side: `/oauth/revoke` verifies the token's signature
+/// but not its expiry, so this guard alone decides whether a token just past
+/// `exp` is recorded. If it declined such a token on the database clock, a host
+/// lagging the database would keep admitting a token whose revocation was
+/// answered 200. The definer therefore records any token less than the 24 h
+/// margin past its expiry. The
 /// 23 h case pins this insert guard to the same (23 h, 25 h] window as the
 /// prune (the 25 h decline is in `access_token_revocations_go_through_the_definer`),
 /// so the two checks the migration says to keep equal cannot drift apart.

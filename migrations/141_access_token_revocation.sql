@@ -31,11 +31,12 @@
 --      the prune deletes only rows a day past expiry (an API host an hour or
 --      more behind the database would otherwise re-admit a revoked token once
 --      its row was pruned), and a token is declined as "already expired" only
---      when it is a day past expiry (`/oauth/revoke` has just verified the
---      token as unexpired on a host that may lag the database; declining it on
---      the database clock would answer 200 and record nothing). A day costs at
---      most a day's revocations of extra rows, and it outlasts any skew an NTP
---      host can drift into; beyond it a skewed host is broken in other ways.
+--      when it is a day past expiry (`/oauth/revoke` verifies the token's
+--      signature but leaves its expiry to this guard, so a token another host
+--      may still admit must be recorded here, not answered 200 and dropped). A
+--      day costs at most a day's revocations of extra rows, and it outlasts any
+--      skew an NTP host can drift into; beyond it a skewed host is broken in
+--      other ways.
 --   3. The application role keeps SELECT, and the read is a plain primary-key
 --      lookup (`RevokedAccessTokenRepository::is_revoked`) run by both servers
 --      AFTER signature validation. `rls_enforcement.rs` requires every public
