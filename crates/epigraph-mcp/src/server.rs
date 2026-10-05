@@ -756,6 +756,29 @@ impl EpiGraphMcpFull {
         Ok(())
     }
 
+    /// Refuse every FEDERATED tool to an ELEVATED request (elevation plan
+    /// EL-10; review cp1 COR-1's residual). A federated call is proxied to the
+    /// extension under the caller's own token before `call_tool` reaches
+    /// [`Self::refuse_elevated_write`] or the per-access recorder, so an
+    /// elevated one would be neither held read-only nor recorded. A request
+    /// that is not elevated passes.
+    ///
+    /// # Errors
+    /// The `ELEVATED READ-ONLY` refusal when `elevated`.
+    pub fn refuse_elevated_federated(elevated: bool, tool_name: &str) -> Result<(), McpError> {
+        if !elevated {
+            return Ok(());
+        }
+        Err(McpError::invalid_request(
+            format!(
+                "ELEVATED READ-ONLY: federated tool '{tool_name}' is unavailable to an elevated \
+                 request (a federated call is neither recorded nor held read-only); call it \
+                 with an unelevated token"
+            ),
+            None,
+        ))
+    }
+
     /// Refuse a WRITE tool to an ELEVATED request, at dispatch (elevation plan
     /// §1.4: the elevated viewer is read-only).
     ///
@@ -2426,6 +2449,16 @@ impl ServerHandler for EpiGraphMcpFull {
             if let Some(ext) = self.federation.route_config(&request.name) {
                 let ext_name = ext.name;
                 let ext_scope = ext.scope;
+                // (0) an ELEVATED request reaches no federated tool (review
+                // cp1 COR-1's residual, elevation plan EL-10): it is proxied
+                // under the caller's token, so neither the read-only refusal
+                // below nor the per-access recorder would see it.
+                if let Err(err) = Self::refuse_elevated_federated(elevated.is_some(), &request.name)
+                {
+                    self.emit_tool_invoked(&format!("denied:{}:{}", ext_name, request.name))
+                        .await;
+                    return Err(err);
+                }
                 // (a) enforce the extension's configured scope against the caller.
                 if let Err(err) =
                     Self::enforce_federated_scope(auth_owned.as_ref(), &request.name, &ext_scope)

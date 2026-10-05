@@ -1115,3 +1115,41 @@ async fn an_elevated_request_holds_the_admin_read_scopes_at_the_mcp_gate(pool: P
         "elevated: past the scope gate, refused as a write: {elevated}"
     );
 }
+
+/// An ELEVATED request reaches no FEDERATED tool (review cp1 COR-1's residual,
+/// plan EL-10): the refusal answers `ELEVATED READ-ONLY` and names the tool;
+/// an unelevated request passes. Source lock (a federated call needs a live
+/// extension to drive end to end): in `call_tool`'s federation branch the
+/// elevation is resolved first and the refusal runs before the extension's
+/// scope gate and the proxy call.
+///
+/// Verified to fail with the refusal's call removed from the federation
+/// branch, and with the refusal answering `Ok` for an elevated request.
+#[test]
+fn an_elevated_request_reaches_no_federated_tool() {
+    let refused = EpiGraphMcpFull::refuse_elevated_federated(true, "attach_blob");
+    assert!(refused_as_elevated(&refused), "{refused:?}");
+    assert!(format!("{refused:?}").contains("attach_blob"));
+    assert!(EpiGraphMcpFull::refuse_elevated_federated(false, "attach_blob").is_ok());
+
+    let src = include_str!("../src/server.rs");
+    let body = &src[src.find("async fn call_tool(").expect("call_tool")..];
+    let resolve = body
+        .find("self.elevation_at_dispatch(auth_owned.as_mut())")
+        .expect("call_tool resolves the elevation");
+    let branch = body
+        .find("self.federation.route_config(&request.name)")
+        .expect("the federation branch");
+    let refusal = body
+        .find("Self::refuse_elevated_federated(elevated.is_some()")
+        .expect("the federation branch refuses an elevated request");
+    let gate = body
+        .find("Self::enforce_federated_scope(auth_owned.as_ref()")
+        .expect("the federated scope gate");
+    let proxy = body.find(".invoke(&request.name").expect("the proxy call");
+    assert!(
+        resolve < branch && branch < refusal && refusal < gate && gate < proxy,
+        "resolve the elevation, then refuse it in the federation branch before the \
+         extension's scope gate and the proxy call"
+    );
+}
