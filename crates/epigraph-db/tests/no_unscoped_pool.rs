@@ -569,14 +569,19 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "state.rs",
-        11,
+        12,
         "Boot and observability, including the session-GUC probe itself. ENUMERATED rather than \
          waved at, because this is the one file where the needle is an indirection layer: a \
          `pub async fn` on AppState that reads self.db_pool is exempt-by-file no matter who calls \
          it, and a ViewerExtractor grep cannot detect the mixed case (AppState methods take &self; \
-         the Viewer lives in the calling handler). The ten sites are exactly \
+         the Viewer lives in the calling handler). The twelve sites are exactly \
          load_entity_type_cache (1), assert_tenancy_triggers_armed (3), probe_rls_posture (3), \
-         rls_canary_visible (2), warn_on_privileged_connection (1), and begin_claim_write (1). \
+         rls_canary_visible (2), warn_on_privileged_connection (1), begin_claim_write (1), and \
+         admin_scope_posture (1, elevation plan EL-10): the admin-scope switch read for the \
+         check chokepoint, `epigraph_admin_scopes_armed()` through AdminScopeArmingCache, called \
+         by the bearer middlewares BEFORE any viewer exists (it decides the request's \
+         AuthContext); the switch is a one-row control table with no tenancy columns and no row \
+         security (migration 128), the same answer for every caller. \
          begin_claim_write's site is the fallback for a TEST-BUILT AppState with no ScopedPool: \
          every server is built through with_scoped_pool and takes the stamped write_as branch, \
          and a claim written by an unstamped application session is refused by migration 122 \
@@ -587,7 +592,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          by grep: every caller outside state.rs is bin/server.rs at boot, tenancy_gauge.rs (itself \
          exempt), or a #[cfg(all(test, feature = \"db\"))] module in routes/admin.rs and \
          routes/edges.rs. Scoping the probe to a Viewer would make it prove a property of that \
-         viewer instead of the pool. The count is pinned so a twelfth site cannot inherit this \
+         viewer instead of the pool. The count is pinned so a thirteenth site cannot inherit this \
          reason silently — see the `state.rs` note in the module's Known limits.",
     ),
     (
