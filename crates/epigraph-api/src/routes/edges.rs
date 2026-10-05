@@ -3370,6 +3370,273 @@ mod db_tests {
         assert_eq!(count, 1);
     }
 
+    // ── Symmetric claim/claim relationships dedup on the UNORDERED pair ──
+    //
+    // `CONTRADICTS` / `CORROBORATES` between two claims are one fact about a
+    // pair, not a per-submission event. `POST /edges` is the HTTP twin of MCP
+    // `link_epistemic`, which already collapses both call orders onto one row;
+    // before this, the REST route wrote each order as its own in-force row
+    // (with its own factor and its own edge-keyed BBA), so one disagreement
+    // was counted twice by DS / BP. The controls below pin the boundary of the
+    // change: directional relationships and non-claim endpoints keep the
+    // directional semantics.
+
+    /// POST a JSON body to `/api/v1/edges`; return the status and parsed body.
+    async fn post_edge(router: &Router, body: Body) -> (StatusCode, serde_json::Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/edges")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, parse_body(resp).await)
+    }
+
+    /// In-force rows over the UNORDERED pair `{a, b}` with `relationship`.
+    async fn unordered_pair_count(pool: &PgPool, a: Uuid, b: Uuid, relationship: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges \
+             WHERE LEAST(source_id, target_id) = LEAST($1, $2) \
+               AND GREATEST(source_id, target_id) = GREATEST($1, $2) \
+               AND relationship = $3 \
+               AND (valid_to IS NULL OR valid_to > now())",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn body_id(body: &serde_json::Value, field: &str) -> Uuid {
+        Uuid::parse_str(
+            body[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("response has no `{field}`: {body}")),
+        )
+        .unwrap()
+    }
+
+    /// Shared body of the two reverse-direction tests: `A CONTRADICTS B`, then
+    /// `B CONTRADICTS A`, both with the given `if_not_exists`.
+    async fn assert_reverse_contradicts_collapses(pool: PgPool, if_not_exists: bool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "symmetric A").await;
+        let b = seed_claim(&pool, agent_id, "symmetric B").await;
+
+        let state = test_state(pool.clone()).await;
+        let router = edges_router_with_auth(state, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(
+            &router,
+            create_edge_body(a, b, "CONTRADICTS", if_not_exists),
+        )
+        .await;
+        assert_eq!(s1, StatusCode::CREATED, "first POST creates: {body1}");
+        let id1 = body_id(&body1, "id");
+
+        let (s2, body2) = post_edge(
+            &router,
+            create_edge_body(b, a, "CONTRADICTS", if_not_exists),
+        )
+        .await;
+
+        assert_eq!(
+            unordered_pair_count(&pool, a, b, "CONTRADICTS").await,
+            1,
+            "`B CONTRADICTS A` after `A CONTRADICTS B` (if_not_exists={if_not_exists}) \
+             is the same disagreement and must not write a second in-force row; \
+             second response was {s2} {body2}"
+        );
+        assert_eq!(
+            body_id(&body2, "id"),
+            id1,
+            "the reverse POST must return the existing edge"
+        );
+        assert_eq!(
+            (body_id(&body2, "source_id"), body_id(&body2, "target_id")),
+            (a, b),
+            "the response reports the STORED orientation (A -> B), not the request's"
+        );
+        assert_eq!(s2, StatusCode::OK, "a dedup hit is 200, not 201");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_reverse_direction_returns_existing_edge(pool: PgPool) {
+        assert_reverse_contradicts_collapses(pool, true).await;
+    }
+
+    /// Option A: the symmetric dedup does not depend on `if_not_exists`. The
+    /// default (multi-emit) path is for verb-edges; a contradiction between two
+    /// claims is a noun-fact, and the MCP twin is always idempotent.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_reverse_direction_dedups_without_if_not_exists(pool: PgPool) {
+        assert_reverse_contradicts_collapses(pool, false).await;
+    }
+
+    /// `CORROBORATES` is the other symmetric relationship REST admits; filed in
+    /// both orders it is likewise one row.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_corroborates_reverse_direction_collapses(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "corroborating A").await;
+        let b = seed_claim(&pool, agent_id, "corroborating B").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "CORROBORATES", false)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        let (s2, body2) = post_edge(&router, create_edge_body(b, a, "CORROBORATES", false)).await;
+
+        assert_eq!(
+            unordered_pair_count(&pool, a, b, "CORROBORATES").await,
+            1,
+            "reverse CORROBORATES must not add a row; second response {s2} {body2}"
+        );
+        assert_eq!(body_id(&body2, "id"), body_id(&body1, "id"));
+    }
+
+    /// Negative control: `SUPPORTS` is DIRECTIONAL (A supports B is not B
+    /// supports A), so the two orders are two distinct facts and two rows.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_directional_reverse_direction_stays_two_rows(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "directional A").await;
+        let b = seed_claim(&pool, agent_id, "directional B").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "SUPPORTS", true)).await;
+        let (s2, body2) = post_edge(&router, create_edge_body(b, a, "SUPPORTS", true)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        assert_eq!(s2, StatusCode::CREATED, "{body2}");
+        assert_ne!(body_id(&body1, "id"), body_id(&body2, "id"));
+        assert_eq!(unordered_pair_count(&pool, a, b, "SUPPORTS").await, 2);
+    }
+
+    /// Control on the claim/claim gate: migration 090's header records that
+    /// `POST /edges` admits `CORROBORATES` between other entity types, where
+    /// nothing has established the relationship is symmetric. An agent/claim
+    /// `CORROBORATES` filed in both orders therefore stays two rows.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_relationship_off_claim_pair_stays_directional(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let claim = seed_claim(&pool, agent_id, "claim endpoint").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let typed = |src: Uuid, src_type: &str, tgt: Uuid, tgt_type: &str| {
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "source_id": src,
+                    "target_id": tgt,
+                    "source_type": src_type,
+                    "target_type": tgt_type,
+                    "relationship": "CORROBORATES",
+                    "if_not_exists": true,
+                }))
+                .unwrap(),
+            )
+        };
+        let (s1, body1) = post_edge(&router, typed(agent_id, "agent", claim, "claim")).await;
+        let (s2, body2) = post_edge(&router, typed(claim, "claim", agent_id, "agent")).await;
+        // Both must be real creations; a 4xx here would make the count below
+        // pass for the wrong reason.
+        assert_eq!(s1, StatusCode::CREATED, "agent -> claim: {body1}");
+        assert_eq!(s2, StatusCode::CREATED, "claim -> agent: {body2}");
+        assert_ne!(body_id(&body1, "id"), body_id(&body2, "id"));
+        assert_eq!(
+            unordered_pair_count(&pool, agent_id, claim, "CORROBORATES").await,
+            2
+        );
+    }
+
+    /// Belief semantics of the collapse, mirroring MCP
+    /// `link_epistemic_smoke.rs::reverse_order_rehit_wires_the_stored_orientation`.
+    ///
+    /// The edge-keyed BBA encodes "source's interval restricts target". The row
+    /// is written `A CONTRADICTS B` while A is factorless (nothing wired); both
+    /// claims then gain identical intervals, and the wake-up arrives as a
+    /// REVERSE POST (`B CONTRADICTS A`). The two candidate orientations have
+    /// opposite, mutually exclusive outcomes:
+    ///   stored  (A -> B): B is recomputed and drops, A keeps its 0.9
+    ///   request (B -> A): A is recomputed and drops, B keeps its 0.9
+    /// so the assertions below discriminate which orientation the handler
+    /// wired.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_reverse_rehit_wires_the_stored_orientation(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "stored source, factorless at first").await;
+        let b = seed_claim(&pool, agent_id, "stored target").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "CONTRADICTS", true)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        let id1 = body_id(&body1, "id");
+        let bbas_on = |edge: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1",
+                )
+                .bind(edge)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(bbas_on(id1).await, 0, "A is factorless: nothing wired yet");
+
+        sqlx::query(
+            "UPDATE claims SET belief = 0.9, plausibility = 0.9, pignistic_prob = 0.9 \
+             WHERE id = ANY($1)",
+        )
+        .bind(vec![a, b])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (s2, body2) = post_edge(&router, create_edge_body(b, a, "CONTRADICTS", true)).await;
+
+        let betp = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<f64>>(
+                    "SELECT pignistic_prob FROM claims WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .expect("pignistic_prob set")
+            }
+        };
+        let a_betp = betp(a).await;
+        assert!(
+            (a_betp - 0.9).abs() < 1e-9,
+            "A is the STORED source and must keep its seeded 0.9; wiring the \
+             request's orientation (B -> A) recomputes A downward. Got {a_betp} \
+             (second response {s2} {body2})"
+        );
+        let b_betp = betp(b).await;
+        assert!(
+            b_betp < 0.5,
+            "the stored A -> B contradiction from a high-belief source must push \
+             B below 0.5, got {b_betp}"
+        );
+        assert_eq!(
+            bbas_on(id1).await,
+            1,
+            "the wake-up BBA is keyed on the one stored edge"
+        );
+        assert_eq!(s2, StatusCode::OK);
+    }
+
     /// 0.B — GET /edges combines source_id, target_id, and relationship
     /// filters at the SQL layer (AND-composed), not first-non-null cascade.
     #[sqlx::test(migrations = "../../migrations")]
