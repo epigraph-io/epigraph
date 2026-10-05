@@ -1831,14 +1831,14 @@ mod refresh_scope_tests {
         let granted = v(&[
             "claims:read",
             "claims:write",
-            "claims:admin",
+            "agents:write",
             "evidence:read",
         ]);
         assert_eq!(
             refresh_scopes(
                 &stored,
                 &granted,
-                Some("claims:read claims:write claims:admin")
+                Some("claims:read claims:write agents:write")
             ),
             Some(v(&["claims:read"])),
             "only a narrowing of the stored scopes; the client's wider grant is not a source"
@@ -1848,8 +1848,8 @@ mod refresh_scope_tests {
     #[test]
     fn a_requested_scope_that_names_nothing_issuable_is_invalid_scope() {
         let stored = v(&["claims:read"]);
-        let granted = v(&["claims:read", "claims:write", "claims:admin"]);
-        for nothing in ["claims:write claims:admin", "offline_access"] {
+        let granted = v(&["claims:read", "claims:write", "agents:write"]);
+        for nothing in ["claims:write agents:write", "offline_access"] {
             assert_eq!(
                 refresh_scopes(&stored, &granted, Some(nothing)),
                 None,
