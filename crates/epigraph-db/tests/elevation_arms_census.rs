@@ -412,7 +412,8 @@ async fn every_armed_table_carries_exactly_its_elevated_policies(pool: PgPool) {
 /// (`privatization_plans_read`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_standing_admin_arms_read_elevation_only_through_the_switch(pool: PgPool) {
-    let rows: Vec<(String, String, String, bool, Vec<String>, Option<String>)> = sqlx::query_as(
+    type SwitchArmRow = (String, String, String, bool, Vec<String>, Option<String>);
+    let rows: Vec<SwitchArmRow> = sqlx::query_as(
         "SELECT c.relname::text, p.polname::text, p.polcmd::text, p.polpermissive, \
                 ARRAY(SELECT CASE WHEN r = 0 THEN 'public' ELSE r::regrole::text END \
                         FROM unnest(p.polroles) r ORDER BY 1), \
