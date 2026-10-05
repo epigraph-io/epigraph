@@ -1077,8 +1077,11 @@ async fn a_standing_admin_scope_is_absent_on_an_mcp_tool_while_armed(pool: PgPoo
 /// READ-ONLY (every write tool is). Calibration: the same scopes on a token
 /// whose claim names no live session stop at the scope gate.
 ///
+/// The refusal of that ADMIN write names `epigraph-operator` (plan EQ-5).
+///
 /// Verified to fail with `call_tool` not setting the request's elevation (the
-/// elevated call stops at the scope gate).
+/// elevated call stops at the scope gate), and with the admin pointer dropped
+/// from `refuse_elevated_write`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_elevated_request_holds_the_admin_read_scopes_at_the_mcp_gate(pool: PgPool) {
     let (p, _) = fixture::seed_human_operator(&pool, "el10-mcp-elevated").await;
@@ -1113,6 +1116,10 @@ async fn an_elevated_request_holds_the_admin_read_scopes_at_the_mcp_gate(pool: P
     assert!(
         !elevated.contains(gate) && elevated.contains("ELEVATED READ-ONLY"),
         "elevated: past the scope gate, refused as a write: {elevated}"
+    );
+    assert!(
+        elevated.contains("epigraph-operator"),
+        "an admin write's refusal says where admin writes run (plan EQ-5): {elevated}"
     );
 }
 

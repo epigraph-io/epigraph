@@ -817,7 +817,19 @@ impl EpiGraphMcpFull {
             return Ok(());
         }
         let viewer = crate::tools::viewer::request_viewer(self, Some(auth)).await?;
-        crate::write_identity::refuse_elevated(&viewer)
+        let admin = crate::scope_map::required_scope(tool_name)
+            .is_some_and(epigraph_auth::is_admin_only_scope);
+        crate::write_identity::refuse_elevated(&viewer).map_err(|mut e| {
+            // An ADMIN write (plan EQ-5): say where it runs instead.
+            if admin {
+                e.message = std::borrow::Cow::Owned(format!(
+                    "{}. Admin writes run through `epigraph-operator` on the maintenance DSN \
+                     while elevated",
+                    e.message
+                ));
+            }
+            e
+        })
     }
 
     /// Decide, ONCE at dispatch, whether an HTTP request is ELEVATED (elevation
