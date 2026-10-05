@@ -592,9 +592,10 @@ async fn the_grace_window_is_thirty_seconds_from_the_tokens_own_rotation(pool: P
     }
 }
 
-/// The rotation derives the successor's authority from the client, not from
-/// the caller, and the application role cannot read the hashes that name a
-/// chain.
+/// The rotation derives the successor's authority from the presented token's
+/// scopes narrowed to the client's grant (migration 140), never from the
+/// caller's request, and the application role cannot read the hashes that name
+/// a chain.
 #[sqlx::test(migrations = "../../migrations")]
 async fn rotation_caps_expiry_and_derives_scopes_and_token_hash_is_unreadable(pool: PgPool) {
     let client = seed_client(&pool, "active").await; // human, granted {claims:read}
@@ -630,7 +631,8 @@ async fn rotation_caps_expiry_and_derives_scopes_and_token_hash_is_unreadable(po
     assert_eq!(
         scopes,
         vec!["claims:read"],
-        "the successor carries the client's granted scopes, not the caller's"
+        "the successor carries the presented scopes narrowed to the client's grant; \
+         claims:admin was never granted"
     );
     // A shorter expiry than the TTL is kept (the caller may shorten).
     let t2 = h("cap2");
