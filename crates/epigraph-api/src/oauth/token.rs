@@ -777,12 +777,13 @@ async fn handle_refresh_token(
     // (RFC 6749 section 5.2), answered BEFORE the chain is spent: a 200 with an
     // empty-scope access token would rotate the chain and authorize nothing.
     let effective_scopes =
-        refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref())
-            .ok_or_else(|| ApiError::BadRequest {
+        refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref()).ok_or_else(
+            || ApiError::BadRequest {
                 message: "invalid_scope: the requested scope names none of the scopes \
                           this refresh token was granted"
                     .into(),
-            })?;
+            },
+        )?;
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
@@ -1468,9 +1469,18 @@ mod refresh_scope_tests {
     #[test]
     fn a_requested_scope_outside_the_stored_set_is_never_added() {
         let stored = v(&["claims:read", "evidence:read"]);
-        let granted = v(&["claims:read", "claims:write", "claims:admin", "evidence:read"]);
+        let granted = v(&[
+            "claims:read",
+            "claims:write",
+            "claims:admin",
+            "evidence:read",
+        ]);
         assert_eq!(
-            refresh_scopes(&stored, &granted, Some("claims:read claims:write claims:admin")),
+            refresh_scopes(
+                &stored,
+                &granted,
+                Some("claims:read claims:write claims:admin")
+            ),
             Some(v(&["claims:read"])),
             "only a narrowing of the stored scopes; the client's wider grant is not a source"
         );

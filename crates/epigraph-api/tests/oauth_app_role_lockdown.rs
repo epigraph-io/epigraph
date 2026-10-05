@@ -639,7 +639,10 @@ async fn a_refresh_scope_naming_nothing_issuable_is_refused_and_keeps_the_chain(
             body.to_string().contains("invalid_scope"),
             "the refusal is invalid_scope: {body}"
         );
-        assert!(body.get("access_token").is_none(), "no token issued: {body}");
+        assert!(
+            body.get("access_token").is_none(),
+            "no token issued: {body}"
+        );
     }
 
     let (status, body) = post_token(app.clone(), refresh_grant(&r0)).await;
