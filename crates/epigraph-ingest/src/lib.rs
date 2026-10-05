@@ -490,14 +490,15 @@ mod tests {
         // "the stored digest is not blake3(content)". Checked over BOTH builders,
         // because the workflow builder binds the PLAIN hash on its compound
         // nodes — `level < 3` alone would misclassify all of them.
-        let mut seed_scoped_seen = 0_usize;
+        let mut seed_scoped_seen: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         for (label, plan) in [("document", &doc_plan), ("workflow", &wf_plan)] {
             for c in &plan.claims {
                 let plain = content_hash(&c.content);
                 let digest_is_derivable = c.content_hash == plain;
                 let predicate = stored_content_hash_is_seed_scoped(&c.properties);
                 if predicate {
-                    seed_scoped_seen += 1;
+                    *seed_scoped_seen.entry(label).or_default() += 1;
                 }
                 assert_eq!(
                     predicate,
@@ -516,10 +517,20 @@ mod tests {
                 );
             }
         }
-        assert!(
-            seed_scoped_seen >= 3,
+        // Counted PER BUILDER: a single total could be met by the document plan
+        // alone and say nothing about the workflow writer.
+        assert_eq!(
+            seed_scoped_seen.get("document").copied().unwrap_or(0),
+            3,
             "guard is vacuous unless the document plan contributes its thesis, section and \
-             paragraph rows; saw {seed_scoped_seen}"
+             paragraph rows; saw {seed_scoped_seen:?}"
+        );
+        assert_eq!(
+            seed_scoped_seen.get("workflow").copied().unwrap_or(0),
+            3,
+            "the workflow plan's thesis, phase and step rows store a canonical_name-scoped \
+             digest (two workflows sharing a text must not collide on \
+             uq_claims_content_hash_agent); saw {seed_scoped_seen:?}"
         );
     }
 
