@@ -2150,3 +2150,56 @@ scope is decided. Rollback: the previous binaries (an open connector ticket
 expires in 5 minutes; a live connector session ends at its expiry, at most
 15 minutes, or at once with `epigraph-operator end-elevation` on the
 maintenance DSN).
+
+## Pending admin acts (migration 130) — the confirmation requirement, deploy order and rollback
+
+A custodial write by a person who holds a passkey is now bound to that
+person's passkey assertion over the write's exact args. The act is PROPOSED by
+an elevated session, CONFIRMED by a passkey of its proposer (a ceremony over
+the act's content), and EXECUTED by the maintenance verb with `--act <id>`,
+which consumes it in the write's own transaction. The rule lives in the table
+guards, so a direct maintenance statement meets it too.
+
+**What changes for the maintenance verbs (`ELV10`).** Once the acting person
+holds a LIVE passkey, the verb without `--act` is refused:
+
+- `grant-role` whose `--granted-by` holds a passkey;
+- `end-role-assignment` while ANY live custodian holds a passkey (an end names
+  no actor, so a confirmation is required whenever one is available);
+- `custodial-supersede` whose `--actor` holds a passkey;
+- `passkey-enroll` of a person who already holds a passkey (a later passkey
+  comes from a confirmed `passkey.register` act of that person).
+
+The bootstrap is unchanged: no grantor, or a grantor with no passkey, still
+writes unconfirmed, and every `platform.role_granted` / `role_ended` /
+`custodial_act` row now says `confirmation` (`none` or `passkey`, with the act
+and its elevation). The privatization custodial acts have no act kind yet and
+record as before. With `--act`, each verb rebuilds the act's args from its own
+flags and refuses before writing (exit 1, the act unspent) when the act is not
+that act: another kind, not confirmed, executed already, expired (an act lives
+30 minutes), other args, another actor. A dry run spends nothing.
+
+**The break-glass.** `epigraph-operator revoke-passkey` (audited) of a lost or
+suspect passkey lifts the requirement for its holder and voids every
+unexecuted act it confirmed. NOTE: proposing an act needs a LIVE elevation, and
+no elevation is live until the stack's last migration opens the recorder gate;
+the act API that proposes and confirms is a later change. Until both ship, a
+custodian who holds a passkey makes these writes only after revoking it.
+
+1. **Migrate 130** (`epigraph-migrate`, migration DSN): one transaction,
+   `lock_timeout` 3s; a new table, an added nullable column on
+   `role_assignments` (metadata only, no rewrite), new functions, and new
+   bodies for 123's role-assignment guards and audit, 123's custodial-act
+   recorder (the six-parameter form becomes a wrapper) and 124's enrollment
+   guard. Retry on a lock timeout.
+2. **Deploy** `epigraph-operator` and `epigraph-tenancy-backfill` from the same
+   commit (`verify` then checks the 130 definers' owner and grants). Older
+   binaries keep working, except where `ELV10` applies.
+
+**Rollback.** Roll back the `epigraph-operator` that passes `--act` first. Then
+run `docs/runbooks/130-undo.sql` on the migration DSN, in one transaction,
+BEFORE `129-undo.sql` and before `123-undo.sql` (130 adds act-taking overloads
+of 123's definers): it archives every act as a `platform.admin_act_archived`
+event, restores 123's and 124's bodies byte for byte (every `ELV10`
+requirement goes with them), and drops the act table and every 130 function.
+The `revoke_act_id` column and the act ids earlier writes recorded stay.
