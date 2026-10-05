@@ -1394,10 +1394,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "match_candidate.rs",
-        "current_status",
-        "READ of one `match_candidates` row's status, a table with no tenancy columns to filter \
-         on, for the refusal message of a conditional decide that matched no row; the caller \
-         already read the same row by id (`MatchCandidateRepo::get`).",
+        "current_decision",
+        "READ of one `match_candidates` row's status and verdict, a table with no tenancy \
+         columns to filter on, after a conditional decide matched no row (refusal message; lost \
+         decision vs re-scored verdict); the caller already read the same row by id \
+         (`MatchCandidateRepo::get`).",
     ),
     (
         "match_candidate.rs",

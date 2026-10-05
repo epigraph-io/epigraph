@@ -167,16 +167,21 @@ pub async fn list_match_candidates(
 /// Map a conditional decide's outcome: a candidate decided by a concurrent
 /// caller between this call's read and its write gets the SAME refusal as a
 /// sequential replay on a decided row (`reject_if_decided`), because to the
-/// caller the two are the same fact.
-fn refuse_if_decided_concurrently(
-    candidate_id: uuid::Uuid,
-    outcome: DecideOutcome,
-) -> Result<(), McpError> {
+/// caller the two are the same fact. A promote whose `verifier_verdict` was
+/// re-scored in between is refused too: the row is still decidable, but not on
+/// the verdict this call read.
+fn refuse_if_lost_race(candidate_id: uuid::Uuid, outcome: DecideOutcome) -> Result<(), McpError> {
     match outcome {
         DecideOutcome::Decided => Ok(()),
         DecideOutcome::AlreadyDecided { status } => Err(invalid_params(format!(
             "candidate {candidate_id} already decided (status={status}); use \
              retire_match_candidate to undo a promotion"
+        ))),
+        DecideOutcome::VerdictChanged { verdict } => Err(invalid_params(format!(
+            "candidate {candidate_id}: its verifier_verdict changed (now {}) while this promote \
+             was in flight, so the edge polarity it resolved no longer holds; nothing was \
+             written. Re-read the candidate and decide again",
+            verdict.as_deref().unwrap_or("none")
         ))),
     }
 }
@@ -261,12 +266,14 @@ pub async fn decide_match_candidate(
             }
 
             // The status flip and the edge write are ONE transaction, and the
-            // flip is conditional on the row still being `pending`
-            // (`MatchCandidateRepo::promote_if_pending`). The early
-            // `reject_if_decided` above is a read-then-gate check that two
-            // concurrent decides can both pass; this is what decides the race,
-            // so a reject that commits first is never overwritten and a
-            // retirement cannot slip between the flip and the edge.
+            // flip is conditional on the row still being `pending` with the
+            // verdict read above (`MatchCandidateRepo::promote_if_pending`).
+            // The early `reject_if_decided` above is a read-then-gate check
+            // that two concurrent decides can both pass; this is what decides
+            // the race, so a reject that commits first is never overwritten, a
+            // retirement cannot slip between the flip and the edge, and a
+            // matcher re-score of the verdict `relationship` was resolved from
+            // refuses the promote instead of inverting it.
             //
             // The edge goes through `EdgeRepository::create_symmetric_if_absent_conn`
             // (inside the repo method): its existence check is the FAST PATH,
@@ -284,10 +291,16 @@ pub async fn decide_match_candidate(
                 "source":           "cross_source_matcher",
             });
             let outcome = repo
-                .promote_if_pending(candidate_id, Some(acting_agent), relationship, props)
+                .promote_if_pending(
+                    candidate_id,
+                    Some(acting_agent),
+                    row.verifier_verdict.as_deref(),
+                    relationship,
+                    props,
+                )
                 .await
                 .map_err(internal_error)?;
-            refuse_if_decided_concurrently(candidate_id, outcome)?;
+            refuse_if_lost_race(candidate_id, outcome)?;
         }
         "reject" => {
             reject_if_decided()?;
@@ -295,7 +308,7 @@ pub async fn decide_match_candidate(
                 .reject_if_pending(candidate_id, Some(acting_agent))
                 .await
                 .map_err(internal_error)?;
-            refuse_if_decided_concurrently(candidate_id, outcome)?;
+            refuse_if_lost_race(candidate_id, outcome)?;
         }
         other => {
             // `retire` is NOT handled here — it is its own tool because it

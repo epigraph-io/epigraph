@@ -56,6 +56,12 @@ pub enum DecideOutcome {
     /// concurrent caller after this one read it. Nothing was written.
     /// `status` is the candidate's status as read after the refused write.
     AlreadyDecided { status: String },
+    /// Promote only: the candidate is still `pending`, but its
+    /// `verifier_verdict` is no longer the one the caller resolved the edge's
+    /// polarity from (a matcher re-score landed in between). Nothing was
+    /// written. `verdict` is the candidate's verdict as read after the refused
+    /// write.
+    VerdictChanged { verdict: Option<String> },
 }
 
 /// What [`MatchCandidateRepo::retire`] actually removed.
@@ -138,6 +144,12 @@ impl MatchCandidateRepo {
     /// writes. Folding them also removes the window *between* the two
     /// statements, during which a concurrent operator tap could read a verdict
     /// that was about to be overwritten.
+    ///
+    /// A re-score of a still-`pending` row can still land between a promote's
+    /// read and its write; [`Self::promote_if_pending`] is conditional on the
+    /// verdict the promote read, so that promote is refused
+    /// ([`DecideOutcome::VerdictChanged`]) rather than writing an edge whose
+    /// polarity the row no longer supports.
     ///
     /// The two verdict columns are gated together on purpose: freezing one
     /// without the other yields a row whose rationale describes a verdict it no
@@ -269,9 +281,8 @@ impl MatchCandidateRepo {
         if rejected == 1 {
             return Ok(DecideOutcome::Decided);
         }
-        Ok(DecideOutcome::AlreadyDecided {
-            status: current_status(&mut conn, id).await?,
-        })
+        let (status, _) = current_decision(&mut conn, id).await?;
+        Ok(DecideOutcome::AlreadyDecided { status })
     }
 
     /// Promote a candidate only if it is still `pending`, and write its
@@ -290,11 +301,21 @@ impl MatchCandidateRepo {
     ///   committed `promoted` with its edge still in flight let the retirement
     ///   run first and the edge land afterwards under a `stale` row.
     ///
+    /// - **A concurrent verdict re-score.** The caller resolved `relationship`
+    ///   from the `verifier_verdict` it read (`read_verdict`), and
+    ///   [`Self::upsert`] may rewrite the verdict of a row that is still
+    ///   `pending`. The flip is also conditional on the verdict being
+    ///   `read_verdict` (`IS NOT DISTINCT FROM`, so a NULL verdict compares
+    ///   equal to NULL); otherwise the promote is refused with
+    ///   [`DecideOutcome::VerdictChanged`] instead of recording a polarity the
+    ///   row no longer supports.
+    ///
     /// The claim pair comes from the row the flip updated (`RETURNING`), not
     /// from the caller. The edge is written by
     /// [`EdgeRepository::create_symmetric_if_absent_conn`], the same INSERT
     /// the promote paths always ran, any-state dedup included. On
-    /// `AlreadyDecided` nothing is written (the transaction rolls back).
+    /// `AlreadyDecided` or `VerdictChanged` nothing is written (the
+    /// transaction rolls back).
     ///
     /// # Errors
     /// The query's error; a candidate that does not exist is `RowNotFound`.
@@ -302,6 +323,7 @@ impl MatchCandidateRepo {
         &self,
         id: Uuid,
         by: Option<Uuid>,
+        read_verdict: Option<&str>,
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<DecideOutcome, DbError> {
@@ -312,17 +334,21 @@ impl MatchCandidateRepo {
             "UPDATE match_candidates
              SET status = 'promoted', decided_at = now(), decided_by = $2
              WHERE id = $1 AND status = 'pending'
+               AND verifier_verdict IS NOT DISTINCT FROM $3
              RETURNING claim_a, claim_b",
         )
         .bind(id)
         .bind(by)
+        .bind(read_verdict)
         .fetch_optional(&mut *tx)
         .await?;
         let Some((claim_a, claim_b)) = pair else {
             drop(tx);
-            return Ok(DecideOutcome::AlreadyDecided {
-                status: current_status(&mut conn, id).await?,
-            });
+            let (status, verdict) = current_decision(&mut conn, id).await?;
+            if status == "pending" {
+                return Ok(DecideOutcome::VerdictChanged { verdict });
+            }
+            return Ok(DecideOutcome::AlreadyDecided { status });
         };
         EdgeRepository::create_symmetric_if_absent_conn(
             &mut tx,
@@ -621,10 +647,14 @@ impl MatchCandidateRepo {
     }
 }
 
-/// The candidate's committed status, for a refused conditional decide's
-/// message.
-async fn current_status(conn: &mut sqlx::PgConnection, id: Uuid) -> sqlx::Result<String> {
-    sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+/// The candidate's committed status and verdict, read after a conditional
+/// decide matched no row: for the refusal's message, and to tell a promote
+/// that lost to a decision from one that lost to a verdict re-score.
+async fn current_decision(
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+) -> sqlx::Result<(String, Option<String>)> {
+    sqlx::query_as("SELECT status, verifier_verdict FROM match_candidates WHERE id = $1")
         .bind(id)
         .fetch_one(&mut *conn)
         .await
