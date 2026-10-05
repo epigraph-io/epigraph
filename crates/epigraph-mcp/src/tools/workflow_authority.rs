@@ -54,10 +54,18 @@
 //!   the write records a `workflows.admin_write` `security_events` row on its
 //!   own transaction, naming the admin, the token, the workflow, its submitter
 //!   and what was written (D2's semantics for a write that needs no definer).
-//! * A workflow with NO record keeps today's behaviour, with a WARN naming it,
-//!   so the legacy population is neither tightened by accident nor handed to
-//!   whoever touches it first. Which authority legacy workflows carry is an
-//!   operator decision this module does not make.
+//! * A workflow with NO record (every workflow written before batch H-b) is
+//!   PLATFORM CORPUS (U005, default decision A, following the D1 ruling that
+//!   the legacy corpus stays platform-owned). Over the authenticated transport
+//!   it is mutable ONLY through the audited admin arm, whose audit row records
+//!   `"submitter": null`; everyone else, the agent that happened to ingest it
+//!   included, is refused with "no recorded submitter". It used to keep the
+//!   pre-H-b behaviour with a WARN, which left any `claims:write` token able to
+//!   `delete_step` on the whole legacy corpus. A new generation of a legacy
+//!   lineage inherits no record, so platform lineage stays platform. No
+//!   submitter is backfilled: there is no provenance to backfill from. stdio is
+//!   unchanged here as everywhere in this module. When the custodian role
+//!   (#529) lands, its check replaces `claims:admin` in `admin_arm`.
 //! * A refusal names the WORKFLOW and its submitter. It used to reuse the claim
 //!   gate's text ("claim is owned by agent X ... cannot retire it"), which named
 //!   the wrong object and the wrong verb.
