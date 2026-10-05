@@ -2575,3 +2575,46 @@ async fn migration_130_admin_act_functions_are_owned_and_granted(pool: PgPool) {
         assert_eq!(can, expected, "{role} {privilege} on pending_admin_acts");
     }
 }
+
+/// Migration 131's reader `epigraph_admin_acts_of_principal(integer)`:
+/// SECURITY DEFINER, owner `epigraph_maintenance` (under any other owner the
+/// act table's definer-frame policy admits no row and the list reads empty;
+/// the harness migrates as a superuser, so a silently no-opped `OWNER TO`
+/// passes every behavioural test), STABLE, an explicit ACL, EXECUTE for the
+/// application and maintenance roles and not PUBLIC.
+///
+/// Verified to fail with the `OWNER TO` removed from 131's grant block (owner
+/// is the migrating superuser), and with the application role's GRANT
+/// removed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_131_admin_act_reader_is_owned_and_granted(pool: PgPool) {
+    let signature = "public.epigraph_admin_acts_of_principal(integer)";
+    let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+           FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE p.oid = to_regprocedure($1)",
+    )
+    .bind(signature)
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, owner, vol, acl) =
+        meta.unwrap_or_else(|| panic!("{signature} must exist (migration 131)"));
+    assert!(secdef, "{signature} SECURITY DEFINER");
+    assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+    assert_eq!(vol, "s", "{signature} volatility");
+    assert!(acl.is_some(), "{signature} must carry an EXPLICIT ACL");
+    for (role, expected) in [
+        ("public", false),
+        ("epigraph_app", true),
+        ("epigraph_maintenance", true),
+    ] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(role)
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("has_function_privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on {signature}");
+    }
+}

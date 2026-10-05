@@ -1808,6 +1808,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_set_admin_act_challenge", 130),
     ("epigraph_passkeys_for_act", 130),
     ("epigraph_confirm_admin_act", 130),
+    // 131, a person reads their own admin acts. The stake: it reads
+    // `pending_admin_acts`, whose policy admits only a privileged session or
+    // `epigraph_definer_bypass()`; under a non-member owner it lists NOTHING,
+    // silently (an empty list reads as "no acts", not as an error), so a
+    // proposer could not see the act waiting for its passkey.
+    ("epigraph_admin_acts_of_principal", 131),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2369,6 +2375,12 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_consume_admin_act",
             "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
             false,
+        ),
+        // 131: the proposer's own acts, principal-bound, on the request DSN.
+        (
+            "epigraph_admin_acts_of_principal",
+            "public.epigraph_admin_acts_of_principal(integer)",
+            true,
         ),
     ];
 

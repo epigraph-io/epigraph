@@ -1789,3 +1789,43 @@ fn every_130_object_is_registered() {
         "130-undo.sql does not drop the act table"
     );
 }
+
+/// Migration 131's one SECURITY DEFINER is on `epigraph-tenancy-backfill
+/// verify`'s ownership list at 131 and on its grant register, and
+/// `docs/runbooks/131-undo.sql` drops it.
+///
+/// Verified to fail: the `("epigraph_admin_acts_of_principal", 131)` entry
+/// removed from `DEFERRED_DEFINER_FUNCTIONS` -> named here.
+#[test]
+fn every_131_object_is_registered() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let migration = read("migrations/131_admin_acts_of_principal.sql");
+    let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let undo = read("docs/runbooks/131-undo.sql");
+    let (definers, all) = functions_of(&migration);
+    assert_eq!(
+        (definers.as_slice(), all.as_slice()),
+        (
+            ["epigraph_admin_acts_of_principal".to_string()].as_slice(),
+            ["epigraph_admin_acts_of_principal".to_string()].as_slice()
+        ),
+        "CALIBRATION: 131 creates exactly one function, a SECURITY DEFINER"
+    );
+    for n in &definers {
+        assert!(
+            backfill.contains(&format!("(\"{n}\", 131)")),
+            "{n} is missing from tenancy_backfill.rs's ownership list at 131"
+        );
+        assert!(
+            undo.contains(&format!("DROP FUNCTION IF EXISTS public.{n}(")),
+            "131-undo.sql does not drop {n}"
+        );
+    }
+    assert!(
+        backfill.contains("\"public.epigraph_admin_acts_of_principal(integer)\""),
+        "the reader is missing from tenancy_backfill.rs's grant register"
+    );
+}
