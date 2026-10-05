@@ -1395,6 +1395,97 @@ async fn holds_role_is_subject_bound(pool: PgPool) {
     }
 }
 
+/// `RoleAssignmentRepository::holds_elevating_role` (elevation plan EL-11,
+/// operator ruling D2: who the MCP manifest shows `sudo` to) answers, on an
+/// APPLICATION connection, whether the stamped principal holds a live
+/// assignment of a role whose catalog row `elevates`. A custodian does; a
+/// holder of the non-elevating auditor role does not; a legacy
+/// `instance_admins` row confers nothing; an ended assignment confers
+/// nothing; and the answer is bound to its subject (asked about the holder
+/// while stamped as someone else, or unstamped: false).
+///
+/// Verified to fail: the `r.elevates` filter dropped (the auditor holds an
+/// elevating role); the predicate keyed on `instance_admins` as well (the
+/// legacy-only principal holds one).
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_live_elevating_assignment_is_an_elevating_role(pool: PgPool) {
+    let (c, cg) = fixture::seed_human_operator(&pool, "elev-c").await;
+    let (a, ag) = fixture::seed_human_operator(&pool, "elev-a").await;
+    let (l, lg) = fixture::seed_human_operator(&pool, "elev-l").await;
+    let (e, eg) = fixture::seed_human_operator(&pool, "elev-e").await;
+    maint_insert(&pool, CUSTODIAN, c, "0", None, None)
+        .await
+        .expect("grant c the custodian role");
+    maint_insert(&pool, AUDITOR, a, "0", None, Some(c))
+        .await
+        .expect("grant a the auditor role");
+    let ended = maint_insert(&pool, CUSTODIAN, e, "0", None, Some(c))
+        .await
+        .expect("grant e the custodian role");
+    maint_exec(
+        &pool,
+        "UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
+                revoked_reason = 'ended' WHERE id = $1",
+        ended,
+    )
+    .await
+    .expect("end e's assignment");
+    {
+        use sqlx::Executor;
+        let mut conn = pool.acquire().await.expect("conn");
+        conn.execute("SET session_replication_role = replica")
+            .await
+            .expect("replica");
+        sqlx::query("INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'legacy')")
+            .bind(l)
+            .execute(&mut *conn)
+            .await
+            .expect("a legacy instance_admins row");
+        conn.execute("SET session_replication_role = origin")
+            .await
+            .expect("origin");
+    }
+    let ask = |stamped: Option<Uuid>, groups: Vec<Uuid>, about: Uuid| {
+        let pool = pool.clone();
+        async move {
+            as_app(&pool, stamped, &groups, |mut conn| async move {
+                let current: String = sqlx::query_scalar("SELECT current_user::text")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .expect("current_user");
+                assert_eq!(
+                    current, "epigraph_app",
+                    "CALIBRATION: asked as the app role"
+                );
+                let held =
+                    epigraph_db::RoleAssignmentRepository::holds_elevating_role(&mut conn, about)
+                        .await
+                        .expect("holds_elevating_role");
+                (conn, held)
+            })
+            .await
+        }
+    };
+    assert!(ask(Some(c), vec![cg], c).await, "the custodian holds one");
+    assert!(
+        !ask(Some(a), vec![ag], a).await,
+        "the auditor role does not elevate"
+    );
+    assert!(
+        !ask(Some(l), vec![lg], l).await,
+        "a legacy instance_admins row is no elevating role (D2)"
+    );
+    assert!(
+        !ask(Some(e), vec![eg], e).await,
+        "an ended assignment confers nothing"
+    );
+    assert!(
+        !ask(Some(a), vec![ag], c).await,
+        "stamped as another principal, the custodian's answer is not given"
+    );
+    assert!(!ask(None, vec![], c).await, "unstamped: nothing");
+}
+
 // =====================================================================
 // T9. Every assignment change is audited, and the audit is unforgeable.
 // =====================================================================

@@ -183,6 +183,34 @@ impl RoleAssignmentRepository {
         Ok(id)
     }
 
+    /// Whether `principal` holds a live assignment of ANY role whose catalog
+    /// row `elevates`, now (operator ruling D2: the MCP manifest lists `sudo`
+    /// only to such a holder). Subject-bound through 123's
+    /// `epigraph_holds_role`, so on an application connection it answers only
+    /// about the STAMPED principal (asked about anyone else, or unstamped:
+    /// `false`). `instance_admins` is never consulted. This is a listing
+    /// decision; the authority to elevate stays with migration 125's ticket
+    /// definer, which re-checks this and more (a live passkey, a live family).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the query fails. A failure is never mapped to
+    /// "holds no role" here; the caller decides.
+    #[instrument(skip(conn))]
+    pub async fn holds_elevating_role(
+        conn: &mut sqlx::PgConnection,
+        principal: Uuid,
+    ) -> Result<bool, DbError> {
+        let held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM public.platform_roles r \
+                             WHERE r.elevates \
+                               AND public.epigraph_holds_role($1, r.key, now()))",
+        )
+        .bind(principal)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(held)
+    }
+
     /// Record one custodial act (`epigraph_record_custodial_act`): a
     /// `platform.custodial_act` audit row naming the assignment, refused
     /// (`CUS04`) unless `assignment` is a LIVE `role:platform-custodian`

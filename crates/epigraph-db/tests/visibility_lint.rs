@@ -656,6 +656,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "role_assignment.rs",
+        "holds_elevating_role",
+        "READ of the `platform_roles` catalog (readable by every session) through 123's \
+         subject-bound `epigraph_holds_role`: whether the session principal holds a live \
+         assignment of an elevating role (the MCP manifest's `sudo` listing, D2). One boolean, \
+         an authority fact about the caller, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
         "record_custodial_act",
         "WRITE through 123's maintenance-only `epigraph_record_custodial_act`: one \
          `platform.custodial_act` security_events row, refused (CUS04) unless the named \
