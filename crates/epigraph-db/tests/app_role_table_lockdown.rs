@@ -1608,11 +1608,13 @@ async fn an_agent_cannot_rewrite_its_own_competence_scopes(pool: PgPool) {
 
 /// Migration 141 (drain U003): `revoked_access_tokens` is written ONLY through
 /// `epigraph_access_token_revoke`, measured as the application role. The
-/// definer records a live token once, ignores an already expired one, prunes
-/// rows whose token expired over an hour ago, and is a maintenance-owned
-/// `SECURITY DEFINER` with a pinned `search_path` that PUBLIC cannot execute.
-/// (UPDATE and DELETE are refused by `credential_and_ledger_tables_refuse_direct_app_writes`
-/// through [`CLOSED`]; INSERT, which that test does not cover, is refused here.)
+/// definer records a live token once, ignores a token long past its expiry, and
+/// is a maintenance-owned `SECURITY DEFINER` with a pinned `search_path` that
+/// PUBLIC cannot execute. (UPDATE and DELETE are refused by
+/// `credential_and_ledger_tables_refuse_direct_app_writes` through [`CLOSED`];
+/// INSERT, which that test does not cover, is refused here.) Its clock-skew
+/// margin is pinned by `access_token_revocation_prune_keeps_a_day_of_clock_skew_margin`
+/// and `a_token_expired_inside_the_skew_margin_is_still_recorded`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn access_token_revocations_go_through_the_definer_and_prune(pool: PgPool) {
     use chrono::{Duration, Utc};
@@ -1661,48 +1663,20 @@ async fn access_token_revocations_go_through_the_definer_and_prune(pool: PgPool)
         "an unknown jti is not revoked"
     );
 
-    // An already expired token is refused by its own exp; nothing is recorded.
+    // A token a day and more past its expiry is refused by its own exp on any
+    // host whose clock is within the margin; nothing is recorded.
     let expired = Uuid::new_v4();
     assert!(!RevokedAccessTokenRepository::revoke(
         &app,
         expired,
         client,
-        Utc::now() - Duration::seconds(1)
+        Utc::now() - Duration::hours(25)
     )
     .await
-    .expect("revoke expired"));
+    .expect("revoke long expired"));
     assert!(!RevokedAccessTokenRepository::is_revoked(&app, expired)
         .await
         .expect("read"));
-
-    // Lazy prune: rows whose token expired over an hour ago go on the next
-    // revocation; a row inside the hour's margin stays.
-    let (stale, recent) = (Uuid::new_v4(), Uuid::new_v4());
-    sqlx::query(
-        "INSERT INTO revoked_access_tokens (jti, client_id, expires_at) VALUES \
-         ($1, $3, now() - interval '2 hours'), ($2, $3, now() - interval '30 minutes')",
-    )
-    .bind(stale)
-    .bind(recent)
-    .bind(client)
-    .execute(&pool)
-    .await
-    .expect("seed expired rows as the owner");
-    RevokedAccessTokenRepository::revoke(&app, Uuid::new_v4(), client, exp)
-        .await
-        .expect("a revocation prunes");
-    let left: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT jti FROM revoked_access_tokens WHERE jti = ANY($1) ORDER BY jti",
-    )
-    .bind(vec![stale, recent])
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        left,
-        vec![recent],
-        "only the row past the hour's margin is pruned"
-    );
 
     // Catalog: maintenance-owned definer, pinned search_path, no PUBLIC EXECUTE,
     // EXECUTE for the application role.
@@ -1726,4 +1700,98 @@ async fn access_token_revocations_go_through_the_definer_and_prune(pool: PgPool)
     );
     assert!(!public_exec, "PUBLIC must not execute the revoke definer");
     assert!(app_exec, "epigraph_app executes the revoke definer");
+}
+
+/// Clock skew (drain U003 follow-up): the definer compares `expires_at` with the
+/// DATABASE clock, while the API and the MCP server check a token's `exp` on
+/// their OWN clock with zero leeway. A row pruned while some API host still
+/// thinks its token unexpired re-admits a revoked token there. So the lazy
+/// prune keeps a day of margin: a row 2 h or 23 h past expiry survives a
+/// revocation (and still answers `is_revoked`), one 25 h past is pruned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn access_token_revocation_prune_keeps_a_day_of_clock_skew_margin(pool: PgPool) {
+    use chrono::{Duration, Utc};
+    use epigraph_db::RevokedAccessTokenRepository;
+    let app = app_pool(&pool, 2).await;
+    let client = Uuid::new_v4();
+
+    let (two_h, twenty_three_h, twenty_five_h) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO revoked_access_tokens (jti, client_id, expires_at) VALUES \
+         ($1, $4, now() - interval '2 hours'), \
+         ($2, $4, now() - interval '23 hours'), \
+         ($3, $4, now() - interval '25 hours')",
+    )
+    .bind(two_h)
+    .bind(twenty_three_h)
+    .bind(twenty_five_h)
+    .bind(client)
+    .execute(&pool)
+    .await
+    .expect("seed expired rows as the owner");
+
+    // Any revocation prunes, as the application role.
+    assert!(RevokedAccessTokenRepository::revoke(
+        &app,
+        Uuid::new_v4(),
+        client,
+        Utc::now() + Duration::minutes(5)
+    )
+    .await
+    .expect("a revocation prunes"));
+
+    let mut left: Vec<Uuid> =
+        sqlx::query_scalar("SELECT jti FROM revoked_access_tokens WHERE jti = ANY($1)")
+            .bind(vec![two_h, twenty_three_h, twenty_five_h])
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    left.sort();
+    let mut kept = vec![two_h, twenty_three_h];
+    kept.sort();
+    assert_eq!(
+        left, kept,
+        "rows 2 h and 23 h past expiry are inside the 24 h skew margin and must \
+         survive the prune; only the row 25 h past is pruned"
+    );
+    // The property a host whose clock lags the database relies on.
+    assert!(
+        RevokedAccessTokenRepository::is_revoked(&app, two_h)
+            .await
+            .expect("read as epigraph_app"),
+        "a token 2 h past its expiry on the database clock is still revoked"
+    );
+    assert!(
+        !RevokedAccessTokenRepository::is_revoked(&app, twenty_five_h)
+            .await
+            .expect("read as epigraph_app")
+    );
+}
+
+/// Clock skew, the write side: `/oauth/revoke` runs on an API host that has
+/// just verified the token as unexpired on ITS clock. If the definer then
+/// declined it as expired on the database clock, a host lagging the database
+/// would keep admitting a token whose revocation was answered 200. The definer
+/// therefore records any token less than the 24 h margin past its expiry.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_token_expired_inside_the_skew_margin_is_still_recorded(pool: PgPool) {
+    use chrono::{Duration, Utc};
+    use epigraph_db::RevokedAccessTokenRepository;
+    let app = app_pool(&pool, 2).await;
+    let jti = Uuid::new_v4();
+    assert!(
+        RevokedAccessTokenRepository::revoke(
+            &app,
+            jti,
+            Uuid::new_v4(),
+            Utc::now() - Duration::hours(2)
+        )
+        .await
+        .expect("revoke as epigraph_app"),
+        "a token 2 h past its expiry on the database clock may still be live on \
+         a lagging API host: the definer must record it"
+    );
+    assert!(RevokedAccessTokenRepository::is_revoked(&app, jti)
+        .await
+        .expect("read as epigraph_app"));
 }
