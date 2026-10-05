@@ -39,11 +39,15 @@
 //!
 //! **THE PROPAGATE-DON'T-DEFAULT RULE HAS A DELIBERATE EXEMPTION HERE, RECORDED
 //! SO IT IS A DECISION AND NOT AN OVERSIGHT.** `routes/workflows.rs` and
-//! `routes/crud.rs` state that rule; three statements in this file do not follow
-//! it. `get_claim`'s inline label read and `list_claims`' batched label read
-//! both keep `.unwrap_or_default()`, and `list_claims`' per-item encryption
-//! lookup keeps `if let Ok(Some(enc))`. The rule was applied only where this
-//! shard changed the statement anyway; these three ALREADY shared a connection
+//! `routes/crud.rs` state that rule; two statements in this file do not follow
+//! it. `list_claims`' batched label read keeps `.unwrap_or_default()`, and
+//! `list_claims`' per-item encryption lookup keeps `if let Ok(Some(enc))`.
+//! (`get_claim`'s inline label read was a third; drain unit U008 removed it by
+//! folding the labels into the claim read itself —
+//! `ClaimRepository::get_by_id_with_labels`, one statement — so there is no
+//! second statement left to swallow an error, and the labels are now from the
+//! same snapshot as the row.) The rule was applied only where this
+//! shard changed the statement anyway; these ALREADY shared a connection
 //! via the `db_pool.begin()` transaction the conversion replaced, so nothing
 //! about their sharing changed, they cover a non-tenancy-bearing projection
 //! (labels, encryption metadata) rather than the rows the viewer predicate
@@ -1047,7 +1051,7 @@ pub struct GetClaimQuery {
 /// Returns the claim if found, or 404 if not found.
 ///
 /// THERE IS NO CONTENT-REDACTION PASS. Filtering happens inside
-/// `ClaimRepository::get_by_id_conn`'s spliced viewer predicate, so a claim the
+/// `ClaimRepository::get_by_id_with_labels`'s spliced viewer predicate, so a claim the
 /// caller may not read is 404 — never a 200 whose `content` has been blanked.
 /// (The post-fetch pass this doc used to describe was deleted with
 /// `access_control` in PR-14; see the comment at the end of the handler body.)
@@ -1093,8 +1097,8 @@ pub async fn get_claim(
     // Conversion shard 7's rule is that a handler converts as a whole, because
     // splitting one READ across two connections defeats the point. This is not
     // that: `is_member` is an AUTHORIZATION gate that runs to completion and
-    // returns 403 before any content read begins, and the three content reads
-    // below — which ARE all on one connection with each other — are the only
+    // returns 403 before any content read begins, and the two content reads
+    // below — which ARE on one connection with each other — are the only
     // ones the response is built from. Nothing that answers the request is
     // split.
     //
@@ -1116,7 +1120,7 @@ pub async fn get_claim(
     // `auth.agent_id` is `None`, so that arm is unreachable on this route.
 
     // A VIEWER-STAMPED connection, replacing a bare `db_pool.begin()`. The
-    // three statements below still share one connection, and now that
+    // two statements below share one connection, and that
     // connection also carries the session GUCs migration 077's `claims` and
     // `claim_encryption` policies read, so the policy and the in-query `$V`
     // predicate describe the same group set instead of disagreeing.
@@ -1141,7 +1145,15 @@ pub async fn get_claim(
         }
     })?;
 
-    let claim = ClaimRepository::get_by_id_conn(&mut read, &viewer, claim_id)
+    // The row AND its labels in ONE spliced statement. Labels used to be a
+    // second `SELECT unnest(labels) …` whose error was `.unwrap_or_default()`-ed
+    // into `labels: []` — a 200 indistinguishable from an unlabelled claim —
+    // and, as two statements under READ COMMITTED, not one snapshot with the
+    // row (drain unit U008, backlog `1e6efd2d` residual). A failed read now
+    // fails the request. `get_by_id_with_labels` projects the same columns
+    // `get_by_id_conn` did (retirement state and crypto columns post-fixed) plus
+    // `c.labels`, under the same `{VISIBILITY:c}` predicate.
+    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&mut *read, &viewer, claim_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Claim".to_string(),
@@ -1154,13 +1166,6 @@ pub async fn get_claim(
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query claim encryption: {e}"),
         })?;
-
-    // Fetch labels from DB (not part of Claim domain model)
-    let labels: Vec<String> = sqlx::query_scalar("SELECT unnest(labels) FROM claims WHERE id = $1")
-        .bind(id)
-        .fetch_all(&mut *read)
-        .await
-        .unwrap_or_default();
 
     drop(read);
 
@@ -1175,7 +1180,7 @@ pub async fn get_claim(
         response.group_id = Some(enc.group_id);
     }
 
-    // No redaction pass. `get_by_id_conn` above already ran under `&viewer`,
+    // No redaction pass. `get_by_id_with_labels` above already ran under `&viewer`,
     // so reaching this line means the claim is readable; the post-pass that
     // used to overwrite `response.content` here could only ever downgrade a row
     // the viewer had ALREADY been allowed to fetch, and its absence-vs-blanking

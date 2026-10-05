@@ -519,9 +519,9 @@ async fn get_claim_serves_the_viewers_own_group_private_claim(pool: PgPool) {
     assert_eq!(
         body.labels,
         vec!["shard7-get".to_string()],
-        "the inline label read runs on the SAME connection as the claim read, so a \
-         label set that comes back empty means the two statements did not share a \
-         tenancy stamp"
+        "the labels are read in the SAME statement as the claim row \
+         (get_by_id_with_labels), so a label set that comes back empty means the \
+         stored labels were dropped, not merely read under another tenancy stamp"
     );
 
     let withheld = get_claim(
