@@ -203,7 +203,6 @@ struct Elevated {
 }
 
 async fn elevated_custodian(pool: &PgPool, label: &str, n: u8) -> Elevated {
-    fixture::open_elevated_access_gate(pool).await;
     let (person, client) = human(pool, label).await;
     let assignment = fixture::make_custodian(pool, person).await;
     let passkey = passkey(pool, person, n).await;

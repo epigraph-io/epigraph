@@ -732,7 +732,6 @@ fn token(
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_role_end_is_proposed_confirmed_and_executed_end_to_end(pool: PgPool) {
     use soft_authenticator::{ClientUv, SoftAuthenticator, ORIGIN};
-    fixture::open_elevated_access_gate(&pool).await;
     let (p, _) = fixture::seed_human_operator(&pool, "custodian").await;
     fixture::make_custodian(&pool, p).await;
     let (x, _) = fixture::seed_human_operator(&pool, "auditor").await;
@@ -994,7 +993,6 @@ async fn enrolled_custodian(
     wrap: fn(&serde_json::Value) -> serde_json::Value,
 ) -> Elevated {
     use soft_authenticator::{ClientUv, ORIGIN};
-    fixture::open_elevated_access_gate(pool).await;
     let (p, _) = fixture::seed_human_operator(pool, "custodian").await;
     fixture::make_custodian(pool, p).await;
     let mut assignments = [Uuid::nil(); 2];

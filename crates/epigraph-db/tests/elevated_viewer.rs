@@ -95,10 +95,6 @@ async fn family(pool: &PgPool, client: Uuid) -> Uuid {
 }
 
 async fn holder(pool: &PgPool, label: &str, n: u8) -> Holder {
-    // 125 ships the recorder gate closed and 127 (the recorder) leaves it
-    // closed, so no session is live until the migration that opens it;
-    // these tests are about what a LIVE session does.
-    fixture::open_elevated_access_gate(pool).await;
     let (person, group) = fixture::seed_human_operator(pool, label).await;
     let client: Uuid = sqlx::query_scalar(
         "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",

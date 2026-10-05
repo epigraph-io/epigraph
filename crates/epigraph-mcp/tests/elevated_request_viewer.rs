@@ -60,10 +60,6 @@ where
 /// `passkey.register` act since migration 130
 /// (`viewer_fixture::passkey_register_act`).
 async fn make_holder(pool: &PgPool, person: Uuid, n: u8) -> (Uuid, Uuid) {
-    // 125 ships the recorder gate closed and 127 (the recorder) leaves it
-    // closed, so no session is live until the migration that opens it;
-    // these tests are about what a LIVE session does.
-    fixture::open_elevated_access_gate(pool).await;
     fixture::make_custodian(pool, person).await;
     let client: Uuid = sqlx::query_scalar(
         "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human' \
