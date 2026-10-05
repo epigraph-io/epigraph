@@ -2,7 +2,7 @@
 //! family (plan §3.4 "Outlink grouping").
 //!
 //! The families mirror the kernel's `GRAPH_VIEW_RELATIONSHIPS` readability
-//! allowlist (`crates/epigraph-api/src/routes/graph.rs:29-66`) and its
+//! allowlist (in `crates/epigraph-api/src/routes/graph.rs`) and its
 //! comment groups. Stored relationship strings mix case and spelling
 //! (`supports`/`SUPPORTS`, `derived_from`/`derives_from`), so every string is
 //! case-folded and alias-merged before grouping; anything outside the

@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::{Api, UpstreamError};
 
-/// Upstream clamps `/agents/:id/claims?limit=` to `1..=100` (`agents.rs:450-461`).
+/// Upstream clamps `/agents/:id/claims?limit=` to `1..=100` (`agents.rs::agent_claims`).
 pub const MAX_AGENT_CLAIMS_LIMIT: u32 = 100;
 /// `/frames/:id/claims?limit=` is NOT clamped upstream (a negative value is a
 /// 500), so the BFF enforces this cap itself (plan §3.5).
@@ -26,7 +26,7 @@ pub const FRAME_CLAIM_SORTS: &[&str] = &["belief", "plausibility", "ignorance"];
 /// `order` values `/frames/:id/claims` accepts; anything else is a 400.
 pub const FRAME_CLAIM_ORDERS: &[&str] = &["desc", "asc"];
 
-// ---- GET /api/v1/claims/:id/history (versioning.rs:102-131) ------------------
+// ---- GET /api/v1/claims/:id/history (versioning.rs::claim_history) -----------
 
 /// The `supersedes` chain through a claim, oldest first. NOT `/genealogy`
 /// (political propagation, plan §1.3).
@@ -71,7 +71,7 @@ pub struct ClaimVersion {
     pub superseded_by: Option<Uuid>,
 }
 
-// ---- GET /api/v1/agents/:id (agents.rs:58-67) --------------------------------
+// ---- GET /api/v1/agents/:id (agents.rs::get_agent) ---------------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct AgentResponse {
@@ -91,9 +91,9 @@ pub struct AgentResponse {
     pub ror_id: Option<String>,
 }
 
-// ---- GET /api/v1/agents/:id/claims (agents.rs:450-544) -----------------------
+// ---- GET /api/v1/agents/:id/claims (agents.rs::agent_claims) -----------------
 
-/// `PaginatedResponse<AttributedClaimResponse>` (`claims.rs:204-209`).
+/// `PaginatedResponse<AttributedClaimResponse>` (`claims.rs::PaginatedResponse`).
 ///
 /// "Attributed" is literal: only claims linked by a claim→agent
 /// `attributed_to` edge (paper authorship at ingestion). Claims the agent
@@ -111,7 +111,7 @@ pub struct AgentClaimsPage {
 }
 
 /// A flattened `ClaimResponse` plus `attribution`; labels and the privacy
-/// fields are always omitted (`agents.rs:516-530`).
+/// fields are always omitted (`agents.rs::agent_claims`).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct AttributedClaim {
     pub id: Uuid,
@@ -136,7 +136,7 @@ pub struct AttributedClaim {
     pub attribution: serde_json::Value,
 }
 
-// ---- GET /api/v1/agents/:id/epistemic-profile (political.rs:39-56) -----------
+// ---- GET /api/v1/agents/:id/epistemic-profile (political.rs::epistemic_profile) ---
 
 /// Unbounded upstream (every claim of the agent is loaded), so it can be
 /// slow; the page degrades it independently.
@@ -175,7 +175,7 @@ pub struct TimeRange {
     pub last: Option<String>,
 }
 
-// ---- GET /api/v1/frames/:id (belief.rs:50-76) --------------------------------
+// ---- GET /api/v1/frames/:id (belief.rs::get_frame) ---------------------------
 
 /// `FrameDetailResponse`. Its `claims` array (every `claim_frames` row,
 /// unpaginated) is deliberately not decoded: the page reads claims from the
@@ -206,7 +206,7 @@ pub struct FrameResponse {
     pub created_at: Option<String>,
 }
 
-// ---- GET /api/v1/frames/:id/claims (belief.rs:209-241) -----------------------
+// ---- GET /api/v1/frames/:id/claims (belief.rs::frame_claims_sorted) ----------
 
 /// One row of the bare JSON array `/frames/:id/claims` returns. There is no
 /// `total`: a page that comes back full means "maybe more".
@@ -229,7 +229,7 @@ pub struct FrameClaimRow {
     pub mass_on_missing: Option<f64>,
 }
 
-// ---- GET /api/v1/evidence/:id (edges.rs:1948-1974) ---------------------------
+// ---- GET /api/v1/evidence/:id (edges.rs::get_evidence) -----------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct EvidenceDetailResponse {

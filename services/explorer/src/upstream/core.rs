@@ -22,7 +22,7 @@ use super::{Api, UpstreamError};
 /// search surface at 50 (plan §3.5).
 pub const MAX_SEARCH_LIMIT: u32 = 50;
 
-// ---- GET /api/v1/claims/:id/evidence (claims.rs:1057-1066) ------------------
+// ---- GET /api/v1/claims/:id/evidence (claims.rs::list_claim_evidence) -------
 
 /// One row of the column-based evidence list: the only complete list of a
 /// claim's evidence (critique.md "Which evidence list is canonical").
@@ -50,7 +50,7 @@ pub struct ClaimEvidence {
 
 // ---- GET /api/v1/claims/:id/{supporting,contradicting}-evidence -------------
 
-/// `{claim_id, relationship, evidence, total}` (edges.rs:2405-2497). Empty
+/// `{claim_id, relationship, evidence, total}` (`edges.rs::evidence_by_relationship`). Empty
 /// when the viewer cannot see the centre claim OR it has no such evidence —
 /// the two are indistinguishable by design: this endpoint never had a
 /// claim-existence check, so a 404 would newly disclose which ids exist.
@@ -79,7 +79,7 @@ pub struct EvidenceEdge {
     pub created_at: String,
 }
 
-// ---- GET /api/v1/claims/:id/challenges (challenge.rs:55-91) -----------------
+// ---- GET /api/v1/claims/:id/challenges (challenge.rs::list_challenges) ------
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ChallengeList {
@@ -114,7 +114,7 @@ pub struct Challenge {
     pub resolved_by: Option<Uuid>,
 }
 
-// ---- GET /api/v1/claims/:id/provenance (edges.rs:2155-2177) -----------------
+// ---- GET /api/v1/claims/:id/provenance (edges.rs::claim_provenance) ---------
 
 /// Claim → reasoning trace → evidence. NOT the claim → claim derivation
 /// chain (`/provenance-chain`); the page shows both, separately.
@@ -148,7 +148,7 @@ pub struct ProvenanceStep {
     pub label: String,
 }
 
-// ---- POST /api/v1/search/semantic (search.rs:56-239) ------------------------
+// ---- POST /api/v1/search/semantic (search.rs::semantic_search) --------------
 
 #[derive(Debug, Clone, Serialize)]
 struct SemanticSearchRequest<'q> {
@@ -201,7 +201,7 @@ pub struct Epistemic {
     pub truth_value: Option<f64>,
 }
 
-// ---- GET /api/v1/claims/by-labels (claims.rs:1633-1671) ---------------------
+// ---- GET /api/v1/claims/by-labels (claims.rs::list_by_labels) ---------------
 
 /// One element of the bare JSON array (no envelope, no total).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -232,7 +232,7 @@ struct ByLabelsQuery<'q> {
     offset: u64,
 }
 
-// ---- GET /api/v1/search/evidence (rag.rs:683-704) ---------------------------
+// ---- GET /api/v1/search/evidence (rag.rs::search_evidence) ------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct EvidenceSearchResponse {
@@ -265,7 +265,7 @@ struct EvidenceSearchQuery<'q> {
 
 // ---- landing overviews (protected upstream routes) ---------------------------
 
-/// `GET /api/v1/graph/themes/overview` (graph.rs:389-407). Unpaginated;
+/// `GET /api/v1/graph/themes/overview` (`graph.rs::themes_overview`). Unpaginated;
 /// ordered `claim_count DESC, label ASC`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ThemesOverview {
@@ -282,7 +282,7 @@ pub struct ThemeSummary {
     pub claim_count: i64,
 }
 
-/// `GET /api/v1/graph/communities/overview` (graph.rs:92-231): Louvain graph
+/// `GET /api/v1/graph/communities/overview` (`graph.rs::overview`): Louvain graph
 /// clusters of the latest run. `cluster_edges` is not read.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct CommunitiesOverview {

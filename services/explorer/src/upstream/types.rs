@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Error body of every `ApiError` response: `{error, message, details?}`
-/// (`errors.rs:58-148`). NOT RFC 6749 — OAuth errors use this shape too.
+/// (`errors.rs`, `impl IntoResponse for ApiError`). NOT RFC 6749 — OAuth errors use this shape too.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct ApiErrorBody {
     #[serde(default)]
@@ -24,7 +24,7 @@ pub struct ApiErrorBody {
     pub details: Option<serde_json::Value>,
 }
 
-/// `GET /api/v1/claims/:id` (`claims.rs:86-115`).
+/// `GET /api/v1/claims/:id` (`claims.rs::get_claim`, `ClaimResponse`).
 ///
 /// Has no `is_current`/`supersedes`/belief: those come from `/history` and
 /// `/belief`. `truth_value` is evidence-derived, not the DS belief.
@@ -60,8 +60,9 @@ pub struct ClaimResponse {
     pub was_created: bool,
 }
 
-/// `GET /api/v1/claims/:id/belief` (`belief.rs:35-47`). Every field is
-/// always present upstream; numbers may be `null`.
+/// `GET /api/v1/claims/:id/belief` (`belief.rs::get_claim_belief`,
+/// `BeliefResponse`). Every field is always present upstream; numbers may be
+/// `null`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct BeliefResponse {
     pub claim_id: Uuid,
@@ -359,7 +360,7 @@ mod tests {
     /// this service. The payloads below are what the kernel's own serde
     /// structs emit, field for field:
     ///
-    /// - `crates/epigraph-api/src/routes/ego.rs:52-93` — `EgoNode`'s five
+    /// - `crates/epigraph-api/src/routes/ego.rs::EgoNode` — `EgoNode`'s five
     ///   claim-only fields carry `skip_serializing_if = "Option::is_none"`, so
     ///   a non-claim neighbour arrives as three keys and nothing else; `label`
     ///   is always present. `labels` is `Option<Vec<String>>` upstream and
@@ -368,16 +369,16 @@ mod tests {
     ///
     /// Neither `EgoNode` nor `ChainNode` carries a `redacted` flag: a node the
     /// viewer may not read is omitted from the response (`68b8a8b1`).
-    /// - `crates/epigraph-api/src/routes/placement.rs:29-40` — the one route
+    /// - `crates/epigraph-api/src/routes/placement.rs::PlacementResponse` — the one route
     ///   that deliberately serialises nulls: "no neighbourhood" has to be
     ///   distinguishable from "field not read".
-    /// - `crates/epigraph-api/src/routes/stats.rs:18-31` — all eight fields
+    /// - `crates/epigraph-api/src/routes/stats.rs::StatsResponse` — all eight fields
     ///   always present.
-    /// - `crates/epigraph-api/src/routes/provenance_chain.rs:54-84` —
+    /// - `crates/epigraph-api/src/routes/provenance_chain.rs::ChainNode` —
     ///   `ChainNode.truth_value`/`is_current` are bare `f64`/`bool` upstream
     ///   and `Option` here (widening, safe); `depth` is `i32` upstream and
     ///   `u32` here, which holds because the BFS seeds at 0 and only
-    ///   increments (`repos/provenance_chain.rs:143,151`).
+    ///   increments (`repos/provenance_chain.rs::ProvenanceChainRepository::chain_conn`).
     #[test]
     fn kernel_routes_serialize_into_these_dtos() {
         // ego: an unhydratable neighbour (every optional key omitted), and

@@ -49,7 +49,7 @@ pub fn clamp_expand_budget(budget: Option<i64>) -> u32 {
     }
 }
 
-// ---- GET /api/v1/graph/themes/overview (graph.rs:389-407) -------------------
+// ---- GET /api/v1/graph/themes/overview (graph.rs::themes_overview) ----------
 
 /// Every theme, ordered `claim_count DESC, label ASC`. Unpaginated upstream.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -68,7 +68,7 @@ pub struct ThemeSummary {
     pub claim_count: i64,
 }
 
-// ---- GET /api/v1/graph/communities/overview (graph.rs:92-231) ---------------
+// ---- GET /api/v1/graph/communities/overview (graph.rs::overview) ------------
 
 /// The latest cluster run's Louvain graph clusters (not the perspective
 /// `communities` of `/api/v1/communities`). Both arrays are unbounded.
@@ -116,7 +116,7 @@ pub struct WeightedEdge {
     pub weight: f64,
 }
 
-// ---- GET /api/v1/graph/communities/:id/expand (graph.rs:126-156, 242) --------
+// ---- GET /api/v1/graph/communities/:id/expand (graph.rs::expand) -------------
 
 /// One cluster's claims (by allowlisted degree) and the induced subgraph.
 /// 404 (text/plain `"no completed run"` / `"cluster not in latest run"`)
@@ -168,7 +168,7 @@ pub struct ExpandEdge {
     pub relationship: String,
 }
 
-// ---- GET /api/v1/graph/themes/:id/expand (graph.rs:414-517) -----------------
+// ---- GET /api/v1/graph/themes/:id/expand (graph.rs::themes_expand) ----------
 
 /// A theme's neighbourhood supernodes and their undirected weighted edges.
 /// NOT a claim graph. `truncated` is hard-coded `false` upstream even when
@@ -222,7 +222,7 @@ impl ThemeExpand {
     }
 }
 
-// ---- GET /api/v1/graph/neighborhoods/:id/expand?mode= (graph_neighborhood.rs:36-124)
+// ---- GET /api/v1/graph/neighborhoods/:id/expand?mode= (graph_neighborhood.rs::expand)
 
 /// `mode=` for neighbourhood expand. Upstream silently treats anything but
 /// `atomic` as compound; the BFF normalises the same way and always sends

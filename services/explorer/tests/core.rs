@@ -37,7 +37,7 @@ const CONTENT: &str = "Water boils at 100 °C at sea level.";
 
 // ---- fixtures -------------------------------------------------------------------
 
-/// `GET /claims/:id` with `labels` omitted when empty (claims.rs:108-109)
+/// `GET /claims/:id` with `labels` omitted when empty (claims.rs::ClaimResponse)
 /// and every other skip_serializing_if field omitted.
 fn claim_json(content: &str, labels: &[&str]) -> Value {
     let mut v = json!({

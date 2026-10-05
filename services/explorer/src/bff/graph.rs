@@ -127,7 +127,7 @@ pub struct CanvasEdge {
 
 /// Edge style family for a raw upstream relationship (case-folded; `-` and
 /// spaces read as `_`). Mirrors the support and refute groups of the
-/// kernel's `GRAPH_VIEW_RELATIONSHIPS` (`routes/graph.rs:29-66`); every
+/// kernel's `routes/graph.rs::GRAPH_VIEW_RELATIONSHIPS`; every
 /// other relationship is drawn as structural.
 pub fn relationship_family(relationship: &str) -> &'static str {
     let r = relationship

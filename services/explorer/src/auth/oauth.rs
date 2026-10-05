@@ -57,7 +57,7 @@ impl std::fmt::Debug for TokenSet {
     }
 }
 
-/// `TokenResponse` (`token.rs:68-75`). `refresh_token` is always sent in
+/// `TokenResponse` (`oauth/token.rs::TokenResponse`). `refresh_token` is always sent in
 /// practice but is not guaranteed by the type.
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -210,7 +210,7 @@ pub async fn exchange_code(
 /// ([`super::refresh_session`]) must store the returned pair.
 ///
 /// `client_id` is sent when configured although upstream neither requires
-/// nor checks it today (`token.rs:469-608`); it costs nothing and keeps
+/// nor checks it today (`oauth/token.rs::handle_refresh_token`); it costs nothing and keeps
 /// working if refresh tokens are ever bound to their client.
 pub async fn refresh_grant(
     state: &AppState,
@@ -247,7 +247,7 @@ fn refresh_error(e: TokenError) -> RefreshError {
 }
 
 /// `POST /oauth/revoke` with the JSON body `{token, token_type_hint:
-/// "refresh_token"}` (JSON only upstream, `revoke.rs:9-61`). Revoking the
+/// "refresh_token"}` (JSON only upstream, `oauth/revoke.rs::revoke_endpoint`). Revoking the
 /// access token would only reach one API process's memory, so logout
 /// revokes the refresh token and lets the access token run out.
 pub async fn revoke_refresh_token(state: &AppState, refresh_token: &str) -> Result<(), TokenError> {

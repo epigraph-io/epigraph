@@ -540,7 +540,7 @@ async fn access_denied_is_reported_without_a_token_call() {
         .mount(&app.upstream)
         .await;
     let started = start_login(&app, "").await;
-    // What upstream's consent POST sends back on "deny" (authorize.rs:325-335).
+    // What upstream's consent POST sends back on "deny" (authorize.rs::consent_endpoint).
     let res = finish_login(&app, &started, "&error=access_denied").await;
     assert_eq!(res.status, StatusCode::FORBIDDEN);
     assert!(res.body.contains("Sign-in was cancelled."), "{}", res.body);
