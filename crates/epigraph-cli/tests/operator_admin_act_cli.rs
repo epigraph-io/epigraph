@@ -1641,3 +1641,79 @@ async fn a_replayed_confirmation_is_flagged(pool: PgPool) {
         )]
     );
 }
+
+/// A SESSION WITH NO CONFIRMATION: a privileged login writes an elevation
+/// session directly beside a live, started ticket of P's that is never
+/// confirmed (125's session guard admits it: the ticket is live, the
+/// assignment and the passkey are P's). The session liveness test never
+/// reads the ticket, so CALIBRATION: the session is live to P's application
+/// connection. It carries no evidence at all, so no per-row check sees it;
+/// the session check flags it `session_unconfirmed`. The genuine session is
+/// not flagged.
+///
+/// Verified to fail with the session check removed (exit 0).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_session_without_a_confirmation_is_flagged(pool: PgPool) {
+    let e = elevated_custodian(&pool).await;
+    let (ticket, _) = started_ticket(&pool, &e).await;
+    let (session, family): (Uuid, Uuid) = sqlx::query_as(
+        "INSERT INTO elevation_sessions (person_agent_id, assignment_id, client_id, family_id, \
+                                         mode, reason, ticket_id, authenticator_id, expires_at) \
+         SELECT t.person_agent_id, \
+                public.epigraph_live_elevating_assignment(t.person_agent_id, now()), \
+                t.client_id, t.family_id, t.mode, t.reason, t.id, a.id, \
+                now() + interval '10 minutes' \
+           FROM elevation_tickets t \
+           JOIN person_authenticators a ON a.person_agent_id = t.person_agent_id \
+          WHERE t.id = $1 \
+         RETURNING id, family_id",
+    )
+    .bind(ticket)
+    .fetch_one(&pool)
+    .await
+    .expect("a session written directly");
+    let person = e.person;
+    let live: i64 = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', $1, false), \
+                    set_config('epigraph.access_recorder', 'on', false)",
+        )
+        .bind(person.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp P");
+        let n = sqlx::query_scalar("SELECT count(*) FROM public.epigraph_elevation_live($1, $2)")
+            .bind(session)
+            .bind(family)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("liveness");
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', '', false), \
+                    set_config('epigraph.access_recorder', '', false)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("unstamp");
+        (conn, n)
+    })
+    .await;
+    assert_eq!(live, 1, "CALIBRATION: the unconfirmed session is live");
+
+    let run = run_verify(&pool, &["--json"], Some(soft_authenticator::ORIGIN)).await;
+    assert_eq!(run.code, 2, "{}", run.show());
+    let report = report_of(&run);
+    assert_eq!(
+        (&report["elevations_checked"], &report["sessions_checked"]),
+        (&serde_json::json!(1), &serde_json::json!(2)),
+        "{report}"
+    );
+    assert_eq!(
+        findings_of(&report),
+        vec![(
+            "elevation_session".to_string(),
+            session,
+            "session_unconfirmed".to_string()
+        )]
+    );
+}

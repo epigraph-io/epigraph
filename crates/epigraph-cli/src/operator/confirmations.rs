@@ -34,12 +34,19 @@
 //! 6. the asserted credential is that passkey;
 //! 7. the asserted backup-eligible flag does not exceed the stored one.
 //!
-//! Then, across rows: a challenge asserted MORE THAN ONCE (over every
-//! asserted ticket and act, confirmed or refused, whatever `--since` says):
-//! every confirmed occurrence after the first is flagged. A ticket's
-//! challenge is random, so a genuine evidence object copied, with its
-//! ceremony state, onto a later ticket passes every per-row check; only its
-//! repetition gives it away.
+//! Then, across rows:
+//!
+//! * a challenge asserted MORE THAN ONCE (over every asserted ticket and act,
+//!   confirmed or refused, whatever `--since` says): every confirmed
+//!   occurrence after the first is flagged. A ticket's challenge is random,
+//!   so a genuine evidence object copied, with its ceremony state, onto a
+//!   later ticket passes every per-row check; only its repetition gives it
+//!   away;
+//! * an elevation SESSION (started at or after `--since`) whose ticket is
+//!   not confirmed naming it: the session liveness test never reads the
+//!   ticket, so a session written directly beside a ticket that was never
+//!   confirmed is live, carries no evidence at all, and is never seen by the
+//!   per-row checks.
 //!
 //! REFUSED assertions are not verified: a refusal granted nothing, and the
 //! audited refusal of an unknown credential stores evidence that by design
@@ -82,6 +89,8 @@ pub enum Subject {
     ElevationTicket,
     /// A confirmed `pending_admin_acts` row (migration 130).
     AdminAct,
+    /// An `elevation_sessions` row (migration 125).
+    ElevationSession,
 }
 
 impl Subject {
@@ -91,11 +100,12 @@ impl Subject {
         match self {
             Self::ElevationTicket => "elevation_ticket",
             Self::AdminAct => "admin_act",
+            Self::ElevationSession => "elevation_session",
         }
     }
 }
 
-/// A confirmation that does not verify.
+/// A confirmation (or session) that does not verify.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Finding {
     /// What kind of row.
@@ -106,13 +116,14 @@ pub struct Finding {
     pub person: Uuid,
     /// The passkey the row names, when it names one.
     pub authenticator_id: Option<Uuid>,
-    /// When the assertion was recorded.
+    /// When the assertion was recorded (when the session started, for a
+    /// session).
     pub at: DateTime<Utc>,
     /// A stable code: `evidence_malformed`, `challenge_state_malformed`,
     /// `challenge_not_stored`, `challenge_not_bound`, `credential_unknown`,
     /// `credential_not_the_persons`, `assertion_does_not_verify`,
     /// `credential_mismatch`, `backup_eligibility_changed`,
-    /// `challenge_reused`.
+    /// `challenge_reused`, `session_unconfirmed`.
     pub reason: &'static str,
     /// What exactly, for the operator.
     pub detail: String,
@@ -128,6 +139,8 @@ pub struct Report {
     /// Confirmed admin acts verified (0 on a database without migration
     /// 130).
     pub acts_checked: usize,
+    /// Elevation sessions checked for their confirmation.
+    pub sessions_checked: usize,
     /// Refused assertions seen (not verified; part of the repetition check).
     pub refused_seen: usize,
     /// Everything that did not verify.
@@ -164,6 +177,26 @@ impl Asserted {
         }
     }
 }
+
+/// One elevation session, with what its ticket says.
+#[derive(Debug, sqlx::FromRow)]
+struct Session {
+    id: Uuid,
+    person: Uuid,
+    authenticator_id: Uuid,
+    started_at: DateTime<Utc>,
+    ticket_id: Uuid,
+    ticket_outcome: Option<String>,
+    ticket_names_it: Option<bool>,
+}
+
+const SESSIONS: &str = "\
+    SELECT s.id, s.person_agent_id AS person, s.authenticator_id, s.started_at, s.ticket_id, \
+           t.outcome AS ticket_outcome, (t.session_id = s.id) AS ticket_names_it \
+      FROM public.elevation_sessions s \
+      LEFT JOIN public.elevation_tickets t ON t.id = s.ticket_id \
+     WHERE ($1::timestamptz IS NULL OR s.started_at >= $1) \
+     ORDER BY s.started_at, s.id";
 
 const TICKETS: &str = "\
     SELECT 'elevation_ticket'::text AS subject, t.id, t.person_agent_id AS person, t.outcome, \
@@ -203,7 +236,7 @@ fn stored_challenge(row: &Asserted) -> Result<Vec<u8>, Failure> {
             .get("ceremony")
             .cloned()
             .ok_or_else(|| fail("challenge_state_malformed", "no stored act ceremony"))?,
-        Subject::ElevationTicket => state.clone(),
+        Subject::ElevationTicket | Subject::ElevationSession => state.clone(),
     };
     AuthenticationState::from_json(ceremony)
         .challenge()
@@ -285,8 +318,9 @@ fn check(verifier: &Verifier, row: &Asserted) -> Result<(), Failure> {
 }
 
 /// Read every asserted ticket and act, verify the confirmed ones asserted
-/// at or after `since`, look for repeated challenges, and report. Reads
-/// only; [`record`] writes the findings.
+/// at or after `since`, look for repeated challenges and for sessions no
+/// confirmation opened, and report. Reads only; [`record`] writes the
+/// findings.
 ///
 /// # Errors
 /// A read fails.
@@ -337,7 +371,9 @@ pub async fn verify(
         }
         match row.subject() {
             Subject::AdminAct => report.acts_checked += 1,
-            Subject::ElevationTicket => report.elevations_checked += 1,
+            Subject::ElevationTicket | Subject::ElevationSession => {
+                report.elevations_checked += 1;
+            }
         }
         let failure = check(verifier, row).err().or_else(|| {
             original.map(|(subject, id)| {
@@ -361,6 +397,30 @@ pub async fn verify(
                 detail,
             });
         }
+    }
+
+    let sessions: Vec<Session> = sqlx::query_as(SESSIONS)
+        .bind(since)
+        .fetch_all(&mut *conn)
+        .await?;
+    for s in &sessions {
+        report.sessions_checked += 1;
+        if s.ticket_outcome.as_deref() == Some("confirmed") && s.ticket_names_it == Some(true) {
+            continue;
+        }
+        report.findings.push(Finding {
+            subject: Subject::ElevationSession,
+            id: s.id,
+            person: s.person,
+            authenticator_id: Some(s.authenticator_id),
+            at: s.started_at,
+            reason: "session_unconfirmed",
+            detail: format!(
+                "its ticket {} is {}, not confirmed naming this session",
+                s.ticket_id,
+                s.ticket_outcome.as_deref().unwrap_or("unasserted")
+            ),
+        });
     }
     Ok(report)
 }
@@ -434,10 +494,11 @@ pub fn describe(f: &Finding) -> String {
 #[must_use]
 pub fn summary(r: &Report) -> String {
     format!(
-        "SUMMARY\televations_checked={}\tacts_checked={}\trefused_seen={}\tunverified={}\t\
-         recorded={}",
+        "SUMMARY\televations_checked={}\tacts_checked={}\tsessions_checked={}\trefused_seen={}\t\
+         unverified={}\trecorded={}",
         r.elevations_checked,
         r.acts_checked,
+        r.sessions_checked,
         r.refused_seen,
         r.findings.len(),
         r.recorded,
