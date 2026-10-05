@@ -190,22 +190,74 @@ async fn inflation_index_summarises_multibyte_content_without_panicking() {
     assert_eq!(only_summary(&body, "sample_claims"), expected);
 }
 
-/// `claim_provenance` builds its claim label before it looks at any trace, so a
-/// claim with no reasoning trace reaches the slice and the response has no
-/// chains to carry the label. The assertion is therefore that the route
-/// ANSWERS; the 60/57 rule itself is pinned by the helper's unit tests.
+/// The provenance label for `claim`, read from the one chain a claim with a
+/// reasoning trace and no evidence edges produces: `[claim_step, trace_step]`.
+fn provenance_claim_label(body: &Value) -> String {
+    let chains = body["chains"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`chains` is not an array: {body}"));
+    assert_eq!(
+        chains.len(),
+        1,
+        "a traced claim with no evidence edges has exactly one chain: {body}"
+    );
+    let step = &chains[0]["path"][0];
+    assert_eq!(step["entity_type"], "claim", "path[0] is the claim: {body}");
+    step["label"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no string claim label: {body}"))
+        .to_string()
+}
+
+/// `claim_provenance` labels the claim step "over 60 characters -> first 57 +
+/// `...`". The label only reaches the response inside a chain, so every claim
+/// here gets a reasoning trace (`seed_reasoning_trace` inserts it and sets
+/// `claims.trace_id`); with no evidence edges the handler then returns one
+/// chain `[claim_step, trace_step]`, and the label is asserted EXACTLY. That
+/// pins the (60, 57) arguments at the edges.rs call site, not only the helper:
+/// a (60, 60) or (57, 57) call, or no truncation at all, fails an arm below.
 #[tokio::test(flavor = "multi_thread")]
-async fn claim_provenance_answers_for_multibyte_content() {
+async fn claim_provenance_labels_multibyte_content_by_character() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let (agent, _) = fixture::seed_agent_with_group(&pool, "provenance-multibyte").await;
 
-    // Control: long ASCII content answers.
-    let ascii = fixture::seed_public_claim(&pool, agent, &"z".repeat(100)).await;
+    async fn traced_claim(pool: &sqlx::PgPool, agent: Uuid, content: &str) -> Uuid {
+        let claim = fixture::seed_public_claim(pool, agent, content).await;
+        fixture::seed_reasoning_trace(pool, claim, "deductive").await;
+        claim
+    }
+
+    // Control: 100 ASCII characters -> 57 + "...", byte-identical to main.
+    let ascii = traced_claim(&pool, agent, &"z".repeat(100)).await;
     let body = get_ok(addr, &format!("/api/v1/claims/{ascii}/provenance")).await;
     assert_eq!(body["claim_id"], ascii.to_string());
+    assert_eq!(
+        provenance_claim_label(&body),
+        format!("{}...", "z".repeat(57)),
+        "ASCII truncation must be unchanged"
+    );
 
-    // Defect arm.
-    let claim = fixture::seed_public_claim(&pool, agent, &content_cut_at_57_mid_char()).await;
+    // Defect arm: byte 57 is inside an `é`; main panicked here.
+    let claim = traced_claim(&pool, agent, &content_cut_at_57_mid_char()).await;
     let body = get_ok(addr, &format!("/api/v1/claims/{claim}/provenance")).await;
     assert_eq!(body["claim_id"], claim.to_string());
+    let label = provenance_claim_label(&body);
+    assert_eq!(
+        label,
+        format!("{}...", "é".repeat(57)),
+        "100 characters are cut to 57 characters plus an ellipsis"
+    );
+    assert_eq!(label.chars().count(), 60, "the label never exceeds 60 chars");
+
+    // Threshold arm: 60 `é` is 120 bytes but only 60 characters, so it is NOT
+    // over the limit and comes back whole (main byte-counted it as over and
+    // panicked on the same mid-character slice).
+    let at_limit = "é".repeat(60);
+    let claim = traced_claim(&pool, agent, &at_limit).await;
+    let body = get_ok(addr, &format!("/api/v1/claims/{claim}/provenance")).await;
+    assert_eq!(
+        provenance_claim_label(&body),
+        at_limit,
+        "60 characters is not over 60: returned whole"
+    );
 }
