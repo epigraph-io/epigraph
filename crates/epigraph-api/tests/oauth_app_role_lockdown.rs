@@ -541,8 +541,8 @@ async fn revoking_a_forged_access_token_writes_nothing(pool: PgPool) {
     );
 }
 
-/// `POST /oauth/introspect` with `token`: the RFC 7662 `active` flag.
-async fn introspect_active(app: axum::Router, token: &str) -> bool {
+/// `POST /oauth/introspect` with `token`: status and body, unasserted.
+async fn introspect(app: axum::Router, token: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(Method::POST)
         .uri("/oauth/introspect")
@@ -552,63 +552,153 @@ async fn introspect_active(app: axum::Router, token: &str) -> bool {
         ))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "introspection answers 200");
+    let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).expect("introspection JSON");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// `POST /oauth/introspect` with `token`: the RFC 7662 `active` flag.
+async fn introspect_active(app: axum::Router, token: &str) -> bool {
+    let (status, body) = introspect(app, token).await;
+    assert_eq!(status, StatusCode::OK, "introspection answers 200: {body}");
     body["active"].as_bool().expect("`active` is a boolean")
 }
 
-/// `GET /api/v1/openapi.json` with `token`: a route on the anonymous allowlist
-/// router, behind `optional_bearer_auth_middleware` (a PRESENT token must
-/// still be valid there).
-async fn openapi_with_token(app: axum::Router, token: &str) -> StatusCode {
-    let req = Request::builder()
+/// `GET /api/v1/openapi.json`, with `token` when given: a route on the
+/// anonymous allowlist router, behind `optional_bearer_auth_middleware` (a
+/// PRESENT token must still be valid there; an absent one is let through).
+async fn openapi(app: axum::Router, token: Option<&str>) -> StatusCode {
+    let mut req = Request::builder()
         .method(Method::GET)
-        .uri("/api/v1/openapi.json")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap();
-    app.oneshot(req).await.unwrap().status()
+        .uri("/api/v1/openapi.json");
+    if let Some(token) = token {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    app.oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
 }
 
-/// The other two surfaces that honour a revocation: `/oauth/introspect`
-/// (RFC 7662 `active`) and `optional_bearer_auth_middleware` (the anonymous
-/// allowlist router, where a present token must be valid). Revoked on router
-/// A, observed on router B, each after a control on B that admits the same
-/// token, so a revocation check removed from either surface fails here. On
-/// origin/main both stay admitted on B (the in-memory set lived on A only).
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_revoked_access_token_is_inactive_on_introspection_and_the_allowlist(pool: PgPool) {
-    let (client_id, _client, code) = seed_code(&pool).await;
-    let a = app_router(&pool, 2).await;
+/// A token minted through the code grant on router A, and a second router B
+/// (another `AppState`: a restart, or another process) on the same database.
+async fn token_and_second_router(pool: &PgPool) -> (axum::Router, String, axum::Router) {
+    let (client_id, _client, code) = seed_code(pool).await;
+    let a = app_router(pool, 2).await;
     let (status, body) = post_token(a.clone(), code_grant(&code, &client_id)).await;
     assert_eq!(status, StatusCode::OK, "code grant: {body}");
     let access = body["access_token"]
         .as_str()
         .expect("access token")
         .to_string();
-    let b = app_router(&pool, 2).await;
+    let b = app_router(pool, 2).await;
+    (a, access, b)
+}
 
-    // CONTROLS on B.
+/// `/oauth/introspect` honours a revocation (RFC 7662 `active: false`).
+/// Revoked on router A, observed on router B after a control on B that
+/// introspects the same token active. On origin/main it stays active on B (the
+/// in-memory set lived on A only).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_access_token_is_inactive_on_introspection(pool: PgPool) {
+    let (a, access, b) = token_and_second_router(&pool).await;
+
     assert!(
         introspect_active(b.clone(), &access).await,
         "control: an unrevoked token introspects active"
     );
+
+    assert_eq!(revoke_access_token(a, &access).await, StatusCode::OK);
+
+    assert!(
+        !introspect_active(b, &access).await,
+        "a revoked token introspects inactive (RFC 7662)"
+    );
+}
+
+/// `optional_bearer_auth_middleware` (the anonymous allowlist router, where a
+/// present token must be valid) honours a revocation. Its own test, so a
+/// revocation check removed from this middleware alone fails here and nowhere
+/// else.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_access_token_is_refused_on_the_allowlist_router(pool: PgPool) {
+    let (a, access, b) = token_and_second_router(&pool).await;
+
     assert_eq!(
-        openapi_with_token(b.clone(), &access).await,
+        openapi(b.clone(), Some(&access)).await,
         StatusCode::OK,
         "control: an unrevoked token passes the optional middleware"
     );
 
     assert_eq!(revoke_access_token(a, &access).await, StatusCode::OK);
 
-    assert!(
-        !introspect_active(b.clone(), &access).await,
-        "a revoked token introspects inactive (RFC 7662)"
-    );
     assert_eq!(
-        openapi_with_token(b, &access).await,
+        openapi(b, Some(&access)).await,
         StatusCode::UNAUTHORIZED,
         "a revoked token presented on the allowlist router is refused, not ignored"
+    );
+}
+
+/// A revocation lookup that cannot answer fails CLOSED on every API surface
+/// that consults it: `bearer_auth_middleware`, `optional_bearer_auth_middleware`
+/// and `/oauth/introspect` each answer 503, never admit the token and never
+/// introspect it `active: true`.
+///
+/// The lookup is broken by renaming the denylist table on the owner pool (this
+/// test's database only). Everything else the routes touch still works, so a
+/// fail-OPEN mutation (an `Err` treated as "not revoked") turns each 503 into a
+/// 200 here, rather than into some other error a dead pool would produce
+/// further down. The three outcomes are asserted together so a run shows every
+/// surface's answer at once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unanswerable_revocation_lookup_fails_closed(pool: PgPool) {
+    let (_a, access, b) = token_and_second_router(&pool).await;
+
+    // CONTROLS on B: the token is valid, unrevoked and admitted everywhere.
+    let (status, body) = list_own_webhooks(b.clone(), &access).await;
+    assert_eq!(status, StatusCode::OK, "control: webhooks admits: {body}");
+    assert_eq!(
+        openapi(b.clone(), Some(&access)).await,
+        StatusCode::OK,
+        "control: the optional middleware admits"
+    );
+    assert!(
+        introspect_active(b.clone(), &access).await,
+        "control: introspects active"
+    );
+
+    sqlx::query("ALTER TABLE public.revoked_access_tokens RENAME TO revoked_access_tokens_gone")
+        .execute(&pool)
+        .await
+        .expect("break the revocation lookup");
+
+    // The server is otherwise up: the allowlist route still answers an
+    // anonymous caller, so a 503 below can only be the revocation lookup's.
+    assert_eq!(
+        openapi(b.clone(), None).await,
+        StatusCode::OK,
+        "control: the allowlist router answers without a token"
+    );
+
+    let (webhooks, webhooks_body) = list_own_webhooks(b.clone(), &access).await;
+    let allowlist = openapi(b.clone(), Some(&access)).await;
+    let (introspection, introspection_body) = introspect(b, &access).await;
+    assert_eq!(
+        (webhooks, allowlist, introspection),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        "(bearer middleware, optional middleware, introspection) must fail closed with 503; \
+         webhooks body: {webhooks_body}; introspection body: {introspection_body}"
+    );
+    assert_ne!(
+        introspection_body["active"],
+        Value::Bool(true),
+        "an unknown revocation state never introspects active"
     );
 }
