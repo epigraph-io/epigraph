@@ -28,8 +28,12 @@
 -- ceiling, never wider.
 --
 -- Existing rows keep what they store. Chains rotated under 118 already carry
--- the client's whole grant and stay that wide until they expire (30 days for a
--- human); revoking them is an operator decision, not this file's.
+-- the client's whole grant, and this file does NOT heal them: every rotation
+-- re-caps the successor's expiry at now() + the client type's TTL and nothing
+-- caps a family's age, so a chain refreshed at least once per TTL never
+-- expires, and its whole-grant scopes rotate into each successor (they are
+-- still within the grant). Only revoking such families (forcing a fresh
+-- consent) narrows them; that is an operator decision, not this file's.
 --
 -- UNDO: re-run 118's `CREATE OR REPLACE FUNCTION
 -- public.epigraph_refresh_token_rotate` block verbatim (owner and ACL survive
