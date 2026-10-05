@@ -40,6 +40,7 @@ pub enum NliError {
 
 /// Abstract per-pair classifier so the probes can be tested against a
 /// deterministic in-process fake (no HTTP), and the real client swapped in.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait NliClassifier: Send + Sync {
     fn is_active(&self) -> bool;

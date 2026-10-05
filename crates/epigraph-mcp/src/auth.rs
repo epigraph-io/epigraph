@@ -289,6 +289,7 @@ pub fn is_principal_less(auth: &AuthContext) -> bool {
 /// A trait rather than the concrete type so this module does not depend on the
 /// server, and so the retry behaviour can be driven deterministically in a test
 /// without a database.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait::async_trait]
 pub trait ServerPrincipalSource: Send + Sync {
     /// The server's own `agents.id`, or a displayable reason it could not be
