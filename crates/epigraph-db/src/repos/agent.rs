@@ -1477,6 +1477,166 @@ impl AgentRepository {
         Self::operator_actor(&mut conn, agent_id).await
     }
 
+    /// Refuse, with [`DbError::OperatorLinkRequired`] (`OPL01`), an author that
+    /// is not bound to a human operator while the database is ARMED (migration
+    /// 122); return quietly otherwise (bound, unarmed, or this session's valve
+    /// off).
+    ///
+    /// The same definer the `claims_require_tenancy_then_operator_binding` trigger calls, so
+    /// the early check and the guarantee cannot disagree. It reads nothing on
+    /// the caller's connection, so it answers the same on an unstamped
+    /// `epigraph_app` session as on a maintenance one.
+    ///
+    /// # Errors
+    /// [`DbError::OperatorLinkRequired`] for an unbound author once armed;
+    /// `DbError::QueryFailed` if the function is absent (a database that has
+    /// not applied migration 122) or the call fails. Deliberately never mapped
+    /// to "bound": a binary that cannot ask must not write as if the answer were
+    /// yes.
+    pub async fn require_bound_author(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<(), DbError> {
+        sqlx::query("SELECT public.epigraph_require_bound_author($1)")
+            .bind(agent_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Refuse, with [`DbError::OperatorScopeRefused`] (`OPL02`), a live-linked
+    /// agent named on a row owned by `group_id` when its operator holds no
+    /// writer/admin membership there (migration 122 section 1b, the MEMBERSHIP
+    /// door's form); quiet for a human, an unarmed database, a privileged
+    /// session and an instance-admin principal, and NOT for the valve (which
+    /// relieves `OPL01` only). The claims trigger applies the stricter
+    /// `epigraph_require_writer_scope`, which scopes a human too.
+    ///
+    /// # Errors
+    /// [`DbError::OperatorScopeRefused`], or `DbError::QueryFailed` if the
+    /// function is absent or the call fails.
+    pub async fn require_operator_scope(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        group_id: Uuid,
+    ) -> Result<(), DbError> {
+        sqlx::query("SELECT public.epigraph_require_operator_scope($1, $2)")
+            .bind(agent_id)
+            .bind(group_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Refuse a WRITER that is not entitled to write a claim owned by
+    /// `group_id` (migration 122 section 2, the checks the claims trigger
+    /// applies to a session principal that is not the author): `OPL01`
+    /// ([`DbError::OperatorLinkRequired`]) when `writer` is unbound or `None`
+    /// once the database is armed (the valve relieves this half), and `OPL02`
+    /// ([`DbError::OperatorScopeRefused`]) when the writer's human holds no
+    /// writer/admin membership in `group_id` (armed, whatever the valve; an
+    /// instance-admin principal and a privileged session are exempt).
+    ///
+    /// And the ATTRIBUTION check the trigger applies to such a writer
+    /// (`epigraph_require_attributable`): the rows name `author`, so `writer`
+    /// must belong to `author`'s human. That half is `OPL02` keyed on the
+    /// arming, so it holds with the valve open too, when the first check is
+    /// relieved and the second is quiet for a writer that belongs to no human.
+    ///
+    /// For the write paths whose rows are authored and stamped as a SHARED
+    /// system identity (workflow ingest): the database sees only that
+    /// identity, so the request path binds its real caller here, on the same
+    /// stamped transaction, before any row is written.
+    ///
+    /// # Errors
+    /// [`DbError::OperatorLinkRequired`], [`DbError::OperatorScopeRefused`], or
+    /// `DbError::QueryFailed` if the functions are absent or the call fails.
+    pub async fn require_writer_authority(
+        conn: &mut sqlx::PgConnection,
+        author: Uuid,
+        writer: Option<Uuid>,
+        group_id: Uuid,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "SELECT public.epigraph_require_bound_writer($1), \
+                    public.epigraph_require_writer_scope($1, $2), \
+                    public.epigraph_require_attributable($3, $1, false)",
+        )
+        .bind(writer)
+        .bind(group_id)
+        .bind(author)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// How `agent_id` is bound to a human operator (migration 122):
+    /// `Some("live_link")`, `Some("human_operator")`, or `None` (unbound).
+    /// Independent of arming and of the valve.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent or the read fails.
+    pub async fn author_binding(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT public.epigraph_author_binding($1)")
+                .bind(agent_id)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// [`Self::author_binding`] for a caller holding a pool (a read through
+    /// the same SECURITY DEFINER function).
+    ///
+    /// # Errors
+    /// As [`Self::author_binding`], plus `DbError::ConnectionFailed` if no
+    /// connection can be acquired.
+    pub async fn author_binding_pool(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::author_binding(&mut conn, agent_id).await
+    }
+
+    /// Whether operator binding is enforced on THIS connection: the database
+    /// is armed and the session's valve is not off (migration 122).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent or the read fails.
+    pub async fn operator_binding_enforced(conn: &mut sqlx::PgConnection) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT public.epigraph_operator_binding_enforced()")
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// Whether the database is ARMED for operator binding (migration 122),
+    /// whatever this connection's valve says. `None` when the database has not
+    /// applied 122 (the arming table is absent), so a boot log can say so
+    /// instead of failing.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn operator_binding_armed(pool: &PgPool) -> Result<Option<bool>, DbError> {
+        let present: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.operator_binding_arming') IS NOT NULL")
+                .fetch_one(pool)
+                .await?;
+        if !present {
+            return Ok(None);
+        }
+        Ok(Some(
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM public.operator_binding_arming)")
+                .fetch_one(pool)
+                .await?,
+        ))
+    }
+
     /// "Whose are `agent_id`'s claims?" — the operator named by its link
     /// record, through migration 107's `epigraph_operator_of_author`, or `None`.
     ///

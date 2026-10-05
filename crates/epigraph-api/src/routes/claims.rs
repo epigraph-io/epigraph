@@ -596,14 +596,13 @@ pub async fn create_claim(
         )
     };
 
-    // Use a transaction for claim + encryption metadata atomicity
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to begin transaction: {e}"),
-        })?;
+    // Use a transaction for claim + encryption metadata atomicity, STAMPED
+    // with the authenticated viewer: migration 122's claims trigger binds the
+    // session principal whenever it differs from the body's `agent_id`, so the
+    // caller must be bound and may name only an author of its own human. On
+    // the raw pool the trigger saw no principal at all (and, once armed, now
+    // refuses the write outright rather than checking the body's author).
+    let mut tx = state.begin_claim_write(&viewer, "create_claim").await?;
 
     // ── Tenancy declaration (PR-16) ──
     //

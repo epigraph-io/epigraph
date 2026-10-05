@@ -764,10 +764,68 @@ Current reservation:
   First written as `102`, a hole below the deployed head; renumbered to the
   next free version so no database at head sees a version below its head
   arrive late. Checked before claiming: no open PR branch carries a `121`.
+  Sets `lock_timeout = '3s'` like 111-120 (its CHECK rebuild validates every
+  row under ACCESS EXCLUSIVE); added in place before 121 was applied to any
+  deployed database.
 
-- **122+**: public next
+- **122**: public `operator_binding` — every claim is authored by an agent
+  BOUND to a human operator: (a) an agent with a live row in the
+  maintenance-only, audited registry `human_operators` whose recorded `human`
+  OAuth client is still active (the registry's checks and audit are table
+  triggers, so a direct maintenance write meets them; revoke is final); or (b)
+  the holder of a LIVE (`retired = false`)
+  `operator_links` row whose operator is (a). A new `operator_links` row whose
+  operator is not (a) is refused by `operator_links_operator_is_human`, armed
+  or not (an exact re-link is skipped); every link row is audited
+  (`operator_links_audit`). A BEFORE INSERT OR UPDATE OF `agent_id` trigger on `claims`
+  (`claims_require_tenancy_then_operator_binding`, a maintenance-owned definer
+  body, named to fire after the tenancy fill) raises `OPL01` naming the fix
+  (`epigraph-operator link`) for any other author, for a session PRINCIPAL
+  that is not bound when it writes a claim naming another author, and for an
+  application session with NO principal, on every role; and `OPL02` when the
+  writer's human does not write the claim's owner group, or the named author
+  belongs to another human (or to any human while the writer belongs to none),
+  or a non-exempt session changes an existing claim's `agent_id`; a retired
+  author is admitted only as the author a supersede inherits (a new row
+  carrying its predecessor's author); with the same rule on
+  writer/admin rows for live-linked agents in `group_memberships`
+  (`group_memberships_operator_scope`); a privileged session and an
+  instance-admin principal are exempt from `OPL02` only. Applying the
+  file enforces NOTHING: enforcement starts when a maintenance session calls
+  `epigraph_arm_operator_binding()` (`epigraph-operator arm-operator-binding
+  --apply`), which is audited and ONE-WAY (the arming table grants the
+  maintenance role SELECT/INSERT only, the app role SELECT only). The per-process
+  valve `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT=off` travels as the session setting
+  `epigraph.operator_link_enforcement` and relieves `OPL01` only. Also
+  `epigraph_link_legacy_authors(operator, exclude[], quiet_since)`: one audited
+  call records a RETIRED link to a HUMAN operator for every agent that authored
+  a tier-A row and has no link, skipping (and reporting) humans, OAuth
+  principals, holders of write authority in the operator's group or in a group
+  it does not write, 107's shared-signer fingerprint, agents whose lineage names
+  another registered human, excluded ids, and claim authors at or after the
+  cutoff (`epigraph-operator link-legacy-authors`). Section 9 re-creates 107's
+  two link definers and 116's attested retire byte for byte except that the
+  operator-side shared-signer fingerprint (app-forgeable edges) is skipped for a
+  registered human operator. Section 8 re-creates
+  arm (d)'s `epigraph_propagate_tenancy` (OB6) with 120's body except the edges
+  meet: the edges touching the batch are found by two equi-joins instead of one
+  OR join (whose nested-loop plan tested every edge against every changed
+  claim), and each endpoint's tenancy is read by LEFT JOINs with
+  `epigraph_node_tenancy`'s exact fallback instead of two function calls per
+  edge; pinned by `epigraph-cli/tests/backfill_equivalence.rs` and the arm (d)
+  suites. Registered in
+  `schema_contract.rs::migration_122_operator_binding_definers_are_owned_and_granted`,
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` and
+  `verify_operator_function_grants`. Behaviour in
+  `epigraph-db/tests/operator_binding.rs`. Checked before claiming: no open PR
+  branch carries a `122`. **Deploy order:** apply before the binaries that
+  read it; ARM only after the enforcing binaries serve (docs/deploy.md). Undo
+  is in the file's header. **Applied to a throwaway database only, NOT to any
+  deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `122` or
+- **123+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `123` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

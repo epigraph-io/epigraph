@@ -857,6 +857,9 @@ impl ScopedPool {
         downgrade_to: Option<&'static str>,
     ) -> Result<Self, DbError> {
         let statement_timeout = options.statement_timeout;
+        // Read the operator-binding valve (migration 122) now, so a process
+        // whose valve is off logs its WARN at boot, before any connection.
+        crate::operator_binding::enforcement();
         let inner = PgPoolOptions::new()
             .max_connections(options.max_connections)
             .acquire_timeout(options.acquire_timeout)
@@ -870,6 +873,11 @@ impl ScopedPool {
                     if let Some(t) = statement_timeout {
                         apply_statement_timeout(conn, t).await?;
                     }
+                    // The valve's transport (`crate::operator_binding`): a
+                    // session setting, stamped once per physical connection
+                    // and untouched by the release scrub, which resets only
+                    // the three tenancy GUCs.
+                    crate::operator_binding::apply_valve(conn).await?;
                     Ok(())
                 })
             })

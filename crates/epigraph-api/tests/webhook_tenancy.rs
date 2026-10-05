@@ -374,7 +374,7 @@ async fn a_subscription_whose_agent_row_is_gone_is_never_delivered_to() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subscription_whose_principal_is_operated_is_never_delivered_to() {
     let pool = test_pool().await;
-    let (operator, operator_group) = fixture::seed_agent_with_group(&pool, "wh-operator").await;
+    let (operator, operator_group) = fixture::seed_human_operator(&pool, "wh-operator").await;
     let (operated, _operated_group) = fixture::seed_agent_with_group(&pool, "wh-operated").await;
     let public_claim = fixture::seed_public_claim(&pool, operator, "wh operated control").await;
     let private_claim = fixture::seed_group_claim(

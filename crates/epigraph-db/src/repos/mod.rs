@@ -92,7 +92,8 @@ pub use claim::{
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
-    DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow, ThemeMemberRow, ThemeSummaryRow,
+    DistantClaimsRow, NeighbourhoodThemeCoverage, RecomputedThemeRow, SplitCandidateRow,
+    ThemeMemberRow, ThemeSummaryRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use cluster_run::{ClaimPlacement, ClusterRunRepository, ClusterRunRow};

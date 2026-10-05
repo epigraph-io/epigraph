@@ -15,6 +15,23 @@
 --
 -- Existing rows are NOT backfilled: every stored value remains valid under the
 -- widened constraint, and the original observational intent is unrecoverable.
+--
+-- LOCKS. `DROP CONSTRAINT` / `ADD CONSTRAINT ... CHECK` take ACCESS EXCLUSIVE
+-- on `reasoning_traces`, and the ADD scans every row to validate the CHECK
+-- while holding it, so reads and writes of the table queue behind this
+-- migration. `lock_timeout` bounds the wait for that lock, as in 111-120: on a
+-- busy table the migration fails fast (re-run it, in a maintenance window),
+-- instead of queueing every request behind it. A `NOT VALID` + `VALIDATE
+-- CONSTRAINT` split would buy nothing here, because the migrator runs this
+-- file in ONE transaction and the ACCESS EXCLUSIVE taken by the DROP is held
+-- through the VALIDATE until commit. The scan is a single CHECK over one text
+-- column, so its hold time is short.
+--
+-- Undo: restore 001's constraint (the same name, without 'observational')
+-- only after deleting or rewriting every row whose reasoning_type is
+-- 'observational'; roll the binaries back first so nothing writes it.
+
+SET LOCAL lock_timeout = '3s';
 
 ALTER TABLE reasoning_traces DROP CONSTRAINT IF EXISTS reasoning_type_valid;
 

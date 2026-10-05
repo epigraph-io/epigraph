@@ -176,7 +176,7 @@ async fn verify_fails_before_the_backfill_and_succeeds_after(pool: PgPool) {
         "verify must NAME the offending rows, not just fail; stderr: {stderr}"
     );
 
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "run must succeed; stderr: {stderr}");
 
     let (code, stderr) = run_backfill(&pool, &["verify"]).await;
@@ -246,7 +246,7 @@ async fn the_backfill_updates_the_undeclared_row_and_leaves_a_declared_one_alone
     let (code, stderr) = run_backfill(&pool, &["verify"]).await;
     assert_eq!(code, 1, "verify before the backfill; stderr: {stderr}");
 
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "run must succeed; stderr: {stderr}");
 
     // THE POSITIVE ASSERTION.
@@ -293,7 +293,12 @@ async fn a_maintenance_dsn_naming_another_database_is_refused(pool: PgPool) {
     let url = fixture::database_url_for(&pool).await;
     let elsewhere = url.rsplit_once('/').expect("DSN has a path").0.to_string() + "/postgres";
 
-    let (code, stderr) = run_backfill_with_maintenance_dsn(&pool, &["run"], &elsewhere).await;
+    let (code, stderr) = run_backfill_with_maintenance_dsn(
+        &pool,
+        &["run", "--legacy-owner", "operator"],
+        &elsewhere,
+    )
+    .await;
     assert_ne!(
         code, 0,
         "a maintenance DSN on another database must refuse, not silently no-op; stderr: {stderr}"
@@ -330,7 +335,7 @@ async fn a_second_run_changes_nothing(pool: PgPool) {
         seed_undeclared_claim(&pool, agent, &format!("claim {i}")).await;
     }
 
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "first run: {stderr}");
 
     let after_first: Vec<(Uuid, Uuid, String)> =
@@ -340,7 +345,7 @@ async fn a_second_run_changes_nothing(pool: PgPool) {
             .expect("snapshot after first run");
     assert_eq!(after_first.len(), 5, "the fixture must actually seed rows");
 
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "second run: {stderr}");
 
     let after_second: Vec<(Uuid, Uuid, String)> =
@@ -371,7 +376,11 @@ async fn an_interrupted_run_resumes_from_its_cursor(pool: PgPool) {
 
     // A batch size of 2 over 6 rows guarantees the walk is genuinely multi-batch;
     // a single-batch walk would make "resumes" vacuous.
-    let (code, stderr) = run_backfill(&pool, &["run", "--batch-size", "2"]).await;
+    let (code, stderr) = run_backfill(
+        &pool,
+        &["run", "--legacy-owner", "operator", "--batch-size", "2"],
+    )
+    .await;
     assert_eq!(code, 0, "run: {stderr}");
     assert_eq!(world_owned(&pool, "claims").await, 0);
 
@@ -407,7 +416,11 @@ async fn an_interrupted_run_resumes_from_its_cursor(pool: PgPool) {
         "precondition: three rows are undeclared again"
     );
 
-    let (code, stderr) = run_backfill(&pool, &["run", "--batch-size", "2"]).await;
+    let (code, stderr) = run_backfill(
+        &pool,
+        &["run", "--legacy-owner", "operator", "--batch-size", "2"],
+    )
+    .await;
     assert_eq!(code, 0, "resumed run: {stderr}");
     assert_eq!(
         world_owned(&pool, "claims").await,
@@ -433,7 +446,7 @@ async fn claims_are_stamped_with_the_authors_personal_group_never_world_or_seed(
     let (agent, group) = fixture::seed_agent_with_group(&pool, "author").await;
     let claim = seed_undeclared_claim(&pool, agent, "mine").await;
 
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "run: {stderr}");
 
     let (owner, vis): (Uuid, String) =
@@ -506,7 +519,7 @@ async fn an_author_with_no_personal_group_is_given_one(pool: PgPool) {
     .expect("count groups");
     assert_eq!(before, 0, "precondition: the agent has no personal group");
 
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "run: {stderr}");
 
     let (owner, vis): (Uuid, String) =
@@ -585,7 +598,7 @@ async fn a_revoked_author_is_not_revived_by_the_backfill(pool: PgPool) {
     .expect("seed revoked membership");
     let claim = seed_undeclared_claim(&pool, agent, "a revoked author's claim").await;
 
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "run: {stderr}");
 
     let (live, revoked): (i64, i64) = sqlx::query_as(
@@ -626,7 +639,7 @@ async fn the_backfill_refuses_to_run_without_migration_070(pool: PgPool) {
         .await
         .expect("disable the propagation trigger");
 
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_ne!(
         code, 0,
         "the backfill must refuse to start with arm (d) disabled; stderr: {stderr}"
@@ -648,7 +661,8 @@ async fn dry_run_writes_nothing(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     seed_undeclared_claim(&pool, agent, "claim").await;
 
-    let (code, stderr) = run_backfill(&pool, &["run", "--dry-run"]).await;
+    let (code, stderr) =
+        run_backfill(&pool, &["run", "--legacy-owner", "operator", "--dry-run"]).await;
     assert_eq!(code, 0, "dry run: {stderr}");
     assert_eq!(
         world_owned(&pool, "claims").await,
@@ -701,7 +715,7 @@ async fn dry_run_writes_nothing(pool: PgPool) {
 async fn verify_fails_when_a_definer_body_is_not_maintenance_owned(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     seed_undeclared_claim(&pool, agent, "ordinary").await;
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
 
     // Reproduce the missing-role deploy: the function exists but was never
@@ -739,7 +753,7 @@ async fn verify_fails_when_a_definer_body_is_not_maintenance_owned(pool: PgPool)
 async fn a_superuser_owned_definer_body_satisfies_verify(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     seed_undeclared_claim(&pool, agent, "ordinary").await;
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
 
     let superuser: String = sqlx::query_scalar("SELECT current_user")
@@ -1003,7 +1017,7 @@ async fn verify_flags_a_cross_group_edge_that_carries_no_co_owner(pool: PgPool) 
 async fn verify_covers_the_086_read_definer_once_its_migration_is_applied(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     seed_undeclared_claim(&pool, agent, "ordinary").await;
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
 
     // PREMISE: the gate is OPEN on this database, i.e. the function really
@@ -1077,7 +1091,7 @@ async fn verify_covers_the_086_read_definer_once_its_migration_is_applied(pool: 
 async fn verify_skips_the_086_definer_and_still_passes_before_that_migration_applies(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     seed_undeclared_claim(&pool, agent, "ordinary").await;
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
 
     // Reproduce "this database has not reached 086 yet" while keeping the rest
@@ -1129,7 +1143,7 @@ async fn verify_skips_the_086_definer_and_still_passes_before_that_migration_app
 async fn verify_still_checks_the_086_definer_when_its_migration_row_is_missing(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     seed_undeclared_claim(&pool, agent, "ordinary").await;
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
 
     let removed = sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 86")
@@ -1217,7 +1231,7 @@ async fn verify_still_checks_the_086_definer_when_its_migration_row_is_missing(p
 async fn verify_covers_the_089_stamping_definer_once_its_migration_is_applied(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     seed_undeclared_claim(&pool, agent, "ordinary").await;
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
 
     // PREMISE: the gate is OPEN on this database. Without this the assertions
@@ -1309,7 +1323,7 @@ async fn verify_covers_the_089_stamping_definer_once_its_migration_is_applied(po
 async fn verify_covers_the_092_roster_definer_once_its_migration_is_applied(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     seed_undeclared_claim(&pool, agent, "ordinary").await;
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
 
     // PREMISE: the gate is OPEN on this database. Without this every assertion
@@ -1376,7 +1390,7 @@ async fn verify_covers_the_092_roster_definer_once_its_migration_is_applied(pool
 async fn verify_checks_the_operator_function_grants_to_the_app_role(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
     seed_undeclared_claim(&pool, agent, "ordinary").await;
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    let (code, stderr) = run_backfill(&pool, &["run", "--legacy-owner", "operator"]).await;
     assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
     let (code, stderr) = run_backfill(&pool, &["verify"]).await;
     assert_eq!(

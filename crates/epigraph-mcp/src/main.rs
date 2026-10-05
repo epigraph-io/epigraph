@@ -566,6 +566,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
     );
+    // Operator binding (migration 122): the valve and the arming state, once
+    // at boot. Non-fatal; the trigger enforces whatever this reports.
+    epigraph_db::operator_binding::log_boot_state(&pool, "epigraph-mcp").await;
 
     // Create or restore agent signer. Precedence lives in `select_signer`
     // (unit-tested); here we only handle the side effects (secret-key print for

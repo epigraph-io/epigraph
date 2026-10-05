@@ -453,16 +453,26 @@ impl EpiGraphMcpFull {
         // from `cached`.
         match self.pool.acquire().await {
             Ok(mut conn) => {
-                if let Err(e) =
-                    epigraph_db::AgentRepository::ensure_personal_group(&mut conn, id).await
-                {
-                    tracing::warn!(
+                match epigraph_db::AgentRepository::ensure_personal_group(&mut conn, id).await {
+                    Ok(_) => {}
+                    // Migration 122 (armed): a LIVE-LINKED agent writes into its
+                    // operator's group, and a writer/admin row in its own
+                    // personal group is in a group its operator does not
+                    // write, so the membership door refuses it. Expected on
+                    // every boot of a correctly linked fleet agent, so neither
+                    // a warning nor an OPL02 line in the log (review C5).
+                    Err(epigraph_db::DbError::OperatorScopeRefused { .. }) => tracing::info!(
+                        agent_id = %id,
+                        "the server agent is live-linked and writes into its operator's group; \
+                         its own personal group is not provisioned"
+                    ),
+                    Err(e) => tracing::warn!(
                         agent_id = %id,
                         error = %e,
                         "did not provision the server agent's personal group (a revoked \
                          membership is refused, never restored); its viewer resolves to its \
                          remaining live groups only"
-                    );
+                    ),
                 }
             }
             Err(e) => tracing::warn!(
@@ -1238,7 +1248,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Paragraph-primary semantic search over the claim graph with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, and CORROBORATES neighbors. Auto-detects centroid_dim (1536 vs 3072) by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN when the corpus has no themes yet. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — and contest wins over truth_value, so a 0.9 paragraph with a live refutation lands in open_question."
+        description = "Paragraph-primary semantic search over the claim graph with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, and CORROBORATES neighbors. Auto-detects centroid_dim (1536 vs 3072) by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN (same response shape, no indication in it) when the corpus has no themes yet, or when fewer than half of the query's nearest paragraphs belong to the max_themes themes it would draw from, so a partial or stale theme set cannot crowd out relevant unthemed results. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — and contest wins over truth_value, so a 0.9 paragraph with a live refutation lands in open_question."
     )]
     async fn recall_with_context(
         &self,

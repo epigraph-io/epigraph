@@ -139,6 +139,7 @@ pub async fn record_outcome(
 /// challenge's status is now, and writes nothing.
 #[cfg(feature = "db")]
 pub async fn create_challenge(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(req): Json<CreateChallengeRequest>,
@@ -168,7 +169,8 @@ pub async fn create_challenge(
     // approval surface that reads it back is not scoped to the requester's
     // group -- so the declaration is the system agent's own group, publicly
     // visible. The caller's `AuthContext` is spent on the `claims:write` scope
-    // check above, which is what it is for here.
+    // check above; the caller's IDENTITY is bound below, by stamping the write
+    // transaction with its viewer.
     let decl =
         epigraph_db::ClaimRepository::default_decl_for_author_pool(&state.db_pool, sys_agent_id)
             .await?;
@@ -195,13 +197,16 @@ pub async fn create_challenge(
     // The lookup projects `id` only, and the repeat answers `{ "id" }`, the
     // same shape as a first create; the challenge's state is
     // `GET /api/v1/policy-challenges/:id`'s to serve.
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to create challenge: {e}"),
-        })?;
+    //
+    // THE TRANSACTION IS STAMPED WITH THE CALLER'S VIEWER, not the system
+    // agent's. The row is authored by the shared system agent, so migration
+    // 122's claims trigger sees a writer (the caller) that is not the author,
+    // and binds it: the caller must be bound (OPL01) and belong to the same
+    // human as the system agent (OPL02), which is the check the workflow
+    // ingest routes make explicitly (`require_caller_write_authority`). On the
+    // raw pool the trigger saw no principal, and any `claims:write` caller put
+    // its text into the linked human's group under the system identity.
+    let mut tx = state.begin_claim_write(&viewer, "create_challenge").await?;
 
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtext('epigraph.policy_challenge'), hashtext($1))",
@@ -253,8 +258,15 @@ pub async fn create_challenge(
         .bind(decl.owner_group_bind())
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to create challenge: {e}"),
+        .map_err(|e| {
+            let e = epigraph_db::DbError::from(e);
+            if e.is_write_authority_refusal() {
+                ApiError::from(e)
+            } else {
+                ApiError::InternalError {
+                    message: format!("Failed to create challenge: {e}"),
+                }
+            }
         })?,
     };
 

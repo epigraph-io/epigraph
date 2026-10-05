@@ -143,7 +143,7 @@ async fn assertion_grant(pool: &PgPool, client_id: &str, key: &SigningKey) -> (S
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_agent_cannot_mint_a_token_by_assertion(pool: PgPool) {
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
 
     // CALIBRATION: an unlinked agent with the same client shape gets a token.
     let unlinked_key = SigningKey::from_bytes(&[0x41; 32]);
@@ -254,7 +254,7 @@ async fn minted_refresh_token(pool: &PgPool, client_id: &str, key: &SigningKey) 
 /// arm that yields an agent token, not only the assertion).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_agent_linked_after_minting_cannot_refresh(pool: PgPool) {
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
     let key = SigningKey::from_bytes(&[0x44; 32]);
     let (agent, client_id) = agent_with_active_client(&pool, &key).await;
     let refresh = minted_refresh_token(&pool, &client_id, &key).await;
@@ -338,7 +338,7 @@ async fn a_failed_operator_check_does_not_burn_the_refresh_token(pool: PgPool) {
 /// thing under test is the extractor, which runs before any handler code.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_token_minted_before_the_link_is_refused_by_the_viewer(pool: PgPool) {
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
     let key = SigningKey::from_bytes(&[0x46; 32]);
     let (agent, client_id) = agent_with_active_client(&pool, &key).await;
     let app = create_router(AppState::with_db(pool.clone(), config()));
@@ -535,7 +535,7 @@ async fn redeem(pool: &PgPool, client_id: &str, code: &str) -> (StatusCode, Valu
 /// The AUTHORIZATION_CODE arm refuses a code whose client's agent is operated.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_agent_cannot_redeem_an_authorization_code(pool: PgPool) {
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
 
     // CALIBRATION: the same flow for an unlinked agent mints.
     let (unlinked, _) = fixture::seed_agent_with_group(&pool, "unlinked").await;
@@ -584,7 +584,7 @@ async fn an_operated_agent_cannot_mint_through_an_external_provider(pool: PgPool
     };
     use std::sync::Arc;
 
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
     let fx = oauth_providers::fixtures::ProviderFixture::new().await;
     std::env::set_var("OPERATED_AGENT_TOKEN_GOOGLE_CLIENT_ID", "test-audience");
     std::env::set_var("OPERATED_AGENT_TOKEN_GOOGLE_CLIENT_SECRET", "test-secret");

@@ -12,12 +12,19 @@
 //!
 //! The env var DECLARES the operator; the DSN AUTHORIZES the link.
 //! `epigraph_link_operator` is EXECUTE-able by `epigraph_maintenance` (and
-//! superusers) only. Epiclaw's per-agent processes connect with a privileged DSN
-//! today, so they can record their own link; on an `epigraph_app` DSN the call
-//! fails with `42501` and [`self_link`] returns that error, which `main` treats
-//! as FATAL — a declared operator the process cannot record is never silently
-//! dropped. A host that moves agents onto `epigraph_app` must record the link
-//! itself, on a maintenance connection, before starting them.
+//! superusers) only. Under operator decision D9 a request-serving process
+//! (every per-agent stdio process included) holds only an `epigraph_app` DSN,
+//! where that call fails with `42501`. So the link is recorded OUT OF BAND, by
+//! the host, on a maintenance connection, BEFORE the process starts:
+//! `epigraph-operator link --agent-model <m> --agent-system-prompt-hash <h>
+//! --operator <human> --apply` (or `--agent <id>`). [`self_link`] then reads the
+//! ACTOR record first and, when it already names the declared operator, starts
+//! without calling the link function at all, so a correctly declared agent on
+//! an app DSN is never stranded. Only when no such live link exists does it
+//! call the link function, which records it on a maintenance DSN and, on an app
+//! DSN, fails with `42501`: [`self_link`] returns that error, naming the
+//! command above, and `main` treats it as FATAL — a declared operator the
+//! process cannot record is never silently dropped.
 //!
 //! # Never on a shared HTTP listener
 //!
@@ -36,7 +43,10 @@
 //! Both HTTP checks also refuse a signer that is anyone's OPERATOR
 //! (`AgentRepository::operates_agents`, migration 107 section 9): on
 //! `--allow-unauthenticated-http` every caller IS the signer, and would satisfy
-//! "caller is the operator of the claim's author" for every linked agent.
+//! "caller is the operator of the claim's author" for every linked agent. And
+//! both refuse a signer that is a registered HUMAN operator (migration 122),
+//! operating anyone or not: principal-less callers and admin-borrowed writes
+//! are written as the signer, so each would author claims as that person.
 //!
 //! ## Why the gate stays strict after batch HTTP-id
 //!
@@ -118,8 +128,11 @@ pub fn check_operator_transport(
 
 /// Refuse to serve HTTP when this process's signer agent already has an
 /// operator link of either kind (see the module doc for why the author record,
-/// retired links included, is the predicate), or is itself some agent's
-/// OPERATOR (migration 107 section 9).
+/// retired links included, is the predicate), is itself some agent's
+/// OPERATOR (migration 107 section 9), or is a registered HUMAN operator
+/// (migration 122): principal-less callers and admin-borrowed writes are
+/// written as the signer, so a human signer would put every such caller's
+/// words in that person's mouth, before it operates any agent.
 ///
 /// Read-only: the signer is looked up by public key and NOT created, so a
 /// listener whose signer has never been registered passes without writing.
@@ -169,7 +182,29 @@ pub async fn refuse_operated_http_signer(
     if operates {
         return Err(operator_http_signer_reason(agent_id));
     }
+    let binding = AgentRepository::author_binding(&mut conn, agent_id)
+        .await
+        .map_err(|e| {
+            format!(
+                "could not check whether this listener's signer agent {agent_id} is a registered \
+                 human operator (is migration 122 applied?): {e}"
+            )
+        })?;
+    if binding.as_deref() == Some("human_operator") {
+        return Err(human_http_signer_reason(agent_id));
+    }
     Ok(())
+}
+
+/// The refusal text for a signer that is a registered HUMAN OPERATOR
+/// (migration 122 section 1c).
+fn human_http_signer_reason(agent_id: Uuid) -> String {
+    format!(
+        "this HTTP listener's signer agent {agent_id} is a registered human operator. Every \
+         principal-less caller of this listener, and every admin-borrowed write, is written as \
+         the signer, so each would author claims as that human. Run the listener under a \
+         different --agent-key; a listener's signer is never a person."
+    )
 }
 
 /// The refusal text shared by the startup gate and the per-call guard.
@@ -244,13 +279,14 @@ pub async fn refuse_linked_http_signer(server: &EpiGraphMcpFull) -> Result<(), M
 }
 
 /// The operator half of [`refuse_linked_http_signer`]: refuse while this
-/// server's signer is anyone's OPERATOR (107 section 9). Fails closed.
+/// server's signer is anyone's OPERATOR (107 section 9), or a registered human
+/// operator (migration 122). Fails closed.
 async fn refuse_operator_http_signer(
     server: &EpiGraphMcpFull,
     agent_id: Uuid,
 ) -> Result<(), McpError> {
     match AgentRepository::operates_agents_pool(&server.pool, agent_id).await {
-        Ok(false) => Ok(()),
+        Ok(false) => refuse_human_http_signer(server, agent_id).await,
         Ok(true) => {
             let reason = operator_http_signer_reason(agent_id);
             tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
@@ -270,6 +306,33 @@ async fn refuse_operator_http_signer(
     }
 }
 
+/// The human half of [`refuse_linked_http_signer`]: refuse while this server's
+/// signer is a registered human operator (migration 122). Fails closed.
+async fn refuse_human_http_signer(
+    server: &EpiGraphMcpFull,
+    agent_id: Uuid,
+) -> Result<(), McpError> {
+    match AgentRepository::author_binding_pool(&server.pool, agent_id).await {
+        Ok(b) if b.as_deref() == Some("human_operator") => {
+            let reason = human_http_signer_reason(agent_id);
+            tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
+            Err(internal_error(format!("refused: {reason}")))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::error!(
+                agent = %agent_id,
+                error = %e,
+                "refusing an HTTP tool call: could not check whether the signer is a human operator"
+            );
+            Err(internal_error(format!(
+                "refused: could not verify that this HTTP listener's signer agent {agent_id} \
+                 is not a registered human operator: {e}"
+            )))
+        }
+    }
+}
+
 /// The startup refusal text for a failed [`self_link`], naming the cause an
 /// operator can act on.
 ///
@@ -282,6 +345,28 @@ async fn refuse_operator_http_signer(
 /// EXECUTE-grant hint, because on a stdio host the usual cause is an
 /// `epigraph_app` DSN (`42501`).
 pub fn link_refusal_text(agent: Uuid, operator: Uuid, e: &epigraph_db::DbError) -> String {
+    link_refusal_text_for(agent, operator, None, e)
+}
+
+/// [`link_refusal_text`] for a process that knows its LLM identity
+/// (`--agent-model` + prompt hash): the printed fix then names that identity
+/// (`epigraph-operator link --agent-model <m> --agent-system-prompt-hash <h>`),
+/// which also records the agent's LLM provenance properties, where the
+/// `--agent <id>` form would link a row an app DSN could not annotate (review
+/// C5).
+pub fn link_refusal_text_for(
+    agent: Uuid,
+    operator: Uuid,
+    llm: Option<(&str, &str)>,
+    e: &epigraph_db::DbError,
+) -> String {
+    let fix = match llm {
+        Some((model, hash)) => format!(
+            "`epigraph-operator link --agent-model {model} --agent-system-prompt-hash {hash} \
+             --operator {operator} --apply`"
+        ),
+        None => format!("`epigraph-operator link --agent {agent} --operator {operator} --apply`"),
+    };
     match e {
         epigraph_db::DbError::MembershipRevoked { message } => format!(
             "refused to record agent {agent} as operated by {operator}: the operator's OWN \
@@ -298,8 +383,8 @@ pub fn link_refusal_text(agent: Uuid, operator: Uuid, e: &epigraph_db::DbError) 
         other => format!(
             "could not record agent {agent} as operated by {operator} \
              (epigraph_link_operator is EXECUTE-able by epigraph_maintenance only; on an \
-             epigraph_app DSN the host must record the link on a maintenance connection \
-             instead): {other}"
+             epigraph_app DSN the host records the link on a maintenance connection BEFORE \
+             starting this process: {fix} with EPIGRAPH_OPERATOR_MAINTENANCE_DSN set): {other}"
         ),
     }
 }
@@ -328,9 +413,30 @@ pub async fn self_link(
         server.pool.acquire().await.map_err(|e| {
             format!("could not acquire a connection to record the operator link: {e}")
         })?;
+    // A live link the host already recorded on a maintenance connection (D9:
+    // this process may hold only an app DSN, where the link function is 42501).
+    // Read through the SAME actor read the authoring path uses; a link to a
+    // DIFFERENT operator is not accepted here and falls through to the link
+    // call, which refuses it by name.
+    if let Some(outcome) = recorded_live_link(&mut conn, agent, operator).await? {
+        tracing::info!(
+            agent = %agent,
+            operator = %operator,
+            operator_group = %outcome.operator_group_id,
+            "operator link recorded: this agent authors into the operator's personal group \
+             (live link recorded out of band on a maintenance connection; not re-linked)"
+        );
+        return Ok(outcome);
+    }
     let outcome = AgentRepository::link_operator(&mut conn, agent, operator)
         .await
-        .map_err(|e| link_refusal_text(agent, operator, &e))?;
+        .map_err(|e| {
+            let llm = server
+                .llm_identity
+                .as_ref()
+                .map(|(m, h)| (m.as_str(), h.as_str()));
+            link_refusal_text_for(agent, operator, llm, &e)
+        })?;
     match LinkStatus::of(&outcome) {
         LinkStatus::Live => tracing::info!(
             agent = %agent,
@@ -366,6 +472,41 @@ pub async fn self_link(
         ),
     }
     Ok(outcome)
+}
+
+/// The outcome of an ACTING link to `operator` that is already recorded for
+/// `agent`, or `None`. Read with `epigraph_operator_actor`, which an
+/// `epigraph_app` session may call, so it answers on the DSN a D9 process holds.
+/// An acting link is, by that read's definition, not retired, with a live
+/// writer/admin membership in the operator's own group, so the synthesised
+/// outcome reports exactly that and claims nothing was created.
+///
+/// # Errors
+/// The read fails (fail closed: a process that cannot ask does not start).
+async fn recorded_live_link(
+    conn: &mut sqlx::PgConnection,
+    agent: Uuid,
+    operator: Uuid,
+) -> Result<Option<OperatorLinkOutcome>, String> {
+    let actor = AgentRepository::operator_actor(conn, agent)
+        .await
+        .map_err(|e| {
+            format!(
+                "could not read whether agent {agent} already acts for operator {operator} \
+                 (is migration 107 applied?): {e}"
+            )
+        })?;
+    Ok(actor
+        .filter(|link| link.operator_id == operator)
+        .map(|link| OperatorLinkOutcome {
+            operator_group_id: link.operator_group_id,
+            group_created: false,
+            membership_created: false,
+            membership_live: true,
+            edge_created: false,
+            link_live: true,
+            link_retired: false,
+        }))
 }
 
 /// What a [`self_link`] outcome means for this process, as the startup log
@@ -502,5 +643,21 @@ mod tests {
             },
         );
         assert!(other.contains("EXECUTE-able"), "{other}");
+        assert!(other.contains(&format!("--agent {a}")), "{other}");
+        // Review C5: an LLM identity is told the form that records its
+        // provenance, not the bare `--agent <id>` one.
+        let llm = super::link_refusal_text_for(
+            a,
+            o,
+            Some(("model-m", "abcd")),
+            &epigraph_db::DbError::QueryFailed {
+                source: sqlx::Error::RowNotFound,
+            },
+        );
+        assert!(
+            llm.contains("--agent-model model-m --agent-system-prompt-hash abcd")
+                && !llm.contains(&format!("--agent {a}")),
+            "{llm}"
+        );
     }
 }

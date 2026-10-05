@@ -540,21 +540,25 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "state.rs",
-        10,
+        11,
         "Boot and observability, including the session-GUC probe itself. ENUMERATED rather than \
          waved at, because this is the one file where the needle is an indirection layer: a \
          `pub async fn` on AppState that reads self.db_pool is exempt-by-file no matter who calls \
          it, and a ViewerExtractor grep cannot detect the mixed case (AppState methods take &self; \
          the Viewer lives in the calling handler). The ten sites are exactly \
          load_entity_type_cache (1), assert_tenancy_triggers_armed (3), probe_rls_posture (3), \
-         rls_canary_visible (2) and warn_on_privileged_connection (1). The third site in \
+         rls_canary_visible (2), warn_on_privileged_connection (1), and begin_claim_write (1). \
+         begin_claim_write's site is the fallback for a TEST-BUILT AppState with no ScopedPool: \
+         every server is built through with_scoped_pool and takes the stamped write_as branch, \
+         and a claim written by an unstamped application session is refused by migration 122 \
+         once armed (OPL01), so the fallback cannot fail open in production. The third site in \
          assert_tenancy_triggers_armed is migration 089's marker probe, added with \
          TENANCY_TRIGGERS_089: it reads pg_proc, which carries no tenancy columns and no rows a \
          Viewer could filter. VERIFIED BY CALL GRAPH, not \
          by grep: every caller outside state.rs is bin/server.rs at boot, tenancy_gauge.rs (itself \
          exempt), or a #[cfg(all(test, feature = \"db\"))] module in routes/admin.rs and \
          routes/edges.rs. Scoping the probe to a Viewer would make it prove a property of that \
-         viewer instead of the pool. The count is pinned so a tenth site cannot inherit this \
+         viewer instead of the pool. The count is pinned so a twelfth site cannot inherit this \
          reason silently — see the `state.rs` note in the module's Known limits.",
     ),
     (
@@ -573,7 +577,15 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 267;
+/// 267 -> 264 in the operator-binding delta review: `create_claim`,
+/// `create_hypothesis` and `create_challenge` now write their claim on
+/// `AppState::begin_claim_write`. 264 -> 263 in its round 2: REST
+/// `evolve_step` authors as the caller's `ViewerExtractor` principal and no
+/// longer resolves a viewer on `state.db_pool`. 263 -> 260 in its round 3:
+/// `create_hypothesis` reads its frame and writes the frame bind and the prior
+/// on the claim's stamped transaction (`routes/hypothesis.rs` 10 -> 7, read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure).
+const HIGH_WATER: usize = 260;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -679,7 +691,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `Viewer::resolve(&state.db_pool, author)`, a membership read through the
     // SECURITY DEFINER `epigraph_live_memberships` — the same call
     // `ViewerExtractor` makes on the same pool. 20, the row below.
-    ("routes/claims.rs", 19),
+    // 19 before the operator-binding delta review, which moved `create_claim`'s
+    // claim transaction onto `AppState::begin_claim_write` (stamped).
+    ("routes/claims.rs", 18),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
@@ -795,7 +809,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // enumeration in this file's module doc.
     ("routes/graph_query.rs", 1),
     ("routes/groups.rs", 12),
-    ("routes/hypothesis.rs", 11),
+    // 11 before the operator-binding delta review, which moved
+    // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`.
+    ("routes/hypothesis.rs", 7),
     ("routes/isomorphism.rs", 3),
     // `routes/lineage.rs` was 7 and is GONE, not zeroed: PR-26, the first
     // conversion shard, moved all seven onto `AppState::read_as`. `measure()`
@@ -823,7 +839,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // neither `PerspectiveRepository::create` nor `::set_source_reliability`
     // takes a `Viewer`. Same owner as `context.rs`'s residue.
     ("routes/perspective.rs", 2),
-    ("routes/policies.rs", 9),
+    // 9 before the operator-binding delta review, which moved
+    // `create_challenge`'s transaction onto `AppState::begin_claim_write`.
+    ("routes/policies.rs", 8),
     // 12 before conversion shard 5, which moved all seven read-only
     // viewer-holding handlers onto `AppState::read_as`: `epistemic_profile`,
     // `compare_agents`, `position_timeline`, `claim_genealogy`,
@@ -917,7 +935,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `AppState::read_as` + `ClaimRepository::get_by_id_with_labels` with the
     // caller's viewer (F-write-authz-reads-unfiltered). Read off this test's
     // failure output.
-    ("routes/workflows.rs", 15),
+    //
+    // 15 -> 14 (operator binding, round 2): REST `evolve_step` takes the
+    // caller's `ViewerExtractor` and authors as its principal, so its
+    // `Viewer::resolve(&state.db_pool, ..)` of an OAuth client row id is gone.
+    // Read off this test's failure output.
+    ("routes/workflows.rs", 14),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

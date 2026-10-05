@@ -52,6 +52,7 @@
 
 pub mod errors;
 pub mod label_validation;
+pub mod operator_binding;
 pub mod pool;
 pub mod repos;
 pub mod visibility;
@@ -64,7 +65,10 @@ pub mod visibility;
 // it, and it re-exported `COARSE_EDGE_TYPES` from `repos::structural` purely to
 // keep that module path resolving. The constant is unaffected and is exported
 // below from where PR-08 actually put it.
-pub use errors::{DbError, PERSONAL_GROUP_NOT_OWNED, PERSONAL_MEMBERSHIP_REVOKED};
+pub use errors::{
+    DbError, OPERATOR_LINK_FIX, OPERATOR_LINK_REQUIRED, OPERATOR_SCOPE_REFUSED,
+    PERSONAL_GROUP_NOT_OWNED, PERSONAL_MEMBERSHIP_REVOKED,
+};
 pub use label_validation::reject_unexpanded_labels;
 pub use pool::{
     apply_statement_timeout, assert_maintenance_privilege, create_pool, create_pool_from_options,
@@ -101,14 +105,14 @@ pub use repos::{
     LineageHead, LineageRepository, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow,
     MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
     MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,
-    MethodUsageExample, NearestClaimHit, NewRecallEvent, OAuthClientRepository, OAuthClientRow,
-    OperatorLink, OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput,
-    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProvenanceChain,
-    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
-    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
-    RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
-    RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RotateOutcome,
-    ScopedBeliefRepository, ScoredHierarchicalWorkflowRow, SecurityEventRepository,
+    MethodUsageExample, NearestClaimHit, NeighbourhoodThemeCoverage, NewRecallEvent,
+    OAuthClientRepository, OAuthClientRow, OperatorLink, OperatorLinkOutcome, PaperRepository,
+    PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
+    PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge,
+    ProvenanceLogRow, ProvenanceNode, ProvenanceRepository, ReasoningTraceRepository,
+    RecallEventRepository, RecallEventRow, RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome,
+    RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow, SecurityEventRepository,
     SecurityEventRow, SheafRepository, SortDirection, StructuralRepository, SupersedeEdgeMigration,
     SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
     TraceProvenanceStep, TripleRepository, TripleRow, WebhookSubscriptionRepository,
