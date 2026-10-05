@@ -22,10 +22,13 @@ mod common;
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+use std::collections::HashSet;
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::Router;
 use epigraph_api::{create_router, ApiConfig, AppState};
+use epigraph_db::EgoRepository;
 use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -379,20 +382,23 @@ async fn retracted_edges_are_excluded(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn non_claim_neighbours_are_hydrated_and_unknown_types_fall_back(pool: PgPool) {
+async fn identity_and_rooted_neighbours_are_hydrated_and_unrooted_ones_are_dropped(pool: PgPool) {
     let center = common::seed_claim(&pool, "centre").await;
 
+    // `identity` tier: rendered on public content by design.
     let agent = seed_agent_named(&pool, "Dr. Ada Lovelace").await;
     common::insert_edge(&pool, center, agent, "claim", "agent", "attributed_to").await;
 
+    // `derived` tier, rooted: a trace derives from its claim, and this one's
+    // claim is the public centre, so the trace is readable.
     let trace = seed_trace(&pool, center).await;
     common::insert_edge(&pool, center, trace, "claim", "trace", "derived_from").await;
 
+    // `derived` tier, unrooted: no single row a paper or an activity derives
+    // from, so there is nothing to apply a viewer to. They are dropped for
+    // every viewer who is not bypassed, rather than shown on trust.
     let paper = seed_paper(&pool, "A Paper With A Title").await;
     common::insert_edge(&pool, center, paper, "claim", "paper", "asserts").await;
-
-    // `activity` is a legal edge-endpoint type that this route does not
-    // hydrate; the neighbour must still be rendered, as a bare typed node.
     let activity = seed_activity(&pool).await;
     common::insert_edge(&pool, center, activity, "claim", "activity", "produced").await;
 
@@ -405,7 +411,23 @@ async fn non_claim_neighbours_are_hydrated_and_unknown_types_fall_back(pool: PgP
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(node_ids(&body).len(), 4, "body: {body}");
+
+    let mut ids = node_ids(&body);
+    ids.sort();
+    let mut want = vec![agent.to_string(), trace.to_string()];
+    want.sort();
+    assert_eq!(ids, want, "body: {body}");
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 2);
+    assert_eq!(
+        body["total_edges"], 2,
+        "the unrooted neighbours are not counted either, got {body}"
+    );
+    let text = body.to_string();
+    assert!(!text.contains(&paper.to_string()), "paper leaked: {body}");
+    assert!(
+        !text.contains(&activity.to_string()),
+        "activity leaked: {body}"
+    );
 
     assert_eq!(node(&body, agent)["entity_type"], "agent");
     assert_eq!(node(&body, agent)["label"], "Dr. Ada Lovelace");
@@ -418,16 +440,6 @@ async fn non_claim_neighbours_are_hydrated_and_unknown_types_fall_back(pool: PgP
 
     assert_eq!(node(&body, trace)["entity_type"], "trace");
     assert_eq!(node(&body, trace)["label"], "deductive (0.75)");
-
-    assert_eq!(node(&body, paper)["entity_type"], "paper");
-    assert_eq!(node(&body, paper)["label"], "A Paper With A Title");
-
-    assert_eq!(node(&body, activity)["entity_type"], "activity");
-    assert_eq!(
-        node(&body, activity)["label"],
-        "activity",
-        "an unhydrated neighbour keeps its declared type as its label"
-    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -726,4 +738,320 @@ async fn the_degree_cap_and_invisibility_subtract_independently(pool: PgPool) {
     assert_eq!(body["edges"].as_array().expect("edges").len(), 2);
     assert_eq!(body["truncated"], Value::Bool(true));
     assert_eq!(body["total_edges"], 5);
+}
+
+// ---------------------------------------------------------------------------
+// Non-claim neighbours, by tenancy tier (`entity_types.tenancy_tier`).
+//
+// A viewer-stamped connection does not filter a row the SQL never reads, so a
+// neighbour is withheld only when the edge statement itself checks the far
+// endpoint: on its own columns for the `columns` tier, on the row it derives
+// from for the `derived` tier, and not at all for the `identity` tier.
+// ---------------------------------------------------------------------------
+
+/// Force `edges` to `visibility = 'public'` with no co-owner, so the EDGE
+/// predicate cannot withhold them and the far-endpoint check is the only thing
+/// that can. Without this a test of the far-endpoint check stays green with
+/// that check deleted (see the private-neighbour tests above).
+async fn force_edges_public(pool: &PgPool, edges: &[Uuid]) {
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', co_owner_group_id = NULL WHERE id = ANY($1)",
+    )
+    .bind(edges)
+    .execute(pool)
+    .await
+    .expect("force the connecting edges public");
+    let public: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE id = ANY($1) AND visibility = 'public' \
+           AND co_owner_group_id IS NULL",
+    )
+    .bind(edges)
+    .fetch_one(pool)
+    .await
+    .expect("read the forced edges back");
+    assert_eq!(
+        public,
+        edges.len() as i64,
+        "every connecting edge is public"
+    );
+}
+
+/// `(visibility, owner_group_id)` of one row of a tenancy-column table, read
+/// back so a mis-seeded fixture fails here rather than making a "the stranger
+/// sees nothing" assertion vacuous.
+async fn tenancy_of(pool: &PgPool, table: &str, id: Uuid) -> (String, Uuid) {
+    sqlx::query_as(&format!(
+        "SELECT visibility::text, owner_group_id FROM {table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read tenancy back")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_columns_tier_neighbour_is_absent_for_a_stranger(pool: PgPool) {
+    // A public claim whose evidence row is hidden in the owner's group: the
+    // `columns` tier is judged on the row's OWN tenancy columns, so the public
+    // claim it hangs off must not make it readable.
+    let owner = Uuid::new_v4();
+    let center = common::seed_claim_with_agent(&pool, "public centre", owner).await;
+    let public_neighbour = common::seed_claim(&pool, "public neighbour").await;
+    let evidence = fixture::seed_evidence(&pool, center, "document").await;
+    let to_public = common::insert_edge(
+        &pool,
+        center,
+        public_neighbour,
+        "claim",
+        "claim",
+        "supports",
+    )
+    .await;
+    let to_evidence =
+        common::insert_edge(&pool, center, evidence, "claim", "evidence", "supports").await;
+    force_edges_public(&pool, &[to_public, to_evidence]).await;
+
+    let group = common::personal_group_of(&pool, owner).await;
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(evidence)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("hide the evidence row");
+    assert_eq!(
+        tenancy_of(&pool, "evidence", evidence).await,
+        ("group".to_string(), group)
+    );
+
+    let app = router(&pool).await;
+    let path = format!("/api/v1/claims/{center}/ego");
+
+    let (status, body) = get(&app, &path, Some(&reader())).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        !body.to_string().contains(&evidence.to_string()),
+        "the private evidence id leaked: {body}"
+    );
+    assert_eq!(node_ids(&body), vec![public_neighbour.to_string()]);
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
+    assert_eq!(
+        body["total_edges"], 1,
+        "`total_edges` counts only what the viewer may see, got {body}"
+    );
+
+    // CALIBRATION: the owner sees it, so the stranger's view is about tenancy
+    // and not about evidence neighbours being dropped wholesale.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let (status, body) = get(&app, &path, Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let mut ids = node_ids(&body);
+    ids.sort();
+    let mut want = vec![public_neighbour.to_string(), evidence.to_string()];
+    want.sort();
+    assert_eq!(ids, want, "body: {body}");
+    assert_eq!(node(&body, evidence)["entity_type"], "evidence");
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 2);
+    assert_eq!(body["total_edges"], 2);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_derived_neighbour_of_a_private_root_is_absent_for_a_stranger(pool: PgPool) {
+    // A trace is a `derived` type: it is gated by the claim it derives from.
+    let owner = Uuid::new_v4();
+    let root = common::seed_claim_with_agent(&pool, "classified root", owner).await;
+    common::seed_private_ownership(&pool, root, owner).await;
+    let group = common::personal_group_of(&pool, owner).await;
+    // Seeded AFTER the root went private, so migration 070's inheritance arm
+    // stamps the trace with the root's tenancy, which is the realistic shape.
+    let trace = fixture::seed_reasoning_trace(&pool, root, "deductive").await;
+    assert_eq!(
+        tenancy_of(&pool, "reasoning_traces", trace).await,
+        ("group".to_string(), group)
+    );
+
+    let center = common::seed_claim(&pool, "public centre").await;
+    let to_trace =
+        common::insert_edge(&pool, center, trace, "claim", "trace", "derived_from").await;
+    let to_root = common::insert_edge(&pool, center, root, "claim", "claim", "supports").await;
+    force_edges_public(&pool, &[to_trace, to_root]).await;
+
+    let app = router(&pool).await;
+    let path = format!("/api/v1/claims/{center}/ego");
+    let stranger = reader();
+
+    let (status, body) = get(&app, &path, Some(&stranger)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let text = body.to_string();
+    assert!(!text.contains(&trace.to_string()), "trace leaked: {body}");
+    assert!(!text.contains(&root.to_string()), "root leaked: {body}");
+    assert!(node_ids(&body).is_empty(), "body: {body}");
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 0);
+    assert_eq!(
+        body["total_edges"], 0,
+        "`total_edges` counts only what the viewer may see, got {body}"
+    );
+
+    // CALIBRATION: the owner sees both the trace and its root.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let (status, body) = get(&app, &path, Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let mut ids = node_ids(&body);
+    ids.sort();
+    let mut want = vec![trace.to_string(), root.to_string()];
+    want.sort();
+    assert_eq!(ids, want, "body: {body}");
+    assert_eq!(node(&body, trace)["entity_type"], "trace");
+    assert_eq!(body["total_edges"], 2);
+
+    // The ROOT is what withholds it, not only the trace's own columns: widen
+    // the trace row alone and the stranger must still not see it, because the
+    // claim it derives from is still private.
+    let world = fixture::world_group(&pool).await;
+    sqlx::query(
+        "UPDATE reasoning_traces SET visibility = 'public', owner_group_id = $2 WHERE id = $1",
+    )
+    .bind(trace)
+    .bind(world)
+    .execute(&pool)
+    .await
+    .expect("widen the trace row alone");
+    assert_eq!(
+        tenancy_of(&pool, "reasoning_traces", trace).await,
+        ("public".to_string(), world)
+    );
+    let (status, body) = get(&app, &path, Some(&stranger)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        !body.to_string().contains(&trace.to_string()),
+        "a public trace of a private claim leaked: {body}"
+    );
+    assert_eq!(body["total_edges"], 0, "body: {body}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_non_claim_neighbour_is_still_shown(pool: PgPool) {
+    // Twin of the columns-tier test: the filter must not over-reach and drop
+    // every non-claim neighbour.
+    let center = common::seed_claim(&pool, "public centre").await;
+    let evidence = fixture::seed_evidence(&pool, center, "document").await;
+    // Migration 070 stamps evidence with its claim's tenancy, so it is public
+    // exactly as the centre is.
+    let (visibility, _) = tenancy_of(&pool, "evidence", evidence).await;
+    assert_eq!(visibility, "public");
+    assert_eq!(
+        tenancy_of(&pool, "evidence", evidence).await,
+        tenancy_of(&pool, "claims", center).await
+    );
+    common::insert_edge(&pool, center, evidence, "claim", "evidence", "supports").await;
+    let app = router(&pool).await;
+
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{center}/ego"),
+        Some(&reader()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(node_ids(&body), vec![evidence.to_string()]);
+    assert_eq!(node(&body, evidence)["entity_type"], "evidence");
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
+    assert_eq!(body["total_edges"], 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_neighbour_is_still_shown(pool: PgPool) {
+    // The `identity` tier: an agent carries no tenancy columns and is
+    // rendered on public content by design, so a stranger sees it.
+    let center = common::seed_claim(&pool, "public centre").await;
+    let agent = seed_agent_named(&pool, "An Author").await;
+    common::insert_edge(&pool, center, agent, "claim", "agent", "attributed_to").await;
+    let app = router(&pool).await;
+
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{center}/ego"),
+        Some(&reader()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(node_ids(&body), vec![agent.to_string()]);
+    assert_eq!(node(&body, agent)["label"], "An Author");
+    assert_eq!(body["total_edges"], 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_bypass_viewer_still_sees_unrooted_neighbours(pool: PgPool) {
+    // The unrooted-derived drop is keyed on the viewer, not on the type: a
+    // bypass viewer (no tenancy predicate at all) still gets them. Read at the
+    // repo layer because no bearer resolves to a bypass viewer. The harness
+    // pool is the superuser, so RLS filters nothing on this connection and the
+    // in-query predicate is the only filter in play.
+    let center = common::seed_claim(&pool, "centre").await;
+    let paper = seed_paper(&pool, "A Paper With A Title").await;
+    common::insert_edge(&pool, center, paper, "claim", "paper", "asserts").await;
+    let activity = seed_activity(&pool).await;
+    common::insert_edge(&pool, center, activity, "claim", "activity", "produced").await;
+
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let got = EgoRepository::edges(&mut conn, &bypass, center, 40, None)
+        .await
+        .expect("bypass edges");
+    let far: HashSet<Uuid> = got.outbound.iter().map(|e| e.target_id).collect();
+    assert_eq!(far, HashSet::from([paper, activity]));
+    assert_eq!(got.total_edges, 2);
+
+    let hydrated = EgoRepository::hydrate(&mut conn, &bypass, &[paper])
+        .await
+        .expect("bypass hydrate");
+    assert_eq!(hydrated.len(), 1);
+    assert_eq!(hydrated[0].entity_type, "paper");
+    assert_eq!(hydrated[0].label, "A Paper With A Title");
+
+    // CALIBRATION: the same rows through a scoped viewer with no groups.
+    let stranger = fixture::public_viewer(&pool).await;
+    let got = EgoRepository::edges(&mut conn, &stranger, center, 40, None)
+        .await
+        .expect("scoped edges");
+    assert!(got.outbound.is_empty(), "{:?}", got.outbound);
+    assert_eq!(got.total_edges, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ego_tier_arms_match_the_registry(pool: PgPool) {
+    // `EgoRepository::edges` writes one far-endpoint arm per `columns` type
+    // (on its own table), the `identity` arm for `agent`, and a rooted arm for
+    // trace, experiment and experiment_result. Anything else is dropped for a
+    // non-bypass viewer. If a migration reclassifies or adds a type, this
+    // fails, and the arms in `repos/ego.rs` have to be revisited with it.
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT type_name, tenancy_tier FROM entity_types ORDER BY type_name")
+            .fetch_all(&pool)
+            .await
+            .expect("read the registry");
+    let tier = |t: &str| -> Vec<String> {
+        rows.iter()
+            .filter(|(_, tr)| tr == t)
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    assert_eq!(
+        tier("columns"),
+        vec![
+            "claim",
+            "community",
+            "context",
+            "evidence",
+            "frame",
+            "perspective"
+        ]
+    );
+    assert_eq!(tier("identity"), vec!["agent"]);
+    let derived = tier("derived");
+    for rooted in ["experiment", "experiment_result", "trace"] {
+        assert!(
+            derived.iter().any(|d| d == rooted),
+            "{rooted} is no longer `derived`: {derived:?}"
+        );
+    }
 }
