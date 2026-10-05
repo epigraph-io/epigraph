@@ -1764,7 +1764,8 @@ async fn access_token_revocation_prune_keeps_a_day_of_clock_skew_margin(pool: Pg
     assert!(
         !RevokedAccessTokenRepository::is_revoked(&app, twenty_five_h)
             .await
-            .expect("read as epigraph_app")
+            .expect("read as epigraph_app"),
+        "the row 25 h past expiry is outside the margin and was pruned"
     );
 }
 
@@ -1772,26 +1773,34 @@ async fn access_token_revocation_prune_keeps_a_day_of_clock_skew_margin(pool: Pg
 /// just verified the token as unexpired on ITS clock. If the definer then
 /// declined it as expired on the database clock, a host lagging the database
 /// would keep admitting a token whose revocation was answered 200. The definer
-/// therefore records any token less than the 24 h margin past its expiry.
+/// therefore records any token less than the 24 h margin past its expiry. The
+/// 23 h case pins this insert guard to the same (23 h, 25 h] window as the
+/// prune (the 25 h decline is in `access_token_revocations_go_through_the_definer_and_prune`),
+/// so the two checks the migration says to keep equal cannot drift apart.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_token_expired_inside_the_skew_margin_is_still_recorded(pool: PgPool) {
     use chrono::{Duration, Utc};
     use epigraph_db::RevokedAccessTokenRepository;
     let app = app_pool(&pool, 2).await;
-    let jti = Uuid::new_v4();
-    assert!(
-        RevokedAccessTokenRepository::revoke(
-            &app,
-            jti,
-            Uuid::new_v4(),
-            Utc::now() - Duration::hours(2)
-        )
-        .await
-        .expect("revoke as epigraph_app"),
-        "a token 2 h past its expiry on the database clock may still be live on \
-         a lagging API host: the definer must record it"
-    );
-    assert!(RevokedAccessTokenRepository::is_revoked(&app, jti)
-        .await
-        .expect("read as epigraph_app"));
+    for hours in [2, 23] {
+        let jti = Uuid::new_v4();
+        assert!(
+            RevokedAccessTokenRepository::revoke(
+                &app,
+                jti,
+                Uuid::new_v4(),
+                Utc::now() - Duration::hours(hours)
+            )
+            .await
+            .expect("revoke as epigraph_app"),
+            "a token {hours} h past its expiry on the database clock may still be \
+             live on a lagging API host: the definer must record it"
+        );
+        assert!(
+            RevokedAccessTokenRepository::is_revoked(&app, jti)
+                .await
+                .expect("read as epigraph_app"),
+            "a token recorded {hours} h past its expiry answers is_revoked"
+        );
+    }
 }
