@@ -518,6 +518,16 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          a session principal, and is reachable on the anonymous OAuth router.",
     ),
     (
+        "oauth/scopes.rs",
+        1,
+        "Pre-authentication, inside token issuance (elevation plan EL-9). The mint chokepoint \
+         reads migration 128's admin-scope switch through its app-callable definer and, while \
+         unarmed, records the would-strip measurement through another, both before the \
+         principal being minted exists; one pool binding serves both. Neither reads a \
+         tenancy-partitioned row: the switch is one control row and the recorder writes one \
+         `oauth.` event about the client.",
+    ),
+    (
         "oauth/token.rs",
         17,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \

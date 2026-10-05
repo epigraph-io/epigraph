@@ -1306,6 +1306,45 @@ async fn the_elevated_token_carries_no_write_scope(pool: PgPool) {
     );
 }
 
+/// ARMED (migration 128's admin-scope switch), the elevate grant still mints
+/// the client's read scopes plus `platform:admin`, and no admin-only scope:
+/// the mint chokepoint's armed strip never touches what elevation is FOR, and
+/// the standing admin scopes stay replaced, not stacked. Calibration: the
+/// switch reads armed for the application role.
+///
+/// Mutations: `grantable` routing the elevate grant through the general path
+/// (it drops `platform:admin` like every other grant) -> the scope is gone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn armed_the_elevate_grant_keeps_platform_admin_and_no_admin_only_scope(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    grant_scopes(&pool, &p, &["claims:read", "claims:admin", "groups:admin"]).await;
+    sqlx::query("SELECT * FROM public.epigraph_set_admin_scope_enforcement(true, 'el9 elevate')")
+        .execute(&pool)
+        .await
+        .expect("arm");
+    let armed: bool = sqlx::query_scalar("SELECT public.epigraph_admin_scopes_armed()")
+        .fetch_one(&pool)
+        .await
+        .expect("armed read");
+    assert!(armed, "CALIBRATION: the switch is armed");
+
+    let (ticket, secret) = open(&s, &p, "armed elevate").await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s.redeem(ticket, &secret, &p.client_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut scopes = s
+        .jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .expect("a valid token")
+        .scopes;
+    scopes.sort();
+    assert_eq!(scopes, vec!["claims:read", "platform:admin"]);
+    assert_eq!(body["scope"], "claims:read platform:admin");
+}
+
 /// The grant refuses, with one `invalid_grant` and WITHOUT spending the
 /// ticket: a wrong secret, a malformed one, another client's `client_id`, an
 /// unknown client; and a request missing a parameter is `invalid_request`.

@@ -1972,6 +1972,17 @@ it unarmed.
    deploy order between the two is free.
 2. **Deploy** `epigraph-tenancy-backfill` built from the same commit (`verify`
    checks the 128 definers' owner and grants).
+3. **Deploy** `epigraph-api`, in any order with the migration. Its token
+   endpoint builds every token's scopes through ONE mint chokepoint
+   (`oauth::scopes::grantable`): the authorization-code exchange, the refresh
+   grant, client credentials (agent and service), an external provider's
+   assertion grant, the browser redirect exchange and the elevate grant. When
+   a token would carry an admin-only scope it reads the switch: unarmed, the
+   scope is kept and one `oauth.admin_scope_would_strip` event is recorded
+   (per client per hour); armed, the scope is stripped; a database without
+   128 is unarmed; a switch the application role cannot read strips (fail
+   closed). The elevate grant is unaffected either way (read scopes plus
+   `platform:admin`). A token without an admin-only scope never reads it.
 
 **Every change is audited.** Arming and disarming are maintenance acts with a
 reason; each writes one `platform.admin_scopes_armed` or

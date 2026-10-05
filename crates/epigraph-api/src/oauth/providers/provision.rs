@@ -166,21 +166,27 @@ pub async fn provision_external_user(
     provider: &dyn ExternalIdentityProvider,
     identity: &ExternalIdentity,
     requested_scope: Option<&str>,
+    grant: crate::oauth::scopes::MintGrant,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
     use epigraph_db::repos::refresh_token::RefreshTokenRepository;
 
     let client = provision_external_user_client(state, provider, identity).await?;
 
     let ttl = Duration::hours(1);
-    // Never the elevation scope (only the elevate grant mints it).
-    let effective_scopes = epigraph_auth::without_elevated_only_scope(match requested_scope {
+    // The request's intersection with the client's scopes, through the mint
+    // chokepoint (never the elevation scope; the admin-only scopes per
+    // migration 128's switch), under the grant that reached this mint (the
+    // token endpoint's assertion grant or the redirect exchange).
+    let requested_scopes = match requested_scope {
         Some(req) => req
             .split(' ')
             .map(|s| s.to_string())
             .filter(|s| client.granted_scopes.contains(s))
             .collect::<Vec<_>>(),
         None => client.granted_scopes.clone(),
-    });
+    };
+    let effective_scopes =
+        crate::oauth::scopes::grantable(state, client.id, requested_scopes, grant).await;
 
     // The FOURTH token-mint site (the other three are in oauth/token.rs). It
     // previously passed literal `None` for both owner_id and agent_id, so every

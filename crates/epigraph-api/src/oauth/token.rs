@@ -397,7 +397,14 @@ async fn handle_external_grant(
         }
     };
 
-    provision_external_user(state, provider.as_ref(), &identity, req.scope.as_deref()).await
+    provision_external_user(
+        state,
+        provider.as_ref(),
+        &identity,
+        req.scope.as_deref(),
+        crate::oauth::scopes::MintGrant::ExternalAssertion,
+    )
+    .await
 }
 
 // ── Agent assertion verification ─────────────────────────────────────────
@@ -587,9 +594,10 @@ async fn handle_client_credentials(
         _ => Duration::minutes(15),
     };
 
-    // Effective scopes = intersection of requested and granted, never the
-    // elevation scope (only the elevate grant mints it).
-    let effective_scopes = epigraph_auth::without_elevated_only_scope({
+    // Effective scopes = intersection of requested and granted, through the
+    // mint chokepoint (never the elevation scope; the admin-only scopes per
+    // migration 128's switch).
+    let requested_scopes = {
         let granted = &client.granted_scopes;
         match &req.scope {
             Some(requested) => {
@@ -601,7 +609,14 @@ async fn handle_client_credentials(
             }
             None => granted.clone(),
         }
-    });
+    };
+    let effective_scopes = crate::oauth::scopes::grantable(
+        state,
+        client.id,
+        requested_scopes,
+        crate::oauth::scopes::MintGrant::ClientCredentials,
+    )
+    .await;
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
@@ -795,10 +810,15 @@ async fn handle_refresh_token(
     };
 
     // Use client's current granted_scopes (may have been updated since refresh
-    // token was issued), never the elevation scope (only the elevate grant
-    // mints it).
-    let effective_scopes =
-        epigraph_auth::without_elevated_only_scope(client.granted_scopes.clone());
+    // token was issued), through the mint chokepoint (never the elevation
+    // scope; the admin-only scopes per migration 128's switch).
+    let effective_scopes = crate::oauth::scopes::grantable(
+        state,
+        client.id,
+        client.granted_scopes.clone(),
+        crate::oauth::scopes::MintGrant::RefreshToken,
+    )
+    .await;
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
@@ -1060,8 +1080,15 @@ async fn handle_authorization_code(
         "service" => Duration::hours(1),
         _ => Duration::minutes(15),
     };
-    // Never the elevation scope (only the elevate grant mints it).
-    let effective_scopes = epigraph_auth::without_elevated_only_scope(row.scopes.clone());
+    // The code's consented scopes, through the mint chokepoint (never the
+    // elevation scope; the admin-only scopes per migration 128's switch).
+    let effective_scopes = crate::oauth::scopes::grantable(
+        state,
+        client.id,
+        row.scopes.clone(),
+        crate::oauth::scopes::MintGrant::AuthorizationCode,
+    )
+    .await;
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
     // their next token, and so all four mint sites share one code path.
@@ -1306,7 +1333,13 @@ async fn handle_elevate_grant(
         return Err(elevate_error("invalid_grant", INVALID));
     }
     let ttl = Duration::seconds(secs);
-    let scopes = elevated_scopes(&client.granted_scopes);
+    let scopes = crate::oauth::scopes::grantable(
+        state,
+        client.id,
+        client.granted_scopes.clone(),
+        crate::oauth::scopes::MintGrant::Elevate,
+    )
+    .await;
     let binding = epigraph_auth::AccessTokenBinding {
         family_id: Some(family),
         elevation_id: Some(session),
