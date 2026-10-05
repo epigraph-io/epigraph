@@ -1069,3 +1069,49 @@ async fn a_standing_admin_scope_is_absent_on_an_mcp_tool_while_armed(pool: PgPoo
     let again = el10_delete_edge(&url, &token).await;
     assert!(!again.contains(gate), "disarmed: the gate passes: {again}");
 }
+
+/// An ELEVATED request's database-checked elevation reaches the MCP scope
+/// gate: through the real `call_tool`, P's elevated token (the elevate
+/// grant's read scopes plus `platform:admin`, no `claims:admin`) passes
+/// `delete_edge`'s `claims:admin` gate and is then refused as ELEVATED
+/// READ-ONLY (every write tool is). Calibration: the same scopes on a token
+/// whose claim names no live session stop at the scope gate.
+///
+/// Verified to fail with `call_tool` not setting the request's elevation (the
+/// elevated call stops at the scope gate).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_request_holds_the_admin_read_scopes_at_the_mcp_gate(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "el10-mcp-elevated").await;
+    let (client, family) = make_holder(&pool, p, 9).await;
+    let live = session(&pool, p, client, family, 9, "grant").await;
+    let url = el8_listener(&pool).await;
+    let mint = |elv: Uuid| {
+        epigraph_auth::JwtConfig::from_secret(EL8_SECRET)
+            .issue_access_token(
+                client,
+                vec!["claims:read".to_string(), "platform:admin".to_string()],
+                "human",
+                None,
+                Some(p),
+                chrono::Duration::minutes(10),
+                epigraph_auth::AccessTokenBinding {
+                    family_id: Some(family),
+                    elevation_id: Some(elv),
+                },
+            )
+            .expect("mint")
+            .0
+    };
+    let gate = "requires scope 'claims:admin'";
+
+    let forged = el10_delete_edge(&url, &mint(Uuid::new_v4())).await;
+    assert!(
+        forged.contains(gate),
+        "CALIBRATION: no live elevation, no admin scope: {forged}"
+    );
+    let elevated = el10_delete_edge(&url, &mint(live)).await;
+    assert!(
+        !elevated.contains(gate) && elevated.contains("ELEVATED READ-ONLY"),
+        "elevated: past the scope gate, refused as a write: {elevated}"
+    );
+}

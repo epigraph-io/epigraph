@@ -4,11 +4,14 @@
 //!
 //! # How a request is known to be elevated
 //!
-//! Only [`super::bearer::ViewerExtractor`] decides it, by resolving the
-//! token's elevation claim against the database. So this layer, which runs
-//! around the handler, hands the extractor a [`ElevatedAccessSlot`] in the
-//! request's extensions, and the extractor MARKS it when (and only when) it
-//! builds an elevated viewer. After the handler, a marked slot means the
+//! Two places resolve the token's elevation claim against the database, and
+//! both MARK the request's [`ElevatedAccessSlot`] when the session is live:
+//! this layer itself (elevation plan EL-10), which then also sets the
+//! request's `AuthContext::elevation`, the authority `has_scope` grants the
+//! admin-only read scopes from, so a handler that takes no viewer is
+//! recorded too; and [`super::bearer::ViewerExtractor`], when it builds an
+//! elevated viewer. The two routes that act as the person
+//! ([`UNELEVATED_ROUTES`]) are resolved by neither. After the handler, a marked slot means the
 //! response was produced for an elevated viewer, and it is recorded. A request
 //! whose token claims an elevation that is not live resolves the scoped viewer,
 //! leaves the slot unmarked, and is served as before. The extractor REFUSES an
@@ -66,6 +69,16 @@ pub const MAX_RECORDED_BODY: usize = 64 * 1024 * 1024;
 /// The longest path or query string the log keeps.
 const MAX_ARG_TEXT: usize = 2048;
 
+/// The routes that act as the PERSON, never as an elevation (open a ticket,
+/// end an elevation: [`super::bearer::UnelevatedViewer`]). The layer does not
+/// resolve an elevation for them, so nothing they do is recorded as an
+/// elevated access (an end would otherwise be refused by the session it just
+/// ended, and its response withheld).
+pub const UNELEVATED_ROUTES: [(&str, &str); 2] = [
+    ("POST", "/api/v1/elevation/tickets"),
+    ("POST", "/api/v1/elevation/end"),
+];
+
 /// The non-GET routes a token carrying an elevation claim may still call
 /// (`(method, matched route)`): the two elevation routes, which act as the
 /// PERSON rather than as the elevation (open a ticket, end an elevation:
@@ -74,8 +87,8 @@ const MAX_ARG_TEXT: usize = 2048;
 /// non-GET request with an elevation claim is refused. Adding a route here is
 /// a security decision: it must write nothing, directly or through a definer.
 pub const ELEVATED_NON_GET_ALLOWLIST: &[(&str, &str)] = &[
-    ("POST", "/api/v1/elevation/tickets"),
-    ("POST", "/api/v1/elevation/end"),
+    (UNELEVATED_ROUTES[0].0, UNELEVATED_ROUTES[0].1),
+    (UNELEVATED_ROUTES[1].0, UNELEVATED_ROUTES[1].1),
     ("POST", "/api/v1/search/semantic"),
     ("POST", "/api/v1/graph/query"),
     ("POST", "/api/v1/triples/query"),
@@ -205,6 +218,46 @@ pub async fn record_elevated_access(
     let mut request = Request::from_parts(parts, Body::from(bytes));
     let slot = ElevatedAccessSlot::default();
     request.extensions_mut().insert(slot.clone());
+
+    // THE AUTH LAYER'S ELEVATION (elevation plan EL-10): the claim, with its
+    // family, checked against the database. Live: the request's AuthContext
+    // carries the elevation (so `has_scope` grants the admin-only read
+    // authority it stands for) and the slot is MARKED here, so every response
+    // that authority produces is recorded, whether or not the handler takes a
+    // viewer. Not live: served unelevated, nothing recorded.
+    let unelevated_route = UNELEVATED_ROUTES
+        .iter()
+        .any(|(m, r)| *m == request.method().as_str() && *r == route);
+    if let (Some(elv), Some(family), Some(principal), false) = (
+        auth.elevation_claim,
+        auth.family_id,
+        auth.agent_id,
+        unelevated_route,
+    ) {
+        let Some(scoped) = state.scoped.as_ref() else {
+            return next.run(request).await;
+        };
+        let viewer =
+            match epigraph_db::Viewer::resolve_elevated(scoped, principal, Some(elv), family).await
+            {
+                Ok(v) => v,
+                Err(e) => return ApiError::from(e).into_response(),
+            };
+        if let Some(elevation) = viewer.elevation() {
+            let checked = epigraph_auth::ElevationRef {
+                session_id: elevation.session_id,
+                family_id: elevation.family_id,
+            };
+            if let Some(ctx) = request.extensions_mut().get_mut::<AuthContext>() {
+                ctx.elevation = Some(checked);
+            }
+            slot.mark(ElevatedMark {
+                principal,
+                session_id: elevation.session_id,
+                family_id: elevation.family_id,
+            });
+        }
+    }
 
     let response = next.run(request).await;
 

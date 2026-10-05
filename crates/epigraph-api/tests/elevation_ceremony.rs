@@ -2663,3 +2663,52 @@ async fn an_elevated_token_writes_through_no_non_get_route(pool: PgPool) {
         "the elevated token ends its own session"
     );
 }
+
+/// An ELEVATED token reads an admin route that takes no viewer (`GET
+/// /api/v1/admin/stats`, `RequireScopeAdmin`): the recorder layer checks the
+/// claim against the database and sets the request's elevation, so the
+/// elevate grant's `platform:admin` stands in for the `claims:admin` it
+/// stripped (200), and the layer MARKS the request, so the access is recorded
+/// (exactly one `elevated_access` row for the route) although no viewer was
+/// built. Calibrations: the same scopes on a token whose claim names no live
+/// session are refused (403: elevation, not the scope string, is the
+/// authority); a plain read writes no row.
+///
+/// Verified to fail with the layer not setting the request's elevation (403),
+/// and with the layer not marking the slot (200 and no row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_admin_read_is_served_and_recorded(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (_, t) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let scopes = ["claims:read", "platform:admin"];
+    let rows = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM elevated_access WHERE surface = 'GET /api/v1/admin/stats'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let forged = s.scoped_token(&p, Some(Uuid::new_v4()), &scopes);
+    let (status, body) = s.get("/api/v1/admin/stats", &forged).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "CALIBRATION: platform:admin without a live elevation is nothing: {body}"
+    );
+    assert_eq!(rows().await, 0, "an unelevated request records nothing");
+
+    let elevated = s.scoped_token(&p, Some(session), &scopes);
+    let (status, body) = s.get("/api/v1/admin/stats", &elevated).await;
+    assert_eq!(status, StatusCode::OK, "the elevated admin read: {body}");
+    assert_eq!(rows().await, 1, "recorded once, though no viewer was built");
+}

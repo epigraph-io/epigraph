@@ -2392,6 +2392,23 @@ impl ServerHandler for EpiGraphMcpFull {
             auth.admin_scopes = self.admin_scope_posture().await;
         }
 
+        // THE PER-ACCESS RECORDER (elevation plan EL-8; `crate::elevated_access`)
+        // and THE CHECK CHOKEPOINT's elevation (EL-10). A request that MAY be
+        // elevated has its viewer resolved once, here, before any scope gate:
+        // elevated, the AuthContext carries the database-checked elevation (the
+        // authority `has_scope` grants the admin-only read scopes from) and the
+        // result is recorded before it is returned (or withheld); not
+        // elevated, the claim and the family are stripped from the AuthContext
+        // the tool sees, so the tool cannot resolve an elevated viewer this
+        // wrapper did not see. Every other request pays nothing.
+        let elevated = self.elevation_at_dispatch(auth_owned.as_mut()).await?;
+        if let (Some(viewer), Some(auth)) = (elevated.as_ref(), auth_owned.as_mut()) {
+            auth.elevation = viewer.elevation().map(|e| epigraph_auth::ElevationRef {
+                session_id: e.session_id,
+                family_id: e.family_id,
+            });
+        }
+
         // FEDERATION BRANCH — only for names the static tool router does NOT own.
         // Must intercept BEFORE the static scope gate below: that gate fails
         // closed for any name absent from `SCOPE_MAP`, and federated tools are
@@ -2504,13 +2521,6 @@ impl ServerHandler for EpiGraphMcpFull {
             }
         }
 
-        // THE PER-ACCESS RECORDER (elevation plan EL-8; `crate::elevated_access`).
-        // A request that MAY be elevated has its viewer resolved once, here:
-        // elevated, its result is recorded before it is returned (or withheld);
-        // not elevated, the claim and the family are stripped from the
-        // AuthContext the tool sees, so the tool cannot resolve an elevated
-        // viewer this wrapper did not see. Every other request pays nothing.
-        let elevated = self.elevation_at_dispatch(auth_owned.as_mut()).await?;
         let recording = elevated.as_ref().map(|_| {
             (
                 request.name.to_string(),
