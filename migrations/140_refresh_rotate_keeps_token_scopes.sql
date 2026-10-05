@@ -23,9 +23,10 @@
 --
 -- The request path (`oauth/token.rs::handle_refresh_token`) computes the same
 -- intersection from the scopes `RefreshTokenRepository::check` reads. The two
--- read `granted_scopes` at different moments; a grant changed in between can
--- only make the stored successor narrower than the issued access token's
--- ceiling, never wider.
+-- read `granted_scopes` at different moments, so a grant changed in between
+-- can make the stored successor differ from the issued access token's ceiling
+-- (narrower after a revoke, or holding a scope re-granted in between), but
+-- never beyond the presented token's stored scopes.
 --
 -- Existing rows keep what they store. Chains rotated under 118 already carry
 -- the client's whole grant, and this file does NOT heal them: every rotation

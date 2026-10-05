@@ -826,8 +826,10 @@ async fn handle_refresh_token(
     // (migration 140: the presented token's scopes narrowed to the client's
     // `granted_scopes`, which is `effective_scopes` before any request
     // narrowing) and caps its expiry at the same TTL table as below. It reads
-    // `granted_scopes` a moment after this handler did; a grant changed in
-    // between can only narrow the successor further, never widen it.
+    // `granted_scopes` a moment after this handler did, so a grant changed in
+    // between can make the successor differ from `effective_scopes` (narrower,
+    // or holding a scope re-granted in between), but never beyond the presented
+    // token's stored scopes.
     let new_refresh = {
         use rand::Rng;
         let raw: [u8; 32] = rand::thread_rng().gen();
