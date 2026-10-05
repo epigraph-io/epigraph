@@ -3154,6 +3154,24 @@ pub struct SudoParams {
     pub reason: String,
 }
 
+/// `propose_admin_act` (elevation plan EL-12b): an administrative act an
+/// ELEVATED caller asks its own passkey to confirm.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProposeAdminActParams {
+    #[schemars(
+        description = "The act: role.grant, role.end, claim.custodial_supersede or passkey.register"
+    )]
+    pub kind: String,
+    #[schemars(
+        description = "The act's arguments, exactly the kind's keys. role.grant: role, holder (uuid), valid_from (time or null: from the execution), valid_to (time or null: open-ended), reason. role.end: assignment (uuid), reason. claim.custodial_supersede: claim (uuid), content_sha256 (64 hex), truth (decimal string, six places), reason, allow_owned (bool). passkey.register: person (your own uuid), label (or null), reason"
+    )]
+    pub args: serde_json::Map<String, serde_json::Value>,
+    #[schemars(
+        description = "Why you propose it (shown on the confirmation page and kept in the audit trail; at most 500 characters)"
+    )]
+    pub reason: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RetireMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to retire")]

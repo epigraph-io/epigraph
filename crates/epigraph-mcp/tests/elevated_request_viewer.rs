@@ -1790,3 +1790,173 @@ async fn the_manifest_lists_admin_tools_as_the_scope_gate_admits_them(pool: PgPo
         "armed and elevated: listed"
     );
 }
+
+// =====================================================================
+// EL-12b: propose_admin_act, listed and served only to an elevated request
+// =====================================================================
+
+/// `(proposed_by, elevation_id, jti)` of every act, oldest first.
+async fn el12b_acts(pool: &PgPool) -> Vec<(Uuid, Uuid, Option<String>, Uuid)> {
+    sqlx::query_as(
+        "SELECT proposed_by, elevation_id, jti, id FROM pending_admin_acts \
+          ORDER BY proposed_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the acts")
+}
+
+fn el12b_args(holder: Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "role.grant",
+        "args": {"role": "role:auditor", "holder": holder.to_string(), "valid_from": null,
+                 "valid_to": null, "reason": "audit"},
+        "reason": "grant an auditor"
+    })
+}
+
+/// `propose_admin_act` is listed (by `tools/list` and by the `list_mcp_tools`
+/// tool) ONLY to an ELEVATED request, here a grant-mode elevation claim with
+/// the connector switch OFF (the CLI path, the one served by default): P's
+/// plain token neither sees it nor can call it (the database refuses: ELV07,
+/// nothing written). P's elevated call answers ONLY the confirmation page's
+/// URL, under the server's public base, naming the one act, which names P,
+/// P's session and the token's jti; and the call is recorded as an elevated
+/// access.
+///
+/// Verified to fail with the listing rule admitting every HTTP caller (the
+/// plain token sees it), with its SCOPE_MAP scope a write scope (the
+/// dispatch's read-only refusal refuses the elevated call), and with the tool
+/// proposing as the caller's plain viewer (ELV07 for the elevated call too).
+#[sqlx::test(migrations = "../../migrations")]
+async fn propose_admin_act_is_listed_and_served_only_to_an_elevated_request(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "el12b-p").await;
+    let (x, _) = fixture::seed_human_operator(&pool, "el12b-grantee").await;
+    let (client, family) = make_holder(&pool, p, 41).await;
+    let live = session(&pool, p, client, family, 41, "grant").await;
+    let url = listener(
+        &pool,
+        epigraph_db::AdminScopeArmingCache::DEFAULT_TTL,
+        false,
+    )
+    .await;
+    let plain = el11_token(p, client, Some(family), None, "human", &["claims:read"]);
+    let elevated = el11_token(
+        p,
+        client,
+        Some(family),
+        Some(live),
+        "human",
+        &["claims:read", "platform:admin"],
+    );
+    let has = |names: &[String]| names.iter().any(|n| n == "propose_admin_act");
+
+    assert!(!has(&el11_list(&url, &plain).await), "plain: not listed");
+    assert!(
+        !has(&el11_meta_list(&url, &plain).await),
+        "plain: not in list_mcp_tools"
+    );
+    let answer = el11_call(&url, &plain, "propose_admin_act", el12b_args(x)).await;
+    let refused = el11_error(&answer).unwrap_or_else(|| panic!("plain call: {answer}"));
+    assert!(refused.contains("ELEVATED request"), "{refused}");
+    assert!(el12b_acts(&pool).await.is_empty(), "nothing proposed");
+
+    assert!(has(&el11_list(&url, &elevated).await), "elevated: listed");
+    assert!(
+        has(&el11_meta_list(&url, &elevated).await),
+        "elevated: in list_mcp_tools"
+    );
+    let before = el8_log(&pool)
+        .await
+        .iter()
+        .filter(|r| r.0 == "mcp:propose_admin_act")
+        .count();
+    let answer = el11_call(&url, &elevated, "propose_admin_act", el12b_args(x)).await;
+    let result = el11_result(&answer).unwrap_or_else(|| panic!("elevated call: {answer}"));
+    let keys: Vec<&String> = result.as_object().expect("an object").keys().collect();
+    assert_eq!(keys, vec!["url"], "only the URL: {result}");
+    let acts = el12b_acts(&pool).await;
+    assert_eq!(acts.len(), 1, "one act");
+    let jti = epigraph_auth::JwtConfig::from_secret(EL8_SECRET)
+        .validate_token(&elevated)
+        .expect("valid")
+        .jti
+        .to_string();
+    assert_eq!(
+        (acts[0].0, acts[0].1, acts[0].2.as_deref()),
+        (p, live, Some(jti.as_str()))
+    );
+    assert_eq!(
+        result["url"],
+        format!("{EL11_BASE}/elevate/act/{}", acts[0].3)
+    );
+    let after = el8_log(&pool)
+        .await
+        .iter()
+        .filter(|r| r.0 == "mcp:propose_admin_act")
+        .count();
+    assert_eq!(after, before + 1, "the proposal is recorded");
+}
+
+/// An AGENT cannot propose (its token resolves no elevation, even carrying a
+/// forged claim naming a holder's live session: the database refuses), and
+/// over stdio the tool refuses before any viewer is resolved. Regression pin:
+/// agents never elevate (CUS01, 125's ELV02).
+#[sqlx::test(migrations = "../../migrations")]
+async fn propose_admin_act_is_refused_to_an_agent_and_over_stdio(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "el12b-holder").await;
+    let (client, family) = make_holder(&pool, p, 42).await;
+    let live = session(&pool, p, client, family, 42, "grant").await;
+    let (g, _) = fixture::seed_agent_with_group(&pool, "el12b-agent").await;
+    let g_client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id, owner_id) \
+         VALUES ($1, 'el12b-agent', 'agent', ARRAY['claims:read'], ARRAY['claims:read'], \
+                 'active', $2, $3) RETURNING id",
+    )
+    .bind(format!("el12b-agent-{g}"))
+    .bind(g)
+    .bind(client)
+    .fetch_one(&pool)
+    .await
+    .expect("agent client");
+    let url = listener(
+        &pool,
+        epigraph_db::AdminScopeArmingCache::DEFAULT_TTL,
+        false,
+    )
+    .await;
+    for elv in [None, Some(live)] {
+        let token = el11_token(
+            g,
+            g_client,
+            Some(family),
+            elv,
+            "agent",
+            &["claims:read", "platform:admin"],
+        );
+        let answer = el11_call(&url, &token, "propose_admin_act", el12b_args(p)).await;
+        assert!(
+            el11_error(&answer).is_some(),
+            "agent (elv {elv:?}): {answer}"
+        );
+    }
+    assert!(el12b_acts(&pool).await.is_empty(), "nothing proposed");
+
+    let server = app_server(&pool).await;
+    let stdio = server
+        .propose_admin_act(
+            rmcp::handler::server::wrapper::Parameters(
+                epigraph_mcp::types::ProposeAdminActParams {
+                    kind: "role.grant".into(),
+                    args: serde_json::Map::new(),
+                    reason: "stdio".into(),
+                },
+            ),
+            rmcp::model::Extensions::default(),
+        )
+        .await;
+    let refused = format!("{:?}", stdio.expect_err("stdio is refused"));
+    assert!(refused.contains("stdio"), "{refused}");
+    assert!(el12b_acts(&pool).await.is_empty(), "nothing over stdio");
+}

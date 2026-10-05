@@ -76,6 +76,14 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // 125's principal-bound definers refuse anyone who may not elevate).
     ("sudo", "claims:read"),
     ("unsudo", "claims:read"),
+    // Proposing an admin act (elevation plan EL-12b): `claims:read`, so
+    // `refuse_elevated_write` lets it through to an ELEVATED request, the only
+    // kind that can propose. It writes no corpus row: one authority record
+    // through migration 130's elevation-gated definer (ELV07 refuses any
+    // unelevated connection), which the proposer's passkey must still confirm
+    // and the maintenance CLI must still execute. Listed only to an elevated
+    // request (`tools::elevation::listed`).
+    ("propose_admin_act", "claims:read"),
     // ─── claims:write ──────────────────────────────────────────────────
     ("add_step", "claims:write"),
     ("batch_submit_claims", "claims:write"),

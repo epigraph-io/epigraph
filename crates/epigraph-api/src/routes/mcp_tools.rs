@@ -17,8 +17,9 @@ use crate::middleware::bearer::AuthContext;
 /// Behind bearer auth (see `routes/mod.rs`). Filtered as the MCP manifest is
 /// (elevation plan EL-11, `epigraph_mcp::catalog_for`): an admin-only-scoped
 /// tool only where the caller's scope gate would admit it (armed: an elevated
-/// request), and never `sudo`/`unsudo`, which an MCP connection lists to a
-/// role holder itself.
+/// request), `propose_admin_act` only to an elevated request (EL-12b), and
+/// never `sudo`/`unsudo`, which an MCP connection lists to a role holder
+/// itself.
 #[cfg(feature = "db")]
 pub async fn list_mcp_tools(Extension(auth): Extension<AuthContext>) -> Json<Value> {
     Json(epigraph_mcp::catalog_for(&auth))
@@ -93,6 +94,27 @@ mod tests {
             "armed standing scope"
         );
         assert!(!reader.iter().any(|n| n == "delete_edge"), "no scope");
+
+        // propose_admin_act (EL-12b): only to a caller whose elevation the
+        // recorder layer confirmed (`AuthContext::elevation`).
+        for list in [&holder_unarmed, &holder_armed, &reader] {
+            assert!(
+                !list.iter().any(|n| n == "propose_admin_act"),
+                "not elevated: {list:?}"
+            );
+        }
+        let mut elevated = caller(&["claims:read"], Armed);
+        elevated.0.elevation = Some(epigraph_auth::ElevationRef {
+            session_id: uuid::Uuid::new_v4(),
+            family_id: uuid::Uuid::new_v4(),
+        });
+        assert!(
+            names(elevated)
+                .await
+                .iter()
+                .any(|n| n == "propose_admin_act"),
+            "elevated: listed"
+        );
     }
 
     #[cfg(feature = "db")]

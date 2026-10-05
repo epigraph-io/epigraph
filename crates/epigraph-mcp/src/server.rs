@@ -2438,7 +2438,7 @@ impl EpiGraphMcpFull {
         tools::matching::retire_match_candidate(self, viewer, params, auth).await
     }
 
-    // ── Elevation (2 tools; elevation plan EL-11) ──
+    // ── Elevation (3 tools; elevation plan EL-11, EL-12b) ──
 
     #[tool(
         description = "Ask to ELEVATE this connection (sudo READ) for at most 15 minutes. Returns ONLY a URL: open it on the device that holds your passkey and confirm. Once confirmed, every request on this connection reads as an elevated custodian: read-only (every write is refused), and every read is recorded where the owners of the rows read can see it. Only a registered human who holds a live elevating role assignment, with a registered passkey, can elevate; agents never can. End it early with unsudo. Served only when the operator has enabled connector-mode elevation; otherwise use the CLI elevate path."
@@ -2467,6 +2467,30 @@ impl EpiGraphMcpFull {
             tools::elevation::over_http(extensions.get::<epigraph_auth::AuthContext>(), "unsudo")?;
         let viewer = &crate::tools::viewer::request_viewer(self, Some(auth)).await?;
         tools::elevation::unsudo(self, viewer, auth).await
+    }
+
+    #[tool(
+        description = "Propose an administrative act (role.grant, role.end, claim.custodial_supersede, passkey.register) while ELEVATED. Returns ONLY a URL: open it on the device that holds your passkey and confirm the act it shows; the act is then executed once, by the maintenance command line (epigraph-operator ... --act <id>), within 30 minutes. Listed and served only to an elevated request; nothing is executed by this tool."
+    )]
+    pub async fn propose_admin_act(
+        &self,
+        Parameters(params): Parameters<ProposeAdminActParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = tools::elevation::over_http(
+            extensions.get::<epigraph_auth::AuthContext>(),
+            tools::elevation::PROPOSE_ADMIN_ACT,
+        )?;
+        let viewer = &crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        tools::elevation::propose_admin_act(
+            self,
+            viewer,
+            auth,
+            &params.kind,
+            serde_json::Value::Object(params.args),
+            &params.reason,
+        )
+        .await
     }
 
     // ── Meta (1 tool) ──

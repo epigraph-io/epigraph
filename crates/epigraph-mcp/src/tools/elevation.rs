@@ -48,6 +48,15 @@
 //! role (and `sudo` only while connector mode is on), and an admin-only-scoped
 //! tool only to a request whose scope gate would admit it
 //! (`AuthContext::has_scope`: armed, that is an elevated request).
+//!
+//! # Proposing an admin act (EL-12b)
+//!
+//! [`propose_admin_act`] is listed only to an ELEVATED request and, unlike the
+//! two tools above, acts AS the elevation: `call_tool` resolves it, keeps the
+//! elevation on its `AuthContext`, and records the call. Its one write is
+//! migration 130's elevation-gated proposal definer (`claims:read` in
+//! `SCOPE_MAP`, so the dispatch's read-only refusal lets it through); the
+//! result is only the confirmation page's URL.
 
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::visibility::Viewer;
@@ -87,11 +96,18 @@ pub struct ManifestCaller<'a> {
     pub connector_elevation: bool,
 }
 
-/// Whether `tool` is listed to `caller` (elevation plan EL-11).
+/// The tool that proposes an admin act (elevation plan EL-12b): listed only
+/// to an ELEVATED request, resolved and recorded at dispatch like every other
+/// tool (it is NOT one of [`ELEVATION_ACTS`]).
+pub const PROPOSE_ADMIN_ACT: &str = "propose_admin_act";
+
+/// Whether `tool` is listed to `caller` (elevation plan EL-11, EL-12b).
 ///
 /// * `sudo`: only over HTTP, to a holder of a live elevating role, while
 ///   connector mode is on (off, it could only refuse).
 /// * `unsudo`: only over HTTP, to a holder of a live elevating role.
+/// * `propose_admin_act`: only over HTTP, to a request whose elevation the
+///   database confirmed (`AuthContext::elevation`).
 /// * An admin-only-scoped tool, over HTTP: only when the request's scope gate
 ///   would admit it (`has_scope`, which armed is "the request is elevated"
 ///   and unarmed is "the token carries the scope"). Over stdio, as before:
@@ -102,6 +118,7 @@ pub fn listed(tool: &str, caller: &ManifestCaller<'_>) -> bool {
     match tool {
         "sudo" => caller.http && caller.holds_elevating_role && caller.connector_elevation,
         "unsudo" => caller.http && caller.holds_elevating_role,
+        PROPOSE_ADMIN_ACT => caller.http && caller.auth.is_some_and(|a| a.elevation.is_some()),
         _ => match crate::scope_map::required_scope(tool) {
             Some(scope) if caller.http && epigraph_auth::is_admin_only_scope(scope) => {
                 caller.auth.is_some_and(|a| a.has_scope(scope))
@@ -337,6 +354,85 @@ pub async fn unsudo(
     json_result(&serde_json::json!({ "ended": ended }))
 }
 
+/// `propose_admin_act(kind, args, reason)`: propose an admin act as the
+/// ELEVATED caller (migration 130's `epigraph_propose_admin_act` through
+/// `ScopedPool::propose_admin_act`), and return ONLY its confirmation page's
+/// URL, which the proposer opens on the device that holds the passkey. The
+/// act id is in the URL (the maintenance CLI's `--act` takes it).
+///
+/// # Errors
+/// `INVALID_REQUEST` when no public base URL is configured, or the request is
+/// not elevated (ELV07); `INVALID_PARAMS` for a missing or overlong reason,
+/// or args the kind does not take (22023).
+pub async fn propose_admin_act(
+    server: &EpiGraphMcpFull,
+    viewer: &Viewer,
+    auth: &AuthContext,
+    kind: &str,
+    args: serde_json::Value,
+    reason: &str,
+) -> Result<CallToolResult, McpError> {
+    let Some(base) = server.public_base_url.as_deref() else {
+        return Err(McpError::invalid_request(
+            "propose_admin_act: this server has no public base URL configured \
+             (EPIGRAPH_PUBLIC_BASE_URL), so it cannot name a confirmation page"
+                .to_string(),
+            None,
+        ));
+    };
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(McpError::invalid_params(
+            "propose_admin_act: a reason is required".to_string(),
+            None,
+        ));
+    }
+    if reason.chars().count() > MAX_REASON_CHARS {
+        return Err(McpError::invalid_params(
+            format!("propose_admin_act: the reason is longer than {MAX_REASON_CHARS} characters"),
+            None,
+        ));
+    }
+    let jti = auth.jti.to_string();
+    let act = match scoped(server, PROPOSE_ADMIN_ACT)?
+        .propose_admin_act(viewer, kind, &args, reason, Some(&jti))
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return Err(match db_refusal(&e) {
+                Some((code, _)) if code == "ELV07" => {
+                    tracing::info!(
+                        target: "elevation.act",
+                        principal = ?auth.agent_id,
+                        "propose_admin_act refused: not elevated (ELV07)"
+                    );
+                    McpError::invalid_request(
+                        "propose_admin_act: an admin act is proposed only by an ELEVATED \
+                         request; elevate first (sudo, or the CLI elevate path), then propose"
+                            .to_string(),
+                        None,
+                    )
+                }
+                Some((code, message)) if code == "22023" || code == "22004" => {
+                    McpError::invalid_params(format!("propose_admin_act: {message}"), None)
+                }
+                _ => internal(PROPOSE_ADMIN_ACT, "propose the act", &e),
+            })
+        }
+    };
+    tracing::info!(
+        target: "elevation.act",
+        act = %act,
+        kind,
+        principal = ?auth.agent_id,
+        "admin act proposed (MCP)"
+    );
+    json_result(&serde_json::json!({
+        "url": format!("{}/elevate/act/{act}", base.trim_end_matches('/')),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +535,21 @@ mod tests {
             "stdio"
         );
         assert!(listed("get_claim", &caller(true, Some(&p), false, false)));
+
+        // propose_admin_act: only an elevated HTTP request, whatever the role
+        // check or the connector switch.
+        assert!(listed(
+            PROPOSE_ADMIN_ACT,
+            &caller(true, Some(&elevated), false, false)
+        ));
+        assert!(
+            !listed(PROPOSE_ADMIN_ACT, &caller(true, Some(&p), true, true)),
+            "a holder that is not elevated"
+        );
+        assert!(
+            !listed(PROPOSE_ADMIN_ACT, &caller(false, None, true, true)),
+            "stdio"
+        );
     }
 
     /// Only a human client's token that names its principal is worth asking
