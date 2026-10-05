@@ -535,6 +535,66 @@ mod tests {
         );
     }
 
+    /// Workflow rows written BEFORE backlog 6178a205 store the PLAIN
+    /// `blake3(content)` under the very same `{level 0-2, source_type:
+    /// "workflow"}` stamp the compound-hash writers use. Production holds
+    /// hundreds of them (thesis/phase/step rows from the builder, step rows from
+    /// `add_step`). If the predicate classified them by stamp alone, MCP
+    /// `verify_claim` would answer `not_applicable` for a tampered legacy row
+    /// that origin/main reported as `mismatch` — a silent loss of tamper
+    /// detection on existing data. Only rows carrying the scope marker the new
+    /// writers stamp may be classed as seed-scoped.
+    #[test]
+    fn unmarked_legacy_workflow_rows_are_not_seed_scoped() {
+        use crate::document::stored_content_hash_is_seed_scoped;
+        use crate::workflow::builder::{CONTENT_HASH_SCOPE_CANONICAL_NAME, CONTENT_HASH_SCOPE_KEY};
+
+        // The shapes production actually holds: the builder's thesis, phase and
+        // step rows (the executor adds `step_lineage_id` on level 2), and
+        // `add_step`'s row.
+        let legacy = [
+            serde_json::json!({"level": 0, "source_type": "workflow",
+                               "thesis_derivation": "top_down", "kind": "workflow_thesis"}),
+            serde_json::json!({"level": 1, "source_type": "workflow", "phase": "Body",
+                               "kind": "workflow_step"}),
+            serde_json::json!({"level": 2, "source_type": "workflow", "phase": "Body",
+                               "rationale": "", "kind": "workflow_step",
+                               "step_lineage_id": "00000000-0000-4000-8000-000000000001"}),
+            serde_json::json!({"level": 2, "source_type": "workflow", "kind": "workflow_step",
+                               "step_lineage_id": "00000000-0000-4000-8000-000000000002"}),
+        ];
+        for props in &legacy {
+            assert!(
+                !stored_content_hash_is_seed_scoped(props),
+                "an unmarked workflow row stores blake3(content); classing it seed-scoped \
+                 would excuse a tampered body as not_applicable: {props}"
+            );
+
+            let mut marked = props.clone();
+            marked[CONTENT_HASH_SCOPE_KEY] =
+                serde_json::Value::String(CONTENT_HASH_SCOPE_CANONICAL_NAME.to_string());
+            assert!(
+                stored_content_hash_is_seed_scoped(&marked),
+                "a marked workflow row stores a canonical_name-scoped digest, so a \
+                 body/digest disagreement is expected, not tampering: {marked}"
+            );
+
+            let mut other_scope = props.clone();
+            other_scope[CONTENT_HASH_SCOPE_KEY] = serde_json::Value::String("plain".to_string());
+            assert!(
+                !stored_content_hash_is_seed_scoped(&other_scope),
+                "only the canonical_name scope value is recognised: {other_scope}"
+            );
+        }
+
+        // The marker does not extend the class past the compound levels: an
+        // operation atom stores the plain hash whatever its properties say.
+        assert!(!stored_content_hash_is_seed_scoped(&serde_json::json!({
+            "level": 3, "source_type": "workflow", "kind": "workflow_atom",
+            CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME,
+        })));
+    }
+
     #[test]
     fn test_normalize_claim_path() {
         use crate::builder::normalize_claim_path;

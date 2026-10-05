@@ -16,6 +16,21 @@ use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
 use crate::workflow::schema::WorkflowExtraction;
 
+/// `properties` key that marks a workflow level-0/1/2 row whose stored
+/// `content_hash` is `compound_content_hash(blake3(content), <seed>)` rather
+/// than `blake3(content)`; its value names the seed
+/// ([`CONTENT_HASH_SCOPE_CANONICAL_NAME`]).
+///
+/// The marker exists because `source_type == "workflow"` alone cannot tell a
+/// compound-hash row from one written before backlog 6178a205, which stores the
+/// plain digest: `document::stored_content_hash_is_seed_scoped` keys the
+/// workflow class on it so a tampered legacy row still reports `mismatch`.
+pub const CONTENT_HASH_SCOPE_KEY: &str = "content_hash_scope";
+
+/// Value of [`CONTENT_HASH_SCOPE_KEY`] on workflow structural rows: the stored
+/// digest is scoped to the workflow's `canonical_name`.
+pub const CONTENT_HASH_SCOPE_CANONICAL_NAME: &str = "canonical_name";
+
 /// Walk a `WorkflowExtraction` tree and produce a flat list of operations.
 ///
 /// The result includes a `workflow` source-node id (deterministic from

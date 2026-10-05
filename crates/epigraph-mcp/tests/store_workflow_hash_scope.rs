@@ -22,7 +22,7 @@ mod fixture;
 mod common;
 use common::*;
 
-use epigraph_ingest::common::ids::{compound_content_hash, content_hash};
+use epigraph_ingest::common::ids::{compound_claim_id, compound_content_hash, content_hash};
 use epigraph_ingest::common::schema::ThesisDerivation;
 use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
 use epigraph_ingest::workflow::WorkflowExtraction;
@@ -341,5 +341,279 @@ async fn legacy_plain_hash_workflow_step_still_matches(pool: PgPool) {
         resp["hash_check"],
         Value::String("match".to_string()),
         "a legacy plain-digest workflow row must still verify: {resp}"
+    );
+}
+
+/// `(hash_check, hash_matches)` of `verify_claim` after overwriting the row's
+/// body behind the digest's back.
+async fn tamper_and_verify(pool: &PgPool, claim_id: Uuid) -> Value {
+    sqlx::query("UPDATE claims SET content = content || ' (tampered)' WHERE id = $1")
+        .bind(claim_id)
+        .execute(pool)
+        .await
+        .expect("tamper");
+    run_verify(pool, claim_id).await
+}
+
+fn legacy_extraction(canonical: &str, tag: &str) -> WorkflowExtraction {
+    WorkflowExtraction {
+        source: WorkflowSource {
+            canonical_name: canonical.to_string(),
+            goal: format!("legacy goal {tag}"),
+            generation: 0,
+            parent_canonical_name: None,
+            authors: vec![],
+            expected_outcome: None,
+            tags: vec![],
+            metadata: serde_json::json!({}),
+        },
+        thesis: Some(format!("legacy thesis {tag}")),
+        thesis_derivation: ThesisDerivation::TopDown,
+        phases: vec![Phase {
+            title: format!("legacy phase {tag}"),
+            summary: format!("legacy phase {tag}"),
+            steps: vec![Step {
+                compound: format!("legacy step {tag}"),
+                rationale: String::new(),
+                operations: vec![],
+                generality: vec![],
+                confidence: 0.8,
+                evidence_type: None,
+            }],
+        }],
+        relationships: vec![],
+    }
+}
+
+/// A TAMPERED workflow row written before backlog 6178a205 must still report
+/// `mismatch`.
+///
+/// Those rows store the plain `blake3(content)` under the same `{level 0-2,
+/// source_type: "workflow"}` stamp the new compound-hash writers use, and
+/// production holds hundreds of them. origin/main reports `mismatch` for a
+/// mutated body on every one; classifying them as seed-scoped by stamp alone
+/// would silently turn that into `not_applicable`.
+///
+/// The builder-shaped rows are seeded at exactly the ids
+/// `workflow::build_ingest_plan` derives and the workflow is then RE-INGESTED
+/// through the real writer, so this also pins that re-ingesting over a legacy
+/// row leaves its properties alone (the executor stamps properties only on a
+/// row it newly inserts). The `add_step`-shaped row has no builder id; it
+/// models the rows `workflow_steps::add_step` wrote.
+#[sqlx::test(migrations = "../../migrations")]
+async fn tampered_legacy_workflow_rows_report_mismatch(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let tag = Uuid::new_v4().to_string();
+    let name = format!("legacy-wf-{tag}");
+    let extraction = legacy_extraction(&name, &tag);
+    let thesis = format!("legacy thesis {tag}");
+    let phase = format!("legacy phase {tag}");
+    let step = format!("legacy step {tag}");
+
+    let seed = |id: Uuid, body: String, props: Value| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels, \
+                                     is_current, properties) \
+                 VALUES ($1, $2, $3, 0.5, $4, ARRAY[]::text[], true, $5)",
+            )
+            .bind(id)
+            .bind(&body)
+            .bind(content_hash(&body).as_slice())
+            .bind(agent)
+            .bind(props)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("seed legacy row {body:?}: {e}"));
+            id
+        }
+    };
+    let id_of = |text: &str| compound_claim_id(&content_hash(text), &name);
+
+    let legacy_rows = [
+        (
+            "builder thesis (level 0)",
+            seed(
+                id_of(&thesis),
+                thesis.clone(),
+                serde_json::json!({"level": 0, "source_type": "workflow",
+                                   "thesis_derivation": "top_down", "kind": "workflow_thesis"}),
+            )
+            .await,
+        ),
+        (
+            "builder phase (level 1)",
+            seed(
+                id_of(&phase),
+                phase.clone(),
+                serde_json::json!({"level": 1, "source_type": "workflow",
+                                   "phase": phase, "kind": "workflow_step"}),
+            )
+            .await,
+        ),
+        (
+            "builder step (level 2)",
+            seed(
+                id_of(&step),
+                step.clone(),
+                serde_json::json!({"level": 2, "source_type": "workflow", "phase": phase,
+                                   "rationale": "", "kind": "workflow_step",
+                                   "step_lineage_id": Uuid::new_v4().to_string()}),
+            )
+            .await,
+        ),
+        (
+            "add_step step (level 2)",
+            seed(
+                Uuid::new_v4(),
+                format!("legacy added step {tag}"),
+                serde_json::json!({"level": 2, "source_type": "workflow", "kind": "workflow_step",
+                                   "step_lineage_id": Uuid::new_v4().to_string()}),
+            )
+            .await,
+        ),
+    ];
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let ingested = epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
+        &pool,
+        &viewer,
+        &extraction,
+    )
+    .await
+    .expect("re-ingest the legacy workflow");
+    assert_eq!(
+        ingested.claims_ingested, 0,
+        "every planned claim already exists as a legacy row, so the ingest must \
+         reuse all of them: {ingested:?}"
+    );
+
+    for (shape, id) in legacy_rows {
+        let resp = tamper_and_verify(&pool, id).await;
+        assert_eq!(
+            resp["hash_check"],
+            Value::String("mismatch".to_string()),
+            "{shape}: a legacy plain-digest workflow row with a mutated body is evidence \
+             of tampering and must be reported as such: {resp}"
+        );
+        assert_eq!(resp["hash_matches"], Value::Bool(false), "{shape}: {resp}");
+    }
+}
+
+/// The accepted cost of the fix, pinned for BOTH new writers: a tampered row
+/// that `store_workflow` (the builder) or `add_step` wrote with a
+/// canonical_name-scoped digest is reported `not_applicable` — undecided — and
+/// never as a positive match. The workflow twin of
+/// `verify_claim_after_document_ingest::a_tampered_spine_row_is_reported_undecided_not_clean`.
+///
+/// It also pins that `add_step` marks its row: an unmarked `add_step` row would
+/// fall out of the seed-scoped class and report `mismatch` here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn tampered_new_workflow_rows_are_reported_undecided_not_clean(pool: PgPool) {
+    let server = server(&pool).await;
+    let stored_step = format!("new stored step {}", Uuid::new_v4());
+    let (wf, name) = store(
+        &server,
+        &pool,
+        &format!("new goal {}", Uuid::new_v4()),
+        &[stored_step.as_str()],
+    )
+    .await
+    .expect("store_workflow");
+
+    let added_step = format!("new added step {}", Uuid::new_v4());
+    let stdio = epigraph_mcp::tools::viewer::request_viewer(&server, None)
+        .await
+        .expect("the server agent's stdio viewer");
+    let added = epigraph_mcp::tools::step_ops::add_step(
+        &server,
+        &stdio,
+        AddStepParams {
+            canonical_name: name,
+            step_text: added_step.clone(),
+            position: None,
+        },
+        None,
+    )
+    .await
+    .expect("add_step");
+    let added_id = parse_uuid_field(&first_text(&added), "step_claim_id");
+
+    let (body_id, _, _) = executed_claim(&pool, wf, 1, "Body").await;
+    let (stored_id, _, _) = executed_claim(&pool, wf, 2, &stored_step).await;
+    for (shape, id) in [
+        ("store_workflow phase", body_id),
+        ("store_workflow step", stored_id),
+        ("add_step step", added_id),
+    ] {
+        let resp = tamper_and_verify(&pool, id).await;
+        assert_eq!(
+            resp["hash_check"],
+            Value::String("not_applicable".to_string()),
+            "{shape}: the stored digest is scoped to canonical_name, so a body/digest \
+             comparison decides nothing: {resp}"
+        );
+        assert_eq!(
+            resp["hash_matches"],
+            Value::Null,
+            "{shape}: undecided, never a positive match: {resp}"
+        );
+    }
+}
+
+/// A step text equal to another workflow's OPERATION ATOM text must not
+/// collide. Atoms keep the plain `blake3(text)` (they converge across
+/// workflows and documents by design), so on origin/main a plain-hash step
+/// written by the same system agent hit `uq_claims_content_hash_agent`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn step_text_equal_to_another_workflows_operation_atom_succeeds(pool: PgPool) {
+    assert_constraint_in_force(&pool).await;
+    let server = server(&pool).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let shared = format!("cargo test {}", Uuid::new_v4());
+
+    let name_a = format!("atom-owner-{}", Uuid::new_v4());
+    let mut extraction_a = extraction_with_step(&name_a, "Run the suite");
+    extraction_a.phases[0].steps[0].operations = vec![shared.clone()];
+    extraction_a.phases[0].steps[0].generality = vec![1];
+    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
+        &pool,
+        &viewer,
+        &extraction_a,
+    )
+    .await
+    .expect("ingest workflow A with the operation atom");
+    let wf_a: Uuid = sqlx::query_scalar("SELECT id FROM workflows WHERE canonical_name = $1")
+        .bind(&name_a)
+        .fetch_one(&pool)
+        .await
+        .expect("workflow A row");
+    let (atom, atom_hash, atom_agent) = executed_claim(&pool, wf_a, 3, &shared).await;
+    assert_eq!(
+        atom_hash,
+        content_hash(&shared).to_vec(),
+        "the atom keeps the plain digest"
+    );
+
+    let (wf_b, name_b) = store(
+        &server,
+        &pool,
+        &format!("goal B {}", Uuid::new_v4()),
+        &[shared.as_str()],
+    )
+    .await
+    .expect("store_workflow whose step text equals workflow A's operation atom");
+    let (step_b, step_b_hash, step_agent) = executed_claim(&pool, wf_b, 2, &shared).await;
+    assert_eq!(
+        atom_agent, step_agent,
+        "atom and step must author as the same agent, or this test does not \
+         exercise uq_claims_content_hash_agent"
+    );
+    assert_ne!(step_b, atom, "B's step is its own row, not A's atom");
+    assert_eq!(
+        step_b_hash,
+        compound_content_hash(&content_hash(&shared), &name_b).to_vec(),
+        "the step row must store compound_content_hash(blake3(text), canonical_name)"
     );
 }
