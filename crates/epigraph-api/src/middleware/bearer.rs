@@ -9,6 +9,8 @@
 // takes the very Viewer this call constructs, so stamping the connection first is circular.
 // Recorded as `D-PR17-live-memberships-is-parameterised-not-principal-bound`. This entry must
 // never be "converted" — a shard that tries will deadlock the bootstrap, not fix a leak.
+// The revocation lookup (`access_token_is_revoked`, migration 141) is pre-authentication for the
+// same reason: it decides whether the verified token yields a principal at all.
 
 use axum::{extract::State, http::Request, middleware::Next, response::Response};
 
@@ -17,9 +19,66 @@ use crate::state::AppState;
 
 pub use epigraph_auth::{AuthContext, ClientType};
 
+/// Whether the access token `jti` has been revoked (RFC 7009, migration 141's
+/// durable denylist, which `/oauth/revoke` writes and the MCP transport also
+/// reads).
+///
+/// Called by both middlewares here and by `/oauth/introspect`, always AFTER
+/// the token's signature has been verified, so the `jti` is the issuer's and a
+/// forged token never reaches the database. The lookup runs on the raw pool
+/// for this file's reason: it runs BEFORE any principal or viewer exists
+/// (whether there will be one is what it decides), and it reads one
+/// non-tenant credential table by primary key.
+///
+/// `Err` means the answer is unknown; every caller refuses the token (fails
+/// CLOSED). No cache: a negative cache would delay a revocation by its TTL.
+#[cfg(feature = "db")]
+pub(crate) async fn access_token_is_revoked(
+    state: &AppState,
+    jti: uuid::Uuid,
+) -> Result<bool, epigraph_db::DbError> {
+    epigraph_db::RevokedAccessTokenRepository::is_revoked(&state.db_pool, jti).await
+}
+
+/// The non-`db` build has no pool and therefore NO revocation store:
+/// `/oauth/revoke` records nothing there, and a signature-valid, unexpired
+/// token is admitted until its `exp`. A function rather than a `cfg` at each
+/// call site, so the callers read the same in both builds.
+#[cfg(not(feature = "db"))]
+pub(crate) async fn access_token_is_revoked(
+    _state: &AppState,
+    _jti: uuid::Uuid,
+) -> Result<bool, std::convert::Infallible> {
+    Ok(false)
+}
+
+/// Refuse a signature-verified token whose `jti` is on the durable revocation
+/// denylist ([`access_token_is_revoked`]): 401 when revoked, 503 when the
+/// lookup cannot answer. Fails CLOSED: an unknown answer never admits the
+/// token.
+pub(crate) async fn refuse_revoked(state: &AppState, jti: uuid::Uuid) -> Result<(), ApiError> {
+    match access_token_is_revoked(state, jti).await {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(ApiError::Unauthorized {
+            reason: "Token has been revoked".to_string(),
+        }),
+        Err(e) => {
+            tracing::error!(
+                reason = "revocation_unavailable",
+                error = %e,
+                "bearer token refused: the revocation lookup failed"
+            );
+            Err(ApiError::ServiceUnavailable {
+                service: "token revocation".to_string(),
+            })
+        }
+    }
+}
+
 /// Middleware: extract Bearer token, validate JWT, inject AuthContext.
 ///
-/// Requests without a valid Bearer token are rejected with 401 Unauthorized.
+/// Requests without a valid Bearer token are rejected with 401 Unauthorized,
+/// and so are tokens revoked through `/oauth/revoke` ([`refuse_revoked`]).
 pub async fn bearer_auth_middleware(
     State(state): State<AppState>,
     mut request: Request<axum::body::Body>,
@@ -35,13 +94,6 @@ pub async fn bearer_auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
 
-            // Check revocation set
-            if state.is_token_revoked(token) {
-                return Err(ApiError::Unauthorized {
-                    reason: "Token has been revoked".to_string(),
-                });
-            }
-
             // Validate JWT
             let claims =
                 state
@@ -50,6 +102,9 @@ pub async fn bearer_auth_middleware(
                     .map_err(|e| ApiError::Unauthorized {
                         reason: format!("Invalid token: {e}"),
                     })?;
+
+            // Revocation, by the now-verified jti (fails closed).
+            refuse_revoked(&state, claims.jti).await?;
 
             // Build AuthContext
             let auth_ctx: AuthContext = claims.into();
@@ -95,13 +150,6 @@ pub async fn optional_bearer_auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
 
-            // Present token must be valid: revoked → 401.
-            if state.is_token_revoked(token) {
-                return Err(ApiError::Unauthorized {
-                    reason: "Token has been revoked".to_string(),
-                });
-            }
-
             // Present token must validate: invalid/expired → 401.
             let claims =
                 state
@@ -110,6 +158,9 @@ pub async fn optional_bearer_auth_middleware(
                     .map_err(|e| ApiError::Unauthorized {
                         reason: format!("Invalid token: {e}"),
                     })?;
+
+            // Present token must not be revoked: revoked → 401.
+            refuse_revoked(&state, claims.jti).await?;
 
             let auth_ctx: AuthContext = claims.into();
             request.extensions_mut().insert(auth_ctx);
