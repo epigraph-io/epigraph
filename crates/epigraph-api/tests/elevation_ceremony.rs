@@ -2781,3 +2781,234 @@ async fn an_elevated_admin_read_is_served_and_recorded(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "the elevated admin read: {body}");
     assert_eq!(rows().await, 1, "recorded once, though no viewer was built");
 }
+
+// =====================================================================
+// EL-12b: proposing admin acts over HTTP, and listing one's own
+// =====================================================================
+
+/// `role.grant` act args for `holder` (the args migration 130 takes).
+fn grant_act_args(holder: Uuid, reason: &str) -> Value {
+    json!({"role": "role:auditor", "holder": holder.to_string(), "valid_from": null,
+           "valid_to": null, "reason": reason})
+}
+
+impl Server {
+    async fn propose(
+        &self,
+        token: &str,
+        kind: &str,
+        args: &Value,
+        reason: &str,
+    ) -> (StatusCode, Value) {
+        self.post(
+            "/api/v1/admin/acts",
+            Some(token),
+            &json!({"kind": kind, "args": args, "reason": reason}),
+        )
+        .await
+    }
+}
+
+/// `(proposed_by, elevation_id, jti)` of every act, oldest first.
+async fn acts(pool: &PgPool) -> Vec<(Uuid, Uuid, Option<String>)> {
+    sqlx::query_as(
+        "SELECT proposed_by, elevation_id, jti FROM pending_admin_acts ORDER BY proposed_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the acts")
+}
+
+/// A grant-mode session for `p` (ceremony stood in) and a token naming it.
+async fn elevated_token(pool: &PgPool, s: &Server, p: &Person) -> (Uuid, String) {
+    let session = elevate(pool, s, p).await;
+    (
+        session,
+        s.scoped_token(p, Some(session), &["claims:read", "platform:admin"]),
+    )
+}
+
+/// The jti of a token this server minted.
+fn jti_of(s: &Server, token: &str) -> String {
+    s.jwt.validate_token(token).expect("valid").jti.to_string()
+}
+
+/// An admin act is proposed only by an ELEVATED request: P's plain token is
+/// refused 403 (the database's ELV07) and nothing is written; P's elevated
+/// token gets 201 with the act id, its confirmation path and URL on the
+/// relying party's origin, and the act names P, P's elevation and the token's
+/// jti. The proposal is recorded as an elevated access. Args the kind does
+/// not take and a missing reason are 400; with no relying party configured,
+/// 503.
+///
+/// Mutations: `POST /api/v1/admin/acts` removed from the elevated allowlist
+/// -> the elevated proposal is refused ELEVATED READ-ONLY; the handler
+/// proposing as `viewer.detach_scoped()` -> ELV07 for the elevated token too;
+/// the route unregistered -> red (404/405).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_act_is_proposed_only_by_an_elevated_request(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let x = person(&pool, "grantee").await;
+    let args = grant_act_args(x.person, "audit");
+
+    let plain = s.scoped_token(&p, None, &["claims:read"]);
+    let (status, body) = s.propose(&plain, "role.grant", &args, "audit x").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body.to_string().contains("ELEVATED request"),
+        "the refusal says why: {body}"
+    );
+    assert!(acts(&pool).await.is_empty(), "nothing proposed");
+
+    let (session, elevated) = elevated_token(&pool, &s, &p).await;
+    let (status, body) = s.propose(&elevated, "role.grant", &args, "audit x").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let act: Uuid = body["act_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(body["path"], format!("/elevate/act/{act}"));
+    assert_eq!(body["url"], format!("{ORIGIN}/elevate/act/{act}"));
+    assert_eq!(
+        acts(&pool).await,
+        vec![(p.person, session, Some(jti_of(&s, &elevated)))]
+    );
+    assert_eq!(
+        log_of(&pool)
+            .await
+            .iter()
+            .filter(|r| r.0 == "POST /api/v1/admin/acts")
+            .count(),
+        1,
+        "the proposal is recorded as an elevated access"
+    );
+
+    let (status, body) = s
+        .propose(
+            &elevated,
+            "role.grant",
+            &json!({"role": "role:auditor"}),
+            "x",
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "args: {body}");
+    let (status, body) = s.propose(&elevated, "role.grant", &args, "  ").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "reason: {body}");
+    assert_eq!(acts(&pool).await.len(), 1, "no other act");
+
+    let unconfigured = spawn(&pool, None).await;
+    let (status, body) = unconfigured
+        .propose(&elevated, "role.grant", &args, "audit x")
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+/// An AGENT cannot propose: its token is refused whether it carries no
+/// elevation claim or a forged one naming the holder's live session (the
+/// claim resolves no elevation for the agent, so the request is served
+/// unelevated and the database refuses: ELV07). Regression pin: agents never
+/// elevate (CUS01, 125's ELV02), so no Rust mutation reaches this alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_cannot_propose(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (session, _) = elevated_token(&pool, &s, &p).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "el12b-agent").await;
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id, owner_id) \
+         VALUES ($1, 'el12b-agent', 'agent', ARRAY['claims:read'], ARRAY['claims:read'], \
+                 'active', $2, $3) RETURNING id",
+    )
+    .bind(format!("el12b-agent-{agent}"))
+    .bind(agent)
+    .bind(p.client)
+    .fetch_one(&pool)
+    .await
+    .expect("agent client");
+    for elv in [None, Some(session)] {
+        let token = s
+            .jwt
+            .issue_access_token(
+                client,
+                vec!["claims:read".into(), "platform:admin".into()],
+                "agent",
+                Some(p.client),
+                Some(agent),
+                Duration::minutes(30),
+                AccessTokenBinding {
+                    family_id: Some(p.family),
+                    elevation_id: elv,
+                },
+            )
+            .expect("mint")
+            .0;
+        let (status, body) = s
+            .propose(
+                &token,
+                "role.grant",
+                &grant_act_args(p.person, "a"),
+                "agent",
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "elv {elv:?}: {body}");
+    }
+    assert!(acts(&pool).await.is_empty(), "nothing proposed");
+}
+
+/// `GET /api/v1/admin/acts?mine` lists the caller's OWN acts (elevated or
+/// not), newest first, each with its confirmation path, and never another
+/// person's; `?mine=false` is refused (only one's own are listed).
+///
+/// Mutations: the list read on an unstamped connection -> P lists nothing;
+/// the route unregistered -> red.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_person_lists_only_their_own_acts_over_http(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder-p", &mut SoftAuthenticator::new(MODEL)).await;
+    let b = holder(&pool, &s, "holder-b", &mut SoftAuthenticator::new(MODEL)).await;
+    let x = person(&pool, "grantee").await;
+    let (_, p_elevated) = elevated_token(&pool, &s, &p).await;
+    let (_, b_elevated) = elevated_token(&pool, &s, &b).await;
+    let (_, mine) = s
+        .propose(
+            &p_elevated,
+            "role.grant",
+            &grant_act_args(x.person, "p"),
+            "p's",
+        )
+        .await;
+    let (_, theirs) = s
+        .propose(
+            &b_elevated,
+            "role.grant",
+            &grant_act_args(x.person, "b"),
+            "b's",
+        )
+        .await;
+    let mine: Uuid = mine["act_id"].as_str().unwrap().parse().unwrap();
+    let theirs: Uuid = theirs["act_id"].as_str().unwrap().parse().unwrap();
+
+    let p_plain = s.scoped_token(&p, None, &["claims:read"]);
+    let (status, body) = s.get("/api/v1/admin/acts?mine", &p_plain).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Vec<Uuid> = body["acts"]
+        .as_array()
+        .expect("acts")
+        .iter()
+        .map(|a| a["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert!(listed.contains(&mine), "P lists its act: {body}");
+    assert!(!listed.contains(&theirs), "never B's: {body}");
+    let first = &body["acts"][0];
+    assert_eq!(first["id"], mine.to_string(), "newest first: {body}");
+    assert_eq!(first["path"], format!("/elevate/act/{mine}"));
+    assert_eq!(first["kind"], "role.grant");
+    assert!(first["outcome"].is_null(), "unconfirmed: {first}");
+    assert!(
+        first.get("challenge_state").is_none() && first.get("assertion_evidence").is_none(),
+        "no ceremony state or evidence: {first}"
+    );
+    let (status, _) = s.get("/api/v1/admin/acts?mine", &p_elevated).await;
+    assert_eq!(status, StatusCode::OK, "listed elevated too");
+    let (status, body) = s.get("/api/v1/admin/acts?mine=false", &p_plain).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

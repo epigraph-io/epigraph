@@ -40,7 +40,11 @@
 //! database round trip. This is the API's counterpart of the MCP server's
 //! dispatch refusal; the admin write routes (client approval, entity-type
 //! registration, the privatization acts) are maintenance-CLI-only for an
-//! elevated session (plan EQ-5), and the refusal says so.
+//! elevated session (plan EQ-5), and the refusal says so. The one write an
+//! elevated token makes through a route is PROPOSING an admin act
+//! ([`ELEVATED_PROPOSAL_ROUTE`], plan EL-12b): an authority record, written
+//! by migration 130's elevation-gated definer, that the proposer's passkey
+//! must still confirm and the maintenance CLI must still execute.
 //!
 //! # Fail-closed
 //!
@@ -82,23 +86,38 @@ pub const UNELEVATED_ROUTES: [(&str, &str); 2] = [
 /// The non-GET routes a token carrying an elevation claim may still call
 /// (`(method, matched route)`): the two elevation routes, which act as the
 /// PERSON rather than as the elevation (open a ticket, end an elevation:
-/// [`super::bearer::UnelevatedViewer`]), and POST routes that only READ
-/// (measured: each reads through the viewer and writes nothing). Every other
-/// non-GET request with an elevation claim is refused. Adding a route here is
-/// a security decision: it must write nothing, directly or through a definer.
+/// [`super::bearer::UnelevatedViewer`]), [`ELEVATED_PROPOSAL_ROUTE`], and POST
+/// routes that only READ (measured: each reads through the viewer and writes
+/// nothing). Every other non-GET request with an elevation claim is refused.
+///
+/// Adding a route here is a security decision: it must write nothing,
+/// directly or through a definer, with ONE named exception,
+/// [`ELEVATED_PROPOSAL_ROUTE`] (elevation plan EL-12b). That route writes, and
+/// only through migration 130's elevation-gated proposal definer
+/// (`ScopedPool::propose_admin_act`), into `pending_admin_acts`, a table
+/// migration 126 does not arm: an authority record that asks the proposer's
+/// passkey for a confirmation, never a corpus row. It is resolved as elevated
+/// (it is NOT in [`UNELEVATED_ROUTES`]) and recorded like every other
+/// elevated request.
 pub const ELEVATED_NON_GET_ALLOWLIST: &[(&str, &str)] = &[
     (UNELEVATED_ROUTES[0].0, UNELEVATED_ROUTES[0].1),
     (UNELEVATED_ROUTES[1].0, UNELEVATED_ROUTES[1].1),
+    (ELEVATED_PROPOSAL_ROUTE.0, ELEVATED_PROPOSAL_ROUTE.1),
     ("POST", "/api/v1/search/semantic"),
     ("POST", "/api/v1/graph/query"),
     ("POST", "/api/v1/triples/query"),
     ("POST", "/api/v1/embeddings/neighborhood-density"),
 ];
 
+/// The one allowlisted non-GET route that WRITES while elevated: proposing an
+/// admin act ([`ELEVATED_NON_GET_ALLOWLIST`]'s named exception).
+pub const ELEVATED_PROPOSAL_ROUTE: (&str, &str) = ("POST", "/api/v1/admin/acts");
+
 /// The refusal text: the elevated read-only denial (`DbError::ElevatedReadOnly`'s
 /// `ELEVATED READ-ONLY` marker) and where admin writes go instead.
 pub const ELEVATED_WRITE_REFUSAL: &str = "ELEVATED READ-ONLY: this token carries an elevation \
-     claim, and an elevated token writes through no route; write with an unelevated token. \
+     claim, and an elevated token writes through no route (it may only propose an admin act, \
+     POST /api/v1/admin/acts); write with an unelevated token. \
      Admin writes (client approval, entity types, privatization acts) run through \
      `epigraph-operator` on the maintenance DSN";
 

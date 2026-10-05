@@ -17,6 +17,8 @@
 pub mod activities;
 pub mod admin;
 #[cfg(feature = "db")]
+pub mod admin_acts;
+#[cfg(feature = "db")]
 pub mod agent_keys;
 #[cfg(feature = "db")]
 pub mod agents;
@@ -746,6 +748,14 @@ pub fn create_router(state: AppState) -> Router {
         // ends its own elevation. The ceremony itself is on the public router.
         .route("/api/v1/elevation/tickets", post(elevation::create_ticket))
         .route("/api/v1/elevation/end", post(elevation::end_elevation))
+        // Admin acts (plan EL-12b): an ELEVATED request proposes an act (the
+        // definer refuses any other, ELV07), and anyone lists their OWN acts.
+        // Confirmation is the public `/elevate/act/:id` ceremony; execution is
+        // the maintenance CLI's (`--act`).
+        .route(
+            "/api/v1/admin/acts",
+            post(admin_acts::propose_act).get(admin_acts::list_acts),
+        )
         .route(
             "/api/v1/clusters/boundary-claims",
             get(crud::get_boundary_claims),
