@@ -595,13 +595,18 @@ decision or conversion before the operator drops `claims_privacy`,
    checked on exactly the row the executor links. The admin arm re-checks the
    token's client record and writes a `workflows.admin_write` audit row through
    migration 112. `workflows` recorded no owner before batch H-b, so every
-   EXISTING workflow has no record and stays open to any caller, with a WARN:
-   which authority legacy workflows carry is an open operator decision.
+   EXISTING workflow has no record. U005 (default decision A) made those
+   platform corpus: over HTTP only the audited admin arm admits them (audit row
+   `"submitter": null`), anyone else gets 403 / "no recorded submitter", a new
+   generation of a legacy lineage records no submitter either, and stdio is
+   unchanged. The `--allow-unauthenticated-http` context (claims:admin, no
+   client record) now gets ADM02 on legacy rows.
    `evolve_step`, `refresh_workflow_promotion` and `report_hierarchical_outcome`
    (item 4; the last is an unguarded read-modify-write of `workflows.metadata`
    counters) are not covered. Measured by
    `epigraph-mcp/tests/workflow_caller_authority.rs`, the API
-   `workflow_lineage_and_admin_arm_are_checked_over_http`, and
+   `workflow_lineage_and_admin_arm_are_checked_over_http` and
+   `a_legacy_workflow_is_refused_to_a_stranger_over_http`, and
    `probe-batch-h.sh review_http`.
 9. **MCP writes that work on B only through the orphan policy** (measured on B
    by the review; A 42501): a stdio `patch_claim`, and a stdio free-label
@@ -614,8 +619,8 @@ decision or conversion before the operator drops `claims_privacy`,
 10. **Open decisions recorded by the review revision**: whether removing the
    `backlog` label is a retirement (it also takes an item out of the open-backlog
    query; it is free vocabulary on stdio today); whether the production
-   unauthenticated socket keeps cross-group writes (above); which authority
-   legacy workflows carry (item 8).
+   unauthenticated socket keeps cross-group writes (above). Which authority
+   legacy workflows carry is decided (item 8, U005 default decision A).
 
 ## What this harness does not cover
 

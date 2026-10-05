@@ -2180,7 +2180,9 @@ struct ApiWorkflowGrant {
 /// recorded, in this order, the submitter, its operator, or the AUDITED admin
 /// arm — `claims:admin` in the token AND a live grant on the token's client
 /// record (migration 111's predicate), never the scope alone. A workflow with
-/// no record (written before batch H-b) keeps today's behaviour, with a WARN.
+/// no record (written before batch H-b) is platform corpus (U005, default
+/// decision A): only the audited admin arm admits it, and a caller with no
+/// token is refused.
 #[cfg(feature = "db")]
 async fn workflow_authority(
     conn: &mut sqlx::PgConnection,
@@ -2193,16 +2195,27 @@ async fn workflow_authority(
         .map_err(|e| ApiError::InternalError {
             message: format!("could not read the workflow's submitter: {e}"),
         })?;
+    // U005 (default decision A): a workflow with NO recorded submitter
+    // (written before batch H-b) is platform corpus. There is no submitter to
+    // match and no operator to derive, so the only arm is the audited admin
+    // arm; with no token there is none, and the caller is refused. When the
+    // custodian role lands (#529), its check replaces `claims:admin` here.
     let Some(owner) = owner else {
-        tracing::warn!(
-            workflow_id = %workflow_id,
-            caller = ?caller,
-            "workflow mutation on a workflow with no recorded submitter (written before batch \
-             H-b): allowed, as before"
+        let subject = format!(
+            "workflow {workflow_id} has no recorded submitter (legacy platform workflow, \
+             written before batch H-b)"
         );
-        return Ok(ApiWorkflowGrant {
-            owner: None,
-            admin: false,
+        if api_admin_arm(conn, auth, caller, &subject).await? {
+            return Ok(ApiWorkflowGrant {
+                owner: None,
+                admin: true,
+            });
+        }
+        return Err(ApiError::Forbidden {
+            reason: format!(
+                "{subject}; it is mutable only through the audited claims:admin path, and the \
+                 caller holds no claims:admin. Nothing was written."
+            ),
         });
     };
     let allowed = ApiWorkflowGrant {
@@ -2223,39 +2236,60 @@ async fn workflow_authority(
             return Ok(allowed);
         }
     }
-    if let (Some(a), Some(caller)) = (auth, caller) {
-        if a.has_scope("claims:admin") {
-            let live = epigraph_db::SecurityEventRepository::admin_grant_is_live(
-                &mut *conn,
-                a.client_id,
-                caller,
-                a.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
-            )
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("could not re-check the admin grant: {e}"),
-            })?;
-            if live {
-                return Ok(ApiWorkflowGrant {
-                    owner: Some(owner),
-                    admin: true,
-                });
-            }
-            return Err(ApiError::Forbidden {
-                reason: format!(
-                    "workflow {workflow_id} was submitted by agent {owner}; the token carries \
-                     claims:admin, but its client record grants no live claims:admin to this \
-                     principal, so the audited admin path refused it (ADM02). Nothing was \
-                     written."
-                ),
-            });
-        }
+    let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
+    if api_admin_arm(conn, auth, caller, &subject).await? {
+        return Ok(ApiWorkflowGrant {
+            owner: Some(owner),
+            admin: true,
+        });
     }
     Err(ApiError::Forbidden {
         reason: format!(
             "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
              submitter, its submitter's operator, nor a live claims:admin holder. Nothing was \
              written."
+        ),
+    })
+}
+
+/// The AUDITED admin arm of [`workflow_authority`], shared by a submitted
+/// workflow (after its submitter and operator arms) and a legacy one (its only
+/// arm): `claims:admin` in the token AND a live grant on the token's client
+/// record (migration 111's predicate), never the scope alone. `Ok(true)`:
+/// admitted. `Ok(false)`: no token, no principal, or no `claims:admin` scope.
+/// A `claims:admin` token whose client record grants none is refused ADM02,
+/// with `subject` naming the workflow.
+#[cfg(feature = "db")]
+async fn api_admin_arm(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&crate::middleware::bearer::AuthContext>,
+    caller: Option<Uuid>,
+    subject: &str,
+) -> Result<bool, ApiError> {
+    let (Some(a), Some(caller)) = (auth, caller) else {
+        return Ok(false);
+    };
+    if !a.has_scope("claims:admin") {
+        return Ok(false);
+    }
+    let live = epigraph_db::SecurityEventRepository::admin_grant_is_live(
+        &mut *conn,
+        a.client_id,
+        caller,
+        a.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("could not re-check the admin grant: {e}"),
+    })?;
+    if live {
+        return Ok(true);
+    }
+    Err(ApiError::Forbidden {
+        reason: format!(
+            "{subject}; the token carries claims:admin, but its client record grants no live \
+             claims:admin to this principal, so the audited admin path refused it (ADM02). \
+             Nothing was written."
         ),
     })
 }
@@ -3278,5 +3312,240 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(audits, 1, "and the admin write is audited");
+    }
+
+    /// U005 (backlog 84b2a98d), default decision A, the HTTP twin of
+    /// `epigraph-mcp/tests/workflow_caller_authority.rs`: a workflow with no
+    /// recorded submitter (every workflow written before batch H-b) is
+    /// platform corpus. A `claims:write` stranger — and the agent that happened
+    /// to ingest it, since nothing records that — is refused on the step route
+    /// and on a new generation (403, nothing written); a live `claims:admin`
+    /// grant is admitted and audited with `"submitter": null`. Before U005 the
+    /// stranger's step and generation landed behind a WARN.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_legacy_workflow_is_refused_to_a_stranger_over_http(pool: PgPool) {
+        use axum::routing::post;
+        let state = scoped_test_state(&pool).await;
+        let ingester = test_auth();
+        let stranger = test_auth();
+        let router_as = |auth: crate::middleware::bearer::AuthContext| {
+            axum::Router::new()
+                .route("/api/v1/workflows/ingest", post(ingest_workflow))
+                .route("/api/v1/workflows/steps", post(add_step))
+                .route("/api/v1/workflows/steps/delete", post(delete_step))
+                .layer(axum::Extension(auth))
+                .with_state(state.clone())
+        };
+        let post_json = |uri: &str, body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let resp = router_as(ingester.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/ingest",
+                ingest_payload("h3-http-legacy"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The shape of every workflow written before batch H-b.
+        sqlx::query(
+            "UPDATE workflows SET metadata = metadata - 'epigraph_submitted_by' \
+              WHERE canonical_name = 'h3-http-legacy'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let executes_sql = "SELECT count(*) FROM edges e JOIN workflows w ON w.id = e.source_id \
+                            WHERE w.canonical_name = 'h3-http-legacy' AND e.relationship = 'executes'";
+        let before: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        for (who, auth) in [("a stranger", stranger.clone()), ("the ingester", ingester)] {
+            let resp = router_as(auth)
+                .oneshot(post_json(
+                    "/api/v1/workflows/steps",
+                    serde_json::json!({"canonical_name": "h3-http-legacy", "step_text": format!("{who}'s step")}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{who}: a legacy workflow is platform corpus"
+            );
+            let body =
+                String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .to_string();
+            assert!(body.contains("no recorded submitter"), "{who}: {body}");
+            let after: i64 = sqlx::query_scalar(executes_sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(after, before, "{who}: nothing written");
+        }
+
+        // The delete route: refused for the same reason, the step's truth
+        // untouched (main drove it to 0.05 behind the WARN).
+        let lineage: Uuid = sqlx::query_scalar(
+            "SELECT c.step_lineage_id FROM claims c JOIN edges e ON e.target_id = c.id \
+               JOIN workflows w ON w.id = e.source_id \
+              WHERE w.canonical_name = 'h3-http-legacy' AND c.step_lineage_id IS NOT NULL \
+              LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let truths_sql = "SELECT truth_value FROM claims WHERE step_lineage_id = $1 ORDER BY id";
+        let truths: Vec<f64> = sqlx::query_scalar(truths_sql)
+            .bind(lineage)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let resp = router_as(stranger.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/steps/delete",
+                serde_json::json!({"canonical_name": "h3-http-legacy", "step_lineage_id": lineage}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a stranger's delete on a legacy workflow"
+        );
+        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+            .to_string();
+        assert!(body.contains("no recorded submitter"), "delete: {body}");
+        let truths_after: Vec<f64> = sqlx::query_scalar(truths_sql)
+            .bind(lineage)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            truths_after, truths,
+            "delete: the step's truth is untouched"
+        );
+
+        let mut next = ingest_payload("h3-http-legacy");
+        next["source"]["generation"] = serde_json::json!(1);
+        next["phases"][0]["summary"] = serde_json::json!("a stranger's generation");
+        let resp = router_as(stranger)
+            .oneshot(post_json("/api/v1/workflows/ingest", next))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a new generation of a legacy lineage"
+        );
+        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+            .to_string();
+        assert!(
+            body.contains("no recorded submitter"),
+            "generation 1 is refused by the legacy rule, not another 403: {body}"
+        );
+        let generations: Vec<(i32, Option<String>)> = sqlx::query_as(
+            "SELECT generation, metadata->>'epigraph_submitted_by' FROM workflows \
+              WHERE canonical_name = 'h3-http-legacy' ORDER BY generation",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(generations, vec![(0, None)], "nothing written");
+
+        // CALIBRATION: the audited admin arm admits, and records no submitter.
+        let mut admin = test_auth();
+        admin.scopes.push("claims:admin".to_string());
+        let admin_agent = admin.agent_id.unwrap();
+        let audits_sql = "SELECT count(*) FROM security_events \
+                          WHERE event_type = 'workflows.admin_write' AND agent_id = $1";
+
+        // claims:admin in the token alone, before its client record grants it:
+        // the audited admin arm refuses it ADM02 (not a silent "no admin"),
+        // naming the legacy workflow, and nothing is written or audited.
+        let resp = router_as(admin.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-legacy", "step_text": "a grantless admin's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "claims:admin in the token alone does not admit a legacy workflow"
+        );
+        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+            .to_string();
+        assert!(body.contains("ADM02"), "grantless admin: {body}");
+        assert!(
+            body.contains("no recorded submitter"),
+            "grantless admin: {body}"
+        );
+        let after: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "grantless admin: nothing written");
+        let audits: i64 = sqlx::query_scalar(audits_sql)
+            .bind(admin_agent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(audits, 0, "grantless admin: nothing audited");
+
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, display_name) \
+             VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'u005 http admin')",
+        )
+        .bind(admin_agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
+                                        granted_scopes, status, agent_id) \
+             VALUES ($1, $2, 'u005 http admin', 'human', ARRAY['claims:admin'], \
+                     ARRAY['claims:admin'], 'active', $3)",
+        )
+        .bind(admin.client_id)
+        .bind(format!("u005-http-admin-{}", admin.client_id))
+        .bind(admin_agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let resp = router_as(admin)
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-legacy", "step_text": "an audited admin's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a live grant is admitted");
+        let after: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before + 1);
+        let submitter_kinds: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT jsonb_typeof(details->'submitter') FROM security_events \
+              WHERE event_type = 'workflows.admin_write' AND agent_id = $1",
+        )
+        .bind(admin_agent)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            submitter_kinds,
+            vec![Some("null".to_string())],
+            "one audit row, \"submitter\": null"
+        );
     }
 }
