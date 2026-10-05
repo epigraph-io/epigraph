@@ -51,6 +51,11 @@ async fn url_for(pool: &PgPool) -> String {
 
 /// The router, serving on a pool whose every connection is `epigraph_app`.
 async fn app_router(pool: &PgPool, max: u32) -> axum::Router {
+    create_router(app_state(pool, max).await)
+}
+
+/// The state [`app_router`] serves: a pool whose every connection is `epigraph_app`.
+async fn app_state(pool: &PgPool, max: u32) -> AppState {
     use sqlx::Executor;
     let app_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(max)
@@ -71,7 +76,7 @@ async fn app_router(pool: &PgPool, max: u32) -> axum::Router {
         warm.push(app_pool.acquire().await.expect("warm connection"));
     }
     drop(warm);
-    create_router(AppState::with_db(app_pool, config()))
+    AppState::with_db(app_pool, config())
 }
 
 async fn post_token(app: axum::Router, body: Value) -> (StatusCode, Value) {
@@ -387,4 +392,137 @@ async fn client_credentials_and_revoke_on_the_app_role(pool: PgPool) {
         assert_eq!(reason.as_deref(), Some("revoked"));
         assert_eq!(live_tokens(&pool, client).await, 0);
     }
+}
+
+/// POST `/oauth/revoke` for an access token.
+async fn revoke_access_token(app: axum::Router, token: &str) -> StatusCode {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/revoke")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "token": token, "token_type_hint": "access_token" }).to_string(),
+        ))
+        .unwrap();
+    app.oneshot(req).await.unwrap().status()
+}
+
+/// `GET /api/v1/claims?limit=1` with `token`: a route the code grant's
+/// `claims:read` admits, behind `bearer_auth_middleware`.
+async fn list_one_claim(app: axum::Router, token: &str) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/claims?limit=1")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// RFC 7009 access-token revocation is DURABLE (drain unit U003, review finding
+/// on epigraph#282). It used to be an in-memory set inside one `AppState`, so a
+/// revoked token worked again after a restart and on every other API process.
+/// Router B is a second `AppState` on the same database and JWT secret: a
+/// restart, or a second process. Its pool, like A's, is the application role,
+/// so this also proves that role can write (through the definer) and read the
+/// denylist.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_access_token_stays_revoked_in_another_process(pool: PgPool) {
+    let (client_id, _client, code) = seed_code(&pool).await;
+    let a = app_router(&pool, 2).await;
+    let (status, body) = post_token(a.clone(), code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    let access = body["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_string();
+
+    let b = app_router(&pool, 2).await;
+
+    // CONTROL: before the revocation, B admits the token end to end.
+    let (status, body) = list_one_claim(b.clone(), &access).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "control: an unrevoked token is admitted on B: {body}"
+    );
+
+    assert_eq!(
+        revoke_access_token(a.clone(), &access).await,
+        StatusCode::OK
+    );
+
+    let (status, body) = list_one_claim(b.clone(), &access).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a token revoked on A must be refused on B (another process / after a restart): {body}"
+    );
+    // And on A itself, now that the in-memory set is gone.
+    let (status, body) = list_one_claim(a, &access).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "refused on A too: {body}");
+}
+
+/// `/oauth/revoke` is on the anonymous OAuth router, so the access-token arm
+/// must verify the token's signature before writing: otherwise anyone could
+/// fill the denylist with chosen `jti`s. A validly signed token IS recorded
+/// (calibration, so "nothing written" cannot pass because nothing ever is);
+/// a token signed with another secret is answered 200 (RFC 7009) and is not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_a_forged_access_token_writes_nothing(pool: PgPool) {
+    use epigraph_db::RevokedAccessTokenRepository;
+    let state = app_state(&pool, 2).await;
+    let jwt = state.jwt_config.clone();
+    let app = create_router(state);
+
+    // CALIBRATION: a token this server signed is recorded.
+    let (genuine, genuine_jti) = jwt
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:read".to_string()],
+            "service",
+            None,
+            None,
+            Duration::minutes(5),
+        )
+        .expect("mint genuine");
+    assert_eq!(
+        revoke_access_token(app.clone(), &genuine).await,
+        StatusCode::OK
+    );
+    assert!(
+        RevokedAccessTokenRepository::is_revoked(&pool, genuine_jti)
+            .await
+            .expect("lookup"),
+        "a validly signed token revoked through /oauth/revoke is recorded"
+    );
+
+    // A token signed with a different secret: 200, nothing recorded.
+    let forger = epigraph_api::oauth::JwtConfig::from_secret(
+        b"an-attacker-chosen-secret-of-at-least-32-bytes",
+    );
+    let (forged, forged_jti) = forger
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:admin".to_string()],
+            "service",
+            None,
+            None,
+            Duration::minutes(5),
+        )
+        .expect("mint forged");
+    assert_eq!(
+        revoke_access_token(app.clone(), &forged).await,
+        StatusCode::OK,
+        "RFC 7009: an invalid token is answered 200"
+    );
+    assert!(
+        !RevokedAccessTokenRepository::is_revoked(&pool, forged_jti)
+            .await
+            .expect("lookup"),
+        "a token this server did not sign must not reach the denylist"
+    );
 }

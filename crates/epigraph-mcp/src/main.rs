@@ -831,11 +831,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let router = if let Some(secret) = cli.jwt_secret.as_deref() {
             use epigraph_auth::JwtConfig;
-            use epigraph_mcp::auth::{bearer_auth_middleware, McpAuthState};
+            use epigraph_mcp::auth::{
+                bearer_auth_middleware, DbAccessTokenRevocation, McpAuthState,
+            };
 
             let state = McpAuthState {
                 jwt_config: Arc::new(JwtConfig::from_secret(secret.as_bytes())),
                 resource_metadata_url: cli.resource_metadata_url.clone(),
+                // The denylist `/oauth/revoke` writes on the HTTP API, read on
+                // this process's pool (migration 141).
+                revocation: Arc::new(DbAccessTokenRevocation::new(pool.clone())),
             };
             router.layer(axum::middleware::from_fn_with_state(
                 state,

@@ -66,11 +66,46 @@ fn rejection_reason(kind: &jsonwebtoken::errors::ErrorKind) -> &'static str {
 #[derive(Clone)]
 pub struct RawBearerToken(pub String);
 
+/// A revocation store could not answer. Opaque on purpose: the reason is for
+/// the server log, never for the 401 the caller sees.
+#[derive(Debug)]
+pub struct RevocationUnavailable(pub String);
+
+/// Answers whether a signature-verified access token's `jti` has been revoked
+/// (RFC 7009, `POST /oauth/revoke` on the HTTP API).
+#[async_trait::async_trait]
+pub trait AccessTokenRevocation: Send + Sync {
+    async fn is_revoked(&self, jti: uuid::Uuid) -> Result<bool, RevocationUnavailable>;
+}
+
+/// The production store: the durable denylist the HTTP API's `/oauth/revoke`
+/// writes, read on this process's own pool.
+pub struct DbAccessTokenRevocation {
+    pool: sqlx::PgPool,
+}
+
+impl DbAccessTokenRevocation {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl AccessTokenRevocation for DbAccessTokenRevocation {
+    async fn is_revoked(&self, jti: uuid::Uuid) -> Result<bool, RevocationUnavailable> {
+        epigraph_db::RevokedAccessTokenRepository::is_revoked(&self.pool, jti)
+            .await
+            .map_err(|e| RevocationUnavailable(e.to_string()))
+    }
+}
+
 #[derive(Clone)]
 pub struct McpAuthState {
     pub jwt_config: Arc<JwtConfig>,
     /// Absolute URL of the protected-resource metadata doc, advertised in 401s.
     pub resource_metadata_url: Option<String>,
+    /// Where revoked access tokens are looked up.
+    pub revocation: Arc<dyn AccessTokenRevocation>,
 }
 
 pub async fn bearer_auth_middleware(

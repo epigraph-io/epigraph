@@ -56,6 +56,7 @@ pub mod provenance;
 pub mod provenance_chain;
 pub mod recall_event;
 pub mod refresh_token;
+pub mod revoked_access_token;
 pub mod scoped_belief;
 pub mod security_event;
 pub mod semantic_link;
@@ -167,6 +168,7 @@ pub use refresh_token::{
     RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
     RefreshTokenRow,
 };
+pub use revoked_access_token::RevokedAccessTokenRepository;
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
 pub use span::{SpanRepository, SpanRow};
 pub use task::{TaskRepository, TaskRow};
