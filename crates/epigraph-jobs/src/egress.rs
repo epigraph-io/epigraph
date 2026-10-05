@@ -266,6 +266,7 @@ pub fn parse_and_classify(raw: &str) -> Result<CheckedUrl, EgressDenied> {
 /// Injectable so tests never touch real DNS ([`StubResolver`]). A resolver
 /// cannot weaken the guard: whatever it returns is judged by the address
 /// table, and the returned addresses are the only ones the caller may dial.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait::async_trait]
 pub trait EgressResolver: Send + Sync {
     /// Resolve `host` (as the URL spells it, normalised by the `url` crate)

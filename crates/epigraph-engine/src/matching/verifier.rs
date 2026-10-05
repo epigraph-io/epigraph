@@ -232,6 +232,7 @@ pub fn map_relationship(rel: &str, _strength: f32) -> MatchVerdict {
 /// Pluggable LLM verifier. The production impl wraps
 /// `epigraph_cli::rerank::rerank_candidates_table` (created in T18 binary
 /// wiring); tests inject a fake.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait VerifierClient: Send + Sync {
     /// Return one **slot** per input pair, in the same order. Implementations

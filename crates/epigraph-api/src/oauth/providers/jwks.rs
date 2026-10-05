@@ -36,6 +36,7 @@ pub struct JwksCache {
     fetcher: Option<Arc<dyn JwksFetcher>>,
 }
 
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait::async_trait]
 pub trait JwksFetcher: Send + Sync {
     async fn fetch(&self, url: &str) -> Result<Value, String>;
