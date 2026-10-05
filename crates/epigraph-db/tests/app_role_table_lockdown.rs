@@ -685,6 +685,100 @@ async fn rotation_caps_expiry_and_derives_scopes_and_token_hash_is_unreadable(po
     assert_eq!(reason.as_deref(), Some("revoked"));
 }
 
+/// Migration 140: the successor's scopes are the PRESENTED token's scopes
+/// narrowed to the client's current grant, never the client's whole grant. A
+/// consent narrowed to `claims:read` by a client that is granted
+/// `claims:write` too must stay `claims:read` through every rotation (RFC 6749
+/// section 6: a refresh MUST NOT include any scope not originally granted).
+/// Under 118's body the successor took `granted_scopes`, so the first rotation
+/// widened the chain to `{claims:read,claims:write}`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotation_successor_inherits_the_presented_tokens_scopes_not_the_clients_grant(
+    pool: PgPool,
+) {
+    let read = "claims:read".to_string();
+    let write = "claims:write".to_string();
+    let client = OAuthClientRepository::create(
+        &pool,
+        &format!("w11_{}", Uuid::new_v4().simple()),
+        None,
+        "u002 narrowed consent",
+        "human",
+        &[read.clone(), write.clone()],
+        &[read.clone(), write.clone()],
+        "active",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("seed client granted read+write");
+    let app = app_pool(&pool, 2).await;
+    let exp = chrono::Utc::now() + chrono::Duration::hours(1);
+    let scopes_of = |hash: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Vec<String>>(
+                "SELECT scopes FROM refresh_tokens WHERE token_hash = $1",
+            )
+            .bind(hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let t0 = h("narrow0");
+    RefreshTokenRepository::create(&app, &t0, client, std::slice::from_ref(&read), exp)
+        .await
+        .unwrap();
+    let t1 = h("narrow1");
+    assert!(matches!(
+        RefreshTokenRepository::rotate(&app, &t0, &t1, exp)
+            .await
+            .unwrap(),
+        RefreshRotateOutcome::Rotated { .. }
+    ));
+    assert_eq!(
+        scopes_of(t1.clone()).await,
+        vec![read.clone()],
+        "the successor keeps the presented token's narrowed scopes, not the client's grant"
+    );
+    let t2 = h("narrow2");
+    RefreshTokenRepository::rotate(&app, &t1, &t2, exp)
+        .await
+        .unwrap();
+    assert_eq!(
+        scopes_of(t2.clone()).await,
+        vec![read.clone()],
+        "and the second rotation does not widen it either"
+    );
+
+    // The narrowing direction still holds: a scope the client has since lost
+    // is dropped from the successor, and the stored order of the rest is kept.
+    let t3 = h("narrow3");
+    RefreshTokenRepository::create(&app, &t3, client, &[write.clone(), read.clone()], exp)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE oauth_clients SET granted_scopes = $2 WHERE id = $1")
+        .bind(client)
+        .bind(std::slice::from_ref(&read))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let t4 = h("narrow4");
+    RefreshTokenRepository::rotate(&app, &t3, &t4, exp)
+        .await
+        .unwrap();
+    assert_eq!(
+        scopes_of(t4).await,
+        vec![read],
+        "a revoked grant leaves the chain at its next rotation"
+    );
+}
+
 /// The rotation's expiry cap is the client type's refresh TTL, row by row: the
 /// same table as `oauth/token.rs::handle_refresh_token`'s `refresh_ttl` (agent
 /// 24 h, human 30 d, service 90 d). A 100-year successor must land in a

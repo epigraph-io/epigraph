@@ -51,6 +51,15 @@ async fn url_for(pool: &PgPool) -> String {
 
 /// The router, serving on a pool whose every connection is `epigraph_app`.
 async fn app_router(pool: &PgPool, max: u32) -> axum::Router {
+    app_router_and_jwt(pool, max).await.0
+}
+
+/// [`app_router`], plus the issuing state's JWT config, so a test validates an
+/// access token under exactly the secret that signed it.
+async fn app_router_and_jwt(
+    pool: &PgPool,
+    max: u32,
+) -> (axum::Router, std::sync::Arc<epigraph_api::oauth::JwtConfig>) {
     use sqlx::Executor;
     let app_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(max)
@@ -71,7 +80,9 @@ async fn app_router(pool: &PgPool, max: u32) -> axum::Router {
         warm.push(app_pool.acquire().await.expect("warm connection"));
     }
     drop(warm);
-    create_router(AppState::with_db(app_pool, config()))
+    let state = AppState::with_db(app_pool, config());
+    let jwt = state.jwt_config.clone();
+    (create_router(state), jwt)
 }
 
 async fn post_token(app: axum::Router, body: Value) -> (StatusCode, Value) {
@@ -92,17 +103,28 @@ async fn post_token(app: axum::Router, body: Value) -> (StatusCode, Value) {
 
 /// An active human client plus one authorization code for it.
 async fn seed_code(pool: &PgPool) -> (String, Uuid, String) {
+    let scopes = vec!["claims:read".to_string()];
+    seed_code_with(pool, &scopes, &scopes).await
+}
+
+/// [`seed_code`] with the client's grant (`allowed_scopes` = `granted_scopes`)
+/// and the code's consented scopes chosen separately, the way
+/// `authorize.rs::callback_endpoint` narrows a consent to `requested ∩ granted`.
+async fn seed_code_with(
+    pool: &PgPool,
+    client_scopes: &[String],
+    scopes: &[String],
+) -> (String, Uuid, String) {
     let unique = Uuid::new_v4().simple().to_string();
     let client_id = format!("w11_{unique}");
-    let scopes = vec!["claims:read".to_string()];
     let id = OAuthClientRepository::create(
         pool,
         &client_id,
         None,
         "w11 connector",
         "human",
-        &scopes,
-        &scopes,
+        client_scopes,
+        client_scopes,
         "active",
         None,
         None,
@@ -122,7 +144,7 @@ async fn seed_code(pool: &PgPool) -> (String, Uuid, String) {
         id,
         REDIRECT_URI,
         &challenge,
-        &scopes,
+        scopes,
         None,
         Utc::now() + Duration::minutes(5),
     )
@@ -387,4 +409,218 @@ async fn client_credentials_and_revoke_on_the_app_role(pool: PgPool) {
         assert_eq!(reason.as_deref(), Some("revoked"));
         assert_eq!(live_tokens(&pool, client).await, 0);
     }
+}
+
+fn s(v: &str) -> String {
+    v.to_string()
+}
+
+/// The successor refresh token's stored scopes, read on the superuser pool.
+async fn live_scopes(pool: &PgPool, client: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT scopes FROM refresh_tokens WHERE client_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .expect("exactly one live refresh token")
+}
+
+/// RFC 6749 section 6: a refreshed token "MUST NOT include any scope not
+/// originally granted by the resource owner". The client here genuinely holds
+/// `claims:write`; the consent (the authorization code) was narrowed to
+/// `claims:read`. Before migration 140 the refresh grant re-read the client's
+/// `granted_scopes`, so the FIRST refresh widened the connector to write.
+/// Served on the application role, so the stored scopes must be readable
+/// there for the narrowing to happen at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refresh_never_widens_a_narrowed_consent(pool: PgPool) {
+    let (client_id, client, code) = seed_code_with(
+        &pool,
+        &[s("claims:read"), s("claims:write")],
+        &[s("claims:read")],
+    )
+    .await;
+    let (app, jwt) = app_router_and_jwt(&pool, 2).await;
+
+    let (status, body) = post_token(app.clone(), code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    assert_eq!(body["scope"], "claims:read", "the consent was narrowed");
+    let r0 = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(app.clone(), refresh_grant(&r0)).await;
+    assert_eq!(status, StatusCode::OK, "refresh: {body}");
+    assert_eq!(
+        body["scope"], "claims:read",
+        "the refresh must not widen the consent to the client's whole grant"
+    );
+    let claims = jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .expect("the refreshed access token validates");
+    assert_eq!(claims.scopes, vec![s("claims:read")], "access-token scopes");
+    assert_eq!(
+        live_scopes(&pool, client).await,
+        vec![s("claims:read")],
+        "the successor refresh token keeps the narrowed scopes"
+    );
+
+    let r1 = body["refresh_token"].as_str().unwrap().to_string();
+    let (status, body) = post_token(app.clone(), refresh_grant(&r1)).await;
+    assert_eq!(status, StatusCode::OK, "second refresh: {body}");
+    assert_eq!(body["scope"], "claims:read", "nor does the second refresh");
+}
+
+/// The other direction, which must keep working: a scope revoked from the
+/// client since the consent leaves the chain at its next refresh.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refresh_narrows_when_the_client_grant_shrinks(pool: PgPool) {
+    let both = [s("claims:read"), s("claims:write")];
+    let (client_id, client, code) = seed_code_with(&pool, &both, &both).await;
+    let (app, jwt) = app_router_and_jwt(&pool, 2).await;
+    let (status, body) = post_token(app.clone(), code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    assert_eq!(body["scope"], "claims:read claims:write");
+    let r0 = body["refresh_token"].as_str().unwrap().to_string();
+
+    sqlx::query("UPDATE oauth_clients SET granted_scopes = $2 WHERE id = $1")
+        .bind(client)
+        .bind(&[s("claims:read")][..])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = post_token(app.clone(), refresh_grant(&r0)).await;
+    assert_eq!(status, StatusCode::OK, "refresh: {body}");
+    assert_eq!(body["scope"], "claims:read", "the revoked scope is gone");
+    let claims = jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.scopes, vec![s("claims:read")]);
+    assert_eq!(live_scopes(&pool, client).await, vec![s("claims:read")]);
+}
+
+/// `client_credentials` mints its refresh token from `requested ∩ granted`;
+/// refreshing it must not widen it to the whole grant either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_client_credentials_refresh_never_widens_the_requested_scope(pool: PgPool) {
+    let secret = [9u8; 32];
+    let client_id = format!("u002_svc_{}", Uuid::new_v4().simple());
+    let both = [s("claims:read"), s("claims:write")];
+    let client = OAuthClientRepository::create(
+        &pool,
+        &client_id,
+        Some(blake3::hash(&secret).as_bytes()),
+        "u002 service",
+        "service",
+        &both,
+        &both,
+        "active",
+        None,
+        None,
+        Some("U002 Test Entity"),
+        Some("ops@example.test"),
+        None,
+    )
+    .await
+    .expect("seed service client");
+    let (app, jwt) = app_router_and_jwt(&pool, 2).await;
+
+    let (status, body) = post_token(
+        app.clone(),
+        serde_json::json!({
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": hex::encode(secret),
+            "scope": "claims:read",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "client_credentials: {body}");
+    assert_eq!(body["scope"], "claims:read");
+    let rt = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(app.clone(), refresh_grant(&rt)).await;
+    assert_eq!(status, StatusCode::OK, "refresh: {body}");
+    assert_eq!(
+        body["scope"], "claims:read",
+        "the refresh must not widen a client_credentials token to the whole grant"
+    );
+    let claims = jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.scopes, vec![s("claims:read")]);
+    assert_eq!(live_scopes(&pool, client).await, vec![s("claims:read")]);
+}
+
+/// RFC 6749 section 6 lets a refresh request NARROW the access token with
+/// `scope`; the new refresh token's scope stays identical to the presented
+/// one's, so a later refresh without `scope` gets the full stored set back. A
+/// requested scope outside the stored set is dropped, never added.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refresh_request_narrows_the_access_token_but_not_the_chain(pool: PgPool) {
+    let both = [s("claims:read"), s("claims:write")];
+    let (client_id, client, code) = seed_code_with(
+        &pool,
+        &[s("claims:read"), s("claims:write"), s("evidence:read")],
+        &both,
+    )
+    .await;
+    let (app, jwt) = app_router_and_jwt(&pool, 2).await;
+    let (status, body) = post_token(app.clone(), code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    let r0 = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = post_token(
+        app.clone(),
+        serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": r0,
+            "scope": "claims:read  evidence:read",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "narrowing refresh: {body}");
+    assert_eq!(
+        body["scope"], "claims:read",
+        "narrowed to the request, and evidence:read (granted to the client but never \
+         consented) is not added"
+    );
+    let claims = jwt
+        .validate_token(body["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.scopes, vec![s("claims:read")]);
+    assert_eq!(
+        live_scopes(&pool, client).await,
+        both.to_vec(),
+        "the successor refresh token keeps the presented token's scopes"
+    );
+
+    let r1 = body["refresh_token"].as_str().unwrap().to_string();
+    let (status, body) = post_token(app.clone(), refresh_grant(&r1)).await;
+    assert_eq!(status, StatusCode::OK, "plain refresh: {body}");
+    assert_eq!(body["scope"], "claims:read claims:write");
+}
+
+/// RFC 6749 section 5.1: a token response carries `Cache-Control: no-store`.
+/// The whole anonymous `/oauth` router is marked so (the consent page carries
+/// a single-use ticket; see `oauth_authorization_code.rs`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn token_responses_are_not_cacheable(pool: PgPool) {
+    let (client_id, _client, code) = seed_code(&pool).await;
+    let app = app_router(&pool, 2).await;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(code_grant(&code, &client_id).to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "a token response must not be cached"
+    );
 }
