@@ -1629,6 +1629,49 @@ async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgP
     }
 }
 
+/// Migration 140 redefines `epigraph_refresh_token_rotate` (the successor keeps
+/// the presented token's scopes, narrowed to the client's grant). `CREATE OR
+/// REPLACE` keeps the owner and ACL, and 140 re-asserts both; this pins them,
+/// because the harness migrates as a superuser and a definer silently left
+/// superuser-owned, or granted back to PUBLIC, would pass every behavioural
+/// test. The pinned `search_path` keeps the body's unqualified `unnest` and
+/// `ANY` resolving in `pg_catalog`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_140_rotate_definer_keeps_owner_grant_and_search_path(pool: PgPool) {
+    let signature = "public.epigraph_refresh_token_rotate(bytea, bytea, timestamp with time zone)";
+    let (secdef, owner, acl, config): (bool, String, Option<String>, Option<Vec<String>>) =
+        sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.proacl::text, p.proconfig \
+               FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE p.oid = $1::regprocedure",
+        )
+        .bind(signature)
+        .fetch_one(&pool)
+        .await
+        .expect("the rotate definer exists");
+    assert!(secdef, "the rotation must stay SECURITY DEFINER");
+    assert_eq!(owner, "epigraph_maintenance", "rotate definer owner");
+    assert!(acl.is_some(), "an EXPLICIT ACL; NULL is the PUBLIC default");
+    assert_eq!(
+        config,
+        Some(vec!["search_path=pg_catalog, public".to_string()]),
+        "the definer pins its search_path"
+    );
+    for (role, expected) in [
+        ("public", false),
+        ("epigraph_app", true),
+        ("epigraph_maintenance", true),
+    ] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(role)
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on the rotate definer");
+    }
+}
+
 /// Migration 122: the operator-binding claims trigger fires AFTER
 /// `claims_require_tenancy` (PostgreSQL fires same-event BEFORE ROW triggers in
 /// name order). Its OPL02 scope check reads `owner_group_id`, which the tenancy

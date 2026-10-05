@@ -181,6 +181,10 @@ cargo run -p epigraph-cli --bin bootstrap_clients -- \
 It is convergent as of PR-02: an existing canonical client has its
 `allowed_scopes`/`granted_scopes` rewritten to `scopes_for(<name>)` and is
 reported `EXISTS: … scopes=RECONCILED`. Non-canonical clients are untouched.
+Since migration 140 a refresh never adds a scope to a refresh-token chain (it
+issues the chain's own scopes narrowed to the grant), so a consumer that only
+refreshes does not pick a newly added canonical scope up: it needs a fresh
+`client_credentials` grant (or, for a human connector, a re-authorization).
 Externally provisioned humans get theirs from `default_scopes` in
 `providers.toml`; if yours still says `groups:manage` (a scope that never
 existed), change it to `groups:write` — see `providers.toml.example`.
@@ -1365,13 +1369,17 @@ a HUMAN's own client an admin-only scope:
   no-op `--apply` is recorded too (`changed: false`), which is how a grant made
   some other way is ratified. A dry run writes nothing.
 
-**A human's agents carry that human's scopes.** Agents acting through the
-human's OAuth client hold what that client is granted, because the refresh
-grant re-reads `granted_scopes`: a grant reaches them at their next refresh. A
-revocation also takes effect at the next refresh; an access token minted before
-it keeps the scope until it expires, except on the paths that re-read the
-grant on every call: the audited admin writes (migrations 111 and 112) and the
-MCP server-stamp borrow in section 3.
+**A human's agents carry at most that human's scopes.** Agents acting through
+the human's OAuth client hold what the human CONSENTED to, narrowed to what the
+client is still granted: since migration 140 the refresh grant issues the
+refresh token's own scopes intersected with `granted_scopes`, and never widens
+them (RFC 6749 section 6). A grant made here therefore does NOT reach an
+existing connector at its next refresh: the human must re-authorize it (a new
+authorization-code grant, e.g. reconnecting the connector) so the consent can
+include the new scope. A revocation does take effect at the next refresh; an
+access token minted before it keeps the scope until it expires, except on the
+paths that re-read the grant on every call: the audited admin writes
+(migrations 111 and 112) and the MCP server-stamp borrow in section 3.
 
 ### 3. BREAKING for hand-minted and de-scoped admin tokens — the MCP server-stamp borrow re-checks the live grant (`ADM02`)
 
@@ -1428,8 +1436,11 @@ confirm each came from the token endpoint for a client that holds the grant.
   the application role and is refused (`42501`) for a client that is
   `suspended` or `revoked`. Because the check is live, a token that
   already carries `claims:admin` in its scope lands again as soon as the
-  grant is applied; a token minted without the scope needs a refresh (the
-  refresh grant re-reads `granted_scopes`) before it reaches the borrow at all.
+  grant is applied; a token minted without the scope never gains it by
+  refreshing (migration 140: a refresh only keeps or narrows the scopes the
+  refresh token was consented with), so the human must re-authorize the
+  connector (a new authorization-code grant) before it reaches the borrow at
+  all.
 * A hand-minted token cannot be re-granted: there is no client row, or no
   row for its agent, to grant. Replace it with a token issued by the token
   endpoint to a client that holds the grant, then grant that client as above
@@ -2392,3 +2403,65 @@ log into `security_events` first), `126-undo.sql`, `125-undo.sql`,
 `124-undo.sql`. Each script's header names the binaries that must be rolled
 back before it. `epigraph-operator revoke-passkey` is the break-glass that
 returns a passkey holder to the bootstrap path without any undo.
+
+## Refresh scope (migration 140) — BREAKING grant semantics, and a revoke decision for chains widened under 118
+
+Migration 140 redefines `epigraph_refresh_token_rotate`, and the same release
+changes `oauth/token.rs::handle_refresh_token`: a refresh issues the PRESENTED
+refresh token's own scopes narrowed to the client's current `granted_scopes`
+(RFC 6749 section 6), never the client's whole grant. Before it, the first
+refresh of a narrowed consent (a connector authorized for `claims:read` by a
+human who also holds `claims:write`, or a `client_credentials` grant with a
+narrowing `scope`) widened the chain to everything the client is granted.
+
+1. **Deploy order.** Migrations apply in number order: 140 goes out after
+   every lower-numbered migration (in particular 123 and the 124–129 elevation
+   series), never ahead of them. Migrate 140 BEFORE (or together with) the new
+   API binary. Either half alone still widens: the new binary on 118's definer
+   issues a narrow access token but stores a whole-grant successor, which the
+   next refresh then issues; the old binary on 140 stores a narrow successor
+   but issues whole-grant access tokens.
+2. **BREAKING — a grant no longer reaches an existing chain.** A scope added
+   to a client after its refresh chain was minted is never picked up by
+   refreshing. This covers `epigraph-operator grant-client-scope` (section
+   "Batch OA1", step 2) and the `bootstrap_clients` canonical-scope reconcile
+   (section "PR-02", step 1). A human connector must be re-authorized (a new
+   authorization-code grant); a refresh-only service consumer must run a fresh
+   `client_credentials` grant. A revocation still takes effect at the next
+   refresh.
+3. **BREAKING — a refresh `scope` that names nothing issuable is refused.**
+   A refresh request whose `scope` names none of the chain's issuable scopes
+   gets `400` with `invalid_scope`, and the presented refresh token is NOT
+   spent. Before this release `scope` was ignored on refresh. A `scope` that
+   names some issuable scopes narrows the access token to them (unknown names
+   are dropped, as for `client_credentials`); the chain keeps its scopes.
+4. **DECISION — chains widened under 118 are not healed.** Migration 140
+   changes only future rotations. A chain rotated under 118 already stores the
+   client's whole grant, and every rotation re-caps its expiry at now() plus
+   the client type's TTL (human 30 days, service 90 days, agent 24 hours) with
+   no family-age cap, so a connector that refreshes at least once per TTL keeps
+   the widened scopes indefinitely. Decide, per client, after step 1:
+   * **Revoke** the client's live chains, forcing a fresh consent (humans
+     re-authorize the connector; services run a new `client_credentials`
+     grant): `SELECT public.epigraph_refresh_token_revoke_client('<oauth_clients.id>');`
+     on the maintenance DSN (it returns the number of tokens revoked). The candidates are `human` clients (any connector consented
+     with a narrowed scope) and `client_credentials` clients that request a
+     narrowing `scope`. Read-only census of what each live chain now stores
+     against the grant (maintenance DSN):
+     ```sql
+     SELECT c.id, c.client_id, c.client_type, t.scopes, c.granted_scopes,
+            t.scopes @> c.granted_scopes AS holds_whole_grant
+       FROM refresh_tokens t JOIN oauth_clients c ON c.id = t.client_id
+      WHERE t.revoked_at IS NULL AND t.expires_at > now()
+      ORDER BY c.client_type, c.client_id;
+     ```
+     `holds_whole_grant` is true for a chain whose last 118 rotation stored
+     the grant as it stands now, and equally for a consent that genuinely asked
+     for everything; the stored row does not record which, so the decision is
+     the operator's.
+   * **Accept** the widening for chains whose consumer is trusted with the
+     whole grant, and record that decision.
+
+   Rollback: re-run 118's `CREATE OR REPLACE FUNCTION
+   public.epigraph_refresh_token_rotate` block verbatim (owner and ACL survive
+   it), and roll the API binary back with it (step 1).

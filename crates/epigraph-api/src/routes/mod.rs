@@ -221,6 +221,35 @@ use axum::{
     Router,
 };
 
+/// Response headers for every route of the anonymous `/oauth` and
+/// `/.well-known` router, in both router variants.
+///
+/// * `Content-Security-Policy: frame-ancestors 'none'` and
+///   `X-Frame-Options: DENY`: the consent page (`GET /oauth/callback`) is an
+///   Allow button bound to a single-use ticket. Rendered inside another
+///   origin's frame, a signed-in user can be walked onto it (clickjacking).
+///   The legacy header covers browsers without CSP level 2.
+/// * `Cache-Control: no-store`: that ticket, and every token response (RFC 6749
+///   section 5.1 requires it there), must not be stored by any cache.
+/// * `Referrer-Policy: no-referrer`: these URLs carry codes and state.
+///
+/// Inserted, not appended, so a handler cannot weaken them.
+async fn oauth_response_headers(mut res: axum::response::Response) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    res
+}
+
 /// Create the main application router with all routes.
 ///
 /// # Route structure — authenticated by default
@@ -1101,7 +1130,8 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
-        );
+        )
+        .layer(middleware::map_response(oauth_response_headers));
 
     // Apply rate limiting and body limit as outermost layers
     // Rate limiting bypasses health endpoints internally
@@ -1584,7 +1614,8 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
-        );
+        )
+        .layer(middleware::map_response(oauth_response_headers));
 
     // Apply rate limiting and body limit as outermost layers
     // Rate limiting bypasses health endpoints internally

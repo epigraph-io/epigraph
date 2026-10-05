@@ -727,7 +727,15 @@ async fn handle_refresh_token(
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
         })? {
-        RefreshCheck::Valid { id, client_id } => StoredRefresh { id, client_id },
+        RefreshCheck::Valid {
+            id,
+            client_id,
+            scopes,
+        } => StoredRefresh {
+            id,
+            client_id,
+            scopes,
+        },
         RefreshCheck::Grace => {
             tracing::info!(
                 "refresh token presented again inside its rotation's grace window: \
@@ -809,13 +817,32 @@ async fn handle_refresh_token(
         _ => Duration::minutes(15),
     };
 
-    // Use client's current granted_scopes (may have been updated since refresh
-    // token was issued), through the mint chokepoint (never the elevation
-    // scope; the admin-only scopes per migration 128's switch).
+    // RFC 6749 section 6: a refreshed token "MUST NOT include any scope not
+    // originally granted by the resource owner". The ceiling is the presented
+    // token's own scopes (the consent it was minted from, carried through every
+    // rotation), narrowed to what the client is STILL granted, so a revocation
+    // takes effect at the next refresh and a grant never widens a narrowed
+    // consent. A `scope` on the request may narrow the access token further,
+    // never add to it; the successor refresh token keeps the presented token's
+    // scopes (narrowed to the grant by the rotation definer, migration 140).
+    //
+    // A `scope` that names nothing this token can issue is `invalid_scope`
+    // (RFC 6749 section 5.2), answered BEFORE the chain is spent: a 200 with an
+    // empty-scope access token would rotate the chain and authorize nothing.
+    let consented =
+        refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref()).ok_or_else(
+            || ApiError::BadRequest {
+                message: "invalid_scope: the requested scope names none of the scopes \
+                          this refresh token was granted"
+                    .into(),
+            },
+        )?;
+    // Then through the mint chokepoint (never the elevation scope; the
+    // admin-only scopes per migration 128's switch), which only ever removes.
     let effective_scopes = crate::oauth::scopes::grantable(
         state,
         client.id,
-        client.granted_scopes.clone(),
+        consented,
         crate::oauth::scopes::MintGrant::RefreshToken,
     )
     .await;
@@ -879,8 +906,13 @@ async fn handle_refresh_token(
     // refreshes presenting one token exactly one gets here with `Rotated`; the
     // others find it spent inside the grace window and get a 401 while the
     // winner's successor stays live. The definer derives the successor's scopes
-    // (the client's `granted_scopes`, which `effective_scopes` already is) and
-    // caps its expiry at the same TTL table as below.
+    // (migration 140: the presented token's scopes narrowed to the client's
+    // `granted_scopes`, which is `effective_scopes` before any request
+    // narrowing) and caps its expiry at the same TTL table as below. It reads
+    // `granted_scopes` a moment after this handler did, so a grant changed in
+    // between can make the successor differ from `effective_scopes` (narrower,
+    // or holding a scope re-granted in between), but never beyond the presented
+    // token's stored scopes.
     let new_refresh = {
         use rand::Rng;
         let raw: [u8; 32] = rand::thread_rng().gen();
@@ -939,6 +971,36 @@ async fn handle_refresh_token(
 struct StoredRefresh {
     id: uuid::Uuid,
     client_id: uuid::Uuid,
+    /// The scopes the presented token was minted with.
+    scopes: Vec<String>,
+}
+
+/// The scopes a refresh issues: the presented token's `stored` scopes that the
+/// client is still `granted`, in stored order, further narrowed to `requested`
+/// (whitespace-separated) when the request names any. An absent or blank
+/// `scope` means "as originally granted" (RFC 6749 section 6). Never a scope
+/// outside `stored`.
+///
+/// `None` when the request names scopes but none of them can be issued
+/// (`invalid_scope`); a requested scope outside the set is otherwise dropped,
+/// the same leniency as the `client_credentials` grant.
+#[cfg(feature = "db")]
+fn refresh_scopes(
+    stored: &[String],
+    granted: &[String],
+    requested: Option<&str>,
+) -> Option<Vec<String>> {
+    let requested: Vec<&str> = requested.map_or_else(Vec::new, |r| r.split_whitespace().collect());
+    let issued: Vec<String> = stored
+        .iter()
+        .filter(|s| granted.contains(s))
+        .filter(|s| requested.is_empty() || requested.contains(&s.as_str()))
+        .cloned()
+        .collect();
+    if issued.is_empty() && !requested.is_empty() {
+        return None;
+    }
+    Some(issued)
 }
 
 /// One 401 for every refresh that cannot proceed (unknown, expired, revoked,
@@ -1737,5 +1799,81 @@ mod refresh_gate_tests {
         // A configured allowlist is NOT widened by allow_all_identities: the flag
         // only governs the no-allowlist-at-all case.
         assert!(!refresh_allowed(&r, "google:sub", "anyone@gmail.com", true));
+    }
+}
+
+/// [`refresh_scopes`], the refresh grant's ceiling (RFC 6749 section 6), at the
+/// edges the DB-backed tests in `tests/oauth_app_role_lockdown.rs` do not reach.
+#[cfg(all(test, feature = "db"))]
+mod refresh_scope_tests {
+    use super::refresh_scopes;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_blank_scope_parameter_means_as_originally_granted() {
+        // stored != granted, so "as originally granted" (stored ∩ granted) is
+        // told apart from "the client's grant" and from "the stored set".
+        let stored = v(&["claims:read", "evidence:read"]);
+        let granted = v(&["claims:read", "claims:write"]);
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                refresh_scopes(&stored, &granted, blank),
+                Some(v(&["claims:read"])),
+                "{blank:?}: the stored scopes still granted, not the grant and not nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_scope_outside_the_stored_set_is_never_added() {
+        let stored = v(&["claims:read", "evidence:read"]);
+        let granted = v(&[
+            "claims:read",
+            "claims:write",
+            "claims:admin",
+            "evidence:read",
+        ]);
+        assert_eq!(
+            refresh_scopes(
+                &stored,
+                &granted,
+                Some("claims:read claims:write claims:admin")
+            ),
+            Some(v(&["claims:read"])),
+            "only a narrowing of the stored scopes; the client's wider grant is not a source"
+        );
+    }
+
+    #[test]
+    fn a_requested_scope_that_names_nothing_issuable_is_invalid_scope() {
+        let stored = v(&["claims:read"]);
+        let granted = v(&["claims:read", "claims:write", "claims:admin"]);
+        for nothing in ["claims:write claims:admin", "offline_access"] {
+            assert_eq!(
+                refresh_scopes(&stored, &granted, Some(nothing)),
+                None,
+                "{nothing:?} must be refused, not answered with an empty-scope token"
+            );
+        }
+        // Blank still means "as originally granted", even when that is empty.
+        assert_eq!(refresh_scopes(&stored, &[], None), Some(Vec::new()));
+    }
+
+    #[test]
+    fn the_stored_order_is_kept_and_a_lost_grant_is_dropped() {
+        let stored = v(&["claims:write", "evidence:read", "claims:read"]);
+        let granted = v(&["claims:read", "claims:write"]);
+        assert_eq!(
+            refresh_scopes(&stored, &granted, None),
+            Some(v(&["claims:write", "claims:read"]))
+        );
+        assert_eq!(
+            refresh_scopes(&stored, &granted, Some("claims:read\tclaims:write")),
+            Some(v(&["claims:write", "claims:read"])),
+            "any whitespace separates requested scopes"
+        );
     }
 }

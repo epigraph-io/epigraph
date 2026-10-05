@@ -1126,6 +1126,17 @@ Current reservation:
 - **133+**: public next (the elevation stack stays at or below 139; 140-159
   are reserved)
 
+- **140**: public `refresh_rotate_keeps_token_scopes` (backlog drain U002;
+  slot from the drain block 140-159, so 123-139 stay free for the in-flight
+  custodian and elevation series). Redefines 118's
+  `epigraph_refresh_token_rotate` (`CREATE OR REPLACE`, same signature, owner
+  and ACL re-asserted): the successor keeps the presented token's scopes
+  narrowed to the client's grant instead of taking the whole grant (RFC 6749
+  section 6). Pinned by `app_role_table_lockdown.rs::rotation_successor_inherits_the_presented_tokens_scopes_not_the_clients_grant`
+  and `schema_contract.rs::migration_140_rotate_definer_keeps_owner_grant_and_search_path`.
+  Undo is in the file's header. **Deploy order:** after 123-129 have been
+  applied (sqlx would otherwise apply them out of order after 140).
+
 Next public migration **outside both reserved tenancy ranges** must be `133` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
