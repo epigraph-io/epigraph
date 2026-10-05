@@ -300,8 +300,11 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequirePrincipal {
 /// `Viewer::resolve_elevated`: ELEVATED only when migration 125's
 /// principal-bound `epigraph_elevation_live` answers for a live session of
 /// this principal on this family, the plain scoped viewer otherwise (a forged,
-/// ended or expired claim, or a liveness check that fails). The request is
-/// never refused for it: the token still works, unelevated. The CLAIM is not
+/// ended or expired claim, or a liveness check that fails). A READ is never
+/// refused for it: it is served unelevated. (Since EL-10 every non-GET request
+/// whose token carries an elevation claim, live or not, is refused before it
+/// reaches a handler, by `middleware::elevated_access::elevated_write_refusal`,
+/// except the allowlisted routes.) The CLAIM is not
 /// authority; the viewer's [`epigraph_db::Viewer::elevation`] is. Connector
 /// mode (a session found by family alone) is the MCP server's, not this one's.
 ///

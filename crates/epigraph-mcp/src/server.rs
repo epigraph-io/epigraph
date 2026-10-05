@@ -791,7 +791,10 @@ impl EpiGraphMcpFull {
     /// would resolve it (`tools::viewer::request_viewer`), and refused when
     /// elevated, with the `ELEVATED READ-ONLY` refusal `begin_as` gives. An
     /// ended or expired session's claim is not elevated, so its writes pass
-    /// here (as the REST router serves them).
+    /// here. (The REST API is stricter since EL-10: it refuses every non-GET
+    /// request whose token carries an elevation claim at all,
+    /// `epigraph-api`'s `middleware::elevated_access::elevated_write_refusal`.
+    /// MCP decides on the live session because connector mode has no claim.)
     ///
     /// This is the chokepoint for EVERY write tool, including those that never
     /// call `write_identity` (the admin maintenance tools, the sheaf and theme
