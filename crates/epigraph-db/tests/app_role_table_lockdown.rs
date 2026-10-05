@@ -1616,7 +1616,7 @@ async fn an_agent_cannot_rewrite_its_own_competence_scopes(pool: PgPool) {
 /// margin is pinned by `access_token_revocation_prune_keeps_a_day_of_clock_skew_margin`
 /// and `a_token_expired_inside_the_skew_margin_is_still_recorded`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn access_token_revocations_go_through_the_definer_and_prune(pool: PgPool) {
+async fn access_token_revocations_go_through_the_definer(pool: PgPool) {
     use chrono::{Duration, Utc};
     use epigraph_db::RevokedAccessTokenRepository;
     let app = app_pool(&pool, 2).await;
@@ -1775,7 +1775,7 @@ async fn access_token_revocation_prune_keeps_a_day_of_clock_skew_margin(pool: Pg
 /// would keep admitting a token whose revocation was answered 200. The definer
 /// therefore records any token less than the 24 h margin past its expiry. The
 /// 23 h case pins this insert guard to the same (23 h, 25 h] window as the
-/// prune (the 25 h decline is in `access_token_revocations_go_through_the_definer_and_prune`),
+/// prune (the 25 h decline is in `access_token_revocations_go_through_the_definer`),
 /// so the two checks the migration says to keep equal cannot drift apart.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_token_expired_inside_the_skew_margin_is_still_recorded(pool: PgPool) {
