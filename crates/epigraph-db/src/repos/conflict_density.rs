@@ -30,18 +30,60 @@ pub struct FrameConflictDensity {
 
 /// `$1` is a nullable frame-id array (NULL = every frame), `$2` the frame
 /// limit. One statement serves both the scan and the single-frame read.
+///
+/// What `contradicts_edges` counts: distinct UNORDERED claim pairs joined by a
+/// live (`valid_to` unset or in the future) claim->claim `contradicts` or
+/// `refutes` edge, either stored spelling, where EITHER endpoint holds a BBA
+/// in the frame. Each rule closes a way the previous inline query miscounted:
+///
+/// * Both spellings, listed literally rather than `lower(relationship)`, so
+///   the btree `idx_edges_relationship` stays usable. MCP, `semantic_link` and
+///   the cross-source matcher write lower-case; the REST edge route accepts
+///   upper-case `CONTRADICTS`.
+/// * `source_type = 'claim' AND target_type = 'claim'`: the upper-case
+///   `CONTRADICTS` rows `submit_evidence` / `assess_claim` try to write have a
+///   mass-function source and are not claim disagreements.
+/// * `fc` is DISTINCT (frame, claim), so a source claim with k BBAs in the
+///   frame does not count its edge k times.
+/// * `LEAST`/`GREATEST` + `UNION`: A->B and B->A are one pair, and so are the
+///   two spellings of one pair.
+/// * Either endpoint: `contradicts` is symmetric and its stored orientation is
+///   arbitrary (`create_symmetric_if_absent_oriented` picks one), so testing
+///   only the source made the count depend on which way the row was written.
 const FRAME_CONFLICT_DENSITY_SQL: &str = "\
-SELECT f.id AS frame_id, f.name AS frame_name, \
-       (SELECT COUNT(DISTINCT mf.claim_id) FROM mass_functions mf WHERE mf.frame_id = f.id) AS total_claims, \
-       (SELECT COUNT(*) FROM edges e \
-        JOIN mass_functions mf1 ON mf1.claim_id = e.source_id AND mf1.frame_id = f.id \
-        WHERE e.relationship = 'CONTRADICTS') AS contradicts_edges, \
-       (SELECT COUNT(DISTINCT mf2.source_agent_id) FROM mass_functions mf2 \
-        WHERE mf2.frame_id = f.id AND mf2.source_agent_id IS NOT NULL) AS distinct_sources \
-FROM frames f \
-WHERE $1::uuid[] IS NULL OR f.id = ANY($1) \
-ORDER BY f.id \
-LIMIT $2";
+WITH target AS ( \
+    SELECT f.id, f.name FROM frames f \
+    WHERE $1::uuid[] IS NULL OR f.id = ANY($1) \
+    ORDER BY f.id \
+    LIMIT $2 \
+), \
+fc AS ( \
+    SELECT DISTINCT mf.frame_id, mf.claim_id \
+    FROM mass_functions mf JOIN target t ON t.id = mf.frame_id \
+), \
+conflict AS ( \
+    SELECT e.source_id, e.target_id FROM edges e \
+    WHERE e.relationship IN ('contradicts', 'CONTRADICTS', 'refutes', 'REFUTES') \
+      AND e.source_type = 'claim' AND e.target_type = 'claim' \
+      AND e.source_id <> e.target_id \
+      AND (e.valid_to IS NULL OR e.valid_to > now()) \
+), \
+pairs AS ( \
+    SELECT fc.frame_id, LEAST(c.source_id, c.target_id) AS a, \
+           GREATEST(c.source_id, c.target_id) AS b \
+    FROM conflict c JOIN fc ON fc.claim_id = c.source_id \
+    UNION \
+    SELECT fc.frame_id, LEAST(c.source_id, c.target_id), \
+           GREATEST(c.source_id, c.target_id) \
+    FROM conflict c JOIN fc ON fc.claim_id = c.target_id \
+) \
+SELECT t.id AS frame_id, t.name AS frame_name, \
+       (SELECT COUNT(*) FROM fc WHERE fc.frame_id = t.id) AS total_claims, \
+       (SELECT COUNT(*) FROM pairs p WHERE p.frame_id = t.id) AS contradicts_edges, \
+       (SELECT COUNT(DISTINCT mf.source_agent_id) FROM mass_functions mf \
+        WHERE mf.frame_id = t.id AND mf.source_agent_id IS NOT NULL) AS distinct_sources \
+FROM target t \
+ORDER BY t.id";
 
 /// Read-only conflict-density queries.
 pub struct ConflictDensityRepository;
