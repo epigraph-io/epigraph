@@ -823,6 +823,21 @@ Current reservation:
   is in the file's header. **Applied to a throwaway database only, NOT to any
   deployed database.**
 
+- **141**: public `access_token_revocation` (backlog drain U003; slot from the
+  drain block 140-159, so 123-139 stay free for the in-flight custodian and
+  elevation series). Adds `revoked_access_tokens` (a `jti` denylist; no
+  tenancy, no row security) and its only write path, the maintenance-owned
+  definer `epigraph_access_token_revoke(jti, client, exp)`, which also prunes
+  rows whose token expired over an hour ago. `epigraph_app` keeps SELECT and
+  loses INSERT/UPDATE/DELETE/TRUNCATE. Written by `/oauth/revoke` (signature
+  verified first), read by both API bearer middlewares, `/oauth/introspect` and
+  the MCP bearer middleware. Pinned by
+  `app_role_table_lockdown.rs::access_token_revocations_go_through_the_definer_and_prune`
+  (and its `CLOSED` list) and `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`.
+  Undo is in the file's header. **Deploy order:** with the API and MCP binaries
+  that read it (they fail closed without it), and after 123-129 have been
+  applied (sqlx would otherwise apply them out of order after 141).
+
 - **123+**: public next
 
 Next public migration **outside both reserved tenancy ranges** must be `123` or

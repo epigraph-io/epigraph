@@ -1668,6 +1668,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // refused by 107's definer-only policy, so it fails CLOSED (links nothing,
     // or errors); the stake is the tie silently skipped.
     ("epigraph_link_legacy_authors", 122),
+    // 141, durable access-token revocation (drain U003). The ONLY write path
+    // into `revoked_access_tokens`: 141 revokes every application-role write
+    // on that table. Under an APP-owned body it fails CLOSED with 42501
+    // (`/oauth/revoke` answers 500 and records nothing, loud); under the
+    // migration runner's superuser it keeps working with more authority than
+    // intended (083's case). The table has no row security, so a non-member
+    // owner changes nothing else.
+    ("epigraph_access_token_revoke", 141),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

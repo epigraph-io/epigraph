@@ -1,13 +1,15 @@
-//! Durable RFC 7009 revocation of JWT access tokens, keyed by `jti`.
+//! Durable RFC 7009 revocation of JWT access tokens, keyed by `jti`
+//! (migration 141).
 //!
-//! STUB: neither method touches the database yet. `revoke` persists nothing
-//! and `is_revoked` answers `false`, the behaviour of origin/main (where a
-//! revocation lived only in one API process's memory). The tests that pin the
-//! durable behaviour are written against this stub first, so they fail on
-//! their assertions rather than on a missing symbol.
+//! Written by `POST /oauth/revoke` on the HTTP API, read by both servers'
+//! bearer middleware after the token's signature has been verified. Keyed by
+//! `jti`, never by the token string: a `jti` is only meaningful on a token
+//! whose signature checks, and a uuid key keeps the table free of bearer
+//! material.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use tracing::instrument;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -16,18 +18,44 @@ pub struct RevokedAccessTokenRepository;
 
 impl RevokedAccessTokenRepository {
     /// Record that the access token `jti` (issued to `client_id`, expiring at
-    /// `expires_at`) is revoked. Returns whether a new row was written.
+    /// `expires_at`) is revoked, through migration 141's definer: the
+    /// application role holds no write on the table. Returns whether a new row
+    /// was written; an already revoked or already expired token is `false`,
+    /// not an error. The definer also prunes rows whose token expired over an
+    /// hour ago.
+    ///
+    /// The caller must pass a `jti` read from a SIGNATURE-VERIFIED token: the
+    /// endpoint that calls this is anonymous, and an unverified `jti` would let
+    /// anyone fill the table.
+    #[instrument(skip(pool))]
     pub async fn revoke(
-        _pool: &PgPool,
-        _jti: Uuid,
-        _client_id: Uuid,
-        _expires_at: DateTime<Utc>,
+        pool: &PgPool,
+        jti: Uuid,
+        client_id: Uuid,
+        expires_at: DateTime<Utc>,
     ) -> Result<bool, DbError> {
-        Ok(false)
+        sqlx::query_scalar("SELECT public.epigraph_access_token_revoke($1, $2, $3)")
+            .bind(jti)
+            .bind(client_id)
+            .bind(expires_at)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| DbError::QueryFailed { source: e })
     }
 
-    /// Whether the access token `jti` has been revoked.
-    pub async fn is_revoked(_pool: &PgPool, _jti: Uuid) -> Result<bool, DbError> {
-        Ok(false)
+    /// Whether the access token `jti` has been revoked. A primary-key lookup on
+    /// the application role (which keeps SELECT on the table).
+    ///
+    /// An `Err` means the answer is UNKNOWN; callers on an authentication path
+    /// must refuse the token, never admit it.
+    #[instrument(skip(pool))]
+    pub async fn is_revoked(pool: &PgPool, jti: Uuid) -> Result<bool, DbError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM public.revoked_access_tokens WHERE jti = $1)",
+        )
+        .bind(jti)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| DbError::QueryFailed { source: e })
     }
 }
