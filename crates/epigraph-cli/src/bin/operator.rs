@@ -15,7 +15,8 @@
 //! agent without a LIVE link (its link is retired, or its membership revoked),
 //! or `reown-reverse` HELD at least one claim or hidden row (it is not fully
 //! restored). `arm-operator-binding --apply` exits 1 when the census of unbound
-//! recent writers refused it.
+//! recent writers refused it. `verify-confirmations` exits 2 when at least one
+//! stored confirmation does not verify (each is recorded).
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -55,11 +56,12 @@
 //!     epigraph-operator revoke-passkey --id <uuid> --reason TEXT [--apply]
 //!     epigraph-operator end-elevation (--session <uuid> | --person <uuid>) --reason TEXT [--apply]
 //!     epigraph-operator list-elevations [--person <uuid>] [--live]
+//!     epigraph-operator verify-confirmations [--since <RFC3339>] [--json]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, bind, client_scope, custodian, elevation, hide, human, legacy, link,
-    passkey, reown, reown_linked, reverse,
+    self, admin_scopes, arm, bind, client_scope, confirmations, custodian, elevation, hide, human,
+    legacy, link, passkey, reown, reown_linked, reverse,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -243,6 +245,20 @@ enum Command {
         /// per-statement liveness re-checks are not evaluated here).
         #[arg(long)]
         live: bool,
+    },
+    /// Re-verify every stored passkey confirmation (elevation tickets and
+    /// admin acts) offline, against the passkey's public key and the relying
+    /// party in EPIGRAPH_WEBAUTHN_RP_ID / EPIGRAPH_WEBAUTHN_ORIGIN (the values
+    /// the ceremonies ran under). Each confirmation that does not verify is
+    /// printed and recorded once as `platform.confirmation_unverified`; exit 2
+    /// when there is any.
+    VerifyConfirmations {
+        /// Only confirmations asserted at or after this instant (RFC 3339).
+        #[arg(long)]
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Print the report as one JSON object instead of lines.
+        #[arg(long)]
+        json: bool,
     },
     /// List role assignments (un-ended ones unless --include-ended).
     ListRoleAssignments {
@@ -548,6 +564,21 @@ async fn main_inner() -> anyhow::Result<i32> {
     } else {
         None
     };
+    // The relying party, before any connection is made: without it nothing
+    // can be verified, and a run that verified nothing must not exit 0.
+    let verifier = if let Command::VerifyConfirmations { .. } = &cli.command {
+        let rp = epigraph_passkey::RelyingParty::from_env()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "verify-confirmations needs {} and {}: the relying party the ceremonies ran \
+                 under (the API's values)",
+                epigraph_passkey::config::ENV_RP_ID,
+                epigraph_passkey::config::ENV_ORIGIN
+            )
+        })?;
+        Some(epigraph_passkey::Verifier::new(rp)?)
+    } else {
+        None
+    };
     if let Command::ReownClaims { batch_size, .. }
     | Command::ReownReverse { batch_size, .. }
     | Command::ReownLinked { batch_size, .. } = &cli.command
@@ -824,6 +855,20 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("{}", elevation::describe(row));
             }
             Ok(0)
+        }
+        Command::VerifyConfirmations { since, json } => {
+            let verifier = verifier.expect("built above for this command");
+            let mut report = confirmations::verify(&mut conn, &verifier, since).await?;
+            report.recorded = confirmations::record(&mut conn, &report.findings).await?;
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                for f in &report.findings {
+                    println!("{}", confirmations::describe(f));
+                }
+                println!("{}", confirmations::summary(&report));
+            }
+            Ok(if report.findings.is_empty() { 0 } else { 2 })
         }
         Command::ListRoleAssignments {
             role,

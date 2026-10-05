@@ -56,6 +56,10 @@
 //! * `end-elevation` — end one live elevation session now, or every un-ended
 //!   session of a person, any person's (migration 125's privileged end;
 //!   audited with the required `--reason`); `list-elevations` — find them.
+//! * `verify-confirmations` — re-verify every stored passkey confirmation
+//!   (elevation tickets, admin acts) offline against its passkey's public key,
+//!   the rp id and the origin, and record each that does not verify as a
+//!   `platform.confirmation_unverified` row (see [`confirmations`]).
 //!
 //! And, beside the backfill, two audited scope commands (batch OA1), which take
 //! exactly one of `--dry-run` / `--apply`:
@@ -104,6 +108,7 @@ pub mod admin_scopes;
 pub mod arm;
 pub mod bind;
 pub mod client_scope;
+pub mod confirmations;
 pub mod custodian;
 pub mod elevation;
 pub mod hide;

@@ -923,3 +923,669 @@ async fn a_role_end_is_proposed_confirmed_and_executed_end_to_end(pool: PgPool) 
         )
     );
 }
+
+// =====================================================================
+// EL-13: `verify-confirmations`, the offline confirmation verifier
+// =====================================================================
+
+/// A custodian P elevated through the real ceremonies, with two bootstrap
+/// test assignments (granted before P held a passkey) an act can end.
+struct Elevated {
+    addr: std::net::SocketAddr,
+    jwt: std::sync::Arc<epigraph_auth::JwtConfig>,
+    auth: soft_authenticator::SoftAuthenticator,
+    person: Uuid,
+    client: Uuid,
+    ticket: Uuid,
+    elevated: String,
+    assignments: [Uuid; 2],
+    credential: Vec<u8>,
+}
+
+/// A fresh refresh family of `client` (one live elevation per family).
+async fn fresh_family(pool: &PgPool, client: Uuid) -> Uuid {
+    let hash: Vec<u8> = [
+        Uuid::new_v4().as_bytes().to_vec(),
+        Uuid::new_v4().as_bytes().to_vec(),
+    ]
+    .concat();
+    sqlx::query_scalar(
+        "INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at) \
+         VALUES ($1, $2, ARRAY['claims:read'], now() + interval '1 day') RETURNING id",
+    )
+    .bind(&hash)
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .expect("a family")
+}
+
+/// A grant-mode ticket of P's on a fresh family, its ceremony started:
+/// `(ticket, the assertion options)`.
+async fn started_ticket(pool: &PgPool, e: &Elevated) -> (Uuid, serde_json::Value) {
+    let family = fresh_family(pool, e.client).await;
+    let plain = token(&e.jwt, e.person, e.client, family, None);
+    let (status, ticket) = post(
+        e.addr,
+        "/api/v1/elevation/tickets",
+        Some(&plain),
+        &serde_json::json!({"reason": "verify-confirmations test"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{ticket}");
+    let ticket: Uuid = ticket["ticket_id"].as_str().unwrap().parse().unwrap();
+    let (status, options) = post(
+        e.addr,
+        &format!("/elevate/{ticket}/challenge"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{options}");
+    (ticket, options)
+}
+
+/// A custodian P holding a passkey of `auth`'s, enrolled through the real
+/// ceremony (its registration passed through `wrap` on the way), NOT yet
+/// elevated (`ticket` and `elevated` are empty).
+async fn enrolled_custodian(
+    pool: &PgPool,
+    auth: soft_authenticator::SoftAuthenticator,
+    wrap: fn(&serde_json::Value) -> serde_json::Value,
+) -> Elevated {
+    use soft_authenticator::{ClientUv, ORIGIN};
+    fixture::open_elevated_access_gate(pool).await;
+    let (p, _) = fixture::seed_human_operator(pool, "custodian").await;
+    fixture::make_custodian(pool, p).await;
+    let mut assignments = [Uuid::nil(); 2];
+    for (i, a) in assignments.iter_mut().enumerate() {
+        let (x, _) = fixture::seed_human_operator(pool, &format!("auditor {i}")).await;
+        *a = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+            let a = sqlx::query_scalar(
+                "SELECT public.epigraph_grant_role('role:auditor', $1, NULL, NULL, $2, 'test')",
+            )
+            .bind(x)
+            .bind(p)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("a test assignment");
+            (conn, a)
+        })
+        .await;
+    }
+    let (addr, jwt) = api(pool).await;
+    let mut auth = auth;
+    let enrollment: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'verify', 'key')",
+        )
+        .bind(p)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("an enrollment");
+        (conn, e)
+    })
+    .await;
+    let base = format!("/elevate/enroll/{enrollment}");
+    let (_, options) = post(
+        addr,
+        &format!("{base}/challenge"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    let registration = wrap(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+    let (status, body) = post(addr, &format!("{base}/finish"), None, &registration).await;
+    assert_eq!(status, 200, "enrollment: {body}");
+    let client: Uuid = sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(p)
+    .fetch_one(pool)
+    .await
+    .expect("P's client");
+    let credential: Vec<u8> = sqlx::query_scalar(
+        "SELECT credential_id FROM person_authenticators WHERE person_agent_id = $1",
+    )
+    .bind(p)
+    .fetch_one(pool)
+    .await
+    .expect("P's passkey");
+    Elevated {
+        addr,
+        jwt,
+        auth,
+        person: p,
+        client,
+        ticket: Uuid::nil(),
+        elevated: String::new(),
+        assignments,
+        credential,
+    }
+}
+
+/// [`enrolled_custodian`] with a synced passkey, then ELEVATED through the
+/// real ticket ceremony (`ticket`, and the elevated token in `elevated`).
+async fn elevated_custodian(pool: &PgPool) -> Elevated {
+    let mut e = enrolled_custodian(
+        pool,
+        soft_authenticator::SoftAuthenticator::new(Uuid::from_u128(0x5eed)),
+        Clone::clone,
+    )
+    .await;
+    let (ticket, options) = started_ticket(pool, &e).await;
+    let assertion = e
+        .auth
+        .authenticate(soft_authenticator::ORIGIN, options)
+        .await;
+    let (status, body) = post(
+        e.addr,
+        &format!("/elevate/{ticket}/assert"),
+        None,
+        &assertion,
+    )
+    .await;
+    assert_eq!(status, 200, "elevation: {body}");
+    let (session, family): (Uuid, Uuid) =
+        sqlx::query_as("SELECT session_id, family_id FROM elevation_tickets WHERE id = $1")
+            .bind(ticket)
+            .fetch_one(pool)
+            .await
+            .expect("the session");
+    e.ticket = ticket;
+    e.elevated = token(&e.jwt, e.person, e.client, family, Some(session));
+    e
+}
+
+/// Propose `role.end` of `assignment` over HTTP, elevated: the act id.
+async fn propose_end(e: &Elevated, assignment: Uuid) -> Uuid {
+    let (status, proposed) = post(
+        e.addr,
+        "/api/v1/admin/acts",
+        Some(&e.elevated),
+        &serde_json::json!({"kind": "role.end",
+                            "args": {"assignment": assignment.to_string(), "reason": "done"},
+                            "reason": "verify-confirmations test"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{proposed}");
+    proposed["act_id"].as_str().unwrap().parse().unwrap()
+}
+
+/// The stored ceremony challenge of a ticket (b64url).
+async fn ticket_challenge(pool: &PgPool, ticket: Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT challenge_state->'library'->'ast'->>'challenge' FROM elevation_tickets \
+          WHERE id = $1",
+    )
+    .bind(ticket)
+    .fetch_one(pool)
+    .await
+    .expect("the ticket's challenge")
+}
+
+/// `response` with one bit of its signature flipped.
+fn tampered(mut response: serde_json::Value) -> serde_json::Value {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut sig = b64
+        .decode(response["response"]["signature"].as_str().unwrap())
+        .unwrap();
+    sig[4] ^= 0x01;
+    response["response"]["signature"] = serde_json::Value::from(b64.encode(sig));
+    response
+}
+
+/// `epigraph_confirm_elevation` called as `epigraph_app` (the definer is
+/// ticket-keyed and takes the caller's word for the assertion): its outcome.
+async fn app_confirm_elevation(
+    pool: &PgPool,
+    ticket: Uuid,
+    credential: Vec<u8>,
+    backup_eligible: bool,
+    evidence: serde_json::Value,
+) -> String {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        let o = sqlx::query_scalar(
+            "SELECT outcome FROM public.epigraph_confirm_elevation($1, $2, 0, $3, $4)",
+        )
+        .bind(ticket)
+        .bind(credential)
+        .bind(backup_eligible)
+        .bind(evidence)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the confirm definer");
+        (conn, o)
+    })
+    .await
+}
+
+/// THE APPLICATION-DSN FORGERY: a ticket of P's confirmed by calling 125's
+/// ticket-keyed confirm definer as `epigraph_app` with evidence that is right
+/// in every respect a row can show (P's credential, the ticket's own stored
+/// challenge, a well-formed response of P's authenticator) except that its
+/// signature does not verify. The database cannot tell: CALIBRATION, it
+/// confirms the ticket and opens a session. Returns the ticket.
+async fn forged_elevation(pool: &PgPool, e: &mut Elevated) -> Uuid {
+    let (ticket, options) = started_ticket(pool, e).await;
+    let response = tampered(
+        e.auth
+            .authenticate(soft_authenticator::ORIGIN, options)
+            .await,
+    );
+    let evidence = serde_json::json!({
+        "v": 1,
+        "challenge": ticket_challenge(pool, ticket).await,
+        "response": response,
+    });
+    let outcome = app_confirm_elevation(pool, ticket, e.credential.clone(), false, evidence).await;
+    assert_eq!(outcome, "confirmed", "CALIBRATION: the database accepts it");
+    ticket
+}
+
+/// Run `verify-confirmations` with the test relying party (`origin`
+/// overridable; `None` leaves the relying party unset).
+async fn run_verify(pool: &PgPool, args: &[&str], origin: Option<&str>) -> Run {
+    let url = fixture::database_url_for(pool).await;
+    let mut cmd = Command::new(BIN);
+    cmd.arg("verify-confirmations")
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env_remove("EPIGRAPH_WEBAUTHN_RP_ID")
+        .env_remove("EPIGRAPH_WEBAUTHN_ORIGIN")
+        .env(DSN_ENV, url);
+    if let Some(origin) = origin {
+        cmd.env("EPIGRAPH_WEBAUTHN_RP_ID", soft_authenticator::RP_ID)
+            .env("EPIGRAPH_WEBAUTHN_ORIGIN", origin);
+    }
+    let out = cmd.output().expect("spawn");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+fn report_of(run: &Run) -> serde_json::Value {
+    serde_json::from_str(run.stdout.trim()).unwrap_or_else(|e| panic!("{e}: {}", run.show()))
+}
+
+/// `(subject, id, reason)` of every finding.
+fn findings_of(report: &serde_json::Value) -> Vec<(String, Uuid, String)> {
+    report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["subject"].as_str().unwrap().to_string(),
+                f["id"].as_str().unwrap().parse().unwrap(),
+                f["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// `(agent_id, subject, id, reason)` of every recorded finding.
+async fn recorded(pool: &PgPool) -> Vec<(Option<Uuid>, String, String, String)> {
+    sqlx::query_as(
+        "SELECT agent_id, details->>'subject', details->>'id', details->>'reason' \
+           FROM security_events WHERE event_type = 'platform.confirmation_unverified' \
+          ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the recorded findings")
+}
+
+/// Every genuine confirmation verifies: an elevation and an admin act, both
+/// through the real ceremonies, are checked (1 and 1), nothing is flagged,
+/// nothing recorded, exit 0. A REFUSED assertion (an unknown credential, the
+/// API's audited path, whose evidence by design does not verify) granted
+/// nothing and is counted, not flagged. CALIBRATIONS that the evidence is really
+/// re-verified: under another origin both are flagged
+/// `assertion_does_not_verify` (exit 2); with no relying party configured
+/// the verb refuses to run (exit 1, nothing recorded), since a run that
+/// verified nothing must not exit 0.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_confirmations_passes_every_genuine_confirmation(pool: PgPool) {
+    let mut e = elevated_custodian(&pool).await;
+    let act = propose_end(&e, e.assignments[0]).await;
+    let (_, options) = post(
+        e.addr,
+        &format!("/elevate/act/{act}/challenge"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    let assertion = e
+        .auth
+        .authenticate(soft_authenticator::ORIGIN, options)
+        .await;
+    let (status, body) = post(
+        e.addr,
+        &format!("/elevate/act/{act}/assert"),
+        None,
+        &assertion,
+    )
+    .await;
+    assert_eq!(status, 200, "the act confirmation: {body}");
+    let (burned, _) = started_ticket(&pool, &e).await;
+    let unverified = serde_json::json!({
+        "v": 1,
+        "challenge": ticket_challenge(&pool, burned).await,
+        "response": {},
+        "verified": false,
+        "unverified_reason": "the credential is not one of the ticket person's live passkeys",
+    });
+    let outcome = app_confirm_elevation(&pool, burned, vec![0xEE; 16], false, unverified).await;
+    assert_eq!(
+        outcome, "refused",
+        "CALIBRATION: an unknown credential is refused"
+    );
+
+    let unset = run_verify(&pool, &["--json"], None).await;
+    assert_eq!(unset.code, 1, "{}", unset.show());
+    assert!(
+        unset.stderr.contains("EPIGRAPH_WEBAUTHN_RP_ID"),
+        "{}",
+        unset.show()
+    );
+
+    let ok = run_verify(&pool, &["--json"], Some(soft_authenticator::ORIGIN)).await;
+    assert_eq!(ok.code, 0, "{}", ok.show());
+    let report = report_of(&ok);
+    assert_eq!(
+        (
+            &report["elevations_checked"],
+            &report["acts_checked"],
+            &report["refused_seen"]
+        ),
+        (
+            &serde_json::json!(1),
+            &serde_json::json!(1),
+            &serde_json::json!(1)
+        ),
+        "{report}"
+    );
+    assert!(findings_of(&report).is_empty(), "{report}");
+    assert!(recorded(&pool).await.is_empty());
+
+    let elsewhere = run_verify(&pool, &["--json"], Some("https://auth.example.com:8443")).await;
+    assert_eq!(elsewhere.code, 2, "{}", elsewhere.show());
+    let mut got = findings_of(&report_of(&elsewhere));
+    got.sort();
+    let mut want = vec![
+        (
+            "admin_act".to_string(),
+            act,
+            "assertion_does_not_verify".to_string(),
+        ),
+        (
+            "elevation_ticket".to_string(),
+            e.ticket,
+            "assertion_does_not_verify".to_string(),
+        ),
+    ];
+    want.sort();
+    assert_eq!(got, want);
+}
+
+/// THE APPLICATION-DSN FORGERY IS FLAGGED (elevation plan EL-13): a ticket
+/// confirmed through the definer with evidence that does not verify is
+/// reported `assertion_does_not_verify` (exit 2), the genuine elevation
+/// beside it is not, and the finding is recorded ONCE, attributed to P: a
+/// second run reports it again (exit 2) and records nothing more. `--since`
+/// after both leaves nothing to check (exit 0).
+///
+/// Verified to fail with the re-verification skipped (a verifier that only
+/// checks the row's shape: the forgery passes, exit 0).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_app_dsn_forged_elevation_is_flagged_and_recorded_once(pool: PgPool) {
+    let mut e = elevated_custodian(&pool).await;
+    let forged = forged_elevation(&pool, &mut e).await;
+
+    let first = run_verify(&pool, &["--json"], Some(soft_authenticator::ORIGIN)).await;
+    assert_eq!(first.code, 2, "{}", first.show());
+    let report = report_of(&first);
+    assert_eq!(
+        report["elevations_checked"],
+        serde_json::json!(2),
+        "{report}"
+    );
+    assert_eq!(
+        findings_of(&report),
+        vec![(
+            "elevation_ticket".to_string(),
+            forged,
+            "assertion_does_not_verify".to_string()
+        )]
+    );
+    assert_eq!(report["recorded"], serde_json::json!(1));
+    let rows = recorded(&pool).await;
+    assert_eq!(
+        rows,
+        vec![(
+            Some(e.person),
+            "elevation_ticket".to_string(),
+            forged.to_string(),
+            "assertion_does_not_verify".to_string()
+        )]
+    );
+
+    let again = run_verify(&pool, &[], Some(soft_authenticator::ORIGIN)).await;
+    assert_eq!(again.code, 2, "{}", again.show());
+    assert!(
+        again
+            .stdout
+            .contains(&format!("UNVERIFIED\televation_ticket\t{forged}")),
+        "{}",
+        again.show()
+    );
+    assert!(again.stdout.contains("recorded=0"), "{}", again.show());
+    assert_eq!(recorded(&pool).await.len(), 1, "recorded once");
+
+    let later = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    let none = run_verify(
+        &pool,
+        &["--json", "--since", &later],
+        Some(soft_authenticator::ORIGIN),
+    )
+    .await;
+    assert_eq!(none.code, 0, "{}", none.show());
+    assert_eq!(report_of(&none)["elevations_checked"], serde_json::json!(0));
+}
+
+/// A VALID SIGNATURE OVER ANOTHER ACT'S CHALLENGE CONFIRMS NOTHING: act B's
+/// started ceremony is copied onto act A through the app-callable
+/// `epigraph_set_admin_act_challenge`, P's authenticator signs B's options,
+/// and A is confirmed with that evidence by the definer, as `epigraph_app`
+/// (CALIBRATION: the database confirms it). The evidence re-verifies and
+/// matches A's stored ceremony; only the act binding (A's id, args digest
+/// and nonce) refuses it: `challenge_not_bound`, exit 2. B, never
+/// confirmed, is not checked; the genuine elevation is not flagged.
+///
+/// Verified to fail with the act challenge not recomputed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_act_confirmed_with_another_acts_signature_is_flagged(pool: PgPool) {
+    let mut e = elevated_custodian(&pool).await;
+    let a = propose_end(&e, e.assignments[0]).await;
+    let b = propose_end(&e, e.assignments[1]).await;
+    let (status, options) = post(
+        e.addr,
+        &format!("/elevate/act/{b}/challenge"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{options}");
+    let response = e
+        .auth
+        .authenticate(soft_authenticator::ORIGIN, options)
+        .await;
+    let (state, challenge): (serde_json::Value, String) = sqlx::query_as(
+        "SELECT challenge_state, challenge_state->'ceremony'->'library'->'ast'->>'challenge' \
+           FROM pending_admin_acts WHERE id = $1",
+    )
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("B's ceremony");
+    let evidence = serde_json::json!({"v": 1, "challenge": challenge, "response": response});
+    let cred = e.credential.clone();
+    let outcome: String = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT public.epigraph_set_admin_act_challenge($1, $2)")
+            .bind(a)
+            .bind(state)
+            .execute(&mut *conn)
+            .await
+            .expect("B's ceremony onto A");
+        let o = sqlx::query_scalar(
+            "SELECT outcome FROM public.epigraph_confirm_admin_act($1, $2, 0, false, $3)",
+        )
+        .bind(a)
+        .bind(cred)
+        .bind(evidence)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the confirm definer");
+        (conn, o)
+    })
+    .await;
+    assert_eq!(outcome, "confirmed", "CALIBRATION: the database accepts it");
+
+    let run = run_verify(&pool, &["--json"], Some(soft_authenticator::ORIGIN)).await;
+    assert_eq!(run.code, 2, "{}", run.show());
+    let report = report_of(&run);
+    assert_eq!(
+        (&report["elevations_checked"], &report["acts_checked"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{report}"
+    );
+    assert_eq!(
+        findings_of(&report),
+        vec![(
+            "admin_act".to_string(),
+            a,
+            "challenge_not_bound".to_string()
+        )]
+    );
+}
+
+/// On a REAL maintenance login (not the superuser the binary tests connect
+/// as), the verifier reads every row it needs through the policies and its
+/// audit row lands: 123's `security_events_platform_privileged` admits a
+/// `platform.` row from a privileged session only with `created_at = now()`.
+/// A second record of the same finding adds nothing. On a database without
+/// migration 130's act table (the rollout verifies elevations before 130),
+/// the acts are skipped, not an error.
+///
+/// Verified to fail with `created_at` bound from the client clock (the
+/// policy refuses the row: invisible to the superuser tests above).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_verifier_reads_and_records_on_a_maintenance_login(pool: PgPool) {
+    use epigraph_cli::operator::confirmations;
+    let mut e = elevated_custodian(&pool).await;
+    let forged = forged_elevation(&pool, &mut e).await;
+    let verifier = || {
+        epigraph_passkey::Verifier::new(epigraph_passkey::RelyingParty {
+            rp_id: soft_authenticator::RP_ID.into(),
+            origin: soft_authenticator::ORIGIN.parse().unwrap(),
+        })
+        .unwrap()
+    };
+    let (report, added, again) =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let v = verifier();
+            let report = confirmations::verify(&mut conn, &v, None)
+                .await
+                .expect("verify");
+            let added = confirmations::record(&mut conn, &report.findings)
+                .await
+                .expect("record");
+            let again = confirmations::record(&mut conn, &report.findings)
+                .await
+                .expect("record again");
+            (conn, (report, added, again))
+        })
+        .await;
+    assert_eq!(report.elevations_checked, 2);
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .map(|f| (f.id, f.reason))
+            .collect::<Vec<_>>(),
+        vec![(forged, "assertion_does_not_verify")]
+    );
+    assert_eq!((added, again), (1, 0));
+    assert_eq!(recorded(&pool).await.len(), 1);
+
+    sqlx::query("ALTER TABLE pending_admin_acts RENAME TO pending_admin_acts_absent")
+        .execute(&pool)
+        .await
+        .expect("a database without 130's table");
+    let report = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let v = verifier();
+        let r = confirmations::verify(&mut conn, &v, None)
+            .await
+            .expect("verify without acts");
+        (conn, r)
+    })
+    .await;
+    assert_eq!((report.elevations_checked, report.acts_checked), (2, 0));
+}
+
+/// A DEVICE-BOUND PASSKEY THAT ASSERTS AS BACKUP-ELIGIBLE: P's passkey was
+/// registered device-bound (BE clear); its authenticator now asserts BE
+/// without BS, which the library's passkey path accepts, and which the
+/// confirm definer refuses only when the caller passes the flag on. An
+/// application-DSN caller passes `false`: CALIBRATION, the database confirms
+/// it. The evidence re-verifies (the signature is genuine) but asserts the
+/// flag: `backup_eligibility_changed`, exit 2.
+///
+/// Verified to fail with the backup-eligible comparison removed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_device_bound_passkey_confirming_as_backup_eligible_is_flagged(pool: PgPool) {
+    let mut e = enrolled_custodian(
+        &pool,
+        soft_authenticator::SoftAuthenticator::new(Uuid::from_u128(0x5eed))
+            .eligible_not_backed_up(),
+        soft_authenticator::hardware_bound,
+    )
+    .await;
+    let stored_be: bool = sqlx::query_scalar(
+        "SELECT backup_eligible FROM person_authenticators WHERE person_agent_id = $1",
+    )
+    .bind(e.person)
+    .fetch_one(&pool)
+    .await
+    .expect("P's passkey");
+    assert!(!stored_be, "CALIBRATION: registered device-bound");
+    let (ticket, options) = started_ticket(&pool, &e).await;
+    let response = e
+        .auth
+        .authenticate(soft_authenticator::ORIGIN, options)
+        .await;
+    let evidence = serde_json::json!({
+        "v": 1,
+        "challenge": ticket_challenge(&pool, ticket).await,
+        "response": response,
+    });
+    let outcome = app_confirm_elevation(&pool, ticket, e.credential.clone(), false, evidence).await;
+    assert_eq!(outcome, "confirmed", "CALIBRATION: the database accepts it");
+
+    let run = run_verify(&pool, &["--json"], Some(soft_authenticator::ORIGIN)).await;
+    assert_eq!(run.code, 2, "{}", run.show());
+    assert_eq!(
+        findings_of(&report_of(&run)),
+        vec![(
+            "elevation_ticket".to_string(),
+            ticket,
+            "backup_eligibility_changed".to_string()
+        )]
+    );
+}
