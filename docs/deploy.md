@@ -2000,9 +2000,13 @@ maintenance DSN. The row is never inserted again or deleted, by any login.
 the consumers that still rely on a standing admin scope have moved off it
 and the would-strip measurement (`oauth.admin_scope_would_strip` events, at
 most one per client per hour, written while unarmed) has read zero for a
-soak window.
+soak window: `epigraph-operator arm-admin-scopes --reason TEXT` on the
+maintenance DSN prints the switch and what would change, and `--apply`
+arms. Armed, `epigraph-operator grant-client-scope` refuses too
+(`revoke-client-scope` still works).
 
-**Rollback.** Disarming is the first rollback and needs no DDL. To remove the
+**Rollback.** Disarming is the first rollback and needs no DDL:
+`epigraph-operator disarm-admin-scopes --reason TEXT --apply`. To remove the
 switch itself, run `docs/runbooks/128-undo.sql` on the migration DSN, in one
 transaction: if the switch is armed it first disarms it through the table's
 own audit (reason `128-undo`), then drops the table and every 128 function.

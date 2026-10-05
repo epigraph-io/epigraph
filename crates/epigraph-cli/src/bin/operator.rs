@@ -36,6 +36,8 @@
 //!         [--quiet-days 30 | --no-quiet-window] [--apply]
 //!     epigraph-operator reown-linked --operator <uuid> --legacy-owner operator|platform \
 //!         --manifest-out reown-linked-1.jsonl [--apply]
+//!     epigraph-operator arm-admin-scopes --reason TEXT [--apply]
+//!     epigraph-operator disarm-admin-scopes --reason TEXT [--apply]
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 //!     epigraph-operator grant-role --role role:platform-custodian --holder <uuid> \
 //!         (--valid-to <RFC3339> | --open-ended) [--valid-from <RFC3339>] \
@@ -53,8 +55,8 @@
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, arm, bind, client_scope, custodian, elevation, hide, human, legacy, link, passkey, reown,
-    reown_linked, reverse,
+    self, admin_scopes, arm, bind, client_scope, custodian, elevation, hide, human, legacy, link,
+    passkey, reown, reown_linked, reverse,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -432,6 +434,14 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+    /// Arm migration 128's admin-scope switch: from then on every mint strips
+    /// the admin-only scopes and every path that hands scopes out refuses
+    /// them. Audited. Without `--apply`, the change is rolled back.
+    ArmAdminScopes(AdminScopeArgs),
+    /// Disarm migration 128's admin-scope switch (the rollback): admin-only
+    /// scopes are standing authority again. Audited. Without `--apply`, the
+    /// change is rolled back.
+    DisarmAdminScopes(AdminScopeArgs),
     /// Grant ONE admin-only scope to a HUMAN's own OAuth client, in both
     /// `allowed_scopes` and `granted_scopes`, with a `security_events` row.
     GrantClientScope(ScopeArgs),
@@ -452,6 +462,18 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+}
+
+/// The arguments of `arm-admin-scopes` and `disarm-admin-scopes`.
+#[derive(clap::Args)]
+struct AdminScopeArgs {
+    /// Why (recorded in the audit event). Required.
+    #[arg(long)]
+    reason: String,
+    /// Commit the change. Without it, the change and its audit event run in a
+    /// transaction that is rolled back.
+    #[arg(long)]
+    apply: bool,
 }
 
 /// The arguments of `grant-client-scope` and `revoke-client-scope`.
@@ -476,6 +498,10 @@ struct ScopeArgs {
 
 async fn main_inner() -> anyhow::Result<i32> {
     let cli = Cli::parse();
+    // Refuse a blank switch reason before any connection is made.
+    if let Command::ArmAdminScopes(a) | Command::DisarmAdminScopes(a) = &cli.command {
+        admin_scopes::validate_reason(&a.reason)?;
+    }
     // Refuse a non-admin-only scope before any connection is made.
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
         client_scope::validate_scope(&a.scope)?;
@@ -977,6 +1003,18 @@ async fn main_inner() -> anyhow::Result<i32> {
                 lock_timeout,
             };
             hide::run_standalone(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(0)
+        }
+        cmd @ (Command::ArmAdminScopes(_) | Command::DisarmAdminScopes(_)) => {
+            let (arm, a) = match cmd {
+                Command::ArmAdminScopes(a) => (true, a),
+                Command::DisarmAdminScopes(a) => (false, a),
+                _ => unreachable!("matched above"),
+            };
+            let outcome = admin_scopes::run(&mut conn, arm, &a.reason, a.apply).await?;
+            for line in admin_scopes::describe(&outcome) {
+                println!("{line}");
+            }
             Ok(0)
         }
         Command::GrantClientScope(a) | Command::RevokeClientScope(a) if !a.dry_run && !a.apply => {

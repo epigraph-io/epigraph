@@ -1477,6 +1477,7 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "INSERT INTO admin_scope_enforcement",
         "DELETE FROM admin_scope_enforcement",
         "epigraph_set_admin_scope_enforcement($",
+        "AdminScopeEnforcement::set(",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //
@@ -1556,6 +1557,9 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "epigraph-cli/src/bin/operator.rs",
         // 124: the operator's passkey verbs, on the maintenance DSN.
         "epigraph-cli/src/operator/passkey.rs",
+        // 128: the operator's admin-scope arm / disarm verbs, on the
+        // maintenance DSN.
+        "epigraph-cli/src/operator/admin_scopes.rs",
     ];
 
     let mut offenders: Vec<String> = Vec::new();

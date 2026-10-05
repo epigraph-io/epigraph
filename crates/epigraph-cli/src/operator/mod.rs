@@ -65,6 +65,13 @@
 //!   `allowed_scopes` and `granted_scopes`, with one `security_events` row per
 //!   `--apply` (see [`client_scope`]).
 //!
+//! And the admin-scope arming switch (migration 128; see [`admin_scopes`]):
+//!
+//! * `arm-admin-scopes` / `disarm-admin-scopes --reason TEXT [--apply]` — turn
+//!   enforcement of the admin-only scopes on or off, audited by the switch's
+//!   own trigger. Armed, every mint strips them and every path that hands
+//!   scopes out refuses them; an admin act then needs an elevation.
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.
@@ -93,6 +100,7 @@
 //! is stricter than `epigraph_db::assert_maintenance_privilege` (which is
 //! conditioned on row security being active): it is unconditional.
 
+pub mod admin_scopes;
 pub mod arm;
 pub mod bind;
 pub mod client_scope;
