@@ -467,6 +467,78 @@ async fn list_claims_counts_the_viewers_own_group_private_claim(pool: PgPool) {
     );
 }
 
+/// `GET /claims` serves each listed claim's OWN stored labels — the success-path
+/// twin of `list_claims_surfaces_a_failed_label_read_instead_of_empty_labels`.
+///
+/// Drain unit U008 replaced `list_claims`' inline batched label read with
+/// `ClaimRepository::labels_by_ids(&mut *read, &viewer, ..)` plus a per-item
+/// `labels_map.remove(&id)`. The fault-injection arm proves an error is no
+/// longer swallowed; nothing proved the labels still ARRIVE. A handler that
+/// calls the read, keeps the `?`, and then serves `labels: []` — the original
+/// defect of backlog `1e6efd2d` — or a viewer splice that drops the labels of
+/// the viewer's own group-private claim, would leave every other arm green.
+///
+/// Three claims, three distinct label shapes: a public claim with two labels
+/// (order as stored), the viewer's own group-private claim with one, and an
+/// unlabelled public claim that must come back `[]`, not borrow a neighbour's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_claims_serves_each_claims_stored_labels(pool: PgPool) {
+    let (viewer_agent, viewer_group) =
+        seed_agent_with_group(&pool, "u008-list-labels-viewer").await;
+
+    let public = seed_public_claim(&pool, viewer_agent, "u008 list labels public").await;
+    let mine = seed_group_claim(&pool, viewer_agent, viewer_group, "u008 list labels mine").await;
+    let bare = seed_public_claim(&pool, viewer_agent, "u008 list labels unlabelled").await;
+    set_labels(&pool, public, &["u008-pub-a", "u008-pub-b"]).await;
+    set_labels(&pool, mine, &["u008-mine"]).await;
+
+    let viewer = viewer_for(&pool, viewer_agent).await;
+    let state = split_state(&pool).await;
+
+    let response = list_claims(
+        ViewerExtractor(viewer),
+        State(state),
+        Query(PaginationParams {
+            limit: 100,
+            offset: 0,
+            search: None,
+            agent_id: None,
+            group_id: None,
+        }),
+        None,
+    )
+    .await
+    .expect("list_claims");
+
+    let served: std::collections::HashMap<Uuid, Vec<String>> = response
+        .0
+        .items
+        .iter()
+        .map(|c| (c.id, c.labels.clone()))
+        .collect();
+    let labels_of = |id: Uuid| -> &Vec<String> {
+        served
+            .get(&id)
+            .unwrap_or_else(|| panic!("claim {id} not listed; served {served:?}"))
+    };
+
+    assert_eq!(
+        labels_of(public),
+        &vec!["u008-pub-a".to_string(), "u008-pub-b".to_string()],
+        "the public claim's stored labels must be served, not []: {served:?}"
+    );
+    assert_eq!(
+        labels_of(mine),
+        &vec!["u008-mine".to_string()],
+        "the viewer's OWN group-private claim must keep its labels through the \
+         viewer-spliced label read: {served:?}"
+    );
+    assert!(
+        labels_of(bare).is_empty(),
+        "an unlabelled claim must be served [], not another claim's labels: {served:?}"
+    );
+}
+
 /// `GET /claims/:id` — the transaction site.
 ///
 /// The claim under test is group-private to the VIEWER's own group, so the read
