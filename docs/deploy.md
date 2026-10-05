@@ -2183,8 +2183,9 @@ that act: another kind, not confirmed, executed already, expired (an act lives
 suspect passkey lifts the requirement for its holder and voids every
 unexecuted act it confirmed. NOTE: proposing an act needs a LIVE elevation, and
 no elevation is live until the stack's last migration opens the recorder gate;
-the act API that proposes and confirms is a later change. Until both ship, a
-custodian who holds a passkey makes these writes only after revoking it.
+the act API that proposes and confirms is the next section (migration 131).
+Until both ship, a custodian who holds a passkey makes these writes only after
+revoking it.
 
 1. **Migrate 130** (`epigraph-migrate`, migration DSN): one transaction,
    `lock_timeout` 3s; a new table, an added nullable column on
@@ -2203,3 +2204,50 @@ of 123's definers): it archives every act as a `platform.admin_act_archived`
 event, restores 123's and 124's bodies byte for byte (every `ELV10`
 requirement goes with them), and drops the act table and every 130 function.
 The `revoke_act_id` column and the act ids earlier writes recorded stay.
+
+## Proposing and confirming admin acts (migration 131) — the act API, deploy order and rollback
+
+The request path's half of migration 130: an elevated person PROPOSES an act
+and CONFIRMS it with their passkey; the maintenance CLI still executes it.
+
+- `POST /api/v1/admin/acts` `{kind, args, reason}`: proposes the act as the
+  caller. Only an ELEVATED request may (a grant-mode elevated token; the
+  database refuses any other, 403). It is the ONE non-GET route an elevated
+  token may write through, and it writes only the act (an authority record
+  the passkey must still confirm), through 130's elevation-gated definer; the
+  request is recorded in the elevated-access log like every elevated request.
+  The answer is the act id, its confirmation path and the URL on the relying
+  party's origin. 503 with no relying party configured.
+- `GET /api/v1/admin/acts?mine`: the caller's OWN acts, newest first, with
+  each step's outcome (migration 131's reader); never anyone else's, never the
+  ceremony state or the evidence.
+- `/elevate/act/<id>` (page), `/elevate/act/<id>/challenge`,
+  `/elevate/act/<id>/assert`: the confirmation, anonymous by design like the
+  elevation page (the act id and the proposer's passkey are its credentials).
+  The page shows the STORED args, their digest and the
+  `epigraph-operator <verb> --act <id>` that executes the act. The WebAuthn
+  challenge commits to the act (its id, its stored args digest and a stored
+  server nonce); a stored ceremony that does not is refused before any
+  assertion is looked at. Only the proposer's live passkeys confirm.
+- MCP `propose_admin_act` (HTTP only): listed and served only to an ELEVATED
+  request; answers only the confirmation URL under `EPIGRAPH_PUBLIC_BASE_URL`
+  (it refuses with none). A grant-mode elevation reaches it with the connector
+  switch OFF.
+
+Behaviour visible to an operator: nothing until the recorder gate opens (no
+elevation is live before it, so nothing can be proposed). The confirmed act
+is executed exactly as the previous section says.
+
+1. **Migrate 131** (`epigraph-migrate`, migration DSN): one transaction,
+   `lock_timeout` 3s, ONE new function (no table, no policy, no earlier body).
+   Before the API that calls it.
+2. **Deploy** `epigraph-api` (routes) and the HTTP MCP units (the tool; set
+   `EPIGRAPH_PUBLIC_BASE_URL` on them, as for `sudo`), and
+   `epigraph-tenancy-backfill` from the same commit (`verify` checks the
+   reader's owner and grant). Old binaries serve none of the routes or the
+   tool.
+
+**Rollback.** Roll back `epigraph-api` and the MCP units first (newest first).
+Then `docs/runbooks/131-undo.sql` on the migration DSN, BEFORE `130-undo.sql`:
+the reader's `LANGUAGE sql` body records no dependency on 130's table, so
+130-undo alone would leave it behind. The acts stay (130-undo archives them).

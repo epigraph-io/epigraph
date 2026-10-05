@@ -9,7 +9,8 @@
 -- passkey-enroll with --act) and any API or MCP build that proposes or
 -- confirms acts. A new binary left serving after this script fails every such
 -- call with 42883 or 42P01. Run it BEFORE 129-undo and every earlier undo
--- (130's act table names 125's sessions and 123's assignments).
+-- (130's act table names 125's sessions and 123's assignments), and AFTER
+-- 131-undo (131's reader reads this table but records no dependency on it).
 --
 -- WHAT IT DOES
 --   1. Copies EVERY act into `security_events` as one
