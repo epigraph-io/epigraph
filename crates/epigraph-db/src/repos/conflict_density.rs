@@ -50,6 +50,11 @@ pub struct FrameConflictDensity {
 /// * Either endpoint: `contradicts` is symmetric and its stored orientation is
 ///   arbitrary (`create_symmetric_if_absent_oriented` picks one), so testing
 ///   only the source made the count depend on which way the row was written.
+///
+/// The per-frame counts are one `GROUP BY` each over `fc` and `pairs`, joined
+/// to the frames, not a correlated `COUNT(*)` per frame: `fc` is referenced
+/// more than once, so Postgres materializes it, and a correlated count would
+/// rescan the whole materialized CTE once per frame of the 100-frame scan.
 const FRAME_CONFLICT_DENSITY_SQL: &str = "\
 WITH target AS ( \
     SELECT f.id, f.name FROM frames f \
@@ -76,13 +81,21 @@ pairs AS ( \
     SELECT fc.frame_id, LEAST(c.source_id, c.target_id), \
            GREATEST(c.source_id, c.target_id) \
     FROM conflict c JOIN fc ON fc.claim_id = c.target_id \
+), \
+fc_counts AS ( \
+    SELECT frame_id, COUNT(*) AS n FROM fc GROUP BY frame_id \
+), \
+pair_counts AS ( \
+    SELECT frame_id, COUNT(*) AS n FROM pairs GROUP BY frame_id \
 ) \
 SELECT t.id AS frame_id, t.name AS frame_name, \
-       (SELECT COUNT(*) FROM fc WHERE fc.frame_id = t.id) AS total_claims, \
-       (SELECT COUNT(*) FROM pairs p WHERE p.frame_id = t.id) AS contradicts_edges, \
+       COALESCE(fcc.n, 0) AS total_claims, \
+       COALESCE(pc.n, 0) AS contradicts_edges, \
        (SELECT COUNT(DISTINCT mf.source_agent_id) FROM mass_functions mf \
         WHERE mf.frame_id = t.id AND mf.source_agent_id IS NOT NULL) AS distinct_sources \
 FROM target t \
+LEFT JOIN fc_counts fcc ON fcc.frame_id = t.id \
+LEFT JOIN pair_counts pc ON pc.frame_id = t.id \
 ORDER BY t.id";
 
 /// Read-only conflict-density queries.
