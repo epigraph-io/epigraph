@@ -118,6 +118,29 @@ impl JwtConfig {
         let data = decode::<EpiGraphClaims>(token, &self.decoding_key, &validation)?;
         Ok(data.claims)
     }
+
+    /// Verify a token for RFC 7009 revocation ONLY: signature, issuer and
+    /// audience, but NOT expiry. Never use this to admit a request; admission
+    /// is [`JwtConfig::validate_token`].
+    ///
+    /// Expiry is left to the revocation store, which applies one clock-skew
+    /// margin on one clock (migration 141's definer: 24 hours on the database
+    /// clock). Checking `exp` here, on the revoking host's own clock, would
+    /// let a host running ahead answer a revocation 200 and record nothing
+    /// while a host lagging it still admits the token.
+    pub fn verify_for_revocation(
+        &self,
+        token: &str,
+    ) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&["epigraph"]);
+        validation.set_audience(&["epigraph-api"]);
+        // `exp` must still be present (`required_spec_claims`); only its
+        // comparison with this host's clock is skipped.
+        validation.validate_exp = false;
+        let data = decode::<EpiGraphClaims>(token, &self.decoding_key, &validation)?;
+        Ok(data.claims)
+    }
 }
 
 /// Authorization context attached to a request after Bearer validation.
@@ -226,6 +249,59 @@ mod tests {
             )
             .unwrap();
         assert!(b.validate_token(&token).is_err());
+    }
+
+    fn mint(cfg: &JwtConfig, ttl: Duration) -> (String, Uuid) {
+        cfg.issue_access_token(Uuid::new_v4(), vec![], "agent", None, None, ttl)
+            .unwrap()
+    }
+
+    #[test]
+    fn revocation_accepts_a_genuine_token_past_its_expiry() {
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let (token, jti) = mint(&cfg, Duration::hours(-2));
+        assert!(
+            cfg.validate_token(&token).is_err(),
+            "precondition: admission refuses it"
+        );
+        let claims = cfg
+            .verify_for_revocation(&token)
+            .expect("a genuine token past exp is still verifiable for revocation");
+        assert_eq!(claims.jti, jti);
+    }
+
+    #[test]
+    fn revocation_still_verifies_signature_issuer_and_audience() {
+        let cfg = JwtConfig::from_secret(b"secret-one-at-least-32-bytes!!!");
+        let forger = JwtConfig::from_secret(b"secret-two-at-least-32-bytes!!!");
+        // CONTROL: the genuine, expired token passes, so each refusal below is
+        // the altered field's, not expiry's.
+        let (genuine, _) = mint(&cfg, Duration::hours(-2));
+        assert!(cfg.verify_for_revocation(&genuine).is_ok());
+
+        let (forged, _) = mint(&forger, Duration::hours(-2));
+        assert!(
+            cfg.verify_for_revocation(&forged).is_err(),
+            "another secret's token is refused"
+        );
+
+        let base = cfg.verify_for_revocation(&genuine).unwrap();
+        for (iss, aud) in [
+            ("not-epigraph", "epigraph-api"),
+            ("epigraph", "not-epigraph-api"),
+        ] {
+            let altered = EpiGraphClaims {
+                iss: iss.to_string(),
+                aud: aud.to_string(),
+                ..base.clone()
+            };
+            let token =
+                encode(&Header::new(Algorithm::HS256), &altered, &cfg.encoding_key).unwrap();
+            assert!(
+                cfg.verify_for_revocation(&token).is_err(),
+                "iss {iss:?} / aud {aud:?} is refused"
+            );
+        }
     }
 
     #[test]

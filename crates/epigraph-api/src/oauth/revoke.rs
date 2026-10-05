@@ -45,11 +45,18 @@ pub async fn revoke_endpoint(
         }
         "access_token" => {
             // Access tokens are JWTs. This router is anonymous, so the token's
-            // signature is verified BEFORE anything is written: a token this
-            // server did not sign (or one already expired, which no server
-            // admits) is answered 200 and recorded nowhere (RFC 7009 section
-            // 2.2), so no caller can fill the denylist with chosen jtis.
-            if let Ok(claims) = state.jwt_config.validate_token(&req.token) {
+            // signature (and issuer and audience) is verified BEFORE anything
+            // is written: a token this server did not sign is answered 200 and
+            // recorded nowhere (RFC 7009 section 2.2), so no caller can fill
+            // the denylist with chosen jtis.
+            //
+            // Expiry is NOT checked on this host's clock. A host running ahead
+            // of another would otherwise answer a revoke that arrives just
+            // after `exp` (by its clock) 200 and record nothing, while the
+            // lagging host keeps admitting the token. The definer decides,
+            // with migration 141's 24-hour margin on the database clock: it
+            // records a token less than a day past `exp` and declines older.
+            if let Ok(claims) = state.jwt_config.verify_for_revocation(&req.token) {
                 #[cfg(feature = "db")]
                 {
                     use epigraph_db::RevokedAccessTokenRepository;
