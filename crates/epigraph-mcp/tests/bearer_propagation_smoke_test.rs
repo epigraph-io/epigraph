@@ -28,6 +28,8 @@ async fn inject_dummy_auth(
         jti: Uuid::new_v4(),
         family_id: None,
         elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
     };
     req.extensions_mut().insert(auth);
     next.run(req).await

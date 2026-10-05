@@ -210,6 +210,8 @@ async fn serve_api_hanging(
                 jti: Uuid::new_v4(),
                 family_id: None,
                 elevation_claim: None,
+                elevation: None,
+                admin_scopes: epigraph_api::middleware::bearer::AdminScopePosture::Unarmed,
             },
         ))
         .with_state(state);

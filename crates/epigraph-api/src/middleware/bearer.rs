@@ -15,7 +15,7 @@ use axum::{extract::State, http::Request, middleware::Next, response::Response};
 use crate::errors::ApiError;
 use crate::state::AppState;
 
-pub use epigraph_auth::{AuthContext, ClientType};
+pub use epigraph_auth::{AdminScopePosture, AuthContext, ClientType, ElevationRef};
 
 /// Middleware: extract Bearer token, validate JWT, inject AuthContext.
 ///
@@ -51,8 +51,11 @@ pub async fn bearer_auth_middleware(
                         reason: format!("Invalid token: {e}"),
                     })?;
 
-            // Build AuthContext
-            let auth_ctx: AuthContext = claims.into();
+            // Build AuthContext. The admin-scope switch decides whether its
+            // admin-only scopes count (`AuthContext::has_scope`, elevation
+            // plan EL-10); `From` leaves it armed (fail closed) until read.
+            let mut auth_ctx: AuthContext = claims.into();
+            auth_ctx.admin_scopes = state.admin_scope_posture().await;
 
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
@@ -111,7 +114,8 @@ pub async fn optional_bearer_auth_middleware(
                         reason: format!("Invalid token: {e}"),
                     })?;
 
-            let auth_ctx: AuthContext = claims.into();
+            let mut auth_ctx: AuthContext = claims.into();
+            auth_ctx.admin_scopes = state.admin_scope_posture().await;
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
         }
@@ -626,6 +630,8 @@ mod require_scope_tests {
             jti: uuid::Uuid::nil(),
             family_id: None,
             elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         });
         parts
     }
@@ -714,6 +720,8 @@ mod viewer_extractor_tests {
             jti: Uuid::new_v4(),
             family_id: None,
             elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         }
     }
 

@@ -2068,3 +2068,33 @@ preconditions (the offline confirmation verifier among them).
 Deploy: with `epigraph-api`, in any order; no migration. Rollback: the
 previous binary.
 
+
+## The admin-scope check chokepoint (no migration)
+
+Every scope check (`epigraph_auth::AuthContext::has_scope`, which
+`check_scopes`, the API's `RequireScope*` extractors and the MCP server's
+`SCOPE_MAP` gate all go through) follows migration 128's switch. The API's
+bearer middleware and the MCP server's dispatch read it for every
+authenticated request through a per-process cache (10 s; a database without
+128 reads unarmed; a switch that cannot be read is armed for that request,
+and the error is not cached).
+
+- **Unarmed**: every scope counts as the token says, exactly as before.
+- **Armed**: an admin-only scope (`claims:admin`, `clients:admin`,
+  `entity-types:write`, `groups:admin`, `instance:admin`) counts only on an
+  ELEVATED request. A token minted before arming that still carries one is
+  treated as lacking it at once (no re-mint needed), on REST and on MCP. With
+  elevation refused every write, the admin WRITE surfaces (client approval,
+  entity-type registration, the privatization acts, the MCP admin tools) are
+  maintenance-CLI-only once armed.
+- **The MCP `--allow-unauthenticated-http` listener**: its injected context
+  carries `claims:admin` (when its scope map lists it); armed, that scope is
+  absent there too, so the listener's admin tools refuse. Expected: arming
+  ends standing admin authority everywhere.
+- `platform:admin` (the elevate grant's) counts only while its elevation is
+  live.
+
+Deploy: with `epigraph-api` and the MCP binaries, in any order; no migration.
+A binary without the chokepoint ignores the switch for checks (the mint still
+strips armed), so arm only after every request unit runs this build.
+Rollback: disarm (`disarm-admin-scopes --apply`), then the previous binaries.

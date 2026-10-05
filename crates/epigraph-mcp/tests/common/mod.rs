@@ -24,6 +24,8 @@ pub fn admin_auth() -> AuthContext {
         jti: Uuid::new_v4(),
         family_id: None,
         elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
     }
 }
 
@@ -537,6 +539,8 @@ pub async fn server_admin(
             jti: Uuid::new_v4(),
             family_id: None,
             elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         },
         viewer,
     )
@@ -600,6 +604,8 @@ pub async fn seed_caller(
             jti: Uuid::new_v4(),
             family_id: None,
             elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         },
         viewer,
     )

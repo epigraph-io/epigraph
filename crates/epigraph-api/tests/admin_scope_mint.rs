@@ -98,8 +98,11 @@ async fn app_role_pool(pool: &PgPool) -> PgPool {
         .expect("application-role pool")
 }
 
+/// Reads the switch on EVERY request (no cache interval): these tests arm and
+/// disarm mid-run.
 async fn state(pool: &PgPool) -> AppState {
     AppState::with_db(app_role_pool(pool).await, config())
+        .with_admin_scope_arming_ttl(std::time::Duration::ZERO)
 }
 
 async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -755,8 +758,7 @@ async fn post_bearer(
 }
 
 /// A registered human holding a STANDING `clients:admin` token (minted
-/// directly: the check chokepoint is a later batch, so such a token still
-/// passes the route's scope check). Returns the bearer.
+/// directly, as one minted before arming would be). Returns the bearer.
 async fn client_admin_bearer(pool: &PgPool, jwt: &JwtConfig) -> String {
     let (person, _) = fixture::seed_human_operator(pool, "el9-approver").await;
     let client: Uuid = sqlx::query_scalar(
@@ -808,14 +810,19 @@ fn approve_path(client: Uuid) -> String {
 }
 
 /// Client approval hands out an admin-only scope only while the switch is
-/// UNARMED: armed, approving one is refused (403) and the client is left
-/// pending with nothing granted, while approving ordinary scopes still
-/// works. `platform:admin` is refused whatever the switch says.
+/// UNARMED, and never `platform:admin`. ARMED, since the check chokepoint
+/// (plan EL-10) a STANDING `clients:admin` token no longer holds the scope the
+/// route needs: every approval through it is refused (403 naming
+/// `clients:admin`) and nothing is granted, so the route's own armed refusal
+/// of an admin-only scope (EL-9's `hand_out`) is a second layer HTTP cannot
+/// reach (an elevated token is refused every non-GET request first): client
+/// approval is maintenance-CLI-only once armed (plan EQ-5). An unreadable
+/// switch is armed for the request (fail closed).
 ///
-/// Catches: `approve_client` not consulting the switch (the armed admin
-/// approval succeeds); the refusal applied to every scope (the armed ordinary
-/// approval fails); the `platform:admin` refusal removed (approved unarmed);
-/// an unreadable switch handed out as unarmed (fail open).
+/// Catches: the unarmed approval refused (the chokepoint treating unarmed as
+/// armed); the `platform:admin` refusal removed (approved unarmed); the
+/// chokepoint not applied to the route's scope check (the armed approvals
+/// succeed); an unreadable switch read as unarmed (fail open).
 #[sqlx::test(migrations = "../../migrations")]
 async fn approval_hands_out_admin_scopes_only_while_unarmed(pool: PgPool) {
     let st = state(&pool).await;
@@ -853,38 +860,25 @@ async fn approval_hands_out_admin_scopes_only_while_unarmed(pool: PgPool) {
         ("pending".to_string(), vec![])
     );
 
-    // Armed: the admin scope is refused, ordinary scopes are not.
+    // Armed: the standing clients:admin token holds no clients:admin any
+    // more, so no approval goes through it, admin-only or ordinary.
     set_armed(&pool, true).await;
     let armed = pending_client(&pool).await;
-    let (status, body) = post_bearer(
-        app.clone(),
-        &approve_path(armed),
-        &bearer,
-        json!({ "granted_scopes": HELD }),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "armed admin approval: {body}"
-    );
-    assert!(body.to_string().contains("claims:admin"), "{body}");
-    assert_eq!(
-        status_and_granted(&pool, armed).await,
-        ("pending".to_string(), vec![])
-    );
-    let (status, body) = post_bearer(
-        app.clone(),
-        &approve_path(armed),
-        &bearer,
-        json!({ "granted_scopes": ["claims:read"] }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "armed ordinary approval: {body}");
-    assert_eq!(
-        status_and_granted(&pool, armed).await,
-        ("active".to_string(), v(&["claims:read"]))
-    );
+    for granted in [json!(HELD), json!(["claims:read"])] {
+        let (status, body) = post_bearer(
+            app.clone(),
+            &approve_path(armed),
+            &bearer,
+            json!({ "granted_scopes": granted }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "armed approval: {body}");
+        assert!(body.to_string().contains("clients:admin"), "{body}");
+        assert_eq!(
+            status_and_granted(&pool, armed).await,
+            ("pending".to_string(), vec![])
+        );
+    }
 
     // Unarmed again, but the switch cannot be read by the application role:
     // refused (fail closed), not "unarmed".
@@ -977,4 +971,90 @@ async fn registration_refuses_a_request_for_an_admin_scope_only_while_armed(pool
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "armed, ordinary scope: {body}");
+}
+
+// ── The check chokepoint (plan EL-10) ────────────────────────────────────────
+
+/// `epigraph-auth` spells the admin-only scopes itself (it does not depend on
+/// `epigraph-core`); the two lists are the same set.
+#[test]
+fn the_check_chokepoint_names_the_canonical_admin_only_scopes() {
+    let mut auth: Vec<&str> = epigraph_auth::ADMIN_ONLY_SCOPES.to_vec();
+    let mut core: Vec<&str> = epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES.to_vec();
+    auth.sort_unstable();
+    core.sort_unstable();
+    assert_eq!(auth, core);
+}
+
+async fn get_bearer(app: axum::Router, uri: &str, token: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// A STANDING `claims:admin` token (minted directly, as one minted before
+/// arming would be) on a REST admin read route (`GET /api/v1/admin/stats`,
+/// `RequireScopeAdmin`): unarmed it is served as before; ARMED the route's
+/// scope check finds no `claims:admin` (403 naming it); disarmed it is served
+/// again, with the same body shape. The switch is read per request (no
+/// re-mint, no restart).
+///
+/// Catches: the `RequireScope*` extractors reading the token's scopes
+/// directly instead of `AuthContext::has_scope`; the bearer middleware not
+/// reading the switch (armed would read unarmed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_standing_admin_scope_is_absent_on_a_rest_route_while_armed(pool: PgPool) {
+    let st = state(&pool).await;
+    let jwt = st.jwt_config.clone();
+    let app = create_router(st);
+    let (person, _) = fixture::seed_human_operator(&pool, "el10-stats").await;
+    let client: Uuid = sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(person)
+    .fetch_one(&pool)
+    .await
+    .expect("the caller's client");
+    let token = jwt
+        .issue_access_token(
+            client,
+            v(&["claims:read", "claims:admin"]),
+            "human",
+            None,
+            Some(person),
+            Duration::minutes(10),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .expect("mint")
+        .0;
+
+    let (status, unarmed) = get_bearer(app.clone(), "/api/v1/admin/stats", &token).await;
+    assert_eq!(status, StatusCode::OK, "unarmed: {unarmed}");
+    set_armed(&pool, true).await;
+    let (status, body) = get_bearer(app.clone(), "/api/v1/admin/stats", &token).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "armed: {body}");
+    assert!(body.to_string().contains("claims:admin"), "{body}");
+    set_armed(&pool, false).await;
+    let (status, again) = get_bearer(app, "/api/v1/admin/stats", &token).await;
+    assert_eq!(status, StatusCode::OK, "disarmed: {again}");
+    let keys = |v: &Value| {
+        v.as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        keys(&again),
+        keys(&unarmed),
+        "the same answer shape unarmed"
+    );
 }

@@ -125,6 +125,50 @@ pub fn without_elevated_only_scope(mut scopes: Vec<String>) -> Vec<String> {
     scopes
 }
 
+/// The admin-only scopes (`epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES`,
+/// spelled here because this crate does not depend on `epigraph-core`; a test
+/// in `epigraph-api` pins the two equal). THE CHECK CHOKEPOINT
+/// ([`AuthContext::has_scope`]) treats them as ABSENT on a request that is
+/// not elevated once the database's admin-scope switch is armed (elevation
+/// plan EL-10, DESIGN 6.5).
+pub const ADMIN_ONLY_SCOPES: &[&str] = &[
+    "claims:admin",
+    "clients:admin",
+    "entity-types:write",
+    "groups:admin",
+    "instance:admin",
+];
+
+/// Whether `scope` is one of [`ADMIN_ONLY_SCOPES`].
+#[must_use]
+pub fn is_admin_only_scope(scope: &str) -> bool {
+    ADMIN_ONLY_SCOPES.contains(&scope)
+}
+
+/// Whether the admin-only scopes are STANDING authority on a request: what the
+/// database's admin-scope switch (migration 128) said when the request's auth
+/// layer read it (through a short cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminScopePosture {
+    /// The switch is unarmed (or absent): an admin-only scope a token carries
+    /// is authority, as before the switch.
+    Unarmed,
+    /// The switch is armed, or could not be read (fail closed): an admin-only
+    /// scope is authority only on an ELEVATED request.
+    Armed,
+}
+
+/// A live elevation the request's auth layer CHECKED against the database (the
+/// session is live for this principal on this family). Never built from a
+/// token claim alone: [`AuthContext::elevation_claim`] is the claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElevationRef {
+    /// The live elevation session (`elevation_sessions.id`).
+    pub session_id: Uuid,
+    /// Its refresh family.
+    pub family_id: Uuid,
+}
+
 pub struct JwtConfig {
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
@@ -208,8 +252,17 @@ pub struct AuthContext {
     pub family_id: Option<Uuid>,
     /// The token's `elv` claim, AS CLAIMED. Not authority: a request is
     /// elevated only once this is resolved against a live elevation session
-    /// bound to this principal and family. Nothing resolves it yet.
+    /// bound to this principal and family ([`Self::elevation`]).
     pub elevation_claim: Option<Uuid>,
+    /// The live elevation this request carries, set ONLY by the auth layer
+    /// after the database said the session is live (the API's recorder layer,
+    /// the MCP server's dispatch). `None` on every other request.
+    pub elevation: Option<ElevationRef>,
+    /// The admin-scope switch as the auth layer read it for this request.
+    /// [`From<EpiGraphClaims>`] sets [`AdminScopePosture::Armed`] (fail
+    /// closed): an auth layer that forgets to read the switch loses admin
+    /// authority rather than keeping it.
+    pub admin_scopes: AdminScopePosture,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -220,8 +273,41 @@ pub enum ClientType {
 }
 
 impl AuthContext {
+    /// THE CHECK CHOKEPOINT (elevation plan EL-10): whether this request holds
+    /// `scope`. Every scope check (`check_scopes`, the API's `RequireScope*`
+    /// extractors, the MCP server's `SCOPE_MAP` gate) goes through here; a
+    /// direct read of [`Self::scopes`] outside this crate is forbidden by the
+    /// API's `admin_scope_literals` ratchet.
+    ///
+    /// * [`ELEVATED_ONLY_SCOPE`] (`platform:admin`) counts only on an ELEVATED
+    ///   request ([`Self::elevation`]): a token whose session ended holds it
+    ///   for nothing.
+    /// * An [`ADMIN_ONLY_SCOPES`] entry, on an ELEVATED request: held when the
+    ///   token carries `platform:admin` (the elevate grant's), so elevation
+    ///   stands in for the standing admin scopes it strips, whatever the
+    ///   switch says. A WRITE-named entry (`entity-types:write`) is never
+    ///   implied: elevation is sudo READ.
+    /// * An [`ADMIN_ONLY_SCOPES`] entry, on a request that is NOT elevated:
+    ///   held as the token says while [`Self::admin_scopes`] is
+    ///   [`AdminScopePosture::Unarmed`], ABSENT while it is
+    ///   [`AdminScopePosture::Armed`].
+    /// * Every other scope: as the token says.
+    #[must_use]
     pub fn has_scope(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|s| s == scope)
+        let carried = self.scopes.iter().any(|s| s == scope);
+        let elevated = self.elevation.is_some();
+        if scope == ELEVATED_ONLY_SCOPE {
+            return carried && elevated;
+        }
+        if !is_admin_only_scope(scope) {
+            return carried;
+        }
+        if elevated {
+            return carried
+                || (!scope.ends_with(":write")
+                    && self.scopes.iter().any(|s| s == ELEVATED_ONLY_SCOPE));
+        }
+        carried && self.admin_scopes == AdminScopePosture::Unarmed
     }
 }
 
@@ -242,6 +328,8 @@ impl From<EpiGraphClaims> for AuthContext {
             jti: claims.jti,
             family_id: claims.fam,
             elevation_claim: claims.elv,
+            elevation: None,
+            admin_scopes: AdminScopePosture::Armed,
         }
     }
 }
@@ -357,6 +445,110 @@ mod tests {
         assert!(b.validate_token(&token).is_err());
     }
 
+    fn ctx(scopes: &[&str], posture: AdminScopePosture, elevated: bool) -> AuthContext {
+        AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: Some(Uuid::new_v4()),
+            owner_id: None,
+            client_type: ClientType::Human,
+            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: elevated.then(|| ElevationRef {
+                session_id: Uuid::new_v4(),
+                family_id: Uuid::new_v4(),
+            }),
+            admin_scopes: posture,
+        }
+    }
+
+    /// THE CHECK CHOKEPOINT (elevation plan EL-10). Unarmed and unelevated:
+    /// every scope as the token says (today's behaviour). Armed and
+    /// unelevated: every admin-only scope ABSENT, every other scope as the
+    /// token says. Elevated (with `platform:admin`, the elevate grant's
+    /// token): the admin-only READ scopes held whatever the switch says, a
+    /// write-named one (`entity-types:write`) never implied, and
+    /// `platform:admin` itself held only while elevated. A context built from
+    /// claims is ARMED until an auth layer reads the switch (fail closed).
+    #[test]
+    fn the_check_chokepoint_follows_the_switch_and_the_elevation() {
+        let standing = [
+            "claims:read",
+            "claims:admin",
+            "clients:admin",
+            "entity-types:write",
+            "groups:admin",
+            "instance:admin",
+        ];
+        let unarmed = ctx(&standing, AdminScopePosture::Unarmed, false);
+        for s in standing {
+            assert!(unarmed.has_scope(s), "unarmed holds {s}");
+        }
+        let armed = ctx(&standing, AdminScopePosture::Armed, false);
+        assert!(
+            armed.has_scope("claims:read"),
+            "armed keeps ordinary scopes"
+        );
+        for s in ADMIN_ONLY_SCOPES {
+            assert!(!armed.has_scope(s), "armed, unelevated: {s} is absent");
+        }
+        assert!(check_scopes(&armed, &["claims:admin"]).is_err());
+        assert!(check_scopes(&unarmed, &["claims:admin"]).is_ok());
+
+        let elevated_token = ["claims:read", ELEVATED_ONLY_SCOPE];
+        for posture in [AdminScopePosture::Unarmed, AdminScopePosture::Armed] {
+            let elevated = ctx(&elevated_token, posture, true);
+            for s in [
+                "claims:admin",
+                "clients:admin",
+                "groups:admin",
+                "instance:admin",
+            ] {
+                assert!(elevated.has_scope(s), "{posture:?} elevated holds {s}");
+            }
+            assert!(
+                !elevated.has_scope("entity-types:write"),
+                "elevation implies no write-named admin scope"
+            );
+            assert!(elevated.has_scope(ELEVATED_ONLY_SCOPE));
+            let ended = ctx(&elevated_token, posture, false);
+            assert!(
+                !ended.has_scope(ELEVATED_ONLY_SCOPE),
+                "{posture:?}: platform:admin counts only while elevated"
+            );
+            assert!(
+                !ended.has_scope("claims:admin"),
+                "{posture:?}: an ended elevation implies nothing"
+            );
+            let no_platform = ctx(&["claims:read"], posture, true);
+            assert!(
+                !no_platform.has_scope("claims:admin"),
+                "elevation implies the admin scopes only with platform:admin"
+            );
+        }
+
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let (token, _) = cfg
+            .issue_access_token(
+                Uuid::new_v4(),
+                vec!["claims:admin".into()],
+                "service",
+                None,
+                None,
+                Duration::minutes(5),
+                AccessTokenBinding::NONE,
+            )
+            .unwrap();
+        let from_claims: AuthContext = cfg.validate_token(&token).unwrap().into();
+        assert_eq!(from_claims.admin_scopes, AdminScopePosture::Armed);
+        assert_eq!(from_claims.elevation, None);
+        assert!(
+            !from_claims.has_scope("claims:admin"),
+            "a context no auth layer stamped holds no admin scope"
+        );
+    }
+
     #[test]
     fn check_scopes_pass_and_fail() {
         let auth = AuthContext {
@@ -368,6 +560,8 @@ mod tests {
             jti: Uuid::new_v4(),
             family_id: None,
             elevation_claim: None,
+            elevation: None,
+            admin_scopes: AdminScopePosture::Unarmed,
         };
         assert!(check_scopes(&auth, &["claims:read"]).is_ok());
         assert!(check_scopes(&auth, &["claims:write"]).is_err());

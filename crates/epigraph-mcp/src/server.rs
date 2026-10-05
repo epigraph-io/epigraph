@@ -120,6 +120,10 @@ pub struct EpiGraphMcpFull {
     /// is. Off, a token without `elv` resolves the plain scoped viewer with no
     /// liveness round trip at all.
     pub(crate) connector_elevation: bool,
+    /// The admin-scope switch (migration 128) as this process reads it,
+    /// behind a short cache (elevation plan EL-10); shared by every session
+    /// the factory clones. [`Self::admin_scope_posture`].
+    pub(crate) admin_scope_arming: Arc<epigraph_db::AdminScopeArmingCache>,
 }
 
 impl EpiGraphMcpFull {
@@ -824,6 +828,26 @@ impl EpiGraphMcpFull {
         Ok(None)
     }
 
+    /// The admin-scope switch for one HTTP call (elevation plan EL-10): read
+    /// on this server's pool through the shared cache, failing closed
+    /// ([`epigraph_db::AdminScopeArmingCache::armed`]).
+    pub async fn admin_scope_posture(&self) -> epigraph_auth::AdminScopePosture {
+        if self.admin_scope_arming.armed(&self.pool).await {
+            epigraph_auth::AdminScopePosture::Armed
+        } else {
+            epigraph_auth::AdminScopePosture::Unarmed
+        }
+    }
+
+    /// Replace the admin-scope switch's cache with one whose reads stand for
+    /// `ttl` (`Duration::ZERO`: every call reads the switch). For tests that
+    /// arm or disarm mid-run.
+    #[must_use]
+    pub fn with_admin_scope_arming_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.admin_scope_arming = Arc::new(epigraph_db::AdminScopeArmingCache::with_ttl(ttl));
+        self
+    }
+
     /// Return an error if the server is in read-only mode.
     pub(crate) fn reject_if_read_only(&self) -> Result<(), McpError> {
         if self.read_only {
@@ -882,6 +906,7 @@ impl EpiGraphMcpFull {
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
         }
     }
 
@@ -986,6 +1011,7 @@ impl EpiGraphMcpFull {
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
         }
     }
 
@@ -2358,6 +2384,13 @@ impl ServerHandler for EpiGraphMcpFull {
                 .and_then(|p| p.extensions.get::<crate::auth::RawBearerToken>())
                 .map(|t| t.0.clone());
         }
+        // THE CHECK CHOKEPOINT's switch (elevation plan EL-10): whether the
+        // caller's admin-only scopes count (`AuthContext::has_scope`). Read
+        // before any scope gate, the federated one included; the bearer
+        // middleware's context leaves it armed (fail closed) until read.
+        if let Some(auth) = auth_owned.as_mut() {
+            auth.admin_scopes = self.admin_scope_posture().await;
+        }
 
         // FEDERATION BRANCH — only for names the static tool router does NOT own.
         // Must intercept BEFORE the static scope gate below: that gate fails
@@ -2583,6 +2616,8 @@ mod scope_guard_tests {
             jti: Uuid::new_v4(),
             family_id: None,
             elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         }
     }
 

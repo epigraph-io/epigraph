@@ -265,6 +265,8 @@ pub fn unauthenticated_context(
         jti: uuid::Uuid::nil(),
         family_id: None,
         elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
     }
 }
 

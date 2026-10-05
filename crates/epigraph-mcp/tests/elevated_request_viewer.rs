@@ -203,6 +203,8 @@ fn http_auth(person: Uuid, client: Uuid, family: Uuid, elv: Option<Uuid>) -> Aut
         jti: Uuid::new_v4(),
         family_id: Some(family),
         elevation_claim: elv,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
     }
 }
 
@@ -674,6 +676,12 @@ const EL8_SECRET: &[u8] = b"el8-mcp-recorder-test-secret-at-least-32-bytes!!";
 /// application-role `ScopedPool` that declares the recorder (the HTTP
 /// transport's pool), bound to an ephemeral port.
 async fn el8_listener(pool: &PgPool) -> String {
+    el8_listener_with(pool, epigraph_db::AdminScopeArmingCache::DEFAULT_TTL).await
+}
+
+/// [`el8_listener`] whose servers read the admin-scope switch through a cache
+/// of interval `arming_ttl` (`Duration::ZERO`: every call reads it).
+async fn el8_listener_with(pool: &PgPool, arming_ttl: std::time::Duration) -> String {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
@@ -692,7 +700,8 @@ async fn el8_listener(pool: &PgPool) -> String {
         move || {
             Ok(
                 EpiGraphMcpFull::new_shared(pool.clone(), signer.clone(), embedder.clone(), false)
-                    .with_scoped_pool(scoped.clone()),
+                    .with_scoped_pool(scoped.clone())
+                    .with_admin_scope_arming_ttl(arming_ttl),
             )
         },
         Arc::new(LocalSessionManager::default()),
@@ -980,4 +989,83 @@ fn the_http_transport_records_and_declares() {
         body.contains("crate::elevated_access::record_elevated_call("),
         "call_tool records an elevated call's result"
     );
+}
+
+// =====================================================================
+// EL-10: the MCP scope gate goes through the check chokepoint
+// =====================================================================
+
+/// Arm (`true`) or disarm the admin-scope switch as the maintenance role.
+async fn set_admin_switch(pool: &PgPool, armed: bool) {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT changed FROM public.epigraph_set_admin_scope_enforcement($1, $2)")
+            .bind(armed)
+            .bind("el10 mcp test")
+            .execute(&mut *conn)
+            .await
+            .expect("set the admin-scope switch");
+        (conn, ())
+    })
+    .await;
+}
+
+/// `tools/call delete_edge` (SCOPE_MAP: `claims:admin`) through the real
+/// `call_tool` with `token`; the JSON-RPC answer as text.
+async fn el10_delete_edge(url: &str, token: &str) -> String {
+    let session = el8_session(url, token).await;
+    let resp = el8_post(
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "delete_edge",
+                       "arguments": {"edge_id": Uuid::new_v4().to_string()}}
+        }),
+    )
+    .await;
+    el8_data(resp).await.to_string()
+}
+
+/// A STANDING `claims:admin` token (minted directly, as one minted before
+/// arming would be) on an MCP admin tool, through the bearer middleware and
+/// the real `call_tool` on the application role: unarmed the scope gate
+/// passes (whatever the tool then answers for a missing edge); ARMED the gate
+/// refuses it for want of `claims:admin`; disarmed it passes again.
+///
+/// Verified to fail with `enforce_tool_scope` reading the token's scopes
+/// directly (armed passes the gate), and with `call_tool` not reading the
+/// switch (the bearer middleware's context stays armed: unarmed is refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_standing_admin_scope_is_absent_on_an_mcp_tool_while_armed(pool: PgPool) {
+    let (person, _) = fixture::seed_human_operator(&pool, "el10-mcp-admin").await;
+    let token = epigraph_auth::JwtConfig::from_secret(EL8_SECRET)
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:read".to_string(), "claims:admin".to_string()],
+            "human",
+            None,
+            Some(person),
+            chrono::Duration::minutes(10),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .expect("mint")
+        .0;
+    let url = el8_listener_with(&pool, std::time::Duration::ZERO).await;
+    let gate = "requires scope 'claims:admin'";
+
+    let unarmed = el10_delete_edge(&url, &token).await;
+    assert!(
+        !unarmed.contains(gate),
+        "unarmed: the gate passes: {unarmed}"
+    );
+    set_admin_switch(&pool, true).await;
+    let armed = el10_delete_edge(&url, &token).await;
+    assert!(
+        armed.contains(gate),
+        "armed: claims:admin is absent: {armed}"
+    );
+    set_admin_switch(&pool, false).await;
+    let again = el10_delete_edge(&url, &token).await;
+    assert!(!again.contains(gate), "disarmed: the gate passes: {again}");
 }

@@ -50,6 +50,8 @@ fn caller_token(agent: Uuid, scopes: &[&str]) -> AuthContext {
         jti: Uuid::new_v4(),
         family_id: None,
         elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
     }
 }
 

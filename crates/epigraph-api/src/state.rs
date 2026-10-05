@@ -444,6 +444,14 @@ pub struct AppState {
     #[cfg(feature = "db")]
     pub entity_type_cache: Arc<std::sync::RwLock<HashMap<String, epigraph_db::EntityTypeEntry>>>,
 
+    /// The admin-scope switch (migration 128) as this process reads it, behind
+    /// a short cache (elevation plan EL-10): every authenticated request's
+    /// [`epigraph_auth::AuthContext::admin_scopes`] comes from here
+    /// ([`Self::admin_scope_posture`]). One per process (cloned states share
+    /// it).
+    #[cfg(feature = "db")]
+    admin_scope_arming: Arc<epigraph_db::AdminScopeArmingCache>,
+
     /// The WebAuthn relying party for the passkey ceremonies (elevation plan
     /// EL-3), built once at boot from `EPIGRAPH_WEBAUTHN_*`. `None` when
     /// passkeys are not configured: every enrollment endpoint then answers 503
@@ -1084,6 +1092,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
         }
     }
@@ -1447,6 +1456,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
         }
     }
@@ -1516,6 +1526,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
         }
     }
@@ -1537,6 +1548,30 @@ impl AppState {
         if let Ok(mut set) = self.revoked_tokens.write() {
             set.insert(token.to_string());
         }
+    }
+
+    /// The admin-scope switch for one request (elevation plan EL-10): read on
+    /// the request pool through this process's cache, failing closed
+    /// ([`epigraph_db::AdminScopeArmingCache::armed`]). A build without a
+    /// database has no switch: unarmed, as before the switch existed.
+    pub async fn admin_scope_posture(&self) -> epigraph_auth::AdminScopePosture {
+        #[cfg(feature = "db")]
+        {
+            if self.admin_scope_arming.armed(&self.db_pool).await {
+                return epigraph_auth::AdminScopePosture::Armed;
+            }
+        }
+        epigraph_auth::AdminScopePosture::Unarmed
+    }
+
+    /// Replace the admin-scope switch's cache with one whose reads stand for
+    /// `ttl` (`Duration::ZERO`: every request reads the switch). For tests that
+    /// arm or disarm mid-run.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_admin_scope_arming_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.admin_scope_arming = Arc::new(epigraph_db::AdminScopeArmingCache::with_ttl(ttl));
+        self
     }
 
     /// Check if a JWT token has been revoked.
