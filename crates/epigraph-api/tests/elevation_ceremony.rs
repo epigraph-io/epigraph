@@ -1484,6 +1484,75 @@ async fn an_unconfirmed_ticket_expires_into_invalid_grant(pool: PgPool) {
     assert_eq!(grant_error(&r), (StatusCode::BAD_REQUEST, "invalid_grant"));
 }
 
+/// A CONNECTOR-mode ticket (the kind MCP `sudo` opens, elevation plan EL-11;
+/// owed since EL-5's hand-off), confirmed by the REAL ceremony over HTTP, is
+/// never redeemed at the token endpoint: whatever secret is presented, the
+/// answer is `invalid_grant` with no token, and the session it opened stays
+/// the family's (reached by the family's own requests, never by a minted
+/// token). Calibration: the ceremony did confirm (a live session exists).
+///
+/// A REGRESSION PIN at the HTTP level: 125's redeem definer refuses it by its
+/// mode clause and, equivalently, because a connector ticket stores no redeem
+/// hash (EL-5 measured the mode-clause mutation as equivalent under the
+/// secret-shape CHECK); the Rust grant adds no mode check of its own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_confirmed_connector_ticket_is_never_redeemed_for_a_token(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "connector", &mut auth).await;
+    let (person, client, family) = (p.person, p.client, p.family);
+    let ticket: Uuid = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(person.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp the principal");
+        let t = epigraph_db::ElevationCeremony::create_ticket(
+            &mut conn,
+            client,
+            family,
+            "connector mode",
+            epigraph_db::TicketMode::Connector,
+        )
+        .await
+        .expect("a connector ticket, as sudo opens it");
+        sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("unstamp");
+        (conn, t)
+    })
+    .await;
+    let (status, body) = s.ceremony(ticket, &mut auth).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the ceremony confirms: {body}"
+    );
+    let (_, _, session) = ticket_row(&pool, ticket).await;
+    assert!(session.is_some(), "CALIBRATION: a session opened");
+
+    for secret in [
+        hex::encode([0x5a_u8; 32]),
+        hex::encode(Sha256::digest(b"guess")),
+    ] {
+        let r = s.redeem(ticket, &secret, &p.client_id).await;
+        assert_eq!(
+            grant_error(&r),
+            (StatusCode::BAD_REQUEST, "invalid_grant"),
+            "a connector ticket redeems for nothing: {r:?}"
+        );
+        assert!(r.1.get("access_token").is_none(), "no token: {:?}", r.1);
+    }
+    let redeemed: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT redeemed_at FROM elevation_tickets WHERE id = $1")
+            .bind(ticket)
+            .fetch_one(&pool)
+            .await
+            .expect("ticket");
+    assert!(redeemed.is_none(), "never marked redeemed");
+}
+
 /// The elevated token never outlives the ASSIGNMENT: a custodian whose
 /// assignment ends in 5 minutes gets a session (and a token) of at most 5
 /// minutes, not 15. Mutation: the token's lifetime fixed at 15 minutes ->
