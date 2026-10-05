@@ -620,3 +620,306 @@ async fn passkey_enroll_a_later_passkey_needs_the_confirmed_act(pool: PgPool) {
     let again = enroll(&[]).await;
     assert_eq!(again.code, 0, "the break-glass: {}", again.show());
 }
+
+// =====================================================================
+// EL-12b: the whole act, end to end: proposed and confirmed over HTTP,
+// executed by the real binary
+// =====================================================================
+
+#[path = "../../epigraph-passkey/tests/support/soft_authenticator.rs"]
+mod soft_authenticator;
+
+/// The real API router on an application-role pool that declares the
+/// per-access recorder, with a software-attestation relying party: its
+/// address and its token signer.
+async fn api(
+    pool: &PgPool,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<epigraph_auth::JwtConfig>,
+) {
+    let scoped = epigraph_db::ScopedPool::connect_with_access_recorder_for_tests(
+        &fixture::database_url_for(pool).await,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions::default(),
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("app-role pool");
+    let rp = epigraph_passkey::Passkeys::new(epigraph_passkey::PasskeyConfig {
+        rp_id: soft_authenticator::RP_ID.into(),
+        origin: soft_authenticator::ORIGIN.parse().unwrap(),
+        policy: epigraph_passkey::AttestationPolicy::SoftwareAllowed,
+    })
+    .expect("relying party");
+    let state =
+        epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default())
+            .with_passkeys(Some(std::sync::Arc::new(rp)));
+    let jwt = state.jwt_config.clone();
+    let app = epigraph_api::create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    (addr, jwt)
+}
+
+async fn post(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: Option<&str>,
+    body: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}{path}"))
+        .json(body);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.expect("POST");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+/// [`run_op`] over owned arguments.
+async fn run_strings(pool: &PgPool, args: &[String]) -> Run {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_op(pool, &refs).await
+}
+
+/// A human token for `person` on `client`, naming `family` and `elv`.
+fn token(
+    jwt: &epigraph_auth::JwtConfig,
+    person: Uuid,
+    client: Uuid,
+    family: Uuid,
+    elv: Option<Uuid>,
+) -> String {
+    jwt.issue_access_token(
+        client,
+        vec!["claims:read".into(), "platform:admin".into()],
+        "human",
+        None,
+        Some(person),
+        chrono::Duration::minutes(15),
+        epigraph_auth::AccessTokenBinding {
+            family_id: Some(family),
+            elevation_id: elv,
+        },
+    )
+    .expect("mint")
+    .0
+}
+
+/// THE ACCEPTANCE PASS for one `role.end` (elevation plan EL-12b), every
+/// step on its production path: the custodian P registers a passkey through
+/// the enrollment ceremony, elevates through the ticket ceremony, PROPOSES the
+/// end of a test assignment over `POST /api/v1/admin/acts`, CONFIRMS it at
+/// `/elevate/act/<id>` with that passkey (the challenge committing to the
+/// act), and the real `epigraph-operator end-role-assignment --act` EXECUTES
+/// it: the assignment ends, names the act, the act is spent, and the end's
+/// audit row says `confirmation = 'passkey'` with the act and the elevation
+/// it was proposed under. Calibration: the same verb without `--act` is
+/// refused ELV10 (P holds a passkey), and before the confirmation the act is
+/// refused by the verb.
+///
+/// Verified to fail with the act's challenge started without the content
+/// binding (the assertion is refused `challenge_not_bound`, so the act is
+/// never confirmed and the verb refuses it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_role_end_is_proposed_confirmed_and_executed_end_to_end(pool: PgPool) {
+    use soft_authenticator::{ClientUv, SoftAuthenticator, ORIGIN};
+    fixture::open_elevated_access_gate(&pool).await;
+    let (p, _) = fixture::seed_human_operator(&pool, "custodian").await;
+    fixture::make_custodian(&pool, p).await;
+    let (x, _) = fixture::seed_human_operator(&pool, "auditor").await;
+    // A bootstrap grant by P: no custodian holds a passkey yet.
+    let assignment: Uuid = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let a = sqlx::query_scalar(
+            "SELECT public.epigraph_grant_role('role:auditor', $1, NULL, NULL, $2, 'test')",
+        )
+        .bind(x)
+        .bind(p)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("a test assignment");
+        (conn, a)
+    })
+    .await;
+    let (addr, jwt) = api(&pool).await;
+    let mut auth = SoftAuthenticator::new(Uuid::from_u128(0x5eed));
+
+    // 1. The passkey, through the enrollment ceremony.
+    let enrollment: Uuid = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'e2e', 'key')",
+        )
+        .bind(p)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("an enrollment");
+        (conn, e)
+    })
+    .await;
+    let base = format!("/elevate/enroll/{enrollment}");
+    let (status, options) = post(
+        addr,
+        &format!("{base}/challenge"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{options}");
+    let registration = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let (status, body) = post(addr, &format!("{base}/finish"), None, &registration).await;
+    assert_eq!(status, 200, "enrollment: {body}");
+
+    // 2. The elevation, through the ticket ceremony.
+    let client: Uuid = sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(p)
+    .fetch_one(&pool)
+    .await
+    .expect("P's client");
+    let hash: Vec<u8> = [
+        Uuid::new_v4().as_bytes().to_vec(),
+        Uuid::new_v4().as_bytes().to_vec(),
+    ]
+    .concat();
+    let family: Uuid = sqlx::query_scalar(
+        "INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at) \
+         VALUES ($1, $2, ARRAY['claims:read'], now() + interval '1 day') RETURNING id",
+    )
+    .bind(&hash)
+    .bind(client)
+    .fetch_one(&pool)
+    .await
+    .expect("a family");
+    let plain = token(&jwt, p, client, family, None);
+    let (status, ticket) = post(
+        addr,
+        "/api/v1/elevation/tickets",
+        Some(&plain),
+        &serde_json::json!({"reason": "end a test assignment"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{ticket}");
+    let ticket = ticket["ticket_id"].as_str().unwrap().to_string();
+    let (_, options) = post(
+        addr,
+        &format!("/elevate/{ticket}/challenge"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    let assertion = auth.authenticate(ORIGIN, options).await;
+    let (status, body) = post(addr, &format!("/elevate/{ticket}/assert"), None, &assertion).await;
+    assert_eq!(status, 200, "elevation: {body}");
+    let session: Uuid =
+        sqlx::query_scalar("SELECT session_id FROM elevation_tickets WHERE id = $1::uuid")
+            .bind(&ticket)
+            .fetch_one(&pool)
+            .await
+            .expect("the session");
+    let elevated = token(&jwt, p, client, family, Some(session));
+
+    // 3. The proposal.
+    let (status, proposed) = post(
+        addr,
+        "/api/v1/admin/acts",
+        Some(&elevated),
+        &serde_json::json!({"kind": "role.end",
+                            "args": {"assignment": assignment.to_string(), "reason": "done"},
+                            "reason": "the test assignment is no longer needed"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{proposed}");
+    let act: Uuid = proposed["act_id"].as_str().unwrap().parse().unwrap();
+    let (a_s, act_s) = (assignment.to_string(), act.to_string());
+    let end = |with_act: bool| {
+        let mut args = vec![
+            "end-role-assignment",
+            "--assignment",
+            &a_s,
+            "--reason",
+            "done",
+        ];
+        if with_act {
+            args.extend(["--act", &act_s]);
+        }
+        args.push("--apply");
+        args.into_iter().map(str::to_string).collect::<Vec<_>>()
+    };
+    let early = run_strings(&pool, &end(true)).await;
+    assert_eq!(
+        early.code,
+        1,
+        "an unconfirmed act is refused: {}",
+        early.show()
+    );
+
+    // 4. The confirmation, with the passkey, over the act's own challenge.
+    let (status, options) = post(
+        addr,
+        &format!("/elevate/act/{act}/challenge"),
+        None,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{options}");
+    let assertion = auth.authenticate(ORIGIN, options).await;
+    let (status, body) = post(
+        addr,
+        &format!("/elevate/act/{act}/assert"),
+        None,
+        &assertion,
+    )
+    .await;
+    assert_eq!(status, 200, "confirmation: {body}");
+
+    // 5. The execution.
+    let bare = run_strings(&pool, &end(false)).await;
+    assert_eq!(bare.code, 1, "{}", bare.show());
+    assert!(
+        bare.stderr.contains("ELV10"),
+        "CALIBRATION: P holds a passkey: {}",
+        bare.show()
+    );
+    let done = run_strings(&pool, &end(true)).await;
+    assert_eq!(done.code, 0, "{}", done.show());
+    let (revoked, revoke_act): (bool, Option<Uuid>) = sqlx::query_as(
+        "SELECT revoked_at IS NOT NULL, revoke_act_id FROM role_assignments WHERE id = $1",
+    )
+    .bind(assignment)
+    .fetch_one(&pool)
+    .await
+    .expect("the assignment");
+    assert_eq!(
+        (revoked, revoke_act),
+        (true, Some(act)),
+        "ended, naming the act"
+    );
+    assert!(consumed(&pool, act).await, "the act is spent");
+    let (confirmation, act_id, elevation): (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT details->>'confirmation', details->>'act_id', details->>'elevation_id' \
+               FROM security_events \
+              WHERE event_type = 'platform.role_ended' AND details->>'assignment_id' = $1",
+        )
+        .bind(assignment.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("the end's audit row");
+    assert_eq!(
+        (confirmation.as_deref(), act_id, elevation),
+        (
+            Some("passkey"),
+            Some(act.to_string()),
+            Some(session.to_string())
+        )
+    );
+}
