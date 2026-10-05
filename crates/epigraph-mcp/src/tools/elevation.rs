@@ -45,7 +45,9 @@
 //!
 //! [`listed`] is the one rule `list_tools` and `list_mcp_tools` apply: `sudo`
 //! and `unsudo` are listed only to a principal that holds a live elevating
-//! role (and `sudo` only while connector mode is on).
+//! role (and `sudo` only while connector mode is on), and an admin-only-scoped
+//! tool only to a request whose scope gate would admit it
+//! (`AuthContext::has_scope`: armed, that is an elevated request).
 
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::visibility::Viewer;
@@ -90,13 +92,22 @@ pub struct ManifestCaller<'a> {
 /// * `sudo`: only over HTTP, to a holder of a live elevating role, while
 ///   connector mode is on (off, it could only refuse).
 /// * `unsudo`: only over HTTP, to a holder of a live elevating role.
+/// * An admin-only-scoped tool, over HTTP: only when the request's scope gate
+///   would admit it (`has_scope`, which armed is "the request is elevated"
+///   and unarmed is "the token carries the scope"). Over stdio, as before:
+///   stdio has no scope gate.
 /// * Everything else: listed. General per-scope filtering is out of scope.
 #[must_use]
 pub fn listed(tool: &str, caller: &ManifestCaller<'_>) -> bool {
     match tool {
         "sudo" => caller.http && caller.holds_elevating_role && caller.connector_elevation,
         "unsudo" => caller.http && caller.holds_elevating_role,
-        _ => true,
+        _ => match crate::scope_map::required_scope(tool) {
+            Some(scope) if caller.http && epigraph_auth::is_admin_only_scope(scope) => {
+                caller.auth.is_some_and(|a| a.has_scope(scope))
+            }
+            _ => true,
+        },
     }
 }
 
@@ -396,6 +407,37 @@ mod tests {
         assert!(!listed("unsudo", &caller(true, Some(&p), false, true)));
         assert!(!listed("unsudo", &caller(false, None, true, true)));
 
+        // The scope `delete_edge` requires, read from SCOPE_MAP (an
+        // admin-only one), so this test spells no admin scope itself.
+        let admin = crate::scope_map::required_scope("delete_edge").expect("mapped");
+        assert!(
+            epigraph_auth::is_admin_only_scope(admin),
+            "CALIBRATION: admin-only"
+        );
+        let standing = auth(ClientType::Human, &[admin], false);
+        let elevated = auth(ClientType::Human, &["platform:admin"], true);
+        assert!(
+            !listed("delete_edge", &caller(true, Some(&standing), false, false)),
+            "armed, a standing admin scope lists no admin tool"
+        );
+        assert!(
+            listed("delete_edge", &caller(true, Some(&elevated), false, false)),
+            "armed and elevated: listed"
+        );
+        let mut unarmed = standing.clone();
+        unarmed.admin_scopes = epigraph_auth::AdminScopePosture::Unarmed;
+        assert!(
+            listed("delete_edge", &caller(true, Some(&unarmed), false, false)),
+            "unarmed, the standing holder keeps it"
+        );
+        assert!(
+            !listed("delete_edge", &caller(true, Some(&p), false, false)),
+            "a caller without the scope never sees it"
+        );
+        assert!(
+            listed("delete_edge", &caller(false, None, false, false)),
+            "stdio"
+        );
         assert!(listed("get_claim", &caller(true, Some(&p), false, false)));
     }
 

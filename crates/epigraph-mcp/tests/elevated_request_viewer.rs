@@ -1732,3 +1732,55 @@ async fn sudo_is_refused_to_an_agent_and_over_stdio(pool: PgPool) {
         "no ticket over stdio"
     );
 }
+
+/// The admin-only-scoped tools are listed as the scope gate would admit
+/// them: a STANDING `claims:admin` token sees `delete_edge` while the switch
+/// is unarmed (today's behaviour) and not once it is armed; an ELEVATED
+/// request (the elevate grant's scopes) sees it armed. A token without the
+/// scope never sees it.
+///
+/// Verified to fail with `list_tools` not reading the switch (the unarmed
+/// holder loses it: the bearer's context starts armed), with admin tools
+/// listed to every HTTP caller (armed, the standing token sees it), and with
+/// `listing_auth` not resolving the elevation (the elevated request loses
+/// it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_manifest_lists_admin_tools_as_the_scope_gate_admits_them(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "el11-admin-p").await;
+    let (client, family) = make_holder(&pool, p, 35).await;
+    let live = session(&pool, p, client, family, 35, "grant").await;
+    let url = el8_listener_with(&pool, std::time::Duration::ZERO).await;
+    let standing = el11_token(
+        p,
+        client,
+        None,
+        None,
+        "human",
+        &["claims:read", "claims:admin"],
+    );
+    let plain = el11_token(p, client, None, None, "human", &["claims:read"]);
+    let elevated = el11_token(
+        p,
+        client,
+        Some(family),
+        Some(live),
+        "human",
+        &["claims:read", "platform:admin"],
+    );
+    let lists = |names: Vec<String>| names.iter().any(|n| n == "delete_edge");
+
+    assert!(
+        lists(el11_list(&url, &standing).await),
+        "unarmed: the standing holder"
+    );
+    assert!(!lists(el11_list(&url, &plain).await), "no scope: never");
+    set_admin_switch(&pool, true).await;
+    assert!(
+        !lists(el11_list(&url, &standing).await),
+        "armed: a standing scope lists nothing"
+    );
+    assert!(
+        lists(el11_list(&url, &elevated).await),
+        "armed and elevated: listed"
+    );
+}

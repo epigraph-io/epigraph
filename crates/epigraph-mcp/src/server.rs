@@ -883,6 +883,38 @@ impl EpiGraphMcpFull {
         }
     }
 
+    /// The `AuthContext` a `tools/list` answer is decided on (elevation plan
+    /// EL-11): the admin-scope switch read (as `call_tool` reads it, for a
+    /// token it can change an answer for) and, for a request that may be
+    /// elevated, the database-checked elevation. Nothing is stripped (this
+    /// copy reaches no tool) and nothing is recorded: a listing reads no row.
+    /// A resolution error leaves the request unelevated (the narrower list).
+    pub async fn listing_auth(
+        &self,
+        mut auth: epigraph_auth::AuthContext,
+    ) -> epigraph_auth::AuthContext {
+        if auth.carries_switch_decided_scope() {
+            auth.admin_scopes = self.admin_scope_posture().await;
+        }
+        let may_be_elevated = auth.elevation_claim.is_some()
+            || (self.connector_elevation && auth.family_id.is_some());
+        if may_be_elevated {
+            match crate::tools::viewer::request_viewer(self, Some(&auth)).await {
+                Ok(viewer) => {
+                    auth.elevation = viewer.elevation().map(|e| epigraph_auth::ElevationRef {
+                        session_id: e.session_id,
+                        family_id: e.family_id,
+                    });
+                }
+                Err(e) => tracing::warn!(
+                    error = %e.message,
+                    "tools/list: elevation not resolved; listing as unelevated"
+                ),
+            }
+        }
+        auth
+    }
+
     /// Whether `auth`'s principal holds a live elevating role (operator
     /// ruling D2), asked of the database on a connection stamped with its
     /// plain scoped viewer (123's `epigraph_holds_role` is subject-bound).
@@ -914,8 +946,10 @@ impl EpiGraphMcpFull {
 
     /// The tools listed to one caller (elevation plan EL-11): every kernel
     /// tool [`crate::tools::elevation::listed`] admits, then every federated
-    /// tool. `auth` is `None` on stdio. The ONE manifest rule `list_tools`
-    /// and `list_mcp_tools` share, so neither can bypass the other.
+    /// tool. `auth` is `None` on stdio; over HTTP it must already carry the
+    /// switch and the elevation ([`Self::listing_auth`], or `call_tool`'s
+    /// dispatch for `list_mcp_tools`). The ONE manifest rule `list_tools` and
+    /// `list_mcp_tools` share, so neither can bypass the other.
     pub async fn manifest_for(
         &self,
         http: bool,
@@ -2443,8 +2477,9 @@ impl EpiGraphMcpFull {
         // may see them, then every federated tool the gateway advertises.
         // `server_instructions` directs clients here to enumerate every tool
         // with its schema, so the federated tools must be present, and the
-        // filter must be the same or this tool would bypass it. stdio has no
-        // `AuthContext`.
+        // filter must be the same or this tool would bypass it. `call_tool`
+        // has already stamped the switch and the elevation on the
+        // `AuthContext`; stdio has none.
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let tools = self.manifest_for(auth.is_some(), auth).await;
         Ok(CallToolResult::success(vec![Content::text(
@@ -2766,13 +2801,17 @@ impl ServerHandler for EpiGraphMcpFull {
         // between an extension and the kernel with a `prefix=`).
         //
         // The kernel list is THIS caller's (elevation plan EL-11, D2):
-        // `sudo`/`unsudo` only to a holder of a live elevating role. The HTTP
-        // transport carries `Parts` (and, behind the bearer, an
+        // `sudo`/`unsudo` only to a holder of a live elevating role, and an
+        // admin-only-scoped tool only where the scope gate would admit it. The
+        // HTTP transport carries `Parts` (and, behind the bearer, an
         // `AuthContext`); stdio carries neither.
         let parts = context.extensions.get::<Parts>();
         let http = parts.is_some();
-        let auth = parts.and_then(|p| p.extensions.get::<epigraph_auth::AuthContext>());
-        let tools = self.manifest_for(http, auth).await;
+        let auth = match parts.and_then(|p| p.extensions.get::<epigraph_auth::AuthContext>()) {
+            Some(a) => Some(self.listing_auth(a.clone()).await),
+            None => None,
+        };
+        let tools = self.manifest_for(http, auth.as_ref()).await;
         Ok(rmcp::model::ListToolsResult {
             tools,
             meta: None,
