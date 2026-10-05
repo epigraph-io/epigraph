@@ -129,10 +129,17 @@ fn is_structural_relationship(s: &str) -> bool {
 /// ORDERS of `link_epistemic`'s own `corroborates`; it does NOT unify a
 /// `link_epistemic` `corroborates` with a matcher-written `CORROBORATES`.
 /// That casing split is pre-existing and out of scope here.
-pub const SYMMETRIC_RELATIONSHIPS: &[&str] = &["contradicts", "corroborates"];
+///
+/// Re-exported from the shared definition in `epigraph_core` so this tool and
+/// the HTTP twin (`POST /api/v1/edges`) cannot drift apart.
+pub const SYMMETRIC_RELATIONSHIPS: &[&str] =
+    epigraph_core::edge::relationships::SYMMETRIC_CLAIM_RELATIONSHIPS;
 
+/// Membership is ASCII-case-insensitive (the shared helper), but this tool
+/// validates against the lower-case `EPISTEMIC_RELATIONSHIPS` first, so only
+/// the lower-case spellings ever reach it here: behaviour is unchanged.
 fn is_symmetric_relationship(s: &str) -> bool {
-    SYMMETRIC_RELATIONSHIPS.contains(&s)
+    epigraph_core::edge::relationships::is_symmetric_claim_relationship(s)
 }
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
