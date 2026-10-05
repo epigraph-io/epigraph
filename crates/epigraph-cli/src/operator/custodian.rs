@@ -266,6 +266,9 @@ pub struct SupersedeRequest {
     /// Admit a claim the world group does not own (OQ-8: the platform corpus
     /// is the default scope).
     pub allow_owned: bool,
+    /// A confirmed `claim.custodial_supersede` admin act (migration 130):
+    /// required once the actor holds a passkey (ELV10 otherwise).
+    pub act: Option<Uuid>,
     pub apply: bool,
 }
 
@@ -278,6 +281,8 @@ pub struct SupersedeReport {
     pub owner: Uuid,
     pub edges_moved: usize,
     pub act_event: Uuid,
+    /// The admin act the supersede executed, when one was named.
+    pub admin_act: Option<Uuid>,
     pub applied: bool,
 }
 
@@ -344,6 +349,39 @@ pub async fn custodial_supersede(
         )));
     }
 
+    // Migration 130: the act's args, rebuilt from these flags (the content's
+    // SHA-256 is over exactly the bytes the supersede stores), must be the
+    // confirmed act's, proposed by this actor; refused before any write.
+    if let Some(act) = req.act {
+        let args = match admin_act::custodial_supersede_args(
+            req.claim,
+            &req.content,
+            req.truth,
+            &req.reason,
+            req.allow_owned,
+        ) {
+            Ok(args) => args,
+            Err(why) => {
+                return Ok(SupersedeOutcome::Refused(format!(
+                    "{why}; nothing was changed"
+                )))
+            }
+        };
+        if let Some(why) = act_refusal(
+            conn,
+            act,
+            admin_act::CUSTODIAL_SUPERSEDE,
+            &args,
+            Some(req.actor),
+        )
+        .await?
+        {
+            return Ok(SupersedeOutcome::Refused(format!(
+                "{why}. Nothing was changed."
+            )));
+        }
+    }
+
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     let (new, old_id) = ClaimRepository::supersede_act_conn(
         &mut tx,
@@ -380,14 +418,7 @@ pub async fn custodial_supersede(
         )));
     }
 
-    let act_event = RoleAssignmentRepository::record_custodial_act(
-        &mut tx,
-        req.assignment,
-        req.actor,
-        "claim.supersede",
-        "claim",
-        old_id,
-        json!({
+    let details = json!({
             "new_id": new,
             "old_hash": hex::encode(&old_hash),
             "new_hash": hex::encode(&new_hash),
@@ -400,9 +431,36 @@ pub async fn custodial_supersede(
             "author": author,
             "reason": req.reason,
             "edges_moved": edges_moved,
-        }),
-    )
-    .await?;
+    });
+    // The record consumes the act (its args recomputed from the stored
+    // successor) in this same transaction, or refuses and rolls the act back.
+    let act_event = match req.act {
+        None => {
+            RoleAssignmentRepository::record_custodial_act(
+                &mut tx,
+                req.assignment,
+                req.actor,
+                "claim.supersede",
+                "claim",
+                old_id,
+                details,
+            )
+            .await?
+        }
+        Some(act) => {
+            RoleAssignmentRepository::record_custodial_act_on_act(
+                &mut tx,
+                req.assignment,
+                req.actor,
+                "claim.supersede",
+                "claim",
+                old_id,
+                details,
+                act,
+            )
+            .await?
+        }
+    };
     if req.apply {
         tx.commit().await?;
     } else {
@@ -415,6 +473,7 @@ pub async fn custodial_supersede(
         owner,
         edges_moved,
         act_event,
+        admin_act: req.act,
         applied: req.apply,
     }))
 }

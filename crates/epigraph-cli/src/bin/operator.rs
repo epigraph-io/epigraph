@@ -46,7 +46,8 @@
 //!         [--apply]
 //!     epigraph-operator list-role-assignments [--role R] [--include-ended]
 //!     epigraph-operator custodial-supersede --claim <uuid> (--content TEXT | --content-file F) \
-//!         --truth <0..1> --assignment <uuid> --actor <uuid> --reason TEXT [--allow-owned] [--apply]
+//!         --truth <0..1> --assignment <uuid> --actor <uuid> --reason TEXT [--allow-owned] \
+//!         [--act <uuid>] [--apply]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 //!     epigraph-operator passkey-enroll --person <uuid> --reason TEXT [--label TEXT] [--apply]
 //!     epigraph-operator list-passkeys [--person <uuid>] [--include-revoked]
@@ -159,6 +160,12 @@ enum Command {
         /// Admit a claim the world group does not own.
         #[arg(long)]
         allow_owned: bool,
+        /// A CONFIRMED `claim.custodial_supersede` admin act (migration 130)
+        /// whose args are exactly these flags (the content's SHA-256, the
+        /// truth to six places), proposed by --actor. Required once the actor
+        /// holds a passkey (ELV10 otherwise).
+        #[arg(long)]
+        act: Option<Uuid>,
         /// Commit. Without it, the act and its audit row roll back.
         #[arg(long)]
         apply: bool,
@@ -643,6 +650,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             actor,
             reason,
             allow_owned,
+            act,
             apply,
         } => {
             let content = match (content, content_file) {
@@ -659,20 +667,23 @@ async fn main_inner() -> anyhow::Result<i32> {
                 actor,
                 reason,
                 allow_owned,
+                act,
                 apply,
             };
             match custodian::custodial_supersede(&mut conn, &req).await? {
                 custodian::SupersedeOutcome::Done(r) => {
                     println!(
                         "{}SUPERSEDED\told={}\tnew={}\tauthor={}\towner={}\tedges_moved={}\t\
-                         custodial_act={}\tassignment={assignment}\tactor={actor}",
+                         custodial_act={}\tassignment={assignment}\tactor={actor}{}",
                         if r.applied { "" } else { "WOULD BE " },
                         r.old,
                         r.new,
                         r.author,
                         r.owner,
                         r.edges_moved,
-                        r.act_event
+                        r.act_event,
+                        r.admin_act
+                            .map_or_else(String::new, |a| format!("\tact={a}"))
                     );
                     if r.applied {
                         println!(

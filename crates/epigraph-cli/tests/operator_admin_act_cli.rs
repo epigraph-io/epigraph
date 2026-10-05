@@ -391,3 +391,134 @@ async fn end_role_assignment_needs_the_confirmed_act(pool: PgPool) {
     .expect("the end's audit row");
     assert_eq!(confirmation, "passkey");
 }
+
+/// A current, world-owned (platform corpus) claim by a fresh unbound author.
+async fn corpus_claim(pool: &PgPool) -> Uuid {
+    let (author, _) = fixture::seed_agent_with_group(pool, "legacy author").await;
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(format!("corpus claim {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(author)
+    .bind(Uuid::nil())
+    .execute(pool)
+    .await
+    .expect("claim");
+    id
+}
+
+async fn is_current(pool: &PgPool, claim: Uuid) -> bool {
+    sqlx::query_scalar("SELECT COALESCE(is_current, true) FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("claim")
+}
+
+/// `custodial-supersede` by a custodian holding a passkey: with no act the
+/// database refuses the record (ELV10) and the whole supersede rolls back;
+/// on an act confirmed for truth 0.7, flags saying 0.8 are refused before any
+/// write; with the act's exact args (the content hashed by the DATABASE in
+/// this test, so the verb's own hash is checked against it) the claim is
+/// revised, the act spent, and the `platform.custodial_act` row names the
+/// act with `confirmation = 'passkey'`.
+///
+/// Verified to fail: the verb recording without the act (the six-parameter
+/// recorder) -> the confirmed run is refused ELV10; the verb hashing the
+/// content trimmed -> the confirmed run is refused (the flags are not the
+/// act's).
+#[sqlx::test(migrations = "../../migrations")]
+async fn custodial_supersede_executes_its_confirmed_act(pool: PgPool) {
+    let (c, a) = custodian_with_passkey(&pool, "custodian", 1).await;
+    let claim = corpus_claim(&pool).await;
+    let content = "  the custodian's revision, with \"quotes\" and a trailing newline\n";
+    let (cs, as_, claims) = (c.to_string(), a.to_string(), claim.to_string());
+    let args_for = |truth: &str, act: Option<&str>| {
+        let mut v: Vec<String> = [
+            "custodial-supersede",
+            "--claim",
+            &claims,
+            "--content",
+            content,
+            "--truth",
+            truth,
+            "--assignment",
+            &as_,
+            "--actor",
+            &cs,
+            "--reason",
+            "custodial revision",
+            "--apply",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        if let Some(act) = act {
+            v.extend(["--act".to_string(), act.to_string()]);
+        }
+        v
+    };
+    let run = |args: Vec<String>| {
+        let pool = pool.clone();
+        async move {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_op(&pool, &refs).await
+        }
+    };
+    let bare = run(args_for("0.7", None)).await;
+    assert_eq!(bare.code, 1, "{}", bare.show());
+    assert!(bare.stderr.contains("ELV10"), "{}", bare.show());
+    assert!(is_current(&pool, claim).await, "the supersede rolled back");
+
+    let hash: String = sqlx::query_scalar("SELECT encode(sha256(convert_to($1, 'UTF8')), 'hex')")
+        .bind(content)
+        .fetch_one(&pool)
+        .await
+        .expect("sha256");
+    let act = fixture::confirmed_act(
+        &pool,
+        "claim.custodial_supersede",
+        &format!(
+            "{{\"claim\": \"{claim}\", \"content_sha256\": \"{hash}\", \"truth\": 0.7, \
+             \"reason\": \"custodial revision\", \"allow_owned\": false}}"
+        ),
+        c,
+    )
+    .await;
+    let act_s = act.to_string();
+    let off = run(args_for("0.8", Some(&act_s))).await;
+    assert_eq!(off.code, 1, "{}", off.show());
+    assert!(off.stderr.contains("REFUSED"), "{}", off.show());
+    assert!(is_current(&pool, claim).await, "nothing was changed");
+
+    let done = run(args_for("0.7", Some(&act_s))).await;
+    assert_eq!(done.code, 0, "{}", done.show());
+    assert!(
+        done.stdout.contains(&format!("act={act}")),
+        "{}",
+        done.show()
+    );
+    assert!(!is_current(&pool, claim).await, "the claim was revised");
+    let (act_id, confirmation): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT details->>'act_id', details->>'confirmation' FROM security_events \
+          WHERE event_type = 'platform.custodial_act' AND details->>'target' = $1",
+    )
+    .bind(claims.as_str())
+    .fetch_one(&pool)
+    .await
+    .expect("the custodial act record");
+    assert_eq!(act_id.as_deref(), Some(act_s.as_str()));
+    assert_eq!(confirmation.as_deref(), Some("passkey"));
+    let spent: bool =
+        sqlx::query_scalar("SELECT consumed_at IS NOT NULL FROM pending_admin_acts WHERE id = $1")
+            .bind(act)
+            .fetch_one(&pool)
+            .await
+            .expect("the act");
+    assert!(spent, "the act is spent");
+}
