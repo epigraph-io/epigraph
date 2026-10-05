@@ -1450,12 +1450,15 @@ mod refresh_scope_tests {
 
     #[test]
     fn a_blank_scope_parameter_means_as_originally_granted() {
-        let stored = v(&["claims:read", "claims:write"]);
+        // stored != granted, so "as originally granted" (stored ∩ granted) is
+        // told apart from "the client's grant" and from "the stored set".
+        let stored = v(&["claims:read", "evidence:read"]);
+        let granted = v(&["claims:read", "claims:write"]);
         for blank in [None, Some(""), Some("   ")] {
             assert_eq!(
-                refresh_scopes(&stored, &stored, blank),
-                Some(stored.clone()),
-                "{blank:?} must not narrow the token to nothing"
+                refresh_scopes(&stored, &granted, blank),
+                Some(v(&["claims:read"])),
+                "{blank:?}: the stored scopes still granted, not the grant and not nothing"
             );
         }
     }
