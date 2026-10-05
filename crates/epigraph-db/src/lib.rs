@@ -127,6 +127,7 @@ pub use sqlx::PgPool;
 // Re-export row types for users of repositories
 pub use repos::activity::ActivityRow;
 pub use repos::community::{CommunityMemberRow, CommunityRow, MembershipOutcome};
+pub use repos::conflict_density::{ConflictDensityRepository, FrameConflictDensity};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{
