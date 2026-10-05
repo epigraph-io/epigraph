@@ -260,15 +260,14 @@ struct Holder {
     token_hash: Vec<u8>,
 }
 
-/// A holder, with the elevated-access gate OPEN (the recorder's stand-in,
-/// [`fixture::open_elevated_access_gate`]), so a session it confirms is live.
+/// A holder. On a database at head the elevated-access gate is OPEN
+/// (migration 132), so a session it confirms is live.
 async fn holder(pool: &PgPool, label: &str, n: u8) -> Holder {
-    fixture::open_elevated_access_gate(pool).await;
     holder_behind_a_closed_gate(pool, label, n).await
 }
 
-/// A holder on a database whose gate is as 125 ships it (closed), unless an
-/// earlier call opened it.
+/// [`holder`], named for a database cut before 132, whose gate is as 125
+/// ships it (closed): its sessions confirm but are never live.
 async fn holder_behind_a_closed_gate(pool: &PgPool, label: &str, n: u8) -> Holder {
     let (person, client) = human(pool, label).await;
     let assignment = fixture::make_custodian(pool, person).await;
@@ -1999,32 +1998,27 @@ async fn elevation_live_is_principal_bound(pool: PgPool) {
     );
 }
 
-/// NO SESSION IS LIVE WHILE THE RECORDER GATE IS CLOSED (review cp2: SEC-01;
-/// cp3: SEC-01). The elevated read arms (126) let a live session read other
-/// people's private rows, and the design requires every such read to be
-/// recorded, fail-closed, where the subject can read it. A deploy applies
-/// every embedded migration up to its head, in version order, so a prose
-/// "hold 126" cannot keep 126 off a database. 125's gate,
+/// NO SESSION IS LIVE UNTIL MIGRATION 132 OPENS THE RECORDER GATE (review
+/// cp2: SEC-01; cp3: SEC-01). The elevated read arms (126) let a live session
+/// read other people's private rows, and the design requires every such read
+/// to be recorded, fail-closed, where the subject can read it. A deploy
+/// applies every embedded migration up to its head, in version order, so a
+/// prose "hold 126" cannot keep 126 off a database. 125's gate,
 /// `epigraph_elevated_access_ready()`, ships `false` and is ANDed into the one
-/// liveness predicate. Migration 127 installs the recorder and LEAVES THE GATE
-/// CLOSED (its header: the other opening conditions are not met yet), so on a
-/// database at this tree's head a confirmed session is still not elevated,
-/// `elevation_live` answers no row, the grant-mode redemption is `invalid`,
-/// and the elevated application session reads NONE of another tenant's
-/// private rows through 126's arms. With the gate opened (the test stand-in
-/// for the opening migration), the same session and ticket are elevated,
-/// answered, redeemed, and read the row.
+/// liveness predicate; 127 installs the recorder and LEAVES THE GATE CLOSED,
+/// and so do 128 to 131. So on a database cut at 131 a confirmed session is
+/// not elevated, `elevation_live` answers no row, the grant-mode redemption
+/// is `invalid`, and the elevated application session reads NONE of another
+/// tenant's private rows through 126's arms. Once the SAME database reaches
+/// 132 (the one migration that opens the gate), the same session and ticket
+/// are elevated, answered, redeemed, and read the row.
 ///
 /// Verified to fail with the gate's conjunct dropped from
 /// `epigraph_elevation_session_is_live` (the session is elevated, and reads B's
-/// row, behind the closed gate), and with the gate shipped `true`.
-///
-/// THE CHANGE THAT OPENS THE GATE REWRITES THIS TEST, and must first meet the
-/// preconditions 125's header lists under "OPENING IT WAITS ON MORE THAN THE
-/// RECORDER" (review cp3: SEC-01); the closed-gate assertion below repeats
-/// them, so whoever flips it reads them.
-#[sqlx::test(migrations = "../../migrations")]
-async fn no_session_is_live_while_the_recorder_gate_is_closed(pool: PgPool) {
+/// row, behind the closed gate), and with 132's body shipped `SELECT false`.
+#[sqlx::test(migrations = false)]
+async fn no_session_is_live_until_132_opens_the_gate(pool: PgPool) {
+    migrate(&pool, &up_to(131)).await;
     let h = holder_behind_a_closed_gate(&pool, "gate-holder", 1).await;
     let g = holder_behind_a_closed_gate(&pool, "gate-grant", 2).await;
     let (b, b_group) = fixture::seed_agent_with_group(&pool, "gate-b").await;
@@ -2081,29 +2075,29 @@ async fn no_session_is_live_while_the_recorder_gate_is_closed(pool: PgPool) {
         .expect("the gate");
     assert!(
         !shipped,
-        "125 ships the gate closed and 127 (the recorder) leaves it closed. A change that \
-         opens it must ALSO, in the same or an earlier change: (1) settle elevated reads of operator-hidden (pinned) evidence \
-         (settled for now by the operator: readable, and recorded for the row's owner, 127); (2) refuse elevated non-GET API requests (with \
-         an allowlist) or measure that no route writes on an elevated read; (3) record \
-         recall_events accesses by owner group (127 does); and declare the recorder only \
+        "125 ships the gate closed and 127 (the recorder) to 131 leave it closed. Only 132 \
+         opens it, once (1) elevated reads of operator-hidden (pinned) evidence are settled \
+         (for now by the operator: readable, and recorded for the row's owner, 127); (2) \
+         elevated non-GET API requests are refused (with an allowlist); (3) recall_events \
+         accesses are recorded by owner group (127); and the recorder is declared only \
          where it is wired. See 125's header, OPENING IT WAITS ON MORE THAN THE RECORDER."
     );
 
-    fixture::open_elevated_access_gate(&pool).await;
+    migrate(&pool, &up_to(132)).await;
     assert!(
         elevated_as(&pool, &h, session).await,
-        "CALIBRATION: with the recorder's stand-in the same session is elevated"
+        "once 132 is applied the same session is elevated"
     );
     assert_eq!(live_rows(&pool, &h, Some(session)).await, vec![session]);
     assert_eq!(
         reads_b().await,
         1,
-        "CALIBRATION: and reads B's private row through 126's arm"
+        "and reads B's private row through 126's arm"
     );
     assert_eq!(
         redeem_as_login(&pool, Some("epigraph_app"), t, &secret, g.client).await,
         "issued",
-        "CALIBRATION: and the same ticket redeems"
+        "and the same ticket redeems"
     );
 }
 

@@ -320,18 +320,18 @@ pub async fn make_human_operator(pool: &PgPool, agent: Uuid) {
         .expect("human operator registry row");
 }
 
-/// Stand in for the per-access elevation recorder (elevation plan EL-8) by
-/// opening migration 125's gate, `epigraph_elevated_access_ready()`, on this
-/// test database only.
+/// Open migration 125's recorder gate, `epigraph_elevated_access_ready()`, on
+/// a test database CUT BEFORE migration 132, standing in for 132.
 ///
 /// 125 ships the gate answering `false`, so NO elevation session is live
 /// (`epigraph_is_elevated()`, `epigraph_elevation_live`, the grant-mode
-/// redemption) until the migration that OPENS elevation replaces it (127, the
-/// recorder's, leaves it closed; 125's header lists what the opening waits
-/// on): a routine deploy can never widen a read before then. A
-/// test of what a LIVE session does calls this first (before any pool is
-/// built, so no cached plan holds the old body); `CREATE OR REPLACE` keeps the
-/// function's owner and ACL, so the 125 register tests still hold. Idempotent.
+/// redemption) until migration 132 (the one migration that opens elevation)
+/// replaces it; 127 to 131 leave it closed. A database migrated to head
+/// therefore needs no call: only a test whose migrator stops before 132 and
+/// is about what a LIVE session does calls this (before any pool is built, so
+/// no cached plan holds the old body). `CREATE OR REPLACE` keeps the
+/// function's owner and ACL, so the 125 register tests still hold.
+/// Idempotent.
 ///
 /// That is only the DATABASE key. The connection must also declare the
 /// recorder (`epigraph_db::ACCESS_RECORDER_GUC`; review cp3: COR-1): build

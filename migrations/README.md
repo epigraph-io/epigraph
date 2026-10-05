@@ -941,9 +941,8 @@ Current reservation:
   `epigraph_family_of_person_is_live`, `epigraph_elevation_session_is_live`,
   `epigraph_end_expired_elevations`, and the recorder gate
   `epigraph_elevated_access_ready` (ships `false`: no session is live until
-  the migration that opens elevation replaces it, which is the per-access
-  elevation log's only if the preconditions in 125's header already hold;
-  review cp2, cp3).
+  the migration that opens elevation replaces it, once the preconditions in
+  125's header hold; review cp2, cp3. That migration is 132.)
   Audited from the tables: `platform.elevation_requested`, `_refused`,
   `platform.elevated`, `platform.elevation_ended` (carrying the operator's
   `--reason` as `operator_reason` when a privileged login ended it), and
@@ -1080,9 +1079,9 @@ Current reservation:
   `epigraph-db/tests/pending_admin_acts.rs`; undo
   (`docs/runbooks/130-undo.sql`, which archives the acts, restores 123's and
   124's bodies verbatim and keeps the column; BEFORE 129-undo and 123-undo).
-  The recorder gate stays CLOSED, so no act can be proposed on a deployed
-  database until the gate opens. Checked before claiming: no remote branch
-  carries a `130`. **Applied to a throwaway database only, NOT to any deployed
+  The recorder gate stays CLOSED here, so no act can be proposed on a
+  deployed database until the gate opens (132). Checked before claiming: no
+  remote branch carries a `130`. **Applied to a throwaway database only, NOT to any deployed
   database.**
 
 - **131** `131_admin_acts_of_principal.sql` (elevation plan EL-12b): a person
@@ -1102,10 +1101,32 @@ Current reservation:
   remote branch carries a `131`. **Applied to a throwaway database only, NOT
   to any deployed database.**
 
-- **132+**: public next (the elevation stack stays at or below 139; 140-159
+- **132** `132_open_elevation.sql` (elevation plan EL-14): OPENS ELEVATION.
+  The one migration of the stack that replaces 125's recorder gate,
+  `epigraph_elevated_access_ready()`: its body becomes a READINESS TEST (true
+  while the per-access recorder is installed: the `elevated_access` table and
+  `epigraph_record_elevated_access` both exist), so taking 127 back out
+  closes the gate by itself. Every condition 125's header lists under
+  "OPENING IT WAITS ON MORE THAN THE RECORDER" is met by an earlier migration
+  or batch: pinned evidence (interim operator ruling, recorded for the row's
+  owner, 127), the API's refusal of elevated non-GET requests and the MCP
+  transport's refusal of elevated non-read and federated tools, and
+  `recall_events` attributed by owner group (127). The second key (the
+  connection declares the recorder; only a recording build does) is
+  unchanged. No table, policy or grant changes; `CREATE OR REPLACE` keeps the
+  owner and ACL (pinned by 125's register in `schema_contract.rs`). Behaviour
+  in `epigraph-db/tests/elevated_access.rs` (closed through 131, open at 132,
+  follows the recorder) and `elevation_sessions.rs`. Undo
+  (`docs/runbooks/132-undo.sql`, restores 125's `SELECT false`; run it FIRST,
+  before every other elevation undo). The operational preconditions for the
+  first real elevation are in `docs/deploy.md`, "Opening elevation (migration
+  132)". Checked before claiming: no remote branch carries a `132`.
+  **Applied to a throwaway database only, NOT to any deployed database.**
+
+- **133+**: public next (the elevation stack stays at or below 139; 140-159
   are reserved)
 
-Next public migration **outside both reserved tenancy ranges** must be `132` or
+Next public migration **outside both reserved tenancy ranges** must be `133` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

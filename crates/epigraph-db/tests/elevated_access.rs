@@ -110,15 +110,14 @@ struct Holder {
     family: Uuid,
 }
 
+/// A holder. Its sessions are live on a database at head (migration 132
+/// opened 125's gate) and confirm, but are never live, on one cut before 132.
 async fn holder(pool: &PgPool, label: &str, n: u8) -> Holder {
-    // 125 ships the gate closed and 127 leaves it closed; these tests are
-    // about what the recorder does for a LIVE session.
-    fixture::open_elevated_access_gate(pool).await;
     holder_behind_the_gate(pool, label, n).await
 }
 
-/// [`holder`] without opening the gate: its sessions confirm (and audit) but
-/// are never live.
+/// [`holder`], named for a database cut before 132 (the gate closed): its
+/// sessions confirm (and audit) but are never live.
 async fn holder_behind_the_gate(pool: &PgPool, label: &str, n: u8) -> Holder {
     let (person, group) = fixture::seed_human_operator(pool, label).await;
     let client: Uuid = sqlx::query_scalar(
@@ -779,20 +778,54 @@ async fn the_log_is_append_only(pool: PgPool) {
     assert_eq!(log_rows(&pool).await, 1);
 }
 
-/// 127 installs the recorder and does NOT open migration 125's gate: on a
-/// database migrated to head with no test stand-in, the gate still answers
-/// false and a confirmed session is not live (the opening waits on the
-/// preconditions 125's header lists).
-///
-/// Verified to fail with `CREATE OR REPLACE FUNCTION
-/// epigraph_elevated_access_ready() ... SELECT true` appended to 127.
-#[sqlx::test(migrations = "../../migrations")]
-async fn the_recorder_leaves_the_gate_closed(pool: PgPool) {
-    let gate: bool = sqlx::query_scalar("SELECT public.epigraph_elevated_access_ready()")
-        .fetch_one(&pool)
+// =====================================================================
+// Migration 132 opens the gate
+// =====================================================================
+
+/// What migration 125's recorder gate answers on this database.
+async fn gate(pool: &PgPool) -> bool {
+    sqlx::query_scalar("SELECT public.epigraph_elevated_access_ready()")
+        .fetch_one(pool)
         .await
-        .expect("the gate");
-    assert!(!gate, "the gate is still closed at 127");
+        .expect("the gate")
+}
+
+/// Whether `session` of `p` is elevated on an application connection that
+/// declares the recorder (the second key, held fixed here).
+async fn is_elevated(pool: &PgPool, p: &Holder, session: Uuid) -> bool {
+    stamped(pool, Stamp::elevated(p, session), |mut conn| async move {
+        let e: bool = sqlx::query_scalar("SELECT public.epigraph_is_elevated()")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("is_elevated");
+        (conn, e)
+    })
+    .await
+}
+
+/// The gate function's owner and ACL, which `CREATE OR REPLACE` must keep.
+async fn gate_owner_and_acl(pool: &PgPool) -> (String, Option<String>) {
+    sqlx::query_as(
+        "SELECT p.proowner::regrole::text, p.proacl::text FROM pg_proc p \
+          WHERE p.oid = 'public.epigraph_elevated_access_ready()'::regprocedure",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the gate's owner and ACL")
+}
+
+/// 127 installs the recorder and LEAVES migration 125's gate closed, and so
+/// do 128 to 131: on a database cut at 131 a confirmed session is not live.
+/// Migration 132 opens it: the SAME session, on the same declaring
+/// application connection, is elevated once the database reaches 132, and
+/// the function keeps its owner and ACL (no EXECUTE for the application).
+///
+/// Verified to fail: 132's body shipped `SELECT false` (not elevated at
+/// 132); the gate opened in 131 instead (open at 131).
+#[sqlx::test(migrations = false)]
+async fn the_gate_is_closed_through_131_and_opened_by_132(pool: PgPool) {
+    migrate(&pool, &up_to(131)).await;
+    assert!(!gate(&pool).await, "the gate is still closed at 131");
     let recorder: bool = sqlx::query_scalar(
         "SELECT to_regprocedure('public.epigraph_record_elevated_access(text, jsonb, integer, \
                                  uuid[])') IS NOT NULL",
@@ -800,7 +833,66 @@ async fn the_recorder_leaves_the_gate_closed(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("the recorder");
-    assert!(recorder, "CALIBRATION: the recorder is installed");
+    assert!(recorder, "CALIBRATION: the recorder is installed at 131");
+    let acl_at_131 = gate_owner_and_acl(&pool).await;
+    let p = holder(&pool, "gate-132-p", 41).await;
+    let live = session(&pool, &p, "gate 132").await;
+    assert!(
+        !is_elevated(&pool, &p, live).await,
+        "behind the closed gate the confirmed session is not elevated"
+    );
+
+    migrate(&pool, &up_to(132)).await;
+    assert!(gate(&pool).await, "132 opens the gate");
+    assert!(
+        is_elevated(&pool, &p, live).await,
+        "once 132 is applied the same session is elevated"
+    );
+    assert_eq!(
+        gate_owner_and_acl(&pool).await,
+        acl_at_131,
+        "132 keeps the gate's owner and ACL"
+    );
+}
+
+/// 132's gate is a READINESS TEST, not a constant: it answers true only while
+/// the recorder (the `elevated_access` table and
+/// `epigraph_record_elevated_access`) is installed, so a database whose
+/// recorder is gone (127 taken back out) has no live session whatever 132
+/// says.
+///
+/// Verified to fail with 132's body `SELECT true` (the gate stays open with
+/// the recorder renamed away).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_opened_gate_follows_the_recorder(pool: PgPool) {
+    let p = holder(&pool, "gate-ready-p", 42).await;
+    let live = session(&pool, &p, "gate readiness").await;
+    assert!(gate(&pool).await, "CALIBRATION: open at head");
+    assert!(is_elevated(&pool, &p, live).await, "CALIBRATION: elevated");
+
+    for (away, back, what) in [
+        (
+            "ALTER FUNCTION public.epigraph_record_elevated_access(text, jsonb, integer, uuid[]) \
+             RENAME TO epigraph_record_elevated_access_moved",
+            "ALTER FUNCTION public.epigraph_record_elevated_access_moved(text, jsonb, integer, \
+             uuid[]) RENAME TO epigraph_record_elevated_access",
+            "the recorder function",
+        ),
+        (
+            "ALTER TABLE public.elevated_access RENAME TO elevated_access_moved",
+            "ALTER TABLE public.elevated_access_moved RENAME TO elevated_access",
+            "the log table",
+        ),
+    ] {
+        sqlx::query(away).execute(&pool).await.expect(what);
+        assert!(!gate(&pool).await, "without {what} the gate is closed");
+        assert!(
+            !is_elevated(&pool, &p, live).await,
+            "without {what} the session is not elevated"
+        );
+        sqlx::query(back).execute(&pool).await.expect(what);
+        assert!(gate(&pool).await, "with {what} back the gate reopens");
+    }
 }
 
 /// The recorder's attribution covers every table an elevated session reads
@@ -1079,6 +1171,149 @@ fn every_127_object_is_registered() {
     assert!(
         kill_switch.contains("'elevated_access'"),
         "079-undo.sql lacks elevated_access"
+    );
+}
+
+// =====================================================================
+// 132's undo, and the registers know 132's one object.
+// =====================================================================
+
+fn undo_132() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/132-undo.sql"),
+    )
+    .expect("132-undo.sql")
+}
+
+/// The gate's full definition (`pg_get_functiondef`: body, volatility,
+/// security, search_path).
+async fn gate_def(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT pg_get_functiondef('public.epigraph_elevated_access_ready()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the gate's definition")
+}
+
+/// `docs/runbooks/132-undo.sql`, applied to a database that went 131 -> 132
+/// with a live session, closes the gate: the session is no longer elevated,
+/// the gate's definition, owner and ACL are BYTE-EQUAL to the same database's
+/// at 131, the catalog is 131's, and the session row stays (history). A
+/// second run changes nothing. Cut at 132, not head: a later migration is
+/// undone before this one.
+///
+/// Verified to fail: the undo's body `SELECT true` (still elevated); the undo
+/// emptied (the definition is 132's).
+#[sqlx::test(migrations = false)]
+async fn the_132_rollback_closes_the_gate_and_restores_125s_body(pool: PgPool) {
+    migrate(&pool, &up_to(131)).await;
+    let (def_131, acl_131, catalog_131) = (
+        gate_def(&pool).await,
+        gate_owner_and_acl(&pool).await,
+        catalog(&pool).await,
+    );
+    migrate(&pool, &up_to(132)).await;
+    assert_ne!(
+        gate_def(&pool).await,
+        def_131,
+        "CALIBRATION: 132 re-bodied the gate"
+    );
+    let p = holder(&pool, "gate-undo-p", 43).await;
+    let live = session(&pool, &p, "gate undo").await;
+    assert!(
+        is_elevated(&pool, &p, live).await,
+        "CALIBRATION: elevated at 132"
+    );
+
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo_132())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the undo script applies (run {run}): {e}"));
+    }
+    assert!(!gate(&pool).await, "the undo closes the gate");
+    assert!(
+        !is_elevated(&pool, &p, live).await,
+        "after the undo the session is not elevated"
+    );
+    assert_eq!(
+        gate_def(&pool).await,
+        def_131,
+        "125's definition, byte for byte"
+    );
+    assert_eq!(
+        gate_owner_and_acl(&pool).await,
+        acl_131,
+        "owner and ACL kept"
+    );
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&catalog_131).collect();
+    let lost: Vec<&String> = catalog_131.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the catalog is not 131's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM elevation_sessions WHERE id = $1")
+        .bind(live)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(kept, 1, "the session row stays");
+}
+
+/// Migration 132 creates no new function: it re-bodies exactly one definer,
+/// 125's recorder gate, which stays on `epigraph-tenancy-backfill verify`'s
+/// ownership list at its own migration (125) and on the grant register as
+/// NOT application-callable; `docs/runbooks/132-undo.sql` restores it; and no
+/// file but 125, 132 and 132's undo defines it (125's header: nothing else
+/// may replace it).
+///
+/// Verified to fail: a second `CREATE OR REPLACE` of the gate planted in
+/// 131 (named here).
+#[test]
+fn every_132_object_is_registered() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let migration = read("migrations/132_open_elevation.sql");
+    let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let undo = read("docs/runbooks/132-undo.sql");
+    let (definers, all) = functions_of(&migration);
+    assert_eq!(
+        (definers.clone(), all),
+        (
+            vec!["epigraph_elevated_access_ready".to_string()],
+            vec!["epigraph_elevated_access_ready".to_string()]
+        ),
+        "132 re-bodies the gate and nothing else"
+    );
+    assert!(
+        backfill.contains("(\"epigraph_elevated_access_ready\", 125)"),
+        "the gate stays on the ownership list at its own migration"
+    );
+    assert!(
+        undo.contains("CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready()")
+            && undo.contains("SELECT false"),
+        "132-undo restores 125's closed body"
+    );
+    let mut replacing: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(root.join("migrations")).expect("migrations") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("migration");
+        if text.contains("CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready(") {
+            replacing.push(path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    replacing.sort();
+    assert_eq!(
+        replacing,
+        vec!["125_elevation.sql", "132_open_elevation.sql"],
+        "only 125 (closed) and 132 (open) define the recorder gate"
     );
 }
 
