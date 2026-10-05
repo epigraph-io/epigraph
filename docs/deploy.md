@@ -2098,3 +2098,55 @@ Deploy: with `epigraph-api` and the MCP binaries, in any order; no migration.
 A binary without the chokepoint ignores the switch for checks (the mint still
 strips armed), so arm only after every request unit runs this build.
 Rollback: disarm (`disarm-admin-scopes --apply`), then the previous binaries.
+
+
+## MCP `sudo` / `unsudo`, and who the tool list shows them to (no migration)
+
+`epigraph-mcp-full` serves two new tools over its HTTP transport:
+
+- **`sudo(reason)`** opens a CONNECTOR-mode elevation ticket for the calling
+  token's own principal, client and refresh family, and returns ONLY the
+  ceremony page's URL (`<EPIGRAPH_PUBLIC_BASE_URL>/elevate/<ticket>`). The
+  person opens it on the device that holds their passkey; once confirmed,
+  every later request on that refresh family resolves elevated (read-only,
+  recorded) for at most 15 minutes. No token, secret or session id is
+  returned, and the token endpoint never redeems a connector ticket.
+- **`unsudo()`** ends that family's live elevation now (`ended_reason =
+  'unsudo'`).
+
+Who may: the database decides (migration 125's ticket definer): a registered
+human holding a live assignment of an elevating role, with a live passkey, on
+a live family of its own human client. Agents never can; over stdio both
+tools refuse.
+
+**Connector mode stays OFF by default.** `sudo` is served only when
+`EPIGRAPH_MCP_CONNECTOR_ELEVATION=on` (see "The elevated viewer"); otherwise it
+refuses and names the CLI elevate path (`POST /api/v1/elevation/tickets`, the
+ceremony, then `grant_type=urn:epigraph:grant:elevate` at `/oauth/token`),
+which is the served path. `unsudo` is served either way (ending only narrows).
+`sudo` also needs **`EPIGRAPH_PUBLIC_BASE_URL`** in the MCP server's
+environment (the API's public origin, where the ceremony page is served);
+unset, `sudo` refuses.
+
+**The tool list is now per caller.** `tools/list` and the `list_mcp_tools`
+tool give the same answer:
+
+- `sudo` is listed over HTTP only to a principal that holds a live elevating
+  role, and only while connector mode is on; `unsudo` to such a principal.
+  The check is one subject-bound database read, made only for a human
+  client's token that names its principal. stdio lists neither.
+- An admin-only-scoped tool is listed only where the scope gate would admit
+  it (`AuthContext::has_scope`): unarmed, to a token carrying the scope (as
+  before for those callers; a caller without the scope no longer sees it);
+  armed, only to an elevated request.
+- `GET /api/v1/mcp/tools` (REST) applies the same admin-tool rule and never
+  lists `sudo`/`unsudo` (the API cannot see an MCP listener's connector
+  switch; an MCP connection lists them to a holder itself).
+
+Deploy: `epigraph-mcp-full` (HTTP units, fleet and stdio images) and
+`epigraph-api`, in any order; no migration. Leave
+`EPIGRAPH_MCP_CONNECTOR_ELEVATION` unset until the connector's refresh-family
+scope is decided. Rollback: the previous binaries (an open connector ticket
+expires in 5 minutes; a live connector session ends at its expiry, at most
+15 minutes, or at once with `epigraph-operator end-elevation` on the
+maintenance DSN).
