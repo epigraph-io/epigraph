@@ -25,6 +25,13 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// the same defect `query_claims` had under `babd5904` / `a85ee585`). Labels
 /// come from ONE `labels_by_ids` read over the selection, which is viewer-spliced
 /// and deliberately not `is_current`-filtered; an id it does not return gets `[]`.
+///
+/// NOT ONE SNAPSHOT. The caller's row read and this label read are two
+/// statements on `server.pool`, so a concurrent `update_labels` between them can
+/// pair a row with its newer labels. That is the same accepted shape as
+/// `query_claims` (backlog `babd5904`); both errors propagate, so nothing is
+/// silently defaulted. `query_paper` and `query_undecomposed_claims` read the
+/// same way. Only REST `get_claim` reads row and labels in one statement.
 async fn claim_responses(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
