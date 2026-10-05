@@ -471,11 +471,24 @@ async fn version_history_is_stable_and_truthful_across_a_fork(pool: PgPool) {
 async fn version_history_returns_each_version_once_on_a_self_supersede(pool: PgPool) {
     let (agent, _group) = fixture::seed_agent_with_group(&pool, "cycle-self").await;
     let x = fixture::seed_public_claim(&pool, agent, "self-supersede X").await;
-    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $1")
-        .bind(x)
-        .execute(&pool)
+    // Migration 123 refuses a statement that SETS a self-reference (OPL02, on
+    // every session), so the self-loop is written the way one written before
+    // 123 exists: by a superuser with triggers off, as custodian_role.rs does.
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut *conn)
         .await
-        .expect("write X -> X");
+        .expect("triggers off");
+    let written = sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $1")
+        .bind(x)
+        .execute(&mut *conn)
+        .await;
+    sqlx::query("SET session_replication_role = DEFAULT")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers on");
+    drop(conn);
+    written.expect("write X -> X");
 
     let stranger = fixture::public_viewer(&pool).await;
     let history = ClaimRepository::version_history(&pool, &stranger, x)
