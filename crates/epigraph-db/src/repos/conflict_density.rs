@@ -5,7 +5,7 @@
 //! module is the one place those numbers are read. Three callers use it:
 //! `GET /api/v1/conflicts/scan` (`silence_alarms`), `GET
 //! /api/v1/conflicts/silence-check`, and the `19c` silence-alarm step of
-//! `POST /api/v1/beliefs/evidence`.
+//! `POST /api/v1/frames/:id/evidence`.
 //!
 //! No `Viewer`: this is an aggregate over counts, with no row content, read on
 //! whatever executor the caller passes (today the handlers' raw pool).

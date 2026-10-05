@@ -2,7 +2,7 @@
 //! silence alarm counted claim-to-claim contradictions as zero by construction.
 //!
 //! `GET /api/v1/conflicts/scan`, `GET /api/v1/conflicts/silence-check` and the
-//! `19c` step of `POST /api/v1/beliefs/evidence` each counted
+//! `19c` step of `POST /api/v1/frames/:id/evidence` each counted
 //!
 //! ```sql
 //! SELECT COUNT(*) FROM edges e
