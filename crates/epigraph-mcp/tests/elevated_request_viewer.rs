@@ -640,6 +640,51 @@ async fn every_write_tool_is_refused_to_an_elevated_request_at_dispatch(pool: Pg
     assert!(refused_as_elevated(&r), "connector mode on: {r:?}");
 }
 
+/// THE DISPATCH DECISION BINDS (staging review of #538): once dispatch has
+/// stamped `auth.elevation` (it saw a live session, and the scope gate granted
+/// the admin-only read scopes from it), `refuse_elevated_write` refuses every
+/// write tool even if the session has ENDED by the time it runs, instead of
+/// re-resolving and letting the write through on scopes only the elevation
+/// granted. Here the stamped session never existed, which is what the
+/// re-resolution sees after an end: not elevated. Read tools still pass.
+///
+/// Verified to fail with the `auth.elevation` check removed (every write tool
+/// answers `Ok`, because the re-resolved viewer is not elevated).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_write_is_refused_when_the_elevation_ends_after_dispatch(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "mcp-dispatch-binds-p").await;
+    let (client, family) = make_holder(&pool, p, 10).await;
+    let server = app_server(&pool).await;
+    let mut stamped = writer_auth(p, client, family, Some(Uuid::new_v4()));
+    stamped.elevation = Some(epigraph_auth::ElevationRef {
+        session_id: Uuid::new_v4(),
+        family_id: family,
+    });
+    let unstamped = writer_auth(p, client, family, Some(Uuid::new_v4()));
+
+    let mut writes = 0;
+    for (tool, scope) in epigraph_mcp::scope_map::SCOPE_MAP {
+        let r = server.refuse_elevated_write(Some(&stamped), tool).await;
+        if scope.ends_with(":read") {
+            assert!(r.is_ok(), "{tool} ({scope}) is a read, refused: {r:?}");
+        } else {
+            writes += 1;
+            assert!(refused_as_elevated(&r), "{tool} ({scope}): {r:?}");
+        }
+    }
+    assert!(
+        writes >= 40,
+        "CALIBRATION: the write half of SCOPE_MAP collapsed ({writes})"
+    );
+    assert!(
+        server
+            .refuse_elevated_write(Some(&unstamped), "memorize")
+            .await
+            .is_ok(),
+        "CALIBRATION: the same token without the dispatch stamp re-resolves to not elevated"
+    );
+}
+
 /// Source lock: `call_tool` runs `refuse_elevated_write` inside the HTTP
 /// gate, AFTER the scope gate and BEFORE `tool_router.call`, so no write tool
 /// body runs for an elevated request (no behavioural test in this crate can

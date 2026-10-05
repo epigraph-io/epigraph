@@ -825,15 +825,12 @@ impl EpiGraphMcpFull {
         };
         let writes = crate::scope_map::required_scope(tool_name)
             .map_or(true, |scope| !scope.ends_with(":read"));
-        let may_be_elevated = auth.elevation_claim.is_some()
-            || (self.connector_elevation && auth.family_id.is_some());
-        if !writes || !may_be_elevated {
+        if !writes {
             return Ok(());
         }
-        let viewer = crate::tools::viewer::request_viewer(self, Some(auth)).await?;
         let admin = crate::scope_map::required_scope(tool_name)
             .is_some_and(epigraph_auth::is_admin_only_scope);
-        crate::write_identity::refuse_elevated(&viewer).map_err(|mut e| {
+        let say_where = |mut e: McpError| {
             // An ADMIN write (plan EQ-5): say where it runs instead.
             if admin {
                 e.message = std::borrow::Cow::Owned(format!(
@@ -843,7 +840,27 @@ impl EpiGraphMcpFull {
                 ));
             }
             e
-        })
+        };
+        // THE DISPATCH DECISION BINDS. `auth.elevation` is set only by
+        // `call_tool` after `elevation_at_dispatch` saw a live session, and the
+        // scope gate has already granted the admin-only read scopes from it
+        // (`AuthContext::has_scope`). Re-resolving below could see the session
+        // ended in between and let a write through on scopes only the
+        // elevation granted, so a request dispatch called elevated stays
+        // elevated here. (`sudo`/`unsudo` are not resolved at dispatch, so
+        // their `elevation` is never set.)
+        if auth.elevation.is_some() {
+            return Err(say_where(crate::errors::db_caller_error(
+                epigraph_db::DbError::ElevatedReadOnly,
+            )));
+        }
+        let may_be_elevated = auth.elevation_claim.is_some()
+            || (self.connector_elevation && auth.family_id.is_some());
+        if !may_be_elevated {
+            return Ok(());
+        }
+        let viewer = crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        crate::write_identity::refuse_elevated(&viewer).map_err(say_where)
     }
 
     /// Decide, ONCE at dispatch, whether an HTTP request is ELEVATED (elevation
