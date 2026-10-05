@@ -93,6 +93,43 @@ impl RoleAssignmentRepository {
         Ok(id)
     }
 
+    /// [`Self::grant`] on a CONFIRMED `role.grant` act (migration 130's
+    /// act-taking `epigraph_grant_role`): the table's guard recomputes the
+    /// act's args from the new row and consumes the act inside the INSERT, so
+    /// a rollback of the caller's transaction un-consumes it. `granted_by` is
+    /// the act's proposer.
+    ///
+    /// # Errors
+    /// [`Self::grant`]'s, plus `ELV08` (the act is not live: unknown, not
+    /// confirmed, consumed, expired, its passkey revoked, its proposer no
+    /// longer a custodian) and `ELV09` (another kind, other args, another
+    /// grantor).
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(conn, reason))]
+    pub async fn grant_on_act(
+        conn: &mut sqlx::PgConnection,
+        role: &str,
+        holder: Uuid,
+        valid_from: Option<DateTime<Utc>>,
+        valid_to: Option<DateTime<Utc>>,
+        granted_by: Uuid,
+        reason: &str,
+        admin_act: Uuid,
+    ) -> Result<Uuid, DbError> {
+        let id: Uuid =
+            sqlx::query_scalar("SELECT public.epigraph_grant_role($1, $2, $3, $4, $5, $6, $7)")
+                .bind(role)
+                .bind(holder)
+                .bind(valid_from)
+                .bind(valid_to)
+                .bind(granted_by)
+                .bind(reason)
+                .bind(admin_act)
+                .fetch_one(&mut *conn)
+                .await?;
+        Ok(id)
+    }
+
     /// End an assignment now (`epigraph_end_role_assignment`). `false` when it
     /// had already ended or does not exist: an end is never repeated.
     ///
@@ -110,6 +147,30 @@ impl RoleAssignmentRepository {
             .bind(reason)
             .fetch_one(&mut *conn)
             .await?;
+        Ok(ended)
+    }
+
+    /// [`Self::end`] on a CONFIRMED `role.end` act (migration 130): the guard
+    /// recomputes the act's args (this assignment, this reason) and consumes
+    /// the act inside the UPDATE. `false` when the assignment had already
+    /// ended (nothing consumed).
+    ///
+    /// # Errors
+    /// [`Self::end`]'s, plus `ELV08` / `ELV09` as for [`Self::grant_on_act`].
+    #[instrument(skip(conn, reason))]
+    pub async fn end_on_act(
+        conn: &mut sqlx::PgConnection,
+        assignment: Uuid,
+        reason: &str,
+        admin_act: Uuid,
+    ) -> Result<bool, DbError> {
+        let ended: bool =
+            sqlx::query_scalar("SELECT public.epigraph_end_role_assignment($1, $2, $3)")
+                .bind(assignment)
+                .bind(reason)
+                .bind(admin_act)
+                .fetch_one(&mut *conn)
+                .await?;
         Ok(ended)
     }
 
@@ -240,6 +301,43 @@ impl RoleAssignmentRepository {
         .bind(target_type)
         .bind(target)
         .bind(details)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(id)
+    }
+
+    /// [`Self::record_custodial_act`] of a `claim.supersede` on a CONFIRMED
+    /// `claim.custodial_supersede` act (migration 130): the recorder
+    /// recomputes the act's args from the STORED successor (`details.new_id`,
+    /// which must supersede `target`: its content's SHA-256 and its truth
+    /// value) and from `details.reason` / `details.allow_owned`, and consumes
+    /// the act; the `platform.custodial_act` row names it. Call it in the
+    /// supersede's own transaction.
+    ///
+    /// # Errors
+    /// [`Self::record_custodial_act`]'s, plus `ELV08` / `ELV09`.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(conn, details))]
+    pub async fn record_custodial_act_on_act(
+        conn: &mut sqlx::PgConnection,
+        assignment: Uuid,
+        actor: Uuid,
+        act: &str,
+        target_type: &str,
+        target: Uuid,
+        details: serde_json::Value,
+        admin_act: Uuid,
+    ) -> Result<Uuid, DbError> {
+        let id: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_record_custodial_act($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(assignment)
+        .bind(actor)
+        .bind(act)
+        .bind(target_type)
+        .bind(target)
+        .bind(details)
+        .bind(admin_act)
         .fetch_one(&mut *conn)
         .await?;
         Ok(id)

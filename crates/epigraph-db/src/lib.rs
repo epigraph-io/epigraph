@@ -80,6 +80,7 @@ pub use pool::{
     MAINTENANCE_DATABASE_URL, MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
 };
 pub use repos::ElevatedAccess;
+pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
     ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository,
     AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,

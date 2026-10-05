@@ -27,6 +27,9 @@ futures = "0.3"
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Migration 130: an admin act's args digest (SHA-256 of their canonical text),
+# recomputed by the maintenance CLI and compared with the database's.
+sha2 = { workspace = true }
 
 [features]
 # TEST SUPPORT ONLY: `ScopedPool::connect_downgraded_for_tests`. Enabled by

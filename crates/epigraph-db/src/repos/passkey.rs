@@ -98,6 +98,32 @@ impl PasskeyRepository {
         Ok(id)
     }
 
+    /// [`Self::create_enrollment`] for a LATER passkey, on a CONFIRMED
+    /// `passkey.register` act of the person's own (migration 130): the
+    /// enrollment is opened `confirmed_act` and its guard consumes the act,
+    /// recomputing its args (person, label, reason) from the enrollment.
+    ///
+    /// # Errors
+    /// [`Self::create_enrollment`]'s, plus `ELV08` / `ELV09`.
+    #[instrument(skip(conn, reason, label))]
+    pub async fn create_enrollment_on_act(
+        conn: &mut sqlx::PgConnection,
+        person: Uuid,
+        reason: &str,
+        label: Option<&str>,
+        admin_act: Uuid,
+    ) -> Result<Uuid, DbError> {
+        let id: Uuid =
+            sqlx::query_scalar("SELECT public.epigraph_create_passkey_enrollment($1, $2, $3, $4)")
+                .bind(person)
+                .bind(reason)
+                .bind(label)
+                .bind(admin_act)
+                .fetch_one(&mut *conn)
+                .await?;
+        Ok(id)
+    }
+
     /// One enrollment ticket by id (a maintenance read; an application
     /// connection sees none).
     ///

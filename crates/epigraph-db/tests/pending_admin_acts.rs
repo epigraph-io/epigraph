@@ -1150,3 +1150,112 @@ async fn a_later_passkey_rides_a_confirmed_register_act(pool: PgPool) {
     .expect("the enrollment");
     assert_eq!((via.as_str(), consumed), ("confirmed_act", true));
 }
+
+// =====================================================================
+// THE CANONICAL FORM: the CLI's (Rust) and the database's agree.
+// =====================================================================
+
+/// The maintenance CLI recomputes an act's args and digest from its own
+/// flags (`epigraph_db::admin_act`) and refuses before writing when they
+/// differ from the confirmed act's; the database canonicalizes at proposal
+/// and recomputes from the write. The two must agree byte for byte: every
+/// builder's output is already canonical by the database's normalizer, and
+/// the canonical text and digest are equal, on args carrying quotes, a
+/// backslash, a newline, a control character and non-ASCII text, a time
+/// with an offset, truth values 0.7 and 1, a null label and a content digest
+/// (which equals the database's SHA-256 of the same text). A free-form value
+/// whose keys sort differently by byte and by length (`a`, `aa`, `b`) pins
+/// the key order.
+///
+/// Verified to fail: the Rust canonicalizer escaping strings by hand
+/// (`format!("\"{s}\"")`) -> the quoted reason differs; the Rust truth form
+/// at five places -> the supersede args are not canonical; the Rust time at
+/// millisecond precision -> the grant args are not canonical; the Rust key
+/// sort by length then bytes (jsonb's order) -> the free-form text differs.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_rust_and_database_canonical_forms_agree(pool: PgPool) {
+    use epigraph_db::admin_act;
+    let t = chrono::DateTime::parse_from_rfc3339("2030-06-01T12:34:56.789012+05:30")
+        .expect("time")
+        .with_timezone(&chrono::Utc);
+    let awkward = "why \"quoted\" \\ back\nslash \u{1} é ✓";
+    let content = "revised text ✓\n\"with quotes\"";
+    let cases: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "role.grant",
+            admin_act::role_grant_args(AUDITOR, Uuid::new_v4(), None, Some(t), awkward),
+        ),
+        (
+            "role.grant",
+            admin_act::role_grant_args(CUSTODIAN, Uuid::new_v4(), Some(t), None, "r"),
+        ),
+        (
+            "role.end",
+            admin_act::role_end_args(Uuid::new_v4(), awkward),
+        ),
+        (
+            "claim.custodial_supersede",
+            admin_act::custodial_supersede_args(Uuid::new_v4(), content, 0.7, awkward, true)
+                .expect("0.7"),
+        ),
+        (
+            "claim.custodial_supersede",
+            admin_act::custodial_supersede_args(Uuid::new_v4(), content, 1.0, "r", false)
+                .expect("1"),
+        ),
+        (
+            "passkey.register",
+            admin_act::passkey_register_args(Uuid::new_v4(), None, "r"),
+        ),
+        (
+            "passkey.register",
+            admin_act::passkey_register_args(Uuid::new_v4(), Some(awkward), "r"),
+        ),
+    ];
+    for (kind, args) in cases {
+        let (db_args, db_text, db_digest): (serde_json::Value, String, Vec<u8>) = sqlx::query_as(
+            "WITH a AS (SELECT public.epigraph_admin_act_args($1, $2) AS v) \
+             SELECT a.v, public.epigraph_canonical_json(a.v), \
+                    public.epigraph_admin_act_digest(a.v) FROM a",
+        )
+        .bind(kind)
+        .bind(&args)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{kind}: {e}"));
+        assert_eq!(db_args, args, "{kind}: the Rust args are already canonical");
+        assert_eq!(
+            admin_act::canonical_json(&args),
+            db_text,
+            "{kind}: the canonical text"
+        );
+        assert_eq!(
+            admin_act::args_digest(&args).to_vec(),
+            db_digest,
+            "{kind}: the digest"
+        );
+    }
+    let db_hash: String =
+        sqlx::query_scalar("SELECT encode(sha256(convert_to($1, 'UTF8')), 'hex')")
+            .bind(content)
+            .fetch_one(&pool)
+            .await
+            .expect("sha256");
+    let rust =
+        admin_act::custodial_supersede_args(Uuid::nil(), content, 0.5, "r", false).expect("args");
+    assert_eq!(rust["content_sha256"], serde_json::json!(db_hash));
+
+    let free = serde_json::json!({
+        "b": 1, "aa": [true, null, {"zz": "\u{1f}\t", "y": "é"}], "a": "q\"\\"
+    });
+    let db: String = sqlx::query_scalar("SELECT public.epigraph_canonical_json($1)")
+        .bind(&free)
+        .fetch_one(&pool)
+        .await
+        .expect("canonical");
+    assert_eq!(admin_act::canonical_json(&free), db);
+    assert!(
+        db.starts_with("{\"a\":"),
+        "CALIBRATION: byte order, not jsonb's: {db}"
+    );
+}

@@ -472,6 +472,13 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "admin_act.rs",
+        "get",
+        "READ of one `pending_admin_acts` row by id for the maintenance CLI (migration 130): an \
+         authority record about a principal (its proposer and confirmation), no `visibility` / \
+         `owner_group_id`; 130's FORCEd policy shows an application connection no row at all.",
+    ),
+    (
         "admin_scope_enforcement.rs",
         "state",
         "READ of migration 128's one-row admin-scope switch (`admin_scope_enforcement`) for the \
@@ -494,6 +501,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          record about a registered human, not a corpus row: no `visibility` / \
          `owner_group_id`, its own triggers enforce every rule (ELV01/ELV03) and write the \
          `platform.passkey_enrollment_created` row. Nothing for a viewer to filter.",
+    ),
+    (
+        "passkey.rs",
+        "create_enrollment_on_act",
+        "WRITE through migration 130's maintenance-only act-taking \
+         `epigraph_create_passkey_enrollment`: as `create_enrollment`, opened `confirmed_act` on \
+         a confirmed `passkey.register` act its guard consumes. An authentication record, not a \
+         corpus row.",
     ),
     (
         "passkey.rs",
@@ -629,6 +644,20 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "role_assignment.rs",
+        "grant_on_act",
+        "WRITE through migration 130's maintenance-only act-taking `epigraph_grant_role`: as \
+         `grant`, on a confirmed `role.grant` act the table's guard consumes. An authority \
+         record, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
+        "end_on_act",
+        "WRITE through migration 130's maintenance-only act-taking \
+         `epigraph_end_role_assignment`: as `end`, on a confirmed `role.end` act the table's \
+         guard consumes. An authority record, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
         "end",
         "WRITE through 123's maintenance-only `epigraph_end_role_assignment`: the one revoke \
          stamp on one `role_assignments` row, an authority record with no tenancy columns.",
@@ -668,6 +697,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE through 123's maintenance-only `epigraph_record_custodial_act`: one \
          `platform.custodial_act` security_events row, refused (CUS04) unless the named \
          assignment is live and held by the actor. An audit record, not a corpus row.",
+    ),
+    (
+        "role_assignment.rs",
+        "record_custodial_act_on_act",
+        "WRITE through migration 130's maintenance-only act-taking \
+         `epigraph_record_custodial_act`: as `record_custodial_act`, consuming a confirmed \
+         `claim.custodial_supersede` act whose args the recorder recomputes from the stored \
+         successor. An audit record, not a corpus row.",
     ),
     (
         "maintenance_lock.rs",
