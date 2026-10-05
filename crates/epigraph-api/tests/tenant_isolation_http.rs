@@ -452,6 +452,98 @@ async fn version_history_is_stable_and_truthful_across_a_fork(pool: PgPool) {
     }
 }
 
+/// A supersedes CYCLE must return each version exactly once.
+///
+/// Cycles are reachable through the repo, not only through raw SQL:
+/// `mark_duplicate_act` refuses only `dup == canonical` and an already
+/// superseded *duplicate*, so `mark_duplicate(X→Y)` then `mark_duplicate(Y→X)`
+/// writes X↔Y (Y was canonical, so its `supersedes` was NULL). A self-loop
+/// X→X is the degenerate case. Without a cycle guard both recursive CTEs in
+/// `version_history` follow the loop until their `depth < 100` bound, so the
+/// self-loop comes back as the same row 101 times — which
+/// `GET /api/v1/claims/:id/history` serves verbatim as 101 "versions".
+///
+/// The cycle is written with a raw UPDATE rather than two `mark_duplicate`
+/// calls so the assertion is about the READ only; `#[sqlx::test]`'s pool is
+/// the privileged writer `claims_supersedes_guard` admits for a public target,
+/// exactly as in the fork test above.
+#[sqlx::test(migrations = "../../migrations")]
+async fn version_history_returns_each_version_once_on_a_self_supersede(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "cycle-self").await;
+    let x = fixture::seed_public_claim(&pool, agent, "self-supersede X").await;
+    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $1")
+        .bind(x)
+        .execute(&pool)
+        .await
+        .expect("write X -> X");
+
+    let stranger = fixture::public_viewer(&pool).await;
+    let history = ClaimRepository::version_history(&pool, &stranger, x)
+        .await
+        .expect("version_history over a self-loop");
+
+    let ids: Vec<Uuid> = history.iter().map(|h| h.id).collect();
+    assert_eq!(
+        ids,
+        vec![x],
+        "a self-supersede is ONE version; got {} rows",
+        history.len()
+    );
+    assert_eq!(history[0].depth, 0, "the single version is the root");
+    // A self-loop truthfully reports ITSELF as its successor: X's
+    // `supersedes` is X, so the `superseded_by` subselect finds X. Pinned so
+    // that changing the subselect (e.g. to exclude the row's own id) is a
+    // deliberate decision rather than an unnoticed one.
+    assert_eq!(history[0].superseded_by, Some(x));
+}
+
+/// X↔Y — the shape two opposite `mark_duplicate` calls write — is two
+/// versions from either end, and the root is the deepest NON-revisited
+/// ancestor of the claim asked about.
+///
+/// From X the backward walk is X(0) → Y(1) → X(2, revisited). Choosing the
+/// root by `ORDER BY up_depth DESC` over ALL of those rows picks the revisited
+/// X, so the root assertion below is what pins the guard into the `root` CTE
+/// and not only into the final SELECT.
+#[sqlx::test(migrations = "../../migrations")]
+async fn version_history_returns_each_version_once_on_a_two_cycle(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "cycle-two").await;
+    let x = fixture::seed_public_claim(&pool, agent, "two-cycle X").await;
+    let y = fixture::seed_public_claim(&pool, agent, "two-cycle Y").await;
+    for (from, to) in [(x, y), (y, x)] {
+        sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+            .bind(to)
+            .bind(from)
+            .execute(&pool)
+            .await
+            .expect("write one half of X <-> Y");
+    }
+
+    let stranger = fixture::public_viewer(&pool).await;
+    for (start, expected_root, other) in [(x, y, x), (y, x, y)] {
+        let history = ClaimRepository::version_history(&pool, &stranger, start)
+            .await
+            .expect("version_history over a two-cycle");
+        let ids: Vec<Uuid> = history.iter().map(|h| h.id).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "from {start}: X<->Y is two versions, got {} rows: {ids:?}",
+            history.len()
+        );
+        assert_eq!(
+            ids,
+            vec![expected_root, other],
+            "from {start}: the root is the deepest non-revisited ancestor \
+             ({expected_root}), followed by its successor"
+        );
+        // `superseded_by` stays truthful inside the cycle: each side really is
+        // superseded by the other.
+        assert_eq!(history[0].superseded_by, Some(other));
+        assert_eq!(history[1].superseded_by, Some(expected_root));
+    }
+}
+
 /// A REAL isolation assertion for the neighborhood projection, seeded with
 /// actual rows.
 ///

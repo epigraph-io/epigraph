@@ -1509,13 +1509,23 @@ impl ClaimRepository {
     ///
     /// # Cycle safety
     ///
-    /// Both recursive terms are capped at depth 100. `mark_duplicate` refuses
-    /// only when the *duplicate* is already superseded, so `A.supersedes = B`
-    /// followed by `B.supersedes = A` is accepted and forms a cycle. Without
-    /// the cap the CTE never terminates: it pins one backend at 100% CPU
-    /// building an unbounded tuplestore that spills to disk, and the request
-    /// pool sets no `statement_timeout` to stop it. 100 is far above any real
-    /// supersession depth.
+    /// `mark_duplicate` refuses only when the *duplicate* is already
+    /// superseded, so `A.supersedes = B` followed by `B.supersedes = A` is
+    /// accepted and forms a cycle; a self-supersede `A.supersedes = A` is the
+    /// degenerate case. Two guards, for two different failures:
+    ///
+    /// * **`CYCLE id SET … USING …` on both recursive CTEs** makes each version
+    ///   appear exactly once. Postgres still emits the row that revisits an id
+    ///   (flagged `*_is_cycle`) but does not expand it, so the flag is filtered
+    ///   in `root` and in the final SELECT. Without it a cycle is walked until
+    ///   the depth cap: a self-loop came back as the same row 101 times and
+    ///   X↔Y as 101 alternating rows, and from X the root was X itself rather
+    ///   than Y, the deepest non-revisited ancestor. Requires PostgreSQL 14+.
+    /// * **Both recursive terms stay capped at depth 100.** The cycle guard
+    ///   does not bound a long ACYCLIC chain; the cap does. Without any bound a
+    ///   cycle pins one backend at 100% CPU building an unbounded tuplestore
+    ///   that spills to disk, and the request pool sets no `statement_timeout`
+    ///   to stop it. 100 is far above any real supersession depth.
     ///
     /// # Why one statement and not a loop
     ///
@@ -1551,7 +1561,22 @@ impl ClaimRepository {
                 FROM claims p
                 JOIN up ON p.id = up.supersedes
                 WHERE up.up_depth < 100 /* {VISIBILITY:p} */
-            ),
+            -- CYCLE, not merely the depth bound. `mark_duplicate` writes
+            -- `dup.supersedes = canonical` with no cycle check, so X<->Y and
+            -- X->X loops are writable through the repo (how many exist in prod
+            -- data was never counted). `up_depth < 100` stops the walk
+            -- running forever, but it does NOT stop it EMITTING: MEASURED on a
+            -- database migrated 001->head, a self-supersedes loop came back as
+            -- the same row 101 times and an X<->Y pair as 101 alternating rows,
+            -- which `GET /claims/:id/history` served verbatim (~50x response
+            -- amplification). `CYCLE ... SET ... USING ...` still EMITS the row
+            -- that revisits an id, flagged, but stops expanding it; so the flag
+            -- is filtered in BOTH consumers -- `root` below (or the revisited
+            -- start claim would be picked as the deepest ancestor) and the
+            -- final SELECT. The depth bound stays as a second guard. Both
+            -- recursive terms keep their visibility splices, so this costs no
+            -- tenancy filtering.
+            ) CYCLE id SET up_is_cycle USING up_path,
             -- The DEEPEST VISIBLE ancestor, not the true root. `up` already
             -- stops at the first link the viewer cannot see, so requiring
             -- `supersedes IS NULL` here would return nothing whenever a
@@ -1560,7 +1585,7 @@ impl ClaimRepository {
             -- deepest row IS the `supersedes IS NULL` root, so this is the
             -- same answer for the fully-visible case.
             root AS (
-                SELECT id FROM up ORDER BY up_depth DESC LIMIT 1
+                SELECT id FROM up WHERE NOT up_is_cycle ORDER BY up_depth DESC LIMIT 1
             ),
             chain AS (
                 SELECT r0.id,
@@ -1582,7 +1607,7 @@ impl ClaimRepository {
                 FROM claims n
                 JOIN chain ON n.supersedes = chain.id
                 WHERE chain.depth < 100 /* {VISIBILITY:n} */
-            )
+            ) CYCLE id SET chain_is_cycle USING chain_path
             SELECT chain.id,
                    chain.content,
                    chain.truth_value,
@@ -1597,6 +1622,7 @@ impl ClaimRepository {
                        LIMIT 1
                    ) AS superseded_by
             FROM chain
+            WHERE NOT chain_is_cycle
             ORDER BY chain.depth, chain.id
             "#,
             2,

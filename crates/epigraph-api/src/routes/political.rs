@@ -586,11 +586,7 @@ pub async fn position_timeline(
     let mut timeline: Vec<TimelineEntry> = claims
         .iter()
         .map(|c| {
-            let summary = if c.content.len() > 120 {
-                format!("{}...", &c.content[..120])
-            } else {
-                c.content.clone()
-            };
+            let summary = super::text::ellipsize(&c.content, 120, 120);
             TimelineEntry {
                 date: c.created_at,
                 claim_id: c.claim_id,
@@ -855,11 +851,7 @@ pub async fn inflation_index(
                 .get("inflation_factor")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(1.0);
-            let summary = if content.len() > 120 {
-                format!("{}...", &content[..120])
-            } else {
-                content.clone()
-            };
+            let summary = super::text::ellipsize(content, 120, 120);
             InflationClaimEntry {
                 claim_id: *claim_id,
                 content_summary: summary,
