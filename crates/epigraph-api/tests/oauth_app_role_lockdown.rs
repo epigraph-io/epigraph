@@ -529,6 +529,16 @@ async fn revoking_a_forged_access_token_writes_nothing(pool: PgPool) {
             .expect("lookup"),
         "a token this server did not sign must not reach the denylist"
     );
+    // Nor under any other key: the calibration row is the table's only row,
+    // so a forged revoke that recorded a nil, random or derived jti fails here.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM public.revoked_access_tokens")
+        .fetch_one(&pool)
+        .await
+        .expect("count the denylist");
+    assert_eq!(
+        rows, 1,
+        "only the genuine token's row: a forged revoke writes nothing at all"
+    );
 }
 
 /// `POST /oauth/introspect` with `token`: the RFC 7662 `active` flag.
