@@ -541,6 +541,63 @@ async fn revoking_a_forged_access_token_writes_nothing(pool: PgPool) {
     );
 }
 
+/// Clock skew on the REVOKING host (drain U003 follow-up). `/oauth/revoke` used
+/// to gate the write on `validate_token`, which checks `exp` with zero leeway
+/// on the revoking host's own clock. A revocation arriving just after `exp` by
+/// that clock was answered 200 and recorded nothing, while a host lagging it
+/// kept admitting the token. The endpoint now verifies signature, issuer and
+/// audience only, and leaves expiry to the definer's 24-hour margin on the
+/// database clock: a token 2 h past `exp` is recorded, one 25 h past is not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_token_expired_on_the_revoking_host_is_still_recorded(pool: PgPool) {
+    use epigraph_db::RevokedAccessTokenRepository;
+    let state = app_state(&pool, 2).await;
+    let jwt = state.jwt_config.clone();
+    let app = create_router(state);
+
+    let mint = |ttl: Duration| {
+        jwt.issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:write".to_string()],
+            "service",
+            None,
+            None,
+            ttl,
+        )
+        .expect("mint")
+    };
+    let (recent, recent_jti) = mint(Duration::hours(-2));
+    let (stale, stale_jti) = mint(Duration::hours(-25));
+
+    // PRECONDITION: on this host's clock the token IS expired, so this is the
+    // skew case (a lagging host may still admit it), not a live token.
+    assert!(
+        jwt.validate_token(&recent).is_err(),
+        "precondition: a token 2 h past exp fails the strict admission check here"
+    );
+
+    assert_eq!(
+        revoke_access_token(app.clone(), &recent).await,
+        StatusCode::OK
+    );
+    assert!(
+        RevokedAccessTokenRepository::is_revoked(&pool, recent_jti)
+            .await
+            .expect("lookup"),
+        "a validly signed token 2 h past exp on the revoking host may still be \
+         live on a lagging host: /oauth/revoke must record it"
+    );
+
+    // Beyond the margin the definer declines it: 200, nothing recorded.
+    assert_eq!(revoke_access_token(app, &stale).await, StatusCode::OK);
+    assert!(
+        !RevokedAccessTokenRepository::is_revoked(&pool, stale_jti)
+            .await
+            .expect("lookup"),
+        "a token 25 h past exp is outside the margin and is not recorded"
+    );
+}
+
 /// `POST /oauth/introspect` with `token`: status and body, unasserted.
 async fn introspect(app: axum::Router, token: &str) -> (StatusCode, Value) {
     let req = Request::builder()
