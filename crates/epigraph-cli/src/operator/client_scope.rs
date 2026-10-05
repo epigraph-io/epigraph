@@ -65,6 +65,11 @@
 //!   records `os_user_source` to say so. Run the binary directly as the
 //!   operator: under `sudo -u <service account>` the real uid names that
 //!   account, and only the login uid still names the person.
+//! * **Not while admin scopes are armed.** Once migration 128's switch is
+//!   armed (`arm-admin-scopes`), a grant is refused, dry run included: a
+//!   standing admin scope would be stripped at every mint, and an admin act
+//!   needs an elevation. A revoke still runs. A switch that cannot be read
+//!   refuses the grant too; a database without 128 is unarmed.
 //! * **`--dry-run`** runs the same statements, the audit row included, in a
 //!   transaction that is rolled back, and prints what would change.
 //!
@@ -73,7 +78,10 @@
 
 use anyhow::{bail, Context};
 use epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES;
-use epigraph_db::{OAuthClientRepository, SecurityEventRepository, SecurityEventRow};
+use epigraph_db::{
+    AdminScopeEnforcement, AdminScopeSwitch, OAuthClientRepository, SecurityEventRepository,
+    SecurityEventRow,
+};
 use sqlx::{Acquire, PgConnection};
 use uuid::Uuid;
 
@@ -295,6 +303,27 @@ pub async fn run(
             row.client_name,
             row.client_type
         );
+    }
+    // Migration 128's admin-scope switch (elevation plan EL-9). Armed, a
+    // standing admin scope is what elevation replaces: a grant is refused
+    // (dry run included), a revoke is not (taking authority away is always
+    // safe). A switch that cannot be read is not "unarmed": refused too. A
+    // database without 128 (`Absent`) cannot have been armed.
+    if op == ScopeOp::Grant {
+        match AdminScopeEnforcement::read(&mut *tx).await {
+            Ok(AdminScopeSwitch::Unarmed | AdminScopeSwitch::Absent) => {}
+            Ok(AdminScopeSwitch::Armed) => bail!(
+                "refusing to grant {scope} to client {client}: admin-scope enforcement is armed \
+                 on this database (migration 128), so a standing admin scope would be stripped \
+                 at every mint; an admin act needs an elevation. Disarm first \
+                 (epigraph-operator disarm-admin-scopes) only if that is the decision. Nothing \
+                 was written."
+            ),
+            Err(e) => bail!(
+                "refusing to grant {scope} to client {client}: the admin-scope switch could not \
+                 be read ({e}), and an unreadable switch is not \"unarmed\". Nothing was written."
+            ),
+        }
     }
     if op == ScopeOp::Grant && row.status != "active" {
         bail!(
