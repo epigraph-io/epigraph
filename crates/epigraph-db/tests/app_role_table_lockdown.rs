@@ -757,7 +757,8 @@ async fn rotation_successor_inherits_the_presented_tokens_scopes_not_the_clients
     );
 
     // The narrowing direction still holds: a scope the client has since lost
-    // is dropped from the successor, and the stored order of the rest is kept.
+    // is dropped from the successor (the order of what survives is pinned by
+    // `rotation_successor_keeps_the_presented_tokens_scope_order`).
     let t3 = h("narrow3");
     RefreshTokenRepository::create(&app, &t3, client, &[write.clone(), read.clone()], exp)
         .await
@@ -776,6 +777,62 @@ async fn rotation_successor_inherits_the_presented_tokens_scopes_not_the_clients
         scopes_of(t4).await,
         vec![read],
         "a revoked grant leaves the chain at its next rotation"
+    );
+}
+
+/// Migration 140 walks the PRESENTED token's scopes `WITH ORDINALITY`, so the
+/// successor keeps their order, not `granted_scopes`' order. A definer that
+/// unnested `granted_scopes` filtered by the presented set would return the same
+/// SET in the grant's order; with stored `[write, read]` and granted
+/// `[read, write, evidence:read]` that is `[read, write]`, and 118's body
+/// (the whole grant) is `[read, write, evidence:read]`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotation_successor_keeps_the_presented_tokens_scope_order(pool: PgPool) {
+    let read = "claims:read".to_string();
+    let write = "claims:write".to_string();
+    let evidence = "evidence:read".to_string();
+    let granted = [read.clone(), write.clone(), evidence.clone()];
+    let client = OAuthClientRepository::create(
+        &pool,
+        &format!("w11_{}", Uuid::new_v4().simple()),
+        None,
+        "u002 scope order",
+        "human",
+        &granted,
+        &granted,
+        "active",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("seed client granted read+write+evidence");
+    let app = app_pool(&pool, 2).await;
+    let exp = chrono::Utc::now() + chrono::Duration::hours(1);
+
+    let t0 = h("order0");
+    RefreshTokenRepository::create(&app, &t0, client, &[write.clone(), read.clone()], exp)
+        .await
+        .unwrap();
+    let t1 = h("order1");
+    assert!(matches!(
+        RefreshTokenRepository::rotate(&app, &t0, &t1, exp)
+            .await
+            .unwrap(),
+        RefreshRotateOutcome::Rotated { .. }
+    ));
+    let scopes: Vec<String> =
+        sqlx::query_scalar("SELECT scopes FROM refresh_tokens WHERE token_hash = $1")
+            .bind(&t1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        scopes,
+        vec![write, read],
+        "the successor is the presented scopes in the presented order"
     );
 }
 
