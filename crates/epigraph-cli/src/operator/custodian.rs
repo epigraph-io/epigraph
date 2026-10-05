@@ -29,9 +29,23 @@
 //! revision lands unrecorded and no record names an authority that did not
 //! hold. It replaces the hand-run SQL sequence the operator-binding runbook
 //! carried for this.
+//!
+//! # `--act`: executing a confirmed admin act (migration 130)
+//!
+//! Once the acting custodian holds a live passkey (the grantor of a grant;
+//! any live custodian, for an end, which names no actor; the actor of a
+//! supersede), the database refuses the write without a CONFIRMED admin act
+//! (`ELV10`): proposed while elevated, confirmed by that person's passkey over
+//! the act's exact args. `--act <id>` names it. The verb recomputes the act's
+//! canonical args and digest from ITS OWN FLAGS (`epigraph_db::admin_act`) and
+//! refuses before writing when the act is not that act (another kind, not
+//! confirmed, executed already, expired, other args, another actor): exit 1,
+//! nothing written. The database then recomputes the args from the write
+//! itself and consumes the act inside it, so the act is spent exactly when the
+//! write commits (a dry run rolls the consumption back with the write).
 
 use chrono::{DateTime, Utc};
-use epigraph_db::{RoleAssignmentRepository, RoleAssignmentRow};
+use epigraph_db::{admin_act, AdminActRepository, RoleAssignmentRepository, RoleAssignmentRow};
 use serde_json::json;
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -85,13 +99,48 @@ impl Window {
     }
 }
 
-/// Grant `role` to `holder` in one transaction (committed under `apply`).
-/// Returns the assignment as written.
+/// Why admin act `act` cannot authorize a write of `kind` whose args are
+/// `args`, on the authority of `actor` (`None`: the write names no actor), or
+/// `None` when the act, read on the maintenance connection, can. The early,
+/// explained refusal (module docs); the database decides again in the write.
+///
+/// # Errors
+/// The read failed.
+pub async fn act_refusal(
+    conn: &mut PgConnection,
+    act: Uuid,
+    kind: &str,
+    args: &serde_json::Value,
+    actor: Option<Uuid>,
+) -> anyhow::Result<Option<String>> {
+    Ok(match AdminActRepository::get(conn, act).await? {
+        None => Some(format!("no admin act {act}")),
+        Some(row) => row.refusal_for(kind, args, actor, Utc::now()),
+    })
+}
+
+/// The canonical args of the `role.grant` act these grant flags execute.
+#[must_use]
+pub fn grant_act_args(role: &str, holder: Uuid, window: Window, reason: &str) -> serde_json::Value {
+    admin_act::role_grant_args(role, holder, window.valid_from, window.valid_to, reason)
+}
+
+/// The canonical args of the `role.end` act these end flags execute.
+#[must_use]
+pub fn end_act_args(assignment: Uuid, reason: &str) -> serde_json::Value {
+    admin_act::role_end_args(assignment, reason)
+}
+
+/// Grant `role` to `holder` in one transaction (committed under `apply`),
+/// on the confirmed admin act `act` when given (its proposer is `granted_by`,
+/// which is then required). Returns the assignment as written.
 ///
 /// # Errors
 /// The table's guards refused it (CUS01 a holder that is not a registered
-/// human, CUS02 a back-dated start, CUS03 the grantor rule), or a statement
-/// failed.
+/// human, CUS02 a back-dated start, CUS03 the grantor rule, ELV10 a grantor
+/// holding a passkey with no act, ELV08 / ELV09 an act that does not
+/// authorize this grant), or a statement failed.
+#[allow(clippy::too_many_arguments)]
 pub async fn grant(
     conn: &mut PgConnection,
     role: &str,
@@ -99,19 +148,43 @@ pub async fn grant(
     window: Window,
     granted_by: Option<Uuid>,
     reason: &str,
+    act: Option<Uuid>,
     apply: bool,
 ) -> anyhow::Result<RoleAssignmentRow> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-    let id = RoleAssignmentRepository::grant(
-        &mut tx,
-        role,
-        holder,
-        window.valid_from,
-        window.valid_to,
-        granted_by,
-        reason,
-    )
-    .await?;
+    let id = match act {
+        None => {
+            RoleAssignmentRepository::grant(
+                &mut tx,
+                role,
+                holder,
+                window.valid_from,
+                window.valid_to,
+                granted_by,
+                reason,
+            )
+            .await?
+        }
+        Some(act) => {
+            let Some(granted_by) = granted_by else {
+                anyhow::bail!(
+                    "a grant on a confirmed act names its grantor: --granted-by <the act's \
+                     proposer>"
+                );
+            };
+            RoleAssignmentRepository::grant_on_act(
+                &mut tx,
+                role,
+                holder,
+                window.valid_from,
+                window.valid_to,
+                granted_by,
+                reason,
+                act,
+            )
+            .await?
+        }
+    };
     let row = RoleAssignmentRepository::get(&mut tx, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("assignment {id} not readable after its grant"))?;
@@ -123,15 +196,19 @@ pub async fn grant(
     Ok(row)
 }
 
-/// End `assignment` now, in one transaction (committed under `apply`).
-/// Returns whether this call ended it and the row as it stands.
+/// End `assignment` now, in one transaction (committed under `apply`), on
+/// the confirmed admin act `act` when given. Returns whether this call ended
+/// it and the row as it stands.
 ///
 /// # Errors
-/// The assignment does not exist, or a statement failed.
+/// The assignment does not exist, the table's guard refused it (ELV10 an end
+/// with no act while a live custodian holds a passkey, ELV08 / ELV09 an act
+/// that does not authorize this end), or a statement failed.
 pub async fn end(
     conn: &mut PgConnection,
     assignment: Uuid,
     reason: &str,
+    act: Option<Uuid>,
     apply: bool,
 ) -> anyhow::Result<(bool, RoleAssignmentRow)> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
@@ -141,7 +218,10 @@ pub async fn end(
     {
         anyhow::bail!("no role assignment {assignment}; nothing was changed");
     }
-    let ended = RoleAssignmentRepository::end(&mut tx, assignment, reason).await?;
+    let ended = match act {
+        None => RoleAssignmentRepository::end(&mut tx, assignment, reason).await?,
+        Some(act) => RoleAssignmentRepository::end_on_act(&mut tx, assignment, reason, act).await?,
+    };
     let row = RoleAssignmentRepository::get(&mut tx, assignment)
         .await?
         .ok_or_else(|| anyhow::anyhow!("assignment {assignment} vanished"))?;

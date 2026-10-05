@@ -41,8 +41,9 @@
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
 //!     epigraph-operator grant-role --role role:platform-custodian --holder <uuid> \
 //!         (--valid-to <RFC3339> | --open-ended) [--valid-from <RFC3339>] \
-//!         [--granted-by <uuid>] --reason TEXT [--apply]
-//!     epigraph-operator end-role-assignment --assignment <uuid> --reason TEXT [--apply]
+//!         [--granted-by <uuid>] --reason TEXT [--act <uuid>] [--apply]
+//!     epigraph-operator end-role-assignment --assignment <uuid> --reason TEXT [--act <uuid>] \
+//!         [--apply]
 //!     epigraph-operator list-role-assignments [--role R] [--include-ended]
 //!     epigraph-operator custodial-supersede --claim <uuid> (--content TEXT | --content-file F) \
 //!         --truth <0..1> --assignment <uuid> --actor <uuid> --reason TEXT [--allow-owned] [--apply]
@@ -102,6 +103,11 @@ enum Command {
         /// Recorded on the assignment and in its audit row.
         #[arg(long)]
         reason: String,
+        /// A CONFIRMED `role.grant` admin act (migration 130) whose args are
+        /// exactly these flags, proposed by --granted-by. Required once the
+        /// grantor holds a passkey (ELV10 otherwise).
+        #[arg(long)]
+        act: Option<Uuid>,
         /// Commit. Without it, the grant, its audit row and its projection roll back.
         #[arg(long)]
         apply: bool,
@@ -114,6 +120,11 @@ enum Command {
         /// Recorded on the assignment and in its audit row.
         #[arg(long)]
         reason: String,
+        /// A CONFIRMED `role.end` admin act (migration 130) for this
+        /// assignment and this reason. Required while any live custodian holds
+        /// a passkey (ELV10 otherwise).
+        #[arg(long)]
+        act: Option<Uuid>,
         /// Commit. Without it, the end and its audit row roll back.
         #[arg(long)]
         apply: bool,
@@ -545,17 +556,42 @@ async fn main_inner() -> anyhow::Result<i32> {
             holder,
             granted_by,
             reason,
+            act,
             apply,
             ..
         } => {
             let window = window.expect("validated above");
-            let row =
-                custodian::grant(&mut conn, &role, holder, window, granted_by, &reason, apply)
-                    .await?;
+            if let Some(act) = act {
+                let Some(grantor) = granted_by else {
+                    eprintln!(
+                        "epigraph-operator: REFUSED: a grant on a confirmed act names its \
+                         grantor: --granted-by <the act's proposer>. Nothing was changed."
+                    );
+                    return Ok(1);
+                };
+                let args = custodian::grant_act_args(&role, holder, window, &reason);
+                if let Some(why) = custodian::act_refusal(
+                    &mut conn,
+                    act,
+                    epigraph_db::admin_act::ROLE_GRANT,
+                    &args,
+                    Some(grantor),
+                )
+                .await?
+                {
+                    eprintln!("epigraph-operator: REFUSED: {why}. Nothing was changed.");
+                    return Ok(1);
+                }
+            }
+            let row = custodian::grant(
+                &mut conn, &role, holder, window, granted_by, &reason, act, apply,
+            )
+            .await?;
             println!(
-                "{}GRANTED\t{}",
+                "{}GRANTED\t{}{}",
                 if apply { "" } else { "WOULD BE " },
-                custodian::describe(&row)
+                custodian::describe(&row),
+                act.map_or_else(String::new, |a| format!("\tact={a}"))
             );
             if !apply {
                 println!(
@@ -567,14 +603,31 @@ async fn main_inner() -> anyhow::Result<i32> {
         Command::EndRoleAssignment {
             assignment,
             reason,
+            act,
             apply,
         } => {
-            let (ended, row) = custodian::end(&mut conn, assignment, &reason, apply).await?;
+            if let Some(act) = act {
+                let args = custodian::end_act_args(assignment, &reason);
+                if let Some(why) = custodian::act_refusal(
+                    &mut conn,
+                    act,
+                    epigraph_db::admin_act::ROLE_END,
+                    &args,
+                    None,
+                )
+                .await?
+                {
+                    eprintln!("epigraph-operator: REFUSED: {why}. Nothing was changed.");
+                    return Ok(1);
+                }
+            }
+            let (ended, row) = custodian::end(&mut conn, assignment, &reason, act, apply).await?;
             println!(
-                "{}{}\t{}",
+                "{}{}\t{}{}",
                 if apply || !ended { "" } else { "WOULD BE " },
                 if ended { "ENDED" } else { "ALREADY-ENDED" },
-                custodian::describe(&row)
+                custodian::describe(&row),
+                act.map_or_else(String::new, |a| format!("\tact={a}"))
             );
             if !apply {
                 println!("DRY RUN: the end and its audit row were rolled back.");
