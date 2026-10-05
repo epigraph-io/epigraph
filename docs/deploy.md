@@ -2251,3 +2251,44 @@ is executed exactly as the previous section says.
 Then `docs/runbooks/131-undo.sql` on the migration DSN, BEFORE `130-undo.sql`:
 the reader's `LANGUAGE sql` body records no dependency on 130's table, so
 130-undo alone would leave it behind. The acts stay (130-undo archives them).
+
+## The offline confirmation verifier (no migration) — `epigraph-operator verify-confirmations`
+
+The database cannot verify a WebAuthn signature: the definers that confirm an
+elevation ticket (125) and an admin act (130) record what the API says it
+verified, with the evidence. So a holder of the application DSN can forge a
+confirmation through those definers, and a holder of the maintenance DSN can
+write the rows directly. That is not preventable in this stack; this verb
+makes it DETECTABLE.
+
+`epigraph-operator verify-confirmations [--since <RFC3339>] [--json]`, on the
+maintenance DSN, with `EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`
+set to the values the API's ceremonies ran under (it refuses to run without
+them: exit 1). For every CONFIRMED ticket and act it re-verifies the stored
+evidence against the confirming passkey's stored public key, the rp id and the
+origin, and checks that the evidence's challenge is the row's own (an act's is
+recomputed from the act id, its stored args digest and its stored nonce),
+that the passkey is the person's, and that a device-bound passkey did not
+assert as backup-eligible. Across rows it flags a challenge asserted more than
+once (a replayed evidence object) and an elevation session that no confirmed
+ticket opened (a session written directly). Refused assertions are counted,
+not verified.
+
+- Exit 0: everything checked verifies. Exit 2: at least one finding; each is
+  printed and recorded ONCE as a `platform.confirmation_unverified` security
+  event attributed to the person (a rerun reports it again and records
+  nothing more). Exit 1: no relying party configured, or a failure.
+- A wrong `EPIGRAPH_WEBAUTHN_ORIGIN` or `_RP_ID` makes every genuine
+  confirmation fail (`assertion_does_not_verify`) and records a row for each:
+  check the two values against the API's before the first run.
+- Before migration 130 the acts are skipped; the elevations are verified.
+
+When to run it: before the FIRST real elevation (with the check that only the
+request units hold the application DSN, a precondition of opening the
+recorder gate), after every admin session, and on a timer. A finding means a
+confirmation nobody's passkey made: end the person's elevations
+(`end-elevation --person`), treat the application or maintenance DSN as
+compromised, and rotate it.
+
+Deploy: `epigraph-operator` from the same commit; nothing else. Rollback: the
+previous binary (the recorded findings stay).
