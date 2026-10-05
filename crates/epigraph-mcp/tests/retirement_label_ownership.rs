@@ -342,7 +342,7 @@ async fn update_labels_admits_resolved_for_the_author_and_a_same_operator_siblin
         .await
         .contains(&"resolved".to_string()));
 
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
     let (sibling, _) = fixture::seed_agent_with_group(&pool, "sibling").await;
     for agent in [me, sibling] {
         let mut conn = pool.acquire().await.expect("acquire");

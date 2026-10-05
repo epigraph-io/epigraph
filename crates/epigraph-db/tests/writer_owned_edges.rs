@@ -473,7 +473,7 @@ async fn a_synthesis_sourced_edge_onto_a_public_claim_is_the_writers(pool: PgPoo
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operators_agents_share_their_edges_and_nobody_else_does(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
-    let (operator, operator_g) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, operator_g) = fixture::seed_human_operator(&pool, "operator").await;
     let (agent_a, agent_a_g) = fixture::seed_agent_with_group(&pool, "operated-a").await;
     let (agent_b, _) = fixture::seed_agent_with_group(&pool, "operated-b").await;
     let (unlinked, _) = fixture::seed_agent_with_group(&pool, "unlinked").await;
@@ -512,7 +512,7 @@ async fn an_operators_agents_share_their_edges_and_nobody_else_does(pool: PgPool
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_agents_edge_is_owned_by_its_operators_group(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
-    let (operator, operator_g) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, operator_g) = fixture::seed_human_operator(&pool, "operator").await;
     let (agent, _) = fixture::seed_agent_with_group(&pool, "operated").await;
     link(&pool, agent, operator).await;
     let a = fixture::seed_public_claim(&pool, author, "public A").await;
@@ -1218,7 +1218,7 @@ async fn reown(
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_legacy_reown_follows_an_attributable_signer_only(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
-    let (operator, operator_g) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, operator_g) = fixture::seed_human_operator(&pool, "operator").await;
     let (linked, _) = fixture::seed_agent_with_group(&pool, "linked-signer").await;
     let (personal, personal_g) = fixture::seed_agent_with_group(&pool, "personal-signer").await;
     let (excluded, _) = fixture::seed_agent_with_group(&pool, "excluded-signer").await;

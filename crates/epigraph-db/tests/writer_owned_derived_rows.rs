@@ -252,7 +252,7 @@ async fn a_writer_attaches_evidence_mass_and_trace_to_a_world_claim_it_cannot_wr
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_agent_attaches_under_its_operators_group(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
-    let (operator, operator_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, operator_group) = fixture::seed_human_operator(&pool, "operator").await;
     let (agent, agent_group) = fixture::seed_agent_with_group(&pool, "operated").await;
     {
         let mut conn = pool.acquire().await.expect("acquire");
@@ -1108,7 +1108,7 @@ async fn a_non_owner_cannot_bind_a_world_claim_to_false_on_binary_truth(pool: Pg
 async fn a_legacy_claim_owned_bba_is_replaceable_after_the_maintenance_reown(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (w, w_group) = fixture::seed_agent_with_group(&pool, "writer").await;
-    let (operator, operator_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, operator_group) = fixture::seed_human_operator(&pool, "operator").await;
     let (operated, _) = fixture::seed_agent_with_group(&pool, "operated").await;
     let (member, member_group) = fixture::seed_agent_with_group(&pool, "member").await;
     {

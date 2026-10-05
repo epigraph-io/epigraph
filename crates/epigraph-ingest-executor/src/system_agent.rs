@@ -262,3 +262,42 @@ pub async fn system_agent_write_authority(
     }
     Ok(SystemAgentAuthority { agent_id, viewer })
 }
+
+/// Bind the REAL caller of a workflow-ingest write (migration 122, review
+/// SEC-3). Call it on the system-agent-stamped transaction
+/// ([`system_agent_write_authority`]'s viewer), before the executor writes.
+///
+/// Every executor row is authored as, and stamped from, the one shared
+/// `workflow-ingest-system` agent, so the database's claims trigger sees only
+/// that identity: bound once it is live-linked, whoever called. This asks the
+/// question the trigger cannot: may `caller` write a claim into the group the
+/// system agent's rows are owned by (its default declaration, which is its
+/// operator's group once it is live-linked)? `caller` must be bound (`OPL01`;
+/// `None` is unbound), its human must write that group (`OPL02`), and it must
+/// belong to the system agent's human (`OPL02`, the attribution check, which
+/// the valve never relieves), so an unbound caller writes nothing once the
+/// database is armed, with the valve open too, and another human's caller
+/// cannot reach the linked human's group through the system identity. On an
+/// unarmed database every check is quiet.
+///
+/// # Errors
+/// [`epigraph_db::DbError::OperatorLinkRequired`],
+/// [`epigraph_db::DbError::OperatorScopeRefused`], or whatever resolving the
+/// system agent's default declaration returns (its own `OPL01` / `OPL02` when
+/// it is not bound).
+pub async fn require_caller_write_authority(
+    conn: &mut sqlx::PgConnection,
+    system_agent: Uuid,
+    caller: Option<Uuid>,
+) -> Result<(), epigraph_db::DbError> {
+    let decl =
+        epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, system_agent).await?;
+    let Some(group) = decl.owner_group_bind() else {
+        return Err(epigraph_db::DbError::InvalidData {
+            reason: "the workflow-ingest-system agent's default declaration names no owner group"
+                .to_string(),
+        });
+    };
+    epigraph_db::AgentRepository::require_writer_authority(&mut *conn, system_agent, caller, group)
+        .await
+}

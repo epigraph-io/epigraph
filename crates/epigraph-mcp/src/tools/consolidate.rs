@@ -116,7 +116,7 @@ pub async fn consolidate_claims(
         // Migration 105's refusal from the all-public branch's owner lookup
         // (the acting agent's personal membership is revoked, or its did_key
         // squatted): a denial, INVALID_REQUEST, as on every other write tool.
-        other if other.is_personal_group_refusal() => crate::errors::db_caller_error(other),
+        other if other.is_write_authority_refusal() => crate::errors::db_caller_error(other),
         other => internal_error(other),
     })?;
     // The cascade's trigger, and its administrative session acquired BEFORE

@@ -129,6 +129,28 @@ pub fn centroid_columns_for_dim(centroid_dim: u32) -> Option<(&'static str, &'st
     }
 }
 
+/// Theme membership of a query's nearest neighbourhood, measured by
+/// [`ClaimThemeRepository::nearest_theme_coverage_since`].
+///
+/// The input to the diverse-retrieval coverage guard: diverse mode draws its
+/// candidates ONLY from members of the themes it shortlisted, so if most of the
+/// claims nearest a query are outside that shortlist (unthemed, or in a theme
+/// that was not shortlisted), diverse mode cannot see them and should not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeighbourhoodThemeCoverage {
+    /// Rows the probe actually returned. At most the requested `k`, and fewer
+    /// when the viewer can see fewer candidates, or when an approximate (HNSW)
+    /// index scan returns a truncated candidate list — so a coverage fraction
+    /// must be computed over THIS, never over the requested `k`.
+    pub probed: i64,
+    /// How many of the probed rows diverse mode could actually return: members
+    /// of one of the shortlisted themes that also carry an embedding at the
+    /// dimension diverse mode ranks by. A claim that is unthemed, in a theme
+    /// outside the shortlist, or missing that embedding is unreachable and
+    /// does not count.
+    pub reachable: i64,
+}
+
 pub struct ClaimThemeRepository;
 
 impl ClaimThemeRepository {
@@ -671,6 +693,98 @@ impl ClaimThemeRepository {
             })
             .collect();
         Ok(results)
+    }
+
+    /// Measure how much of a query's nearest neighbourhood diverse mode can
+    /// reach through its theme shortlist.
+    ///
+    /// Takes the `k` claims nearest `query_vec` in the candidate space
+    /// [`Self::claims_in_themes_at_dim_since`] draws from — same
+    /// `paragraph_only` level filter, same `since` window, same viewer
+    /// predicate — but WITHOUT the theme restriction, and reports how many of
+    /// them diverse mode could return: members of `shortlist` (the themes the
+    /// theme lookup picked) that carry an embedding at `reachable_dim`, the
+    /// dimension the candidate query ranks by. See
+    /// [`NeighbourhoodThemeCoverage`].
+    ///
+    /// Counting shortlist membership, not membership in any theme, is
+    /// deliberate: the candidate query is `theme_id = ANY(shortlist)`, so a
+    /// neighbour that sits in a theme outside the shortlist is exactly as
+    /// invisible to diverse mode as an unthemed one.
+    ///
+    /// `neighbourhood_dim` picks the embedding column the neighbourhood is
+    /// ordered by. It may differ from `reachable_dim`: the REST route probes
+    /// on the 1536-d column (which carries the ANN index; the 3072-d column
+    /// has none, so ordering by it scans every row that has one) and checks
+    /// 3072-d reachability per probed row. `query_vec` must be at
+    /// `neighbourhood_dim`.
+    ///
+    /// Per-query rather than a corpus-wide ratio on purpose: a corpus can be
+    /// mostly unthemed while a given query's neighbourhood is fully themed, and
+    /// vice versa. It is also tenancy-neutral — it counts only rows the viewer
+    /// can see — and data-independent (no stored statistic to go stale).
+    ///
+    /// Generic over [`sqlx::PgExecutor`] so the REST route can run it on its
+    /// viewer-stamped connection, like the two theme reads above.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn nearest_theme_coverage_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_vec: &str,
+        neighbourhood_dim: u32,
+        shortlist: &[Uuid],
+        reachable_dim: u32,
+        k: i32,
+        paragraph_only: bool,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<NeighbourhoodThemeCoverage, DbError> {
+        let unsupported = |dim: u32| DbError::InvalidData {
+            reason: format!("unsupported centroid_dim: {dim} (must be 1536 or 3072)"),
+        };
+        let (_, nn_col) = centroid_columns_for_dim(neighbourhood_dim)
+            .ok_or_else(|| unsupported(neighbourhood_dim))?;
+        let (_, reach_col) =
+            centroid_columns_for_dim(reachable_dim).ok_or_else(|| unsupported(reachable_dim))?;
+
+        let level_clause = if paragraph_only {
+            " AND (c.properties->>'level')::int = 2"
+        } else {
+            ""
+        };
+
+        // The nearest-k subquery is ordered and limited BEFORE anything is
+        // counted, so the reachability test cannot change which rows are
+        // probed. An unthemed claim has a NULL theme_id, for which `= ANY`
+        // yields NULL and the FILTER excludes it.
+        let sql = format!(
+            "SELECT COUNT(*)::int8 AS probed, \
+                    COUNT(*) FILTER (WHERE nn.reachable)::int8 AS reachable \
+             FROM ( \
+                 SELECT (c.theme_id = ANY($4::uuid[]) AND c.{reach_col} IS NOT NULL) AS reachable \
+                 FROM claims c \
+                 WHERE c.{nn_col} IS NOT NULL \
+                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)\
+                   {level_clause} \
+                   /* {{VISIBILITY:c}} */ \
+                 ORDER BY c.{nn_col} <=> $1::vector \
+                 LIMIT $2 \
+             ) nn"
+        );
+        let sql = viewer.splice(&sql, 5);
+
+        let mut q = sqlx::query(&sql)
+            .bind(query_vec)
+            .bind(k)
+            .bind(since)
+            .bind(shortlist);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row = q.fetch_one(executor).await.map_err(DbError::from)?;
+        Ok(NeighbourhoodThemeCoverage {
+            probed: row.get("probed"),
+            reachable: row.get("reachable"),
+        })
     }
 
     /// Delete all themes and unassign all claims (for re-clustering).

@@ -1396,3 +1396,263 @@ async fn migration_116_shared_signer_retire_is_owned_and_not_app_executable(pool
         assert_eq!(can, expected, "{role} EXECUTE on the shared-signer retire");
     }
 }
+
+/// Migration 122 (operator binding): every definer it adds is a SECURITY
+/// DEFINER owned by `epigraph_maintenance` (the reads must pass
+/// `epigraph_definer_bypass()` to see `operator_links` at all, and the trigger
+/// body must reach the check without a per-role grant), carries an explicit
+/// ACL that excludes PUBLIC, and grants `epigraph_app` exactly the four reads
+/// the request path calls. Arming is maintenance-only. The owner is pinned here
+/// because the harness migrates as a superuser, so a silently no-opped
+/// `OWNER TO` would still pass every behavioural test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_122_operator_binding_definers_are_owned_and_granted(pool: PgPool) {
+    for (name, signature, volatility, app_may_execute) in [
+        (
+            "epigraph_is_human_operator",
+            "public.epigraph_is_human_operator(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_author_binding",
+            "public.epigraph_author_binding(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_binding_enforced",
+            "public.epigraph_operator_binding_enforced()",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_require_bound_author",
+            "public.epigraph_require_bound_author(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_claims_require_operator_binding",
+            "public.epigraph_claims_require_operator_binding()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_arm_operator_binding",
+            "public.epigraph_arm_operator_binding()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_link_legacy_authors",
+            "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_operator_writes_group",
+            "public.epigraph_operator_writes_group(uuid, uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_scope_exempt",
+            "public.epigraph_operator_scope_exempt()",
+            "s",
+            false,
+        ),
+        (
+            "epigraph_require_operator_scope",
+            "public.epigraph_require_operator_scope(uuid, uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_group_memberships_operator_scope",
+            "public.epigraph_group_memberships_operator_scope()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_register_human_operator",
+            "public.epigraph_register_human_operator(uuid, text, uuid)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_human_of",
+            "public.epigraph_human_of(uuid, boolean)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_binding_armed",
+            "public.epigraph_operator_binding_armed()",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_require_bound_writer",
+            "public.epigraph_require_bound_writer(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_require_writer_scope",
+            "public.epigraph_require_writer_scope(uuid, uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_require_attributable",
+            "public.epigraph_require_attributable(uuid, uuid, boolean)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_links_audit",
+            "public.epigraph_operator_links_audit()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_human_operators_guard_insert",
+            "public.epigraph_human_operators_guard_insert()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_human_operators_guard_update",
+            "public.epigraph_human_operators_guard_update()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_human_operators_audit",
+            "public.epigraph_human_operators_audit()",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_revoke_human_operator",
+            "public.epigraph_revoke_human_operator(uuid, text)",
+            "v",
+            false,
+        ),
+        (
+            "epigraph_operator_links_operator_is_human",
+            "public.epigraph_operator_links_operator_is_human()",
+            "v",
+            false,
+        ),
+    ] {
+        let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+               FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+               JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE n.nspname = 'public' AND p.proname = $1",
+        )
+        .bind(name)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl) =
+            meta.unwrap_or_else(|| panic!("public.{name} must exist (migration 122)"));
+        assert!(secdef, "{name} must stay SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{name} owner");
+        assert_eq!(vol, volatility, "{name} volatility");
+        assert!(
+            acl.is_some(),
+            "{name} must carry an EXPLICIT ACL; a NULL proacl is the default grant, which \
+             includes EXECUTE to PUBLIC"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_may_execute),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE on {name}");
+        }
+    }
+
+    // The arming record and the human-operator registry: SELECT for the app,
+    // SELECT and INSERT (never a table-wide UPDATE or DELETE) for the
+    // maintenance role. That grant set is what makes arming one-way and the
+    // registry append-only apart from its revocation columns.
+    for (role, privilege, expected) in [
+        ("epigraph_app", "SELECT", true),
+        ("epigraph_app", "INSERT", false),
+        ("epigraph_app", "UPDATE", false),
+        ("epigraph_app", "DELETE", false),
+        ("epigraph_maintenance", "SELECT", true),
+        ("epigraph_maintenance", "INSERT", true),
+        ("epigraph_maintenance", "UPDATE", false),
+        ("epigraph_maintenance", "DELETE", false),
+    ] {
+        for table in ["public.operator_binding_arming", "public.human_operators"] {
+            let can: bool = sqlx::query_scalar("SELECT has_table_privilege($1, $2, $3)")
+                .bind(role)
+                .bind(table)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("table privilege");
+            assert_eq!(can, expected, "{role} {privilege} on {table}");
+        }
+    }
+    // The registry's revocation columns are the maintenance role's one UPDATE.
+    for (col, expected) in [
+        ("revoked_at", true),
+        ("revoked_by", true),
+        ("revoked_reason", true),
+        ("agent_id", false),
+        ("client_id", false),
+        ("reason", false),
+    ] {
+        let can: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege('epigraph_maintenance', 'public.human_operators', $1, \
+             'UPDATE')",
+        )
+        .bind(col)
+        .fetch_one(&pool)
+        .await
+        .expect("column privilege");
+        assert_eq!(can, expected, "maintenance UPDATE of human_operators.{col}");
+    }
+}
+
+/// Migration 122: the operator-binding claims trigger fires AFTER
+/// `claims_require_tenancy` (PostgreSQL fires same-event BEFORE ROW triggers in
+/// name order). Its OPL02 scope check reads `owner_group_id`, which the tenancy
+/// trigger fills for a supersede or a step-lineage insert; sorting first, it
+/// read NULL and refused every supersede of a linked agent's claim (review
+/// SEC-4). Renaming the trigger back fails this.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_122_binding_trigger_fires_after_the_tenancy_fill(pool: PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT tgname::text FROM pg_trigger \
+          WHERE tgrelid = 'public.claims'::regclass AND NOT tgisinternal \
+            AND tgname IN ('claims_require_tenancy', 'claims_require_operator_binding', \
+                           'claims_require_tenancy_then_operator_binding') \
+          ORDER BY tgname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("trigger names");
+    assert_eq!(
+        names,
+        vec![
+            "claims_require_tenancy".to_string(),
+            "claims_require_tenancy_then_operator_binding".to_string()
+        ],
+        "the binding trigger must exist once, and sort after the tenancy trigger"
+    );
+}

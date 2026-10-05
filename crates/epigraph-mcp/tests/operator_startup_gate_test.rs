@@ -210,7 +210,7 @@ async fn register_signer(pool: &PgPool, seed: u8) -> (Uuid, String) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_http_listener_refuses_a_signer_that_already_has_an_operator_link(pool: PgPool) {
     let db_url = fixture::database_url_for(&pool).await;
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
 
     // CALIBRATION: unlinked signer, same everything else -> serves.
     let (_unlinked, unlinked_key) = register_signer(&pool, 0x63).await;
@@ -283,6 +283,9 @@ async fn an_http_listener_refuses_a_signer_that_already_has_an_operator_link(poo
     // claim the linked agent authored.
     let (operator_signer, operator_key) = register_signer(&pool, 0x66).await;
     let (operated, _) = register_signer(&pool, 0x67).await;
+    // The signer must be a registered human to be anyone's operator
+    // (migration 122); what is under test is the listener's refusal.
+    fixture::make_human_operator(&pool, operator_signer).await;
     let mut conn = pool.acquire().await.expect("acquire");
     epigraph_db::AgentRepository::link_retired_agent(&mut conn, operated, operator_signer)
         .await
@@ -381,7 +384,7 @@ async fn a_stdio_agent_self_links_at_startup_and_a_restart_does_not_revive_a_rev
     pool: PgPool,
 ) {
     let db_url = fixture::database_url_for(&pool).await;
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
     let model = "operator-gate-test-model";
     let prompt_hash = "ab".repeat(32);
     let pk = epigraph_crypto::keypair_from_llm_agent_prehashed(model, &prompt_hash).public_key();

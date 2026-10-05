@@ -613,6 +613,33 @@ impl From<DbError> for ApiError {
                         .to_string(),
                 }
             }
+            // Migration 122 (OPL01): the author is not bound to a human
+            // operator. A denial; the code and the fix are the useful part of
+            // the body, and the agent id stays in the log, as for the two above.
+            DbError::OperatorLinkRequired { message } => {
+                tracing::warn!(detail = %message, "claim author is not bound to a human operator");
+                ApiError::Forbidden {
+                    reason: format!(
+                        "OPL01: the author agent, or the authenticated caller writing it, is \
+                         not bound to a human operator (neither a human operator nor the holder \
+                         of a live operator link); nothing was written. Fix: {}",
+                        epigraph_db::OPERATOR_LINK_FIX
+                    ),
+                }
+            }
+            // Migration 122 section 1b (OPL02): a linked agent outside its
+            // operator's groups. The group and operator ids stay in the log.
+            DbError::OperatorScopeRefused { message } => {
+                tracing::warn!(detail = %message, "linked agent outside its operator's groups");
+                ApiError::Forbidden {
+                    reason: "OPL02: the write is outside the groups its human operator holds \
+                             writer/admin membership in, or names an author that belongs to \
+                             another human than the caller's; an agent writes only where its own \
+                             operator writes, and only in its own human's name. Nothing was \
+                             written."
+                        .to_string(),
+                }
+            }
             DbError::InvalidData { reason } => ApiError::ValidationError {
                 field: "data".to_string(),
                 reason,
@@ -749,6 +776,40 @@ mod tests {
             other => panic!("23514 must not be a DatabaseError: {other:?}"),
         }
         assert_eq!(api.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Migration 122's OPL01 is a DENIAL (403), not a server fault, and its
+    /// body carries the stable code and the fix; the database's text (which
+    /// names the agent) stays in the log.
+    #[cfg(feature = "db")]
+    #[test]
+    fn an_unbound_author_is_forbidden_with_the_code_and_the_fix() {
+        let api = ApiError::from(DbError::OperatorLinkRequired {
+            message: "OPL01: agent 00000000-0000-0000-0000-00000000abcd is not bound".to_string(),
+        });
+        match &api {
+            ApiError::Forbidden { reason } => {
+                assert!(reason.contains("OPL01"), "the code: {reason}");
+                assert!(
+                    reason.contains("epigraph-operator link"),
+                    "the fix: {reason}"
+                );
+                assert!(
+                    !reason.contains("00000000-0000-0000-0000-00000000abcd"),
+                    "the database text must stay server-side: {reason}"
+                );
+            }
+            other => panic!("OPL01 must be Forbidden: {other:?}"),
+        }
+        assert_eq!(api.into_response().status(), StatusCode::FORBIDDEN);
+
+        let scope = ApiError::from(DbError::OperatorScopeRefused {
+            message: "OPL02: agent a is linked to operator o ... group g".to_string(),
+        });
+        match &scope {
+            ApiError::Forbidden { reason } => assert!(reason.starts_with("OPL02"), "{reason}"),
+            other => panic!("OPL02 must be Forbidden: {other:?}"),
+        }
     }
 
     #[test]

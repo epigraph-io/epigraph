@@ -555,3 +555,62 @@ async fn paragraph_only_filter_excludes_non_paragraph_claims(pool: PgPool) {
         "paragraph_only=false must surface both levels; got selected={lax_ids:?}"
     );
 }
+
+/// The theme-coverage probe FAILS OPEN: when the probe statement errors (here
+/// forced by renaming the column only the probe and the candidate query read,
+/// after a control run proves the fixture is covered), the pipeline returns
+/// `Ok(vec![])` — the caller's flat-fallback signal — instead of propagating
+/// the error and failing a request that flat retrieval can still answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn coverage_probe_failure_falls_back_instead_of_erroring(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let theme = seed_theme_with_centroid(&pool, "covering", &cluster_pgvec(0, 1.0)).await;
+    for i in 0..10 {
+        seed_claim_in_theme(
+            &pool,
+            agent,
+            theme,
+            &format!("covered-{i}"),
+            2,
+            &cluster_pgvec_with_drift(0, 1.0, 1, 0.01 * i as f32),
+        )
+        .await;
+    }
+    let query = cluster_pgvec(0, 1.0);
+    let config = || DiverseRetrievalConfig {
+        centroid_dim: 1536,
+        max_themes: 5,
+        candidate_pool: DEFAULT_CANDIDATE_POOL,
+        budget: 5,
+        alpha: 0.4,
+        paragraph_only: true,
+        since: None,
+    };
+
+    let control = run_diverse_pipeline(&pool, &viewer, &query, config())
+        .await
+        .expect("control run must succeed");
+    assert_eq!(
+        control.len(),
+        5,
+        "control: a fully covered neighbourhood must run diverse selection"
+    );
+
+    // Break ONLY the probe: the theme lookup reads `claim_themes`, and the
+    // probe is the first statement to touch `claims.theme_id`.
+    sqlx::query("ALTER TABLE claims RENAME COLUMN theme_id TO theme_id_unavailable")
+        .execute(&pool)
+        .await
+        .expect("rename theme_id");
+
+    let result = run_diverse_pipeline(&pool, &viewer, &query, config()).await;
+    match result {
+        Ok(selected) => assert!(
+            selected.is_empty(),
+            "a failed probe must signal flat fallback (empty), got {} rows",
+            selected.len()
+        ),
+        Err(e) => panic!("a failed coverage probe must fail open, not error: {e}"),
+    }
+}
