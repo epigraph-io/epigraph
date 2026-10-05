@@ -24,6 +24,21 @@
 //! for ids, and recorded on its own stamped transaction (one viewer
 //! resolution, one recorder call).
 //!
+//! # An elevated token writes through no route (elevation plan EL-10)
+//!
+//! Before anything else, a request whose token carries an elevation claim
+//! (`elv`: minted only by the elevate grant) is REFUSED (403 `ELEVATED
+//! READ-ONLY`) unless its method is `GET`, `HEAD` or `OPTIONS` or its route
+//! is on [`ELEVATED_NON_GET_ALLOWLIST`]. Keyed on the CLAIM, not on a live
+//! session: an elevate-grant token is read-only for its whole life, so a
+//! token whose session ended (or a forged claim) cannot write through a route
+//! that checks no scope and writes on the unscoped pool (the cp2 COR-1 class:
+//! `assess`, `refine_frame`, `submit_evidence`), and the refusal needs no
+//! database round trip. This is the API's counterpart of the MCP server's
+//! dispatch refusal; the admin write routes (client approval, entity-type
+//! registration, the privatization acts) are maintenance-CLI-only for an
+//! elevated session (plan EQ-5), and the refusal says so.
+//!
 //! # Fail-closed
 //!
 //! Any failure after the handler ran for an elevated viewer (a body too large
@@ -50,6 +65,48 @@ pub const MAX_RECORDED_BODY: usize = 64 * 1024 * 1024;
 
 /// The longest path or query string the log keeps.
 const MAX_ARG_TEXT: usize = 2048;
+
+/// The non-GET routes a token carrying an elevation claim may still call
+/// (`(method, matched route)`): the two elevation routes, which act as the
+/// PERSON rather than as the elevation (open a ticket, end an elevation:
+/// [`super::bearer::UnelevatedViewer`]), and POST routes that only READ
+/// (measured: each reads through the viewer and writes nothing). Every other
+/// non-GET request with an elevation claim is refused. Adding a route here is
+/// a security decision: it must write nothing, directly or through a definer.
+pub const ELEVATED_NON_GET_ALLOWLIST: &[(&str, &str)] = &[
+    ("POST", "/api/v1/elevation/tickets"),
+    ("POST", "/api/v1/elevation/end"),
+    ("POST", "/api/v1/search/semantic"),
+    ("POST", "/api/v1/graph/query"),
+    ("POST", "/api/v1/triples/query"),
+    ("POST", "/api/v1/embeddings/neighborhood-density"),
+];
+
+/// The refusal text: the elevated read-only denial (`DbError::ElevatedReadOnly`'s
+/// `ELEVATED READ-ONLY` marker) and where admin writes go instead.
+pub const ELEVATED_WRITE_REFUSAL: &str = "ELEVATED READ-ONLY: this token carries an elevation \
+     claim, and an elevated token writes through no route; write with an unelevated token. \
+     Admin writes (client approval, entity types, privatization acts) run through \
+     `epigraph-operator` on the maintenance DSN";
+
+/// `Some(refusal)` when a request with an elevation claim asks `method` of
+/// `route` (the matched route template) and that is not a read: any method
+/// but `GET`, `HEAD` and `OPTIONS`, unless the pair is on
+/// [`ELEVATED_NON_GET_ALLOWLIST`].
+#[must_use]
+pub fn elevated_write_refusal(method: &axum::http::Method, route: &str) -> Option<ApiError> {
+    use axum::http::Method;
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        || ELEVATED_NON_GET_ALLOWLIST
+            .iter()
+            .any(|(m, r)| *m == method.as_str() && *r == route)
+    {
+        return None;
+    }
+    Some(ApiError::Forbidden {
+        reason: ELEVATED_WRITE_REFUSAL.to_string(),
+    })
+}
 
 /// What the extractor knew when it built an elevated viewer: enough to build
 /// it again for the recorder's own transaction.
@@ -110,18 +167,22 @@ pub async fn record_elevated_access(
     if auth.elevation_claim.is_none() {
         return next.run(request).await;
     }
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| request.uri().path(), MatchedPath::as_str)
+        .to_string();
+    if let Some(refusal) = elevated_write_refusal(request.method(), &route) {
+        tracing::info!(
+            target: "elevation",
+            method = %request.method(),
+            route = %route,
+            "a request carrying an elevation claim asked to write; refused"
+        );
+        return refusal.into_response();
+    }
 
-    let surface = bounded(
-        &format!(
-            "{} {}",
-            request.method(),
-            request
-                .extensions()
-                .get::<MatchedPath>()
-                .map_or_else(|| request.uri().path(), MatchedPath::as_str)
-        ),
-        MAX_SURFACE_LEN,
-    );
+    let surface = bounded(&format!("{} {}", request.method(), route), MAX_SURFACE_LEN);
     let path = bounded(request.uri().path(), MAX_ARG_TEXT);
     let query = request
         .uri()
@@ -189,4 +250,54 @@ pub async fn record_elevated_access(
         return withheld(&e.to_string());
     }
     Response::from_parts(parts, Body::from(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{elevated_write_refusal, ELEVATED_NON_GET_ALLOWLIST};
+    use axum::http::Method;
+
+    /// Reads pass, every other method is refused unless allowlisted, and the
+    /// refusal carries the elevated read-only marker and the CLI pointer.
+    #[test]
+    fn only_reads_and_the_allowlist_pass_an_elevation_claim() {
+        for m in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(elevated_write_refusal(&m, "/api/v1/claims/:id/assess").is_none());
+        }
+        for m in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let refused = elevated_write_refusal(&m, "/api/v1/claims/:id/assess");
+            let text = format!("{refused:?}");
+            assert!(text.contains("ELEVATED READ-ONLY"), "{m}: {text}");
+            assert!(text.contains("epigraph-operator"), "{m}: {text}");
+        }
+        for (m, r) in ELEVATED_NON_GET_ALLOWLIST {
+            let method: Method = m.parse().unwrap();
+            assert!(elevated_write_refusal(&method, r).is_none(), "{m} {r}");
+            // The pair, not the path alone: another method on it is refused.
+            assert!(
+                elevated_write_refusal(&Method::DELETE, r).is_some(),
+                "DELETE {r}"
+            );
+        }
+    }
+
+    /// Every allowlist entry is a REAL non-GET route of the database router,
+    /// spelled as `routes/mod.rs` registers it (a stale or misspelled entry
+    /// would hide nothing but would read as a decision that was never made).
+    #[test]
+    fn every_allowlisted_pair_is_a_registered_route() {
+        let flat: String = include_str!("../routes/mod.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (m, r) in ELEVATED_NON_GET_ALLOWLIST {
+            let method = m.to_ascii_lowercase();
+            let a = format!(".route(\"{r}\", {method}(");
+            let b = format!(".route( \"{r}\", {method}(");
+            assert!(
+                flat.contains(&a) || flat.contains(&b),
+                "{m} {r} is not registered in routes/mod.rs"
+            );
+        }
+    }
 }

@@ -1293,9 +1293,15 @@ async fn the_elevated_token_carries_no_write_scope(pool: PgPool) {
     assert_eq!(scopes, vec!["agents:read", "claims:read", "platform:admin"]);
 
     let agent = |key: u8| json!({ "public_key": hex::encode([key; 32]), "display_name": "cp1" });
+    // Since EL-10 the API refuses the elevated token's non-GET request before
+    // the route's scope check (`elevated_write_refusal`); the token's scope
+    // set above is what this test pins.
     let (status, body) = s.post("/api/v1/agents", Some(&token), &agent(0x11)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert!(body.to_string().contains("agents:write"), "{body}");
+    assert!(
+        body.to_string().contains("agents:write") || refused_as_elevated(&body),
+        "{body}"
+    );
 
     let plain = s.scoped_token(&p, None, &["agents:write"]);
     let (status, body) = s.post("/api/v1/agents", Some(&plain), &agent(0x22)).await;
@@ -1723,13 +1729,18 @@ fn refused_as_elevated(body: &Value) -> bool {
 /// The elevated token (the elevate grant's: `elv` = a live session, `fam` =
 /// its family) resolves an ELEVATED viewer: a write is refused 403 ELEVATED
 /// READ-ONLY, a read of the caller's own private row still answers 200. The
-/// same principal's unelevated token, a forged claim, and the claim of an
-/// ENDED session all resolve the scoped viewer: the write is not refused for
-/// elevation, and the request is served.
+/// same principal's unelevated token writes (not refused for elevation).
 ///
-/// Verified to fail with the extractor ignoring the claim (always the scoped
-/// viewer: the elevated write is not refused), and with `AppState::write_as`
-/// mapping the refusal to a 500 (the status).
+/// Since EL-10 the API refuses every non-GET request whose token CARRIES an
+/// elevation claim (`middleware::elevated_access::elevated_write_refusal`),
+/// before the viewer is resolved: so a forged claim and the claim of an ENDED
+/// session are refused the write too (an elevate-grant token is read-only for
+/// its life), while their READS resolve the scoped viewer and are served.
+///
+/// Verified to fail with the chokepoint removed from the recorder layer AND
+/// the extractor ignoring the claim (the elevated write is not refused; either
+/// alone is covered by the other), and with a forged claim's write let through
+/// (the chokepoint keyed on a live session).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_elevated_token_reads_and_writes_nothing(pool: PgPool) {
     let s = spawn(&pool, Some(software())).await;
@@ -1756,19 +1767,30 @@ async fn an_elevated_token_reads_and_writes_nothing(pool: PgPool) {
     let (status, body) = s.get(&format!("/api/v1/claims/{mine}"), &elevated).await;
     assert_eq!(status, StatusCode::OK, "an elevated read is served: {body}");
 
-    for (what, token) in [
-        ("the unelevated token", s.scoped_token(&p, None, &scopes)),
-        (
-            "a forged claim",
-            s.scoped_token(&p, Some(Uuid::new_v4()), &scopes),
-        ),
-    ] {
-        let (status, body) = s.post("/api/v1/edges", Some(&token), &an_edge()).await;
-        assert!(
-            !refused_as_elevated(&body),
-            "{what}: refused as elevated ({status}): {body}"
-        );
-    }
+    let (status, body) = s
+        .post(
+            "/api/v1/edges",
+            Some(&s.scoped_token(&p, None, &scopes)),
+            &an_edge(),
+        )
+        .await;
+    assert!(
+        !refused_as_elevated(&body),
+        "the unelevated token: refused as elevated ({status}): {body}"
+    );
+    let forged = s.scoped_token(&p, Some(Uuid::new_v4()), &scopes);
+    let (status, body) = s.post("/api/v1/edges", Some(&forged), &an_edge()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        refused_as_elevated(&body),
+        "a token carrying a (forged) elevation claim writes nothing: {body}"
+    );
+    let (status, body) = s.get(&format!("/api/v1/claims/{mine}"), &forged).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a forged claim's read resolves the scoped viewer and is served: {body}"
+    );
 
     // The elevated token ends its own session (the route acts as the
     // principal), and its claim then resolves scoped: served, not refused.
@@ -1781,12 +1803,17 @@ async fn an_elevated_token_reads_and_writes_nothing(pool: PgPool) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let (status, body) = s.post("/api/v1/edges", Some(&elevated), &an_edge()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(
-        !refused_as_elevated(&body),
-        "an ended session's claim is not elevated ({status}): {body}"
+        refused_as_elevated(&body),
+        "an ended session's elevate-grant token still writes nothing ({status}): {body}"
     );
     let (status, body) = s.get(&format!("/api/v1/claims/{mine}"), &elevated).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an ended session's claim reads unelevated, served: {body}"
+    );
 }
 
 // =====================================================================
@@ -2511,4 +2538,128 @@ async fn an_elevated_read_of_pinned_evidence_is_recorded_for_its_owner(pool: PgP
     );
     assert_eq!(log_seen_by(&pool, h).await, 1, "H reads it");
     assert_eq!(log_seen_by(&pool, b).await, 0, "B does not");
+}
+
+// =====================================================================
+// EL-10: an elevated token writes through no non-GET route
+// =====================================================================
+
+/// The API refuses every non-GET request whose token carries an elevation
+/// claim, except the allowlisted ones (review cp2 COR-1 / cp1 SEC-06; the
+/// recorder gate's opening condition (2)). On the APPLICATION-ROLE unit:
+///
+/// * `POST /api/v1/claims/{P's own claim}/assess` checks no scope and writes
+///   on the unscoped pool (the cp2 class). On a unit whose pool reads P's
+///   private claim (the privileged unit: the application-role unit's unscoped
+///   pool sees no private row, so the route cannot reach it there), P's plain
+///   `claims:read` token is served and writes a mass function (CALIBRATION:
+///   the route writes); P's elevated token is refused 403 ELEVATED READ-ONLY
+///   and writes nothing.
+/// * `POST /api/v1/admin/clients/:id/approve` (an admin write) is refused the
+///   same way, and the refusal points at `epigraph-operator`.
+/// * `POST /api/v1/triples/query` (allowlisted: it only reads) is served to
+///   the elevated token, and so is `POST /api/v1/elevation/end`.
+///
+/// Verified to fail with the refusal removed from the recorder layer (the
+/// elevated assess writes a mass function), and with the allowlist emptied
+/// (the elevated triples query is refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_token_writes_through_no_non_get_route(pool: PgPool) {
+    // `assess` loads `calibration.toml` relative to the working directory (see
+    // `a_privileged_unit_never_serves_an_elevated_request`).
+    std::env::set_current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).unwrap();
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let p_group: Uuid = sqlx::query_scalar(
+        "SELECT group_id FROM group_memberships WHERE agent_id = $1 ORDER BY group_id LIMIT 1",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("P's own group");
+    let mine = fixture::seed_group_claim(&pool, p.person, p_group, "el10 P own claim").await;
+    let other = fixture::seed_group_claim(&pool, p.person, p_group, "el10 P other claim").await;
+    let (_, t) = s
+        .open_ticket(&s.human_token(&p, Some(p.family), None), "read")
+        .await;
+    let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
+    let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
+    let plain = s.scoped_token(&p, None, &["claims:read"]);
+    let mass_functions = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+                .bind(claim)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let body = json!({"evidence_type": "empirical", "methodology": "instrumental",
+                      "confidence": 0.8, "supports": true});
+
+    let privileged = spawn_privileged(&pool).await;
+    let before = mass_functions(other).await;
+    let (status, seen) = privileged
+        .post(
+            &format!("/api/v1/claims/{other}/assess"),
+            Some(&plain),
+            &body,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "CALIBRATION: assess writes: {seen}");
+    assert!(
+        mass_functions(other).await > before,
+        "CALIBRATION: the plain token's assess wrote a mass function"
+    );
+
+    let before = mass_functions(mine).await;
+    let (status, seen) = privileged
+        .post(
+            &format!("/api/v1/claims/{mine}/assess"),
+            Some(&elevated),
+            &body,
+        )
+        .await;
+    assert_eq!(
+        mass_functions(mine).await,
+        before,
+        "nothing written for the elevated token ({status}): {seen}"
+    );
+    assert_eq!(status, StatusCode::FORBIDDEN, "{seen}");
+    assert!(refused_as_elevated(&seen), "{seen}");
+
+    let (status, seen) = s
+        .post(
+            &format!("/api/v1/admin/clients/{}/approve", Uuid::new_v4()),
+            Some(&elevated),
+            &json!({"scopes": ["claims:read"]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{seen}");
+    assert!(
+        refused_as_elevated(&seen) && seen.to_string().contains("epigraph-operator"),
+        "an admin write is maintenance-CLI-only for an elevated token: {seen}"
+    );
+
+    let (status, seen) = s
+        .post("/api/v1/triples/query", Some(&elevated), &json!({}))
+        .await;
+    assert!(
+        status.is_success() && !refused_as_elevated(&seen),
+        "an allowlisted read POST is served elevated ({status}): {seen}"
+    );
+    let resp = s
+        .http
+        .post(s.url("/api/v1/elevation/end"))
+        .bearer_auth(&elevated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the elevated token ends its own session"
+    );
 }

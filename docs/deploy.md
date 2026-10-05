@@ -1906,7 +1906,9 @@ invited). Every such read is recorded against the hidden row's owning group
 
 **It does NOT open the gate.** 125's gate waits on more than the log (125's
 header, "OPENING IT WAITS ON MORE THAN THE RECORDER"): the API refusal of
-elevated non-GET requests is not built at 127. So after 127, as before it,
+elevated non-GET requests is not built at 127 (EL-10 builds it in
+`epigraph-api`: see "An elevated token writes through no API route" below;
+the gate still stays closed until the stack's last migration). So after 127, as before it,
 no session is live on any database, and every recorder call is refused
 (`ELV07`) because no connection is elevated. The opening is a later
 migration of this stack.
@@ -2040,3 +2042,29 @@ policy DDL.
 transaction, recreates the four bodies exactly as 083 and 087 left them. Run
 it BEFORE `128-undo.sql`. On an ARMED database it returns the standing
 custodian reads at once; disarm first if that is not intended.
+
+## An elevated token writes through no API route (no migration)
+
+`epigraph-api` refuses, before routing reaches the handler, every request
+whose token CARRIES an elevation claim (`elv`, minted only by the elevate
+grant) unless its method is `GET`, `HEAD` or `OPTIONS` or the route is on
+`middleware::elevated_access::ELEVATED_NON_GET_ALLOWLIST`: the two elevation
+routes (open a ticket, end an elevation: they act as the person) and the POST
+routes that only read (`/api/v1/search/semantic`, `/api/v1/graph/query`,
+`/api/v1/triples/query`, `/api/v1/embeddings/neighborhood-density`). The
+refusal is 403 `ELEVATED READ-ONLY` and names `epigraph-operator` on the
+maintenance DSN as the place admin writes (client approval, entity types,
+privatization acts) run while elevated. Keyed on the claim, not on a live
+session: an elevate-grant token is read-only for its whole life, so a write
+route that checks no scope and writes on the unscoped pool (`assess`,
+`refine_frame`, `submit_evidence`) never runs for one, and the check costs no
+database round trip. Nothing changes for a token without the claim.
+
+This is the API half of the recorder gate's opening condition (2) (125's
+header, "OPENING IT WAITS ON MORE THAN THE RECORDER"). The gate itself stays
+CLOSED: it opens in the stack's last migration, after the remaining
+preconditions (the offline confirmation verifier among them).
+
+Deploy: with `epigraph-api`, in any order; no migration. Rollback: the
+previous binary.
+

@@ -1005,7 +1005,8 @@ Current reservation:
   of the opening conditions in 125's header, pinned evidence is settled (the
   operator's interim ruling: an elevated session may read it, and the read is
   recorded for the row's owner) and `recall_events` is attributed here, but
-  the API refusal of elevated non-GET requests is not built, so no session is
+  the API refusal of elevated non-GET requests is not built (EL-10 builds it
+  later, in `epigraph-api`, and the gate still stays closed), so no session is
   live after 127 either. Registers: the census EXCLUDED list, the
   FORCE registers (state.rs, locked_decisions, rls_enforcement, 079-undo),
   rls_enforcement's session helpers. Behaviour in
