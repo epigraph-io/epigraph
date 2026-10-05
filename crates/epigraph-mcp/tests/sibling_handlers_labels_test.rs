@@ -165,6 +165,72 @@ async fn query_paper_returns_real_labels_and_retirement_state(pool: PgPool) {
     );
 }
 
+/// The arms above all read as the PUBLIC viewer over public claims, so the
+/// viewer handed to the new `labels_by_ids` call is never exercised there. Here
+/// the asserted claims are group-private to the caller's own group: the row read
+/// (`list_asserted_claims`, static `$4`/`$5` group binds) admits them, and the
+/// label read (`labels_by_ids`, `{VISIBILITY:claims}` splice) must admit them
+/// too. If the two predicates disagreed — or the label read were given some
+/// other viewer — the caller would get its own claims back with `labels: []`
+/// and no error, the very symptom backlog `1e6efd2d` is about.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_serves_labels_of_the_callers_own_group_private_claims(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "u008-paper-private").await;
+    let doi = "10.48550/arXiv.9999.00809";
+
+    let paper = seed_paper(&pool, doi).await;
+    let superseded = seed_claim(&pool, agent, &["private-archived"], 0.6, false, None).await;
+    let current = seed_claim(
+        &pool,
+        agent,
+        &["private-current"],
+        0.7,
+        true,
+        Some(superseded),
+    )
+    .await;
+    common::stamp_group_private(&pool, superseded, group).await;
+    common::stamp_group_private(&pool, current, group).await;
+    seed_asserts_edge(&pool, paper, superseded).await;
+    seed_asserts_edge(&pool, paper, current).await;
+
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("resolve the owning agent's viewer");
+    assert_eq!(
+        viewer.group_bind(),
+        Some([group].as_slice()),
+        "CALIBRATION: the caller must be scoped to exactly its own group, or this \
+         arm is the public arm again"
+    );
+
+    let server = build_test_server(pool.clone());
+    let result = query_paper(
+        &server,
+        &viewer,
+        QueryPaperParams {
+            doi: doi.to_string(),
+            limit: Some(50),
+            offset: None,
+        },
+    )
+    .await
+    .expect("query_paper");
+    let body = parse_value(&result);
+    let claims = body["claims"]
+        .as_array()
+        .unwrap_or_else(|| panic!("query_paper body has a claims array: {body}"))
+        .clone();
+
+    assert_retirement_pair(
+        &claims,
+        current,
+        &["private-current"],
+        superseded,
+        &["private-archived"],
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_undecomposed_claims_returns_real_labels(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
