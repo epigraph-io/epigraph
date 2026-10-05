@@ -48,6 +48,26 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 async fn app_role_server(pool: &PgPool) -> (EpiGraphMcpFull, Uuid) {
+    let (plain, scoped) = app_role_pools(pool).await;
+    let server = build_scoped_test_server(plain, scoped);
+    let agent = server.server_agent_id().await.expect("server agent");
+    (server, agent)
+}
+
+/// The same app-role server with a per-process GENERATED signer: no declared
+/// signer identity (`--agent-key` / `--agent-model` absent), the configuration
+/// `common::build_test_server_generated_signer` documents as the one epiclaw
+/// agent containers run. `require_owner_or_admin` answers
+/// `OwnershipGrant::UndeclaredSigner` for a claim it did not author there, and
+/// only `gate_retirement_label` turns that into a refusal for `resolved`.
+async fn app_role_server_undeclared(pool: &PgPool) -> (EpiGraphMcpFull, Uuid) {
+    let (plain, scoped) = app_role_pools(pool).await;
+    let server = build_scoped_test_server_generated_signer(plain, scoped);
+    let agent = server.server_agent_id().await.expect("server agent");
+    (server, agent)
+}
+
+async fn app_role_pools(pool: &PgPool) -> (PgPool, ScopedPool) {
     let bypassrls: bool =
         sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
             .fetch_one(pool)
@@ -63,9 +83,7 @@ async fn app_role_server(pool: &PgPool) -> (EpiGraphMcpFull, Uuid) {
             .await
             .expect("app-role ScopedPool");
     let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
-    let server = build_scoped_test_server(plain, scoped);
-    let agent = server.server_agent_id().await.expect("server agent");
-    (server, agent)
+    (plain, scoped)
 }
 
 /// A human's OAuth token: its graph agent is `agent`, its login principal
@@ -260,9 +278,54 @@ async fn a_stdio_signer_cannot_retire_another_agents_claim_in_its_own_group(pool
     )
     .await
     .expect_err("a declared stdio signer must not retire a claim it did not author");
+    // The DECLARED arm's text (`require_owner_or_admin`), not the
+    // undeclared-signer refusal ("has no declared signer identity", from
+    // `gate_retirement_label`), which the next test pins: both mention a
+    // "declared signer identity", so each test names the arm it reached.
     assert!(
-        err.message.contains("declared signer identity"),
-        "the refusal must be the stdio ownership rule's: {}",
+        err.message
+            .contains("is this server's declared signer identity")
+            && !err.message.contains("no declared signer"),
+        "the refusal must be the declared stdio signer's ownership rule: {}",
+        err.message
+    );
+    assert_nothing_written(&pool, c, "resolved").await;
+}
+
+/// FAILS before the fix. The production stdio population: a server with NO
+/// declared signer (a per-process generated key) writes the group owning
+/// another agent's PUBLIC claim. `require_owner_or_admin` cannot decide
+/// ownership there and answers `UndeclaredSigner` (an allow), so a bare
+/// ownership call would let `resolved` through; `gate_retirement_label`
+/// refuses that arm for the retirement label, as `update_labels` does
+/// (`retirement_label_ownership.rs::an_undeclared_stdio_signer_cannot_retire_a_claim_it_did_not_author`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undeclared_stdio_signer_cannot_retire_another_agents_claim_in_its_own_group(
+    pool: PgPool,
+) {
+    let (server, me) = app_role_server_undeclared(&pool).await;
+    let sg = personal_group_of(&pool, me).await;
+    let (other, _) = fixture::seed_agent_with_group(&pool, "uwe-undeclared-other").await;
+    let c = claim_of(
+        &pool,
+        other,
+        sg,
+        "public",
+        "another agent's item in the undeclared signer's group",
+    )
+    .await;
+
+    let err = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer(&pool, me).await,
+        params(c, "closing this with no declared signer", &["resolved"]),
+        None,
+    )
+    .await
+    .expect_err("undecidable ownership must not retire another agent's claim");
+    assert!(
+        err.message.contains("no declared signer"),
+        "the refusal must be the undeclared-signer arm's: {}",
         err.message
     );
     assert_nothing_written(&pool, c, "resolved").await;
@@ -338,9 +401,73 @@ async fn a_group_writers_evidence_without_labels_still_lands(pool: PgPool) {
     assert_ne!(
         truth_of(&pool, c).await,
         0.5,
-        "on a claim the caller can write, truth_written=true"
+        "on a claim the caller can write, truth_written=true. This pins drain U004 part 1 \
+         OPTION A (a non-author group writer's evidence moves truth_value), the current \
+         behaviour pending the operator's ruling; if B or C is chosen, invert THIS assertion"
     );
     assert_eq!(labels_of(&pool, c).await, vec!["backlog".to_string()]);
+}
+
+/// `claims:admin` over HTTP passes both label gates on a claim its group
+/// writes but it did not author: the group writer `w`, holding the admin
+/// scope, retires its colleague's claim. Rules out an over-narrow ownership
+/// predicate (`caller == claim.agent_id`), which every refusal arm above would
+/// also accept. No `seed_admin_grant`: that record is re-checked only by
+/// `update_labels`' audited admin path, which `update_with_evidence` does not
+/// have, so seeding it would hide what this calibrates.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claims_admin_retires_a_colleagues_claim_its_group_writes(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let TeamFixture { w, c, .. } = team(&pool).await;
+
+    epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer(&pool, w).await,
+        params(c, "closing a colleague's item as admin", &["resolved"]),
+        Some(&human(w, &["claims:write", "claims:admin"])),
+    )
+    .await
+    .expect("claims:admin passes require_owner_or_admin and the retirement gate");
+    let labels = labels_of(&pool, c).await;
+    assert!(labels.contains(&"resolved".to_string()), "{labels:?}");
+    assert!(labels.contains(&"backlog".to_string()), "{labels:?}");
+    assert_eq!(evidence_rows(&pool, c).await, 1);
+}
+
+/// `update_with_evidence` has NO admin path (CLAUDE.md, #374 note): a
+/// `claims:admin` caller labelling a PUBLIC claim owned by a group it cannot
+/// write is refused with nothing written, where `update_labels` would route the
+/// same label through its audited admin path. The admin scope does not lift
+/// the foreign-public label refusal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claims_admin_cannot_label_a_public_claim_its_group_cannot_write(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "uwe-foreign-author").await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "uwe-outside-admin").await;
+    let c = claim_of(
+        &pool,
+        h,
+        hg,
+        "public",
+        "a public claim outside the admin's groups",
+    )
+    .await;
+
+    let err = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer(&pool, a).await,
+        params(c, "admin labelling a foreign public claim", &["topic-x"]),
+        Some(&human(a, &["claims:write", "claims:admin"])),
+    )
+    .await
+    .expect_err("update_with_evidence has no admin path for a label merge");
+    assert!(
+        err.message
+            .contains("its labels belong to the claim's owner"),
+        "the refusal must be the foreign-public label rule's: {}",
+        err.message
+    );
+    assert_nothing_written(&pool, c, "topic-x").await;
 }
 
 /// On stdio, free labels on a claim this server's agent can write stay ungated
