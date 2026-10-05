@@ -3324,6 +3324,7 @@ mod tests {
             axum::Router::new()
                 .route("/api/v1/workflows/ingest", post(ingest_workflow))
                 .route("/api/v1/workflows/steps", post(add_step))
+                .route("/api/v1/workflows/steps/delete", post(delete_step))
                 .layer(axum::Extension(auth))
                 .with_state(state.clone())
         };
@@ -3382,6 +3383,48 @@ mod tests {
             assert_eq!(after, before, "{who}: nothing written");
         }
 
+        // The delete route: refused for the same reason, the step's truth
+        // untouched (main drove it to 0.05 behind the WARN).
+        let lineage: Uuid = sqlx::query_scalar(
+            "SELECT c.step_lineage_id FROM claims c JOIN edges e ON e.target_id = c.id \
+               JOIN workflows w ON w.id = e.source_id \
+              WHERE w.canonical_name = 'h3-http-legacy' AND c.step_lineage_id IS NOT NULL \
+              LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let truths_sql = "SELECT truth_value FROM claims WHERE step_lineage_id = $1 ORDER BY id";
+        let truths: Vec<f64> = sqlx::query_scalar(truths_sql)
+            .bind(lineage)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let resp = router_as(stranger.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/steps/delete",
+                serde_json::json!({"canonical_name": "h3-http-legacy", "step_lineage_id": lineage}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a stranger's delete on a legacy workflow"
+        );
+        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+            .to_string();
+        assert!(body.contains("no recorded submitter"), "delete: {body}");
+        let truths_after: Vec<f64> = sqlx::query_scalar(truths_sql)
+            .bind(lineage)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            truths_after, truths,
+            "delete: the step's truth is untouched"
+        );
+
         let mut next = ingest_payload("h3-http-legacy");
         next["source"]["generation"] = serde_json::json!(1);
         next["phases"][0]["summary"] = serde_json::json!("a stranger's generation");
@@ -3393,6 +3436,12 @@ mod tests {
             resp.status(),
             StatusCode::FORBIDDEN,
             "a new generation of a legacy lineage"
+        );
+        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+            .to_string();
+        assert!(
+            body.contains("no recorded submitter"),
+            "generation 1 is refused by the legacy rule, not another 403: {body}"
         );
         let generations: Vec<(i32, Option<String>)> = sqlx::query_as(
             "SELECT generation, metadata->>'epigraph_submitted_by' FROM workflows \
@@ -3407,6 +3456,43 @@ mod tests {
         let mut admin = test_auth();
         admin.scopes.push("claims:admin".to_string());
         let admin_agent = admin.agent_id.unwrap();
+        let audits_sql = "SELECT count(*) FROM security_events \
+                          WHERE event_type = 'workflows.admin_write' AND agent_id = $1";
+
+        // claims:admin in the token alone, before its client record grants it:
+        // the audited admin arm refuses it ADM02 (not a silent "no admin"),
+        // naming the legacy workflow, and nothing is written or audited.
+        let resp = router_as(admin.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-legacy", "step_text": "a grantless admin's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "claims:admin in the token alone does not admit a legacy workflow"
+        );
+        let body = String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes())
+            .to_string();
+        assert!(body.contains("ADM02"), "grantless admin: {body}");
+        assert!(
+            body.contains("no recorded submitter"),
+            "grantless admin: {body}"
+        );
+        let after: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "grantless admin: nothing written");
+        let audits: i64 = sqlx::query_scalar(audits_sql)
+            .bind(admin_agent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(audits, 0, "grantless admin: nothing audited");
+
         sqlx::query(
             "INSERT INTO agents (id, public_key, display_name) \
              VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'u005 http admin')",
