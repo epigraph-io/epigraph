@@ -912,6 +912,9 @@ fn refresh_scopes(
         .filter(|s| requested.is_empty() || requested.contains(&s.as_str()))
         .cloned()
         .collect();
+    if issued.is_empty() && !requested.is_empty() {
+        return None;
+    }
     Some(issued)
 }
 
