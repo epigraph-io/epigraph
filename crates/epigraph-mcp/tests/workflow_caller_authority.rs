@@ -309,7 +309,7 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(
     );
     assert_eq!(steps(&pool, "h3-legacy").await, before, "nothing written");
 
-    tools::step_ops::delete_step(
+    let err = tools::step_ops::delete_step(
         &server,
         &stranger_viewer,
         DeleteStepParams {
@@ -320,27 +320,63 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(
     )
     .await
     .expect_err("a stranger must not soft-delete a legacy workflow's step");
+    assert!(
+        err.message.contains("no recorded submitter"),
+        "refused by the legacy rule, not for another reason: {}",
+        err.message
+    );
     assert_eq!(
         lineage_truths(&pool, lineage).await,
         truths,
         "the step's truth is untouched (not driven to 0.05)"
     );
 
-    tools::workflow_ingest::improve_workflow_hierarchy(
+    // A refined phase, as the admin arm's improve uses: the call differs from
+    // the stored generation, so the only thing left to refuse it is authority.
+    let mut refined = extraction("ignored", serde_json::json!({}));
+    refined.phases[0].summary = "a stranger's refined phase".to_string();
+    let err = tools::workflow_ingest::improve_workflow_hierarchy(
         &server,
         &stranger_viewer,
         ImproveWorkflowHierarchyParams {
             parent_canonical_name: "h3-legacy".to_string(),
-            extraction: extraction("ignored", serde_json::json!({})),
+            extraction: refined,
         },
         Some(&stranger_token),
     )
     .await
     .expect_err("a stranger must not add a generation to a legacy lineage");
+    assert!(
+        err.message.contains("no recorded submitter"),
+        "refused by the legacy rule, not for another reason: {}",
+        err.message
+    );
     assert_eq!(
         generation_rows(&pool, "h3-legacy").await,
         vec![(0, None)],
         "no generation-1 row"
+    );
+
+    // CALIBRATION: the lineage the stranger was refused on IS deletable — a
+    // stdio delete_step (unchecked) drives its head to 0.05 — so the refusal
+    // above was the authority gate, not an unknown lineage.
+    let public = fixture::public_viewer(&pool).await;
+    tools::step_ops::delete_step(
+        &server,
+        &public,
+        DeleteStepParams {
+            canonical_name: "h3-legacy".to_string(),
+            step_lineage_id: lineage.to_string(),
+        },
+        None,
+    )
+    .await
+    .expect("stdio soft-deletes the same step");
+    let after = lineage_truths(&pool, lineage).await;
+    assert_ne!(after, truths, "the stdio delete changed the lineage");
+    assert!(
+        after.iter().any(|t| (t - 0.05).abs() < 1e-9),
+        "its head is driven to 0.05: {after:?}"
     );
 }
 
