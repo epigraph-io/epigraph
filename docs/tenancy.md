@@ -797,7 +797,11 @@ reads the platform audit trail and confers nothing else.
   `platform.` row, and no row is ever edited, deleted or back-dated. The
   trail is NOT proof against a holder of the maintenance DSN: `granted_by`
   and an act's actor are UUIDs that login supplies, checked for a live
-  custodian but not bound to a confirmed act until the elevation batch.
+  custodian. Since migration 130, once the acting custodian holds a live
+  passkey the write must name a PASSKEY-CONFIRMED admin act whose canonical
+  arguments are exactly the write's (`ELV10` otherwise; see "Elevation"
+  below); before any passkey exists the write is a bootstrap act, audited
+  `confirmation = 'none'`.
   A holder of `role:auditor` (or the custodian role) reads the trail through
   `epigraph_platform_audit(since, limit)`.
 * **Custodial acts**: privatization plan writes (create, approve, abort,
@@ -823,20 +827,135 @@ reads the platform audit trail and confers nothing else.
   every other live row loudly, naming why (an agent, a human linked as an
   agent, a human whose client is not active).
 
-Not yet built (the elevation batch): activating the role per session
-(time-boxed, passkey-confirmed), per-act confirmation, audited READS,
-group-held assignments, and visibility of the trail to the persons it names.
-Until then the role confers no WRITE authority on an application session,
-and every custodial write is a maintenance act. It does confer standing READ
-authority there, keyed on the session's stamped principal (which any holder
-of the application DSN sets, so it is not a secret): 083's
-`security_events_read` arm admits EVERY `security_events` row (every agent's
-`oauth.`, `cascade.` and `platform.` events, not only the platform trail) to a
-principal holding the custodian role; the privatization plan and item reads
-admit it for the groups it administers, and the privatization audit read
-admits every plan-level row (entity ids only for those groups); and it passes
-the privatization routes' gate. Gating those reads behind a per-session elevation is the
-elevation batch's work (operator ruling OQ-12).
+The role confers no WRITE authority on an application session: every custodial
+write is a maintenance act. Its standing READ authority (083's
+`security_events_read` arm, the privatization plan, item and audit reads, and
+the privatization routes' gate, all keyed on the session's stamped principal,
+which any holder of the application DSN sets) follows the admin-scope switch
+since migration 129: UNARMED it is as described here; ARMED it needs a live
+elevation. Activating the role per session, per-act confirmation and audited
+reads are the next section.
+
+## Elevation: time-boxed, passkey-confirmed READ for custodians (migrations 124-132)
+
+**What it is.** A holder of an elevating role (today `role:platform-custodian`)
+may, for at most 15 minutes, READ rows of groups it is not a member of. It is
+"sudo READ": nothing is written through an elevation except the audit trail
+and an admin-act proposal. Every elevated access is recorded where the people
+whose rows were read can see it. Migration 132 opens it (125's recorder gate);
+before 132 no session is ever live.
+
+**Who may elevate** (operator ruling D2). Only a REGISTERED HUMAN, not linked
+as any human's agent, holding a LIVE assignment of an elevating role, with a
+live passkey (WebAuthn with user verification, ruling D5), on a live refresh
+family of its own human OAuth client. Agents never elevate (they hold no
+role, `CUS01`); `instance_admins` and standing flags never qualify. All of
+this is re-checked by the database on EVERY statement, so revoking the
+assignment, the registration, the client, the family or the confirming
+passkey ends the elevation at once.
+
+**How.**
+
+* Passkeys are enrolled on a maintenance-DSN ticket
+  (`epigraph-operator passkey-enroll`), completed by the person at
+  `/elevate/enroll/<id>` on their own device. A later passkey of a holder
+  needs a confirmed `passkey.register` act. The relying party requires a
+  verified attestation on a configured allowlist; the test and development
+  flag that accepts software (`none` / self) attestation,
+  `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION`, is REFUSED by the API on a
+  database armed for operator binding, at boot and while running.
+* The CLI / console path (the one served by default): `POST
+  /api/v1/elevation/tickets {reason}` with the person's own token opens a
+  ticket; the person confirms it with their passkey at `/elevate/<ticket>`
+  (only their own passkeys are offered; another person's passkey on the
+  ticket is REFUSED and audited); the client then redeems the ticket at
+  `/oauth/token` (`urn:epigraph:grant:elevate`) for ONE token: at most the
+  session's lifetime, no refresh token, the client's scopes minus every
+  admin-only one plus `platform:admin`, naming the session (`elv`).
+* MCP `sudo` / `unsudo` (connector mode) exist but `sudo` is served only with
+  `EPIGRAPH_MCP_CONNECTOR_ELEVATION` on, which is OFF by default (see the
+  limits). `unsudo`, `POST /api/v1/elevation/end` and `epigraph-operator
+  end-elevation` end a session early.
+
+**What an elevated request may do.** Read: 126's per-table read arms admit
+every row to a live elevated session on the application role; the request's
+own query fragment is always-true for an elevated viewer, so the database
+decides. Write: nothing. The API refuses every non-GET request from a token
+carrying an elevation claim (a named allowlist of read-only POSTs aside, and
+the one act-proposal route); the MCP transport refuses every non-read tool
+and every federated tool to an elevated request; the database's RESTRICTIVE
+policies refuse INSERT, UPDATE and DELETE on every armed table; a pool
+connection is scrubbed of the elevation on release; a task detached from an
+elevated request runs as the person's ordinary viewer.
+
+**Who sees that it happened.** Every elevated request (REST response or MCP
+tool result) is recorded in `elevated_access` BEFORE the response leaves; if
+the record cannot be written the response is withheld. A row names the
+session, the person, the reason, the surface, the ids and filters (never
+content), the row count, and the GROUPS whose non-public rows the response
+named; an admin member of such a group reads the row through its row policy,
+and a holder of `role:auditor` or an elevated custodian reads all rows through
+a definer reader. Attribution is by the ids the response contains, so it errs
+toward the subject: a group id merely mentioned (a public row's owner, a
+not-found error naming an id) attributes that group, and an aggregate with no
+row ids is recorded with no group. No API route or MCP tool shows a subject
+their rows yet: they are readable on the database through the policy.
+
+**Operator-hidden (pinned) evidence** is readable to an elevated session that
+reads the claims it is for or against, and every such read is recorded for
+the evidence row's owning group. This is an INTERIM operator ruling ("for
+now"); a later one may restore hiding.
+
+**Admin acts** (migrations 130 and 131). An elevated person PROPOSES an act
+(`POST /api/v1/admin/acts`, or MCP `propose_admin_act` listed only to an
+elevated request): `role.grant`, `role.end`, `claim.custodial_supersede`, or
+`passkey.register`, with its arguments stored in a canonical form and digested.
+The same person CONFIRMS that act with their passkey at `/elevate/act/<id>`;
+the WebAuthn challenge commits to the act's id, its stored digest and a stored
+nonce, so a page cannot show one act while another is confirmed. The
+maintenance CLI then EXECUTES it (`epigraph-operator grant-role |
+end-role-assignment | custodial-supersede | passkey-enroll ... --act <id>`),
+recomputing the digest from its own flags and consuming the act in the same
+transaction; the audit row carries `confirmation = passkey`, the act id and
+the elevation id. The database's guards enforce this for direct maintenance
+statements too (`ELV10`): once the acting custodian holds a passkey, a
+custodial write without a confirmed act is refused. `revoke-passkey` is the
+break-glass back to the bootstrap path.
+
+**Admin-only scopes** (`claims:admin`, `clients:admin`, `groups:admin`, ...)
+pass through one mint chokepoint and one check chokepoint behind a switch that
+ships UNARMED. Armed, no grant mints them, a standing one counts for nothing
+on an unelevated request, and an elevated request holds the admin READ
+scopes; arming is an operator step (`docs/deploy.md`).
+
+**The honest limits, stated rather than left to be found.**
+
+* **Tokens are HS256 until the EdDSA token work.** A holder of the token
+  secret can forge an elevation claim and a family; the database still
+  requires a live session bound to that principal and family, but the forger
+  can ride a LIVE elevation of the person's family while it lasts.
+* **Forged confirmations are DETECTABLE, not preventable.** The database
+  cannot verify a WebAuthn signature, so a holder of the application DSN can
+  record a confirmation through the confirm definers, and a holder of the
+  maintenance DSN can write the rows directly. `epigraph-operator
+  verify-confirmations` re-verifies every stored confirmation offline (the
+  signature against the stored public key, the act binding, a replayed
+  evidence object, a session no confirmed ticket opened) and records each
+  finding. It does not detect: an assertion phished from the person's real
+  passkey over a challenge the forger chose; a maintenance holder editing or
+  deleting the ceremony rows or the trail (the append-only guards bind every
+  login a superuser has not disabled); a signature counter going back across
+  confirmations.
+* **Connector-mode family scope is unmeasured.** An MCP `sudo` elevates the
+  calling token's refresh family; whether a connector shares one family
+  across chats is not measured, so connector mode stays OFF and the CLI path
+  is the served one.
+* **MCP reads are not widened.** The MCP read tools read on the server's own
+  unstamped pool, so an elevated MCP request reads no more than before; its
+  calls are still recorded (attributed when the answer names a row). The REST
+  surface is widened.
+* **Lockdown, group-held assignments, a two-person rule and signed audit
+  events are out of scope** for this stack.
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 
