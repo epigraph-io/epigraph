@@ -1563,7 +1563,8 @@ impl ClaimRepository {
                 WHERE up.up_depth < 100 /* {VISIBILITY:p} */
             -- CYCLE, not merely the depth bound. `mark_duplicate` writes
             -- `dup.supersedes = canonical` with no cycle check, so X<->Y and
-            -- X->X loops exist in real data. `up_depth < 100` stops the walk
+            -- X->X loops are writable through the repo (how many exist in prod
+            -- data was never counted). `up_depth < 100` stops the walk
             -- running forever, but it does NOT stop it EMITTING: MEASURED on a
             -- database migrated 001->head, a self-supersedes loop came back as
             -- the same row 101 times and an X<->Y pair as 101 alternating rows,
