@@ -1085,10 +1085,27 @@ Current reservation:
   carries a `130`. **Applied to a throwaway database only, NOT to any deployed
   database.**
 
-- **131+**: public next (the elevation stack stays at or below 139; 140-159
+- **131** `131_admin_acts_of_principal.sql` (elevation plan EL-12b): a person
+  reads their OWN admin acts. 130's act table admits no application-role read,
+  so `GET /api/v1/admin/acts?mine` needs one principal-bound reader:
+  `epigraph_admin_acts_of_principal(p_limit)` lists the acts whose proposer is
+  the session principal, newest first, at most `p_limit` (clamped to 1..200;
+  NULL reads 50); an unstamped connection lists nothing. It returns the act's
+  kind, canonical args and digest, target, reason, elevation, times and each
+  step's outcome, NEVER the ceremony state, the assertion evidence, the
+  consuming login or the result. Owned by the maintenance role (under any
+  other owner the table's definer-frame policy admits no row); the app may
+  EXECUTE it. No table, policy or earlier body changes. Behaviour in
+  `epigraph-db/tests/pending_admin_acts.rs`; undo
+  (`docs/runbooks/131-undo.sql`, BEFORE 130-undo: a `LANGUAGE sql` body
+  records no dependency on the table it reads). Checked before claiming: no
+  remote branch carries a `131`. **Applied to a throwaway database only, NOT
+  to any deployed database.**
+
+- **132+**: public next (the elevation stack stays at or below 139; 140-159
   are reserved)
 
-Next public migration **outside both reserved tenancy ranges** must be `131` or
+Next public migration **outside both reserved tenancy ranges** must be `132` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

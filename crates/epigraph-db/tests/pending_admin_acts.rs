@@ -1432,6 +1432,226 @@ async fn the_rollback_returns_the_catalog_to_129_and_archives_the_acts(pool: PgP
 }
 
 // =====================================================================
+// MIGRATION 131: a person reads their own acts
+// =====================================================================
+
+/// One listed act: `(id, kind, outcome, consumed)`.
+type Listed = (Uuid, String, Option<String>, bool);
+
+/// The acts `epigraph_admin_acts_of_principal(limit)` lists on an app session
+/// stamped as `who` (unstamped when `None`), in the order it lists them.
+async fn listed(pool: &PgPool, who: Option<Uuid>, limit: Option<i32>) -> Vec<Listed> {
+    as_app(pool, who, "", "", |mut conn| async move {
+        let rows = sqlx::query_as::<_, Listed>(
+            "SELECT id, kind, outcome, consumed_at IS NOT NULL \
+               FROM public.epigraph_admin_acts_of_principal($1)",
+        )
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("list the acts");
+        (conn, rows)
+    })
+    .await
+}
+
+/// A person's app session lists exactly the acts THAT PERSON proposed, newest
+/// first, with each one's outcome; another person's acts never; an unstamped
+/// session nothing. The limit is clamped to 1..=200 (NULL reads 50). The
+/// reader returns no ceremony state, evidence, consuming login or result.
+///
+/// Verified to fail: the proposer clause dropped -> B lists P's acts; the
+/// order reversed -> P's newest act is not first; the clamp's lower bound
+/// dropped -> a limit of 0 lists nothing; `a.challenge_state` added to the
+/// returned columns -> the column list differs.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_person_lists_only_their_own_acts(pool: PgPool) {
+    let p = elevated_custodian(&pool, "lister-p", 1).await;
+    let b = elevated_custodian(&pool, "lister-b", 2).await;
+    let (x, _) = human(&pool, "holder").await;
+    let older = propose(
+        &pool,
+        &p,
+        true,
+        "role.grant",
+        &grant_args(AUDITOR, x, None, "list test"),
+    )
+    .await
+    .expect("P's first act");
+    // Distinct proposal times (`proposed_at` is the transaction's now()).
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let newer = confirmed(
+        &pool,
+        &p,
+        "role.end",
+        &format!(
+            "{{\"assignment\": \"{}\", \"reason\": \"r\"}}",
+            p.assignment
+        ),
+    )
+    .await;
+    let theirs = propose(
+        &pool,
+        &b,
+        true,
+        "role.grant",
+        &grant_args(AUDITOR, x, None, "b's act"),
+    )
+    .await
+    .expect("B's act");
+
+    // The harness's view of who proposed what (a custodian's grant may ride a
+    // stand-in act of the custodian that holds a passkey: `make_custodian`).
+    let of = |who: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM pending_admin_acts WHERE proposed_by = $1 \
+                  ORDER BY proposed_at DESC, id",
+            )
+            .bind(who)
+            .fetch_all(&pool)
+            .await
+            .expect("the harness's view")
+        }
+    };
+    let p_list = listed(&pool, Some(p.person), None).await;
+    assert_eq!(
+        p_list[..2],
+        [
+            (
+                newer,
+                "role.end".to_string(),
+                Some("confirmed".to_string()),
+                false
+            ),
+            (older, "role.grant".to_string(), None, false),
+        ],
+        "P lists its own acts, newest first, each with its outcome"
+    );
+    assert_eq!(
+        p_list.iter().map(|r| r.0).collect::<Vec<_>>(),
+        of(p.person).await,
+        "P lists exactly the acts P proposed"
+    );
+    let b_list = listed(&pool, Some(b.person), None).await;
+    assert!(b_list.contains(&(theirs, "role.grant".to_string(), None, false)));
+    assert_eq!(
+        b_list.iter().map(|r| r.0).collect::<Vec<_>>(),
+        of(b.person).await,
+        "B lists exactly the acts B proposed"
+    );
+    assert!(
+        !p_list.iter().any(|r| r.0 == theirs) && !b_list.iter().any(|r| r.0 == newer),
+        "neither lists the other's acts"
+    );
+    assert!(
+        listed(&pool, None, None).await.is_empty(),
+        "an unstamped session has no principal and lists nothing"
+    );
+    assert!(
+        listed(&pool, Some(x), None).await.is_empty(),
+        "a person who proposed nothing lists nothing"
+    );
+    assert_eq!(listed(&pool, Some(p.person), Some(1)).await.len(), 1);
+    assert_eq!(
+        listed(&pool, Some(p.person), Some(0)).await.len(),
+        1,
+        "a limit below 1 reads as 1"
+    );
+
+    let columns: Vec<String> = as_app(&pool, Some(p.person), "", "", |mut conn| async move {
+        use sqlx::{Column, Row};
+        let row = sqlx::query("SELECT * FROM public.epigraph_admin_acts_of_principal(1)")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("one row");
+        let names = row.columns().iter().map(|c| c.name().to_string()).collect();
+        (conn, names)
+    })
+    .await;
+    assert_eq!(
+        columns,
+        [
+            "id",
+            "kind",
+            "args",
+            "args_digest",
+            "target_type",
+            "target_id",
+            "reason",
+            "elevation_id",
+            "proposed_at",
+            "expires_at",
+            "asserted_at",
+            "outcome",
+            "refusal",
+            "consumed_at"
+        ],
+        "no ceremony state, evidence, consuming login or result"
+    );
+}
+
+fn undo_131() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/131-undo.sql"),
+    )
+    .expect("131-undo.sql")
+}
+
+/// `docs/runbooks/131-undo.sql`, applied to a database that went 130 -> 131
+/// and holds an act, returns its catalog to 130's (the reader gone, the act
+/// table and its acts untouched); a second run changes nothing.
+///
+/// Verified to fail: the undo's DROP removed -> the reader is left behind.
+#[sqlx::test(migrations = false)]
+async fn the_131_rollback_drops_only_the_reader(pool: PgPool) {
+    migrate(&pool, &up_to(130)).await;
+    fixture::open_elevated_access_gate(&pool).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to(131)).await;
+    let p = elevated_custodian(&pool, "P", 1).await;
+    let (x, _) = human(&pool, "holder").await;
+    let act = propose(
+        &pool,
+        &p,
+        true,
+        "role.grant",
+        &grant_args(AUDITOR, x, None, "a"),
+    )
+    .await
+    .expect("an act");
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 131 changed the catalog"
+    );
+
+    sqlx::raw_sql(&undo_131())
+        .execute(&pool)
+        .await
+        .expect("the undo script applies");
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the catalog is not 130's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM pending_admin_acts WHERE id = $1")
+        .bind(act)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(kept, 1, "the acts stay");
+    sqlx::raw_sql(&undo_131())
+        .execute(&pool)
+        .await
+        .expect("a second run applies");
+    assert_eq!(catalog(&pool).await, before, "idempotent");
+}
+
+// =====================================================================
 // THE REGISTERS
 // =====================================================================
 
