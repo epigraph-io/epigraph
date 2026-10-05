@@ -4566,6 +4566,11 @@ impl ClaimRepository {
     ///
     /// Ordered `created_at ASC` (oldest first) so a bounded batch makes
     /// monotonic progress through the backlog across scheduled runs.
+    ///
+    /// Every returned row is current by the `WHERE` clause, so `claim_from_row`'s
+    /// `is_current = true` default is already true here; `supersedes` is NOT
+    /// (a current claim that replaced another carries a non-null link), so it
+    /// is projected and post-fixed — the `claim_from_row` rule in `CLAUDE.md`.
     pub async fn list_undecomposed<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -4581,6 +4586,7 @@ impl ClaimRepository {
             trace_id: Option<Uuid>,
             created_at: chrono::DateTime<chrono::Utc>,
             updated_at: chrono::DateTime<chrono::Utc>,
+            supersedes: Option<Uuid>,
         }
 
         let limit = limit.clamp(1, 1000);
@@ -4593,7 +4599,7 @@ impl ClaimRepository {
         let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
-                   c.created_at, c.updated_at
+                   c.created_at, c.updated_at, c.supersedes
             FROM claims c
             WHERE COALESCE(c.is_current, true) = true
               AND length(c.content) > 10
@@ -4622,7 +4628,7 @@ impl ClaimRepository {
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
             let truth_value = TruthValue::new(row.truth_value)?;
-            claims.push(claim_from_row(
+            let mut claim = claim_from_row(
                 row.id,
                 row.content,
                 row.agent_id,
@@ -4630,7 +4636,9 @@ impl ClaimRepository {
                 truth_value,
                 row.created_at,
                 row.updated_at,
-            ));
+            );
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
         }
         Ok(claims)
     }

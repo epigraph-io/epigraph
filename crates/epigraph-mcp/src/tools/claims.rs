@@ -2353,6 +2353,15 @@ pub async fn query_undecomposed_claims(
     // redaction layer entirely — a finding fixed by adding a second pass; the
     // durable fix is that the read itself filters, so there is no second pass
     // left to forget.
+    //
+    // Labels: one batched, viewer-spliced read over the page, as `query_claims`
+    // does — not a hardcoded `[]` (drain unit U008, backlog `1e6efd2d`
+    // residual).
+    let ids: Vec<uuid::Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
+    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+        .await
+        .map_err(internal_error)?;
+
     let results: Vec<ClaimResponse> = claims
         .into_iter()
         .map(|c| {
@@ -2364,9 +2373,13 @@ pub async fn query_undecomposed_claims(
                 agent_id: c.agent_id.as_uuid().to_string(),
                 content_hash: ContentHasher::to_hex(&c.content_hash),
                 created_at: c.created_at.to_rfc3339(),
-                labels: Vec::new(),
+                labels: labels_map.get(&id).cloned().unwrap_or_default(),
+                // True by `list_undecomposed`'s `COALESCE(is_current, true) =
+                // true` predicate — no superseded row reaches this map.
                 is_current: true,
-                supersedes: None,
+                // A current claim that replaced another DOES carry a link;
+                // `list_undecomposed` projects and post-fixes it.
+                supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
                 belief_score: None,
             }
         })

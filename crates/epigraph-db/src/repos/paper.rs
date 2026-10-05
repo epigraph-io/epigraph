@@ -300,8 +300,16 @@ impl PaperRepository {
     /// tiebreaker so `LIMIT`/`OFFSET` paging is stable across the many claims
     /// a single ingestion writes with an identical timestamp.
     ///
-    /// Returns `(id, content, truth_value, agent_id, content_hash, created_at)`
-    /// per claim — the shape `query_paper` needs for `ClaimResponse`.
+    /// Returns `(id, content, truth_value, agent_id, content_hash, created_at,
+    /// is_current, supersedes)` per claim — the shape `query_paper` needs for
+    /// `ClaimResponse`.
+    ///
+    /// There is deliberately NO `is_current` filter: a superseded claim the
+    /// paper asserted is still on the page, and `query_paper`'s `has_more`
+    /// ("a short page is the end of the set") is computed over exactly this
+    /// row set. The row's real retirement state is projected instead, so the
+    /// caller can report it rather than claim every asserted row is current
+    /// (drain unit U008, backlog `1e6efd2d` residual).
     ///
     /// `offset` exists because `query_paper` previously hardcoded
     /// `limit = 100` with no way to reach claim 101, and the resulting
@@ -331,6 +339,8 @@ impl PaperRepository {
             agent_id: Uuid,
             content_hash: Vec<u8>,
             created_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
         }
 
         let rows: Vec<Row> = sqlx::query_as(
@@ -341,7 +351,9 @@ impl PaperRepository {
                 c.truth_value,
                 c.agent_id,
                 c.content_hash,
-                c.created_at
+                c.created_at,
+                COALESCE(c.is_current, true) AS is_current,
+                c.supersedes
             FROM edges e
             JOIN claims c ON c.id = e.target_id
             WHERE e.source_id = $1
@@ -390,6 +402,8 @@ impl PaperRepository {
                     agent_id: r.agent_id,
                     content_hash,
                     created_at: r.created_at,
+                    is_current: r.is_current,
+                    supersedes: r.supersedes,
                 })
             })
             .collect()
@@ -405,4 +419,9 @@ pub struct AssertedClaimRow {
     pub agent_id: Uuid,
     pub content_hash: [u8; 32],
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The row's real retirement state (`COALESCE(is_current, true)`); the
+    /// query does not filter on it.
+    pub is_current: bool,
+    /// The claim this one superseded, if any.
+    pub supersedes: Option<Uuid>,
 }
