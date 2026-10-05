@@ -157,23 +157,28 @@ async fn seed_frame_with_claims(pool: &PgPool, n: usize) -> SeededFrame {
     }
 }
 
+/// `valid_to_days`: `None` leaves `valid_to` unset (open-ended); `Some(d)`
+/// sets it to `now() + d days`, so a negative `d` is a retracted edge and a
+/// positive one is a live edge with a scheduled expiry.
 async fn insert_edge_at(
     pool: &PgPool,
     (source_id, source_type): (Uuid, &str),
     (target_id, target_type): (Uuid, &str),
     relationship: &str,
-    retracted: bool,
+    valid_to_days: Option<i32>,
 ) {
     sqlx::query(
         "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship, valid_to) \
-         VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN now() - interval '1 day' END)",
+         VALUES ($1, $2, $3, $4, $5, \
+                 CASE WHEN $6::int IS NULL THEN NULL \
+                      ELSE now() + make_interval(days => $6::int) END)",
     )
     .bind(source_id)
     .bind(target_id)
     .bind(source_type)
     .bind(target_type)
     .bind(relationship)
-    .bind(retracted)
+    .bind(valid_to_days)
     .execute(pool)
     .await
     .expect("insert edge");
@@ -185,7 +190,7 @@ async fn claim_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &st
         (source, "claim"),
         (target, "claim"),
         relationship,
-        false,
+        None,
     )
     .await;
 }
@@ -231,8 +236,35 @@ fn alarms_for(body: &Value, key: &str, frame: Uuid) -> Vec<Value> {
         .collect()
 }
 
+/// The control frame's alarm on both routes: present, with no contradiction.
+async fn assert_control_alarms(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    token: &str,
+    control: Uuid,
+    when: &str,
+) {
+    let silence = get_json(client, addr, token, "/api/v1/conflicts/silence-check").await;
+    let alarm = alarms_for(&silence, "alarms", control);
+    assert_eq!(
+        alarm.len(),
+        1,
+        "{when}: the control frame has no contradiction of its own and must alarm: {silence}"
+    );
+    assert_eq!(alarm[0]["contradicts_edges"], 0, "{when}: {silence}");
+    let scan = get_json(client, addr, token, "/api/v1/conflicts/scan").await;
+    let alarm = alarms_for(&scan, "silence_alarms", control);
+    assert_eq!(alarm.len(), 1, "{when}: control must alarm in scan: {scan}");
+    assert_eq!(alarm[0]["contradicts_edges"], 0, "{when}: {scan}");
+}
+
 /// The discriminating pair, on both HTTP routes. Previous query: the
-/// lower-case edge is never matched, so the frame still alarms after step 3.
+/// lower-case edge is never matched, so the frame still alarms after step 2.
+///
+/// A second, untouched 20-claim frame is the control: both routes scan many
+/// frames in one statement, and the contradiction in `frame` must not be
+/// credited to it. A count that lost the per-frame partition would give the
+/// control 1/20 and silence its alarm.
 #[sqlx::test(migrations = "../../migrations")]
 async fn silence_check_clears_once_a_lowercase_claim_contradiction_exists(
     pool_opts: PgPoolOptions,
@@ -241,6 +273,7 @@ async fn silence_check_clears_once_a_lowercase_claim_contradiction_exists(
     let pool = connect(pool_opts, &conn_opts).await;
     let seeded = seed_frame_with_claims(&pool, 20).await;
     let frame = seeded.frame;
+    let control = seed_frame_with_claims(&pool, 20).await.frame;
 
     let (addr, _shutdown) = spawn_app(&conn_opts).await;
     let client = reqwest::Client::new();
@@ -260,6 +293,7 @@ async fn silence_check_clears_once_a_lowercase_claim_contradiction_exists(
     let before = alarms_for(&scan, "silence_alarms", frame);
     assert_eq!(before.len(), 1, "silent frame must alarm in scan: {scan}");
     assert_eq!(before[0]["contradicts_edges"], 0);
+    assert_control_alarms(&client, addr, &token, control, "before the edge").await;
 
     // (2) One claim->claim contradiction, in the spelling every MCP / matcher
     // writer uses: 1 / 20 = 5% >= 2%, so neither route may alarm on the frame.
@@ -285,6 +319,7 @@ async fn silence_check_clears_once_a_lowercase_claim_contradiction_exists(
         Vec::<Value>::new(),
         "scan must agree with silence-check: {scan}"
     );
+    assert_control_alarms(&client, addr, &token, control, "after the edge").await;
 }
 
 /// One edge whose source claim carries 3 BBAs in the frame is one
@@ -337,29 +372,46 @@ async fn every_spelling_of_contradicts_and_refutes_counts_once_per_pair(
     assert_eq!(density(&pool, seeded.frame).await, (6, 3));
 }
 
-/// A retracted edge (`valid_to` in the past) is not a live contradiction.
-/// Previous query (scan / silence-check): 1, it had no `valid_to` filter.
+/// A retracted edge (`valid_to` in the past) is not a live contradiction; an
+/// edge whose `valid_to` is still in the future is. Previous query (scan /
+/// silence-check): 2, it had no `valid_to` filter. A filter reduced to
+/// `valid_to IS NULL` would give 0, dropping the still-live edge.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_retracted_contradiction_does_not_count(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
     let pool = connect(pool_opts, &conn_opts).await;
-    let seeded = seed_frame_with_claims(&pool, 2).await;
+    let seeded = seed_frame_with_claims(&pool, 4).await;
+    let c = &seeded.claims;
+    // Retracted yesterday.
     insert_edge_at(
         &pool,
-        (seeded.claims[0], "claim"),
-        (seeded.claims[1], "claim"),
+        (c[0], "claim"),
+        (c[1], "claim"),
         "CONTRADICTS",
-        true,
+        Some(-1),
+    )
+    .await;
+    // Live until tomorrow.
+    insert_edge_at(
+        &pool,
+        (c[2], "claim"),
+        (c[3], "claim"),
+        "contradicts",
+        Some(1),
     )
     .await;
 
-    assert_eq!(density(&pool, seeded.frame).await, (2, 0));
+    assert_eq!(density(&pool, seeded.frame).await, (4, 1));
 }
 
-/// A `CONTRADICTS` edge from an in-frame claim to a non-claim node is not a
-/// claim contradiction. Previous query: 1, it never checked endpoint types.
+/// A `CONTRADICTS` edge between an in-frame claim and a non-claim node is not
+/// a claim contradiction, whichever end the claim is on. Previous query: 1
+/// (the claim->agent row, through its source join); it never checked endpoint
+/// types. The agent->claim row is the one the `source_type = 'claim'` filter
+/// alone excludes: the target join matches it, as it would an evidence-sourced
+/// `CONTRADICTS` row like `submit_evidence` step 16 writes.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_contradiction_with_a_non_claim_endpoint_does_not_count(
     pool_opts: PgPoolOptions,
@@ -372,7 +424,15 @@ async fn a_contradiction_with_a_non_claim_endpoint_does_not_count(
         (seeded.claims[0], "claim"),
         (seeded.agents[1], "agent"),
         "CONTRADICTS",
-        false,
+        None,
+    )
+    .await;
+    insert_edge_at(
+        &pool,
+        (seeded.agents[1], "agent"),
+        (seeded.claims[0], "claim"),
+        "CONTRADICTS",
+        None,
     )
     .await;
 
@@ -401,5 +461,115 @@ async fn a_contradiction_counts_when_only_its_target_is_in_the_frame(
         density(&pool, other_frame).await,
         (1, 1),
         "the source's frame counts the same pair"
+    );
+}
+
+/// `silence.suspicious` events that evidence on `claim` raised for `frame`.
+///
+/// Read from the process-global in-memory store the `19c` step pushes to,
+/// filtered on both payload ids: every `#[sqlx::test]` in this binary shares
+/// that store, and each test's frame and claim ids are fresh.
+async fn silence_events(frame: Uuid, claim: Uuid) -> usize {
+    let filter = epigraph_api::routes::events::EventFilter {
+        since: None,
+        event_type: Some("silence.suspicious".to_string()),
+        limit: Some(1000),
+        offset: None,
+    };
+    let (events, _) = epigraph_api::routes::events::global_event_store()
+        .list(&filter)
+        .await;
+    events
+        .iter()
+        .filter(|e| {
+            e.payload["frame_id"] == Value::String(frame.to_string())
+                && e.payload["claim_id"] == Value::String(claim.to_string())
+        })
+        .count()
+}
+
+/// `POST /api/v1/frames/:id/evidence` for `claim`, asserting 201.
+async fn submit_evidence(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    token: &str,
+    frame: Uuid,
+    claim: Uuid,
+    agent: Uuid,
+) {
+    let resp = client
+        .post(format!("http://{addr}/api/v1/frames/{frame}/evidence"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "claim_id": claim,
+            "agent_id": agent,
+            "masses": { "0": 0.6, "0,1": 0.4 },
+        }))
+        .send()
+        .await
+        .expect("evidence request");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 201,
+        "POST /api/v1/frames/{frame}/evidence for {claim}: {body}"
+    );
+}
+
+/// The third call site, the `19c` silence-alarm step of
+/// `POST /api/v1/frames/:id/evidence`, as a discriminating pair. The only
+/// difference between (a) and (b) is one lower-case claim->claim
+/// `contradicts` edge between two other claims of the frame; (a) and (b)
+/// submit for different claims seeded alike, so each half's event is told
+/// apart by `claim_id`. Previous 19c query: the lower-case edge is never
+/// matched, so (b) raises the alarm too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_evidence_alarms_only_while_the_frame_has_no_claim_contradiction(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = connect(pool_opts, &conn_opts).await;
+    let seeded = seed_frame_with_claims(&pool, 20).await;
+    let frame = seeded.frame;
+    let agent = seeded.agents[0];
+    // claims[0] and claims[2] both hold one BBA from agents[0].
+    let (first, second) = (seeded.claims[0], seeded.claims[2]);
+
+    let (addr, _shutdown) = spawn_app(&conn_opts).await;
+    let client = reqwest::Client::new();
+    let token = common::mint_token_with_agent(&["claims:read", "claims:write"], agent);
+
+    // (a) 0 contradictions in 20 claims: 19c must raise the alarm. This half
+    // proves 19c ran and read a row for the frame, so (b) cannot pass because
+    // the step was skipped.
+    submit_evidence(&client, addr, &token, frame, first, agent).await;
+    assert_eq!(
+        silence_events(frame, first).await,
+        1,
+        "evidence into a 20-claim, 2-source frame with no contradiction must \
+         raise silence.suspicious"
+    );
+
+    // (b) One lower-case claim->claim contradiction: 1 / 20 = 5% >= 2%.
+    common::insert_edge(
+        &pool,
+        seeded.claims[10],
+        seeded.claims[11],
+        "claim",
+        "claim",
+        "contradicts",
+    )
+    .await;
+    submit_evidence(&client, addr, &token, frame, second, agent).await;
+    assert_eq!(
+        silence_events(frame, second).await,
+        0,
+        "a frame with a live claim->claim `contradicts` edge is not silent; \
+         19c must not raise silence.suspicious"
+    );
+    assert_eq!(
+        silence_events(frame, first).await,
+        1,
+        "(a)'s event stays the only one for this frame"
     );
 }
