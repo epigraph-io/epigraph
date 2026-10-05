@@ -80,6 +80,7 @@ pub struct RevocationUnavailable(pub String);
 
 /// Answers whether a signature-verified access token's `jti` has been revoked
 /// (RFC 7009, `POST /oauth/revoke` on the HTTP API).
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait::async_trait]
 pub trait AccessTokenRevocation: Send + Sync {
     async fn is_revoked(&self, jti: uuid::Uuid) -> Result<bool, RevocationUnavailable>;

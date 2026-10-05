@@ -681,6 +681,8 @@ async fn token_responses_are_not_cacheable(pool: PgPool) {
             .and_then(|v| v.to_str().ok()),
         Some("no-store"),
         "a token response must not be cached"
+    );
+}
 
 /// POST `/oauth/revoke` for an access token.
 async fn revoke_access_token(app: axum::Router, token: &str) -> StatusCode {

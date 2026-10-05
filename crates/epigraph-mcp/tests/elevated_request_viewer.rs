@@ -749,6 +749,11 @@ async fn listener(pool: &PgPool, arming_ttl: std::time::Duration, connector: boo
     // MCP reads run on it unstamped: see
     // `mcp_reads_are_not_widened_by_the_arms_until_they_are_stamped`).
     let pool = fixture::downgraded_pool(pool, "epigraph_app").await;
+    // The transport reads migration 141's denylist on the application role,
+    // as `main.rs` wires it.
+    let revocation = Arc::new(epigraph_mcp::auth::DbAccessTokenRevocation::new(
+        pool.clone(),
+    ));
     let signer = Arc::new(epigraph_crypto::AgentSigner::from_bytes(&[0x58; 32]).expect("signer"));
     let embedder = Arc::new(
         epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone()),
@@ -769,6 +774,7 @@ async fn listener(pool: &PgPool, arming_ttl: std::time::Duration, connector: boo
     let state = epigraph_mcp::auth::McpAuthState {
         jwt_config: Arc::new(epigraph_auth::JwtConfig::from_secret(EL8_SECRET)),
         resource_metadata_url: None,
+        revocation,
     };
     let router = axum::Router::new().nest_service("/mcp", service).layer(
         axum::middleware::from_fn_with_state(state, epigraph_mcp::auth::bearer_auth_middleware),

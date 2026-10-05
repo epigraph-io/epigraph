@@ -829,14 +829,12 @@ async fn handle_refresh_token(
     // A `scope` that names nothing this token can issue is `invalid_scope`
     // (RFC 6749 section 5.2), answered BEFORE the chain is spent: a 200 with an
     // empty-scope access token would rotate the chain and authorize nothing.
-    let consented =
-        refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref()).ok_or_else(
-            || ApiError::BadRequest {
-                message: "invalid_scope: the requested scope names none of the scopes \
+    let consented = refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref())
+        .ok_or_else(|| ApiError::BadRequest {
+            message: "invalid_scope: the requested scope names none of the scopes \
                           this refresh token was granted"
-                    .into(),
-            },
-        )?;
+                .into(),
+        })?;
     // Then through the mint chokepoint (never the elevation scope; the
     // admin-only scopes per migration 128's switch), which only ever removes.
     let effective_scopes = crate::oauth::scopes::grantable(
