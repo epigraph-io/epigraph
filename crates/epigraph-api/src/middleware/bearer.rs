@@ -53,9 +53,12 @@ pub async fn bearer_auth_middleware(
 
             // Build AuthContext. The admin-scope switch decides whether its
             // admin-only scopes count (`AuthContext::has_scope`, elevation
-            // plan EL-10); `From` leaves it armed (fail closed) until read.
+            // plan EL-10); `From` leaves it armed (fail closed) until read,
+            // and it is read only for a token it can change an answer for.
             let mut auth_ctx: AuthContext = claims.into();
-            auth_ctx.admin_scopes = state.admin_scope_posture().await;
+            if auth_ctx.carries_switch_decided_scope() {
+                auth_ctx.admin_scopes = state.admin_scope_posture().await;
+            }
 
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
@@ -115,7 +118,9 @@ pub async fn optional_bearer_auth_middleware(
                     })?;
 
             let mut auth_ctx: AuthContext = claims.into();
-            auth_ctx.admin_scopes = state.admin_scope_posture().await;
+            if auth_ctx.carries_switch_decided_scope() {
+                auth_ctx.admin_scopes = state.admin_scope_posture().await;
+            }
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
         }

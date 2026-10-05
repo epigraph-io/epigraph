@@ -2422,9 +2422,13 @@ impl ServerHandler for EpiGraphMcpFull {
         }
         // THE CHECK CHOKEPOINT's switch (elevation plan EL-10): whether the
         // caller's admin-only scopes count (`AuthContext::has_scope`). Read
-        // before any scope gate, the federated one included; the bearer
-        // middleware's context leaves it armed (fail closed) until read.
-        if let Some(auth) = auth_owned.as_mut() {
+        // before any scope gate, the federated one included, for a token it
+        // can change an answer for; the bearer middleware's context leaves it
+        // armed (fail closed) until read.
+        if let Some(auth) = auth_owned
+            .as_mut()
+            .filter(|a| a.carries_switch_decided_scope())
+        {
             auth.admin_scopes = self.admin_scope_posture().await;
         }
 

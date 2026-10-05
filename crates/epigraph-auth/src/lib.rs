@@ -273,6 +273,18 @@ pub enum ClientType {
 }
 
 impl AuthContext {
+    /// Whether the token carries a scope whose meaning the admin-scope switch
+    /// decides (an [`ADMIN_ONLY_SCOPES`] entry or [`ELEVATED_ONLY_SCOPE`]).
+    /// Only then does an auth layer need to read the switch: for any other
+    /// token [`Self::admin_scopes`] changes no answer of [`Self::has_scope`],
+    /// and it stays at the fail-closed default.
+    #[must_use]
+    pub fn carries_switch_decided_scope(&self) -> bool {
+        self.scopes
+            .iter()
+            .any(|s| is_admin_only_scope(s) || s == ELEVATED_ONLY_SCOPE)
+    }
+
     /// THE CHECK CHOKEPOINT (elevation plan EL-10): whether this request holds
     /// `scope`. Every scope check (`check_scopes`, the API's `RequireScope*`
     /// extractors, the MCP server's `SCOPE_MAP` gate) goes through here; a
@@ -541,6 +553,15 @@ mod tests {
             )
             .unwrap();
         let from_claims: AuthContext = cfg.validate_token(&token).unwrap().into();
+        assert!(from_claims.carries_switch_decided_scope());
+        assert!(!ctx(
+            &["claims:read", "claims:write"],
+            AdminScopePosture::Armed,
+            false
+        )
+        .carries_switch_decided_scope());
+        assert!(ctx(&[ELEVATED_ONLY_SCOPE], AdminScopePosture::Armed, false)
+            .carries_switch_decided_scope());
         assert_eq!(from_claims.admin_scopes, AdminScopePosture::Armed);
         assert_eq!(from_claims.elevation, None);
         assert!(

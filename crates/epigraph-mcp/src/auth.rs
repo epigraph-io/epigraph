@@ -266,7 +266,9 @@ pub fn unauthenticated_context(
         family_id: None,
         elevation_claim: None,
         elevation: None,
-        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        // Fail closed until `call_tool` reads the switch (elevation plan
+        // EL-10): armed, the listener's injected admin scopes count for nothing.
+        admin_scopes: epigraph_auth::AdminScopePosture::Armed,
     }
 }
 
