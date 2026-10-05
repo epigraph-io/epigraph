@@ -470,8 +470,9 @@ impl Viewer {
     ///
     /// **Nothing elevates before the per-access recorder.** 125's gate
     /// (`epigraph_elevated_access_ready()`) ships false and 127 (the
-    /// recorder's migration) leaves it closed, so until the migration that
-    /// opens it no session is live and this returns the scoped viewer. And
+    /// recorder's migration) to 131 leave it closed; migration 132 opens it
+    /// while the recorder is installed. On a database before 132 (or without
+    /// the recorder) no session is live and this returns the scoped viewer. And
     /// `epigraph_elevation_live` answers nothing on a connection that does not
     /// declare the recorder ([`crate::ACCESS_RECORDER_GUC`]), so a pool whose
     /// process does not record (every pool not built by

@@ -937,9 +937,9 @@ impl ScopedPool {
     /// The production declaring constructor is
     /// [`Self::connect_recording_elevated_access`], which cannot downgrade. A
     /// test of what a LIVE elevation does stands in for both keys: the
-    /// database's gate (`viewer_fixture::open_elevated_access_gate`, until the
-    /// migration that opens it) and this declaration, on a pool it can
-    /// downgrade to the application role.
+    /// database's gate (opened by migration 132 on a database at head;
+    /// `viewer_fixture::open_elevated_access_gate` on one cut before it) and
+    /// this declaration, on a pool it can downgrade to the application role.
     ///
     /// # Errors
     /// As [`Self::connect_downgraded_for_tests`].
