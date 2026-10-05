@@ -73,8 +73,9 @@ pub async fn revoke_endpoint(
                         message: e.to_string(),
                     })?;
                 }
-                // The non-db build has no revocation store (see
-                // `middleware::bearer::access_token_is_revoked`): nothing is recorded.
+                // The non-db build has no revocation store: nothing is recorded,
+                // and the token stays live until its `exp`. A known limitation,
+                // documented on the non-db `middleware::bearer::access_token_is_revoked`.
                 #[cfg(not(feature = "db"))]
                 let _ = claims;
             }

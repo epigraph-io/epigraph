@@ -40,10 +40,16 @@ pub(crate) async fn access_token_is_revoked(
     epigraph_db::RevokedAccessTokenRepository::is_revoked(&state.db_pool, jti).await
 }
 
-/// The non-`db` build has no pool and therefore NO revocation store:
-/// `/oauth/revoke` records nothing there, and a signature-valid, unexpired
-/// token is admitted until its `exp`. A function rather than a `cfg` at each
-/// call site, so the callers read the same in both builds.
+/// KNOWN LIMITATION: the non-`db` build has no pool and therefore NO
+/// revocation store. `/oauth/revoke` records nothing there and answers 200, and
+/// a REVOKED but signature-valid, unexpired token is admitted until its `exp`.
+/// This is a regression for that build: before migration 141 it kept an
+/// in-process set, which at least refused the token on the revoking process
+/// until a restart. The non-`db` build is unsupported in production (prod runs
+/// the default features, which include `db`); do not serve OAuth from it.
+///
+/// A function rather than a `cfg` at each call site, so the callers read the
+/// same in both builds.
 #[cfg(not(feature = "db"))]
 pub(crate) async fn access_token_is_revoked(
     _state: &AppState,
