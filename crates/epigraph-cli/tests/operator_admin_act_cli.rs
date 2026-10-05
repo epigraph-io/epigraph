@@ -1589,3 +1589,55 @@ async fn a_device_bound_passkey_confirming_as_backup_eligible_is_flagged(pool: P
         )]
     );
 }
+
+/// A REPLAYED CONFIRMATION: the genuine elevation's stored ceremony and its
+/// stored evidence are copied onto a second ticket of P's (through the
+/// app-callable `epigraph_set_elevation_ticket_challenge`, then the confirm
+/// definer as `epigraph_app`; CALIBRATION, the database confirms it). Every
+/// per-row check passes: the signature is genuine, made over the challenge
+/// the second ticket now stores. Only the repetition gives it away: the
+/// LATER assertion is flagged `challenge_reused`, the original is not.
+///
+/// Verified to fail with the repetition check removed (exit 0), and with
+/// the original flagged instead of the replay.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replayed_confirmation_is_flagged(pool: PgPool) {
+    let e = elevated_custodian(&pool).await;
+    let (state, evidence): (serde_json::Value, serde_json::Value) = sqlx::query_as(
+        "SELECT challenge_state, assertion_evidence FROM elevation_tickets WHERE id = $1",
+    )
+    .bind(e.ticket)
+    .fetch_one(&pool)
+    .await
+    .expect("the genuine ticket");
+    let (replay, _) = started_ticket(&pool, &e).await;
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT public.epigraph_set_elevation_ticket_challenge($1, $2)")
+            .bind(replay)
+            .bind(state)
+            .execute(&mut *conn)
+            .await
+            .expect("the genuine ceremony onto the replay");
+        (conn, ())
+    })
+    .await;
+    let outcome = app_confirm_elevation(&pool, replay, e.credential.clone(), false, evidence).await;
+    assert_eq!(outcome, "confirmed", "CALIBRATION: the database accepts it");
+
+    let run = run_verify(&pool, &["--json"], Some(soft_authenticator::ORIGIN)).await;
+    assert_eq!(run.code, 2, "{}", run.show());
+    let report = report_of(&run);
+    assert_eq!(
+        report["elevations_checked"],
+        serde_json::json!(2),
+        "{report}"
+    );
+    assert_eq!(
+        findings_of(&report),
+        vec![(
+            "elevation_ticket".to_string(),
+            replay,
+            "challenge_reused".to_string()
+        )]
+    );
+}

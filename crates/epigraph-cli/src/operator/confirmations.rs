@@ -34,9 +34,17 @@
 //! 6. the asserted credential is that passkey;
 //! 7. the asserted backup-eligible flag does not exceed the stored one.
 //!
+//! Then, across rows: a challenge asserted MORE THAN ONCE (over every
+//! asserted ticket and act, confirmed or refused, whatever `--since` says):
+//! every confirmed occurrence after the first is flagged. A ticket's
+//! challenge is random, so a genuine evidence object copied, with its
+//! ceremony state, onto a later ticket passes every per-row check; only its
+//! repetition gives it away.
+//!
 //! REFUSED assertions are not verified: a refusal granted nothing, and the
 //! audited refusal of an unknown credential stores evidence that by design
-//! does not verify. They are counted.
+//! does not verify. They are counted, and they take part in the repetition
+//! check.
 //!
 //! # What it records
 //!
@@ -48,6 +56,8 @@
 //! reports it and still exits 2 until the row is dealt with. The rows commit
 //! whether or not the run found anything else; nothing else is written, and
 //! no ceremony row is changed.
+
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use epigraph_passkey::{
@@ -101,7 +111,8 @@ pub struct Finding {
     /// A stable code: `evidence_malformed`, `challenge_state_malformed`,
     /// `challenge_not_stored`, `challenge_not_bound`, `credential_unknown`,
     /// `credential_not_the_persons`, `assertion_does_not_verify`,
-    /// `credential_mismatch`, `backup_eligibility_changed`.
+    /// `credential_mismatch`, `backup_eligibility_changed`,
+    /// `challenge_reused`.
     pub reason: &'static str,
     /// What exactly, for the operator.
     pub detail: String,
@@ -117,7 +128,7 @@ pub struct Report {
     /// Confirmed admin acts verified (0 on a database without migration
     /// 130).
     pub acts_checked: usize,
-    /// Refused assertions seen (not verified).
+    /// Refused assertions seen (not verified; part of the repetition check).
     pub refused_seen: usize,
     /// Everything that did not verify.
     pub findings: Vec<Finding>,
@@ -274,8 +285,8 @@ fn check(verifier: &Verifier, row: &Asserted) -> Result<(), Failure> {
 }
 
 /// Read every asserted ticket and act, verify the confirmed ones asserted
-/// at or after `since`, and report. Reads only; [`record`] writes the
-/// findings.
+/// at or after `since`, look for repeated challenges, and report. Reads
+/// only; [`record`] writes the findings.
 ///
 /// # Errors
 /// A read fails.
@@ -300,7 +311,21 @@ pub async fn verify(
         ..Report::default()
     };
     let in_window = |at: DateTime<Utc>| since.is_none_or(|s| at >= s);
+    // The first assertion (in `asserted_at` order) of every challenge, over
+    // ALL asserted rows: a replay of an old evidence object is as old as its
+    // original, whatever the window.
+    let mut first: HashMap<Vec<u8>, (Subject, Uuid)> = HashMap::new();
     for row in &rows {
+        let original = match evidence_challenge(&row.assertion_evidence) {
+            Ok(c) => match first.get(&c) {
+                Some(o) => Some(*o),
+                None => {
+                    first.insert(c, (row.subject(), row.id));
+                    None
+                }
+            },
+            Err(_) => None,
+        };
         if row.outcome != "confirmed" {
             if in_window(row.asserted_at) {
                 report.refused_seen += 1;
@@ -314,7 +339,18 @@ pub async fn verify(
             Subject::AdminAct => report.acts_checked += 1,
             Subject::ElevationTicket => report.elevations_checked += 1,
         }
-        if let Err((reason, detail)) = check(verifier, row) {
+        let failure = check(verifier, row).err().or_else(|| {
+            original.map(|(subject, id)| {
+                fail(
+                    "challenge_reused",
+                    format!(
+                        "the same challenge was asserted earlier, by {} {id}",
+                        subject.as_str()
+                    ),
+                )
+            })
+        });
+        if let Some((reason, detail)) = failure {
             report.findings.push(Finding {
                 subject: row.subject(),
                 id: row.id,
