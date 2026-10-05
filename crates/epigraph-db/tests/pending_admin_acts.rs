@@ -1432,6 +1432,75 @@ async fn the_rollback_returns_the_catalog_to_129_and_archives_the_acts(pool: PgP
 }
 
 // =====================================================================
+// THE RUST PROPOSAL PATH (ScopedPool::propose_admin_act, EL-12b)
+// =====================================================================
+
+/// `ScopedPool::propose_admin_act` proposes as an ELEVATED viewer in BOTH
+/// session-setting modes (an elevated viewer otherwise gets only `BEGIN READ
+/// ONLY`, where the definer's insert fails with 25006, or is refused
+/// `begin_as` outright), the act naming the viewer's elevation; a viewer that
+/// is not elevated reaches the definer and is refused there (ELV07), (a bypass
+/// viewer is refused before any statement, by construction).
+///
+/// Verified to fail with the path opening `BEGIN READ ONLY` (25006) and with
+/// its stamp skipped (ELV07 for the elevated viewer too).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_scoped_pool_proposes_only_as_an_elevated_viewer(pool: PgPool) {
+    use epigraph_db::{DbError, ScopedPool, ScopedPoolOptions, SessionGucMode, Viewer};
+    let p = elevated_custodian(&pool, "pool-proposer", 1).await;
+    let (x, _) = human(&pool, "holder").await;
+    let args: serde_json::Value =
+        serde_json::from_str(&grant_args(AUDITOR, x, None, "pool path")).expect("json");
+    for mode in [SessionGucMode::Session, SessionGucMode::Transaction] {
+        let s = ScopedPool::connect_with_access_recorder_for_tests(
+            &fixture::database_url_for(&pool).await,
+            mode,
+            ScopedPoolOptions {
+                max_connections: 2,
+                ..ScopedPoolOptions::default()
+            },
+            Some("epigraph_app"),
+        )
+        .await
+        .expect("a recording application-role pool");
+        let elevated = Viewer::resolve_elevated(&s, p.person, Some(p.session), p.family)
+            .await
+            .expect("resolve");
+        assert!(elevated.is_elevated(), "CALIBRATION ({mode:?})");
+        let act = s
+            .propose_admin_act(&elevated, "role.grant", &args, "pool path", Some("jti-p"))
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        let (proposer, elevation, jti): (Uuid, Uuid, Option<String>) = sqlx::query_as(
+            "SELECT proposed_by, elevation_id, jti FROM pending_admin_acts WHERE id = $1",
+        )
+        .bind(act)
+        .fetch_one(&pool)
+        .await
+        .expect("the act");
+        assert_eq!(
+            (proposer, elevation, jti.as_deref()),
+            (p.person, p.session, Some("jti-p")),
+            "{mode:?}"
+        );
+
+        let plain = Viewer::resolve(s.inner(), p.person).await.expect("resolve");
+        assert!(!plain.is_elevated(), "CALIBRATION");
+        let refused = s
+            .propose_admin_act(&plain, "role.grant", &args, "pool path", None)
+            .await;
+        let code = match &refused {
+            Err(DbError::QueryFailed { source }) => source
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .map(|c| c.to_string()),
+            _ => None,
+        };
+        assert_eq!(code.as_deref(), Some("ELV07"), "{mode:?}: {refused:?}");
+    }
+}
+
+// =====================================================================
 // MIGRATION 131: a person reads their own acts
 // =====================================================================
 

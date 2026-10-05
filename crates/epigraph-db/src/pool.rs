@@ -1031,6 +1031,49 @@ impl ScopedPool {
         Ok(id)
     }
 
+    /// PROPOSE one admin act (migration 130's `epigraph_propose_admin_act`)
+    /// as `v`, on its own transaction stamped with `v`, committed. Works in
+    /// either [`SessionGucMode`]. Returns the act id; its confirmation page
+    /// is `/elevate/act/<id>`.
+    ///
+    /// The second (and last) write an ELEVATED viewer's connection makes
+    /// (the first is [`Self::record_elevated_access`]): [`Self::begin_as`]
+    /// refuses it every other transaction and [`Self::begin_read_as`] is
+    /// READ ONLY, where the definer's insert fails. This one runs exactly the
+    /// proposal definer, which writes only `pending_admin_acts` (a table
+    /// migration 126 does not arm) and refuses a connection that is not
+    /// elevated (ELV07). A viewer that is not elevated is passed through on
+    /// purpose, so the database stays the one authority on who may propose.
+    ///
+    /// # Errors
+    /// * `DbError::InvalidData` for a bypass viewer.
+    /// * `DbError::QueryFailed` carrying the definer's refusal: `ELV07` (not
+    ///   elevated), `22023` (args the kind does not take), `22004` (no
+    ///   reason).
+    pub async fn propose_admin_act(
+        &self,
+        v: &Viewer,
+        kind: &str,
+        args: &serde_json::Value,
+        reason: &str,
+        jti: Option<&str>,
+    ) -> Result<uuid::Uuid, DbError> {
+        if v.is_bypass() {
+            return Err(DbError::InvalidData {
+                reason: "propose_admin_act refuses a Bypass viewer: an act is proposed by an \
+                         elevated person, never by a maintenance session"
+                    .to_string(),
+            });
+        }
+        let mut tx = self.begin_stamped(v, "BEGIN").await?;
+        let id = crate::repos::admin_act_ceremony::AdminActCeremony::propose(
+            &mut tx, kind, args, reason, jti,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     async fn connect_inner(
         database_url: &str,
         mode: SessionGucMode,

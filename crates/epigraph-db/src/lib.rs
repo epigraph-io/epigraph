@@ -81,6 +81,7 @@ pub use pool::{
 };
 pub use repos::ElevatedAccess;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
+pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
     ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository,
     AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,

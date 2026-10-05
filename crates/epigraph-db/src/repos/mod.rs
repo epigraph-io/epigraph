@@ -5,6 +5,7 @@
 
 pub mod activity;
 pub mod admin_act;
+pub mod admin_act_ceremony;
 pub mod admin_cascade;
 pub mod admin_scope_enforcement;
 pub mod agent;
@@ -79,6 +80,7 @@ pub mod workflow_execution;
 // Re-export all repositories for convenience
 pub use activity::ActivityRepository;
 pub use admin_act::{AdminActRepository, AdminActRow};
+pub use admin_act_ceremony::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use admin_scope_enforcement::{
     AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
     AdminScopeSwitch,

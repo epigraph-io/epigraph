@@ -479,6 +479,55 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `owner_group_id`; 130's FORCEd policy shows an application connection no row at all.",
     ),
     (
+        "admin_act_ceremony.rs",
+        "propose",
+        "WRITE through migration 130's PRINCIPAL-BOUND, elevation-gated app-callable definer \
+         `epigraph_propose_admin_act` (EL-12b), called only by `ScopedPool::propose_admin_act` on \
+         a transaction STAMPED with the proposer's viewer: the definer refuses an unelevated \
+         connection (ELV07) and takes the proposer, elevation and assignment from the stamped \
+         session. An act is an authority record about a principal, not a corpus row; the \
+         viewer is spent on the stamp.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "list_mine",
+        "READ through migration 131's principal-bound app-callable definer \
+         `epigraph_admin_acts_of_principal` on the requester's STAMPED connection: only the \
+         stamped principal's own acts (no caller-supplied id), no ceremony state or evidence. \
+         Authority records about the requester, not corpus rows; the viewer is spent on the \
+         stamp.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "live_act",
+        "READ of ONE act by id through 130's app-callable definer `epigraph_act_for_ceremony`, \
+         for the anonymous confirmation page (EL-12b): only while the act is live, and it \
+         enumerates nothing. An authority record, not a corpus row, and the page has no \
+         principal a Viewer could carry.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "passkeys",
+        "READ through 130's app-callable definer `epigraph_passkeys_for_act`: the act PROPOSER's \
+         live passkeys (the ceremony's allowCredentials and verifying keys), only while the act \
+         is live, never anyone else's. Authentication records, not corpus rows.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "store_challenge",
+        "WRITE through 130's app-callable definer `epigraph_set_admin_act_challenge` (the \
+         confirmation state of one live act, by id); the table's guard refuses a non-live act. \
+         Nothing for a viewer to filter.",
+    ),
+    (
+        "admin_act_ceremony.rs",
+        "confirm",
+        "WRITE through 130's app-callable definer `epigraph_confirm_admin_act`: an assertion over \
+         one live, started act, confirmed or RETURNED as an audited refusal. Every rule (only a \
+         live passkey of the proposer, the counter, the backup flag, the proposer's assignment) \
+         is the definer's and the table's; nothing for a viewer to filter.",
+    ),
+    (
         "admin_scope_enforcement.rs",
         "state",
         "READ of migration 128's one-row admin-scope switch (`admin_scope_enforcement`) for the \
