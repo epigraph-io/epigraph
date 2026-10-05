@@ -247,7 +247,11 @@ async fn claim_provenance_labels_multibyte_content_by_character() {
         format!("{}...", "é".repeat(57)),
         "100 characters are cut to 57 characters plus an ellipsis"
     );
-    assert_eq!(label.chars().count(), 60, "the label never exceeds 60 chars");
+    assert_eq!(
+        label.chars().count(),
+        60,
+        "the label never exceeds 60 chars"
+    );
 
     // Threshold arm: 60 `é` is 120 bytes but only 60 characters, so it is NOT
     // over the limit and comes back whole (main byte-counted it as over and
