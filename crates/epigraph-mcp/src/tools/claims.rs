@@ -1193,6 +1193,34 @@ pub async fn update_with_evidence(
         )));
     }
 
+    // ── THE RETIREMENT LABEL TAKES #374's GATE HERE TOO (drain U004, I253) ──
+    //
+    // `is_foreign_public_claim` is a GROUP test, so a caller that WRITES the
+    // owning group without having AUTHORED the claim (a team writer; on stdio,
+    // a server agent whose group owns another agent's claim) is not foreign and
+    // reaches the label merge below. Without this, `labels: ["resolved"]`
+    // retired a colleague's claim on every transport while `update_labels` and
+    // `patch_claim` refused the identical label. Same gate, same arms: the
+    // author or the author's operator (stdio: an agent under the same
+    // operator), `claims:admin` over HTTP, and never the undeclared-signer arm.
+    //
+    // Before `EvidenceRepository::create`, so a refusal writes nothing: `tx` is
+    // dropped and rolls back. No admin path is needed: a `claims:admin` caller
+    // on a group it cannot write is either foreign-public (labels refused
+    // above) or refused by `claims_tenancy`, and on a group it can write the
+    // plain merge under its own stamp is the right write.
+    gate_retirement_label(
+        server,
+        &mut tx,
+        viewer,
+        auth,
+        author,
+        claim_id,
+        &params.labels,
+        &[],
+    )
+    .await?;
+
     EvidenceRepository::create(&mut *tx, &evidence)
         .await
         .map_err(internal_error)?;
