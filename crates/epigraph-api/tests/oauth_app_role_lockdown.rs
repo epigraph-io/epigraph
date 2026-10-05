@@ -407,12 +407,13 @@ async fn revoke_access_token(app: axum::Router, token: &str) -> StatusCode {
     app.oneshot(req).await.unwrap().status()
 }
 
-/// `GET /api/v1/claims?limit=1` with `token`: a route the code grant's
-/// `claims:read` admits, behind `bearer_auth_middleware`.
-async fn list_one_claim(app: axum::Router, token: &str) -> (StatusCode, String) {
+/// `GET /api/v1/webhooks` with `token`: behind `bearer_auth_middleware`, and
+/// answered from the caller's principal alone (`RequirePrincipal`, no database
+/// read), so an admitted token gets a plain 200 on this test's unscoped state.
+async fn list_own_webhooks(app: axum::Router, token: &str) -> (StatusCode, String) {
     let req = Request::builder()
         .method(Method::GET)
-        .uri("/api/v1/claims?limit=1")
+        .uri("/api/v1/webhooks")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -443,7 +444,7 @@ async fn a_revoked_access_token_stays_revoked_in_another_process(pool: PgPool) {
     let b = app_router(&pool, 2).await;
 
     // CONTROL: before the revocation, B admits the token end to end.
-    let (status, body) = list_one_claim(b.clone(), &access).await;
+    let (status, body) = list_own_webhooks(b.clone(), &access).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -455,14 +456,17 @@ async fn a_revoked_access_token_stays_revoked_in_another_process(pool: PgPool) {
         StatusCode::OK
     );
 
-    let (status, body) = list_one_claim(b.clone(), &access).await;
+    // The control above admitted this very token, so a 401 now is the
+    // revocation's; the body names it.
+    let (status, body) = list_own_webhooks(b.clone(), &access).await;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
         "a token revoked on A must be refused on B (another process / after a restart): {body}"
     );
+    assert!(body.contains("revoked"), "refused AS revoked: {body}");
     // And on A itself, now that the in-memory set is gone.
-    let (status, body) = list_one_claim(a, &access).await;
+    let (status, body) = list_own_webhooks(a, &access).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "refused on A too: {body}");
 }
 
