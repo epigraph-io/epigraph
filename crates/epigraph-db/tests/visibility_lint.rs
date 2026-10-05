@@ -831,10 +831,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "claim_encryption.rs",
         "get_by_claim_id_conn",
         "READ, and the only exempt read that touches a tenanted table — so it is the one to \
-         re-check. Its two callers (routes/claims.rs::get_claim and the batch sibling) both run it \
-         on the SAME transaction immediately after ClaimRepository::get_by_id_conn(&mut tx, \
-         &viewer, id) has already resolved the parent claim under the viewer predicate, so the \
-         authority decision has been made one statement earlier on the same connection. \
+         re-check. Its two callers both run it on the SAME viewer-stamped connection after a \
+         viewer-spliced read has already resolved the parent claim: routes/claims.rs::get_claim \
+         immediately after ClaimRepository::get_by_id_with_labels(&mut *read, &viewer, id), and \
+         its batch sibling list_claims per item of ClaimRepository::list_conn(&mut read, \
+         &viewer, ..), so the authority decision has been made earlier on the same connection. \
          claim_encryption is additionally in migration 077's `enc` protected array, so RLS \
          backstops it from step 11d onward. A shard that ever calls this WITHOUT the preceding \
          gated fetch must give it a Viewer instead of inheriting this entry.",
