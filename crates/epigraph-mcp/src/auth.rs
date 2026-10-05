@@ -4,13 +4,20 @@
 //! validation via `epigraph-auth` so a single token works against both
 //! servers.
 //!
-//! ## Deferred: revocation
+//! ## Revocation
 //!
-//! The HTTP API consults `AppState::is_token_revoked` here. MCP has no
-//! equivalent state and v1 relies on short JWT TTLs. When MCP grows shared
-//! state, plumb the revocation set through and call it before
-//! `validate_token`. Tracked separately — do not silently skip when adding
-//! state.
+//! A token revoked through the HTTP API's `POST /oauth/revoke` is refused here
+//! too: after `validate_token` succeeds, [`bearer_auth_middleware`] asks
+//! [`McpAuthState::revocation`] whether the token's `jti` is on migration 141's
+//! durable denylist, the same table the HTTP API's middleware reads. The store
+//! is a REQUIRED field, not an `Option`: there is no configuration in which an
+//! authenticated listener skips the check. A store that cannot answer refuses
+//! the token (fails closed) with the same uniform `invalid_token`; the reason
+//! (`revoked` / `revocation_unavailable`) is logged server-side only.
+//!
+//! The production store is [`DbAccessTokenRevocation`] on the process pool.
+//! There is deliberately no public "never revoked" store in this crate: test
+//! suites that serve on a dead pool declare their own under `tests/support/`.
 
 use std::sync::Arc;
 
@@ -124,6 +131,32 @@ pub async fn bearer_auth_middleware(
             let token = &h[7..];
             match state.jwt_config.validate_token(token) {
                 Ok(claims) => {
+                    // Revocation (RFC 7009, migration 141), by the jti of a
+                    // token whose signature has just been verified. Refused with
+                    // the same uniform `invalid_token` as every other rejection;
+                    // the reason is logged server-side only. Fails CLOSED: a
+                    // store that cannot answer refuses the token.
+                    match state.revocation.is_revoked(claims.jti).await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            tracing::info!(reason = "revoked", "MCP bearer token rejected");
+                            return unauthorized(
+                                state.resource_metadata_url.as_deref(),
+                                INVALID_TOKEN,
+                            );
+                        }
+                        Err(RevocationUnavailable(e)) => {
+                            tracing::error!(
+                                reason = "revocation_unavailable",
+                                error = %e,
+                                "MCP bearer token rejected"
+                            );
+                            return unauthorized(
+                                state.resource_metadata_url.as_deref(),
+                                INVALID_TOKEN,
+                            );
+                        }
+                    }
                     let auth: AuthContext = claims.into();
                     req.extensions_mut().insert(auth);
                     // Stash the raw, still-signed token so the federation gateway
