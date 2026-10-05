@@ -90,7 +90,7 @@ pub use repos::{
     ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository, ClaimVersionRow,
     CommunityRepository, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult,
     ContextRepository, CorpusCounts, CorpusStatsRepository, CounterfactualRepository,
-    CounterfactualRow, DedupRepair, DivergenceRepository, EdgeEncryptionRepository,
+    CounterfactualRow, DecideOutcome, DedupRepair, DivergenceRepository, EdgeEncryptionRepository,
     EdgeEncryptionRow, EdgeRepository, EntityRepository, EntityRow, EntityTypeEntry,
     EntityTypeRepository, EpistemicEdgePairRow, EventRepository, EventRow, EvidenceAtTimeRow,
     EvidenceDetailRow, EvidenceEdgeRow, EvidenceEncryptionRepository, EvidenceEncryptionRow,

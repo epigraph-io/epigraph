@@ -1394,6 +1394,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "match_candidate.rs",
+        "current_status",
+        "READ of one `match_candidates` row's status, a table with no tenancy columns to filter \
+         on, for the refusal message of a conditional decide that matched no row; the caller \
+         already read the same row by id (`MatchCandidateRepo::get`).",
+    ),
+    (
+        "match_candidate.rs",
         "require_privileged",
         "Reads no table and filters nothing: it asks the session one boolean, \
          `epigraph_session_is_privileged_writer()`, before a privileged-only write.",

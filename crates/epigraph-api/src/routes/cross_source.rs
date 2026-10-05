@@ -301,6 +301,23 @@ pub struct DecideCandidateRequest {
     pub verdict: String,
 }
 
+/// Map a conditional decide's outcome: a candidate decided by a concurrent
+/// request between this one's read and its write gets the SAME 409 as a
+/// sequential replay on a decided row (`reject_if_decided`), because to the
+/// caller the two are the same fact.
+#[cfg(feature = "db")]
+fn refuse_if_decided_concurrently(
+    id: Uuid,
+    outcome: epigraph_db::DecideOutcome,
+) -> Result<(), ApiError> {
+    match outcome {
+        epigraph_db::DecideOutcome::Decided => Ok(()),
+        epigraph_db::DecideOutcome::AlreadyDecided { status } => Err(ApiError::Conflict {
+            reason: format!("candidate {id} already decided (status={status})"),
+        }),
+    }
+}
+
 #[cfg(feature = "db")]
 pub async fn decide_candidate(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -479,7 +496,7 @@ pub async fn decide_candidate(
         "promote" => {
             reject_if_decided()?;
             // Resolve the polarity FIRST — before the current-ness guard and
-            // before `set_status`. "promote" is the operator saying "act on
+            // before the status write. "promote" is the operator saying "act on
             // this pair", not "these claims agree": the relationship comes
             // from the row's own `verifier_verdict`. Writing CORROBORATES
             // unconditionally recorded the exact inverse of the verifier's
@@ -520,12 +537,13 @@ pub async fn decide_candidate(
                 });
             }
 
-            repo.set_status(id, "promoted", decided_by)
-                .await
-                .map_err(|e| ApiError::DatabaseError {
-                    message: e.to_string(),
-                })?;
-
+            // One transaction, conditional on the row still being `pending`
+            // (`MatchCandidateRepo::promote_if_pending`): `reject_if_decided`
+            // above is a read-then-gate check that two concurrent decides can
+            // both pass, and this write is what decides the race. A reject
+            // that commits first is never overwritten, and a retirement cannot
+            // slip between the status flip and the edge INSERT. The edge write
+            // runs on the repo's pool, so this handler adds no `db_pool` site.
             let props = serde_json::json!({
                 "candidate_id": id,
                 "score": row.score,
@@ -534,25 +552,22 @@ pub async fn decide_candidate(
                 "decided_by": decided_by,
                 "source": "cross_source_matcher",
             });
-            epigraph_db::EdgeRepository::create_symmetric_if_absent(
-                &state.db_pool,
-                row.claim_a,
-                row.claim_b,
-                relationship,
-                props,
-            )
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: e.to_string(),
-            })?;
-        }
-        "reject" => {
-            reject_if_decided()?;
-            repo.set_status(id, "rejected", decided_by)
+            let outcome = repo
+                .promote_if_pending(id, decided_by, relationship, props)
                 .await
                 .map_err(|e| ApiError::DatabaseError {
                     message: e.to_string(),
                 })?;
+            refuse_if_decided_concurrently(id, outcome)?;
+        }
+        "reject" => {
+            reject_if_decided()?;
+            let outcome = repo.reject_if_pending(id, decided_by).await.map_err(|e| {
+                ApiError::DatabaseError {
+                    message: e.to_string(),
+                }
+            })?;
+            refuse_if_decided_concurrently(id, outcome)?;
         }
         other => {
             return Err(ApiError::BadRequest {

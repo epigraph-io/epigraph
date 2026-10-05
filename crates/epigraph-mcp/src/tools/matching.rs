@@ -30,7 +30,7 @@ use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_db::{ClaimRepository, EdgeRepository, MatchCandidateRepo};
+use epigraph_db::{ClaimRepository, DecideOutcome, MatchCandidateRepo};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -164,6 +164,23 @@ pub async fn list_match_candidates(
     success_json(&out)
 }
 
+/// Map a conditional decide's outcome: a candidate decided by a concurrent
+/// caller between this call's read and its write gets the SAME refusal as a
+/// sequential replay on a decided row (`reject_if_decided`), because to the
+/// caller the two are the same fact.
+fn refuse_if_decided_concurrently(
+    candidate_id: uuid::Uuid,
+    outcome: DecideOutcome,
+) -> Result<(), McpError> {
+    match outcome {
+        DecideOutcome::Decided => Ok(()),
+        DecideOutcome::AlreadyDecided { status } => Err(invalid_params(format!(
+            "candidate {candidate_id} already decided (status={status}); use \
+             retire_match_candidate to undo a promotion"
+        ))),
+    }
+}
+
 pub async fn decide_match_candidate(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -205,7 +222,7 @@ pub async fn decide_match_candidate(
         "promote" => {
             reject_if_decided()?;
             // Resolve the polarity FIRST — before the current-ness guard and
-            // before `set_status`. "promote" is the operator saying "act on
+            // before the status write. "promote" is the operator saying "act on
             // this pair", not "these claims agree": the relationship comes from
             // the row's own `verifier_verdict`. Writing CORROBORATES
             // unconditionally recorded the exact inverse of the verifier's
@@ -243,19 +260,21 @@ pub async fn decide_match_candidate(
                 )));
             }
 
-            repo.set_status(candidate_id, "promoted", Some(acting_agent))
-                .await
-                .map_err(internal_error)?;
-
-            // Write the edge if it doesn't already exist (either direction).
-            // The unique-triple index was dropped in migrations 017/018, and
-            // migration 090's `edges_symmetric_relationship_uniq` replaces it:
-            // the explicit existence check — now centralized in
-            // `EdgeRepository::create_symmetric_if_absent` — is the FAST PATH,
-            // and that index is what makes the answer true for a duplicate the
-            // check cannot see. The index is keyed on the
-            // `"source": "cross_source_matcher"` marker the props below stamp.
-            // The are_all_current guard above stays here at the call site.
+            // The status flip and the edge write are ONE transaction, and the
+            // flip is conditional on the row still being `pending`
+            // (`MatchCandidateRepo::promote_if_pending`). The early
+            // `reject_if_decided` above is a read-then-gate check that two
+            // concurrent decides can both pass; this is what decides the race,
+            // so a reject that commits first is never overwritten and a
+            // retirement cannot slip between the flip and the edge.
+            //
+            // The edge goes through `EdgeRepository::create_symmetric_if_absent_conn`
+            // (inside the repo method): its existence check is the FAST PATH,
+            // and migration 090's `edges_symmetric_relationship_uniq` is what
+            // makes the answer true for a duplicate the check cannot see. The
+            // index is keyed on the `"source": "cross_source_matcher"` marker
+            // the props below stamp. The are_all_current guard above stays
+            // here at the call site.
             let props = serde_json::json!({
                 "candidate_id":     candidate_id,
                 "score":            row.score,
@@ -264,21 +283,19 @@ pub async fn decide_match_candidate(
                 "decided_by":       acting_agent,
                 "source":           "cross_source_matcher",
             });
-            EdgeRepository::create_symmetric_if_absent(
-                &server.pool,
-                row.claim_a,
-                row.claim_b,
-                relationship,
-                props,
-            )
-            .await
-            .map_err(internal_error)?;
+            let outcome = repo
+                .promote_if_pending(candidate_id, Some(acting_agent), relationship, props)
+                .await
+                .map_err(internal_error)?;
+            refuse_if_decided_concurrently(candidate_id, outcome)?;
         }
         "reject" => {
             reject_if_decided()?;
-            repo.set_status(candidate_id, "rejected", Some(acting_agent))
+            let outcome = repo
+                .reject_if_pending(candidate_id, Some(acting_agent))
                 .await
                 .map_err(internal_error)?;
+            refuse_if_decided_concurrently(candidate_id, outcome)?;
         }
         other => {
             // `retire` is NOT handled here — it is its own tool because it

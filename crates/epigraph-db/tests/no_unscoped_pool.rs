@@ -575,7 +575,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `create_hypothesis` reads its frame and writes the frame bind and the prior
 /// on the claim's stamped transaction (`routes/hypothesis.rs` 10 -> 7, read off
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure).
-const HIGH_WATER: usize = 260;
+/// 260 -> 259 in U012: the promote arm of `routes/cross_source.rs` writes its
+/// matcher edge inside `MatchCandidateRepo::promote_if_pending` instead of on
+/// `state.db_pool` (the file 7 -> 6, keeping sites), read off
+/// `the_scanner_is_not_vacuous`'s own failure (`left: 259, right: 260`).
+const HIGH_WATER: usize = 259;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -721,6 +725,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // for two converted sites in two files. The three that remain
     // (`learn_convention`, `forget_convention`, `share_skill`) all WRITE.
     ("routes/conventions.rs", 3),
+    // 7 until U012 (concurrent match-candidate decides), which removed the
+    // promote arm's own `EdgeRepository::create_symmetric_if_absent(&state.db_pool, …)`:
+    // the edge is now written inside `MatchCandidateRepo::promote_if_pending`,
+    // on the same transaction as the status flip, through the repo's own pool.
+    // The rest of this note is the measurement that held the count at 7.
+    //
     // UNCHANGED at 7, and that is a measurement rather than an omission.
     // Conversion shard 5 was sized to include this file (4 of its 7 sites were
     // classified as convertible reads) and then measured it site by site. Three
@@ -737,7 +747,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `read_as` doc's own stated hazard, and the disposition shard 4 already
     // took when `routes/computation.rs` offered the same choice. Whole handlers
     // or nothing.
-    ("routes/cross_source.rs", 7),
+    ("routes/cross_source.rs", 6),
     // 40 before conversion shard 7, which moved the four read-only
     // `ClaimThemeRepository` handlers (`get_boundary_claims`,
     // `get_split_candidates`, `get_distant_claims`, `get_theme_embeddings`) onto

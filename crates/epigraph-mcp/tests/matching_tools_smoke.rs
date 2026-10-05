@@ -1362,7 +1362,11 @@ async fn a_promote_does_not_publish_promoted_before_its_edge_commits(pool: PgPoo
         .as_database_error()
         .and_then(|e| e.code())
         .map(|c| c.into_owned());
-    assert_eq!(code.as_deref(), Some("55P03"), "lock_not_available: {lock_err}");
+    assert_eq!(
+        code.as_deref(),
+        Some("55P03"),
+        "lock_not_available: {lock_err}"
+    );
 
     result.expect("the promote completes once the competing edge is rolled back");
     let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
