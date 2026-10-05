@@ -772,8 +772,17 @@ async fn handle_refresh_token(
     // consent. A `scope` on the request may narrow the access token further,
     // never add to it; the successor refresh token keeps the presented token's
     // scopes (narrowed to the grant by the rotation definer, migration 140).
+    //
+    // A `scope` that names nothing this token can issue is `invalid_scope`
+    // (RFC 6749 section 5.2), answered BEFORE the chain is spent: a 200 with an
+    // empty-scope access token would rotate the chain and authorize nothing.
     let effective_scopes =
-        refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref());
+        refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref())
+            .ok_or_else(|| ApiError::BadRequest {
+                message: "invalid_scope: the requested scope names none of the scopes \
+                          this refresh token was granted"
+                    .into(),
+            })?;
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
@@ -883,18 +892,27 @@ struct StoredRefresh {
 
 /// The scopes a refresh issues: the presented token's `stored` scopes that the
 /// client is still `granted`, in stored order, further narrowed to `requested`
-/// (space-separated) when the request names any. An absent or blank `scope`
-/// means "as originally granted" (RFC 6749 section 6). Never a scope outside
-/// `stored`.
+/// (whitespace-separated) when the request names any. An absent or blank
+/// `scope` means "as originally granted" (RFC 6749 section 6). Never a scope
+/// outside `stored`.
+///
+/// `None` when the request names scopes but none of them can be issued
+/// (`invalid_scope`); a requested scope outside the set is otherwise dropped,
+/// the same leniency as the `client_credentials` grant.
 #[cfg(feature = "db")]
-fn refresh_scopes(stored: &[String], granted: &[String], requested: Option<&str>) -> Vec<String> {
+fn refresh_scopes(
+    stored: &[String],
+    granted: &[String],
+    requested: Option<&str>,
+) -> Option<Vec<String>> {
     let requested: Vec<&str> = requested.map_or_else(Vec::new, |r| r.split_whitespace().collect());
-    stored
+    let issued: Vec<String> = stored
         .iter()
         .filter(|s| granted.contains(s))
         .filter(|s| requested.is_empty() || requested.contains(&s.as_str()))
         .cloned()
-        .collect()
+        .collect();
+    Some(issued)
 }
 
 /// One 401 for every refresh that cannot proceed (unknown, expired, revoked,
@@ -1433,7 +1451,7 @@ mod refresh_scope_tests {
         for blank in [None, Some(""), Some("   ")] {
             assert_eq!(
                 refresh_scopes(&stored, &stored, blank),
-                stored,
+                Some(stored.clone()),
                 "{blank:?} must not narrow the token to nothing"
             );
         }
@@ -1441,13 +1459,28 @@ mod refresh_scope_tests {
 
     #[test]
     fn a_requested_scope_outside_the_stored_set_is_never_added() {
-        let stored = v(&["claims:read"]);
-        let granted = v(&["claims:read", "claims:write", "claims:admin"]);
+        let stored = v(&["claims:read", "evidence:read"]);
+        let granted = v(&["claims:read", "claims:write", "claims:admin", "evidence:read"]);
         assert_eq!(
-            refresh_scopes(&stored, &granted, Some("claims:write claims:admin")),
-            Vec::<String>::new(),
+            refresh_scopes(&stored, &granted, Some("claims:read claims:write claims:admin")),
+            Some(v(&["claims:read"])),
             "only a narrowing of the stored scopes; the client's wider grant is not a source"
         );
+    }
+
+    #[test]
+    fn a_requested_scope_that_names_nothing_issuable_is_invalid_scope() {
+        let stored = v(&["claims:read"]);
+        let granted = v(&["claims:read", "claims:write", "claims:admin"]);
+        for nothing in ["claims:write claims:admin", "offline_access"] {
+            assert_eq!(
+                refresh_scopes(&stored, &granted, Some(nothing)),
+                None,
+                "{nothing:?} must be refused, not answered with an empty-scope token"
+            );
+        }
+        // Blank still means "as originally granted", even when that is empty.
+        assert_eq!(refresh_scopes(&stored, &[], None), Some(Vec::new()));
     }
 
     #[test]
@@ -1456,11 +1489,11 @@ mod refresh_scope_tests {
         let granted = v(&["claims:read", "claims:write"]);
         assert_eq!(
             refresh_scopes(&stored, &granted, None),
-            v(&["claims:write", "claims:read"])
+            Some(v(&["claims:write", "claims:read"]))
         );
         assert_eq!(
             refresh_scopes(&stored, &granted, Some("claims:read\tclaims:write")),
-            v(&["claims:write", "claims:read"]),
+            Some(v(&["claims:write", "claims:read"])),
             "any whitespace separates requested scopes"
         );
     }

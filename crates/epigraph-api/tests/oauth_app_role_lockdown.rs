@@ -601,6 +601,57 @@ async fn a_refresh_request_narrows_the_access_token_but_not_the_chain(pool: PgPo
     assert_eq!(body["scope"], "claims:read claims:write");
 }
 
+/// A refresh whose `scope` names none of the presented token's issuable scopes
+/// is `invalid_scope` (RFC 6749 section 5.2), and it is refused BEFORE the
+/// chain is spent: the same refresh token still works afterwards. Answering
+/// 200 instead would rotate the chain into an access token that authorizes
+/// nothing; on main the request's `scope` was ignored on refresh, so a client
+/// sending an unrelated scope (`offline_access`) would fail silently.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refresh_scope_naming_nothing_issuable_is_refused_and_keeps_the_chain(pool: PgPool) {
+    let (client_id, client, code) = seed_code_with(
+        &pool,
+        &[s("claims:read"), s("claims:write")],
+        &[s("claims:read")],
+    )
+    .await;
+    let app = app_router(&pool, 2).await;
+    let (status, body) = post_token(app.clone(), code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    let r0 = body["refresh_token"].as_str().unwrap().to_string();
+
+    for nothing in ["offline_access", "claims:write"] {
+        let (status, body) = post_token(
+            app.clone(),
+            serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": r0,
+                "scope": nothing,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "scope={nothing:?} names nothing this token can issue: {body}"
+        );
+        assert!(
+            body.to_string().contains("invalid_scope"),
+            "the refusal is invalid_scope: {body}"
+        );
+        assert!(body.get("access_token").is_none(), "no token issued: {body}");
+    }
+
+    let (status, body) = post_token(app.clone(), refresh_grant(&r0)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refused requests did not spend the presented token: {body}"
+    );
+    assert_eq!(body["scope"], "claims:read");
+    assert_eq!(live_scopes(&pool, client).await, vec![s("claims:read")]);
+}
+
 /// RFC 6749 section 5.1: a token response carries `Cache-Control: no-store`.
 /// The whole anonymous `/oauth` router is marked so (the consent page carries
 /// a single-use ticket; see `oauth_authorization_code.rs`).
