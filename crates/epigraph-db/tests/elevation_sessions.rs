@@ -122,6 +122,24 @@ async fn maint_exec(pool: &PgPool, sql: &str, id: Uuid) -> Result<u64, sqlx::Err
     .await
 }
 
+/// End `assignment` on a maintenance session, as `epigraph-operator
+/// end-role-assignment` does. Since migration 130 an end while a live
+/// custodian holds a passkey rides a confirmed `role.end` act
+/// ([`fixture::role_end_act`]); rows affected.
+async fn end_assignment(pool: &PgPool, assignment: Uuid) -> Result<u64, sqlx::Error> {
+    let act = fixture::role_end_act(pool, assignment, "elevation test").await;
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query("SELECT public.epigraph_end_role_assignment($1, 'elevation test', $2)")
+            .bind(assignment)
+            .bind(act)
+            .execute(&mut *conn)
+            .await
+            .map(|d| d.rows_affected());
+        (conn, r)
+    })
+    .await
+}
+
 /// One statement binding `id` as the harness superuser with every trigger
 /// off: used only to age a row, or to make a change WITHOUT its end trigger
 /// so that the computed check is what holds.
@@ -161,13 +179,25 @@ async fn human(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
 }
 
 /// A live passkey for `person`, through 124's ceremony definers: enrolled on
-/// the maintenance role, challenged and completed by the unstamped app.
+/// the maintenance role, challenged and completed by the unstamped app. A
+/// LATER passkey of the same person is enrolled on a confirmed
+/// `passkey.register` act since migration 130
+/// ([`fixture::passkey_register_act`]).
 async fn passkey(pool: &PgPool, person: Uuid, n: u8) -> Uuid {
+    let act = fixture::passkey_register_act(pool, person, "elevation test", "key").await;
     let e: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
-        let e = sqlx::query_scalar(
-            "SELECT public.epigraph_create_passkey_enrollment($1, 'elevation test', 'key')",
-        )
-        .bind(person)
+        let e = match act {
+            None => sqlx::query_scalar(
+                "SELECT public.epigraph_create_passkey_enrollment($1, 'elevation test', 'key')",
+            )
+            .bind(person),
+            Some(act) => sqlx::query_scalar(
+                "SELECT public.epigraph_create_passkey_enrollment($1, 'elevation test', 'key', \
+                                                                  $2)",
+            )
+            .bind(person)
+            .bind(act),
+        }
         .fetch_one(&mut *conn)
         .await
         .expect("enroll");
@@ -818,13 +848,9 @@ async fn a_device_bound_passkey_asserting_backup_eligible_is_refused(pool: PgPoo
 async fn a_confirmation_rechecks_the_holder_at_use_time(pool: PgPool) {
     let h = holder(&pool, "ended", 1).await;
     let t = ticket(&pool, &h, "connector", None).await;
-    maint_exec(
-        &pool,
-        "SELECT public.epigraph_end_role_assignment($1, 'elevation test')",
-        h.assignment,
-    )
-    .await
-    .expect("end the assignment");
+    end_assignment(&pool, h.assignment)
+        .await
+        .expect("end the assignment");
     let r = confirm(&pool, t, &h.cred, 0, false).await.expect("confirm");
     assert_eq!(
         (r.0.as_str(), r.2.as_deref()),
@@ -1256,13 +1282,29 @@ async fn the_live_assignment_must_be_the_stored_one(pool: PgPool) {
     let h = holder(&pool, "holder", 1).await;
     let sid = elevated(&pool, &h).await;
     let q = holder(&pool, "grantor", 2).await;
-    sqlx::query("SELECT public.epigraph_grant_role($1, $2, NULL, NULL, $3, 'a second assignment')")
-        .bind(CUSTODIAN)
-        .bind(h.person)
-        .bind(q.person)
-        .execute(&pool)
-        .await
-        .expect("a second assignment");
+    // Since 130 the grantor Q holds a passkey, so the grant rides a confirmed
+    // `role.grant` act (the fixture's stand-in).
+    let act = fixture::confirmed_act(
+        &pool,
+        "role.grant",
+        &format!(
+            "{{\"role\": \"{CUSTODIAN}\", \"holder\": \"{}\", \"valid_from\": null, \
+             \"valid_to\": null, \"reason\": \"a second assignment\"}}",
+            h.person
+        ),
+        q.person,
+    )
+    .await;
+    sqlx::query(
+        "SELECT public.epigraph_grant_role($1, $2, NULL, NULL, $3, 'a second assignment', $4)",
+    )
+    .bind(CUSTODIAN)
+    .bind(h.person)
+    .bind(q.person)
+    .bind(act)
+    .execute(&pool)
+    .await
+    .expect("a second assignment");
     without_triggers(
         &pool,
         "UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
@@ -1522,13 +1564,9 @@ async fn a_family_reuse_ends_the_session_and_a_rotation_does_not(pool: PgPool) {
 async fn an_assignment_end_ends_its_session(pool: PgPool) {
     let h = holder(&pool, "holder", 1).await;
     let sid = elevated(&pool, &h).await;
-    maint_exec(
-        &pool,
-        "SELECT public.epigraph_end_role_assignment($1, 'elevation test')",
-        h.assignment,
-    )
-    .await
-    .expect("end the assignment");
+    end_assignment(&pool, h.assignment)
+        .await
+        .expect("end the assignment");
     assert_eq!(
         ended_reason(&pool, sid).await.as_deref(),
         Some("assignment_revoked")

@@ -1,0 +1,1152 @@
+//! Migration 130: pending admin acts, the 123 guards bound to confirmed acts,
+//! and when a confirmation is required (ELV10).
+//!
+//! An act is PROPOSED by an elevated session, CONFIRMED by a passkey of its
+//! proposer, and CONSUMED from inside the maintenance write it authorizes
+//! (the role-assignment guards, the custodial-act recorder, the enrollment
+//! guard), whose args the database recomputes from the write itself.
+//!
+//! Every SQL-authority probe runs as `epigraph_app` or `epigraph_maintenance`
+//! under `SET SESSION AUTHORIZATION`, stamped and unstamped as
+//! `elevation_sessions.rs` does ([`as_app`]). Sessions and acts are driven
+//! through the real definers (ticket, ceremony, confirmation; proposal,
+//! challenge, confirmation) with synthetic evidence: the database cannot
+//! verify a signature, so what it is asked to hold here is the binding. A
+//! superuser with triggers off is used only to age a row. Every refusal is
+//! asserted by its SQLSTATE.
+//!
+//! Each test names the mutation of `migrations/130_pending_admin_acts.sql`
+//! it was run against ("Verified to fail").
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const CUSTODIAN: &str = "role:platform-custodian";
+const AUDITOR: &str = "role:auditor";
+
+fn sqlstate(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(|c| c.to_string())
+}
+
+fn assert_code<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>, code: &str, what: &str) {
+    assert_eq!(
+        r.as_ref().err().and_then(sqlstate).as_deref(),
+        Some(code),
+        "{what}: expected SQLSTATE {code}, got {r:?}"
+    );
+}
+
+/// Run `f` as `epigraph_app` with all five session GUCs stamped (and the
+/// recorder declared), cleared afterwards (`elevation_sessions.rs`' helper).
+async fn as_app<F, Fut, T>(pool: &PgPool, principal: Option<Uuid>, elv: &str, fam: &str, f: F) -> T
+where
+    F: FnOnce(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
+    Fut: std::future::Future<Output = (sqlx::pool::PoolConnection<sqlx::Postgres>, T)>,
+{
+    let principal = principal.map(|p| p.to_string()).unwrap_or_default();
+    let (elv, fam) = (elv.to_string(), fam.to_string());
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', $1, false), \
+                    set_config('epigraph.group_ids', '', false), \
+                    set_config('epigraph.writable_group_ids', '', false), \
+                    set_config('epigraph.elevation_id', $2, false), \
+                    set_config('epigraph.family_id', $3, false), \
+                    set_config('epigraph.access_recorder', 'on', false)",
+        )
+        .bind(&principal)
+        .bind(&elv)
+        .bind(&fam)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp");
+        let (mut conn, out) = f(conn).await;
+        sqlx::query(
+            "SELECT set_config('epigraph.principal_id', '', false), \
+                    set_config('epigraph.elevation_id', '', false), \
+                    set_config('epigraph.family_id', '', false), \
+                    set_config('epigraph.access_recorder', '', false)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("unstamp");
+        (conn, out)
+    })
+    .await
+}
+
+/// One statement on a MAINTENANCE session, binding the given uuids in order
+/// (a `None` binds NULL); rows affected.
+async fn maint(pool: &PgPool, sql: &str, ids: &[Option<Uuid>]) -> Result<u64, sqlx::Error> {
+    let (sql, ids) = (sql.to_string(), ids.to_vec());
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let mut q = sqlx::query(&sql);
+        for id in ids {
+            q = q.bind(id);
+        }
+        let r = q.execute(&mut *conn).await.map(|d| d.rows_affected());
+        (conn, r)
+    })
+    .await
+}
+
+/// One statement as the harness superuser with every trigger off (to age a
+/// row only).
+async fn without_triggers(pool: &PgPool, sql: &str, id: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers off");
+    let r = sqlx::query(sql).bind(id).execute(&mut *conn).await;
+    sqlx::query("SET session_replication_role = DEFAULT")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers on");
+    r.unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+fn credential(n: u8) -> Vec<u8> {
+    let mut id = vec![0x5A_u8; 16];
+    id[0] = n;
+    id
+}
+
+/// A registered human: `(agent, human client id)`.
+async fn human(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
+    let (person, _) = fixture::seed_human_operator(pool, label).await;
+    let client: Uuid = sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client");
+    (person, client)
+}
+
+/// A live passkey for `person` through 124's ceremony definers (maintenance
+/// opens, the unstamped app completes); its id. Since 130 a SECOND passkey of
+/// one person is refused here (ELV10); see
+/// [`a_later_passkey_rides_a_confirmed_register_act`].
+async fn passkey(pool: &PgPool, person: Uuid, n: u8) -> Uuid {
+    let e: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'act test', 'key')",
+        )
+        .bind(person)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("enroll");
+        (conn, e)
+    })
+    .await;
+    complete_enrollment(pool, e, n).await
+}
+
+async fn complete_enrollment(pool: &PgPool, enrollment: Uuid, n: u8) -> Uuid {
+    as_app(pool, None, "", "", |mut conn| async move {
+        sqlx::query(
+            "SELECT public.epigraph_set_passkey_enrollment_challenge($1, '{\"rs\": 1}'::jsonb)",
+        )
+        .bind(enrollment)
+        .execute(&mut *conn)
+        .await
+        .expect("enrollment challenge");
+        let key: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_complete_passkey_enrollment($1, $2, \
+                    '{\"cred\": 1}'::jsonb, '00000000-0000-0000-0000-000000000000'::uuid, \
+                    'none', true, false)",
+        )
+        .bind(enrollment)
+        .bind(credential(n))
+        .fetch_one(&mut *conn)
+        .await
+        .expect("complete the enrollment");
+        (conn, key)
+    })
+    .await
+}
+
+async fn family(pool: &PgPool, client: Uuid) -> Uuid {
+    let hash: Vec<u8> = [
+        Uuid::new_v4().as_bytes().to_vec(),
+        Uuid::new_v4().as_bytes().to_vec(),
+    ]
+    .concat();
+    sqlx::query_scalar(
+        "INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at) \
+         VALUES ($1, $2, ARRAY['claims:read'], now() + interval '1 day') RETURNING id",
+    )
+    .bind(&hash)
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .expect("a refresh token")
+}
+
+/// A custodian with one live passkey and a live family, and a LIVE elevation
+/// session on that family (the recorder gate opened for this database).
+#[derive(Clone, Debug)]
+struct Elevated {
+    person: Uuid,
+    assignment: Uuid,
+    passkey: Uuid,
+    cred: Vec<u8>,
+    family: Uuid,
+    session: Uuid,
+}
+
+async fn elevated_custodian(pool: &PgPool, label: &str, n: u8) -> Elevated {
+    fixture::open_elevated_access_gate(pool).await;
+    let (person, client) = human(pool, label).await;
+    let assignment = fixture::make_custodian(pool, person).await;
+    let passkey = passkey(pool, person, n).await;
+    let family = family(pool, client).await;
+    let ticket: Uuid = as_app(pool, Some(person), "", "", |mut conn| async move {
+        let t: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_create_elevation_ticket($1, $2, 'connector', 'act test', \
+                                                           NULL)",
+        )
+        .bind(client)
+        .bind(family)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("a ticket");
+        sqlx::query(
+            "SELECT public.epigraph_set_elevation_ticket_challenge($1, '{\"st\": 1}'::jsonb)",
+        )
+        .bind(t)
+        .execute(&mut *conn)
+        .await
+        .expect("the ticket's challenge");
+        (conn, t)
+    })
+    .await;
+    let cred = credential(n);
+    let c2 = cred.clone();
+    let session: Uuid = as_app(pool, None, "", "", |mut conn| async move {
+        let (outcome, session): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT outcome, session_id FROM public.epigraph_confirm_elevation($1, $2, 0, \
+                    false, '{\"ev\": 1}'::jsonb)",
+        )
+        .bind(ticket)
+        .bind(c2)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("confirm the elevation");
+        assert_eq!(outcome, "confirmed", "CALIBRATION: the elevation confirms");
+        (conn, session.expect("a session"))
+    })
+    .await;
+    Elevated {
+        person,
+        assignment,
+        passkey,
+        cred,
+        family,
+        session,
+    }
+}
+
+/// `epigraph_propose_admin_act` on an app session stamped as `e.person`,
+/// elevated on its session when `elevated`, else with no elevation.
+async fn propose(
+    pool: &PgPool,
+    e: &Elevated,
+    elevated: bool,
+    kind: &str,
+    args: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let (elv, fam) = if elevated {
+        (e.session.to_string(), e.family.to_string())
+    } else {
+        (String::new(), String::new())
+    };
+    let (kind, args) = (kind.to_string(), args.to_string());
+    as_app(pool, Some(e.person), &elv, &fam, |mut conn| async move {
+        let r = sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_propose_admin_act($1, $2::jsonb, 'act test: why', 'jti-1')",
+        )
+        .bind(&kind)
+        .bind(&args)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// The confirmation ceremony's first step, as the unauthenticated API runs it.
+async fn start(pool: &PgPool, act: Uuid) -> Result<(), sqlx::Error> {
+    as_app(pool, None, "", "", |mut conn| async move {
+        let r = sqlx::query(
+            "SELECT public.epigraph_set_admin_act_challenge($1, '{\"act\": 1}'::jsonb)",
+        )
+        .bind(act)
+        .execute(&mut *conn)
+        .await
+        .map(|_| ());
+        (conn, r)
+    })
+    .await
+}
+
+type ActOutcome = (String, Option<String>, Option<String>);
+
+/// (kind, args, hex digest, target, proposer, elevation, assignment, jti).
+type ActRow = (
+    String,
+    serde_json::Value,
+    String,
+    Uuid,
+    Uuid,
+    Uuid,
+    Uuid,
+    Option<String>,
+);
+
+/// The ceremony's last step: (outcome, refusal, code).
+async fn confirm_act(
+    pool: &PgPool,
+    act: Uuid,
+    cred: &[u8],
+    counter: i64,
+) -> Result<ActOutcome, sqlx::Error> {
+    let cred = cred.to_vec();
+    as_app(pool, None, "", "", |mut conn| async move {
+        let r = sqlx::query_as::<_, ActOutcome>(
+            "SELECT outcome, refusal, code \
+               FROM public.epigraph_confirm_admin_act($1, $2, $3, false, '{\"ev\": 1}'::jsonb)",
+        )
+        .bind(act)
+        .bind(cred)
+        .bind(counter)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// A proposed, started and CONFIRMED act of `e`; its id.
+async fn confirmed(pool: &PgPool, e: &Elevated, kind: &str, args: &str) -> Uuid {
+    let act = propose(pool, e, true, kind, args).await.expect("propose");
+    start(pool, act).await.expect("the act's challenge");
+    let r = confirm_act(pool, act, &e.cred, 0).await.expect("confirm");
+    assert_eq!(r.0, "confirmed", "CALIBRATION: the act confirms: {r:?}");
+    act
+}
+
+async fn events(pool: &PgPool, event_type: &str, key: &str, id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = $1 AND details->>$2 = $3",
+    )
+    .bind(event_type)
+    .bind(key)
+    .bind(id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("events")
+}
+
+/// The `confirmation` (and `act_id`) of the newest `event_type` row about
+/// assignment `id`.
+async fn confirmation_of(pool: &PgPool, event_type: &str, id: Uuid) -> (String, Option<String>) {
+    sqlx::query_as(
+        "SELECT details->>'confirmation', details->>'act_id' FROM security_events \
+          WHERE event_type = $1 AND details->>'assignment_id' = $2 \
+          ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(event_type)
+    .bind(id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("the audit row")
+}
+
+fn grant_args(role: &str, holder: Uuid, valid_to: Option<&str>, reason: &str) -> String {
+    format!(
+        "{{\"role\": \"{role}\", \"holder\": \"{holder}\", \"valid_from\": null, \
+         \"valid_to\": {}, \"reason\": \"{reason}\"}}",
+        valid_to.map_or_else(|| "null".to_string(), |t| format!("\"{t}\""))
+    )
+}
+
+/// `epigraph_grant_role` (seven-parameter, act-taking form) on a maintenance
+/// session; the new assignment id.
+async fn grant_on(
+    pool: &PgPool,
+    role: &str,
+    holder: Uuid,
+    valid_to: Option<&str>,
+    granted_by: Option<Uuid>,
+    reason: &str,
+    act: Option<Uuid>,
+) -> Result<Uuid, sqlx::Error> {
+    let (role, valid_to, reason) = (
+        role.to_string(),
+        valid_to.map(str::to_string),
+        reason.to_string(),
+    );
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_grant_role($1, $2, NULL, $3::timestamptz, $4, $5, $6)",
+        )
+        .bind(&role)
+        .bind(holder)
+        .bind(valid_to)
+        .bind(granted_by)
+        .bind(&reason)
+        .bind(act)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+// =====================================================================
+// PROPOSAL: only an elevated session, only through the definer.
+// =====================================================================
+
+/// An act is proposed only by an ELEVATED session (ELV07 otherwise), as the
+/// session principal, with its args in canonical form and their digest, the
+/// target they name, and the elevation and assignment it was proposed under;
+/// the proposal is audited.
+///
+/// Verified to fail: the definer's `epigraph_is_elevated()` check dropped ->
+/// the unelevated proposal raises 23502 (no elevation to record), not ELV07.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_act_is_proposed_only_while_elevated(pool: PgPool) {
+    let p = elevated_custodian(&pool, "proposer", 1).await;
+    let (x, _) = human(&pool, "holder").await;
+    let args = format!(
+        "{{\"role\": \"{AUDITOR}\", \"holder\": \"{}\", \"valid_to\": \
+         \"2099-01-01T00:00:00+01:00\", \"reason\": \"audit\"}}",
+        x.to_string().to_uppercase()
+    );
+    assert_code(
+        &propose(&pool, &p, false, "role.grant", &args).await,
+        "ELV07",
+        "an unelevated proposal",
+    );
+    let act = propose(&pool, &p, true, "role.grant", &args)
+        .await
+        .expect("an elevated proposal");
+    let row: ActRow = sqlx::query_as(
+        "SELECT kind, args, encode(args_digest, 'hex'), target_id, proposed_by, \
+                    elevation_id, assignment_id, jti \
+               FROM pending_admin_acts WHERE id = $1",
+    )
+    .bind(act)
+    .fetch_one(&pool)
+    .await
+    .expect("the act");
+    assert_eq!(row.0, "role.grant");
+    assert_eq!(
+        row.1,
+        serde_json::json!({"role": AUDITOR, "holder": x.to_string(), "valid_from": null,
+                           "valid_to": "2098-12-31T23:00:00.000000Z", "reason": "audit"}),
+        "canonical args"
+    );
+    let digest: String = sqlx::query_scalar(
+        "SELECT encode(sha256(convert_to(public.epigraph_canonical_json(args), 'UTF8')), 'hex') \
+           FROM pending_admin_acts WHERE id = $1",
+    )
+    .bind(act)
+    .fetch_one(&pool)
+    .await
+    .expect("digest");
+    assert_eq!(row.2, digest, "the digest is of the canonical text");
+    assert_eq!(
+        (row.3, row.4, row.5, row.6, row.7.as_deref()),
+        (x, p.person, p.session, p.assignment, Some("jti-1"))
+    );
+    assert_eq!(
+        events(&pool, "platform.admin_act_proposed", "act_id", act).await,
+        1
+    );
+}
+
+/// The TABLE binds an act to a live elevation of its proposer: a
+/// maintenance login (on which no session is ever live) inserting a
+/// well-formed act naming a live session is refused ELV07, and the
+/// application role has no INSERT at all (42501).
+///
+/// Verified to fail: the insert guard's live-session check dropped -> the
+/// maintenance insert lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_login_inserts_an_act_directly(pool: PgPool) {
+    let p = elevated_custodian(&pool, "proposer", 1).await;
+    let insert = "INSERT INTO pending_admin_acts (kind, args, args_digest, target_type, \
+                    target_id, reason, proposed_by, elevation_id, assignment_id, expires_at) \
+                  SELECT 'role.end', a, public.epigraph_admin_act_digest(a), 'role_assignment', \
+                         $1, 'direct', $2, $3, $1, now() + interval '30 minutes' \
+                    FROM public.epigraph_admin_act_args('role.end', jsonb_build_object( \
+                         'assignment', $1, 'reason', 'r')) a";
+    assert_code(
+        &maint(
+            &pool,
+            insert,
+            &[Some(p.assignment), Some(p.person), Some(p.session)],
+        )
+        .await,
+        "ELV07",
+        "a maintenance insert",
+    );
+    let (a, pr, s) = (p.assignment, p.person, p.session);
+    let r = as_app(
+        &pool,
+        Some(p.person),
+        &p.session.to_string(),
+        &p.family.to_string(),
+        |mut conn| async move {
+            let r = sqlx::query(insert)
+                .bind(a)
+                .bind(pr)
+                .bind(s)
+                .execute(&mut *conn)
+                .await;
+            (conn, r)
+        },
+    )
+    .await;
+    assert_code(&r, "42501", "an application insert");
+}
+
+/// Stored args are canonical and carry their own digest: an insert whose
+/// digest is not the digest of its args is refused ELV03 (before any other
+/// check), and the canonicalizer refuses a key the kind does not take and a
+/// truth value with more than six places (22023).
+///
+/// Verified to fail: the insert guard's digest comparison dropped -> the
+/// mismatched insert is refused ELV07 instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn stored_args_are_canonical_and_digested(pool: PgPool) {
+    let p = elevated_custodian(&pool, "proposer", 1).await;
+    let r = maint(
+        &pool,
+        "INSERT INTO pending_admin_acts (kind, args, args_digest, target_type, target_id, \
+                reason, proposed_by, elevation_id, assignment_id, expires_at) \
+         SELECT 'role.end', a, sha256('other'::bytea), 'role_assignment', $1, 'direct', $2, \
+                $3, $1, now() + interval '30 minutes' \
+           FROM public.epigraph_admin_act_args('role.end', jsonb_build_object( \
+                'assignment', $1, 'reason', 'r')) a",
+        &[Some(p.assignment), Some(p.person), Some(p.session)],
+    )
+    .await;
+    assert_code(&r, "ELV03", "a digest that is not its args'");
+    assert_code(
+        &propose(
+            &pool,
+            &p,
+            true,
+            "role.end",
+            &format!(
+                "{{\"assignment\": \"{}\", \"reason\": \"r\", \"extra\": 1}}",
+                p.assignment
+            ),
+        )
+        .await,
+        "22023",
+        "a key role.end does not take",
+    );
+    assert_code(
+        &propose(
+            &pool,
+            &p,
+            true,
+            "claim.custodial_supersede",
+            &format!(
+                "{{\"claim\": \"{}\", \"content_sha256\": \"{}\", \"truth\": 0.1234567, \
+                 \"reason\": \"r\", \"allow_owned\": false}}",
+                Uuid::new_v4(),
+                "a".repeat(64)
+            ),
+        )
+        .await,
+        "22023",
+        "a truth value with seven places",
+    );
+}
+
+// =====================================================================
+// CONFIRMATION: only the proposer's live passkey; refusals final, audited.
+// =====================================================================
+
+/// An act confirmed by ANOTHER person's credential is refused
+/// `person_mismatch` (returned, audited), and the refusal is final: the
+/// proposer's own passkey cannot confirm it afterwards (ELV08). A direct
+/// maintenance UPDATE confirming an act with another person's passkey is
+/// refused by the table (ELV02).
+///
+/// Verified to fail: the definer's person check dropped -> the refusal is no
+/// longer recorded and returned (the table guard raises ELV02 at the
+/// confirmation instead, so nothing is audited); the table guard's proposer
+/// check dropped -> the direct update lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_proposers_passkey_confirms(pool: PgPool) {
+    let p = elevated_custodian(&pool, "proposer", 1).await;
+    let b = elevated_custodian(&pool, "bystander", 2).await;
+    let args = format!(
+        "{{\"assignment\": \"{}\", \"reason\": \"r\"}}",
+        b.assignment
+    );
+    let act = propose(&pool, &p, true, "role.end", &args)
+        .await
+        .expect("propose");
+    start(&pool, act).await.expect("challenge");
+    let r = confirm_act(&pool, act, &b.cred, 1).await.expect("confirm");
+    assert_eq!(
+        (r.0.as_str(), r.1.as_deref(), r.2.as_deref()),
+        ("refused", Some("person_mismatch"), Some("ELV02"))
+    );
+    assert_eq!(
+        events(&pool, "platform.admin_act_refused", "act_id", act).await,
+        1
+    );
+    assert_code(
+        &confirm_act(&pool, act, &p.cred, 1).await,
+        "ELV08",
+        "a refused act is final",
+    );
+
+    let act2 = propose(&pool, &p, true, "role.end", &args)
+        .await
+        .expect("propose again");
+    start(&pool, act2).await.expect("challenge");
+    let r = maint(
+        &pool,
+        "UPDATE pending_admin_acts SET asserted_at = now(), outcome = 'confirmed', \
+                assertion_evidence = '{}'::jsonb, authenticator_id = $2 WHERE id = $1",
+        &[Some(act2), Some(b.passkey)],
+    )
+    .await;
+    assert_code(
+        &r,
+        "ELV02",
+        "a direct confirmation by another person's passkey",
+    );
+}
+
+/// A regressed signature counter refuses the confirmation `counter_regressed`
+/// (ELV05), audited as `platform.passkey_counter_regressed` too.
+///
+/// Verified to fail: the counter test dropped -> the confirmation raises
+/// (124's passkey guard refuses a decreasing counter, ELV03) instead of being
+/// refused, recorded and audited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_regressed_counter_refuses_the_confirmation(pool: PgPool) {
+    let p = elevated_custodian(&pool, "proposer", 1).await;
+    let args = format!(
+        "{{\"assignment\": \"{}\", \"reason\": \"r\"}}",
+        p.assignment
+    );
+    let first = confirmed_with(&pool, &p, &args, 7).await;
+    assert_eq!(first.0, "confirmed");
+    let act = propose(&pool, &p, true, "role.end", &args)
+        .await
+        .expect("propose");
+    start(&pool, act).await.expect("challenge");
+    let r = confirm_act(&pool, act, &p.cred, 5).await.expect("confirm");
+    assert_eq!(
+        (r.0.as_str(), r.1.as_deref(), r.2.as_deref()),
+        ("refused", Some("counter_regressed"), Some("ELV05"))
+    );
+    assert_eq!(
+        events(&pool, "platform.passkey_counter_regressed", "act_id", act).await,
+        1
+    );
+}
+
+async fn confirmed_with(pool: &PgPool, e: &Elevated, args: &str, counter: i64) -> ActOutcome {
+    let act = propose(pool, e, true, "role.end", args)
+        .await
+        .expect("propose");
+    start(pool, act).await.expect("challenge");
+    confirm_act(pool, act, &e.cred, counter)
+        .await
+        .expect("confirm")
+}
+
+// =====================================================================
+// ELV10: when a confirmation is required (EQ-2 (a)), and bootstrap.
+// =====================================================================
+
+/// The BOOTSTRAP grant (no grantor) is admitted and audited `confirmation =
+/// 'none'`; a grant by a grantor with NO passkey is admitted unconfirmed,
+/// even to a holder that holds one; once the GRANTOR holds a passkey, its
+/// grant without an act is refused ELV10.
+///
+/// Verified to fail: the ELV10 test keyed on the holder instead of the
+/// grantor -> the passkey-holding holder's grant is refused and the
+/// passkey-holding grantor's admitted; the ELV10 test dropped -> the last
+/// grant lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_grantor_holding_a_passkey_grants_only_on_a_confirmed_act(pool: PgPool) {
+    let (g, _) = human(&pool, "grantor").await;
+    let boot = grant_on(&pool, CUSTODIAN, g, None, None, "bootstrap", None)
+        .await
+        .expect("the bootstrap grant");
+    assert_eq!(
+        confirmation_of(&pool, "platform.role_granted", boot).await,
+        ("none".to_string(), None),
+        "the bootstrap is recorded unconfirmed"
+    );
+    let (h, _) = human(&pool, "holder").await;
+    passkey(&pool, h, 3).await;
+    let a = grant_on(&pool, AUDITOR, h, None, Some(g), "audit", None)
+        .await
+        .expect("a grantor with no passkey grants unconfirmed");
+    assert_eq!(
+        confirmation_of(&pool, "platform.role_granted", a).await.0,
+        "none"
+    );
+    passkey(&pool, g, 4).await;
+    let (y, _) = human(&pool, "second holder").await;
+    assert_code(
+        &grant_on(&pool, AUDITOR, y, None, Some(g), "audit", None).await,
+        "ELV10",
+        "a passkey-holding grantor's unconfirmed grant",
+    );
+}
+
+/// A confirmed `role.grant` act executes exactly its args, once, by its
+/// proposer: a grant whose `valid_to` differs by one field is refused ELV09;
+/// one naming another grantor is refused ELV09; the exact grant lands, the
+/// act is consumed (by this login, with the assignment as its result), and
+/// the grant's audit names the act and its elevation; a second use is
+/// refused ELV08.
+///
+/// Verified to fail: the canonical args built without `valid_to` (a digest
+/// over a subset, on both sides) -> the one-field-different grant lands; the
+/// actor comparison dropped from the consumer -> the other grantor's grant
+/// lands; the consumer's consumption UPDATE dropped -> the act stays
+/// unconsumed and the second use lands. EQUIVALENT alone: the consumer's
+/// already-consumed test (the table guard refuses any change to a consumed
+/// act, ELV08, as a second layer).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_confirmed_grant_executes_exactly_its_args_once(pool: PgPool) {
+    let p = elevated_custodian(&pool, "proposer", 1).await;
+    let q = elevated_custodian(&pool, "other custodian", 2).await;
+    let (x, _) = human(&pool, "holder").await;
+    let to = "2099-01-01T00:00:00.000000Z";
+    let act = confirmed(
+        &pool,
+        &p,
+        "role.grant",
+        &grant_args(AUDITOR, x, Some(to), "audit"),
+    )
+    .await;
+    assert_code(
+        &grant_on(
+            &pool,
+            AUDITOR,
+            x,
+            Some("2099-01-02T00:00:00Z"),
+            Some(p.person),
+            "audit",
+            Some(act),
+        )
+        .await,
+        "ELV09",
+        "args differing in valid_to",
+    );
+    assert_code(
+        &grant_on(
+            &pool,
+            AUDITOR,
+            x,
+            Some(to),
+            Some(q.person),
+            "audit",
+            Some(act),
+        )
+        .await,
+        "ELV09",
+        "another grantor",
+    );
+    let id = grant_on(
+        &pool,
+        AUDITOR,
+        x,
+        Some(to),
+        Some(p.person),
+        "audit",
+        Some(act),
+    )
+    .await
+    .expect("the confirmed grant");
+    let (consumed_by, result): (Option<String>, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT consumed_by, result FROM pending_admin_acts WHERE id = $1")
+            .bind(act)
+            .fetch_one(&pool)
+            .await
+            .expect("the act");
+    assert_eq!(consumed_by.as_deref(), Some("epigraph_maintenance"));
+    assert_eq!(
+        result,
+        Some(serde_json::json!({"assignment_id": id.to_string()}))
+    );
+    assert_eq!(
+        confirmation_of(&pool, "platform.role_granted", id).await,
+        ("passkey".to_string(), Some(act.to_string()))
+    );
+    let elevation: Option<String> = sqlx::query_scalar(
+        "SELECT details->>'elevation_id' FROM security_events \
+          WHERE event_type = 'platform.role_granted' AND details->>'assignment_id' = $1",
+    )
+    .bind(id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("elevation");
+    assert_eq!(elevation, Some(p.session.to_string()));
+    assert_eq!(
+        events(&pool, "platform.admin_act_executed", "act_id", act).await,
+        1
+    );
+    assert_code(
+        &grant_on(
+            &pool,
+            AUDITOR,
+            x,
+            Some(to),
+            Some(p.person),
+            "audit",
+            Some(act),
+        )
+        .await,
+        "ELV08",
+        "a consumed act",
+    );
+}
+
+/// An act that is not confirmed, an expired confirmed act, an act of another
+/// kind, and a FORGED act id are each refused, on a DIRECT maintenance
+/// INSERT too (the rule is the table's, not the CLI's).
+///
+/// Verified to fail: the consumer's not-found test dropped -> the forged id
+/// is refused ELV09 (a kind of NULL), not ELV08; the consumer's expiry test
+/// dropped TOGETHER with the table guard's -> the expired act executes; the
+/// consumer's confirmed test dropped together with the table guard's
+/// consumption refusal, its passkey test and the consumed-shape CHECK -> the
+/// unconfirmed act still fails, but ELV03 (the guard's challenge-only rule),
+/// not ELV08. EQUIVALENT alone (layered on purpose): the consumer's confirmed
+/// and expiry tests (the table guard refuses the consumption of an
+/// unconfirmed or expired act), and its kind test (every kind has its own key
+/// set, so another kind's digest never matches: ELV09 either way).
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_live_confirmed_act_of_the_kind_executes(pool: PgPool) {
+    let p = elevated_custodian(&pool, "proposer", 1).await;
+    let (x, _) = human(&pool, "holder").await;
+    let args = grant_args(AUDITOR, x, None, "audit");
+    let unconfirmed = propose(&pool, &p, true, "role.grant", &args)
+        .await
+        .expect("propose");
+    assert_code(
+        &grant_on(
+            &pool,
+            AUDITOR,
+            x,
+            None,
+            Some(p.person),
+            "audit",
+            Some(unconfirmed),
+        )
+        .await,
+        "ELV08",
+        "an unconfirmed act",
+    );
+    let expired = confirmed(&pool, &p, "role.grant", &args).await;
+    without_triggers(
+        &pool,
+        "UPDATE pending_admin_acts SET proposed_at = proposed_at - interval '1 hour', \
+                expires_at = expires_at - interval '1 hour' WHERE id = $1",
+        expired,
+    )
+    .await;
+    assert_code(
+        &grant_on(
+            &pool,
+            AUDITOR,
+            x,
+            None,
+            Some(p.person),
+            "audit",
+            Some(expired),
+        )
+        .await,
+        "ELV08",
+        "an expired act",
+    );
+    let other_kind = confirmed(
+        &pool,
+        &p,
+        "role.end",
+        &format!(
+            "{{\"assignment\": \"{}\", \"reason\": \"audit\"}}",
+            p.assignment
+        ),
+    )
+    .await;
+    assert_code(
+        &grant_on(
+            &pool,
+            AUDITOR,
+            x,
+            None,
+            Some(p.person),
+            "audit",
+            Some(other_kind),
+        )
+        .await,
+        "ELV09",
+        "an act of another kind",
+    );
+    let r = maint(
+        &pool,
+        "INSERT INTO role_assignments (role, holder_person_id, valid_from, granted_by, reason, \
+                                       grant_act_id) \
+         VALUES ('role:auditor', $1, now(), $2, 'audit', $3)",
+        &[Some(x), Some(p.person), Some(Uuid::new_v4())],
+    )
+    .await;
+    assert_code(&r, "ELV08", "a direct insert naming a forged act");
+}
+
+/// An END needs a confirmed `role.end` act while any live custodian holds a
+/// passkey (the end names no actor): unconfirmed it is refused ELV10, an act
+/// over another reason ELV09, the exact act ends it (audited `passkey`). The
+/// BREAK-GLASS: once every custodian's passkey is revoked, a maintenance end
+/// is admitted again, recorded `none`; and the revoked passkey voids the
+/// act it had confirmed (ELV08).
+///
+/// Verified to fail: the update guard's ELV10 test dropped -> the
+/// unconfirmed end lands; the guard taking the act's own digest instead of
+/// recomputing it from the end -> the other-reason end lands; the consumer's
+/// passkey-revoked test dropped -> the voided act executes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_end_needs_a_confirmed_act_while_a_custodian_holds_a_passkey(pool: PgPool) {
+    let p = elevated_custodian(&pool, "proposer", 1).await;
+    let (x, _) = human(&pool, "holder").await;
+    let a = grant_on(
+        &pool,
+        AUDITOR,
+        x,
+        None,
+        Some(p.person),
+        "audit",
+        Some(
+            confirmed(
+                &pool,
+                &p,
+                "role.grant",
+                &grant_args(AUDITOR, x, None, "audit"),
+            )
+            .await,
+        ),
+    )
+    .await
+    .expect("an auditor");
+    let end = "SELECT public.epigraph_end_role_assignment($1, 'done', $2)";
+    assert_code(
+        &maint(&pool, end, &[Some(a), None]).await,
+        "ELV10",
+        "an unconfirmed end",
+    );
+    let other = confirmed(
+        &pool,
+        &p,
+        "role.end",
+        &format!("{{\"assignment\": \"{a}\", \"reason\": \"another reason\"}}"),
+    )
+    .await;
+    assert_code(
+        &maint(&pool, end, &[Some(a), Some(other)]).await,
+        "ELV09",
+        "an act over another reason",
+    );
+    let act = confirmed(
+        &pool,
+        &p,
+        "role.end",
+        &format!("{{\"assignment\": \"{a}\", \"reason\": \"done\"}}"),
+    )
+    .await;
+    maint(&pool, end, &[Some(a), Some(act)])
+        .await
+        .expect("the confirmed end");
+    assert_eq!(
+        confirmation_of(&pool, "platform.role_ended", a).await,
+        ("passkey".to_string(), Some(act.to_string()))
+    );
+
+    // The break-glass.
+    let b = grant_on(
+        &pool,
+        AUDITOR,
+        x,
+        None,
+        Some(p.person),
+        "audit again",
+        Some(
+            confirmed(
+                &pool,
+                &p,
+                "role.grant",
+                &grant_args(AUDITOR, x, None, "audit again"),
+            )
+            .await,
+        ),
+    )
+    .await
+    .expect("a second auditor assignment");
+    let voided = confirmed(
+        &pool,
+        &p,
+        "role.end",
+        &format!("{{\"assignment\": \"{b}\", \"reason\": \"done\"}}"),
+    )
+    .await;
+    maint(
+        &pool,
+        "SELECT public.epigraph_revoke_passkey($1, 'lost')",
+        &[Some(p.passkey)],
+    )
+    .await
+    .expect("revoke the passkey");
+    assert_code(
+        &maint(&pool, end, &[Some(b), Some(voided)]).await,
+        "ELV08",
+        "an act whose confirming passkey was revoked",
+    );
+    maint(&pool, end, &[Some(b), None])
+        .await
+        .expect("no passkey holds: the maintenance end is admitted");
+    assert_eq!(
+        confirmation_of(&pool, "platform.role_ended", b).await.0,
+        "none"
+    );
+}
+
+/// A `claim.supersede` custodial act on the authority of a custodian holding
+/// a passkey needs its confirmed act (ELV10 without); the privatization acts,
+/// which have no act kind yet, record as before, `confirmation = 'none'`. An
+/// act id on a privatization act is refused ELV09. (The confirmed supersede
+/// itself is driven end to end by the CLI's `custodial_supersede.rs`.)
+///
+/// Verified to fail: the recorder's ELV10 test dropped -> the unconfirmed
+/// supersede record lands; the test widened to every act -> the
+/// privatization record is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_custodial_supersede_by_a_passkey_holder_needs_its_act(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let target = Some(Uuid::new_v4());
+    let rec = |act: &'static str| {
+        format!(
+            "SELECT public.epigraph_record_custodial_act($1, $2, '{act}', 'claim', $3, \
+                    '{{}}'::jsonb, $4)"
+        )
+    };
+    assert_code(
+        &maint(
+            &pool,
+            &rec("claim.supersede"),
+            &[Some(p.assignment), Some(p.person), target, None],
+        )
+        .await,
+        "ELV10",
+        "an unconfirmed supersede record",
+    );
+    maint(
+        &pool,
+        &rec("privatization.plan_create"),
+        &[Some(p.assignment), Some(p.person), target, None],
+    )
+    .await
+    .expect("a privatization act records unconfirmed");
+    let confirmation: String = sqlx::query_scalar(
+        "SELECT details->>'confirmation' FROM security_events \
+          WHERE event_type = 'platform.custodial_act' AND details->>'actor' = $1",
+    )
+    .bind(p.person.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the record");
+    assert_eq!(confirmation, "none");
+    assert_code(
+        &maint(
+            &pool,
+            &rec("privatization.plan_create"),
+            &[
+                Some(p.assignment),
+                Some(p.person),
+                target,
+                Some(Uuid::new_v4()),
+            ],
+        )
+        .await,
+        "ELV09",
+        "an act id on an act with no kind",
+    );
+}
+
+/// A person who already holds a passkey gets a LATER one only on a confirmed
+/// `passkey.register` act of their own: a maintenance enrollment is refused
+/// ELV10; the act's enrollment is opened `confirmed_act` and consumes it; a
+/// proposal registering someone else's passkey is refused (22023).
+///
+/// Verified to fail: the enrollment guard's ELV10 test dropped -> the
+/// maintenance enrollment opens; its consumption dropped -> the act stays
+/// unconsumed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_later_passkey_rides_a_confirmed_register_act(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let open3 = "SELECT public.epigraph_create_passkey_enrollment($1, 'a second key', 'key 2', $2)";
+    assert_code(
+        &maint(&pool, open3, &[Some(p.person), None]).await,
+        "ELV10",
+        "a maintenance enrollment of a passkey holder",
+    );
+    let (other, _) = human(&pool, "someone else").await;
+    assert_code(
+        &propose(
+            &pool,
+            &p,
+            true,
+            "passkey.register",
+            &format!("{{\"person\": \"{other}\", \"label\": null, \"reason\": \"r\"}}"),
+        )
+        .await,
+        "22023",
+        "registering someone else's passkey",
+    );
+    let act = confirmed(
+        &pool,
+        &p,
+        "passkey.register",
+        &format!(
+            "{{\"person\": \"{}\", \"label\": \"key 2\", \"reason\": \"a second key\"}}",
+            p.person
+        ),
+    )
+    .await;
+    maint(&pool, open3, &[Some(p.person), Some(act)])
+        .await
+        .expect("the confirmed enrollment");
+    let (via, consumed): (String, bool) = sqlx::query_as(
+        "SELECT e.created_via, a.consumed_at IS NOT NULL FROM passkey_enrollments e \
+           JOIN pending_admin_acts a ON a.id = e.act_id WHERE e.act_id = $1",
+    )
+    .bind(act)
+    .fetch_one(&pool)
+    .await
+    .expect("the enrollment");
+    assert_eq!((via.as_str(), consumed), ("confirmed_act", true));
+}

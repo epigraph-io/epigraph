@@ -263,6 +263,14 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          DELETE policy default-denies every non-superuser role, 127 grants DELETE to nobody, and \
          its change guard refuses (ELV03) even a superuser.",
     ),
+    (
+        "pending_admin_acts",
+        "DELETE",
+        "A pending admin act (130) is never deleted: a proposed, confirmed, refused or \
+         consumed act is the record the offline verifier re-checks. Under FORCE the absent \
+         DELETE policy default-denies every non-superuser role, and 130 grants DELETE to \
+         nobody.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -330,6 +338,7 @@ const PROTECTED: &[&str] = &[
     "elevation_tickets",
     "elevation_sessions",
     "elevated_access",
+    "pending_admin_acts",
 ];
 
 // ===========================================================================

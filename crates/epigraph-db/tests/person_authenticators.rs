@@ -609,15 +609,17 @@ async fn an_expired_enrollment_is_refused(pool: PgPool) {
 // ELV03. Append-only shapes.
 // =====================================================================
 
-/// An enrollment is written by the database's rules, never the writer's: no
-/// confirmed-act path exists yet, a writer supplies no consumption, challenge
-/// or provenance, an enrollment lives at most 15 minutes, and its identity
-/// never changes after the insert.
+/// An enrollment is written by the database's rules, never the writer's: a
+/// confirmed-act enrollment names a confirmed act it consumes (migration
+/// 130; before it, none was admitted: this case was deliberately amended from
+/// ELV03 to ELV08, an act id naming no act, when 130 opened that path), a
+/// writer supplies no consumption, challenge or provenance, an enrollment
+/// lives at most 15 minutes, and its identity never changes after the insert.
 ///
-/// Verified to fail: the insert guard's `created_via` refusal removed -> the
-/// confirmed-act row lands; its provenance test removed -> the back-dated row
-/// lands; the update guard's column comparison removed -> the reason edit
-/// lands.
+/// Verified to fail: the insert guard's act consumption removed -> the
+/// confirmed-act row naming no act lands; its provenance test removed -> the
+/// back-dated row lands; the update guard's column comparison removed -> the
+/// reason edit lands.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_enrollment_is_append_only(pool: PgPool) {
     let (human, _) = fixture::seed_human_operator(&pool, "human").await;
@@ -626,8 +628,8 @@ async fn an_enrollment_is_append_only(pool: PgPool) {
             "INSERT INTO passkey_enrollments (person_agent_id, reason, expires_at, created_via, \
                                               act_id) \
              VALUES ($1, 'raw', now() + interval '5 minutes', 'confirmed_act', gen_random_uuid())",
-            "ELV03",
-            "a confirmed-act enrollment before the act batch exists",
+            "ELV08",
+            "a confirmed-act enrollment naming no act",
         ),
         (
             "INSERT INTO passkey_enrollments (person_agent_id, reason, expires_at, created_at) \

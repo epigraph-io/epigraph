@@ -90,6 +90,11 @@ const EXCLUDED: &[(&str, &str)] = &[
         "the log of elevated reads (127): read by its subjects' admins and the audit reader, \
          written by the recorder definer while the caller IS elevated",
     ),
+    (
+        "pending_admin_acts",
+        "the admin-act record itself (130): proposed by its definer while the caller IS \
+         elevated, confirmed and consumed by definers",
+    ),
     ("person_authenticators", "passkey material (124)"),
     ("passkey_enrollments", "passkey enrollment state (124)"),
     (

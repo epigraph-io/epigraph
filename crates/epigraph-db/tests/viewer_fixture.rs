@@ -412,15 +412,200 @@ pub async fn make_custodian(pool: &PgPool, agent: Uuid) -> Uuid {
     .fetch_optional(pool)
     .await
     .expect("grantor");
-    sqlx::query_scalar(
-        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, $2, \
-                                          'test fixture')",
-    )
-    .bind(agent)
-    .bind(grantor)
+    // Since 130 a grantor that holds a live passkey grants only on a
+    // confirmed `role.grant` act (ELV10 otherwise): stand one in.
+    let act = match grantor {
+        Some(g) if at_130(pool).await && has_live_passkey(pool, g).await => Some(
+            confirmed_act(
+                pool,
+                "role.grant",
+                &format!(
+                    "{{\"role\": \"role:platform-custodian\", \"holder\": \"{agent}\", \
+                     \"valid_from\": null, \"valid_to\": null, \"reason\": \"test fixture\"}}"
+                ),
+                g,
+            )
+            .await,
+        ),
+        _ => None,
+    };
+    // The six-parameter (123) form when no act is needed, so a database cut
+    // before 130 still takes the fixture.
+    match act {
+        None => sqlx::query_scalar(
+            "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, $2, \
+                                              'test fixture')",
+        )
+        .bind(agent)
+        .bind(grantor),
+        Some(act) => sqlx::query_scalar(
+            "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, $2, \
+                                              'test fixture', $3)",
+        )
+        .bind(agent)
+        .bind(grantor)
+        .bind(act),
+    }
     .fetch_one(pool)
     .await
     .expect("grant role:platform-custodian")
+}
+
+/// Is migration 130 (pending admin acts) applied? Before it no act is ever
+/// required, so the act-standing-in helpers below answer `None` on a database
+/// cut earlier.
+pub async fn at_130(pool: &PgPool) -> bool {
+    sqlx::query_scalar("SELECT to_regclass('public.pending_admin_acts') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .expect("catalog")
+}
+
+/// Does `person` hold a live passkey (migration 124)? Read on the harness
+/// (superuser) connection; `false` on a database cut before 124.
+pub async fn has_live_passkey(pool: &PgPool, person: Uuid) -> bool {
+    let at_124: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.person_authenticators') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .expect("catalog");
+    if !at_124 {
+        return false;
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM person_authenticators \
+                         WHERE person_agent_id = $1 AND revoked_at IS NULL)",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("live passkey")
+}
+
+/// Stand in for a CONFIRMED admin act (migration 130) of `kind` with args
+/// `args_json`, proposed and confirmed by `proposer`, live 30 minutes; its
+/// id.
+///
+/// A real act is proposed under a live elevation and confirmed by a passkey
+/// ceremony (`pending_admin_acts.rs` drives that path). A fixture that only
+/// needs a write the 130 guards ADMIT (a second custodian granted by a
+/// passkey holder, an assignment ended while one holds a passkey) writes the
+/// confirmed row directly, as the harness superuser with triggers off
+/// (`session_replication_role = replica`: the act's own birth guard, which
+/// demands a live elevation, and its audit do not run; its CHECKs do). Its
+/// args are canonicalized and digested by the database's own functions, its
+/// assignment is the proposer's live custodian assignment (the proposer must
+/// hold one), and its confirming passkey is the proposer's earliest live one
+/// (it must hold one). Its elevation id names no session. The WRITE that
+/// consumes it then meets every 130 rule for real.
+pub async fn confirmed_act(pool: &PgPool, kind: &str, args_json: &str, proposer: Uuid) -> Uuid {
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers off");
+    let r = sqlx::query_scalar::<_, Uuid>(
+        "WITH a AS (SELECT public.epigraph_admin_act_args($1, $2::jsonb) AS args) \
+         INSERT INTO pending_admin_acts \
+                (kind, args, args_digest, target_type, target_id, reason, proposed_by, \
+                 elevation_id, assignment_id, expires_at, challenge_state, asserted_at, \
+                 outcome, assertion_evidence, authenticator_id) \
+         SELECT $1, a.args, public.epigraph_admin_act_digest(a.args), \
+                CASE $1 WHEN 'role.end' THEN 'role_assignment' \
+                        WHEN 'claim.custodial_supersede' THEN 'claim' ELSE 'agent' END, \
+                (a.args->>CASE $1 WHEN 'role.grant' THEN 'holder' \
+                                  WHEN 'role.end' THEN 'assignment' \
+                                  WHEN 'claim.custodial_supersede' THEN 'claim' \
+                                  ELSE 'person' END)::uuid, \
+                'test fixture: a confirmed act', $3, gen_random_uuid(), \
+                public.epigraph_live_role_assignment($3, 'role:platform-custodian', now()), \
+                now() + interval '30 minutes', '{}'::jsonb, now(), 'confirmed', \
+                '{\"fixture\": true}'::jsonb, \
+                (SELECT k.id FROM person_authenticators k \
+                  WHERE k.person_agent_id = $3 AND k.revoked_at IS NULL \
+                  ORDER BY k.created_at, k.id LIMIT 1) \
+           FROM a RETURNING id",
+    )
+    .bind(kind)
+    .bind(args_json)
+    .bind(proposer)
+    .fetch_one(&mut *conn)
+    .await;
+    sqlx::query("SET session_replication_role = DEFAULT")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers on");
+    r.unwrap_or_else(|e| panic!("a confirmed {kind} act by {proposer}: {e}"))
+}
+
+/// The act a passkey ENROLLMENT of `person` (with this reason and label)
+/// needs since migration 130: `None` while the person holds no live passkey
+/// (the first passkey is a maintenance enrollment), otherwise a confirmed
+/// `passkey.register` act of the person's own ([`confirmed_act`]; the
+/// person must be a live custodian). Pass it as the fourth argument of
+/// `epigraph_create_passkey_enrollment`.
+pub async fn passkey_register_act(
+    pool: &PgPool,
+    person: Uuid,
+    reason: &str,
+    label: &str,
+) -> Option<Uuid> {
+    if !at_130(pool).await || !has_live_passkey(pool, person).await {
+        return None;
+    }
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(
+        confirmed_act(
+            pool,
+            "passkey.register",
+            &format!(
+                "{{\"person\": \"{person}\", \"label\": \"{}\", \"reason\": \"{}\"}}",
+                esc(label),
+                esc(reason)
+            ),
+            person,
+        )
+        .await,
+    )
+}
+
+/// The act an END of `assignment` with `reason` needs since migration 130:
+/// `None` while no live custodian holds a live passkey (a maintenance end is
+/// then admitted unconfirmed), otherwise a confirmed `role.end` act
+/// ([`confirmed_act`]) proposed by the earliest such custodian. Pass it as
+/// the third argument of `epigraph_end_role_assignment`.
+pub async fn role_end_act(pool: &PgPool, assignment: Uuid, reason: &str) -> Option<Uuid> {
+    if !at_130(pool).await {
+        return None;
+    }
+    let proposer: Option<Uuid> = sqlx::query_scalar(
+        "SELECT ra.holder_person_id FROM role_assignments ra \
+          WHERE ra.role = 'role:platform-custodian' AND ra.revoked_at IS NULL \
+            AND public.epigraph_live_role_assignment(ra.holder_person_id, \
+                    'role:platform-custodian', now()) IS NOT NULL \
+            AND EXISTS (SELECT 1 FROM person_authenticators k \
+                         WHERE k.person_agent_id = ra.holder_person_id \
+                           AND k.revoked_at IS NULL) \
+          ORDER BY ra.valid_from, ra.id LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("a custodian holding a passkey");
+    match proposer {
+        Some(p) => Some(
+            confirmed_act(
+                pool,
+                "role.end",
+                &format!(
+                    "{{\"assignment\": \"{assignment}\", \"reason\": \"{}\"}}",
+                    reason.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+                p,
+            )
+            .await,
+        ),
+        None => None,
+    }
 }
 
 /// [`seed_agent_with_group`] for an agent that is a HUMAN OPERATOR

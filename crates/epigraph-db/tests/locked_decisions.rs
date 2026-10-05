@@ -2212,6 +2212,7 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "elevation_tickets",
     "elevation_sessions",
     "elevated_access",
+    "pending_admin_acts",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2288,6 +2289,12 @@ const ELEVATION_TABLES: &[&str] = &["elevation_tickets", "elevation_sessions"];
 /// `visibility` / `owner_group_id` columns, so it does not join `tier_a`.
 const ELEVATED_ACCESS_TABLES: &[&str] = &["elevated_access"];
 
+/// The pending admin acts, which migration 130 creates and FORCEs. A NINTH
+/// TERM for the same reason as the eight above: FORCEd by the migration that
+/// creates it, none of the earlier kinds, and carrying no `visibility` /
+/// `owner_group_id` columns, so it does not join `tier_a`.
+const ADMIN_ACT_TABLES: &[&str] = &["pending_admin_acts"];
+
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
 /// reports.
@@ -2341,6 +2348,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .chain(PASSKEY_TABLES.iter().map(|s| (*s).to_string()))
         .chain(ELEVATION_TABLES.iter().map(|s| (*s).to_string()))
         .chain(ELEVATED_ACCESS_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(ADMIN_ACT_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()

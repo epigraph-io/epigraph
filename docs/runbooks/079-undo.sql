@@ -119,7 +119,10 @@ DECLARE t text;
           'elevation_tickets','elevation_sessions',
           -- ---- the log of elevated reads (127) ---------------------------
           -- FORCEd by 127 at creation, same precedent and reason.
-          'elevated_access'];
+          'elevated_access',
+          -- ---- the pending admin acts (130) ------------------------------
+          -- FORCEd by 130 at creation, same precedent and reason.
+          'pending_admin_acts'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

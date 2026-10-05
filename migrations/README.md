@@ -1052,9 +1052,43 @@ Current reservation:
   CLOSED. Checked before claiming: no remote branch carries a `129`.
   **Applied to a throwaway database only, NOT to any deployed database.**
 
-- **130+**: public next
+- **130** `130_pending_admin_acts.sql` (elevation plan EL-12a): PENDING
+  ADMIN ACTS. `pending_admin_acts` (FORCE RLS; the app reads no row): an act
+  of a closed kind (`role.grant`, `role.end`, `claim.custodial_supersede`,
+  `passkey.register`) is PROPOSED by an elevated session
+  (`epigraph_propose_admin_act`, ELV07 otherwise; the insert guard binds the
+  row to a live elevation of its proposer), its args stored in canonical form
+  (`epigraph_admin_act_args`, `epigraph_canonical_json`: keys in byte order,
+  no whitespace, no numbers) with their SHA-256 digest; CONFIRMED once by a
+  live passkey of the proposer (`epigraph_confirm_admin_act`; refusals
+  recorded, audited and returned, never raised); CONSUMED once from inside the
+  maintenance write it authorizes (`epigraph_consume_admin_act`: ELV08 not
+  live, ELV09 another kind, other args or another actor). The 123 guards are
+  amended (`epigraph_role_assignments_guard_insert` / `_guard_update` /
+  `_audit`): a `grant_act_id` must name a confirmed `role.grant` act whose
+  args the guard recomputes from the row and whose proposer is `granted_by`
+  (no longer CUS02 outright); the new `revoke_act_id` column does the same for
+  `role.end`; `epigraph_record_custodial_act` gains `p_act_id` (the
+  six-parameter form is a wrapper); 124's enrollment guard admits
+  `confirmed_act` on a `passkey.register` act. ELV10 (EQ-2 (a)): a grantor
+  holding a live passkey, an end while any live custodian holds one, a
+  `claim.supersede` by a passkey holder, and a later passkey all need a
+  confirmed act; bootstrap stays unconfirmed and every `platform.` row names
+  its confirmation. New overloads `epigraph_grant_role(.., p_act)`,
+  `epigraph_end_role_assignment(.., p_act)`,
+  `epigraph_create_passkey_enrollment(.., p_act)`. Behaviour in
+  `epigraph-db/tests/pending_admin_acts.rs`; undo
+  (`docs/runbooks/130-undo.sql`, which archives the acts, restores 123's and
+  124's bodies verbatim and keeps the column; BEFORE 129-undo and 123-undo).
+  The recorder gate stays CLOSED, so no act can be proposed on a deployed
+  database until the gate opens. Checked before claiming: no remote branch
+  carries a `130`. **Applied to a throwaway database only, NOT to any deployed
+  database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `130` or
+- **131+**: public next (the elevation stack stays at or below 139; 140-159
+  are reserved)
+
+Next public migration **outside both reserved tenancy ranges** must be `131` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

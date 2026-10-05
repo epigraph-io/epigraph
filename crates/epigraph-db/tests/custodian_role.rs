@@ -899,27 +899,42 @@ async fn assignments_are_append_only(pool: PgPool) {
     // The insert guard's other CUS02 arms: a row recorded already ended, and
     // provenance the writer supplies instead of the database. (With `h` ended
     // there is no live custodian, so each is a well-formed bootstrap grant
-    // but for the one column under test.)
-    for (columns, values, what) in [
+    // but for the one column under test.) Since migration 130 a
+    // `grant_act_id` is no longer provenance the guard refuses outright: it
+    // must name a confirmed act this grant consumes, and a bootstrap grant
+    // (no grantor) names none, so a grant naming one is refused ELV09
+    // (deliberately amended from CUS02; `pending_admin_acts.rs` holds the
+    // act rules); a `revoke_act_id` at birth is the CUS02 case instead.
+    for (columns, values, what, code) in [
         (
             "revoked_at, revoked_by, revoked_reason",
             "now(), session_user, 'pre-ended'",
             "an assignment INSERTed already ended",
+            "CUS02",
         ),
         (
             "granted_via",
             "'migration 123'",
             "an INSERT posing as the 123 carry-over",
+            "CUS02",
         ),
         (
             "created_at",
             "'2020-01-01T00:00:00Z'::timestamptz",
             "a back-dated created_at",
+            "CUS02",
+        ),
+        (
+            "revoke_act_id",
+            "gen_random_uuid()",
+            "an INSERT naming an end's act id",
+            "CUS02",
         ),
         (
             "grant_act_id",
             "gen_random_uuid()",
-            "an INSERT naming an act id",
+            "a bootstrap INSERT naming an act id",
+            "ELV09",
         ),
     ] {
         let sql = format!(
@@ -931,7 +946,7 @@ async fn assignments_are_append_only(pool: PgPool) {
             (conn, r)
         })
         .await;
-        assert_code(&r, "CUS02", what);
+        assert_code(&r, code, what);
     }
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM role_assignments")
         .fetch_one(&pool)
@@ -2953,6 +2968,16 @@ async fn the_rollback_restores_122_and_083(pool: PgPool) {
         "CALIBRATION: 123 re-bodied these functions"
     );
 
+    // A later migration that re-bodies 123's functions is undone before this
+    // one (docs/deploy.md): 130 adds act-taking overloads of 123's definers.
+    let undo_130 = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/130-undo.sql"),
+    )
+    .expect("130-undo.sql");
+    sqlx::raw_sql(&undo_130)
+        .execute(&pool)
+        .await
+        .expect("130's undo applies first");
     let undo = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/123-undo.sql"),
     )
