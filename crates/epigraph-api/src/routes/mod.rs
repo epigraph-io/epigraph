@@ -100,6 +100,8 @@ pub mod structural;
 pub mod submit;
 #[cfg(feature = "db")]
 pub mod tasks;
+#[cfg(test)]
+pub(crate) mod text;
 #[cfg(feature = "db")]
 pub mod timeline;
 pub mod versioning;
