@@ -778,3 +778,71 @@ async fn arming_turns_the_standing_admin_read_arms_into_elevated_ones(pool: PgPo
         "disarmed, the standing arms answer as before"
     );
 }
+
+// =====================================================================
+// ADM02 follows the admin-scope switch (plan EL-10)
+// =====================================================================
+
+async fn adm02(conn: &mut sqlx::PgConnection, client: Uuid, person: Uuid, armed: bool) -> bool {
+    epigraph_db::SecurityEventRepository::admin_grant_is_live(conn, client, person, armed)
+        .await
+        .expect("ADM02")
+}
+
+/// `SecurityEventRepository::admin_grant_is_live` (ADM02, the audited admin
+/// paths' re-check), on the application role: UNARMED it answers the client
+/// record's standing `claims:admin` grant, as before (true with the grant,
+/// false once it is withdrawn). ARMED the grant counts for nothing: it answers
+/// whether the CONNECTION is elevated, false on P's plain connection whatever
+/// the client record says, true on P's elevated one.
+///
+/// Verified to fail with the armed branch still reading `granted_scopes` (the
+/// plain connection answers true armed), and with the armed branch answering
+/// a constant `false` (the elevated connection answers false).
+#[sqlx::test(migrations = "../../migrations")]
+async fn adm02_answers_the_grant_unarmed_and_the_elevation_armed(pool: PgPool) {
+    let p = holder(&pool, "arms-adm02-p", 31).await;
+    sqlx::query(
+        "UPDATE oauth_clients SET granted_scopes = array_append(granted_scopes, 'claims:admin') \
+          WHERE id = $1",
+    )
+    .bind(p.client)
+    .execute(&pool)
+    .await
+    .expect("grant claims:admin");
+    let s = scoped(&pool).await;
+    let live = session(&pool, &p).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
+
+    let mut conn = app_conn(&s, &plain).await;
+    assert!(
+        adm02(&mut conn, p.client, p.person, false).await,
+        "unarmed: the standing grant"
+    );
+    assert!(
+        !adm02(&mut conn, p.client, p.person, true).await,
+        "armed: a standing grant on a plain connection is nothing"
+    );
+    release(conn).await;
+    let mut conn = app_conn(&s, &elevated).await;
+    assert!(
+        adm02(&mut conn, p.client, p.person, true).await,
+        "armed: the elevated connection"
+    );
+    release(conn).await;
+
+    sqlx::query(
+        "UPDATE oauth_clients SET granted_scopes = array_remove(granted_scopes, 'claims:admin') \
+          WHERE id = $1",
+    )
+    .bind(p.client)
+    .execute(&pool)
+    .await
+    .expect("withdraw claims:admin");
+    let mut conn = app_conn(&s, &plain).await;
+    assert!(
+        !adm02(&mut conn, p.client, p.person, false).await,
+        "CALIBRATION: unarmed, a withdrawn grant is refused"
+    );
+    release(conn).await;
+}

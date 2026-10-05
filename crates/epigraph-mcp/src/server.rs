@@ -245,6 +245,7 @@ impl EpiGraphMcpFull {
             &mut *conn,
             auth.client_id,
             principal,
+            auth.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
         )
         .await
         .map_err(|e| {

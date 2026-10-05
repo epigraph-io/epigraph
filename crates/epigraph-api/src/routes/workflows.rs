@@ -2229,6 +2229,7 @@ async fn workflow_authority(
                 &mut *conn,
                 a.client_id,
                 caller,
+                a.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
             )
             .await
             .map_err(|e| ApiError::InternalError {
