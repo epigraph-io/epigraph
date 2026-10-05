@@ -756,7 +756,33 @@ pub async fn create_edge(
             ApiError::from(e)
         }
     };
-    let (edge_row, was_created) = if request.if_not_exists {
+    // Symmetric claim/claim relationships (`CONTRADICTS`, `CORROBORATES`) are
+    // ONE fact about an unordered pair, so they dedup on that pair in BOTH
+    // directions, whatever `if_not_exists` says — the noun-edge case migration
+    // 018 leaves to application code, and the same contract as the MCP twin
+    // `link_epistemic`. Without it each call order wrote its own in-force row,
+    // factor and edge-keyed BBA, double-counting one disagreement. Gated on
+    // claim/claim: migration 090's header records that this route admits
+    // `CORROBORATES` between other entity types, where nothing establishes
+    // symmetry. On a reverse dedup hit `edge_row` is the stored row, whose
+    // orientation is the reverse of the request's.
+    let symmetric_claim_pair =
+        epigraph_core::edge::relationships::is_symmetric_claim_relationship(&request.relationship)
+            && request.source_type == "claim"
+            && request.target_type == "claim";
+    let (edge_row, was_created) = if symmetric_claim_pair {
+        EdgeRepository::create_symmetric_if_absent_row_conn(
+            &mut tx,
+            request.source_id,
+            request.target_id,
+            &request.relationship,
+            request.properties.clone(),
+            request.valid_from,
+            request.valid_to,
+        )
+        .await
+        .map_err(refused)?
+    } else if request.if_not_exists {
         EdgeRepository::create_if_not_exists_conn(
             &mut tx,
             request.source_id,
@@ -850,16 +876,21 @@ pub async fn create_edge(
     // `RestrictionKind::Neutral` on non-epistemic relationships, so the
     // wrapper handles all 13 epistemic types (supports/corroborates/
     // contradicts/refutes/refines/...) instead of just the 4 evidentials.
+    //
+    // The wire follows the STORED row, not the request: the BBA is keyed on
+    // `edge_id` and encodes "source's interval restricts target", and on a
+    // symmetric reverse dedup hit the stored orientation is the opposite of
+    // the request's (as `link_epistemic`'s `wire_source` / `wire_target`).
     if let Err(e) = trigger_edge_ds_recomputation(
         pool,
         &viewer,
         was_created,
         edge_id,
-        request.source_id,
-        request.target_id,
-        &request.source_type,
-        &request.target_type,
-        &request.relationship,
+        edge_row.source_id,
+        edge_row.target_id,
+        &edge_row.source_type,
+        &edge_row.target_type,
+        &edge_row.relationship,
     )
     .await
     {
