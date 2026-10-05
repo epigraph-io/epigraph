@@ -55,7 +55,10 @@ where
 }
 
 /// A custodian with one live passkey and one live refresh family of its own
-/// human client: `(client row id, family)`. `person` must already exist.
+/// human client: `(client row id, family)`. `person` must already exist. A
+/// LATER passkey of the same person is opened on a confirmed
+/// `passkey.register` act since migration 130
+/// (`viewer_fixture::passkey_register_act`).
 async fn make_holder(pool: &PgPool, person: Uuid, n: u8) -> (Uuid, Uuid) {
     // 125 ships the recorder gate closed and 127 (the recorder) leaves it
     // closed, so no session is live until the migration that opens it;
@@ -70,11 +73,14 @@ async fn make_holder(pool: &PgPool, person: Uuid, n: u8) -> (Uuid, Uuid) {
     .fetch_one(pool)
     .await
     .expect("the human's client");
+    let act = fixture::passkey_register_act(pool, person, "mcp elevation test", "key").await;
     let e: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
         let e = sqlx::query_scalar(
-            "SELECT public.epigraph_create_passkey_enrollment($1, 'mcp elevation test', 'key')",
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'mcp elevation test', 'key', \
+                                                              $2)",
         )
         .bind(person)
+        .bind(act)
         .fetch_one(&mut *conn)
         .await
         .expect("enroll");
