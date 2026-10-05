@@ -198,11 +198,62 @@ pub mod relationships {
 
     /// Instrument is manufactured by an organization
     pub const MANUFACTURED_BY: &str = "MANUFACTURED_BY";
+
+    // ── Symmetric claim/claim relationships ──────────────────────────
+
+    /// Relationships that state ONE fact about an unordered pair of claims:
+    /// "A contradicts B" is "B contradicts A". Writers dedup them on the
+    /// unordered pair (MCP `link_epistemic`, HTTP `POST /api/v1/edges`), so the
+    /// two call orders collapse onto one row instead of double-counting one
+    /// disagreement in DS / BP.
+    ///
+    /// Listed in the lower-case canonical spelling; use
+    /// [`is_symmetric_claim_relationship`] to test membership, which ignores
+    /// ASCII case so the upper-case `CONTRADICTS` / `CORROBORATES` the HTTP
+    /// allow-list admits are recognised too. Recognising a spelling does not
+    /// unify spellings: the writers' dedup probe still compares
+    /// `relationship` byte-exactly.
+    ///
+    /// The other epistemic relations (`supports`, `refutes`, `elaborates`,
+    /// `generalizes`, `specializes`) are directional and MUST NOT be added:
+    /// collapsing their orderings would erase information, not a duplicate.
+    pub const SYMMETRIC_CLAIM_RELATIONSHIPS: &[&str] = &["contradicts", "corroborates"];
+
+    /// Whether `relationship` is one of [`SYMMETRIC_CLAIM_RELATIONSHIPS`],
+    /// ignoring ASCII case.
+    #[must_use]
+    pub fn is_symmetric_claim_relationship(relationship: &str) -> bool {
+        SYMMETRIC_CLAIM_RELATIONSHIPS
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(relationship))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symmetric_claim_relationships_match_either_case_and_exclude_directional_ones() {
+        use relationships::is_symmetric_claim_relationship as sym;
+        // Both spellings each writer admits: MCP lower case, HTTP upper case.
+        for rel in ["contradicts", "CONTRADICTS", "corroborates", "CORROBORATES"] {
+            assert!(sym(rel), "{rel} is symmetric");
+        }
+        // Directional epistemic relations, in both cases, and a near-miss.
+        for rel in [
+            "supports",
+            "SUPPORTS",
+            "refutes",
+            "elaborates",
+            "generalizes",
+            "specializes",
+            "alternative_of",
+            "contradict",
+        ] {
+            assert!(!sym(rel), "{rel} is directional or unknown");
+        }
+    }
 
     #[test]
     fn create_edge_between_nodes() {
