@@ -1,12 +1,39 @@
 //! Character-safe text shortening for response summaries and labels.
+//!
+//! Gated `any(test, feature = "db")` in `routes/mod.rs`: every caller is a
+//! `#[cfg(feature = "db")]` handler, so an ungated module is dead code under
+//! `--no-default-features` and fails clippy's `-D warnings`.
 
 /// Shorten `s` for display: when it has MORE than `limit` characters, return
 /// its first `keep` characters followed by `"..."`; otherwise return it whole.
 ///
-/// RED-PHASE STUB: returns `s` unchanged.
+/// Both counts are in CHARACTERS (Unicode scalar values), never bytes. The
+/// byte slice this replaces, `&s[..n]`, panics when byte `n` falls inside a
+/// multibyte character, which took the calling handler down on ordinary
+/// non-ASCII claim content. For ASCII input the output is byte-identical to
+/// the old slice, because one character is one byte.
+///
+/// `keep` may be smaller than `limit` so that the result, ellipsis included,
+/// stays within `limit` (`claim_provenance` uses 60 / 57). `keep > limit` is a
+/// caller bug; it is clamped to `limit` rather than producing text longer than
+/// the input's cut point.
+///
+/// `str::floor_char_boundary` would do the cut in one call but is not stable
+/// at this workspace's MSRV.
 pub(crate) fn ellipsize(s: &str, limit: usize, keep: usize) -> String {
-    let _ = (limit, keep);
-    s.to_string()
+    debug_assert!(
+        keep <= limit,
+        "keep ({keep}) must not exceed limit ({limit})"
+    );
+    let keep = keep.min(limit);
+    // `nth(limit)` is `Some` exactly when there are more than `limit` chars.
+    if s.char_indices().nth(limit).is_none() {
+        return s.to_string();
+    }
+    // There are > limit >= keep chars, so the `keep`-th char exists and its
+    // byte offset is a char boundary.
+    let cut = s.char_indices().nth(keep).map_or(s.len(), |(i, _)| i);
+    format!("{}...", &s[..cut])
 }
 
 #[cfg(test)]
