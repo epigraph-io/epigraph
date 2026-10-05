@@ -21,6 +21,7 @@ pub mod claim_encryption;
 pub mod claim_theme;
 pub mod claim_version;
 pub mod community;
+pub mod conflict_density;
 pub mod context;
 pub mod corpus_stats;
 pub mod counterfactual;
@@ -110,6 +111,7 @@ pub use claim_theme::{
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use community::{CommunityRepository, MembershipOutcome};
+pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity};
 pub use context::ContextRepository;
 pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
