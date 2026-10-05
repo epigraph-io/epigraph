@@ -1082,11 +1082,11 @@ async fn one_act_runs_only_after_its_confirmation(pool: PgPool) {
             fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
                 let r = if with_act {
                     epigraph_db::RoleAssignmentRepository::end_on_act(
-                        &mut *conn, assignment, "done", act,
+                        &mut conn, assignment, "done", act,
                     )
                     .await
                 } else {
-                    epigraph_db::RoleAssignmentRepository::end(&mut *conn, assignment, "done").await
+                    epigraph_db::RoleAssignmentRepository::end(&mut conn, assignment, "done").await
                 };
                 (conn, r)
             })
