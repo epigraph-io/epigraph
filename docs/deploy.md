@@ -181,6 +181,10 @@ cargo run -p epigraph-cli --bin bootstrap_clients -- \
 It is convergent as of PR-02: an existing canonical client has its
 `allowed_scopes`/`granted_scopes` rewritten to `scopes_for(<name>)` and is
 reported `EXISTS: … scopes=RECONCILED`. Non-canonical clients are untouched.
+Since migration 140 a refresh never adds a scope to a refresh-token chain (it
+issues the chain's own scopes narrowed to the grant), so a consumer that only
+refreshes does not pick a newly added canonical scope up: it needs a fresh
+`client_credentials` grant (or, for a human connector, a re-authorization).
 Externally provisioned humans get theirs from `default_scopes` in
 `providers.toml`; if yours still says `groups:manage` (a scope that never
 existed), change it to `groups:write` — see `providers.toml.example`.
