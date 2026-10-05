@@ -1281,3 +1281,78 @@ async fn a_promote_racing_a_committed_reject_is_refused_with_409(pool: PgPool) {
         "no matcher edge may be written over a rejected pair"
     );
 }
+
+/// Interleaving A over HTTP, the direction backlog b3f95bea names: a `reject`
+/// that read the candidate as `pending` loses the race to a `promote` that
+/// commits first, edge and all.
+///
+/// An unconditional status write waits for the promote's row lock, then
+/// overwrites it to `rejected` and returns 200, leaving the promotion's matcher
+/// edge in force under a rejected candidate -- the orphan the backlog item
+/// reported. The reject must be refused with the same 409 as a sequential
+/// replay and change nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reject_racing_a_committed_promote_is_refused_with_409(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+    let token = decide_bearer_token(Uuid::new_v4(), Some(agent), "agent");
+    let mut watcher = pool.acquire().await.expect("watcher connection");
+
+    // A promote that has passed its gate, mid-flight: status flipped and its
+    // matcher edge written (the shape `create_symmetric_if_absent` writes), NOT
+    // committed. It holds the candidate's row lock while the committed version
+    // is still `pending`.
+    let mut other = pool.begin().await.expect("competing transaction");
+    sqlx::query(
+        "UPDATE match_candidates SET status = 'promoted', decided_at = now() WHERE id = $1",
+    )
+    .bind(candidate)
+    .execute(&mut *other)
+    .await
+    .expect("competing promote: status");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+         VALUES ($1, 'claim', $2, 'claim', 'CORROBORATES', $3)",
+    )
+    .bind(a)
+    .bind(b)
+    .bind(SqlxJson(serde_json::json!({
+        "source": "cross_source_matcher",
+        "candidate_id": candidate,
+    })))
+    .execute(&mut *other)
+    .await
+    .expect("competing promote: edge");
+
+    let reject = post_decide(pool.clone(), candidate, &token, "reject");
+    let commit_once_blocked = async {
+        wait_until_blocked(&mut watcher, "%UPDATE match_candidates%", "the reject").await;
+        other.commit().await.expect("commit the competing promote");
+    };
+    let (resp, ()) = tokio::join!(reject, commit_once_blocked);
+
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a reject that lost the race to a committed promote must 409: {body}"
+    );
+    assert!(
+        body.contains("already decided (status=promoted)"),
+        "the race loser gets the same refusal as a sequential replay: {body}"
+    );
+    assert_eq!(
+        status_of(&pool, candidate).await,
+        "promoted",
+        "the committed promotion stands; `rejected` here is b3f95bea's orphan state"
+    );
+    assert_eq!(
+        matcher_edge_footprint(&pool, a, b).await.0,
+        1,
+        "the promotion's matcher edge is still in force"
+    );
+}

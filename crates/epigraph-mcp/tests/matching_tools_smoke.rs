@@ -1381,3 +1381,177 @@ async fn a_promote_does_not_publish_promoted_before_its_edge_commits(pool: PgPoo
         "exactly one matcher edge, written by the promote itself"
     );
 }
+
+/// Interleaving A, roles swapped: a promote that read the row as `pending`
+/// loses the race to a reject that commits first.
+///
+/// The conditional write leaves the database safe on its own (no edge is
+/// written for a row that is no longer `pending`), so what this pins is the
+/// tool's answer: the loser must be told it lost, with the same refusal as a
+/// sequential replay. An unconditional write instead overwrites the operator's
+/// reject to `promoted` and writes a matcher edge over a pair just rejected; a
+/// dropped outcome check reports success for a promotion that never happened.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promote_racing_a_committed_reject_is_refused(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    let mut watcher = pool.acquire().await.expect("watcher connection");
+
+    // An operator's reject that has passed its gate and written, NOT committed.
+    let mut other = pool.begin().await.expect("competing transaction");
+    sqlx::query(
+        "UPDATE match_candidates SET status = 'rejected', decided_at = now() WHERE id = $1",
+    )
+    .bind(cand)
+    .execute(&mut *other)
+    .await
+    .expect("competing reject");
+
+    let promote = tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+        None,
+    );
+    let commit_once_blocked = async {
+        wait_until_blocked(&mut watcher, "%UPDATE match_candidates%", "the promote").await;
+        other.commit().await.expect("commit the competing reject");
+    };
+    let (result, ()) = tokio::join!(promote, commit_once_blocked);
+
+    let err = result.expect_err(
+        "a promote that lost the race to a committed reject must be refused, not reported done",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("already decided (status=rejected)"),
+        "the race loser gets the same refusal as a sequential replay: {msg}"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "rejected", "the operator's reject stands");
+    assert!(
+        edge_relationships(&pool, a, b).await.is_empty(),
+        "no matcher edge may be written over a rejected pair"
+    );
+}
+
+/// Interleaving B end to end: a retirement that arrives while a promote is in
+/// flight must still retract the promote's edge.
+///
+/// The promote is held at its edge INSERT (a competing transaction holds an
+/// uncommitted copy of the same matcher edge, so the INSERT waits on migration
+/// 090's `edges_symmetric_relationship_uniq`); the retirement is started
+/// against that state, and only then is the competitor rolled back.
+///
+/// When the status flip and the edge INSERT are two autocommit statements, the
+/// retirement finds `promoted` with no edge yet, flips it to `stale` having
+/// retracted nothing, and the promote's edge then lands in force under a
+/// `stale` row. With one transaction the retirement's `SELECT ... FOR UPDATE`
+/// waits for the promote, then retracts the edge it wrote.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retirement_during_an_in_flight_promote_retracts_its_edge(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    let mut watcher = pool.acquire().await.expect("watcher connection");
+
+    let mut other = pool.begin().await.expect("competing transaction");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+         VALUES ($1, 'claim', $2, 'claim', 'CORROBORATES', $3)",
+    )
+    .bind(a)
+    .bind(b)
+    .bind(Json(serde_json::json!({"source": "cross_source_matcher"})))
+    .execute(&mut *other)
+    .await
+    .expect("competing uncommitted matcher edge");
+
+    let promote = tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+        None,
+    );
+    let retire_mid_promote = async {
+        wait_until_blocked(
+            &mut watcher,
+            "%INSERT INTO edges%",
+            "the promote's edge write",
+        )
+        .await;
+        // The retirement as the replay runs it: the repo's own transaction on a
+        // privileged session (the test pool is a superuser).
+        let retirement = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                epigraph_db::MatchCandidateRepo::new(pool)
+                    .retire(cand, None)
+                    .await
+            }
+        });
+        // It either waits on the promote's row lock or, with no lock to wait
+        // on, runs to completion; either way it has acted before the promote's
+        // edge is released.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND pid <> pg_backend_pid()
+                   AND wait_event_type = 'Lock'
+                   AND query ILIKE '%FROM match_candidates%FOR UPDATE%'",
+            )
+            .fetch_one(&mut *watcher)
+            .await
+            .expect("pg_stat_activity");
+            if waiting >= 1 || retirement.is_finished() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "calibration: the retirement neither blocked nor finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        other.rollback().await.expect("release the competing edge");
+        retirement.await.expect("retirement task")
+    };
+    let (promoted, retired) = tokio::join!(promote, retire_mid_promote);
+
+    promoted.expect("the promote completes once the competing edge is rolled back");
+    let retired = retired.expect("the retirement completes");
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "stale", "the retirement is the last decision");
+    assert!(
+        edge_relationships(&pool, a, b).await.is_empty(),
+        "a `stale` candidate must leave no matcher edge in force; one here is the edge the \
+         in-flight promote wrote after the retirement had already run"
+    );
+    assert_eq!(
+        (retired.previous_status.as_str(), retired.edges_retracted),
+        ("promoted", 1),
+        "the retirement waited for the promote and retracted the edge it wrote"
+    );
+}
