@@ -1356,3 +1356,68 @@ async fn a_reject_racing_a_committed_promote_is_refused_with_409(pool: PgPool) {
         "the promotion's matcher edge is still in force"
     );
 }
+
+/// A promote resolves its edge's polarity from the `verifier_verdict` it read.
+/// A matcher sweep may re-score a still-`pending` row in between
+/// (`MatchCandidateRepo::upsert` only freezes the verdict once `decided_at` is
+/// set), so by the time the promote's write runs the verdict it acted on is no
+/// longer the row's.
+///
+/// Here the row is read with NO verdict (which promotes as CORROBORATES) and a
+/// competing transaction re-scores it to `contradicts` before the promote's
+/// write runs. A write conditional only on `status = 'pending'` still matches
+/// and records CORROBORATES over a pair the verifier now says contradict: the
+/// inverted polarity the promote arm's comment says was fixed. The promote
+/// must be refused with a 409 naming the changed verdict and write nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promote_racing_a_verdict_rescore_is_refused_with_409(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+    let token = decide_bearer_token(Uuid::new_v4(), Some(agent), "agent");
+    let mut watcher = pool.acquire().await.expect("watcher connection");
+
+    // A matcher re-score of the still-pending row, written NOT committed: the
+    // verdict changes, the status does not.
+    let mut other = pool.begin().await.expect("competing transaction");
+    sqlx::query(
+        "UPDATE match_candidates
+         SET verifier_verdict = 'contradicts', verifier_rationale = 'rescored'
+         WHERE id = $1",
+    )
+    .bind(candidate)
+    .execute(&mut *other)
+    .await
+    .expect("competing re-score");
+
+    let promote = post_decide(pool.clone(), candidate, &token, "promote");
+    let commit_once_blocked = async {
+        wait_until_blocked(&mut watcher, "%UPDATE match_candidates%", "the promote").await;
+        other.commit().await.expect("commit the competing re-score");
+    };
+    let (resp, ()) = tokio::join!(promote, commit_once_blocked);
+
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a promote whose verdict was re-scored under it must 409: {body}"
+    );
+    assert!(
+        body.contains("verifier_verdict changed"),
+        "the refusal names the changed verdict, not an already-decided row: {body}"
+    );
+    assert_eq!(
+        status_of(&pool, candidate).await,
+        "pending",
+        "nothing was decided; the operator re-reads and decides again"
+    );
+    assert_eq!(
+        matcher_edge_footprint(&pool, a, b).await.0,
+        0,
+        "no edge may be written from a verdict the row no longer carries"
+    );
+}

@@ -1555,3 +1555,64 @@ async fn a_retirement_during_an_in_flight_promote_retracts_its_edge(pool: PgPool
         "the retirement waited for the promote and retracted the edge it wrote"
     );
 }
+
+/// The MCP twin of the HTTP verdict re-score race: the row is read as `same`
+/// (CORROBORATES), a matcher sweep re-scores it to `contradicts` before the
+/// promote's write runs, and the promote must be refused rather than record
+/// the inverse of the verifier's current finding.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promote_racing_a_verdict_rescore_is_refused(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate_with_verdict(&pool, a, b, 0.95, "pending", "same").await;
+    let mut watcher = pool.acquire().await.expect("watcher connection");
+
+    let mut other = pool.begin().await.expect("competing transaction");
+    sqlx::query(
+        "UPDATE match_candidates
+         SET verifier_verdict = 'contradicts', verifier_rationale = 'rescored'
+         WHERE id = $1",
+    )
+    .bind(cand)
+    .execute(&mut *other)
+    .await
+    .expect("competing re-score");
+
+    let promote = tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+        None,
+    );
+    let commit_once_blocked = async {
+        wait_until_blocked(&mut watcher, "%UPDATE match_candidates%", "the promote").await;
+        other.commit().await.expect("commit the competing re-score");
+    };
+    let (result, ()) = tokio::join!(promote, commit_once_blocked);
+
+    let err = result.expect_err(
+        "a promote whose verdict was re-scored under it must be refused, not record the old \
+         polarity",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("verifier_verdict changed"),
+        "the refusal names the changed verdict: {msg}"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+        .bind(cand)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "pending", "nothing was decided");
+    assert!(
+        edge_relationships(&pool, a, b).await.is_empty(),
+        "no edge may be written from a verdict the row no longer carries"
+    );
+}
