@@ -1685,7 +1685,7 @@ human and to the live assignment of an `elevates` role), plus
 `epigraph_is_elevated()`. INERT on its own: no binary stamps the elevation
 session settings yet and no row policy reads the function, so every session
 answers false and nothing reads more than before. And no session is live at
-all until a later migration of this stack opens 125's gate
+all until a later migration of this stack (132) opens 125's gate
 (`epigraph_elevated_access_ready()`, shipped false) AND the serving build
 declares that it writes the log (see "two keys" in the 126 section).
 
@@ -1908,7 +1908,7 @@ invited). Every such read is recorded against the hidden row's owning group
 header, "OPENING IT WAITS ON MORE THAN THE RECORDER"): the API refusal of
 elevated non-GET requests is not built at 127 (EL-10 builds it in
 `epigraph-api`: see "An elevated token writes through no API route" below;
-the gate still stays closed until the stack's last migration). So after 127, as before it,
+the gate still stays closed until the stack's last migration, 132). So after 127, as before it,
 no session is live on any database, and every recorder call is refused
 (`ELV07`) because no connection is elevated. The opening is a later
 migration of this stack.
@@ -2062,7 +2062,7 @@ database round trip. Nothing changes for a token without the claim.
 
 This is the API half of the recorder gate's opening condition (2) (125's
 header, "OPENING IT WAITS ON MORE THAN THE RECORDER"). The gate itself stays
-CLOSED: it opens in the stack's last migration, after the remaining
+CLOSED: it opens in the stack's last migration (132), after the remaining
 preconditions (the offline confirmation verifier among them).
 
 Deploy: with `epigraph-api`, in any order; no migration. Rollback: the
@@ -2182,7 +2182,7 @@ that act: another kind, not confirmed, executed already, expired (an act lives
 **The break-glass.** `epigraph-operator revoke-passkey` (audited) of a lost or
 suspect passkey lifts the requirement for its holder and voids every
 unexecuted act it confirmed. NOTE: proposing an act needs a LIVE elevation, and
-no elevation is live until the stack's last migration opens the recorder gate;
+no elevation is live until the stack's last migration (132) opens the recorder gate;
 the act API that proposes and confirms is the next section (migration 131).
 Until both ship, a custodian who holds a passkey makes these writes only after
 revoking it.
@@ -2234,8 +2234,8 @@ and CONFIRMS it with their passkey; the maintenance CLI still executes it.
   (it refuses with none). A grant-mode elevation reaches it with the connector
   switch OFF.
 
-Behaviour visible to an operator: nothing until the recorder gate opens (no
-elevation is live before it, so nothing can be proposed). The confirmed act
+Behaviour visible to an operator: nothing until the recorder gate opens (132;
+no elevation is live before it, so nothing can be proposed). The confirmed act
 is executed exactly as the previous section says.
 
 1. **Migrate 131** (`epigraph-migrate`, migration DSN): one transaction,
@@ -2292,3 +2292,103 @@ compromised, and rotate it.
 
 Deploy: `epigraph-operator` from the same commit; nothing else. Rollback: the
 previous binary (the recorded findings stay).
+
+## Opening elevation (migration 132) — the preconditions, deploy order and rollback
+
+Migration 132 is the ONE migration of the elevation stack that opens migration
+125's recorder gate (`epigraph_elevated_access_ready()`). Its new body is a
+readiness test: true while the per-access recorder (127's `elevated_access`
+table and `epigraph_record_elevated_access`) is installed. Every earlier
+migration of the stack shipped the gate closed, so on a database before 132 a
+confirmed ceremony opens a session that is never live.
+
+After 132 a session is live only when ALL of these hold, re-checked on every
+statement: the serving connection DECLARES the recorder (only the recording
+builds do: the API `server` and the HTTP MCP units; a unit on an older build
+never elevates), the login is the application role (never a privileged login
+or a role switch), the person is a registered human holding a live
+assignment of an elevating role, the session's passkey is unrevoked, its
+refresh family and human client are live, and it has not expired (at most 15
+minutes) or been ended.
+
+**`epigraph-migrate` applies every embedded migration up to the build's head,
+and so does `EPIGRAPH_MIGRATE_ON_BOOT`.** Deploying ANY build of this commit or
+later therefore opens the gate at its migrate step. So the preconditions below
+come BEFORE the deploy that carries 132, not before "the first elevation":
+
+1. `epigraph-operator verify-confirmations` (with the API's relying-party
+   values) exits 0 on the target database.
+2. Only the request units hold the application DSN (checked on the host; the
+   offline verifier detects a confirmation forged through it, it cannot stop
+   one).
+3. `epigraph-tenancy-backfill verify` passes (it fails while a maintenance
+   role, or PUBLIC, may CREATE in schema `public`: that is what would let a
+   maintenance statement replace the gate), and the maintenance DSN is not the
+   superuser.
+4. Every request unit runs on the application role with no role switch in its
+   DSN (`options=-c role=...`) and no per-login default role.
+5. Connector mode stays OFF: leave `EPIGRAPH_MCP_CONNECTOR_ELEVATION` unset
+   until the connector's refresh-family scope has been measured and ruled on.
+   The served path is the CLI / console elevate grant.
+
+Applying 132 with no passkey enrolled and no elevating assignment held widens
+nothing: a session needs both, and a ceremony.
+
+1. **Migrate 132** (`epigraph-migrate`, migration DSN): one transaction,
+   `lock_timeout` 3s, one function body; no table, policy or grant changes
+   (`CREATE OR REPLACE` keeps the owner and the ACL).
+2. **Deploy** nothing new for it: the recording builds are the ones the 127
+   and later sections already deployed.
+
+**Rollback.** `docs/runbooks/132-undo.sql` on the migration DSN, FIRST, before
+every other elevation undo: it restores 125's `SELECT false`, so every session
+stops being live at its next statement (no binary needs rolling back first: a
+recording build on a gate-closed database serves every request unelevated).
+Taking 127 back out also closes the gate by itself (the readiness test reads
+the recorder), but run 132-undo first anyway.
+
+## The elevation stack as a whole (migrations 124-132) — order, undo order, arming
+
+The per-migration sections above hold the detail; this is the order across
+them. Record each deployed commit as you go.
+
+**Deploy (W-list order).**
+
+1. Migrate 124 (passkeys and enrollment tickets) and 125 (elevation tickets and
+   sessions; inert: the gate is closed).
+2. Deploy the binaries that understand elevation: `epigraph-api`, the HTTP and
+   fleet/stdio `epigraph-mcp` units, the maintenance CLIs
+   (`epigraph-operator`, `epigraph-tenancy-backfill`), the jobs runner. Old
+   binaries stamp no elevation pair and never elevate.
+3. Migrate 126 (the elevated read arms and write refusals) under its lock plan
+   (timers stopped, no long transaction, outside backup windows).
+4. Migrate 127 (the elevated-access log) and deploy the RECORDING builds (API
+   server, HTTP MCP units). Then 128 (the admin-scope switch, shipped
+   UNARMED) and 129 (the standing admin arms follow the switch, under the lock
+   plan), with the builds that read the switch.
+5. Migrate 130 (pending admin acts) with the CLIs that take `--act`, then 131
+   (a person reads their own acts) before the API and MCP builds that serve the
+   act routes and tool.
+6. Meet the preconditions in "Opening elevation (migration 132)", then deploy
+   the build that carries 132 (its migrate step opens the gate).
+7. Enroll the operator's passkey (`epigraph-operator passkey-enroll`, then the
+   ceremony on the operator's device at the relying party's host), elevate
+   once through the CLI path, read one row of another group, and confirm its
+   `elevated_access` row. Run `verify-confirmations` after every admin session
+   and on a timer.
+
+**Arming the admin-scope chokepoints** (a separate, later step): only after
+every request unit runs the check-chokepoint build (129's section) and the
+`oauth.admin_scope_would_strip` events have read zero for a soak window, run
+`epigraph-operator arm-admin-scopes --reason TEXT --apply`. Armed, standing
+admin-only scopes count for nothing on an unelevated request and no grant
+mints them; admin reads need an elevation; admin writes are maintenance-CLI
+acts. The rollback is `disarm-admin-scopes --reason TEXT --apply` (no DDL).
+
+**Undo order.** Disarm first (if armed). Roll back the binaries, newest first.
+Then the undo scripts in reverse: `132-undo.sql`, `131-undo.sql`,
+`130-undo.sql`, `129-undo.sql`, `128-undo.sql`, `127-undo.sql` (archives the
+log into `security_events` first), `126-undo.sql`, `125-undo.sql`,
+`124-undo.sql`. Each script's header names the binaries that must be rolled
+back before it. `epigraph-operator revoke-passkey` is the break-glass that
+returns a passkey holder to the bootstrap path without any undo.
