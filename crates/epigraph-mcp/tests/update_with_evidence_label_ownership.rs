@@ -372,3 +372,33 @@ async fn stdio_free_labels_stay_ungated_on_a_claim_the_signer_can_write(pool: Pg
     assert!(labels.contains(&"backlog".to_string()), "{labels:?}");
     assert_eq!(evidence_rows(&pool, c).await, 1);
 }
+
+// ── the contract an agent reads ─────────────────────────────────────────────
+
+/// The tool description is what a calling agent plans from, and before this
+/// change it said only "On a claim you can write, … truth_written=true", which
+/// a team writer could read as licence to label a colleague's claim. Pins the
+/// new label-ownership sentence positively, and that it states the stdio
+/// carve-out rather than a blanket rule.
+#[test]
+fn the_tool_description_states_the_label_ownership_rule() {
+    let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
+    let description = tools
+        .as_array()
+        .expect("all_tools_json returns an array")
+        .iter()
+        .find(|t| t["name"] == "update_with_evidence")
+        .and_then(|t| t["description"].as_str())
+        .expect("update_with_evidence is registered with a description")
+        .to_string();
+    for needle in [
+        "LABELS take update_labels' ownership rule even on a claim you can write",
+        "a writer of the owning group who did not author the claim is refused with nothing written",
+        "on stdio only the 'resolved' label is gated",
+    ] {
+        assert!(
+            description.contains(needle),
+            "update_with_evidence's description must say {needle:?}; got: {description}"
+        );
+    }
+}
