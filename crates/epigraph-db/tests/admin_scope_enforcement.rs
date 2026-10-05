@@ -839,3 +839,86 @@ async fn the_129_rollback_restores_the_standing_arms_and_runs_before_128s(pool: 
         .await
         .expect("128-undo applies once 129-undo has run");
 }
+
+// =====================================================================
+// The request units' cached read (plan EL-10's check chokepoint)
+// =====================================================================
+
+/// `AdminScopeArmingCache` on the application role's login (what a request
+/// unit holds): a read stands for its interval, so arming reaches a cache
+/// only once its read has aged out, and a fresh cache reads the change at
+/// once; with a zero interval every call reads. A read ERROR (EXECUTE
+/// withdrawn from the application role) answers ARMED and is not cached: the
+/// next call, once the grant is back, reads unarmed.
+///
+/// Verified to fail with the error arm answering `false` (unarmed), and with
+/// the error answer cached (the call after the grant returns still reads
+/// armed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_arming_cache_follows_the_switch_and_fails_closed(pool: PgPool) {
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let standing =
+        epigraph_db::AdminScopeArmingCache::with_ttl(std::time::Duration::from_secs(3600));
+    let every = epigraph_db::AdminScopeArmingCache::with_ttl(std::time::Duration::ZERO);
+    assert!(!standing.armed(&app).await, "shipped unarmed");
+    assert!(!every.armed(&app).await, "shipped unarmed");
+
+    set_as_maintenance(&pool, true, "cache test").await;
+    assert!(
+        !standing.armed(&app).await,
+        "a read stands for its interval"
+    );
+    assert!(every.armed(&app).await, "a zero interval reads every call");
+    assert!(
+        epigraph_db::AdminScopeArmingCache::default()
+            .armed(&app)
+            .await,
+        "a fresh cache reads the change at once"
+    );
+
+    set_as_maintenance(&pool, false, "cache test").await;
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION public.epigraph_admin_scopes_armed() FROM epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke");
+    assert!(
+        every.armed(&app).await,
+        "an unreadable switch answers armed (fail closed)"
+    );
+    sqlx::query("GRANT EXECUTE ON FUNCTION public.epigraph_admin_scopes_armed() TO epigraph_app")
+        .execute(&pool)
+        .await
+        .expect("grant");
+    let once = epigraph_db::AdminScopeArmingCache::with_ttl(std::time::Duration::from_secs(3600));
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION public.epigraph_admin_scopes_armed() FROM epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke again");
+    assert!(
+        once.armed(&app).await,
+        "CALIBRATION: unreadable reads armed"
+    );
+    sqlx::query("GRANT EXECUTE ON FUNCTION public.epigraph_admin_scopes_armed() TO epigraph_app")
+        .execute(&pool)
+        .await
+        .expect("grant again");
+    assert!(
+        !once.armed(&app).await,
+        "an error is not cached: the next call reads the (unarmed) switch"
+    );
+}
+
+/// A database without migration 128 reads UNARMED through the cache (a
+/// binary built with the switch keeps serving there).
+///
+/// Verified to fail with `Absent` mapped to armed.
+#[sqlx::test(migrations = false)]
+async fn the_arming_cache_reads_a_database_without_the_switch_as_unarmed(pool: PgPool) {
+    migrate(&pool, &up_to(127)).await;
+    let cache = epigraph_db::AdminScopeArmingCache::with_ttl(std::time::Duration::ZERO);
+    assert!(!cache.armed(&pool).await, "no switch: unarmed");
+}

@@ -145,3 +145,80 @@ impl AdminScopeEnforcement {
         .await?)
     }
 }
+
+/// The admin-scope switch as a REQUEST UNIT reads it (elevation plan EL-10):
+/// [`AdminScopeEnforcement::read`] behind a short cache, so the check
+/// chokepoint (`epigraph_auth::AuthContext::has_scope`) costs one read per
+/// interval per process instead of one per request.
+///
+/// The answer is a plain `armed` boolean, decided with
+/// [`AdminScopeEnforcement::read`]'s semantics and failing CLOSED:
+/// [`AdminScopeSwitch::Armed`] is armed; [`AdminScopeSwitch::Unarmed`] and
+/// [`AdminScopeSwitch::Absent`] (no migration 128) are not; a read ERROR is
+/// armed for that request and is NOT cached, so the next request reads again.
+/// Arming or disarming therefore reaches a running unit within [`Self::ttl`].
+///
+/// One per process: the API keeps one in its state, the MCP server one shared
+/// by every session it builds.
+#[derive(Debug)]
+pub struct AdminScopeArmingCache {
+    ttl: std::time::Duration,
+    slot: std::sync::Mutex<Option<(std::time::Instant, bool)>>,
+}
+
+impl Default for AdminScopeArmingCache {
+    fn default() -> Self {
+        Self::with_ttl(Self::DEFAULT_TTL)
+    }
+}
+
+impl AdminScopeArmingCache {
+    /// How long a read stands (elevation plan EL-10: 10 s).
+    pub const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A cache whose reads stand for `ttl` (`Duration::ZERO`: every call reads).
+    #[must_use]
+    pub fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// How long a read stands.
+    #[must_use]
+    pub const fn ttl(&self) -> std::time::Duration {
+        self.ttl
+    }
+
+    /// Whether the admin-only scopes are armed, read on `pool` unless a read
+    /// younger than [`Self::ttl`] stands. Fails closed (`true`) on a read
+    /// error, which is logged and not cached.
+    pub async fn armed(&self, pool: &sqlx::PgPool) -> bool {
+        if let Ok(slot) = self.slot.lock() {
+            if let Some((at, armed)) = *slot {
+                if at.elapsed() < self.ttl {
+                    return armed;
+                }
+            }
+        }
+        match AdminScopeEnforcement::read(pool).await {
+            Ok(switch) => {
+                let armed = switch.is_armed();
+                if let Ok(mut slot) = self.slot.lock() {
+                    *slot = Some((std::time::Instant::now(), armed));
+                }
+                armed
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "elevation",
+                    error = %e,
+                    "could not read the admin-scope switch; treating admin-only scopes as \
+                     armed (absent unless elevated) for this request"
+                );
+                true
+            }
+        }
+    }
+}

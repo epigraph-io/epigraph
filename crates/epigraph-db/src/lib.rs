@@ -120,7 +120,10 @@ pub use repos::{
     WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
     WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
-pub use repos::{AdminScopeChange, AdminScopeEnforcement, AdminScopeState, AdminScopeSwitch};
+pub use repos::{
+    AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
+    AdminScopeSwitch,
+};
 pub use repos::{
     AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
     Redemption, TicketMode, TicketPasskey,

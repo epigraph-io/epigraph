@@ -78,7 +78,8 @@ pub mod workflow_execution;
 // Re-export all repositories for convenience
 pub use activity::ActivityRepository;
 pub use admin_scope_enforcement::{
-    AdminScopeChange, AdminScopeEnforcement, AdminScopeState, AdminScopeSwitch,
+    AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
+    AdminScopeSwitch,
 };
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
