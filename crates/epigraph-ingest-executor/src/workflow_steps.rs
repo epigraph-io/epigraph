@@ -29,6 +29,9 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use epigraph_ingest::common::ids::{compound_claim_id, compound_content_hash, content_hash};
+use epigraph_ingest::workflow::builder::{
+    CONTENT_HASH_SCOPE_CANONICAL_NAME, CONTENT_HASH_SCOPE_KEY,
+};
 
 use crate::error::IngestExecutorError;
 use crate::system_agent::get_or_create_system_agent;
@@ -371,6 +374,9 @@ pub async fn add_step(
         "level": 2,
         "source_type": "workflow",
         "kind": "workflow_step",
+        // Marks the digest above as canonical_name-scoped, so `verify_claim`
+        // tells this row from a pre-6178a205 plain-hash step (same stamp).
+        CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME,
         "step_lineage_id": step_lineage.to_string(),
     }))
     .bind(step_lineage)

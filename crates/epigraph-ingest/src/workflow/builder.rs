@@ -56,8 +56,13 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
     // step text fail with 23505 although its id differs — and `store_workflow`
     // files every workflow under a constant "Body" phase (backlog 6178a205).
     // The id stays `compound_claim_id(blake3(text), canonical_name)`, so
-    // already-stored workflows keep their ids. `verify_claim` classifies these
-    // rows through `document::stored_content_hash_is_seed_scoped`.
+    // already-stored workflows keep their ids. Each such node also carries
+    // `CONTENT_HASH_SCOPE_KEY`, which is what `verify_claim` (through
+    // `document::stored_content_hash_is_seed_scoped`) keys on: rows written
+    // before this change share the `source_type` stamp but keep the plain
+    // digest, and must still report a tampered body as `mismatch`. The executor
+    // writes properties only on a row it newly inserts, so a re-ingest over a
+    // legacy row never marks it.
 
     // Step 1: Thesis (level 0)
     let thesis_id = if let Some(ref thesis_text) = extraction.thesis {
@@ -75,6 +80,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 "source_type": source_type,
                 "thesis_derivation": thesis_derivation_str(&extraction.thesis_derivation),
                 "kind": "workflow_thesis",
+                CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME,
             }),
             content_hash: stored_hash,
             confidence: 1.0,
@@ -136,6 +142,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 "source_type": source_type,
                 "phase": phase.title,
                 "kind": "workflow_step",
+                CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME,
             }),
             content_hash: compound_content_hash(&phase_hash, canonical_name),
             confidence: 1.0,
@@ -182,6 +189,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                     "phase": phase.title,
                     "rationale": step.rationale,
                     "kind": "workflow_step",
+                    CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME,
                 }),
                 content_hash: compound_content_hash(&step_hash, canonical_name),
                 confidence: step.confidence,

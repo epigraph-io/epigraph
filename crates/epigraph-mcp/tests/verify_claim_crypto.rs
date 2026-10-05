@@ -366,8 +366,9 @@ async fn tampered_atom_still_reports_mismatch(pool: PgPool) {
 /// `ClaimRepository::evolve_step` writes `properties = {"level": <n>,
 /// "step_lineage_id": …}` with `content_hash = blake3(content)`. That is level
 /// < 3, so a classifier keyed on `level` alone would excuse a tampered body on
-/// it. This pins the predicate to the seed-scoped writers' `source_type`
-/// stamps (document ingest, and `"workflow"` since backlog 6178a205).
+/// it. This pins the predicate to the seed-scoped writers' markers: the
+/// document `source_type` stamps, and the workflow stamp only together with its
+/// `content_hash_scope` marker (backlog 6178a205).
 #[sqlx::test(migrations = "../../migrations")]
 async fn tampered_non_document_level_two_reports_mismatch(pool: PgPool) {
     use epigraph_ingest::common::ids::content_hash;
