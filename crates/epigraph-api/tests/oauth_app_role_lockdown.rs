@@ -779,6 +779,7 @@ async fn revoking_a_forged_access_token_writes_nothing(pool: PgPool) {
             None,
             None,
             Duration::minutes(5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("mint genuine");
     assert_eq!(
@@ -804,6 +805,7 @@ async fn revoking_a_forged_access_token_writes_nothing(pool: PgPool) {
             None,
             None,
             Duration::minutes(5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("mint forged");
     assert_eq!(
@@ -851,6 +853,7 @@ async fn a_token_expired_on_the_revoking_host_is_still_recorded(pool: PgPool) {
             None,
             None,
             ttl,
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("mint")
     };

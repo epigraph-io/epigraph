@@ -51,6 +51,7 @@ fn mint(client: Uuid) -> (String, Uuid, chrono::DateTime<Utc>) {
             None,
             None,
             ChronoDuration::minutes(5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("mint");
     let exp = cfg.validate_token(&token).expect("own token validates").exp;
