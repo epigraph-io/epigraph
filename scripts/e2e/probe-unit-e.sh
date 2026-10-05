@@ -373,9 +373,10 @@ echo
 echo "=== STORE_WORKFLOW TWICE: a SECOND workflow on a database that already holds one ==="
 # README trap 5. Every probe TRUNCATEs first, so "store_workflow succeeds" had
 # only ever been measured for the FIRST workflow in a database. Its constant
-# "Body" phase collides on uq_claims_content_hash_agent for every later one.
-# PASS for this unit = the collision fails LOUDLY and ATOMICALLY (delta 0/0/0);
-# the collision itself is open work (see the README).
+# "Body" phase used to collide on uq_claims_content_hash_agent for every later
+# one; since backlog 6178a205 the phase and step rows are scoped to the
+# workflow's canonical_name. PASS = isError:false and a POSITIVE delta
+# (claims > 0, workflows = 1). A 23505 / delta 0/0/0 here is a regression.
 CB=$(q "SELECT count(*) FROM claims"); WB=$(q "SELECT count(*) FROM workflows"); EB=$(q "SELECT count(*) FROM edges")
 R=$(tool store_workflow "{\"goal\":\"Unit E second workflow probe $LABEL\",\"steps\":[\"second workflow step $LABEL\"]}")
 echo "   $(echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,160}|workflow_id[^,]{0,60}' | head -2 | tr '\n' ' ')"

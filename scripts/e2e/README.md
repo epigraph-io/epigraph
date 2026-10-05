@@ -152,23 +152,21 @@ site that hit them; they are collected here because they generalise.
    fails before it reaches the database, so `embedding IS NULL` says nothing about
    the write path. `probe-embed.sh` hard-refuses rather than reporting it.
 5. **Every probe TRUNCATEs first, which hides collisions that span runs.**
-   `store_workflow`'s constant `"Body"` phase is hashed with plain `content_hash`,
-   so the SECOND workflow ever written collides on `uq_claims_content_hash_agent`
-   ("Duplicate entity already exists") — on main and in production too. No probe
-   saw it, because each run starts from an empty `claims` table and writes one
-   workflow. A probe that asserts "tool X succeeds" on a truncated database says
-   nothing about the second call. **This trap caught this branch's own
-   acceptance matrix**: commit 3c921b69 reports `store_workflow` as "ingested 4"
-   on both configs, and that is the FIRST workflow only. The STORE_WORKFLOW
-   TWICE arm of `probe-unit-e.sh` measures the second: on this branch it fails
-   loudly and atomically (`Duplicate entity already exists`, delta 0/0/0) on
-   both configs; on main it fails the same way but leaves one claim and one
-   `workflows` row behind. The collision itself is open work: the workflow
-   builder hashes thesis/phase/step claims with plain `content_hash`, and
-   switching them to `compound_content_hash` (as the document builder did)
-   also changes what `verify_claim` must accept for level-2 workflow claims
-   (`verify_claim_crypto.rs::tampered_non_document_level_two_reports_mismatch`
-   pins the plain hash), so it is its own decision.
+   A probe that asserts "tool X succeeds" on a truncated database says nothing
+   about the second call. This trap hid a real bug: `store_workflow`'s constant
+   `"Body"` phase was hashed with plain `content_hash`, so the SECOND workflow
+   ever written collided on `uq_claims_content_hash_agent` ("Duplicate entity
+   already exists") — on main and in production too — while no probe saw it,
+   because each run started from an empty `claims` table and wrote one
+   workflow. Commit 3c921b69's acceptance matrix reported `store_workflow` as
+   "ingested 4" on both configs, and that was the FIRST workflow only. Backlog
+   6178a205 fixed it: workflow thesis/phase/step rows now store
+   `compound_content_hash(blake3(text), canonical_name)` (as the document
+   builder's structural rows do) and carry a `content_hash_scope` marker, so
+   `verify_claim` still reports a tampered pre-fix plain-hash row as
+   `mismatch` (`crates/epigraph-mcp/tests/store_workflow_hash_scope.rs`). The
+   STORE_WORKFLOW TWICE arm of `probe-unit-e.sh` keeps measuring the second
+   call: PASS is now `isError:false` with a positive claims/workflows delta.
 6. **One transaction means one `NOW()`.** Since the Unit E conversions a whole
    workflow plan (every claim, every `executes` edge, every `claim.created`
    event) shares one `created_at`. Any ordering keyed on `created_at` over
