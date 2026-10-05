@@ -2748,6 +2748,10 @@ mod db_tests {
             client_type: ClientType::Service,
             scopes: vec!["claims:write".to_string()],
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         }
     }
 
@@ -3149,6 +3153,10 @@ mod db_tests {
             client_type: ClientType::Service,
             scopes: vec!["claims:read".to_string()],
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         };
 
         let state = AppState::with_db(

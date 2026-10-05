@@ -3613,6 +3613,10 @@ mod db_tests {
             client_type: ClientType::Service,
             scopes: vec!["edges:write".to_string()],
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         }
     }
 

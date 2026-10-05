@@ -76,9 +76,12 @@ pub use pool::{
     probe_maintenance_privilege, probe_maintenance_privilege_conn,
     request_unit_maintenance_dsn_check, resolve_maintenance_url, MaintenanceConn,
     MaintenanceDsnSource, MaintenancePrivilege, MaintenanceSession, MaintenanceVerdict, ScopedConn,
-    ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, MAINTENANCE_DATABASE_URL,
-    MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
+    ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, ACCESS_RECORDER_GUC,
+    MAINTENANCE_DATABASE_URL, MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
 };
+pub use repos::ElevatedAccess;
+pub use repos::{admin_act, AdminActRepository, AdminActRow};
+pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
     ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository,
     AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
@@ -119,7 +122,18 @@ pub use repos::{
     WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
     WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
-pub use visibility::{MaintenanceLease, SystemReason, Viewer};
+pub use repos::{
+    AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
+    AdminScopeSwitch,
+};
+pub use repos::{
+    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
+    Redemption, TicketMode, TicketPasskey,
+};
+pub use repos::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
+pub use repos::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
+pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
+pub use visibility::{Elevation, MaintenanceLease, SystemReason, Viewer};
 
 // Re-export sqlx types that users will need
 pub use sqlx::PgPool;

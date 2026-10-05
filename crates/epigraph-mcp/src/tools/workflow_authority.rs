@@ -141,6 +141,7 @@ pub(crate) async fn require_workflow_authority(
             &mut *conn,
             auth.client_id,
             caller_agent,
+            auth.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
         )
         .await
         .map_err(|e| {

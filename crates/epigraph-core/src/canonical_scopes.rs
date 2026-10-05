@@ -94,6 +94,26 @@ pub const ADMIN_ONLY_SCOPES: &[&str] = &[
     "instance:admin",
 ];
 
+/// The scope an ELEVATED access token carries (elevation plan EL-5, operator
+/// rulings D2/D5): minted ONLY by the token endpoint's elevate grant
+/// (`urn:epigraph:grant:elevate`), after a passkey ceremony confirmed an
+/// elevation ticket of a person holding a live elevating-role assignment, on
+/// a token that expires with that elevation (at most 15 minutes) and has no
+/// refresh token. That grant keeps only the client's [`READ_SCOPES`] (so
+/// every [`ADMIN_ONLY_SCOPES`] entry and every write scope goes) and adds this
+/// one: the standing admin scopes are what elevation replaces, and elevation
+/// is sudo READ.
+///
+/// Deliberately NOT in [`ADMIN_ONLY_SCOPES`] and in no canonical role or
+/// registration set. Nothing checks it yet: what an elevated request may do is
+/// decided by the live elevation session the token names (`elv`), re-checked
+/// by the database, not by this string. Every other grant strips it
+/// (`epigraph_auth::JwtConfig::issue_access_token` drops it from any token
+/// that names no elevation, and the token endpoint's grants leave it out of
+/// their response), so a client whose `granted_scopes` holds it mints it
+/// nowhere but the elevate grant.
+pub const PLATFORM_ADMIN_SCOPE: &str = "platform:admin";
+
 /// Read scopes. These are included in all three roles.
 pub const READ_SCOPES: &[&str] = &[
     "claims:read",

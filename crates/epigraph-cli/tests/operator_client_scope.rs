@@ -752,3 +752,107 @@ async fn it_runs_on_the_maintenance_dsn_only(pool: PgPool) {
     assert_eq!(scopes(&pool, c).await, (v(GRANTED), v(GRANTED)));
     assert_eq!(all_scope_audit_rows(&pool).await, 0);
 }
+
+/// Arm (`true`) or disarm migration 128's admin-scope switch, as the harness
+/// (superuser: a maintenance session for the setter).
+async fn set_admin_scopes_armed(pool: &PgPool, armed: bool) {
+    sqlx::query(
+        "SELECT * FROM public.epigraph_set_admin_scope_enforcement($1, 'operator_client_scope')",
+    )
+    .bind(armed)
+    .execute(pool)
+    .await
+    .expect("set the admin-scope switch");
+}
+
+/// While migration 128's admin-scope switch is ARMED (elevation plan EL-9),
+/// `grant-client-scope` refuses, in both modes, with nothing written and
+/// nothing audited: an admin act then needs an elevation, not a standing
+/// scope. `revoke-client-scope` still works (taking authority away is always
+/// safe). Disarmed again, the same grant applies, so the refusal is the
+/// switch's.
+///
+/// Catches: the grant path not consulting the switch; the refusal applied to
+/// revokes too; a switch read error treated as unarmed (the grant must be
+/// refused, not applied).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_armed_database_refuses_a_grant_and_still_takes_a_revoke(pool: PgPool) {
+    let c = seed_client(&pool, "human", GRANTED, GRANTED, None, None).await;
+    set_admin_scopes_armed(&pool, true).await;
+    for mode in ["--dry-run", "--apply"] {
+        let r = run_op(
+            &pool,
+            &["grant-client-scope", &c.to_string(), "claims:admin", mode],
+        )
+        .await;
+        assert_eq!(r.code, 1, "armed {mode}: {}", r.show());
+        assert!(
+            r.stderr.contains("admin-scope enforcement is armed"),
+            "armed {mode}: {}",
+            r.show()
+        );
+    }
+    assert_eq!(scopes(&pool, c).await, (v(GRANTED), v(GRANTED)));
+    assert!(audit(&pool, c).await.is_empty(), "nothing audited");
+
+    let held = &["claims:read", "claims:admin"];
+    let h = seed_client(&pool, "human", held, held, None, None).await;
+    let r = run_op(
+        &pool,
+        &[
+            "revoke-client-scope",
+            &h.to_string(),
+            "claims:admin",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "armed revoke: {}", r.show());
+    assert_eq!(
+        scopes(&pool, h).await,
+        (v(&["claims:read"]), v(&["claims:read"]))
+    );
+
+    set_admin_scopes_armed(&pool, false).await;
+    let r = run_op(
+        &pool,
+        &[
+            "grant-client-scope",
+            &c.to_string(),
+            "claims:admin",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(
+        r.code,
+        0,
+        "CALIBRATION: unarmed, the grant applies: {}",
+        r.show()
+    );
+
+    // An unreadable switch is not "unarmed": with its table moved away the
+    // switch read fails (42P01, not the 42883 of a database without 128).
+    let d = seed_client(&pool, "human", GRANTED, GRANTED, None, None).await;
+    sqlx::query("ALTER TABLE admin_scope_enforcement RENAME TO admin_scope_enforcement_moved")
+        .execute(&pool)
+        .await
+        .expect("move the switch's table");
+    let r = run_op(
+        &pool,
+        &[
+            "grant-client-scope",
+            &d.to_string(),
+            "claims:admin",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 1, "unreadable switch: {}", r.show());
+    assert!(
+        r.stderr.contains("could not be read"),
+        "refused BY the switch rule, not by a later statement on an aborted transaction: {}",
+        r.show()
+    );
+    assert_eq!(scopes(&pool, d).await, (v(GRANTED), v(GRANTED)));
+}

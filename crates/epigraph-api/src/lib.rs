@@ -10,6 +10,8 @@ pub mod migrate;
 pub mod oauth;
 pub mod openapi;
 #[cfg(feature = "db")]
+pub mod passkey_boot;
+#[cfg(feature = "db")]
 pub mod query_parser;
 pub mod routes;
 pub mod security;

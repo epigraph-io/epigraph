@@ -131,6 +131,43 @@ async fn main() {
         }
     }
 
+    // The passkey relying party (elevation plan EL-3), read once. Unset is
+    // "off" (the enrollment endpoints answer 503); a partial or malformed
+    // configuration refuses to start rather than silently serving 503s.
+    #[cfg(feature = "db")]
+    let passkey_config = match epigraph_passkey::PasskeyConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+    #[cfg(feature = "db")]
+    let passkeys = match passkey_config.clone().map(epigraph_passkey::Passkeys::new) {
+        None => {
+            tracing::info!(
+                target: "elevate",
+                "passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the \
+                 enrollment ceremony answers 503"
+            );
+            None
+        }
+        Some(Ok(rp)) => {
+            tracing::info!(
+                target: "elevate",
+                rp_id = %rp.config().rp_id,
+                origin = %rp.config().origin,
+                software_attestation = rp.config().allows_software_attestation(),
+                "passkey relying party configured"
+            );
+            Some(Arc::new(rp))
+        }
+        Some(Err(e)) => {
+            eprintln!("ERROR: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // Configure API settings.
     //
     // `require_packet_signatures` enables the Ed25519 **payload** signature gate
@@ -232,9 +269,17 @@ async fn main() {
                 .unwrap_or_default()
                 .as_str(),
         );
-        let scoped = epigraph_db::ScopedPool::connect(&database_url, guc_mode)
-            .await
-            .expect("Failed to connect to PostgreSQL");
+        // `connect_recording_elevated_access`: this binary RECORDS every
+        // elevated access (the router's per-access recorder layer, elevation
+        // plan EL-8), so its pool declares the recorder, migration 125's second
+        // key. Sizing is `connect`'s (`ScopedPoolOptions::default()`).
+        let scoped = epigraph_db::ScopedPool::connect_recording_elevated_access(
+            &database_url,
+            guc_mode,
+            epigraph_db::ScopedPoolOptions::default(),
+        )
+        .await
+        .expect("Failed to connect to PostgreSQL");
         // PR-06 stops discarding the `ScopedPool`. `AppState` now carries it
         // alongside the inner `PgPool`, because `Viewer::system` requires a
         // `MaintenanceLease` and `ScopedPool::unscoped_for_maintenance` is the
@@ -324,13 +369,50 @@ async fn main() {
             "{}",
             epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
         );
+        // The TEST-ONLY software-attestation flag (elevation plan EL-3,
+        // EQ-1 (a)) is never served on a database armed for operator binding.
+        // Checked BEFORE OQ-7's refusal below, so on a privileged DSN of an
+        // armed database the flag, not the DSN, is the reason printed.
+        let allows_software = passkey_config
+            .as_ref()
+            .is_some_and(epigraph_passkey::PasskeyConfig::allows_software_attestation);
+        if let Err(refusal) = epigraph_api::passkey_boot::check_software_attestation_boot(
+            scoped.inner(),
+            allows_software,
+        )
+        .await
+        {
+            eprintln!("ERROR: {refusal}");
+            std::process::exit(1);
+        }
         // Operator binding (migration 122): say at boot whether the valve is
-        // open and whether the database is armed. Non-fatal; the trigger
-        // enforces whatever this reports.
-        epigraph_db::operator_binding::log_boot_state(scoped.inner(), "epigraph-api").await;
+        // open and whether the database is armed, and REFUSE TO START on a
+        // privileged DSN of an armed database (operator ruling OQ-7 (b): on
+        // such a DSN the trigger checks the author column alone and relieves
+        // the cross-human scope). One code path, every environment, no
+        // override; an unarmed database (dev, CI) is not refused.
+        if let Err(refusal) =
+            epigraph_db::operator_binding::check_request_unit_boot(scoped.inner(), "epigraph-api")
+                .await
+        {
+            eprintln!("ERROR: {refusal}");
+            std::process::exit(1);
+        }
+        // And for as long as it serves: the deploy order starts this unit
+        // before the database is armed, so the boot check alone would let a
+        // privileged DSN keep serving once it is (review R2-OQ-COR-1). The
+        // watch re-reads the posture and exits the process on that state. ONE
+        // watch, with the software-attestation flag's rule ahead of OQ-7's
+        // (a second watch would race OQ-7's to name the reason).
+        epigraph_db::operator_binding::spawn_posture_watch(
+            scoped.inner().clone(),
+            "epigraph-api",
+            epigraph_api::passkey_boot::running_stop(allows_software),
+        );
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
-            .with_admin_cascade(false);
+            .with_admin_cascade(false)
+            .with_passkeys(passkeys);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the

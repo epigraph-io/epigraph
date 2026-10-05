@@ -1668,6 +1668,152 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // refused by 107's definer-only policy, so it fails CLOSED (links nothing,
     // or errors); the stake is the tie silently skipped.
     ("epigraph_link_legacy_authors", 122),
+    // 123, the custodian role. Every body reads a FORCEd table
+    // (`role_assignments`, `platform_roles`, `instance_admins`,
+    // `security_events`, `edges`) or writes one through a policy that admits
+    // only `epigraph_definer_bypass()`: under a non-member owner the role
+    // readers find no assignment (every custodian reads as none: authority
+    // fails CLOSED, loud), the guards and audit trigger are refused their
+    // reads and `platform.` rows (every grant and end fails, loud), and the
+    // custodial-act recorder is refused its audit INSERT.
+    // `epigraph_is_instance_admin` (83) and the 122 checks 123 re-bodies keep
+    // their entries above.
+    ("epigraph_platform_roles_guard_update", 123),
+    ("epigraph_live_role_assignment", 123),
+    ("epigraph_role_assignments_guard_insert", 123),
+    ("epigraph_role_assignments_guard_update", 123),
+    ("epigraph_role_assignment_for", 123),
+    ("epigraph_holds_role", 123),
+    ("epigraph_role_assignments_audit", 123),
+    ("epigraph_grant_role", 123),
+    ("epigraph_end_role_assignment", 123),
+    ("epigraph_record_custodial_act", 123),
+    ("epigraph_platform_audit", 123),
+    ("epigraph_refuse_role_node_subject", 123),
+    ("epigraph_operator_links_refuse_role_holder", 123),
+    ("epigraph_instance_admins_frozen", 123),
+    ("epigraph_human_operators_mirror_instance_admins", 123),
+    // 124, passkeys. Every body reads or writes a FORCEd table
+    // (`passkey_enrollments`, `person_authenticators`, `operator_links`,
+    // `security_events`) through a policy that admits only a privileged
+    // session or `epigraph_definer_bypass()`. Under a non-member owner the
+    // completion guard reads no enrollment (every completion refused ELV04,
+    // loud), the audit triggers are refused their `platform.` rows (every
+    // ticket, completion and revoke fails, loud) and the ceremony reader
+    // serves nothing (loud) -- but both ELV01 guards read no `operator_links`
+    // row either, so a registered human linked as another human's agent would
+    // be ADMITTED (fail-OPEN): the stake that makes the owner a control here.
+    ("epigraph_passkey_enrollments_guard_insert", 124),
+    ("epigraph_passkey_enrollments_guard_update", 124),
+    ("epigraph_person_authenticators_guard_insert", 124),
+    ("epigraph_person_authenticators_guard_update", 124),
+    ("epigraph_passkey_enrollments_audit", 124),
+    ("epigraph_person_authenticators_audit", 124),
+    ("epigraph_create_passkey_enrollment", 124),
+    ("epigraph_enrollment_for_ceremony", 124),
+    ("epigraph_set_passkey_enrollment_challenge", 124),
+    ("epigraph_complete_passkey_enrollment", 124),
+    ("epigraph_revoke_passkey", 124),
+    // 125, elevation. Every body reads or writes a FORCEd table
+    // (`elevation_tickets`, `elevation_sessions`, `person_authenticators`,
+    // `role_assignments`, `security_events`) through a policy that admits only
+    // a privileged session or `epigraph_definer_bypass()`. Under a non-member
+    // owner the ticket guard reads no passkey and no assignment (every ticket
+    // refused ELV02, loud), the session guard reads no ticket (every
+    // confirmation refused ELV06, loud), and `epigraph_is_elevated` /
+    // `epigraph_elevation_live` read no session (never elevated: fail-closed)
+    // -- but the END TRIGGERS would update no session and say nothing: a
+    // revoked assignment, registration, family, client or passkey would leave the row
+    // un-ended, the trail without its `platform.elevation_ended`, and the
+    // family's one-session slot taken. Authority still ends (the computed
+    // check re-reads the assignment), the record does not: the stake.
+    ("epigraph_live_elevating_assignment", 125),
+    ("epigraph_family_of_person_is_live", 125),
+    ("epigraph_elevated_access_ready", 125),
+    ("epigraph_elevation_session_is_live", 125),
+    ("epigraph_elevation_tickets_guard_insert", 125),
+    ("epigraph_elevation_tickets_guard_update", 125),
+    ("epigraph_elevation_sessions_guard_insert", 125),
+    ("epigraph_elevation_sessions_guard_update", 125),
+    ("epigraph_elevation_tickets_audit", 125),
+    ("epigraph_elevation_sessions_audit", 125),
+    ("epigraph_end_elevations_on_assignment_revoke", 125),
+    ("epigraph_end_elevations_on_operator_revoke", 125),
+    ("epigraph_end_elevations_on_family_revoke", 125),
+    ("epigraph_end_elevations_on_client_revoke", 125),
+    ("epigraph_end_elevations_on_passkey_revoke", 125),
+    ("epigraph_end_expired_elevations", 125),
+    ("epigraph_create_elevation_ticket", 125),
+    ("epigraph_ticket_for_ceremony", 125),
+    ("epigraph_set_elevation_ticket_challenge", 125),
+    ("epigraph_passkeys_for_ticket", 125),
+    ("epigraph_confirm_elevation", 125),
+    ("epigraph_redeem_elevation_ticket", 125),
+    ("epigraph_elevation_live", 125),
+    ("epigraph_end_elevation", 125),
+    ("epigraph_is_elevated", 125),
+    // 127, the elevated-access log. Every body reads or writes FORCEd tables
+    // (`elevated_access`, `elevation_sessions`, `group_memberships`, every
+    // owner-group table the recorder attributes) through policies that admit
+    // only a privileged session or `epigraph_definer_bypass()`. Under a
+    // non-member owner the recorder reads no session (`SELECT ... STRICT`
+    // raises: every elevated request refused, loud and fail-closed), the
+    // insert guard reads no session (ELV03, loud), the admin-group helper
+    // returns no group (the subject reads nothing: fail-closed) and the audit
+    // reader returns no row -- but the recorder's ATTRIBUTION would read none
+    // of the rows it attributes and record every elevated request with an
+    // EMPTY group list, silently: the subjects would never see it. The stake.
+    ("epigraph_elevated_access_guard_insert", 127),
+    ("epigraph_elevated_access_guard_change", 127),
+    ("epigraph_admin_group_ids", 127),
+    ("epigraph_record_elevated_access", 127),
+    ("epigraph_elevated_access_audit", 127),
+    // 128, the admin-scope arming switch. The guard, the audit trigger and
+    // the setter only need the owner's grant on `admin_scope_enforcement`
+    // (UPDATE of armed and reason, granted to the maintenance role) and
+    // `security_events`; under a non-member owner they fail LOUD (42501 on
+    // every arm or disarm). The armed read fails loud too, which the mint
+    // chokepoint treats as armed (it strips). The stake is the would-strip
+    // recorder: it reads `oauth_clients` and the rate-limit window in
+    // `security_events` through policies that admit only a privileged
+    // session or `epigraph_definer_bypass()`, so under a non-member owner it
+    // finds no client and refuses every record (ADS03), and the token
+    // endpoint only WARNS on a failed record: the measurement that gates
+    // arming would read zero, silently.
+    ("epigraph_admin_scope_enforcement_guard", 128),
+    ("epigraph_admin_scope_enforcement_audit", 128),
+    ("epigraph_admin_scopes_armed", 128),
+    ("epigraph_set_admin_scope_enforcement", 128),
+    ("epigraph_record_admin_scope_would_strip", 128),
+    // 130, pending admin acts. (130 also re-bodies 123's and 124's guards,
+    // audit and recorder, and adds act-taking overloads of 123's and 124's
+    // maintenance definers: those names are registered at 123 / 124 above.)
+    // The stake: the act table's guards, audit and the consumer read
+    // `pending_admin_acts`, `elevation_sessions`, `person_authenticators` and
+    // `role_assignments` through policies that admit only a privileged session
+    // or `epigraph_definer_bypass()`. Under a non-member owner the proposal
+    // fails LOUD (its insert guard finds no live session: ELV07) and so do the
+    // ceremony definers (no act: ELV08), but `epigraph_has_live_passkey` reads
+    // NO passkey, so every ELV10 requirement silently lifts: a passkey
+    // holder's unconfirmed grant, end, custodial supersede or later enrollment
+    // is admitted as a bootstrap act. That is the failure this entry exists to
+    // catch.
+    ("epigraph_has_live_passkey", 130),
+    ("epigraph_pending_admin_acts_guard_insert", 130),
+    ("epigraph_pending_admin_acts_guard_update", 130),
+    ("epigraph_pending_admin_acts_audit", 130),
+    ("epigraph_consume_admin_act", 130),
+    ("epigraph_propose_admin_act", 130),
+    ("epigraph_act_for_ceremony", 130),
+    ("epigraph_set_admin_act_challenge", 130),
+    ("epigraph_passkeys_for_act", 130),
+    ("epigraph_confirm_admin_act", 130),
+    // 131, a person reads their own admin acts. The stake: it reads
+    // `pending_admin_acts`, whose policy admits only a privileged session or
+    // `epigraph_definer_bypass()`; under a non-member owner it lists NOTHING,
+    // silently (an empty list reads as "no acts", not as an error), so a
+    // proposer could not see the act waiting for its passkey.
+    ("epigraph_admin_acts_of_principal", 131),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -1984,6 +2130,258 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
             false,
         ),
+        // 123 (the custodian role): the request path reads its OWN role
+        // (subject-bound readers) and the audit trail; granting, ending,
+        // recording a custodial act and the unbound roster read are
+        // maintenance acts the request DSN must never call.
+        (
+            "epigraph_live_role_assignment",
+            "public.epigraph_live_role_assignment(uuid, text, timestamp with time zone)",
+            false,
+        ),
+        (
+            "epigraph_role_assignment_for",
+            "public.epigraph_role_assignment_for(uuid, text, timestamp with time zone)",
+            true,
+        ),
+        (
+            "epigraph_holds_role",
+            "public.epigraph_holds_role(uuid, text, timestamp with time zone)",
+            true,
+        ),
+        (
+            "epigraph_grant_role",
+            "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_end_role_assignment",
+            "public.epigraph_end_role_assignment(uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_record_custodial_act",
+            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb)",
+            false,
+        ),
+        (
+            "epigraph_platform_audit",
+            "public.epigraph_platform_audit(timestamp with time zone, integer)",
+            true,
+        ),
+        // 124 (passkeys): the unauthenticated enrollment ceremony runs on the
+        // request DSN, so its three definers (the reader, the challenge store,
+        // the completion) are app-callable; opening a ticket and revoking a
+        // passkey are maintenance acts the request DSN must never call.
+        (
+            "epigraph_create_passkey_enrollment",
+            "public.epigraph_create_passkey_enrollment(uuid, text, text)",
+            false,
+        ),
+        (
+            "epigraph_enrollment_for_ceremony",
+            "public.epigraph_enrollment_for_ceremony(uuid)",
+            true,
+        ),
+        (
+            "epigraph_set_passkey_enrollment_challenge",
+            "public.epigraph_set_passkey_enrollment_challenge(uuid, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_complete_passkey_enrollment",
+            "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean)",
+            true,
+        ),
+        (
+            "epigraph_revoke_passkey",
+            "public.epigraph_revoke_passkey(uuid, text)",
+            false,
+        ),
+        // 125 (elevation): the ticket API, the unauthenticated ceremony, the
+        // elevate grant and the viewer's liveness check all run on the request
+        // DSN, so the nine principal-bound or ticket-keyed definers are
+        // app-callable. The three unbound helpers are NOT: "who may elevate",
+        // "whose family is this" for any person would be a roster oracle, and
+        // ending another person's expired sessions is not the request DSN's.
+        (
+            "epigraph_create_elevation_ticket",
+            "public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea)",
+            true,
+        ),
+        (
+            "epigraph_ticket_for_ceremony",
+            "public.epigraph_ticket_for_ceremony(uuid)",
+            true,
+        ),
+        (
+            "epigraph_set_elevation_ticket_challenge",
+            "public.epigraph_set_elevation_ticket_challenge(uuid, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_passkeys_for_ticket",
+            "public.epigraph_passkeys_for_ticket(uuid)",
+            true,
+        ),
+        (
+            "epigraph_confirm_elevation",
+            "public.epigraph_confirm_elevation(uuid, bytea, bigint, boolean, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_redeem_elevation_ticket",
+            "public.epigraph_redeem_elevation_ticket(uuid, bytea, uuid)",
+            true,
+        ),
+        (
+            "epigraph_elevation_live",
+            "public.epigraph_elevation_live(uuid, uuid)",
+            true,
+        ),
+        (
+            "epigraph_end_elevation",
+            "public.epigraph_end_elevation(uuid, text)",
+            true,
+        ),
+        (
+            "epigraph_is_elevated",
+            "public.epigraph_is_elevated()",
+            true,
+        ),
+        (
+            "epigraph_live_elevating_assignment",
+            "public.epigraph_live_elevating_assignment(uuid, timestamp with time zone)",
+            false,
+        ),
+        (
+            "epigraph_family_of_person_is_live",
+            "public.epigraph_family_of_person_is_live(uuid, uuid, uuid)",
+            false,
+        ),
+        (
+            "epigraph_elevated_access_ready",
+            "public.epigraph_elevated_access_ready()",
+            false,
+        ),
+        (
+            "epigraph_elevation_session_is_live",
+            "public.epigraph_elevation_session_is_live(uuid)",
+            false,
+        ),
+        (
+            "epigraph_end_expired_elevations",
+            "public.epigraph_end_expired_elevations(uuid, uuid)",
+            false,
+        ),
+        // 127 (the elevated-access log): the API's response layer and the MCP
+        // tool-call wrapper record on the request DSN, and the subject's read
+        // policy calls the admin-group helper as the application role, so all
+        // three are app-callable: the recorder refuses an unelevated
+        // connection (ELV07), the helper answers only for the caller, and the
+        // audit reader returns nothing to an unentitled caller.
+        (
+            "epigraph_record_elevated_access",
+            "public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])",
+            true,
+        ),
+        (
+            "epigraph_admin_group_ids",
+            "public.epigraph_admin_group_ids()",
+            true,
+        ),
+        (
+            "epigraph_elevated_access_audit",
+            "public.epigraph_elevated_access_audit(timestamp with time zone, integer)",
+            true,
+        ),
+        // 128 (the admin-scope arming switch): the token endpoint reads the
+        // switch and records the would-strip measurement on the request DSN,
+        // so both are app-callable; arming and disarming are maintenance acts.
+        (
+            "epigraph_admin_scopes_armed",
+            "public.epigraph_admin_scopes_armed()",
+            true,
+        ),
+        (
+            "epigraph_record_admin_scope_would_strip",
+            "public.epigraph_record_admin_scope_would_strip(uuid, text, text[])",
+            true,
+        ),
+        (
+            "epigraph_set_admin_scope_enforcement",
+            "public.epigraph_set_admin_scope_enforcement(boolean, text)",
+            false,
+        ),
+        // 130 (pending admin acts): proposing (elevation-gated) and the
+        // act-keyed confirmation ceremony run on the request DSN, so they are
+        // app-callable; consuming an act, the passkey oracle and the
+        // act-taking forms of the maintenance verbs are maintenance acts.
+        (
+            "epigraph_propose_admin_act",
+            "public.epigraph_propose_admin_act(text, jsonb, text, text)",
+            true,
+        ),
+        (
+            "epigraph_act_for_ceremony",
+            "public.epigraph_act_for_ceremony(uuid)",
+            true,
+        ),
+        (
+            "epigraph_set_admin_act_challenge",
+            "public.epigraph_set_admin_act_challenge(uuid, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_passkeys_for_act",
+            "public.epigraph_passkeys_for_act(uuid)",
+            true,
+        ),
+        (
+            "epigraph_confirm_admin_act",
+            "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
+            false,
+        ),
+        (
+            "epigraph_has_live_passkey",
+            "public.epigraph_has_live_passkey(uuid)",
+            false,
+        ),
+        // The act-taking OVERLOADS share their names with the 123 / 124
+        // forms, and the presence check below reads the name; each is
+        // therefore keyed on `epigraph_consume_admin_act`, which exists
+        // exactly when 130 (and so the overload) does.
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text, uuid)",
+            false,
+        ),
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_end_role_assignment(uuid, text, uuid)",
+            false,
+        ),
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb, uuid)",
+            false,
+        ),
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
+            false,
+        ),
+        // 131: the proposer's own acts, principal-bound, on the request DSN.
+        (
+            "epigraph_admin_acts_of_principal",
+            "public.epigraph_admin_acts_of_principal(integer)",
+            true,
+        ),
     ];
 
     let app_exists: bool =
@@ -2103,11 +2501,76 @@ async fn residual_for(
 /// `settle_remaining` documents: a `('public', world)` row on those tables is a
 /// correct declaration, not an undeclared one. `edges` is exempt from the
 /// blanket residual but gets the sharper endpoint predicate instead.
+/// No NON-superuser maintenance role may CREATE in schema `public` (review
+/// cp3: SEC-03).
+///
+/// Every definer is owned by `epigraph_maintenance`, migration 125's recorder
+/// gate (`epigraph_elevated_access_ready()`, shipped answering false) among
+/// them. `CREATE OR REPLACE FUNCTION` needs CREATE on the schema AND ownership,
+/// and a member of the owning role has the ownership half, so a maintenance
+/// login that may CREATE in `public` can open the gate (or rewrite the
+/// liveness test) with one statement before the per-access recorder exists.
+/// The barrier is therefore this ACL, not ownership: PUBLIC holds no CREATE on
+/// `public` by default since PostgreSQL 15, but a cluster upgraded from an
+/// older default keeps the old grant. A superuser is not checked: no ACL binds
+/// it, which is why the maintenance DSN must not be the superuser either
+/// (`docs/deploy.md`, the 126 section).
+async fn verify_no_maintenance_create_on_public(pool: &PgPool) -> anyhow::Result<usize> {
+    let role_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(MAINTENANCE_ROLE)
+            .fetch_one(pool)
+            .await?;
+    if !role_exists {
+        // `verify_definer_ownership` already failed on the missing role.
+        return Ok(0);
+    }
+    let public_may_create: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege('public', 'public', 'CREATE')")
+            .fetch_one(pool)
+            .await?;
+    let offenders: Vec<String> = sqlx::query_scalar(
+        "SELECT r.rolname::text FROM pg_roles r
+          WHERE NOT r.rolsuper
+            AND pg_has_role(r.oid, $1, 'MEMBER')
+            AND has_schema_privilege(r.oid, 'public', 'CREATE')
+          ORDER BY 1",
+    )
+    .bind(MAINTENANCE_ROLE)
+    .fetch_all(pool)
+    .await?;
+    if offenders.is_empty() {
+        return Ok(0);
+    }
+    eprintln!(
+        "FAIL: non-superuser role(s) {offenders:?} (members of '{MAINTENANCE_ROLE}') hold CREATE \
+         on schema public{}. A member of the role that owns every definer, migration 125's \
+         recorder gate included, needs only that privilege to replace one, so an operator \
+         statement on the maintenance DSN could open elevation before the per-access recorder \
+         exists. Revoke it: {}.",
+        if public_may_create {
+            " (through PUBLIC: the pre-PostgreSQL-15 default, kept by an upgraded cluster)"
+        } else {
+            ""
+        },
+        if public_may_create {
+            "REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_string()
+        } else {
+            format!(
+                "REVOKE CREATE ON SCHEMA public FROM {}",
+                offenders.join(", ")
+            )
+        }
+    );
+    Ok(1)
+}
+
 async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usize> {
     let mut failures = 0usize;
 
     failures += verify_definer_ownership(pool).await?;
     failures += verify_operator_function_grants(pool).await?;
+    failures += verify_no_maintenance_create_on_public(pool).await?;
 
     // A4. NOT the plan's rationale: an earlier revision of this comment said
     // "the derivation is total, because claims.agent_id is NOT NULL". NOT NULL

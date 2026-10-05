@@ -4,6 +4,8 @@
 //! - client_credentials with Ed25519 proof (agents) or client_secret (services)
 //! - refresh_token (all client types)
 //! - external provider grant types (registered via providers.toml; e.g. google_id_token, cloudflare_access_jwt)
+//! - `urn:epigraph:grant:elevate`: a confirmed grant-mode elevation ticket, redeemed once
+//!   for a short, refreshless, elevated access token (elevation plan EL-5)
 
 // UNSCOPED-POOL-EXEMPT: Pre-authentication by definition, and the largest such site. Token issuance is
 // the step that MINTS the principal; a Viewer cannot precede it.
@@ -66,13 +68,27 @@ pub struct TokenRequest {
     pub code_verifier: Option<String>,
     /// For authorization_code grant: must equal the redirect_uri used at /authorize.
     pub redirect_uri: Option<String>,
+    /// For the elevate grant: the ticket `POST /api/v1/elevation/tickets` opened.
+    pub ticket_id: Option<String>,
+    /// For the elevate grant: the redeem secret shown once with that ticket (hex).
+    pub redeem_secret: Option<String>,
 }
+
+/// The grant that redeems a confirmed grant-mode elevation ticket.
+pub const ELEVATE_GRANT_TYPE: &str = "urn:epigraph:grant:elevate";
+
+/// The longest an elevated access token lives (migration 125: a session lasts
+/// at most 15 minutes; the token never outlives its session).
+pub const ELEVATED_TOKEN_MAX_SECS: i64 = 900;
 
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
     pub expires_in: i64,
+    /// Absent (not `null`) when the grant issues none: the elevate grant
+    /// never does. Every other grant issues one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
     pub scope: String,
 }
@@ -211,6 +227,21 @@ pub(crate) async fn principal_agent_id(
     Ok(agent_id)
 }
 
+/// Whether an access token minted with a refresh token carries that refresh
+/// token's family (`fam`). Only for a HUMAN client: the family is what a
+/// later elevation session binds to, an agent never elevates, and a family on
+/// an agent or service token could only cost that resolution a database round
+/// trip that answers "no". A grant that issues no refresh token binds nothing.
+///
+/// The rule holds at every mint site, so a token's binding never depends on
+/// which grant minted it: `handle_authorization_code` and the external grant
+/// (`provision_external_user`, human by construction) bind to the refresh row
+/// they insert, `handle_refresh_token` to the chain it rotates, and
+/// `handle_client_credentials` (agent and service clients only) binds nothing.
+pub(crate) fn binds_refresh_family(client_type: &str) -> bool {
+    client_type == "human"
+}
+
 /// Refuse to mint a token for an agent with any operator link record. See
 /// [`principal_agent_id`]. A RETIRED link refuses too: `epigraph_link_retired_agent`
 /// creates no membership, but a writer row that predates the retire, or one a
@@ -301,6 +332,7 @@ pub async fn token_endpoint(
         "client_credentials" => handle_client_credentials(&state, &req).await,
         "refresh_token" => handle_refresh_token(&state, &req).await,
         "authorization_code" => handle_authorization_code(&state, &req).await,
+        ELEVATE_GRANT_TYPE => handle_elevate_grant(&state, &req).await,
         other => {
             // Look up an external provider by grant_type.
             if let Some(provider) = state.providers.by_grant_type(other) {
@@ -365,7 +397,14 @@ async fn handle_external_grant(
         }
     };
 
-    provision_external_user(state, provider.as_ref(), &identity, req.scope.as_deref()).await
+    provision_external_user(
+        state,
+        provider.as_ref(),
+        &identity,
+        req.scope.as_deref(),
+        crate::oauth::scopes::MintGrant::ExternalAssertion,
+    )
+    .await
 }
 
 // ── Agent assertion verification ─────────────────────────────────────────
@@ -555,8 +594,10 @@ async fn handle_client_credentials(
         _ => Duration::minutes(15),
     };
 
-    // Effective scopes = intersection of requested and granted
-    let effective_scopes = {
+    // Effective scopes = intersection of requested and granted, through the
+    // mint chokepoint (never the elevation scope; the admin-only scopes per
+    // migration 128's switch).
+    let requested_scopes = {
         let granted = &client.granted_scopes;
         match &req.scope {
             Some(requested) => {
@@ -569,11 +610,22 @@ async fn handle_client_credentials(
             None => granted.clone(),
         }
     };
+    let effective_scopes = crate::oauth::scopes::grantable(
+        state,
+        client.id,
+        requested_scopes,
+        crate::oauth::scopes::MintGrant::ClientCredentials,
+    )
+    .await;
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
     // their next token, and so all four mint sites share one code path.
     let agent_id = principal_agent_id(state, client.id, client.agent_id).await?;
+    // No `fam`: this grant serves agent and service clients only (every other
+    // type is refused above), and [`binds_refresh_family`] binds humans only,
+    // although a refresh token is issued below.
+    let binding = epigraph_auth::AccessTokenBinding::NONE;
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(
@@ -583,6 +635,7 @@ async fn handle_client_credentials(
             client.owner_id,
             Some(agent_id),
             ttl,
+            binding,
         )
         .map_err(|e| ApiError::InternalError {
             message: format!("JWT signing failed: {e}"),
@@ -756,8 +809,16 @@ async fn handle_refresh_token(
         _ => Duration::minutes(15),
     };
 
-    // Use client's current granted_scopes (may have been updated since refresh token was issued)
-    let effective_scopes = client.granted_scopes.clone();
+    // Use client's current granted_scopes (may have been updated since refresh
+    // token was issued), through the mint chokepoint (never the elevation
+    // scope; the admin-only scopes per migration 128's switch).
+    let effective_scopes = crate::oauth::scopes::grantable(
+        state,
+        client.id,
+        client.granted_scopes.clone(),
+        crate::oauth::scopes::MintGrant::RefreshToken,
+    )
+    .await;
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
@@ -774,6 +835,25 @@ async fn handle_refresh_token(
         Err(unanswered) => return Err(unanswered),
     };
 
+    // The family the rotation below keeps (118 inserts the successor in the
+    // presented token's family), read BEFORE the rotation so that it, too,
+    // is something that can fail to answer without spending the token. A
+    // human client's token names it; see [`binds_refresh_family`].
+    let binding = if binds_refresh_family(&client.client_type) {
+        match RefreshTokenRepository::family_of(&state.db_pool, stored.id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })? {
+            Some(family) => epigraph_auth::AccessTokenBinding::family(family),
+            // Valid a moment ago and gone now (expired-row cleanup): the
+            // same answer as any refresh that cannot proceed.
+            None => return Err(invalid_refresh()),
+        }
+    } else {
+        epigraph_auth::AccessTokenBinding::NONE
+    };
+
     // Everything that can fail to ANSWER (the checks above, the signing below)
     // runs before the old token is spent, so an outage never burns a chain.
     // The access token is signed first and simply dropped if the rotation
@@ -787,6 +867,7 @@ async fn handle_refresh_token(
             client.owner_id,
             Some(agent_id),
             ttl,
+            binding,
         )
         .map_err(|e| ApiError::InternalError {
             message: format!("JWT signing failed: {e}"),
@@ -999,27 +1080,26 @@ async fn handle_authorization_code(
         "service" => Duration::hours(1),
         _ => Duration::minutes(15),
     };
-    let effective_scopes = row.scopes.clone();
+    // The code's consented scopes, through the mint chokepoint (never the
+    // elevation scope; the admin-only scopes per migration 128's switch).
+    let effective_scopes = crate::oauth::scopes::grantable(
+        state,
+        client.id,
+        row.scopes.clone(),
+        crate::oauth::scopes::MintGrant::AuthorizationCode,
+    )
+    .await;
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
     // their next token, and so all four mint sites share one code path.
     let agent_id = principal_agent_id(state, client.id, client.agent_id).await?;
-    let (access_token, _jti) = state
-        .jwt_config
-        .issue_access_token(
-            client.id,
-            effective_scopes.clone(),
-            &client.client_type,
-            client.owner_id,
-            Some(agent_id),
-            ttl,
-        )
-        .map_err(|e| ApiError::InternalError {
-            message: format!("JWT signing failed: {e}"),
-        })?;
 
-    // Refresh token (reuse the existing rotation pattern).
-    let refresh_token = {
+    // Refresh token (reuse the existing rotation pattern). Inserted BEFORE the
+    // access token is signed, so the access token can name its family: a new
+    // row opens its own family (`family_id` NULL reads as its id, migration
+    // 118). If the signing below fails, the row is left unreturned; nobody
+    // holds its raw token, so it can never be presented.
+    let (refresh_token, refresh_id) = {
         use rand::Rng;
         let raw: [u8; 32] = rand::thread_rng().gen();
         let token_str = hex::encode(raw);
@@ -1030,7 +1110,7 @@ async fn handle_authorization_code(
             "service" => Duration::days(90),
             _ => Duration::hours(24),
         };
-        epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
+        let refresh_id = epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
             &state.db_pool,
             hash.as_bytes(),
             client.id,
@@ -1041,8 +1121,28 @@ async fn handle_authorization_code(
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
         })?;
-        token_str
+        (token_str, refresh_id)
     };
+
+    let binding = if binds_refresh_family(&client.client_type) {
+        epigraph_auth::AccessTokenBinding::family(refresh_id)
+    } else {
+        epigraph_auth::AccessTokenBinding::NONE
+    };
+    let (access_token, _jti) = state
+        .jwt_config
+        .issue_access_token(
+            client.id,
+            effective_scopes.clone(),
+            &client.client_type,
+            client.owner_id,
+            Some(agent_id),
+            ttl,
+            binding,
+        )
+        .map_err(|e| ApiError::InternalError {
+            message: format!("JWT signing failed: {e}"),
+        })?;
 
     Ok((
         StatusCode::OK,
@@ -1056,7 +1156,267 @@ async fn handle_authorization_code(
     ))
 }
 
+// ── The elevate grant (elevation plan EL-5) ─────────────────────────────────
+
+/// The scopes of an ELEVATED access token: the client's own `granted_scopes`
+/// narrowed to its READ scopes ([`READ_SCOPES`], an allowlist), plus
+/// [`PLATFORM_ADMIN_SCOPE`] once. Elevation replaces the standing admin
+/// scopes ([`ADMIN_ONLY_SCOPES`] are never read scopes); it does not stack on
+/// them.
+///
+/// Read only, because elevation is sudo READ (operator ruling D2) and the
+/// elevated viewer is read-only (plan §1.4). `begin_as` and migration 126
+/// refuse an elevated viewer's writes on the stamped paths, but a route that
+/// authorizes a write on the token's SCOPES alone and writes on the unscoped
+/// pool (`POST /api/v1/agents` under `agents:write`, for one) never meets
+/// either, so a write scope kept here would make a leaked elevated token a
+/// 15-minute write credential as well as a read-everything one.
+///
+/// [`READ_SCOPES`]: epigraph_core::canonical_scopes::READ_SCOPES
+/// [`ADMIN_ONLY_SCOPES`]: epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES
+/// [`PLATFORM_ADMIN_SCOPE`]: epigraph_core::canonical_scopes::PLATFORM_ADMIN_SCOPE
+#[cfg(feature = "db")]
+pub(crate) fn elevated_scopes(granted: &[String]) -> Vec<String> {
+    use epigraph_core::canonical_scopes::{PLATFORM_ADMIN_SCOPE, READ_SCOPES};
+    let mut out: Vec<String> = Vec::with_capacity(granted.len() + 1);
+    for s in granted {
+        if !READ_SCOPES.contains(&s.as_str()) {
+            continue;
+        }
+        if !out.contains(s) {
+            out.push(s.clone());
+        }
+    }
+    out.push(PLATFORM_ADMIN_SCOPE.to_string());
+    out
+}
+
+/// An RFC 6749 §5.2 error for the elevate grant.
+#[cfg(feature = "db")]
+fn elevate_error(error: &'static str, description: &str) -> ApiError {
+    ApiError::OAuthGrantError {
+        error,
+        description: description.to_string(),
+    }
+}
+
+/// `grant_type=urn:epigraph:grant:elevate`: redeem a confirmed grant-mode
+/// elevation ticket, ONCE, for an elevated access token.
+///
+/// The request names the ticket (`ticket_id`), presents the secret shown once
+/// when it was opened (`redeem_secret`) and the ticket's client (`client_id`,
+/// returned with the ticket; a per-user human client is a public client, so
+/// the secret is the credential and the client binding is that the two
+/// match). Migration 125's `epigraph_redeem_elevation_ticket` answers:
+///
+/// * `pending` while no ceremony has landed: `authorization_pending` (RFC 8628
+///   §3.5 style; the caller polls);
+/// * `invalid` for everything else (unknown ticket, wrong secret, another
+///   client, a connector-mode ticket, refused, expired before its assertion,
+///   already redeemed, or a session no longer live): one `invalid_grant`, so
+///   the endpoint is no oracle;
+/// * `issued` ONCE, with the session.
+///
+/// The token: the session's person as principal, `elv` = the session, `fam` =
+/// its refresh family, scopes per [`elevated_scopes`], expiry the session's
+/// (at most [`ELEVATED_TOKEN_MAX_SECS`], and never past the assignment's own
+/// window: the session's expiry already is LEAST of the two), and NO refresh
+/// token: an elevation is never renewed, it is asked for again.
+///
+/// Everything that can fail to answer (the client, its principal) runs BEFORE
+/// the redemption, which is the irreversible step; a failure after it (the
+/// signing) spends the ticket with no token, which fails closed.
+///
+/// The principal is the client's EXISTING agent, checked only for an operator
+/// link: unlike the other grants this one never goes through
+/// [`principal_agent_id`], so it can never provision an agent or reach the
+/// personal-group mint (`personal_group_mint_ratchet`). An unlinked client is
+/// `invalid_grant`: it can hold no redeemable ticket.
+#[cfg(feature = "db")]
+async fn handle_elevate_grant(
+    state: &AppState,
+    req: &TokenRequest,
+) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
+    use epigraph_db::repos::oauth_client::OAuthClientRepository;
+    use sha2::Digest;
+
+    const INVALID: &str = "the elevation ticket is unknown, not yours, refused, expired or \
+                           already redeemed";
+
+    let ticket: uuid::Uuid = req
+        .ticket_id
+        .as_deref()
+        .ok_or_else(|| elevate_error("invalid_request", "ticket_id is required"))?
+        .parse()
+        .map_err(|_| elevate_error("invalid_grant", INVALID))?;
+    let secret = req
+        .redeem_secret
+        .as_deref()
+        .ok_or_else(|| elevate_error("invalid_request", "redeem_secret is required"))?;
+    let client_id = req
+        .client_id
+        .as_deref()
+        .ok_or_else(|| elevate_error("invalid_request", "client_id is required"))?;
+    let secret_hash: [u8; 32] = match hex::decode(secret) {
+        Ok(bytes) if bytes.len() == 32 => sha2::Sha256::digest(&bytes).into(),
+        _ => return Err(elevate_error("invalid_grant", INVALID)),
+    };
+
+    let client = OAuthClientRepository::get_by_client_id(&state.db_pool, client_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?
+        .ok_or_else(|| elevate_error("invalid_grant", INVALID))?;
+    if client.status != "active" || client.client_type != "human" {
+        return Err(elevate_error("invalid_grant", INVALID));
+    }
+    // The principal is the client's EXISTING agent; this grant never provisions
+    // one (no `principal_agent_id`, whose cold path mints an agent and its
+    // personal group). A redeemable ticket names a family of a client already
+    // linked to the ticket's person (migration 125's family-liveness helper
+    // requires the client's agent to be the person), so an unlinked client
+    // holds no ticket and is answered here, before anything is written.
+    let Some(agent_id) = client.agent_id else {
+        return Err(elevate_error("invalid_grant", INVALID));
+    };
+    match refuse_operated_agent(state, agent_id).await {
+        Ok(()) => {}
+        Err(ApiError::Forbidden { .. }) => return Err(elevate_error("invalid_grant", INVALID)),
+        Err(other) => return Err(other),
+    }
+
+    let mut conn = state
+        .db_pool
+        .acquire()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to acquire a connection: {e}"),
+        })?;
+    let r = epigraph_db::ElevationCeremony::redeem(&mut conn, ticket, &secret_hash, client.id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
+    drop(conn);
+    match r.status.as_str() {
+        "pending" => {
+            return Err(elevate_error(
+                "authorization_pending",
+                "the elevation has not been confirmed yet: complete the passkey ceremony at the \
+                 ticket's page, then retry",
+            ))
+        }
+        "issued" => {}
+        _ => return Err(elevate_error("invalid_grant", INVALID)),
+    }
+    let (Some(session), Some(person), Some(family), Some(expires_at)) =
+        (r.session_id, r.person_agent_id, r.family_id, r.expires_at)
+    else {
+        return Err(ApiError::InternalError {
+            message: "the redemption issued no session".into(),
+        });
+    };
+    if person != agent_id {
+        tracing::error!(
+            target: "elevation",
+            ticket = %ticket,
+            session = %session,
+            "elevate grant: the session's person is not the client's principal; refused"
+        );
+        return Err(elevate_error("invalid_grant", INVALID));
+    }
+    let secs = (expires_at - Utc::now())
+        .num_seconds()
+        .min(ELEVATED_TOKEN_MAX_SECS);
+    if secs <= 0 {
+        return Err(elevate_error("invalid_grant", INVALID));
+    }
+    let ttl = Duration::seconds(secs);
+    let scopes = crate::oauth::scopes::grantable(
+        state,
+        client.id,
+        client.granted_scopes.clone(),
+        crate::oauth::scopes::MintGrant::Elevate,
+    )
+    .await;
+    let binding = epigraph_auth::AccessTokenBinding {
+        family_id: Some(family),
+        elevation_id: Some(session),
+    };
+    let (access_token, _jti) = state
+        .jwt_config
+        .issue_access_token(
+            client.id,
+            scopes.clone(),
+            &client.client_type,
+            client.owner_id,
+            Some(agent_id),
+            ttl,
+            binding,
+        )
+        .map_err(|e| ApiError::InternalError {
+            message: format!("JWT signing failed: {e}"),
+        })?;
+    tracing::info!(
+        target: "elevation",
+        ticket = %ticket,
+        session = %session,
+        client = %client.id,
+        expires_in = secs,
+        "elevated access token issued"
+    );
+    Ok((
+        StatusCode::OK,
+        Json(TokenResponse {
+            access_token,
+            token_type: "Bearer".to_string(),
+            expires_in: secs,
+            refresh_token: None,
+            scope: scopes.join(" "),
+        }),
+    ))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "db"))]
+mod elevate_scope_tests {
+    use super::elevated_scopes;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    /// Elevation is sudo READ (operator ruling D2): only the client's READ
+    /// scopes survive, every standing admin scope AND every write scope is
+    /// removed, `platform:admin` is added once (even when the client already
+    /// carries it), and the kept scopes keep their order. An unknown scope is
+    /// dropped (an allowlist). Mutations: the ADMIN_ONLY filter dropped ->
+    /// `claims:admin` survives; the read allowlist dropped -> `claims:write`,
+    /// `agents:write` and the unknown scope survive; the dedup of a granted
+    /// `platform:admin` dropped -> twice.
+    #[test]
+    fn elevation_replaces_the_standing_admin_scopes() {
+        assert_eq!(
+            elevated_scopes(&v(&[
+                "claims:read",
+                "claims:admin",
+                "platform:admin",
+                "groups:admin",
+                "claims:write",
+                "agents:write",
+                "evidence:read",
+                "instance:admin",
+                "clients:admin",
+                "entity-types:write",
+                "not-a-known:scope",
+            ])),
+            v(&["claims:read", "evidence:read", "platform:admin"])
+        );
+        assert_eq!(elevated_scopes(&[]), v(&["platform:admin"]));
+    }
+}
 
 #[cfg(test)]
 mod assertion_tests {

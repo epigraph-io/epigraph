@@ -26,6 +26,9 @@ pub struct IntrospectResponse {
     pub iat: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_type: Option<String>,
+    /// The token's `fam` claim (its refresh family), when it carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fam: Option<String>,
 }
 
 pub async fn introspect_endpoint(
@@ -42,6 +45,7 @@ pub async fn introspect_endpoint(
             exp: None,
             iat: None,
             token_type: None,
+            fam: None,
         }));
     }
 
@@ -55,6 +59,7 @@ pub async fn introspect_endpoint(
             exp: Some(claims.exp),
             iat: Some(claims.iat),
             token_type: Some("Bearer".to_string()),
+            fam: claims.fam.map(|f| f.to_string()),
         })),
         Err(_) => Ok(Json(IntrospectResponse {
             active: false,
@@ -64,6 +69,7 @@ pub async fn introspect_endpoint(
             exp: None,
             iat: None,
             token_type: None,
+            fam: None,
         })),
     }
 }
