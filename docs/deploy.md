@@ -1983,6 +1983,12 @@ it unarmed.
    128 is unarmed; a switch the application role cannot read strips (fail
    closed). The elevate grant is unaffected either way (read scopes plus
    `platform:admin`). A token without an admin-only scope never reads it.
+   The paths that hand scopes OUT follow the same switch: client approval
+   (`POST /api/v1/admin/clients/:id/approve`) approves an admin-only scope
+   only while unarmed (with a warning in the log) and refuses it (403) while
+   armed or when the switch cannot be read; it never grants `platform:admin`.
+   Registration (`POST /oauth/register`), which grants a fixed set whatever it
+   is asked, refuses (400) a request naming an admin-only scope while armed.
 
 **Every change is audited.** Arming and disarming are maintenance acts with a
 reason; each writes one `platform.admin_scopes_armed` or

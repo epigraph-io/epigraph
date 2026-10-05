@@ -507,9 +507,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/register.rs",
-        3,
+        4,
         "Pre-authentication. RFC 7591 dynamic client registration CREATES the client; no principal \
-         exists until it succeeds, so there is nothing to stamp the connection from.",
+         exists until it succeeds, so there is nothing to stamp the connection from. The fourth \
+         site (elevation plan EL-9) reads migration 128's admin-scope switch through its \
+         app-callable definer, only when the request names an admin-only scope: one control \
+         row, no tenancy-partitioned read, before any principal exists.",
     ),
     (
         "oauth/revoke.rs",

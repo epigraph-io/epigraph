@@ -153,6 +153,52 @@ pub async fn grantable(
     }
 }
 
+/// What a path that HANDS OUT scopes (client approval, registration's
+/// request, the operator CLI's grant) may do with the admin-only ones it was
+/// asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandOut {
+    /// None of the scopes is admin-only.
+    Allowed,
+    /// Unarmed (or no switch on this database): hand them out as before, and
+    /// say so in the log. These are the admin-only scopes asked for.
+    Warned(Vec<String>),
+    /// Armed, or the switch could not be read (fail closed): refuse. These are
+    /// the admin-only scopes asked for.
+    Refused(Vec<String>),
+}
+
+/// Decide [`HandOut`] for `scopes` against migration 128's switch, read on
+/// `pool` only when one of them is admin-only ([`is_admin_only`]: the
+/// admin-only set plus `platform:admin`).
+#[cfg(feature = "db")]
+pub async fn hand_out(pool: &sqlx::PgPool, scopes: &[String]) -> HandOut {
+    use epigraph_db::{AdminScopeEnforcement, AdminScopeSwitch};
+
+    let mut admin: Vec<String> = Vec::new();
+    for s in scopes {
+        if is_admin_only(s) && !admin.contains(s) {
+            admin.push(s.clone());
+        }
+    }
+    if admin.is_empty() {
+        return HandOut::Allowed;
+    }
+    match AdminScopeEnforcement::read(pool).await {
+        Ok(AdminScopeSwitch::Armed) => HandOut::Refused(admin),
+        Ok(AdminScopeSwitch::Unarmed | AdminScopeSwitch::Absent) => HandOut::Warned(admin),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                scopes = ?admin,
+                "the admin-scope switch could not be read; refusing to hand out admin-only \
+                 scopes (fail closed)"
+            );
+            HandOut::Refused(admin)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

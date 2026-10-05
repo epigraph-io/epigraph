@@ -12,10 +12,18 @@
 //! one failure. UNARMED, every token keeps it and the database records one
 //! `oauth.admin_scope_would_strip` event per client, naming the grant.
 //!
+//! The paths that HAND OUT scopes follow the same switch: client approval
+//! (`POST /api/v1/admin/clients/:id/approve`) refuses an admin-only scope
+//! while armed and approves it while unarmed, and never grants
+//! `platform:admin`; registration (`POST /oauth/register`) refuses a request
+//! that names one while armed (it never grants one either way).
+//!
 //! Every request is served on a pool whose connections run as the deployed
 //! application role, so the switch read and the measurement go through 128's
 //! grants, not a superuser's. Each test names the mutation it catches.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
 mod oauth_providers;
 
 use std::sync::Arc;
@@ -720,4 +728,253 @@ async fn an_unreadable_switch_strips_and_a_missing_one_keeps(pool: PgPool) {
         would_strip(&pool, client).await.is_empty(),
         "a database without the switch records no measurement"
     );
+}
+
+// ── The paths that hand scopes out: approval and registration ────────────────
+
+async fn post_bearer(
+    app: axum::Router,
+    uri: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// A registered human holding a STANDING `clients:admin` token (minted
+/// directly: the check chokepoint is a later batch, so such a token still
+/// passes the route's scope check). Returns the bearer.
+async fn client_admin_bearer(pool: &PgPool, jwt: &JwtConfig) -> String {
+    let (person, _) = fixture::seed_human_operator(pool, "el9-approver").await;
+    let client: Uuid = sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("the approver's client");
+    jwt.issue_access_token(
+        client,
+        v(&["clients:admin"]),
+        "human",
+        None,
+        Some(person),
+        Duration::minutes(10),
+        epigraph_auth::AccessTokenBinding::NONE,
+    )
+    .expect("mint")
+    .0
+}
+
+/// A PENDING service client with nothing granted.
+async fn pending_client(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, legal_entity_name, \
+                                    legal_contact_email) \
+         VALUES ($1, 'el9 pending', 'service', ARRAY['claims:read'], ARRAY[]::text[], 'pending', \
+                 'EL9 Test Org', 'el9@example.com') \
+         RETURNING id",
+    )
+    .bind(format!("el9_pending_{}", Uuid::new_v4().simple()))
+    .fetch_one(pool)
+    .await
+    .expect("pending client")
+}
+
+async fn status_and_granted(pool: &PgPool, client: Uuid) -> (String, Vec<String>) {
+    sqlx::query_as("SELECT status, granted_scopes FROM oauth_clients WHERE id = $1")
+        .bind(client)
+        .fetch_one(pool)
+        .await
+        .expect("client row")
+}
+
+fn approve_path(client: Uuid) -> String {
+    format!("/api/v1/admin/clients/{client}/approve")
+}
+
+/// Client approval hands out an admin-only scope only while the switch is
+/// UNARMED: armed, approving one is refused (403) and the client is left
+/// pending with nothing granted, while approving ordinary scopes still
+/// works. `platform:admin` is refused whatever the switch says.
+///
+/// Catches: `approve_client` not consulting the switch (the armed admin
+/// approval succeeds); the refusal applied to every scope (the armed ordinary
+/// approval fails); the `platform:admin` refusal removed (approved unarmed);
+/// an unreadable switch handed out as unarmed (fail open).
+#[sqlx::test(migrations = "../../migrations")]
+async fn approval_hands_out_admin_scopes_only_while_unarmed(pool: PgPool) {
+    let st = state(&pool).await;
+    let jwt = st.jwt_config.clone();
+    let app = create_router(st);
+    let bearer = client_admin_bearer(&pool, &jwt).await;
+
+    // Unarmed: as before.
+    let unarmed = pending_client(&pool).await;
+    let (status, body) = post_bearer(
+        app.clone(),
+        &approve_path(unarmed),
+        &bearer,
+        json!({ "granted_scopes": HELD }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "unarmed approval: {body}");
+    assert_eq!(
+        status_and_granted(&pool, unarmed).await,
+        ("active".to_string(), v(HELD))
+    );
+
+    // platform:admin: never.
+    let never = pending_client(&pool).await;
+    let (status, body) = post_bearer(
+        app.clone(),
+        &approve_path(never),
+        &bearer,
+        json!({ "granted_scopes": ["claims:read", "platform:admin"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "platform:admin: {body}");
+    assert_eq!(
+        status_and_granted(&pool, never).await,
+        ("pending".to_string(), vec![])
+    );
+
+    // Armed: the admin scope is refused, ordinary scopes are not.
+    set_armed(&pool, true).await;
+    let armed = pending_client(&pool).await;
+    let (status, body) = post_bearer(
+        app.clone(),
+        &approve_path(armed),
+        &bearer,
+        json!({ "granted_scopes": HELD }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "armed admin approval: {body}"
+    );
+    assert!(body.to_string().contains("claims:admin"), "{body}");
+    assert_eq!(
+        status_and_granted(&pool, armed).await,
+        ("pending".to_string(), vec![])
+    );
+    let (status, body) = post_bearer(
+        app.clone(),
+        &approve_path(armed),
+        &bearer,
+        json!({ "granted_scopes": ["claims:read"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "armed ordinary approval: {body}");
+    assert_eq!(
+        status_and_granted(&pool, armed).await,
+        ("active".to_string(), v(&["claims:read"]))
+    );
+
+    // Unarmed again, but the switch cannot be read by the application role:
+    // refused (fail closed), not "unarmed".
+    set_armed(&pool, false).await;
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION public.epigraph_admin_scopes_armed() FROM epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke");
+    let unreadable = pending_client(&pool).await;
+    let (status, body) = post_bearer(
+        app,
+        &approve_path(unreadable),
+        &bearer,
+        json!({ "granted_scopes": HELD }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unreadable switch: {body}");
+    assert_eq!(
+        status_and_granted(&pool, unreadable).await,
+        ("pending".to_string(), vec![])
+    );
+}
+
+fn registration(name: &str, scope: Option<&str>) -> Value {
+    let mut body = json!({
+        "client_name": name,
+        "client_type": "service",
+        "legal_entity_name": "EL9 Test Org",
+        "legal_contact_email": "el9@example.com",
+    });
+    if let Some(scope) = scope {
+        body["scope"] = json!(scope);
+    }
+    body
+}
+
+async fn clients_named(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM oauth_clients WHERE client_name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
+/// Registration grants a fixed set whatever `scope` asks for; a request that
+/// NAMES an admin-only scope registers as before while unarmed (granting
+/// nothing admin) and is refused (400, nothing created) while armed. A
+/// request naming only ordinary scopes registers armed or not.
+///
+/// Catches: registration not consulting the switch (the armed admin request
+/// registers); the refusal applied to any `scope` (the armed ordinary request
+/// is refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn registration_refuses_a_request_for_an_admin_scope_only_while_armed(pool: PgPool) {
+    let app = create_router(state(&pool).await);
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/oauth/register",
+        registration("el9-unarmed", Some("claims:read claims:admin")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "unarmed: {body}");
+    assert!(
+        !body["allowed_scopes"].to_string().contains("claims:admin"),
+        "registration never grants an admin scope: {body}"
+    );
+
+    set_armed(&pool, true).await;
+    let (status, body) = post_json(
+        app.clone(),
+        "/oauth/register",
+        registration("el9-armed", Some("claims:read claims:admin")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "armed: {body}");
+    assert!(body.to_string().contains("claims:admin"), "{body}");
+    assert_eq!(
+        clients_named(&pool, "el9-armed").await,
+        0,
+        "nothing registered"
+    );
+
+    let (status, body) = post_json(
+        app,
+        "/oauth/register",
+        registration("el9-armed-plain", Some("claims:read")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "armed, ordinary scope: {body}");
 }

@@ -285,9 +285,44 @@ pub async fn approve_client(
     Json(req): Json<ApproveClientRequest>,
 ) -> Result<(StatusCode, Json<ApproveClientResponse>), ApiError> {
     crate::middleware::scopes::check_scopes(&auth, &["clients:admin"])?;
+    let pool = &state.db_pool;
+
+    // Admin-only scopes (elevation plan EL-9). `platform:admin` is minted by
+    // the elevate grant alone and no client may hold it, so it is refused
+    // whatever the switch says. The admin-only set follows migration 128's
+    // switch: armed (or unreadable), refused; unarmed, approved as before,
+    // with a warning naming them.
+    if req
+        .granted_scopes
+        .iter()
+        .any(|s| s == epigraph_core::canonical_scopes::PLATFORM_ADMIN_SCOPE)
+    {
+        return Err(ApiError::Forbidden {
+            reason: "platform:admin is minted only by the elevate grant and is never granted to \
+                     a client"
+                .to_string(),
+        });
+    }
+    match crate::oauth::scopes::hand_out(pool, &req.granted_scopes).await {
+        crate::oauth::scopes::HandOut::Allowed => {}
+        crate::oauth::scopes::HandOut::Warned(admin) => tracing::warn!(
+            client = %id,
+            approved_by = %auth.client_id,
+            scopes = ?admin,
+            "approving a client with admin-only scopes while admin-scope enforcement is unarmed"
+        ),
+        crate::oauth::scopes::HandOut::Refused(admin) => {
+            return Err(ApiError::Forbidden {
+                reason: format!(
+                    "admin-only scopes {admin:?} cannot be granted while admin-scope enforcement \
+                     is armed; admin acts need an elevation"
+                ),
+            })
+        }
+    }
 
     use epigraph_db::repos::oauth_client::OAuthClientRepository;
-    OAuthClientRepository::approve(&state.db_pool, id, &req.granted_scopes, auth.client_id)
+    OAuthClientRepository::approve(pool, id, &req.granted_scopes, auth.client_id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
