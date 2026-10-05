@@ -35,14 +35,32 @@
 //! refuses (signature, origin, user verification), is a 400 that leaves the
 //! ticket live for a retry.
 //!
+//! # Admin acts: `/elevate/act/:id` (EL-12b)
+//!
+//! `POST /api/v1/admin/acts` (`routes/admin_acts.rs`) records an act an
+//! elevated person proposed. Its page shows the act's kind, its STORED
+//! canonical args, their digest, the reason and the verb that will execute
+//! it. The challenge COMMITS TO THE ACT (elevation plan §1.6):
+//! `epigraph_passkey::act_challenge(act id, stored args digest, server
+//! nonce)`, the nonce stored beside the library's state. At the assertion the
+//! handler recomputes that challenge from the act id, the digest the act
+//! definer returns and the stored nonce, and refuses (409
+//! `challenge_not_bound`, the act left live) a stored state whose challenge
+//! is anything else, BEFORE it looks at the assertion: a state copied from
+//! another act's ceremony (the application DSN can write it) cannot carry a
+//! confirmation over. Only the PROPOSER's live passkeys are allowed; the rest
+//! is the ticket assertion's rules, through migration 130's act definers.
+//! Confirming executes nothing: the maintenance CLI's `--act` does.
+//!
 //! # Unauthenticated by design
 //!
 //! These routes are on the PUBLIC router (`tests/public_router_allowlist.rs`
 //! names each with its reason). The page has no bearer token to present: the
 //! id in its URL (a random UUID, live for at most 15 minutes for an
 //! enrollment and 5 for a ticket, used once) and the authenticator are its
-//! credentials. Every handler reads through the ceremony definers, keyed by
-//! that id, on an UNSTAMPED application connection; none enumerates anything.
+//! credentials (an act's: at most 30 minutes, asserted once). Every handler
+//! reads through the ceremony definers, keyed by that id, on an UNSTAMPED
+//! application connection; none enumerates anything.
 //!
 //! # What the pages are careful about
 //!
@@ -62,8 +80,8 @@
 // UNSCOPED-POOL-EXEMPT: Pre-authentication. The ceremony pages are anonymous by
 // design (the enrollment or ticket id and the authenticator are their
 // credentials), so no principal exists to stamp a connection from; each site
-// calls one of migration 124's or 125's ceremony definers keyed by that id,
-// which need no stamp.
+// calls one of migration 124's, 125's or 130's ceremony definers keyed by that
+// id, which need no stamp.
 
 use std::sync::Arc;
 
@@ -77,11 +95,12 @@ use axum::{
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use epigraph_db::{
-    AssertedCredential, CeremonyEnrollment, CeremonyTicket, Confirmation, DbError,
-    ElevationCeremony, PasskeyCeremony, VerifiedPasskey,
+    ActConfirmation, AdminActCeremony, AssertedCredential, CeremonyAct, CeremonyEnrollment,
+    CeremonyTicket, Confirmation, DbError, ElevationCeremony, PasskeyCeremony, VerifiedPasskey,
 };
 use epigraph_passkey::{
-    AuthenticationState, PasskeyError, Passkeys, RegistrationState, StoredPasskey,
+    act_challenge as act_challenge_of, AuthenticationState, PasskeyError, Passkeys,
+    RegistrationState, StoredPasskey, ACT_NONCE_LEN,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -763,6 +782,432 @@ pub async fn ticket_assert(
         return internal("commit the refusal", &e);
     }
     confirmation_response(id, &t.mode, &c)
+}
+
+// =====================================================================
+// The admin-act confirmation (EL-12b): `/elevate/act/:id`
+// =====================================================================
+
+/// The maintenance verb that executes an act of `kind` (`--act <id>`).
+fn executing_verb(kind: &str) -> &'static str {
+    match kind {
+        "role.grant" => "grant-role",
+        "role.end" => "end-role-assignment",
+        "claim.custodial_supersede" => "custodial-supersede",
+        "passkey.register" => "passkey-enroll",
+        _ => "the matching verb",
+    }
+}
+
+fn act_not_live() -> Response {
+    json_error(
+        StatusCode::NOT_FOUND,
+        "act_not_live",
+        "no live admin act with this id: it is unknown, expired, or already confirmed or \
+         refused; propose it again",
+    )
+}
+
+/// Read the live act `id`. The refusal is the response to send, boxed.
+async fn live_act(conn: &mut sqlx::PgConnection, id: Uuid) -> Result<CeremonyAct, Box<Response>> {
+    match AdminActCeremony::live_act(conn, id).await {
+        Ok(Some(a)) => Ok(a),
+        Ok(None) => Err(Box::new(act_not_live())),
+        Err(e) => Err(Box::new(internal("read the act", &e))),
+    }
+}
+
+/// The stored args digest as the fixed-length value the challenge commits to.
+fn digest_of(act: &CeremonyAct) -> Result<[u8; 32], Box<Response>> {
+    act.args_digest
+        .as_slice()
+        .try_into()
+        .map_err(|_| Box::new(internal("read the act's digest", &"not 32 bytes")))
+}
+
+/// One stored arg, for the page: a string as itself, null as "(none)",
+/// anything else as its JSON text. Escaped by the caller.
+fn arg_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "(none)".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The confirmation page, rendered from the STORED canonical args.
+fn render_act_page(id: Uuid, act: &CeremonyAct) -> String {
+    let args = act.args.as_object().map_or_else(String::new, |m| {
+        m.iter()
+            .map(|(k, v)| {
+                format!(
+                    "<dt>{}</dt><dd><code>{}</code></dd>\n",
+                    html_escape(k),
+                    html_escape(&arg_text(v))
+                )
+            })
+            .collect::<String>()
+    });
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Confirm an admin act</title>
+<link rel="stylesheet" href="{css}">
+</head>
+<body>
+<main id="ceremony" data-base="/elevate/act/{id}" data-noun="act">
+<h1>Confirm an admin act</h1>
+<p>An elevated session signed in as the principal below PROPOSED the
+administrative act shown here. Confirming asks your passkey to verify you (PIN
+or biometric) and signs over exactly these arguments: the act can then be
+executed once, by the maintenance command line, within its expiry. Nothing is
+executed by this page.</p>
+<dl>
+<dt>Proposed by</dt><dd><code>{person}</code></dd>
+<dt>Act</dt><dd id="kind"><code>{kind}</code></dd>
+<dt>Reason</dt><dd id="reason">{reason}</dd>
+</dl>
+<h2>Arguments</h2>
+<dl id="args">
+{args}</dl>
+<dl>
+<dt>Arguments digest (SHA-256)</dt><dd><code>{digest}</code></dd>
+<dt>Expires</dt><dd>{expires}</dd>
+<dt>Executed by</dt><dd><code>epigraph-operator {verb} --act {id}</code></dd>
+</dl>
+<p>Only confirm if you proposed this yourself, just now, with these arguments.</p>
+<button id="confirm" type="button">Confirm with passkey</button>
+<p id="status" role="status" aria-live="polite"></p>
+</main>
+<script src="{js}"></script>
+</body>
+</html>
+"#,
+        css = CSS_PATH,
+        js = ELEVATE_JS_PATH,
+        id = id,
+        person = act.proposed_by,
+        kind = html_escape(&act.kind),
+        reason = html_escape(&act.reason),
+        args = args,
+        digest = hex::encode(&act.args_digest),
+        expires = act.expires_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        verb = executing_verb(&act.kind),
+    )
+}
+
+/// `GET /elevate/act/:id`: the confirmation page.
+pub async fn act_page(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    if passkeys(&state).is_none() {
+        return not_configured();
+    }
+    let mut conn = match ceremony_conn(&state).await {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    let act = match live_act(&mut conn, id).await {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
+    let mut resp = (StatusCode::OK, render_act_page(id, &act)).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    harden(resp)
+}
+
+/// `POST /elevate/act/:id/challenge`: start (or restart) the confirmation.
+/// The challenge COMMITS TO THE ACT: `epigraph_passkey::act_challenge` over
+/// the act id, its stored args digest and a fresh server nonce, which is
+/// stored with the library's state so the assertion (and the offline
+/// verifier) can recompute it. Only the PROPOSER's live passkeys are allowed;
+/// user verification is required; the counter is the confirm definer's.
+pub async fn act_challenge(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    let Some(rp) = passkeys(&state) else {
+        return not_configured();
+    };
+    let mut conn = match ceremony_conn(&state).await {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    let act = match live_act(&mut conn, id).await {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
+    let digest = match digest_of(&act) {
+        Ok(d) => d,
+        Err(resp) => return *resp,
+    };
+    let keys = match AdminActCeremony::passkeys(&mut conn, id).await {
+        Ok(k) => k,
+        Err(e) => return internal("read the act's passkeys", &e),
+    };
+    if keys.is_empty() {
+        return json_error(
+            StatusCode::CONFLICT,
+            "no_live_passkey",
+            "the person who proposed this act has no live passkey",
+        );
+    }
+    let stored: Vec<StoredPasskey> = keys
+        .into_iter()
+        .map(|k| StoredPasskey {
+            passkey: k.passkey,
+            sign_count: 0,
+        })
+        .collect();
+    let nonce: [u8; ACT_NONCE_LEN] = rand::random();
+    let challenge = act_challenge_of(id, &digest, &nonce);
+    let (options, ceremony) =
+        match rp.start_authentication_deferring_counter(&stored, Some(&challenge)) {
+            Ok(v) => v,
+            Err(e) => return internal("start the assertion", &e),
+        };
+    let state_json = json!({
+        "v": 1,
+        "ceremony": ceremony.to_json(),
+        "nonce": URL_SAFE_NO_PAD.encode(nonce),
+    });
+    match AdminActCeremony::store_challenge(&mut conn, id, &state_json).await {
+        Ok(()) => harden((StatusCode::OK, Json(options)).into_response()),
+        Err(e) if matches!(sqlstate(&e).as_deref(), Some("ELV08" | "ELV03")) => act_not_live(),
+        Err(e) => internal("store the challenge", &e),
+    }
+}
+
+/// The stored ceremony of an act, CHECKED to commit to that act: its library
+/// state's challenge must be `act_challenge(id, stored digest, stored
+/// nonce)`. Anything else (a state written for another act, a random
+/// challenge, a malformed row) is refused before any assertion is looked at.
+fn bound_ceremony(
+    id: Uuid,
+    digest: &[u8; 32],
+    stored: &Value,
+) -> Result<AuthenticationState, Box<Response>> {
+    let unbound = || {
+        tracing::warn!(
+            target: "elevate.act",
+            act = %id,
+            "the stored confirmation ceremony does not commit to this act; refused"
+        );
+        Box::new(json_error(
+            StatusCode::CONFLICT,
+            "challenge_not_bound",
+            "the stored confirmation ceremony does not commit to this act; request a new \
+             challenge",
+        ))
+    };
+    let nonce: [u8; ACT_NONCE_LEN] = stored
+        .get("nonce")
+        .and_then(Value::as_str)
+        .and_then(|n| URL_SAFE_NO_PAD.decode(n).ok())
+        .and_then(|n| n.try_into().ok())
+        .ok_or_else(unbound)?;
+    let ceremony =
+        AuthenticationState::from_json(stored.get("ceremony").cloned().ok_or_else(unbound)?);
+    match ceremony.challenge() {
+        Ok(c) if c.as_slice() == act_challenge_of(id, digest, &nonce).as_slice() => Ok(ceremony),
+        _ => Err(unbound()),
+    }
+}
+
+/// The response to a confirm definer's answer for an act.
+fn act_confirmation_response(id: Uuid, kind: &str, c: &ActConfirmation) -> Response {
+    if c.outcome == "confirmed" {
+        tracing::info!(target: "elevate.act", act = %id, "admin act confirmed");
+        harden(
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "outcome": "confirmed",
+                    "detail": format!(
+                        "Confirmed. Execute it on the maintenance command line before it \
+                         expires: epigraph-operator {} --act {id} (with the act's arguments)",
+                        executing_verb(kind)
+                    ),
+                })),
+            )
+                .into_response(),
+        )
+    } else {
+        tracing::warn!(
+            target: "elevate.act",
+            act = %id,
+            refusal = ?c.refusal,
+            code = ?c.code,
+            "admin act refused"
+        );
+        harden(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "act_refused",
+                    "refusal": c.refusal,
+                    "code": c.code,
+                    "detail": "the confirmation was refused, and a refused act is final; \
+                               propose it again",
+                })),
+            )
+                .into_response(),
+        )
+    }
+}
+
+/// An act confirm definer's raised refusal (ELV08: the act stopped being
+/// live), or a failure.
+fn act_confirm_failed(e: &DbError) -> Response {
+    if sqlstate(e).as_deref() == Some("ELV08") {
+        json_error(
+            StatusCode::CONFLICT,
+            "act_not_confirmable",
+            "the act is no longer live and started",
+        )
+    } else {
+        internal("record the act's assertion", e)
+    }
+}
+
+/// `POST /elevate/act/:id/assert`: check that the stored ceremony commits to
+/// THIS act, verify the authenticator's response against the proposer's
+/// passkeys, and record it (the ticket assertion's rules otherwise: an
+/// assertion by a credential that is not one of the proposer's live passkeys
+/// is recorded as an audited refusal, in a transaction rolled back should the
+/// definer ever confirm it).
+pub async fn act_assert(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Bytes,
+) -> Response {
+    let Some(rp) = passkeys(&state) else {
+        return not_configured();
+    };
+    let mut conn = match ceremony_conn(&state).await {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    let act = match live_act(&mut conn, id).await {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
+    let Some(stored) = act.challenge_state.clone() else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "no_ceremony_started",
+            "request a challenge for this act first",
+        );
+    };
+    let digest = match digest_of(&act) {
+        Ok(d) => d,
+        Err(resp) => return *resp,
+    };
+    // THE CONTENT BINDING, before anything else is looked at.
+    let ceremony = match bound_ceremony(id, &digest, &stored) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    let response: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "malformed_response",
+                err.to_string(),
+            )
+        }
+    };
+    let Some(raw_id) = response
+        .get("rawId")
+        .and_then(Value::as_str)
+        .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
+        .filter(|id| !id.is_empty())
+    else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "malformed_response",
+            "the response names no credential (rawId)",
+        );
+    };
+    let keys = match AdminActCeremony::passkeys(&mut conn, id).await {
+        Ok(k) => k,
+        Err(e) => return internal("read the act's passkeys", &e),
+    };
+
+    if keys.iter().any(|k| k.credential_id == raw_id) {
+        let a = match rp.finish_authentication(&response, &ceremony) {
+            Ok(a) => a,
+            Err(err) => {
+                tracing::warn!(
+                    target: "elevate.act",
+                    act = %id,
+                    error = %err,
+                    "act assertion refused by the WebAuthn library"
+                );
+                let code = match err {
+                    PasskeyError::UserNotVerified => "user_not_verified",
+                    PasskeyError::State(_) => "ceremony_state_unusable",
+                    PasskeyError::Malformed { .. } => "malformed_response",
+                    _ => "assertion_refused",
+                };
+                return json_error(StatusCode::BAD_REQUEST, code, err.to_string());
+            }
+        };
+        let asserted = AssertedCredential {
+            credential_id: &a.credential_id,
+            counter: i64::from(a.counter),
+            backup_eligible: a.backup_eligible,
+            evidence: &a.evidence,
+        };
+        return match AdminActCeremony::confirm(&mut conn, id, asserted).await {
+            Ok(c) => act_confirmation_response(id, &act.kind, &c),
+            Err(e) => act_confirm_failed(&e),
+        };
+    }
+
+    // Not one of the proposer's live passkeys: nothing to verify it with.
+    let evidence = json!({
+        "v": 1,
+        "challenge": ceremony.challenge().ok().map(|c| URL_SAFE_NO_PAD.encode(c)),
+        "response": response,
+        "verified": false,
+        "unverified_reason": "the credential is not one of the proposer's live passkeys; the \
+                              server held no key to verify it with",
+    });
+    let asserted = AssertedCredential {
+        credential_id: &raw_id,
+        counter: 0,
+        backup_eligible: false,
+        evidence: &evidence,
+    };
+    let mut tx = match sqlx::Connection::begin(&mut *conn).await {
+        Ok(tx) => tx,
+        Err(e) => return internal("begin", &e),
+    };
+    let c = match AdminActCeremony::confirm(&mut tx, id, asserted).await {
+        Ok(c) => c,
+        Err(e) => return act_confirm_failed(&e),
+    };
+    if c.outcome != "refused" {
+        let _ = tx.rollback().await;
+        tracing::error!(
+            target: "elevate.act",
+            act = %id,
+            "an unverified act assertion would have been confirmed; rolled back"
+        );
+        return json_error(
+            StatusCode::CONFLICT,
+            "retry",
+            "the proposer's passkeys changed during the ceremony; request a new challenge",
+        );
+    }
+    if let Err(e) = tx.commit().await {
+        return internal("commit the refusal", &e);
+    }
+    act_confirmation_response(id, &act.kind, &c)
 }
 
 /// `GET /elevate/assets/elevate.js`.

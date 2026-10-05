@@ -1025,6 +1025,14 @@ pub fn create_router(state: AppState) -> Router {
     // definers, the challenge allows only the TICKET person's live passkeys,
     // and nothing here mints a token (the elevate grant at `/oauth/token`
     // does, against the ticket's redeem secret).
+    //
+    // The ADMIN-ACT confirmation (plan EL-12b) is the same kind of surface:
+    // the proposer opens `/elevate/act/<id>` on the device that holds the
+    // passkey. The act id (random, live for at most 30 minutes, asserted once)
+    // and the PROPOSER's passkey are its credentials; every handler reads only
+    // that one act through migration 130's ceremony definers, the challenge
+    // commits to the act's stored args digest, and nothing here executes an
+    // act (the maintenance CLI's `--act` does).
     let public = Router::new()
         .route("/health", get(health::health_check))
         .route(
@@ -1045,6 +1053,9 @@ pub fn create_router(state: AppState) -> Router {
             post(elevate::ticket_challenge),
         )
         .route("/elevate/:ticket/assert", post(elevate::ticket_assert))
+        .route("/elevate/act/:id", get(elevate::act_page))
+        .route("/elevate/act/:id/challenge", post(elevate::act_challenge))
+        .route("/elevate/act/:id/assert", post(elevate::act_assert))
         .route("/elevate/assets/elevate.js", get(elevate::elevate_js));
 
     // Layered on the allowlist: a request with no Authorization

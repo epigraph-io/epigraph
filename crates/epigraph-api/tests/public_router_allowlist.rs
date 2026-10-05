@@ -87,7 +87,14 @@ const PUBLIC_ALLOWLIST: &[&str] = &["/health", "/api/v1/openapi.json"];
 /// challenge allows only the TICKET person's live passkeys, nothing here mints
 /// a token, and all of it answers 503 when no relying party is configured.
 ///
-/// Eleven application routes + the 11 OAuth/discovery routes = 22 paths
+/// The ADMIN-ACT confirmation (plan EL-12b) likewise: `/elevate/act/<id>`,
+/// whose act id (random, live for at most 30 minutes, asserted once) and the
+/// PROPOSER's passkey are its credentials; every handler reads only that one
+/// act through migration 130's ceremony definers, the challenge commits to
+/// the act's stored args digest, nothing here executes an act, and all of it
+/// answers 503 when no relying party is configured.
+///
+/// Fourteen application routes + the 11 OAuth/discovery routes = 25 paths
 /// reachable with no `Authorization` header.
 const PUBLIC_ALLOWLIST_DB: &[&str] = &[
     "/health",
@@ -100,6 +107,9 @@ const PUBLIC_ALLOWLIST_DB: &[&str] = &[
     "/elevate/:ticket",
     "/elevate/:ticket/challenge",
     "/elevate/:ticket/assert",
+    "/elevate/act/:id",
+    "/elevate/act/:id/challenge",
+    "/elevate/act/:id/assert",
     "/elevate/assets/elevate.js",
 ];
 
@@ -643,6 +653,9 @@ async fn the_enrollment_ceremony_answers_anonymously() {
         ("GET", format!("/elevate/{id}")),
         ("POST", format!("/elevate/{id}/challenge")),
         ("POST", format!("/elevate/{id}/assert")),
+        ("GET", format!("/elevate/act/{id}")),
+        ("POST", format!("/elevate/act/{id}/challenge")),
+        ("POST", format!("/elevate/act/{id}/assert")),
     ] {
         let req = if method == "GET" {
             client.get(format!("http://{addr}{path}"))

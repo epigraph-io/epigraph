@@ -3012,3 +3012,340 @@ async fn a_person_lists_only_their_own_acts_over_http(pool: PgPool) {
     let (status, body) = s.get("/api/v1/admin/acts?mine=false", &p_plain).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+// =====================================================================
+// EL-12b: the admin-act confirmation, /elevate/act/:id
+// =====================================================================
+
+impl Server {
+    async fn act_page(&self, act: Uuid) -> reqwest::Response {
+        self.http
+            .get(self.url(&format!("/elevate/act/{act}")))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn act_challenge(&self, act: Uuid) -> (StatusCode, Value) {
+        self.post(&format!("/elevate/act/{act}/challenge"), None, &json!({}))
+            .await
+    }
+
+    async fn act_options(&self, act: Uuid) -> Value {
+        let (status, options) = self.act_challenge(act).await;
+        assert_eq!(status, StatusCode::OK, "act challenge: {options}");
+        options
+    }
+
+    async fn act_assert(&self, act: Uuid, response: &Value) -> (StatusCode, Value) {
+        self.post(&format!("/elevate/act/{act}/assert"), None, response)
+            .await
+    }
+}
+
+/// A `role.grant` act proposed over HTTP with the elevated `token`, for a
+/// fresh grantee, with `reason`; its id.
+async fn propose_with(pool: &PgPool, s: &Server, token: &str, reason: &str) -> Uuid {
+    let x = person(pool, &format!("grantee {reason}")).await;
+    let (status, body) = s
+        .propose(
+            token,
+            "role.grant",
+            &grant_act_args(x.person, "audit"),
+            reason,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "CALIBRATION: propose: {body}");
+    body["act_id"].as_str().unwrap().parse().unwrap()
+}
+
+/// [`propose_with`], `p` elevated for the purpose (one session per family:
+/// call it once per person).
+async fn proposed_act(pool: &PgPool, s: &Server, p: &Person, reason: &str) -> Uuid {
+    let (_, token) = elevated_token(pool, s, p).await;
+    propose_with(pool, s, &token, reason).await
+}
+
+/// `(outcome, refusal)` of an act.
+async fn act_row(pool: &PgPool, act: Uuid) -> (Option<String>, Option<String>) {
+    sqlx::query_as("SELECT outcome, refusal FROM pending_admin_acts WHERE id = $1")
+        .bind(act)
+        .fetch_one(pool)
+        .await
+        .expect("the act")
+}
+
+/// `(args_digest, stored challenge state)` of an act.
+async fn act_ceremony_row(pool: &PgPool, act: Uuid) -> (Vec<u8>, Option<Value>) {
+    sqlx::query_as("SELECT args_digest, challenge_state FROM pending_admin_acts WHERE id = $1")
+        .bind(act)
+        .fetch_one(pool)
+        .await
+        .expect("the act")
+}
+
+/// The confirmation end to end: the page names the act, its digest and the
+/// verb that executes it; the challenge allows ONLY the proposer's passkey,
+/// with user verification required, and IS `act_challenge(act, stored digest,
+/// stored nonce)`; the proposer's assertion confirms the act (audited), the
+/// page is gone, and the act lists as confirmed.
+///
+/// Mutation: the challenge started with no override (the library's random
+/// challenge) -> the challenge is not the act's (and the assertion is refused
+/// `challenge_not_bound`); the routes unregistered -> red.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_act_ceremony_confirms_with_the_proposers_passkey(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let act = proposed_act(&pool, &s, &p, "grant an auditor").await;
+
+    let page = s.act_page(act).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = page.text().await.unwrap();
+    let (digest, _) = act_ceremony_row(&pool, act).await;
+    assert!(html.contains("<code>role.grant</code>"), "{html}");
+    assert!(html.contains(&hex::encode(&digest)), "the digest: {html}");
+    assert!(
+        html.contains(&format!("epigraph-operator grant-role --act {act}")),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-base="/elevate/act/"#), "{html}");
+
+    let options = s.act_options(act).await;
+    assert_eq!(options["publicKey"]["userVerification"], "required");
+    let allowed: Vec<Vec<u8>> = options["publicKey"]["allowCredentials"]
+        .as_array()
+        .expect("allowCredentials")
+        .iter()
+        .map(|c| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                c["id"].as_str().unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(allowed, vec![credential_of(&pool, p.person).await]);
+    let (_, stored) = act_ceremony_row(&pool, act).await;
+    let stored = stored.expect("a stored ceremony");
+    let nonce: [u8; 32] = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        stored["nonce"].as_str().expect("a nonce"),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let expected =
+        epigraph_passkey::act_challenge(act, &digest.clone().try_into().unwrap(), &nonce);
+    assert_eq!(
+        options["publicKey"]["challenge"],
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, expected),
+        "the challenge commits to the act"
+    );
+
+    let response = auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.act_assert(act, &response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "confirmed");
+    assert_eq!(act_row(&pool, act).await.0.as_deref(), Some("confirmed"));
+    assert_eq!(
+        events(&pool, "platform.admin_act_confirmed", "act_id", act).await,
+        1
+    );
+    assert_eq!(s.act_page(act).await.status(), StatusCode::NOT_FOUND);
+    let (_, listed) = s
+        .get(
+            "/api/v1/admin/acts?mine",
+            &s.scoped_token(&p, None, &["claims:read"]),
+        )
+        .await;
+    assert_eq!(listed["acts"][0]["outcome"], "confirmed", "{listed}");
+}
+
+/// THE CONTENT BINDING: a stored ceremony whose challenge was computed for a
+/// DIFFERENT act is refused. The application DSN can write any act's
+/// ceremony state (`epigraph_set_admin_act_challenge` is app-callable): copy
+/// act B's started ceremony onto act A, let the proposer's passkey sign B's
+/// options, and post that assertion to A. Refused 409 `challenge_not_bound`,
+/// A stays unasserted and unconfirmed. Calibration: a fresh, genuine ceremony
+/// for A then confirms it.
+///
+/// Mutation: the binding check skipped (the stored ceremony used as it is)
+/// -> A is CONFIRMED by an assertion over B's challenge: a random challenge
+/// alone does not catch this, because the library compares the response with
+/// whatever challenge the row holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_challenge_computed_for_another_act_is_refused(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let p = holder(&pool, &s, "holder", &mut auth).await;
+    let (_, token) = elevated_token(&pool, &s, &p).await;
+    let a = propose_with(&pool, &s, &token, "act a").await;
+    let b = propose_with(&pool, &s, &token, "act b").await;
+
+    let b_options = s.act_options(b).await;
+    let (_, b_state) = act_ceremony_row(&pool, b).await;
+    let b_state = b_state.expect("B's ceremony");
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT public.epigraph_set_admin_act_challenge($1, $2)")
+            .bind(a)
+            .bind(&b_state)
+            .execute(&mut *conn)
+            .await
+            .expect("an app-DSN write of A's ceremony state");
+        (conn, ())
+    })
+    .await;
+    let signed_for_b = auth.authenticate(ORIGIN, b_options).await;
+    let (status, body) = s.act_assert(a, &signed_for_b).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "challenge_not_bound", "{body}");
+    assert_eq!(act_row(&pool, a).await, (None, None), "A is untouched");
+    assert_eq!(
+        events(&pool, "platform.admin_act_confirmed", "act_id", a).await,
+        0
+    );
+
+    let options = s.act_options(a).await;
+    let response = auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.act_assert(a, &response).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: A's own ceremony: {body}"
+    );
+}
+
+/// The page renders the STORED args and reason, escaped, under the strict
+/// CSP, with no-store and no-referrer on the page and the challenge.
+///
+/// Mutation: the args rendered unescaped -> the raw markup appears.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_act_page_escapes_the_stored_args(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "holder", &mut SoftAuthenticator::new(MODEL)).await;
+    let (_, token) = elevated_token(&pool, &s, &p).await;
+    let x = person(&pool, "grantee").await;
+    let hostile_arg = r#"<script>alert(1)</script>"#;
+    let hostile_reason = r#""><img src=x onerror="y">"#;
+    let (status, body) = s
+        .propose(
+            &token,
+            "role.grant",
+            &grant_act_args(x.person, hostile_arg),
+            hostile_reason,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let act: Uuid = body["act_id"].as_str().unwrap().parse().unwrap();
+    let page = s.act_page(act).await;
+    let challenge = s
+        .http
+        .post(s.url(&format!("/elevate/act/{act}/challenge")))
+        .send()
+        .await
+        .unwrap();
+    for (what, resp) in [("page", &page), ("challenge", &challenge)] {
+        assert_eq!(resp.status(), StatusCode::OK, "{what}");
+        let h = resp.headers();
+        assert!(
+            h["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .starts_with("default-src 'none'; script-src 'self';"),
+            "{what}"
+        );
+        assert_eq!(h["referrer-policy"], "no-referrer", "{what}");
+        assert_eq!(h["cache-control"], "no-store", "{what}");
+    }
+    let html = page.text().await.unwrap();
+    assert!(!html.contains("<script>alert"), "{html}");
+    assert!(!html.contains("<img"), "{html}");
+    assert!(
+        html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "the stored arg, escaped: {html}"
+    );
+    assert!(
+        html.contains("&quot;&gt;&lt;img src=x onerror=&quot;y&quot;&gt;"),
+        "the reason, escaped: {html}"
+    );
+    assert!(
+        html.contains(&x.person.to_string()),
+        "the grantee the args name: {html}"
+    );
+    assert_eq!(html.matches("<script").count(), 1, "{html}");
+}
+
+/// THE CONFUSED DEPUTY on an act: B's passkey (a hostile client ignoring
+/// `allowCredentials`) completing P's act is REFUSED `person_mismatch` and
+/// audited, and a refused act is final (its page is gone).
+///
+/// Mutation: an assertion by a credential outside the proposer's passkeys
+/// answered 400 without reaching the definer -> no refusal recorded, and the
+/// act stays live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_persons_passkey_is_refused_on_an_act(pool: PgPool) {
+    let s = spawn(&pool, Some(software())).await;
+    let p = holder(&pool, &s, "custodian-p", &mut SoftAuthenticator::new(MODEL)).await;
+    let mut b_auth = SoftAuthenticator::new(MODEL);
+    let _b = holder(&pool, &s, "custodian-b", &mut b_auth).await;
+    let act = proposed_act(&pool, &s, &p, "P's act").await;
+
+    let mut options = s.act_options(act).await;
+    options["publicKey"]["allowCredentials"] = json!([]);
+    let response = b_auth.authenticate(ORIGIN, options).await;
+    let (status, body) = s.act_assert(act, &response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["refusal"], "person_mismatch");
+    assert_eq!(
+        act_row(&pool, act).await,
+        (Some("refused".into()), Some("person_mismatch".into()))
+    );
+    assert_eq!(
+        events(&pool, "platform.admin_act_refused", "act_id", act).await,
+        1
+    );
+    assert_eq!(s.act_page(act).await.status(), StatusCode::NOT_FOUND);
+}
+
+/// No relying party: every act ceremony endpoint answers 503 even for a live
+/// act. An unknown act is 404 on every endpoint.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_act_ceremony_fails_closed_unconfigured_and_on_an_unknown_act(pool: PgPool) {
+    let configured = spawn(&pool, Some(software())).await;
+    let p = holder(
+        &pool,
+        &configured,
+        "holder",
+        &mut SoftAuthenticator::new(MODEL),
+    )
+    .await;
+    let act = proposed_act(&pool, &configured, &p, "unconfigured").await;
+    let s = spawn(&pool, None).await;
+    assert_eq!(
+        s.act_page(act).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        s.act_challenge(act).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        s.act_assert(act, &json!({})).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let unknown = Uuid::new_v4();
+    assert_eq!(
+        configured.act_page(unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        configured.act_challenge(unknown).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        configured.act_assert(unknown, &json!({})).await.0,
+        StatusCode::NOT_FOUND
+    );
+}

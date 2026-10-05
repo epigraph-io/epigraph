@@ -1,4 +1,5 @@
-// The elevation page's script (elevation plan EL-5). Served from the API
+// The elevation page's and the admin-act page's script (elevation plan EL-5,
+// EL-12b). Served from the API
 // binary under a CSP that forbids inline script, so everything the page does
 // is here. It talks only to its own origin.
 (function () {
@@ -10,7 +11,11 @@
   if (!root || !button || !status) {
     return;
   }
-  var base = '/elevate/' + encodeURIComponent(root.getAttribute('data-ticket'));
+  // The elevation page names its ticket; the admin-act page names its own
+  // base path (`/elevate/act/<id>`) and what it confirms.
+  var base = root.getAttribute('data-base') ||
+    ('/elevate/' + encodeURIComponent(root.getAttribute('data-ticket')));
+  var noun = root.getAttribute('data-noun') === 'act' ? 'Not confirmed: ' : 'Not elevated: ';
 
   function say(text, kind) {
     status.textContent = text;
@@ -103,7 +108,7 @@
         });
       })
       .catch(function (err) {
-        say('Not elevated: ' + (err && err.message ? err.message : String(err)), 'error');
+        say(noun + (err && err.message ? err.message : String(err)), 'error');
         button.disabled = false;
       });
   }
