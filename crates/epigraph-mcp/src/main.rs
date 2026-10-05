@@ -758,7 +758,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             llm_identity.clone(),
         )
         .with_scoped_pool(scoped.clone())
-        .with_connector_elevation(connector_elevation_from_env());
+        .with_connector_elevation(connector_elevation_from_env())
+        // The ceremony page's public origin, for the URL `sudo` returns
+        // (elevation plan EL-11): the API's own variable. Unset, `sudo`
+        // refuses.
+        .with_public_base_url(std::env::var("EPIGRAPH_PUBLIC_BASE_URL").ok());
         let template = if identity_declared {
             template
         } else {

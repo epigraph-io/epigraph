@@ -70,6 +70,12 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("suggest_alternative_sets", "claims:read"),
     ("system_stats", "claims:read"),
     ("traverse", "claims:read"),
+    // The caller's own elevation (elevation plan EL-11): `claims:read`
+    // because neither reads nor writes a corpus row and neither is refused
+    // to an elevated request; the authority is the database's (migration
+    // 125's principal-bound definers refuse anyone who may not elevate).
+    ("sudo", "claims:read"),
+    ("unsudo", "claims:read"),
     // ─── claims:write ──────────────────────────────────────────────────
     ("add_step", "claims:write"),
     ("batch_submit_claims", "claims:write"),

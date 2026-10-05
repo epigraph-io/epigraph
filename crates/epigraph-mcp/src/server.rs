@@ -124,6 +124,11 @@ pub struct EpiGraphMcpFull {
     /// behind a short cache (elevation plan EL-10); shared by every session
     /// the factory clones. [`Self::admin_scope_posture`].
     pub(crate) admin_scope_arming: Arc<epigraph_db::AdminScopeArmingCache>,
+    /// The public origin the elevation ceremony page is served at (the API's
+    /// `EPIGRAPH_PUBLIC_BASE_URL`), for the URL `sudo` returns (elevation
+    /// plan EL-11). `None` in every constructor and unless `main` reads it:
+    /// with none, `sudo` refuses (it cannot name a page).
+    pub(crate) public_base_url: Option<String>,
 }
 
 impl EpiGraphMcpFull {
@@ -878,6 +883,64 @@ impl EpiGraphMcpFull {
         }
     }
 
+    /// Whether `auth`'s principal holds a live elevating role (operator
+    /// ruling D2), asked of the database on a connection stamped with its
+    /// plain scoped viewer (123's `epigraph_holds_role` is subject-bound).
+    /// `false`, without a round trip, for a token that is not a human
+    /// client's naming its principal; `false` on any error or with no
+    /// tenancy-aware pool (the narrower list).
+    pub async fn holds_elevating_role(&self, auth: &epigraph_auth::AuthContext) -> bool {
+        if !crate::tools::elevation::may_hold_an_elevating_role(auth) {
+            return false;
+        }
+        let (Some(principal), Some(scoped)) = (auth.agent_id, self.scoped.as_ref()) else {
+            return false;
+        };
+        let answer = async {
+            let viewer = epigraph_db::visibility::Viewer::resolve(&self.pool, principal).await?;
+            let mut read = scoped.read_as(&viewer).await?;
+            let held =
+                epigraph_db::RoleAssignmentRepository::holds_elevating_role(&mut read, principal)
+                    .await?;
+            read.commit().await?;
+            Ok::<bool, epigraph_db::DbError>(held)
+        }
+        .await;
+        answer.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "tools/list: the elevating-role check failed; not listing sudo");
+            false
+        })
+    }
+
+    /// The tools listed to one caller (elevation plan EL-11): every kernel
+    /// tool [`crate::tools::elevation::listed`] admits, then every federated
+    /// tool. `auth` is `None` on stdio. The ONE manifest rule `list_tools`
+    /// and `list_mcp_tools` share, so neither can bypass the other.
+    pub async fn manifest_for(
+        &self,
+        http: bool,
+        auth: Option<&epigraph_auth::AuthContext>,
+    ) -> Vec<rmcp::model::Tool> {
+        let holder = match (http, auth) {
+            (true, Some(a)) => self.holds_elevating_role(a).await,
+            _ => false,
+        };
+        let caller = crate::tools::elevation::ManifestCaller {
+            http,
+            auth,
+            holds_elevating_role: holder,
+            connector_elevation: self.connector_elevation,
+        };
+        let mut tools: Vec<rmcp::model::Tool> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|t| crate::tools::elevation::listed(t.name.as_ref(), &caller))
+            .collect();
+        tools.extend(self.federation.list_federated_tools());
+        tools
+    }
+
     /// Replace the admin-scope switch's cache with one whose reads stand for
     /// `ttl` (`Duration::ZERO`: every call reads the switch). For tests that
     /// arm or disarm mid-run.
@@ -946,6 +1009,7 @@ impl EpiGraphMcpFull {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
+            public_base_url: None,
         }
     }
 
@@ -982,6 +1046,17 @@ impl EpiGraphMcpFull {
     #[must_use]
     pub fn with_connector_elevation(mut self, enabled: bool) -> Self {
         self.connector_elevation = enabled;
+        self
+    }
+
+    /// Set the public origin `sudo` names the ceremony page under (the API's
+    /// `EPIGRAPH_PUBLIC_BASE_URL`; a trailing `/` is dropped). `None`, or a
+    /// blank value: `sudo` refuses.
+    #[must_use]
+    pub fn with_public_base_url(mut self, base: Option<String>) -> Self {
+        self.public_base_url = base
+            .map(|b| b.trim().trim_end_matches('/').to_string())
+            .filter(|b| !b.is_empty());
         self
     }
 
@@ -1051,6 +1126,7 @@ impl EpiGraphMcpFull {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
+            public_base_url: None,
         }
     }
 
@@ -2322,19 +2398,55 @@ impl EpiGraphMcpFull {
         tools::matching::retire_match_candidate(self, viewer, params, auth).await
     }
 
+    // ── Elevation (2 tools; elevation plan EL-11) ──
+
+    #[tool(
+        description = "Ask to ELEVATE this connection (sudo READ) for at most 15 minutes. Returns ONLY a URL: open it on the device that holds your passkey and confirm. Once confirmed, every request on this connection reads as an elevated custodian: read-only (every write is refused), and every read is recorded where the owners of the rows read can see it. Only a registered human who holds a live elevating role assignment, with a registered passkey, can elevate; agents never can. End it early with unsudo. Served only when the operator has enabled connector-mode elevation; otherwise use the CLI elevate path."
+    )]
+    // `pub` so a test can drive this dispatch body directly (the stdio
+    // refusal is here, before any viewer is resolved).
+    pub async fn sudo(
+        &self,
+        Parameters(params): Parameters<SudoParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth =
+            tools::elevation::over_http(extensions.get::<epigraph_auth::AuthContext>(), "sudo")?;
+        let viewer = &crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        tools::elevation::sudo(self, viewer, auth, &params.reason).await
+    }
+
+    #[tool(
+        description = "End this connection's elevation now (see sudo). Returns {\"ended\": true} when an elevation of yours was live and is now ended, else {\"ended\": false}."
+    )]
+    pub async fn unsudo(
+        &self,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth =
+            tools::elevation::over_http(extensions.get::<epigraph_auth::AuthContext>(), "unsudo")?;
+        let viewer = &crate::tools::viewer::request_viewer(self, Some(auth)).await?;
+        tools::elevation::unsudo(self, viewer, auth).await
+    }
+
     // ── Meta (1 tool) ──
 
     #[tool(
         description = "List all MCP tools available on this server. Returns the name, description, and full JSON Schema for every registered tool — including tools your client may have DEFERRED (name visible but schema not loaded). Use this for runtime tool discovery and to load the schema of any tool your client could not call directly. The list reflects the live server state, including newly deployed tools not yet stored in the knowledge graph."
     )]
-    async fn list_mcp_tools(&self) -> Result<CallToolResult, McpError> {
-        // Kernel tools + every federated tool the gateway advertises, matching
-        // `ServerHandler::list_tools`. `server_instructions` directs clients here
-        // to enumerate every tool with its schema, so the federated tools must be
-        // present or a deferred-schema client following that guidance would never
-        // discover them.
-        let mut tools = self.tool_router.list_all();
-        tools.extend(self.federation.list_federated_tools());
+    async fn list_mcp_tools(
+        &self,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        // The SAME manifest `ServerHandler::list_tools` answers
+        // (`manifest_for`, elevation plan EL-11): kernel tools as this caller
+        // may see them, then every federated tool the gateway advertises.
+        // `server_instructions` directs clients here to enumerate every tool
+        // with its schema, so the federated tools must be present, and the
+        // filter must be the same or this tool would bypass it. stdio has no
+        // `AuthContext`.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let tools = self.manifest_for(auth.is_some(), auth).await;
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&tools).map_err(crate::errors::internal_error)?,
         )]))
@@ -2444,7 +2556,17 @@ impl ServerHandler for EpiGraphMcpFull {
         // elevated, the claim and the family are stripped from the AuthContext
         // the tool sees, so the tool cannot resolve an elevated viewer this
         // wrapper did not see. Every other request pays nothing.
-        let elevated = self.elevation_at_dispatch(auth_owned.as_mut()).await?;
+        //
+        // `sudo` and `unsudo` act ON the caller's elevation, not AS it
+        // (elevation plan EL-11): not resolved, not stripped, not recorded.
+        // `sudo` needs the family a not-elevated request would lose, and an
+        // `unsudo` would otherwise be recorded by the session it just ended.
+        // Both stamp the principal's plain scoped viewer and read no row.
+        let elevated = if tools::elevation::acts_on_the_elevation(&request.name) {
+            None
+        } else {
+            self.elevation_at_dispatch(auth_owned.as_mut()).await?
+        };
         if let (Some(viewer), Some(auth)) = (elevated.as_ref(), auth_owned.as_mut()) {
             auth.elevation = viewer.elevation().map(|e| epigraph_auth::ElevationRef {
                 session_id: e.session_id,
@@ -2636,14 +2758,21 @@ impl ServerHandler for EpiGraphMcpFull {
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         // Kernel tools first, then every federated tool the gateway currently
         // advertises. Static-first mirrors `call_tool`'s resolution order: a
         // kernel tool always wins a name clash (the operator resolves clashes
         // between an extension and the kernel with a `prefix=`).
-        let mut tools = self.tool_router.list_all();
-        tools.extend(self.federation.list_federated_tools());
+        //
+        // The kernel list is THIS caller's (elevation plan EL-11, D2):
+        // `sudo`/`unsudo` only to a holder of a live elevating role. The HTTP
+        // transport carries `Parts` (and, behind the bearer, an
+        // `AuthContext`); stdio carries neither.
+        let parts = context.extensions.get::<Parts>();
+        let http = parts.is_some();
+        let auth = parts.and_then(|p| p.extensions.get::<epigraph_auth::AuthContext>());
+        let tools = self.manifest_for(http, auth).await;
         Ok(rmcp::model::ListToolsResult {
             tools,
             meta: None,

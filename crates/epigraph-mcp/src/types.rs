@@ -3143,6 +3143,17 @@ pub struct DecideMatchCandidateParams {
 /// (`claims:admin`). Supersession is no longer the analogy: since batch OA1 it is
 /// the caller's act on a claim it writes, at `claims:write`. Folding it back into
 /// `decide_match_candidate` would force one of the two to hold the wrong scope.
+/// `sudo` (elevation plan EL-11): why the caller asks to elevate. Shown on
+/// the ceremony page and kept on the ticket, the session and their audit
+/// rows.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SudoParams {
+    #[schemars(
+        description = "Why you need to elevate (shown on the confirmation page and kept in the audit trail; at most 500 characters)"
+    )]
+    pub reason: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RetireMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to retire")]

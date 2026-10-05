@@ -682,6 +682,16 @@ async fn el8_listener(pool: &PgPool) -> String {
 /// [`el8_listener`] whose servers read the admin-scope switch through a cache
 /// of interval `arming_ttl` (`Duration::ZERO`: every call reads it).
 async fn el8_listener_with(pool: &PgPool, arming_ttl: std::time::Duration) -> String {
+    listener(pool, arming_ttl, false).await
+}
+
+/// The public origin the EL-11 listeners name the ceremony page under.
+const EL11_BASE: &str = "http://localhost:8080";
+
+/// [`el8_listener_with`] whose servers serve connector-mode elevation when
+/// `connector` (the switch is OFF in `main` unless enabled) and name the
+/// ceremony page under [`EL11_BASE`].
+async fn listener(pool: &PgPool, arming_ttl: std::time::Duration, connector: bool) -> String {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
@@ -701,7 +711,9 @@ async fn el8_listener_with(pool: &PgPool, arming_ttl: std::time::Duration) -> St
             Ok(
                 EpiGraphMcpFull::new_shared(pool.clone(), signer.clone(), embedder.clone(), false)
                     .with_scoped_pool(scoped.clone())
-                    .with_admin_scope_arming_ttl(arming_ttl),
+                    .with_admin_scope_arming_ttl(arming_ttl)
+                    .with_connector_elevation(connector)
+                    .with_public_base_url(Some(EL11_BASE.to_string())),
             )
         },
         Arc::new(LocalSessionManager::default()),
@@ -1158,5 +1170,565 @@ fn an_elevated_request_reaches_no_federated_tool() {
         resolve < branch && branch < refusal && refusal < gate && gate < proxy,
         "resolve the elevation, then refuse it in the federation branch before the \
          extension's scope gate and the proxy call"
+    );
+}
+
+// =====================================================================
+// EL-11: MCP `sudo` / `unsudo`, and the manifest shows them only to role
+// holders (D2). Connector mode is OFF by default; the CLI path is served.
+// =====================================================================
+
+/// A token for `person` on `client` naming `family`/`elv`, of `client_type`
+/// with `scopes`.
+fn el11_token(
+    person: Uuid,
+    client: Uuid,
+    family: Option<Uuid>,
+    elv: Option<Uuid>,
+    client_type: &str,
+    scopes: &[&str],
+) -> String {
+    epigraph_auth::JwtConfig::from_secret(EL8_SECRET)
+        .issue_access_token(
+            client,
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            client_type,
+            None,
+            Some(person),
+            chrono::Duration::minutes(10),
+            epigraph_auth::AccessTokenBinding {
+                family_id: family,
+                elevation_id: elv,
+            },
+        )
+        .expect("mint")
+        .0
+}
+
+/// The first COMPLETE SSE `data:` line of `resp`, parsed: a tool list is
+/// larger than one chunk, so (unlike [`el8_data`]) a line counts only once
+/// its newline has arrived.
+async fn el11_data(mut resp: reqwest::Response) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut acc = String::new();
+    while let Ok(Ok(Some(bytes))) = tokio::time::timeout_at(deadline, resp.chunk()).await {
+        acc.push_str(&String::from_utf8_lossy(&bytes));
+        if let Some(line) = acc
+            .split_inclusive('\n')
+            .filter(|l| l.ends_with('\n'))
+            .find(|l| l.starts_with("data:") && l.trim_end().len() > 5)
+        {
+            return serde_json::from_str(line.trim_start_matches("data:").trim())
+                .unwrap_or_else(|e| panic!("SSE data is JSON ({e}): {line}"));
+        }
+    }
+    panic!("no complete SSE data: {acc}");
+}
+
+/// One JSON-RPC request on a fresh MCP session; the answer.
+async fn el11_rpc(
+    url: &str,
+    token: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let session = el8_session(url, token).await;
+    let resp = el8_post(
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": method, "params": params}),
+    )
+    .await;
+    el11_data(resp).await
+}
+
+/// The tool names `tools/list` answers `token`.
+async fn el11_list(url: &str, token: &str) -> Vec<String> {
+    let answer = el11_rpc(url, token, "tools/list", serde_json::json!({})).await;
+    names_of(&answer["result"]["tools"], &answer)
+}
+
+/// The tool names the `list_mcp_tools` TOOL answers `token`.
+async fn el11_meta_list(url: &str, token: &str) -> Vec<String> {
+    let answer = el11_call(url, token, "list_mcp_tools", serde_json::json!({})).await;
+    let listed = el11_result(&answer).unwrap_or_else(|| panic!("list_mcp_tools: {answer}"));
+    names_of(&listed, &answer)
+}
+
+fn names_of(tools: &serde_json::Value, answer: &serde_json::Value) -> Vec<String> {
+    tools
+        .as_array()
+        .unwrap_or_else(|| panic!("a tool array: {answer}"))
+        .iter()
+        .map(|t| t["name"].as_str().expect("name").to_string())
+        .collect()
+}
+
+/// `tools/call name(arguments)` for `token`; the JSON-RPC answer.
+async fn el11_call(
+    url: &str,
+    token: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    el11_rpc(
+        url,
+        token,
+        "tools/call",
+        serde_json::json!({"name": name, "arguments": arguments}),
+    )
+    .await
+}
+
+/// A successful tool answer's text content, parsed as JSON.
+fn el11_result(answer: &serde_json::Value) -> Option<serde_json::Value> {
+    if answer["result"]["isError"].as_bool() == Some(true) {
+        return None;
+    }
+    let text = answer["result"]["content"][0]["text"].as_str()?;
+    serde_json::from_str(text).ok()
+}
+
+/// A tool answer's error text (a JSON-RPC error or an `isError` result).
+fn el11_error(answer: &serde_json::Value) -> Option<String> {
+    answer["error"]["message"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            (answer["result"]["isError"].as_bool() == Some(true))
+                .then(|| answer["result"]["content"].to_string())
+        })
+}
+
+/// The tickets `person` holds: `(mode, redeem hash present, client, family, reason)`.
+async fn el11_tickets(pool: &PgPool, person: Uuid) -> Vec<(String, bool, Uuid, Uuid, String)> {
+    sqlx::query_as(
+        "SELECT mode, redeem_secret_hash IS NOT NULL, client_id, family_id, reason \
+           FROM elevation_tickets WHERE person_agent_id = $1 ORDER BY created_at",
+    )
+    .bind(person)
+    .fetch_all(pool)
+    .await
+    .expect("tickets")
+}
+
+/// A further live refresh family of `client`.
+async fn el11_family(pool: &PgPool, client: Uuid) -> Uuid {
+    let hash: Vec<u8> = [
+        Uuid::new_v4().as_bytes().to_vec(),
+        Uuid::new_v4().as_bytes().to_vec(),
+    ]
+    .concat();
+    sqlx::query_scalar(
+        "INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at) \
+         VALUES ($1, $2, ARRAY['claims:read'], now() + interval '1 day') RETURNING id",
+    )
+    .bind(&hash)
+    .bind(client)
+    .fetch_one(pool)
+    .await
+    .expect("a refresh token")
+}
+
+/// `person`'s own human client.
+async fn el11_client(pool: &PgPool, person: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human' \
+          ORDER BY created_at LIMIT 1",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client")
+}
+
+/// Complete `ticket`'s ceremony through migration 125's definers with the
+/// passkey `make_holder(.., n)` enrolled (synthetic evidence, as `session`):
+/// the session it opened.
+async fn el11_confirm(pool: &PgPool, ticket: Uuid, n: u8) -> Uuid {
+    let mut cred = vec![0xA5_u8; 16];
+    cred[0] = n;
+    as_app(pool, None, |mut conn| async move {
+        sqlx::query(
+            "SELECT public.epigraph_set_elevation_ticket_challenge($1, '{\"st\": 1}'::jsonb)",
+        )
+        .bind(ticket)
+        .execute(&mut *conn)
+        .await
+        .expect("the ceremony's challenge");
+        let (outcome, session): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT outcome, session_id \
+               FROM public.epigraph_confirm_elevation($1, $2, 0, false, '{\"ev\": 1}'::jsonb)",
+        )
+        .bind(ticket)
+        .bind(cred)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("confirm");
+        assert_eq!(outcome, "confirmed", "CALIBRATION: the ceremony confirms");
+        (conn, session.expect("a session"))
+    })
+    .await
+}
+
+/// A legacy `instance_admins` row for `person` (frozen since 123; seeded with
+/// its triggers off).
+async fn el11_legacy_admin(pool: &PgPool, person: Uuid) {
+    use sqlx::Executor;
+    let mut conn = pool.acquire().await.expect("conn");
+    conn.execute("SET session_replication_role = replica")
+        .await
+        .expect("replica");
+    sqlx::query("INSERT INTO instance_admins (agent_id, note) VALUES ($1, 'legacy')")
+        .bind(person)
+        .execute(&mut *conn)
+        .await
+        .expect("a legacy row");
+    conn.execute("SET session_replication_role = origin")
+        .await
+        .expect("origin");
+}
+
+/// D2: with connector mode ON, the manifest lists `sudo` and `unsudo` to P
+/// (a registered human holding the elevating custodian role) and to nobody
+/// else: not to A (a registered human whose only standing is a legacy
+/// `instance_admins` row), and not to G, an agent, whether its token says
+/// `agent` (refused by token type, before any database round trip: a
+/// SHORTCUT, not the database's answer) or `human` (the database answers: an
+/// agent holds no role). The `list_mcp_tools` TOOL answers each caller the
+/// same names as `tools/list`.
+///
+/// Verified to fail with `listed` admitting `sudo`/`unsudo` to every HTTP
+/// caller (no filter: A and G see them), with `list_mcp_tools` listing the
+/// router unfiltered, and with `manifest_for` never asking the database
+/// (P's list loses them).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_manifest_lists_sudo_only_to_a_role_holder(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "el11-list-p").await;
+    let (a, _) = fixture::seed_human_operator(&pool, "el11-list-a").await;
+    let (g, _) = fixture::seed_agent_with_group(&pool, "el11-list-g").await;
+    let (p_client, p_family) = make_holder(&pool, p, 31).await;
+    el11_legacy_admin(&pool, a).await;
+    let a_client = el11_client(&pool, a).await;
+    let a_family = el11_family(&pool, a_client).await;
+    let url = listener(&pool, epigraph_db::AdminScopeArmingCache::DEFAULT_TTL, true).await;
+
+    let p_token = el11_token(p, p_client, Some(p_family), None, "human", &["claims:read"]);
+    let a_token = el11_token(a, a_client, Some(a_family), None, "human", &["claims:read"]);
+    let g_agent = el11_token(
+        g,
+        Uuid::new_v4(),
+        Some(Uuid::new_v4()),
+        None,
+        "agent",
+        &["claims:read"],
+    );
+    let g_human = el11_token(
+        g,
+        Uuid::new_v4(),
+        Some(Uuid::new_v4()),
+        None,
+        "human",
+        &["claims:read"],
+    );
+
+    let has = |names: &[String], tool: &str| names.iter().any(|n| n == tool);
+    let p_list = el11_list(&url, &p_token).await;
+    assert!(
+        has(&p_list, "sudo") && has(&p_list, "unsudo"),
+        "the role holder sees both: {p_list:?}"
+    );
+    assert!(has(&p_list, "get_claim"), "CALIBRATION: an ordinary tool");
+    for (who, token) in [
+        ("A (instance_admins only)", &a_token),
+        ("G (agent token)", &g_agent),
+        ("G (agent principal, human-typed token)", &g_human),
+    ] {
+        let list = el11_list(&url, token).await;
+        assert!(has(&list, "get_claim"), "{who}: CALIBRATION: listed at all");
+        assert!(
+            !has(&list, "sudo") && !has(&list, "unsudo"),
+            "{who} must not see sudo/unsudo: {list:?}"
+        );
+    }
+    for (who, token, list) in [
+        ("P", &p_token, p_list),
+        ("A", &a_token, el11_list(&url, &a_token).await),
+    ] {
+        let mut meta = el11_meta_list(&url, token).await;
+        let mut listed = list;
+        meta.sort();
+        listed.sort();
+        assert_eq!(
+            meta, listed,
+            "{who}: list_mcp_tools answers what tools/list answers"
+        );
+    }
+}
+
+/// Connector mode is OFF by default (operator ruling, EQ-7 unruled): on a
+/// listener built as `main` builds it without the switch, P (who may elevate)
+/// is not shown `sudo` (but is shown `unsudo`, which only ever narrows), and
+/// a `sudo` call is REFUSED, pointing at the CLI elevate path, with no ticket
+/// opened. Calibration: the same P on a listener with the switch on gets a
+/// URL and a ticket.
+///
+/// Verified to fail with `sudo`'s switch guard dropped (the off listener
+/// opens a ticket), and with `listed` showing `sudo` regardless of the
+/// switch.
+#[sqlx::test(migrations = "../../migrations")]
+async fn sudo_is_served_only_with_connector_mode_on(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "el11-off-p").await;
+    let (client, family) = make_holder(&pool, p, 32).await;
+    let token = el11_token(p, client, Some(family), None, "human", &["claims:read"]);
+    let off = el8_listener(&pool).await;
+
+    let list = el11_list(&off, &token).await;
+    assert!(
+        !list.iter().any(|n| n == "sudo"),
+        "switch off: no sudo: {list:?}"
+    );
+    assert!(list.iter().any(|n| n == "unsudo"), "unsudo stays: {list:?}");
+    let answer = el11_call(&off, &token, "sudo", serde_json::json!({"reason": "audit"})).await;
+    let refused = el11_error(&answer).unwrap_or_else(|| panic!("refused: {answer}"));
+    assert!(
+        refused.contains("OFF") && refused.contains("/api/v1/elevation/tickets"),
+        "the refusal names the CLI path: {refused}"
+    );
+    assert!(el11_tickets(&pool, p).await.is_empty(), "no ticket opened");
+
+    let on = listener(&pool, epigraph_db::AdminScopeArmingCache::DEFAULT_TTL, true).await;
+    let answer = el11_call(&on, &token, "sudo", serde_json::json!({"reason": "audit"})).await;
+    assert!(
+        el11_result(&answer).is_some_and(|r| r.get("url").is_some()),
+        "CALIBRATION: switched on, the same P gets a URL: {answer}"
+    );
+    assert_eq!(el11_tickets(&pool, p).await.len(), 1);
+}
+
+/// `sudo` returns ONLY the ceremony URL: the result's sole key is `url`,
+/// `<base>/elevate/<ticket>`, and nothing token-shaped. The ticket is a
+/// CONNECTOR-mode ticket with no redeem secret, for P's own client and the
+/// token's family, carrying the reason.
+///
+/// Verified to fail with the ticket opened in grant mode (a redeem hash is
+/// stored), with the result naming the ticket id as a separate field, and
+/// with `call_tool`'s dispatch exemption removed (a not-elevated `sudo` has
+/// its family stripped and is refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn sudo_returns_only_the_ceremony_url(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "el11-url-p").await;
+    let (client, family) = make_holder(&pool, p, 33).await;
+    let token = el11_token(p, client, Some(family), None, "human", &["claims:read"]);
+    let url = listener(&pool, epigraph_db::AdminScopeArmingCache::DEFAULT_TTL, true).await;
+
+    let answer = el11_call(
+        &url,
+        &token,
+        "sudo",
+        serde_json::json!({"reason": "read B's rows"}),
+    )
+    .await;
+    let result = el11_result(&answer).unwrap_or_else(|| panic!("sudo answered: {answer}"));
+    let keys: Vec<&String> = result.as_object().expect("an object").keys().collect();
+    assert_eq!(keys, vec!["url"], "only the URL: {result}");
+    let page = result["url"].as_str().expect("a string");
+    let tickets = el11_tickets(&pool, p).await;
+    assert_eq!(tickets.len(), 1, "one ticket");
+    let id: Uuid =
+        sqlx::query_scalar("SELECT id FROM elevation_tickets WHERE person_agent_id = $1")
+            .bind(p)
+            .fetch_one(&pool)
+            .await
+            .expect("ticket id");
+    assert_eq!(page, format!("{EL11_BASE}/elevate/{id}"));
+    assert_eq!(
+        tickets[0],
+        (
+            "connector".to_string(),
+            false,
+            client,
+            family,
+            "read B's rows".to_string()
+        ),
+        "a connector ticket with no redeem secret, for the caller's client and family"
+    );
+    let text = answer.to_string();
+    assert!(!text.contains("eyJ"), "no token in the answer: {text}");
+}
+
+/// ADM-10: after the ceremony a `sudo` ticket opens, P's SAME-family token
+/// resolves elevated and its tool call is recorded, while P's OTHER family on
+/// the same client is neither elevated nor recorded; `unsudo` then ends it
+/// (reason `unsudo`) and the same-family token is plain again. A second
+/// `unsudo` has nothing to end.
+///
+/// Verified to fail with `unsudo` ending nothing, and with the family bound
+/// dropped from BOTH layers that hold it (125's `epigraph_elevation_live`
+/// family clause and `Viewer::resolve_elevated`'s family cross-check: the
+/// other family elevates). Either layer alone still holds it (each single
+/// drop was run and survived, by design), and with the dispatch exemption
+/// removed (`sudo` loses its family to the strip).
+#[sqlx::test(migrations = "../../migrations")]
+async fn sudo_elevates_its_own_family_until_unsudo(pool: PgPool) {
+    let (p, _) = fixture::seed_human_operator(&pool, "el11-adm10-p").await;
+    let (client, family) = make_holder(&pool, p, 34).await;
+    let other = el11_family(&pool, client).await;
+    let claim = fixture::seed_public_claim(&pool, p, "el11 P's public claim").await;
+    let url = listener(&pool, epigraph_db::AdminScopeArmingCache::DEFAULT_TTL, true).await;
+    let mine = el11_token(p, client, Some(family), None, "human", &["claims:read"]);
+    let theirs = el11_token(p, client, Some(other), None, "human", &["claims:read"]);
+
+    let answer = el11_call(&url, &mine, "sudo", serde_json::json!({"reason": "adm-10"})).await;
+    let page = el11_result(&answer).unwrap_or_else(|| panic!("sudo: {answer}"))["url"]
+        .as_str()
+        .expect("url")
+        .to_string();
+    let ticket: Uuid = page
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .parse()
+        .expect("a uuid");
+    let session = el11_confirm(&pool, ticket, 34).await;
+
+    let server = app_server(&pool).await.with_connector_elevation(true);
+    let same = request_viewer(&server, Some(&http_auth(p, client, family, None)))
+        .await
+        .expect("viewer");
+    assert_eq!(
+        same.elevation().map(|e| (e.session_id, e.connector)),
+        Some((session, true)),
+        "the sudo family is elevated by the connector session"
+    );
+    let other_viewer = request_viewer(&server, Some(&http_auth(p, client, other, None)))
+        .await
+        .expect("viewer");
+    assert!(
+        !other_viewer.is_elevated(),
+        "P's other family is NOT elevated"
+    );
+
+    let _ = el11_call(
+        &url,
+        &mine,
+        "get_claim",
+        serde_json::json!({"claim_id": claim.to_string()}),
+    )
+    .await;
+    assert_eq!(
+        el8_log(&pool).await.len(),
+        1,
+        "the same-family call is recorded"
+    );
+    let _ = el11_call(
+        &url,
+        &theirs,
+        "get_claim",
+        serde_json::json!({"claim_id": claim.to_string()}),
+    )
+    .await;
+    assert_eq!(
+        el8_log(&pool).await.len(),
+        1,
+        "the other family's call is not"
+    );
+
+    let answer = el11_call(&url, &mine, "unsudo", serde_json::json!({})).await;
+    assert_eq!(
+        el11_result(&answer),
+        Some(serde_json::json!({"ended": true})),
+        "unsudo ends it: {answer}"
+    );
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT ended_reason FROM elevation_sessions WHERE id = $1")
+            .bind(session)
+            .fetch_one(&pool)
+            .await
+            .expect("session");
+    assert_eq!(reason.as_deref(), Some("unsudo"));
+    let after = request_viewer(&server, Some(&http_auth(p, client, family, None)))
+        .await
+        .expect("viewer");
+    assert!(!after.is_elevated(), "after unsudo the family is plain");
+    let _ = el11_call(
+        &url,
+        &mine,
+        "get_claim",
+        serde_json::json!({"claim_id": claim.to_string()}),
+    )
+    .await;
+    assert_eq!(el8_log(&pool).await.len(), 1, "and no longer recorded");
+    let again = el11_call(&url, &mine, "unsudo", serde_json::json!({})).await;
+    assert_eq!(
+        el11_result(&again),
+        Some(serde_json::json!({"ended": false}))
+    );
+}
+
+/// `sudo` is refused to an AGENT (the database's ELV02: an agent holds no
+/// role, even carrying a live family of its own client) and over STDIO (no
+/// `AuthContext`: refused before any viewer is resolved), and opens no
+/// ticket either way; `unsudo` is refused over stdio too. Both run with
+/// connector mode ON, so neither refusal is the switch's.
+///
+/// A regression pin: the refusals are the database's and the transport
+/// gate's, and no one-line change to the tool body admits either without
+/// also failing the ticket count.
+#[sqlx::test(migrations = "../../migrations")]
+async fn sudo_is_refused_to_an_agent_and_over_stdio(pool: PgPool) {
+    let (g, _) = fixture::seed_agent_with_group(&pool, "el11-agent").await;
+    let (owner, _) = fixture::seed_human_operator(&pool, "el11-agent-owner").await;
+    let owner_client = el11_client(&pool, owner).await;
+    let g_client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id, owner_id) \
+         VALUES ($1, 'el11-agent', 'agent', ARRAY['claims:read'], ARRAY['claims:read'], \
+                 'active', $2, $3) RETURNING id",
+    )
+    .bind(format!("el11-agent-{g}"))
+    .bind(g)
+    .bind(owner_client)
+    .fetch_one(&pool)
+    .await
+    .expect("agent client");
+    let g_family = el11_family(&pool, g_client).await;
+    let url = listener(&pool, epigraph_db::AdminScopeArmingCache::DEFAULT_TTL, true).await;
+    for client_type in ["agent", "human"] {
+        let token = el11_token(
+            g,
+            g_client,
+            Some(g_family),
+            None,
+            client_type,
+            &["claims:read"],
+        );
+        let answer = el11_call(&url, &token, "sudo", serde_json::json!({"reason": "try"})).await;
+        let refused = el11_error(&answer).unwrap_or_else(|| panic!("{client_type}: {answer}"));
+        assert!(refused.contains("sudo refused"), "{client_type}: {refused}");
+    }
+    assert!(
+        el11_tickets(&pool, g).await.is_empty(),
+        "no ticket for the agent"
+    );
+
+    let server = app_server(&pool).await.with_connector_elevation(true);
+    let stdio = server
+        .sudo(
+            rmcp::handler::server::wrapper::Parameters(epigraph_mcp::types::SudoParams {
+                reason: "stdio".into(),
+            }),
+            rmcp::model::Extensions::default(),
+        )
+        .await;
+    let refused = format!("{:?}", stdio.expect_err("stdio sudo is refused"));
+    assert!(refused.contains("stdio"), "{refused}");
+    let stdio = server.unsudo(rmcp::model::Extensions::default()).await;
+    assert!(stdio.is_err(), "stdio unsudo is refused");
+    let me = server.server_agent_id().await.expect("server agent");
+    assert!(
+        el11_tickets(&pool, me).await.is_empty(),
+        "no ticket over stdio"
     );
 }
