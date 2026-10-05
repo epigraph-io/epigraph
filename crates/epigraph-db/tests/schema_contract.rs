@@ -2409,3 +2409,169 @@ async fn migration_128_admin_scope_definers_are_owned_and_granted(pool: PgPool) 
         assert!(!app, "app UPDATE of admin_scope_enforcement.{col}");
     }
 }
+
+/// Migration 130's functions, each by its FULL signature (several share a
+/// name with a 123 / 124 form): owner `epigraph_maintenance` for every
+/// SECURITY DEFINER (the harness migrates as a superuser, so a silently
+/// no-opped `OWNER TO` passes every behavioural test), volatility, an explicit
+/// ACL, and who may EXECUTE: the application role only the proposal, the
+/// act-keyed ceremony definers and the four pure canonical-form helpers, never
+/// the consumer, the passkey oracle or an act-taking maintenance form. The act
+/// table: the application role SELECT only (its row policy shows it nothing),
+/// the maintenance role SELECT, INSERT and UPDATE, nobody DELETE or TRUNCATE.
+///
+/// Verified to fail with the consumer's `OWNER TO` removed from 130's grant
+/// block (owner is the migrating superuser), and with the act-taking
+/// `epigraph_grant_role` left EXECUTE-able by the application role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_130_admin_act_functions_are_owned_and_granted(pool: PgPool) {
+    // (signature, SECURITY DEFINER, volatility, the application role may EXECUTE)
+    for (signature, definer, volatility, app_may_execute) in [
+        ("public.epigraph_canonical_json(jsonb)", false, "i", true),
+        (
+            "public.epigraph_canonical_timestamp(timestamp with time zone)",
+            false,
+            "i",
+            true,
+        ),
+        (
+            "public.epigraph_admin_act_args(text, jsonb)",
+            false,
+            "s",
+            true,
+        ),
+        ("public.epigraph_admin_act_digest(jsonb)", false, "i", true),
+        ("public.epigraph_has_live_passkey(uuid)", true, "s", false),
+        (
+            "public.epigraph_pending_admin_acts_guard_insert()",
+            true,
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_pending_admin_acts_guard_update()",
+            true,
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_pending_admin_acts_audit()",
+            true,
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
+            true,
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_grant_role(text, uuid, timestamp with time zone, \
+             timestamp with time zone, uuid, text, uuid)",
+            true,
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_end_role_assignment(uuid, text, uuid)",
+            true,
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb, uuid)",
+            true,
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb)",
+            true,
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
+            true,
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_propose_admin_act(text, jsonb, text, text)",
+            true,
+            "v",
+            true,
+        ),
+        ("public.epigraph_act_for_ceremony(uuid)", true, "s", true),
+        (
+            "public.epigraph_set_admin_act_challenge(uuid, jsonb)",
+            true,
+            "v",
+            true,
+        ),
+        ("public.epigraph_passkeys_for_act(uuid)", true, "s", true),
+        (
+            "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
+            true,
+            "v",
+            true,
+        ),
+    ] {
+        let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \
+               FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE p.oid = to_regprocedure($1)",
+        )
+        .bind(signature)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl) =
+            meta.unwrap_or_else(|| panic!("{signature} must exist (migration 130)"));
+        assert_eq!(secdef, definer, "{signature} SECURITY DEFINER");
+        if definer {
+            assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+        }
+        assert_eq!(vol, volatility, "{signature} volatility");
+        assert!(
+            acl.is_some(),
+            "{signature} must carry an EXPLICIT ACL; a NULL proacl is the default grant, \
+             which includes EXECUTE to PUBLIC"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_may_execute),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE on {signature}");
+        }
+    }
+    for (role, privilege, expected) in [
+        ("epigraph_app", "SELECT", true),
+        ("epigraph_app", "INSERT", false),
+        ("epigraph_app", "UPDATE", false),
+        ("epigraph_app", "DELETE", false),
+        ("epigraph_app", "TRUNCATE", false),
+        ("epigraph_maintenance", "SELECT", true),
+        ("epigraph_maintenance", "INSERT", true),
+        ("epigraph_maintenance", "UPDATE", true),
+        ("epigraph_maintenance", "DELETE", false),
+        ("epigraph_maintenance", "TRUNCATE", false),
+    ] {
+        let can: bool =
+            sqlx::query_scalar("SELECT has_table_privilege($1, 'public.pending_admin_acts', $2)")
+                .bind(role)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("table privilege");
+        assert_eq!(can, expected, "{role} {privilege} on pending_admin_acts");
+    }
+}

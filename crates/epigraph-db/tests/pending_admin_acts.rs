@@ -1430,3 +1430,142 @@ async fn the_rollback_returns_the_catalog_to_129_and_archives_the_acts(pool: PgP
         .expect("a second run applies");
     assert_eq!(catalog(&pool).await, before, "idempotent");
 }
+
+// =====================================================================
+// THE REGISTERS
+// =====================================================================
+
+/// The functions a migration file creates, by name: `(definers, all)`.
+fn functions_of(migration: &str) -> (Vec<String>, Vec<String>) {
+    let mut definers = Vec::new();
+    let mut all = Vec::new();
+    let mut rest = migration;
+    while let Some(i) = rest.find("CREATE OR REPLACE FUNCTION public.") {
+        let after = &rest[i + "CREATE OR REPLACE FUNCTION public.".len()..];
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let body_end = after.find("$$;").unwrap_or(after.len());
+        let header_end = after.find(" AS $$").unwrap_or(body_end);
+        if after[..header_end].contains("SECURITY DEFINER") {
+            definers.push(name.clone());
+        }
+        all.push(name);
+        rest = &after[body_end..];
+    }
+    definers.sort();
+    definers.dedup();
+    all.sort();
+    all.dedup();
+    (definers, all)
+}
+
+/// Every SECURITY DEFINER migration 130 creates is on
+/// `epigraph-tenancy-backfill verify`'s ownership list (a NEW name at 130; a
+/// re-bodied or overloaded 123 / 124 name at its own migration), every
+/// application-callable one and every act-taking overload is on its grant
+/// register, and `docs/runbooks/130-undo.sql` drops every function 130 adds
+/// (each overload by its full signature) and restores each body it replaced.
+///
+/// Verified to fail: the `("epigraph_has_live_passkey", 130)` entry removed
+/// from `DEFERRED_DEFINER_FUNCTIONS` -> named here.
+#[test]
+fn every_130_object_is_registered() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let migration = read("migrations/130_pending_admin_acts.sql");
+    let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let undo = read("docs/runbooks/130-undo.sql");
+
+    const REBODIED: &[(&str, i64)] = &[
+        ("epigraph_role_assignments_guard_insert", 123),
+        ("epigraph_role_assignments_guard_update", 123),
+        ("epigraph_role_assignments_audit", 123),
+        ("epigraph_grant_role", 123),
+        ("epigraph_end_role_assignment", 123),
+        ("epigraph_record_custodial_act", 123),
+        ("epigraph_passkey_enrollments_guard_insert", 124),
+        ("epigraph_create_passkey_enrollment", 124),
+    ];
+    let (definers, all) = functions_of(&migration);
+    assert_eq!(
+        definers.len(),
+        18,
+        "CALIBRATION: 130 creates or re-bodies 18 SECURITY DEFINER names; the scan found \
+         {definers:?}"
+    );
+    assert_eq!(all.len(), 22, "CALIBRATION: and 4 pure helpers: {all:?}");
+    let missing: Vec<String> = definers
+        .iter()
+        .filter_map(|n| {
+            let at = REBODIED
+                .iter()
+                .find(|(r, _)| r == n)
+                .map_or(130, |(_, v)| *v);
+            let entry = format!("(\"{n}\", {at})");
+            (!backfill.contains(&entry)).then_some(entry)
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "130 definers missing from tenancy_backfill.rs's ownership list: {missing:?}"
+    );
+    for signature in [
+        "public.epigraph_propose_admin_act(text, jsonb, text, text)",
+        "public.epigraph_act_for_ceremony(uuid)",
+        "public.epigraph_set_admin_act_challenge(uuid, jsonb)",
+        "public.epigraph_passkeys_for_act(uuid)",
+        "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
+        "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
+        "public.epigraph_has_live_passkey(uuid)",
+        "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time \
+         zone, uuid, text, uuid)",
+        "public.epigraph_end_role_assignment(uuid, text, uuid)",
+        "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb, uuid)",
+        "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
+    ] {
+        assert!(
+            backfill.contains(&format!("\"{signature}\"")),
+            "{signature} is missing from tenancy_backfill.rs's grant register"
+        );
+    }
+    let new_names: Vec<&String> = all
+        .iter()
+        .filter(|n| !REBODIED.iter().any(|(r, _)| r == n))
+        .collect();
+    let undropped: Vec<&&String> = new_names
+        .iter()
+        .filter(|n| !undo.contains(&format!("DROP FUNCTION IF EXISTS public.{n}(")))
+        .collect();
+    assert!(
+        undropped.is_empty(),
+        "130-undo.sql does not drop: {undropped:?}"
+    );
+    for (overload, _) in REBODIED.iter().filter(|(n, _)| {
+        n.starts_with("epigraph_grant_role")
+            || n.starts_with("epigraph_end_role_assignment")
+            || n.starts_with("epigraph_record_custodial_act")
+            || n.starts_with("epigraph_create_passkey_enrollment")
+    }) {
+        assert!(
+            undo.contains(&format!("DROP FUNCTION IF EXISTS public.{overload}(")),
+            "130-undo.sql does not drop the act-taking {overload}"
+        );
+    }
+    for (rebodied, _) in REBODIED
+        .iter()
+        .filter(|(n, _)| n.contains("guard") || n.ends_with("audit"))
+    {
+        assert!(
+            undo.contains(&format!("CREATE OR REPLACE FUNCTION public.{rebodied}()")),
+            "130-undo.sql does not restore {rebodied}"
+        );
+    }
+    assert!(
+        undo.contains("DROP TABLE IF EXISTS public.pending_admin_acts;"),
+        "130-undo.sql does not drop the act table"
+    );
+}

@@ -1785,6 +1785,29 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_admin_scopes_armed", 128),
     ("epigraph_set_admin_scope_enforcement", 128),
     ("epigraph_record_admin_scope_would_strip", 128),
+    // 130, pending admin acts. (130 also re-bodies 123's and 124's guards,
+    // audit and recorder, and adds act-taking overloads of 123's and 124's
+    // maintenance definers: those names are registered at 123 / 124 above.)
+    // The stake: the act table's guards, audit and the consumer read
+    // `pending_admin_acts`, `elevation_sessions`, `person_authenticators` and
+    // `role_assignments` through policies that admit only a privileged session
+    // or `epigraph_definer_bypass()`. Under a non-member owner the proposal
+    // fails LOUD (its insert guard finds no live session: ELV07) and so do the
+    // ceremony definers (no act: ELV08), but `epigraph_has_live_passkey` reads
+    // NO passkey, so every ELV10 requirement silently lifts: a passkey
+    // holder's unconfirmed grant, end, custodial supersede or later enrollment
+    // is admitted as a bootstrap act. That is the failure this entry exists to
+    // catch.
+    ("epigraph_has_live_passkey", 130),
+    ("epigraph_pending_admin_acts_guard_insert", 130),
+    ("epigraph_pending_admin_acts_guard_update", 130),
+    ("epigraph_pending_admin_acts_audit", 130),
+    ("epigraph_consume_admin_act", 130),
+    ("epigraph_propose_admin_act", 130),
+    ("epigraph_act_for_ceremony", 130),
+    ("epigraph_set_admin_act_challenge", 130),
+    ("epigraph_passkeys_for_act", 130),
+    ("epigraph_confirm_admin_act", 130),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2282,6 +2305,69 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_set_admin_scope_enforcement",
             "public.epigraph_set_admin_scope_enforcement(boolean, text)",
+            false,
+        ),
+        // 130 (pending admin acts): proposing (elevation-gated) and the
+        // act-keyed confirmation ceremony run on the request DSN, so they are
+        // app-callable; consuming an act, the passkey oracle and the
+        // act-taking forms of the maintenance verbs are maintenance acts.
+        (
+            "epigraph_propose_admin_act",
+            "public.epigraph_propose_admin_act(text, jsonb, text, text)",
+            true,
+        ),
+        (
+            "epigraph_act_for_ceremony",
+            "public.epigraph_act_for_ceremony(uuid)",
+            true,
+        ),
+        (
+            "epigraph_set_admin_act_challenge",
+            "public.epigraph_set_admin_act_challenge(uuid, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_passkeys_for_act",
+            "public.epigraph_passkeys_for_act(uuid)",
+            true,
+        ),
+        (
+            "epigraph_confirm_admin_act",
+            "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
+            true,
+        ),
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
+            false,
+        ),
+        (
+            "epigraph_has_live_passkey",
+            "public.epigraph_has_live_passkey(uuid)",
+            false,
+        ),
+        // The act-taking OVERLOADS share their names with the 123 / 124
+        // forms, and the presence check below reads the name; each is
+        // therefore keyed on `epigraph_consume_admin_act`, which exists
+        // exactly when 130 (and so the overload) does.
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text, uuid)",
+            false,
+        ),
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_end_role_assignment(uuid, text, uuid)",
+            false,
+        ),
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb, uuid)",
+            false,
+        ),
+        (
+            "epigraph_consume_admin_act",
+            "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
             false,
         ),
     ];

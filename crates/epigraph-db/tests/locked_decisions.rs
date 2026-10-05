@@ -1478,6 +1478,21 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "DELETE FROM admin_scope_enforcement",
         "epigraph_set_admin_scope_enforcement($",
         "AdminScopeEnforcement::set(",
+        // Migration 130: a pending admin act is written ONLY by its definers
+        // (the proposal and the confirmation ceremony, app-callable and NOT
+        // banned here: the act API calls them) and consumed ONLY from inside
+        // the maintenance write it authorizes (the 123 / 124 guards and the
+        // custodial recorder, in the database). A raw statement would skip the
+        // live-elevation binding, the proposer's-passkey rule or the args
+        // recomputation; a direct consume would spend an act on nothing. The
+        // act-taking repository forms are the operator CLI's (its library
+        // modules are allowed below); `grant_on_act`, `end_on_act` and
+        // `create_enrollment_on_act` are caught by the 123 / 124 needles above.
+        "INSERT INTO pending_admin_acts",
+        "UPDATE pending_admin_acts",
+        "DELETE FROM pending_admin_acts",
+        "epigraph_consume_admin_act($",
+        "record_custodial_act_on_act",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //
@@ -1523,6 +1538,12 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "epigraph_live_elevating_assignment",
         "epigraph_family_of_person_is_live",
         "epigraph_elevation_session_is_live",
+        // Migration 130: the act read is a maintenance read (the act API gets
+        // its own principal-bound lister), and whether a person holds a live
+        // passkey is a roster oracle.
+        "AdminActRepository::get",
+        "FROM pending_admin_acts",
+        "epigraph_has_live_passkey",
     ];
     const READ_ROOTS: usize = 2;
     // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision
