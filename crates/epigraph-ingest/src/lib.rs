@@ -487,9 +487,10 @@ mod tests {
         let wf_plan = crate::workflow::build_ingest_plan(&wf);
 
         // The predicate must agree with the observable fact it stands in for:
-        // "the stored digest is not blake3(content)". Checked over BOTH builders,
-        // because the workflow builder binds the PLAIN hash on its compound
-        // nodes — `level < 3` alone would misclassify all of them.
+        // "the stored digest is not blake3(content)". Checked over BOTH builders:
+        // both bind a seed-scoped digest on their level-0..2 nodes (the workflow
+        // builder since backlog 6178a205) and the plain hash on atoms, and they
+        // stamp different `source_type`s, so each stamp must be in the class.
         let mut seed_scoped_seen: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
         for (label, plan) in [("document", &doc_plan), ("workflow", &wf_plan)] {

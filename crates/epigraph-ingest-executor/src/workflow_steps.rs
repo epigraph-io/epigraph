@@ -28,7 +28,7 @@ use std::collections::HashSet;
 
 use uuid::Uuid;
 
-use epigraph_ingest::common::ids::{compound_claim_id, content_hash};
+use epigraph_ingest::common::ids::{compound_claim_id, compound_content_hash, content_hash};
 
 use crate::error::IngestExecutorError;
 use crate::system_agent::get_or_create_system_agent;
@@ -361,7 +361,11 @@ pub async fn add_step(
     )
     .bind(step_claim_id)
     .bind(step_text)
-    .bind(step_hash.as_slice())
+    // Scoped to the workflow like the builder's step nodes: the row is
+    // authored by the shared system agent, so a plain `blake3(step_text)`
+    // collides on `uq_claims_content_hash_agent` with any other workflow's
+    // step of the same text (backlog 6178a205).
+    .bind(compound_content_hash(&step_hash, canonical_name).as_slice())
     .bind(agent_id)
     .bind(serde_json::json!({
         "level": 2,

@@ -43,6 +43,10 @@ pub const DOCUMENT_SOURCE_TYPES: [&str; 7] = [
     source_type_str(&SourceType::Tabular),
 ];
 
+/// The `properties.source_type` stamp of workflow ingest output
+/// (`workflow::build_ingest_plan`, `epigraph_ingest_executor::add_step`).
+const WORKFLOW_SOURCE_TYPE: &str = "workflow";
+
 /// Whether a persisted claim's `properties` identify it as a row whose
 /// `claims.content_hash` is a [`compound_content_hash`] — a digest that is NOT
 /// `blake3(content)` and CANNOT be re-derived from the claim alone.
@@ -58,6 +62,14 @@ pub const DOCUMENT_SOURCE_TYPES: [&str; 7] = [
 /// structural row of every ingested document. That disagreement is not
 /// evidence of tampering and must not be reported as such — MCP `verify_claim`
 /// routes on this predicate to answer "not applicable" instead.
+///
+/// The WORKFLOW builder (`workflow::build_ingest_plan`) and
+/// `epigraph_ingest_executor::add_step` do the same on their level-0/1/2 nodes
+/// with seed `canonical_name` (backlog 6178a205), so `source_type ==
+/// "workflow"` is in the class too. It is matched separately rather than
+/// through [`DOCUMENT_SOURCE_TYPES`], which is the document `SourceType` stamp
+/// list. Workflow rows written before that change keep their plain digest;
+/// `verify_claim` compares before it classifies, so they still report `match`.
 ///
 /// # What it deliberately does NOT do
 ///
@@ -99,12 +111,12 @@ pub fn stored_content_hash_is_seed_scoped(properties: &serde_json::Value) -> boo
     });
     let is_compound_level = matches!(level, Some(0..=2));
 
-    let is_document = properties
+    let is_compound_writer = properties
         .get("source_type")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|st| DOCUMENT_SOURCE_TYPES.contains(&st));
+        .is_some_and(|st| DOCUMENT_SOURCE_TYPES.contains(&st) || st == WORKFLOW_SOURCE_TYPE);
 
-    is_compound_level && is_document
+    is_compound_level && is_compound_writer
 }
 
 fn enrichment_from_paragraph(paragraph: &Paragraph) -> serde_json::Value {
@@ -438,8 +450,8 @@ mod source_type_guard {
         );
         assert!(
             !DOCUMENT_SOURCE_TYPES.contains(&"workflow"),
-            "the workflow builder binds the PLAIN content hash on its compound nodes; listing \
-             its stamp here would excuse a tampered workflow phase/step body"
+            "DOCUMENT_SOURCE_TYPES is the document SourceType stamp list; the workflow stamp \
+             is matched separately by stored_content_hash_is_seed_scoped"
         );
     }
 }

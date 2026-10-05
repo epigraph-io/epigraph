@@ -1,14 +1,17 @@
 //! Workflow hierarchy walker. Reads a `WorkflowExtraction` and produces an
 //! `IngestPlan` of claims + edges + path index. Compound nodes are scoped by
-//! `canonical_name`; operation atoms use the global `ATOM_NAMESPACE` (shared
-//! with documents) for cross-source convergence.
+//! `canonical_name` — both their id and their stored `content_hash`; operation
+//! atoms use the global `ATOM_NAMESPACE` (shared with documents) and the plain
+//! content hash, for cross-source convergence.
 
 use std::collections::HashMap;
 
 use uuid::Uuid;
 
 use crate::common::edges::{decomposes_edge, thesis_derivation_str};
-use crate::common::ids::{atom_id, compound_claim_id, content_hash, workflow_root_id};
+use crate::common::ids::{
+    atom_id, compound_claim_id, compound_content_hash, content_hash, workflow_root_id,
+};
 use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
 use crate::workflow::schema::WorkflowExtraction;
@@ -30,10 +33,22 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
     let canonical_name = &extraction.source.canonical_name;
     let source_type = "workflow";
 
+    // Compound (level 0-2) nodes STORE a `canonical_name`-scoped digest, the
+    // same way `document::build_ingest_plan` does (#389). Every workflow claim
+    // is authored by the one workflow-ingest system agent, and migration 013
+    // puts `UNIQUE (content_hash, agent_id)` on `claims`; a plain
+    // `blake3(text)` here made the second workflow sharing a thesis, phase or
+    // step text fail with 23505 although its id differs — and `store_workflow`
+    // files every workflow under a constant "Body" phase (backlog 6178a205).
+    // The id stays `compound_claim_id(blake3(text), canonical_name)`, so
+    // already-stored workflows keep their ids. `verify_claim` classifies these
+    // rows through `document::stored_content_hash_is_seed_scoped`.
+
     // Step 1: Thesis (level 0)
     let thesis_id = if let Some(ref thesis_text) = extraction.thesis {
         let hash = content_hash(thesis_text);
         let id = compound_claim_id(&hash, canonical_name);
+        let stored_hash = compound_content_hash(&hash, canonical_name);
         path_index.insert("thesis".to_string(), id);
 
         claims.push(PlannedClaim {
@@ -46,7 +61,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 "thesis_derivation": thesis_derivation_str(&extraction.thesis_derivation),
                 "kind": "workflow_thesis",
             }),
-            content_hash: hash,
+            content_hash: stored_hash,
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
@@ -107,7 +122,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 "phase": phase.title,
                 "kind": "workflow_step",
             }),
-            content_hash: phase_hash,
+            content_hash: compound_content_hash(&phase_hash, canonical_name),
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
@@ -153,7 +168,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                     "rationale": step.rationale,
                     "kind": "workflow_step",
                 }),
-                content_hash: step_hash,
+                content_hash: compound_content_hash(&step_hash, canonical_name),
                 confidence: step.confidence,
                 methodology: None,
                 evidence_type: step_evidence_type.clone(),
