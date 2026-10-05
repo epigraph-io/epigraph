@@ -1259,3 +1259,174 @@ async fn the_rust_and_database_canonical_forms_agree(pool: PgPool) {
         "CALIBRATION: byte order, not jsonb's: {db}"
     );
 }
+
+// =====================================================================
+// THE UNDO (docs/runbooks/130-undo.sql)
+// =====================================================================
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+fn up_to(max: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= max)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+/// Run `migrator` on one connection and reset it: 001's pg_dump header leaves
+/// session-level SETs behind (viewer_fixture::db_at_122_then_head).
+async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+}
+
+/// The catalog facts 130 could leave behind, by name: relations, functions
+/// (body and owner), policies, triggers and constraints in `public`.
+async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT 'rel ' || c.relname || ' ' || c.relkind::text \
+           FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'fn ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') ' \
+                || md5(p.prosrc) || ' ' || p.proowner::regrole::text \
+           FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'pol ' || c.relname || '.' || pol.polname \
+           FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid \
+          WHERE c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'trg ' || c.relname || '.' || t.tgname \
+           FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+          WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace \
+         UNION ALL \
+         SELECT 'con ' || c.relname || '.' || k.conname \
+           FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid \
+          WHERE c.relnamespace = 'public'::regnamespace",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("catalog");
+    rows.into_iter().collect()
+}
+
+fn undo_130() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/130-undo.sql"),
+    )
+    .expect("130-undo.sql")
+}
+
+/// `docs/runbooks/130-undo.sql`, applied to a database that went 129 -> 130
+/// and holds a consumed act and an open one, returns its catalog (relations,
+/// function bodies and owners, policies, triggers, constraints) to the same
+/// database's at 129: 123's and 124's guard, audit and recorder bodies
+/// byte for byte, every 130 function and overload gone. Every act is archived
+/// as one `platform.admin_act_archived` event and the `platform.admin_act_*`
+/// history stays; 123's behaviour is back (a writer-supplied `grant_act_id`
+/// is CUS02 again, and a grantor holding a passkey grants unconfirmed). A
+/// second run changes nothing.
+///
+/// Verified to fail: the undo's restore of 123's insert guard removed -> the
+/// guard keeps 130's body (catalog differs); the archive step removed -> no
+/// archived event; the DROP of the act-taking `epigraph_grant_role` removed
+/// -> that overload is left behind.
+#[sqlx::test(migrations = false)]
+async fn the_rollback_returns_the_catalog_to_129_and_archives_the_acts(pool: PgPool) {
+    migrate(&pool, &up_to(129)).await;
+    // The gate is opened BEFORE the snapshot: it re-bodies a 125 function.
+    fixture::open_elevated_access_gate(&pool).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to(130)).await;
+
+    let p = elevated_custodian(&pool, "P", 1).await;
+    let (x, _) = human(&pool, "holder").await;
+    let act = confirmed(
+        &pool,
+        &p,
+        "role.grant",
+        &grant_args(AUDITOR, x, None, "audit"),
+    )
+    .await;
+    grant_on(&pool, AUDITOR, x, None, Some(p.person), "audit", Some(act))
+        .await
+        .expect("a confirmed grant");
+    let open = propose(
+        &pool,
+        &p,
+        true,
+        "role.end",
+        &format!(
+            "{{\"assignment\": \"{}\", \"reason\": \"r\"}}",
+            p.assignment
+        ),
+    )
+    .await
+    .expect("an open act");
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 130 changed the catalog"
+    );
+
+    sqlx::raw_sql(&undo_130())
+        .execute(&pool)
+        .await
+        .expect("the undo script applies");
+
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the catalog is not 129's after the undo; left behind: {left:?}; lost: {lost:?}"
+    );
+    for id in [act, open] {
+        assert_eq!(
+            events(&pool, "platform.admin_act_archived", "id", id).await,
+            1,
+            "act {id} is archived"
+        );
+    }
+    assert_eq!(
+        events(&pool, "platform.admin_act_executed", "act_id", act).await,
+        1,
+        "the act history stays"
+    );
+
+    let (y, _) = human(&pool, "second holder").await;
+    let r = maint(
+        &pool,
+        "INSERT INTO role_assignments (role, holder_person_id, valid_from, granted_by, reason, \
+                                       grant_act_id) \
+         VALUES ('role:auditor', $1, now(), $2, 'audit', $3)",
+        &[Some(y), Some(p.person), Some(act)],
+    )
+    .await;
+    assert_code(&r, "CUS02", "123's refusal of a writer-supplied act id");
+    maint(
+        &pool,
+        "SELECT public.epigraph_grant_role('role:auditor', $1, NULL, NULL, $2, 'audit')",
+        &[Some(y), Some(p.person)],
+    )
+    .await
+    .expect("a passkey-holding grantor grants unconfirmed again");
+
+    sqlx::raw_sql(&undo_130())
+        .execute(&pool)
+        .await
+        .expect("a second run applies");
+    assert_eq!(catalog(&pool).await, before, "idempotent");
+}
