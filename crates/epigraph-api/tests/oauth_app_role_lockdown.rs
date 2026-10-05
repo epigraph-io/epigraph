@@ -530,3 +530,75 @@ async fn revoking_a_forged_access_token_writes_nothing(pool: PgPool) {
         "a token this server did not sign must not reach the denylist"
     );
 }
+
+/// `POST /oauth/introspect` with `token`: the RFC 7662 `active` flag.
+async fn introspect_active(app: axum::Router, token: &str) -> bool {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/introspect")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "token": token }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "introspection answers 200");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("introspection JSON");
+    body["active"].as_bool().expect("`active` is a boolean")
+}
+
+/// `GET /api/v1/openapi.json` with `token`: a route on the anonymous allowlist
+/// router, behind `optional_bearer_auth_middleware` (a PRESENT token must
+/// still be valid there).
+async fn openapi_with_token(app: axum::Router, token: &str) -> StatusCode {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/openapi.json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    app.oneshot(req).await.unwrap().status()
+}
+
+/// The other two surfaces that honour a revocation: `/oauth/introspect`
+/// (RFC 7662 `active`) and `optional_bearer_auth_middleware` (the anonymous
+/// allowlist router, where a present token must be valid). Revoked on router
+/// A, observed on router B, each after a control on B that admits the same
+/// token, so a revocation check removed from either surface fails here. On
+/// origin/main both stay admitted on B (the in-memory set lived on A only).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_access_token_is_inactive_on_introspection_and_the_allowlist(pool: PgPool) {
+    let (client_id, _client, code) = seed_code(&pool).await;
+    let a = app_router(&pool, 2).await;
+    let (status, body) = post_token(a.clone(), code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    let access = body["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_string();
+    let b = app_router(&pool, 2).await;
+
+    // CONTROLS on B.
+    assert!(
+        introspect_active(b.clone(), &access).await,
+        "control: an unrevoked token introspects active"
+    );
+    assert_eq!(
+        openapi_with_token(b.clone(), &access).await,
+        StatusCode::OK,
+        "control: an unrevoked token passes the optional middleware"
+    );
+
+    assert_eq!(revoke_access_token(a, &access).await, StatusCode::OK);
+
+    assert!(
+        !introspect_active(b.clone(), &access).await,
+        "a revoked token introspects inactive (RFC 7662)"
+    );
+    assert_eq!(
+        openapi_with_token(b, &access).await,
+        StatusCode::UNAUTHORIZED,
+        "a revoked token presented on the allowlist router is refused, not ignored"
+    );
+}
