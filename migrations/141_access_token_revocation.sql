@@ -21,11 +21,21 @@
 --      are revoked here), so no application session can un-revoke a token or
 --      plant arbitrary rows. The caller (`oauth/revoke.rs`) passes only a `jti`
 --      read from a token whose signature it has verified.
---      It also PRUNES, lazily: rows whose token expired more than an hour ago
---      are deleted on every call. Past `expires_at` the token is refused by its
---      own `exp` (validation runs with zero leeway), so the row decides nothing;
---      the hour is margin for clock skew between hosts. No timer is needed: the
---      table grows only by revocations, and each revocation trims it.
+--      It also PRUNES, lazily: rows whose token expired more than 24 HOURS ago
+--      are deleted on every call. No timer is needed: the table grows only by
+--      revocations, and each revocation trims it.
+--      CLOCK SKEW. The definer compares `expires_at` with the DATABASE clock;
+--      the API and the MCP server check `exp` on their OWN clock with zero
+--      leeway. A row matters for as long as ANY host still thinks its token
+--      unexpired, so both of the definer's time checks keep a 24-hour margin:
+--      the prune deletes only rows a day past expiry (an API host an hour or
+--      more behind the database would otherwise re-admit a revoked token once
+--      its row was pruned), and a token is declined as "already expired" only
+--      when it is a day past expiry (`/oauth/revoke` has just verified the
+--      token as unexpired on a host that may lag the database; declining it on
+--      the database clock would answer 200 and record nothing). A day costs at
+--      most a day's revocations of extra rows, and it outlasts any skew an NTP
+--      host can drift into; beyond it a skewed host is broken in other ways.
 --   3. The application role keeps SELECT, and the read is a plain primary-key
 --      lookup (`RevokedAccessTokenRepository::is_revoked`) run by both servers
 --      AFTER signature validation. `rls_enforcement.rs` requires every public
@@ -59,8 +69,8 @@ CREATE INDEX IF NOT EXISTS idx_revoked_access_tokens_expires_at
     ON public.revoked_access_tokens (expires_at);
 
 -- Record one revoked access token. Returns whether a row was written: `false`
--- for a token already revoked or already past its expiry (a no-op either
--- way; RFC 7009 answers 200 regardless). Idempotent.
+-- for a token already revoked or more than the 24-hour skew margin past its
+-- expiry (a no-op either way; RFC 7009 answers 200 regardless). Idempotent.
 CREATE OR REPLACE FUNCTION public.epigraph_access_token_revoke(
     p_jti uuid, p_client_id uuid, p_expires_at timestamptz)
 RETURNS boolean
@@ -71,9 +81,10 @@ BEGIN
         RAISE EXCEPTION 'AT01: an access-token revocation names a jti, a client and an expiry'
             USING ERRCODE = '22023';
     END IF;
+    -- Both margins are the clock-skew allowance in the header: keep them equal.
     DELETE FROM public.revoked_access_tokens
-     WHERE expires_at < now() - interval '1 hour';
-    IF p_expires_at <= now() THEN
+     WHERE expires_at < now() - interval '24 hours';
+    IF p_expires_at <= now() - interval '24 hours' THEN
         RETURN false;
     END IF;
     INSERT INTO public.revoked_access_tokens (jti, client_id, expires_at)

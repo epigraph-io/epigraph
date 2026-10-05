@@ -20,9 +20,11 @@ impl RevokedAccessTokenRepository {
     /// Record that the access token `jti` (issued to `client_id`, expiring at
     /// `expires_at`) is revoked, through migration 141's definer: the
     /// application role holds no write on the table. Returns whether a new row
-    /// was written; an already revoked or already expired token is `false`,
-    /// not an error. The definer also prunes rows whose token expired over an
-    /// hour ago.
+    /// was written; an already revoked token, or one more than 24 hours past
+    /// its expiry, is `false`, not an error. The definer also prunes rows whose
+    /// token expired over 24 hours ago. Both margins are on the DATABASE clock
+    /// and absorb clock skew against the hosts that check `exp` on their own
+    /// clock with zero leeway (see migration 141's header).
     ///
     /// The caller must pass a `jti` read from a SIGNATURE-VERIFIED token: the
     /// endpoint that calls this is anonymous, and an unverified `jti` would let
