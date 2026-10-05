@@ -180,12 +180,9 @@ async fn a_revoked_access_token_is_refused_on_mcp(pool: PgPool) {
         .await
         .expect("revoke");
 
-    // A new session with the revoked token is refused...
-    let (status, challenge, _) = post(&http, &url, &token, None, initialize_body()).await;
-    assert_invalid_token(status, challenge.as_deref(), "initialize after revoke");
-
-    // ...and so is the session it opened BEFORE the revocation: the check runs
-    // per request, not once per session.
+    // The session it opened BEFORE the revocation is refused: the check runs
+    // per request, not once per session. Asserted first, so a check that only
+    // ran on session-less requests fails here rather than being masked.
     let (status, challenge, _) = post(
         &http,
         &url,
@@ -200,6 +197,10 @@ async fn a_revoked_access_token_is_refused_on_mcp(pool: PgPool) {
         "existing session after revoke",
     );
 
+    // And a new session with the revoked token is refused.
+    let (status, challenge, _) = post(&http, &url, &token, None, initialize_body()).await;
+    assert_invalid_token(status, challenge.as_deref(), "initialize after revoke");
+
     // Per token, not per client: a second token of the same client still works.
     let (status, _, _) = post(&http, &url, &other, None, initialize_body()).await;
     assert_eq!(
@@ -208,11 +209,15 @@ async fn a_revoked_access_token_is_refused_on_mcp(pool: PgPool) {
     );
 }
 
-/// A store that cannot answer fails CLOSED: a valid, unrevoked token is
-/// refused with the same uniform `invalid_token`, never passed through.
+/// The PRODUCTION store fails CLOSED when its database cannot answer: a valid,
+/// unrevoked token is refused with the same uniform `invalid_token`, never
+/// passed through. The closed listener serves `DbAccessTokenRevocation` itself
+/// on a dead pool, so what is pinned is the adapter's error mapping, not a
+/// test double that already returns `Err`.
 #[tokio::test]
 async fn an_unavailable_revocation_store_fails_closed() {
-    // A dead pool: nothing below the middleware may be reached anyway.
+    // A dead pool: nothing below the middleware may be reached anyway (the
+    // control shows `initialize` needs no database).
     let pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(Duration::from_millis(100))
         .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/invalid")
@@ -225,7 +230,7 @@ async fn an_unavailable_revocation_store_fails_closed() {
     let (status, _, _) = post(&http, &open, &token, None, initialize_body()).await;
     assert_eq!(status, 200, "control: the token is valid");
 
-    let closed = spawn_listener(pool, static_revocation::StaticRevocation::unavailable()).await;
+    let closed = spawn_listener(pool.clone(), Arc::new(DbAccessTokenRevocation::new(pool))).await;
     let (status, challenge, _) = post(&http, &closed, &token, None, initialize_body()).await;
     assert_invalid_token(status, challenge.as_deref(), "store unavailable");
 }

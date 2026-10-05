@@ -17,28 +17,17 @@ use uuid::Uuid;
 pub enum StaticRevocation {
     /// No token is revoked.
     None,
-    /// Every lookup fails, as a store whose database is down does.
-    Unavailable,
 }
 
 impl StaticRevocation {
     pub fn none() -> std::sync::Arc<dyn AccessTokenRevocation> {
         std::sync::Arc::new(Self::None)
     }
-
-    pub fn unavailable() -> std::sync::Arc<dyn AccessTokenRevocation> {
-        std::sync::Arc::new(Self::Unavailable)
-    }
 }
 
 #[async_trait::async_trait]
 impl AccessTokenRevocation for StaticRevocation {
     async fn is_revoked(&self, _jti: Uuid) -> Result<bool, RevocationUnavailable> {
-        match self {
-            Self::None => Ok(false),
-            Self::Unavailable => Err(RevocationUnavailable(
-                "test store: revocation lookup unavailable".to_string(),
-            )),
-        }
+        Ok(false)
     }
 }
