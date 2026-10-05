@@ -33,6 +33,7 @@ pub mod config;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use webauthn_rs::prelude::{
     AttestationCaList, AttestationCaListBuilder, AttestedPasskeyRegistration, Passkey,
@@ -575,6 +576,31 @@ impl Passkeys {
     }
 }
 
+/// The length of the server nonce an admin act's confirmation challenge is
+/// computed with ([`act_challenge`]).
+pub const ACT_NONCE_LEN: usize = 32;
+
+/// The challenge an ADMIN ACT's confirmation asserts over (elevation plan
+/// §1.6): SHA-256 of the act id's 16 bytes, the act's args digest (SHA-256 of
+/// its canonical args, 32 bytes) and a server nonce, concatenated in that
+/// order. Every part has a fixed length, so the concatenation is unambiguous.
+///
+/// It is given to [`Passkeys::start_authentication_deferring_counter`] as the
+/// challenge override, and the nonce is stored with the ceremony state. The
+/// page that runs the ceremony can therefore not show act A while the
+/// passkey confirms act B: whoever holds the act row (the API at the
+/// assertion, the offline verifier long after) recomputes the challenge from
+/// the act id and the STORED digest and refuses a stored state, or a recorded
+/// assertion, whose challenge is anything else.
+#[must_use]
+pub fn act_challenge(act: Uuid, args_digest: &[u8; 32], nonce: &[u8; ACT_NONCE_LEN]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(act.as_bytes());
+    h.update(args_digest);
+    h.update(nonce);
+    h.finalize().into()
+}
+
 /// The challenge recorded in an assertion's evidence.
 ///
 /// # Errors
@@ -652,4 +678,38 @@ fn registered_from(passkey: Value) -> Result<RegisteredPasskey, PasskeyError> {
         user_verified,
         backup_eligible,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The act challenge is SHA-256 over the act id's 16 bytes, the args
+    /// digest and the nonce, in that order (a fixed vector computed outside
+    /// Rust). Mutations: the id hashed as its text; the nonce omitted; the
+    /// digest and nonce swapped; any part replaced by a random value -> the
+    /// vector differs.
+    #[test]
+    fn the_act_challenge_is_sha256_of_id_digest_and_nonce() {
+        let act = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let digest = [0x11u8; 32];
+        let nonce = [0x22u8; ACT_NONCE_LEN];
+        let c = act_challenge(act, &digest, &nonce);
+        assert_eq!(
+            c.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "fefcb32873e8b15e1f6c8aec0c094474d04f6a8e3beec576ac9d684fc01640bf"
+        );
+        // One bit of the digest changes the challenge.
+        let mut other = digest;
+        other[0] = 0x12;
+        assert_eq!(
+            act_challenge(act, &other, &nonce)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "4cd9a8b75d8f9af7862a312958f2c8b47ff47c6912ee8ed085a7ef32b332730a"
+        );
+        // A challenge override accepts it.
+        assert!((MIN_CHALLENGE_LEN..=MAX_CHALLENGE_LEN).contains(&c.len()));
+    }
 }

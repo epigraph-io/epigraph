@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 url = "2"
 base64 = "0.22"
+# The admin-act confirmation challenge (`act_challenge`).
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
