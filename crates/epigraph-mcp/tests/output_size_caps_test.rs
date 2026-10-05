@@ -84,6 +84,7 @@ async fn get_provenance_bounds_nodes_and_content_by_default(pool: PgPool) {
             max_depth: None,
             max_nodes: None,
             max_content_chars: None,
+            max_output_chars: None,
         },
     )
     .await
@@ -180,6 +181,10 @@ async fn get_provenance_bounds_nodes_and_content_by_default(pool: PgPool) {
             max_depth: Some(1),
             max_nodes: Some(PARENTS + 1),
             max_content_chars: Some(CONTENT_CHARS + 10),
+            // 81 x ~2.1K of claim text is ~175K; the default 40K output
+            // budget would (correctly) cut it, so this arm widens that cap
+            // too. Within the 500K ceiling.
+            max_output_chars: Some(400_000),
         },
     )
     .await
@@ -275,6 +280,7 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
                 max_depth: None,
                 max_nodes: None,
                 max_content_chars: None,
+                max_output_chars: None,
             },
         )
         .await
@@ -337,11 +343,13 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
                 .filter(|e| {
                     e["@type"] == "prov:Entity"
                         && e["claim_id"] == target_ref.as_str()
-                        && e["@id"].as_str().is_some_and(|i| i.starts_with("evidence:"))
+                        && e["@id"]
+                            .as_str()
+                            .is_some_and(|i| i.starts_with("evidence:"))
                 })
                 .count();
             if emitted_for_target != EXPECTED_MAX_EVIDENCE_PER_CLAIM
-                || t["evidence_count"] != Value::from(TARGET_EVIDENCE)
+                || t["evidence_count"] != TARGET_EVIDENCE
                 || t["evidence_truncated"] != Value::Bool(true)
             {
                 failures.push(format!(
@@ -356,7 +364,10 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
 
     // ---- (4) the cut is reported ----
     if bundle["truncated"] != Value::Bool(true) {
-        failures.push(format!("truncated must be true, got {}", bundle["truncated"]));
+        failures.push(format!(
+            "truncated must be true, got {}",
+            bundle["truncated"]
+        ));
     }
 
     assert!(
@@ -375,7 +386,12 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
         "the budget must not collapse the bundle to the target alone: {claim_entities}"
     );
     assert_eq!(bundle["claim_node_count"], Value::from(claim_entities));
-    assert_eq!(bundle["budget_exhausted"], Value::Bool(true), "{}", bundle["limits"]);
+    assert_eq!(
+        bundle["budget_exhausted"],
+        Value::Bool(true),
+        "{}",
+        bundle["limits"]
+    );
 
     // ---- Control: a lineage inside every budget is NOT reported as cut ----
     // One parent alone: itself, 6 evidence rows, 1 trace. Proves `truncated`,
@@ -389,6 +405,7 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
                 max_depth: None,
                 max_nodes: None,
                 max_content_chars: None,
+                max_output_chars: None,
             },
         )
         .await
@@ -399,7 +416,9 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
     assert_eq!(
         small_entities
             .iter()
-            .filter(|e| e["@id"].as_str().is_some_and(|i| i.starts_with("evidence:")))
+            .filter(|e| e["@id"]
+                .as_str()
+                .is_some_and(|i| i.starts_with("evidence:")))
             .count(),
         EVIDENCE_PER_PARENT,
         "every evidence row of a small lineage must come back: {small}"
@@ -453,6 +472,7 @@ async fn get_provenance_reports_untruncated_when_the_lineage_fits(pool: PgPool) 
             max_depth: None,
             max_nodes: None,
             max_content_chars: None,
+            max_output_chars: None,
         },
     )
     .await
