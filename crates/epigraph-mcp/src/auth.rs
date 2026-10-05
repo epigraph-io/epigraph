@@ -931,13 +931,28 @@ mod tests {
     }
 
     /// The opt-in (`--allow-unauthenticated-writes`) keeps the pre-HTTP-id
-    /// scope set, every scope in the map.
+    /// scope set, every scope in the map, while the admin-scope switch is
+    /// unarmed. The injected context starts ARMED (fail closed, elevation plan
+    /// EL-10) until `call_tool` reads the switch: armed, its admin-only scopes
+    /// count for nothing (it is never elevated), every other scope still does.
     #[test]
     fn the_opt_in_principal_less_context_carries_every_scope() {
         let (reads, writes) = map_scopes();
-        let ctx = unauthenticated_context(None, UnauthenticatedWrites::AsListenerSigner);
+        let mut ctx = unauthenticated_context(None, UnauthenticatedWrites::AsListenerSigner);
+        assert_eq!(ctx.admin_scopes, epigraph_auth::AdminScopePosture::Armed);
         for s in reads.iter().chain(writes.iter()) {
-            assert!(ctx.has_scope(s), "opt-in context must carry {s}");
+            assert_eq!(
+                ctx.has_scope(s),
+                !epigraph_auth::is_admin_only_scope(s),
+                "armed, the opt-in context holds {s} only if it is not admin-only"
+            );
+        }
+        ctx.admin_scopes = epigraph_auth::AdminScopePosture::Unarmed;
+        for s in reads.iter().chain(writes.iter()) {
+            assert!(
+                ctx.has_scope(s),
+                "unarmed, the opt-in context must carry {s}"
+            );
         }
     }
 
