@@ -1471,6 +1471,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "create_symmetric_if_absent_conn",
+        "WRITE. `create_symmetric_if_absent` on a caller's connection, so a matcher promotion \
+         writes its edge on the same transaction as the candidate's status flip \
+         (`MatchCandidateRepo::promote_if_pending`); the pool form delegates here. One \
+         INSERT ... WHERE NOT EXISTS (any-state dedup), authorised by edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "edge.rs",
         "create_symmetric_if_absent_returning_conn",
         "WRITE. `create_symmetric_if_absent_returning` on a caller's connection, for \
          `link_alternative`'s author-stamped transaction. Same argument as \
