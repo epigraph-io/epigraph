@@ -39,18 +39,18 @@
 //!
 //! **THE PROPAGATE-DON'T-DEFAULT RULE HAS A DELIBERATE EXEMPTION HERE, RECORDED
 //! SO IT IS A DECISION AND NOT AN OVERSIGHT.** `routes/workflows.rs` and
-//! `routes/crud.rs` state that rule; two statements in this file do not follow
-//! it. `list_claims`' batched label read keeps `.unwrap_or_default()`, and
-//! `list_claims`' per-item encryption lookup keeps `if let Ok(Some(enc))`.
-//! (`get_claim`'s inline label read was a third; drain unit U008 removed it by
-//! folding the labels into the claim read itself —
-//! `ClaimRepository::get_by_id_with_labels`, one statement — so there is no
-//! second statement left to swallow an error, and the labels are now from the
-//! same snapshot as the row.) The rule was applied only where this
-//! shard changed the statement anyway; these ALREADY shared a connection
+//! `routes/crud.rs` state that rule; one statement in this file does not follow
+//! it: `list_claims`' per-item encryption lookup keeps `if let Ok(Some(enc))`.
+//! (There were three. Drain unit U008 removed the two label reads:
+//! `get_claim`'s now comes from the claim read itself —
+//! `ClaimRepository::get_by_id_with_labels`, one statement, one snapshot — and
+//! `list_claims`' batched one is `ClaimRepository::labels_by_ids` with the
+//! viewer and a propagated error. A failed label read is a failed request, not
+//! a 200 whose labels are silently empty.) The rule was applied only where this
+//! shard changed the statement anyway; this one ALREADY shared a connection
 //! via the `db_pool.begin()` transaction the conversion replaced, so nothing
-//! about their sharing changed, they cover a non-tenancy-bearing projection
-//! (labels, encryption metadata) rather than the rows the viewer predicate
+//! about its sharing changed, it covers a non-tenancy-bearing projection
+//! (encryption metadata) rather than the rows the viewer predicate
 //! selects, and the direction of failure is safe — a swallowed error drops a
 //! field from the response and can never add a row. One consequence is worth
 //! writing down: `claim_encryption` DOES carry a narrowing policy at head 92, so
@@ -1306,23 +1306,20 @@ pub async fn list_claims(
 
     let mut items: Vec<ClaimResponse> = claims.into_iter().map(Into::into).collect();
 
-    // Fetch labels for all listed claims in one query
+    // Labels for all listed claims in one viewer-spliced repo read, on the same
+    // stamped connection. This was an inline, unspliced
+    // `SELECT id, unnest(labels) …` whose error was `.unwrap_or_default()`-ed
+    // into every item answering `labels: []` (drain unit U008, backlog
+    // `1e6efd2d` residual); a failed read now fails the request.
     if !items.is_empty() {
         let claim_ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
-        let label_rows: Vec<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, unnest(labels) FROM claims WHERE id = ANY($1) AND labels != '{}'",
-        )
-        .bind(&claim_ids)
-        .fetch_all(&mut *read)
-        .await
-        .unwrap_or_default();
-
+        let mut labels_map = ClaimRepository::labels_by_ids(&mut *read, &viewer, &claim_ids)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to query labels: {e}"),
+            })?;
         for item in &mut items {
-            item.labels = label_rows
-                .iter()
-                .filter(|(id, _)| *id == item.id)
-                .map(|(_, label)| label.clone())
-                .collect();
+            item.labels = labels_map.remove(&item.id).unwrap_or_default();
         }
     }
 
