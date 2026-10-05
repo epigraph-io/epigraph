@@ -490,6 +490,11 @@ async fn version_history_returns_each_version_once_on_a_self_supersede(pool: PgP
         history.len()
     );
     assert_eq!(history[0].depth, 0, "the single version is the root");
+    // A self-loop truthfully reports ITSELF as its successor: X's
+    // `supersedes` is X, so the `superseded_by` subselect finds X. Pinned so
+    // that changing the subselect (e.g. to exclude the row's own id) is a
+    // deliberate decision rather than an unnoticed one.
+    assert_eq!(history[0].superseded_by, Some(x));
 }
 
 /// X↔Y — the shape two opposite `mark_duplicate` calls write — is two
