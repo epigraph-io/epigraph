@@ -283,6 +283,7 @@ async fn every_area_route_is_mounted() {
         "/explorer/bff/themes".to_string(),
         "/explorer/bff/communities".to_string(),
         format!("/explorer/bff/neighborhood/{CLAIM}"),
+        "/explorer/bff/audit".to_string(),
     ];
     for uri in &bff {
         let res = app.get_as(uri, &sid).await;

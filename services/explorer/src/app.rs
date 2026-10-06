@@ -82,6 +82,7 @@ pub fn build_app_with(state: AppState, extra: Router<AppState>) -> Router {
         .merge(pages::candidates::routes())
         .merge(pages::acts::routes())
         .merge(bff::core::routes())
+        .merge(bff::audit::routes())
         .merge(bff::graph::routes())
         .merge(extra);
 
@@ -198,6 +199,7 @@ fn top_level_segments() -> Vec<String> {
         "/bff/themes",
         "/bff/communities",
         "/bff/neighborhood/{id}",
+        "/bff/audit",
     ];
     let mut segments: Vec<String> = ROUTE_PATHS
         .iter()

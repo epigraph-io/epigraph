@@ -621,3 +621,55 @@ async fn audit_requires_sign_in_and_makes_no_anonymous_call() {
     assert!(res.location().unwrap_or_default().contains("/auth/login"));
     assert!(upstream_calls(&app).await.is_empty());
 }
+
+/// `/bff/audit` serves what the page renders, as JSON; a bad window is a
+/// 400 there, and an anonymous caller gets a JSON 401.
+#[tokio::test]
+async fn bff_audit_serves_the_counted_window_as_json() {
+    let app = spawn().await;
+    first_page()
+        .respond_with(ok(vec![
+            event(0, "auth_attempt", Some(AGENT), Some(false)),
+            event(1, "auth_attempt", Some(AGENT), Some(true)),
+            event(2, "token_rotation", Some(AGENT), Some(true)),
+        ]))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+
+    let res = app
+        .get_as(&format!("{BASE}/bff/audit?since={SINCE}"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let v = res.json();
+    assert_eq!(v["since"], SINCE);
+    assert_eq!(v["failures_only"], false);
+    assert_eq!(v["result"]["status"], "counted");
+    assert_eq!(v["result"]["events_read"], 3);
+    assert_eq!(v["result"]["capped_at"], Value::Null);
+    assert_eq!(v["result"]["partial"], Value::Null);
+    assert_eq!(v["result"]["reads_beyond_own"], false);
+    assert_eq!(
+        v["result"]["types"],
+        json!([
+            {"event_type": "auth_attempt", "total": 2, "failures": 1},
+            {"event_type": "token_rotation", "total": 1, "failures": 0},
+        ])
+    );
+    assert_eq!(res.header("cache-control"), Some("private, no-store"));
+    app.upstream.verify().await;
+
+    let res = app
+        .get_as(&format!("{BASE}/bff/audit?since=yesterday"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert_eq!(res.json()["error"], "bad_request");
+
+    // Signed-in only, as JSON: no redirect, and upstream is not asked.
+    let calls = upstream_calls(&app).await.len();
+    let res = app.get(&format!("{BASE}/bff/audit?since={SINCE}")).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(res.json()["error"], "unauthorized");
+    assert_eq!(upstream_calls(&app).await.len(), calls);
+}

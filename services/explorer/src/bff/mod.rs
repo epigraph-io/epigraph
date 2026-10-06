@@ -2,5 +2,6 @@
 //! (see `error::render_errors`). Each module exposes `routes()`, already
 //! merged by `app::build_app`.
 
+pub mod audit;
 pub mod core;
 pub mod graph;
