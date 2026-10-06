@@ -24,20 +24,23 @@
 //! online path (`MatchCandidateRepo::retire`). What still lives only here is
 //! the batch shape — an ids file, a dry run, and the JSON undo dump.
 //!
-//! FOLLOW-UP IS **NOT** `recompute_claim_belief`. Earlier revisions printed
-//! that as the next step; it is the wrong entry point. That binary recombines
-//! `mass_functions`, and a matcher promotion writes none of those — the
-//! promote paths call `EdgeRepository::create_symmetric_if_absent`, never
-//! `edge_factor::auto_wire_edge_if_epistemic` (measured on prod 2026-08-19:
-//! 716 `cross_source_matcher` edges, 715 derived `factors`, **0**
-//! `mass_functions` with `perspective_id` = a matcher edge). Running it after
-//! a retirement therefore reproduces the pre-retirement scalars exactly. The
-//! records this tool deletes feed the *factor graph*, whose only consumer is
-//! `epigraph-api/src/routes/computation.rs::propagate_beliefs`
-//! (`POST /api/v1/bp/propagate`), which reloads `factors` from the database on
-//! every run — so the retirement takes effect there on the next pass, and only
-//! `apply_updates: true` runs can have written a now-stale
-//! `claims.pignistic_prob` needing repair.
+//! BELIEF IS RE-DERIVED IN THE SAME RUN. After the transaction commits, both
+//! endpoints of every retired pair are re-derived from the `mass_functions`
+//! that survive (`epigraph_engine::retraction_cascade::cascade_after_edge_withdrawal`:
+//! recomputed on `binary_truth`, or the cache cleared when no BBA on any frame
+//! backs the claim), as the online retirement
+//! (`epigraph_engine::admin_cascade::apply_match_retire`) does. Earlier
+//! revisions sent the operator to `POST /api/v1/bp/propagate` instead, on the
+//! grounds that a matcher promotion writes no `mass_functions` (measured on
+//! prod 2026-08-19: 716 `cross_source_matcher` edges, 715 derived `factors`,
+//! **0** `mass_functions` with `perspective_id` = a matcher edge), so a DS
+//! recompute reproduces the DS scalars exactly. That is true of the DS output,
+//! not of the stored column: a past propagate with `apply_updates: true`
+//! overwrote `claims.pignistic_prob` with a value the deleted factor biased,
+//! and a later propagate cannot undo it. It builds its variables from the
+//! surviving `factors` only, so an endpoint whose only factor was the matcher
+//! edge is no longer a variable at all, and scalar BP seeds its priors from
+//! the stored (biased) value. Only a DS re-derivation removes it.
 //!
 //! Scoping (see the design review): edges are matched by CLAIM PAIR + the
 //! `properties->>'source' = 'cross_source_matcher'` marker, NOT by
@@ -79,7 +82,9 @@ struct Args {
     dump: PathBuf,
 
     /// Where to write the newline-separated affected claim ids (both endpoints
-    /// of every retired pair) for a follow-up `recompute_claim_belief` pass.
+    /// of every retired pair). `--apply` re-derives their belief itself; the
+    /// file is the record, and the input for a `recompute_claim_belief
+    /// --input` re-run should a re-derivation fail.
     #[arg(long)]
     affected_out: Option<PathBuf>,
 
@@ -333,21 +338,44 @@ async fn main() -> anyhow::Result<()> {
     println!("  factors deleted:     {factors_deleted}");
     println!("  edges deleted:       {edges_deleted}");
     println!("  candidates -> stale: {candidates_staled}");
+
+    // Re-derive the endpoints' belief from the `mass_functions` that survive,
+    // as the online retirement does (see the module docs for why a BP
+    // propagate cannot do this). Only when the run withdrew something: a
+    // candidate that was never promoted fed no cache.
+    if bp_deleted + factors_deleted + edges_deleted == 0 {
+        println!("\nNothing was withdrawn, so no belief was re-derived.");
+        return Ok(());
+    }
+    let endpoints: Vec<Uuid> = affected_claims.iter().copied().collect();
+    let mut session = maint
+        .viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .map_err(|e| anyhow::anyhow!("maintenance viewer: {e}"))?;
+    let (conn, viewer) = session.split();
+    let report = epigraph_engine::retraction_cascade::cascade_after_edge_withdrawal(
+        conn, viewer, &endpoints, 0,
+    )
+    .await;
     println!(
-        "\nNext: the {} affected endpoint(s) are recorded in {}.\n  \
-         Do NOT run `recompute_claim_belief` on them — it recombines \
-         mass_functions,\n  of which a matcher promotion writes none, so it \
-         reproduces the pre-retirement\n  numbers exactly. The deleted factors \
-         feed the BP factor graph instead:\n  \
-         POST /api/v1/bp/propagate reloads `factors` on every run, so this \
-         retirement\n  lands there on the next pass. Only if a previous \
-         propagate ran with\n  `apply_updates: true` is a cached \
-         claims.pignistic_prob now stale.",
-        affected_claims.len(),
-        args.affected_out
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<no --affected-out given>".into())
+        "\nBelief re-derived on the {} affected endpoint(s) from their surviving \
+         mass_functions:",
+        endpoints.len()
     );
+    println!(
+        "  recomputed:                   {}",
+        report.recomputed.len()
+    );
+    println!("  cache cleared (no BBA backs): {}", report.unbacked.len());
+    if !report.errors.is_empty() {
+        for e in &report.errors {
+            println!("  error: {e}");
+        }
+        anyhow::bail!(
+            "the retirement committed, but {} re-derivation(s) failed; re-run \
+             `recompute_claim_belief --input <the --affected-out file>` for them",
+            report.errors.len()
+        );
+    }
     Ok(())
 }
