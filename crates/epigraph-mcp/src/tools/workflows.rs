@@ -1503,13 +1503,16 @@ pub async fn deprecate_workflow(
 /// * The target set is the row plus, with `cascade`, every row descended from
 ///   it through `workflows.parent_id` (the lineage the `workflow -variant_of->
 ///   workflow` edges describe).
-/// * `require_workflow_authority` over EVERY target before any write; one
-///   refusal writes nothing. A legacy row with no recorded submitter gets
-///   U005's rule (admin-only over the authenticated transport); stdio is
-///   unchecked, the batch H-b bar.
-/// * Every `workflows` row sharing a `canonical_name` with a target is locked
-///   first, so two concurrent deprecations of one lineage cannot each keep a
+/// * `require_workflow_authority` over EVERY target, with NO lock held, so a
+///   caller without authority is refused before it takes or waits for any
+///   lineage row lock; one refusal writes nothing. A legacy row with no
+///   recorded submitter gets U005's rule (admin-only over the authenticated
+///   transport); stdio is unchecked, the batch H-b bar.
+/// * Then every `workflows` row sharing a `canonical_name` with a target is
+///   locked, so two concurrent deprecations of one lineage cannot each keep a
 ///   claim the other is retiring.
+/// * Then authority is RE-CHECKED over every target under that lock (TOCTOU),
+///   before any write; only those grants admit the write and drive the audit.
 /// * Per target: `workflows.truth_value` to 0.05, then every level 0-2 claim
 ///   it executes that no live workflow outside the target set also executes
 ///   is retired (`is_current = false`, both ANN columns nulled). A claim a
@@ -1554,14 +1557,35 @@ async fn deprecate_hierarchical_workflow(
         }
     }
 
-    // Serialize against any other deprecation that could share a claim with
-    // this target set, BEFORE the sharing rule reads other workflows' truth
-    // (write skew; see `lock_lineages_for_deprecation`).
+    // AUTHORITY, THEN THE LOCK, THEN AUTHORITY AGAIN (security review of U017:
+    // lock-before-authz).
+    //
+    // 1. Authority over the WHOLE target set with no lock held. A caller with
+    //    no authority over the lineage is refused here, before it takes, or
+    //    queues for, a single row lock: the lock used to come first, so every
+    //    refused `claims:write` call first waited on and then held every row of
+    //    the lineage until its refusal rolled back, a repeatable contention
+    //    lever on anyone's workflow.
+    for &row in &targets {
+        crate::tools::workflow_authority::require_workflow_authority(
+            server, &mut tx, auth, caller, row, TOOL,
+        )
+        .await?;
+    }
+
+    // 2. Serialize against any other deprecation that could share a claim with
+    //    this target set, BEFORE the sharing rule reads other workflows' truth
+    //    (write skew; see `lock_lineages_for_deprecation`).
     WorkflowRepository::lock_lineages_for_deprecation(&mut *tx, &targets)
         .await
         .map_err(internal_error)?;
 
-    // Authority over the WHOLE target set before the first write.
+    // 3. RE-CHECK under the lock (TOCTOU): the call may have waited on the lock
+    //    while another transaction changed what step 1 read (a row's recorded
+    //    submitter, the caller's admin grant). Only the grant decided here,
+    //    with every target row now locked against another writer and the
+    //    admin grant re-read after the wait, admits the write and drives the
+    //    per-target audit; step 1's grants are discarded.
     let mut grants = Vec::with_capacity(targets.len());
     for &row in &targets {
         grants.push(
