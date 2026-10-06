@@ -168,21 +168,20 @@ async fn semantic_graph_neighbors_sees_lowercase_corroborates(pool: PgPool) {
     );
 }
 
-/// `ClaimRepository::grounded_neighborhood` and `::has_grounded_evidence`
-/// count `evidence --SUPPORTS--> claim` as grounding but not
-/// `evidence --supports--> claim`.
-#[sqlx::test(migrations = "../../migrations")]
-async fn grounded_readers_see_lowercase_evidence_supports(pool: PgPool) {
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "spelling-grounded").await;
-    let probe = public_claim(&pool, agent, "grounded probe", Some(0.5)).await;
-    let g_upper = public_claim(&pool, agent, "grounded via SUPPORTS", Some(0.5)).await;
-    let g_lower = public_claim(&pool, agent, "grounded via supports", Some(0.5)).await;
-    let ungrounded = public_claim(&pool, agent, "no evidence edge", Some(0.5)).await;
-    let ev_upper = fixture::seed_evidence(&pool, g_upper, "document").await;
-    let ev_lower = fixture::seed_evidence(&pool, g_lower, "document").await;
+/// Seed three public claims for the grounded readers: `g_upper` grounded by an
+/// `evidence --SUPPORTS--> claim` edge, `g_lower` grounded by the same edge in
+/// the lower-case spelling, and `ungrounded` with no evidence edge. Returns
+/// `(agent, g_upper, g_lower, ungrounded)`.
+async fn seed_grounded_pair(pool: &PgPool, tag: &str) -> (Uuid, Uuid, Uuid, Uuid) {
+    let (agent, _) = fixture::seed_agent_with_group(pool, tag).await;
+    let g_upper = public_claim(pool, agent, "grounded via SUPPORTS", Some(0.5)).await;
+    let g_lower = public_claim(pool, agent, "grounded via supports", Some(0.5)).await;
+    let ungrounded = public_claim(pool, agent, "no evidence edge", Some(0.5)).await;
+    let ev_upper = fixture::seed_evidence(pool, g_upper, "document").await;
+    let ev_lower = fixture::seed_evidence(pool, g_lower, "document").await;
     let none = serde_json::json!({});
     edge(
-        &pool,
+        pool,
         ev_upper,
         "evidence",
         g_upper,
@@ -192,9 +191,19 @@ async fn grounded_readers_see_lowercase_evidence_supports(pool: PgPool) {
     )
     .await;
     edge(
-        &pool, ev_lower, "evidence", g_lower, "claim", "supports", none,
+        pool, ev_lower, "evidence", g_lower, "claim", "supports", none,
     )
     .await;
+    (agent, g_upper, g_lower, ungrounded)
+}
+
+/// `ClaimRepository::has_grounded_evidence` counted
+/// `evidence --SUPPORTS--> claim` as grounding but not
+/// `evidence --supports--> claim`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn has_grounded_evidence_sees_lowercase_evidence_supports(pool: PgPool) {
+    let (_, g_upper, g_lower, ungrounded) =
+        seed_grounded_pair(&pool, "spelling-has-grounded").await;
 
     let viewer = fixture::public_viewer(&pool).await;
     let mut grounded = BTreeMap::new();
@@ -210,7 +219,18 @@ async fn grounded_readers_see_lowercase_evidence_supports(pool: PgPool) {
         grounded[&g_lower],
         "an evidence -> claim `supports` edge is grounding evidence"
     );
+}
 
+/// `ClaimRepository::grounded_neighborhood` names its grounding literal
+/// separately from `has_grounded_evidence`, so it gets its own test: a revert
+/// of either literal alone must go red on its own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn grounded_neighborhood_sees_lowercase_evidence_supports(pool: PgPool) {
+    let (agent, g_upper, g_lower, _ungrounded) =
+        seed_grounded_pair(&pool, "spelling-grounded-nbhd").await;
+    let probe = public_claim(&pool, agent, "grounded probe", Some(0.5)).await;
+
+    let viewer = fixture::public_viewer(&pool).await;
     let near: BTreeSet<Uuid> =
         ClaimRepository::grounded_neighborhood(&pool, &viewer, &vec_literal(0.5), probe, 0.5, 50)
             .await
@@ -308,19 +328,22 @@ async fn edge_counts_merge_spellings_into_one_coarse_bucket(pool: PgPool) {
     edge(&pool, a, "claim", c, "claim", "relates_to", none).await;
 
     let viewer = fixture::public_viewer(&pool).await;
-    let counts: BTreeMap<String, i64> = StructuralRepository::edge_counts(&pool, &viewer, owner)
+    let counts: Vec<(String, i64)> = StructuralRepository::edge_counts(&pool, &viewer, owner)
         .await
-        .expect("edge_counts")
-        .into_iter()
-        .collect();
+        .expect("edge_counts");
 
+    // Compared as a Vec, not a map: the merge re-sorts after folding (the SQL
+    // `ORDER BY count DESC` saw `SUPPORTS` and `supports` as 1 each), so the
+    // order contract (count descending, name ascending on a tie) is the
+    // merge's to keep.
     assert_eq!(
         counts,
-        BTreeMap::from([
+        vec![
             ("SUPPORTS".to_string(), 2),
             ("CONTRADICTS".to_string(), 1),
             ("RELATES_TO".to_string(), 1),
-        ]),
-        "folded spellings share one bucket; lower-case relates_to is not a coarse type"
+        ],
+        "folded spellings share one bucket, ordered by count then name; \
+         lower-case relates_to is not a coarse type"
     );
 }
