@@ -2264,6 +2264,48 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `workflows` has no RLS (see `find_root_by_canonical`); widened for COHESION, so a \
          workflow row cannot survive the rollback of the plan walk that wrote it.",
     ),
+    // ── U017 (backlog fe874d2a): `deprecate_workflow` retires a hierarchical
+    //    workflow as a unit, on the ingest system agent's stamped transaction.
+    (
+        "claim.rs",
+        "deprecate_claim_if_current",
+        "UPDATE `claims` with `deprecate_claim`'s SET list plus `AND is_current`, so \
+         `rows_affected` means the call retired the row. A write by primary key: the control is \
+         `claims_tenancy`'s `WITH CHECK` against the connection's GUCs (the hierarchical \
+         `deprecate_workflow` runs it on the ingest system agent's stamp, after the workflow \
+         authority rule admitted the caller), exactly as for `deprecate_claim` above.",
+    ),
+    (
+        "workflow.rs",
+        "set_truth_value_if_changed",
+        "UPDATE `workflows` SET `truth_value` WHERE it differs, so `rows_affected` means the \
+         state changed. `workflows` has no row security and no policy (see `set_truth_value`), \
+         so there is nothing for a viewer to filter; the caller's authority is \
+         `require_workflow_authority` over the same row.",
+    ),
+    (
+        "workflow.rs",
+        "exists",
+        "READ of `workflows` only: whether a row with this id exists, for `deprecate_workflow`'s \
+         dispatch between a flat claim and a hierarchical row. `workflows` has no row security \
+         and no policy, so the answer is the same on every connection.",
+    ),
+    (
+        "workflow.rs",
+        "lineage_descendants",
+        "READ of `workflows` only: the rows descended from one through `parent_id` (the cascade \
+         set of `deprecate_workflow`). `workflows` has no row security and no policy; it reads \
+         `parent_id` rather than `edges` precisely so no tenancy filter can truncate the walk.",
+    ),
+    (
+        "workflow.rs",
+        "executed_structural_claims",
+        "READ of `edges`/`claims`/`workflows`: the level 0-2 claims a hierarchical workflow \
+         `executes`, each with whether another live workflow executes it. It plans the WRITE \
+         that follows (carries a `VISIBILITY-EXEMPT: WRITE path` note), on the ingest system \
+         agent's stamped transaction that owns these claims; the caller's authority is the \
+         workflow authority rule, not read visibility, so no caller viewer is spliced.",
+    ),
 ];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has
