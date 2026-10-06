@@ -12,11 +12,14 @@ Output, last line: `Reconciler: patched=N needs_review=M apply=<bool>`.
 - Dry run (default): N is the number of unambiguous matches an `--apply`
   run WOULD patch. Each one is also printed, before the summary, as
   `WOULD-PATCH <backlog_id> via <resolved_claim_id>`; those lines are the
-  operator's apply list. Nothing is written.
-- `--apply`: N is the number of PATCHes that SUCCEEDED. A refused PATCH
-  prints `FAIL <backlog_id>: <error>` to stderr, and the run exits 1 if any
-  FAIL was printed, so a scheduled apply alerts instead of reporting a
-  quiet `patched=0`.
+  operator's apply list. No label PATCH is sent.
+- `--apply`: N is the number of PATCHes that SUCCEEDED. A failed PATCH
+  (HTTP error or transport error) prints `FAIL <backlog_id>: <error>` to
+  stderr, and the run exits 1 if any FAIL was printed, so a scheduled apply
+  alerts instead of reporting a quiet `patched=0`.
+
+In both modes, ambiguous matches are appended to the needs-review log
+(its directory is created if missing).
 
 M counts open backlog items whose match is ambiguous, in both modes.
 

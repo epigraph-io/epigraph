@@ -50,4 +50,6 @@ prefix collisions among open backlog UUIDs) are logged for human triage at
 It is a dry run unless passed `--apply`. A dry run prints one
 `WOULD-PATCH <backlog_id> via <resolved_claim_id>` line per unambiguous match
 and counts them in the summary's `patched=N`; under `--apply`, `patched=N`
-counts successful PATCHes and the run exits 1 if any PATCH was refused.
+counts successful PATCHes and the run exits 1 if any PATCH failed (HTTP
+error or transport error). Both modes append ambiguous matches to the
+needs-review log; only `--apply` sends label PATCHes.
