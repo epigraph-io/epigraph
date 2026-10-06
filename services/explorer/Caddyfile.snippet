@@ -1,40 +1,61 @@
-# EpiGraph Explorer — append inside the public site block of the VM Caddyfile,
-# next to the existing epigraph-api stanzas (same pattern as services/nli).
+# EpiGraph Explorer: a site block of its OWN in the VM Caddyfile, for a
+# dedicated Explorer host served at the root. It is not a stanza inside the
+# API's site block.
 # Assumes the explorer listens on 127.0.0.1:8096 on the same host: either the
 # systemd unit (epigraph-explorer.service.example) or a --network host
 # container. The binary binds loopback only, so Caddy is the public edge.
 #
-# PREFIX STRIPPING. `handle_path` strips the matched `/explorer` prefix before
-# proxying, so the explorer receives `/claim/<id>`, not
-# `/explorer/claim/<id>`. It cannot recover the prefix from the request, so
-# EPIGRAPH_EXPLORER_PUBLIC_BASE_URL must carry it, e.g.
-#   EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com/explorer
-# Every link, redirect, og:url, the cookie Path and the OAuth redirect_uri
-# (`.../explorer/auth/callback`, which must match the oauth_clients row
-# byte for byte) are generated from it. The explorer also answers on the
-# unstripped paths, so `handle /explorer* { ... }` works too; pick one.
+# WHY ITS OWN HOST. Co-hosting the Explorer under a path of the API's site
+# (`handle_path /explorer*`) puts it in one origin with the API's HTML pages
+# (the OAuth consent page, and any passkey ceremony page the API serves).
+# Then an HTML-injection bug on either side reaches the other, and the
+# Explorer's Origin check on POST /auth/logout and /auth/redeem accepts any
+# page the API serves. A cookie Path is not an isolation boundary inside one
+# origin. On its own host at the root, the Explorer's cookies carry the
+# `__Host-` prefix (Secure, Path=/, no Domain), so no other host, a sibling
+# under the same parent domain included, can set or shadow them. That closes
+# login CSRF by cookie tossing even when the parent domain is not a public
+# suffix. Under a base path the prefix is impossible: the explorer then uses
+# plain cookie names and logs "base path set: `__Host-` cookie prefix
+# unavailable" at startup. A deploy must not show that line.
 #
-# /oauth/* MUST STAY BROWSER-REACHABLE. Sign-in is the API's own OAuth
+# THE PUBLIC BASE URL HAS AN EMPTY PATH:
+#   EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com
+# Every link, redirect, og:url and the OAuth redirect_uri
+# (`https://explorer.example.com/auth/callback`, which must match the
+# oauth_clients row byte for byte) are generated from it. No prefix is
+# stripped, so the explorer sees the request path unchanged.
+#
+# REMOVE ANY OLD CO-HOSTED STANZA. If the API's site block still has a
+# `handle_path /explorer* { ... }` or `handle /explorer* { ... }` from an
+# earlier deploy, delete it. Serving the Explorer on both origins keeps the
+# co-hosting exposure alive.
+#
+# /oauth/* STAYS ON THE API'S HOST, NOT HERE. Sign-in is the API's own OAuth
 # authorization server, and the browser navigates to it directly:
 #   GET  /oauth/authorize            (explorer -> API, with PKCE)
 #   GET  /oauth/callback             (Google -> API)
 #   POST /oauth/authorize/consent    (the consent form's root-relative action)
 # These live at the root of the API's EPIGRAPH_PUBLIC_BASE_URL and are
-# already exposed for the claude.ai connector. Do not move them behind this
-# prefix, and do not let a broader matcher here shadow them. Point
-# EPIGRAPH_OAUTH_BASE_URL at that browser-facing API origin. Only /api/v1 can
-# stay hidden behind the explorer (it reaches the API on loopback via
-# EPIGRAPH_API_URL). The explorer's own sign-in routes are /explorer/auth/*,
-# which are distinct from the API's /oauth/*.
+# already exposed for the claude.ai connector. Point EPIGRAPH_OAUTH_BASE_URL
+# at that browser-facing API origin. Do not proxy /oauth/* or /api/v1/* on
+# the Explorer's host: the explorer reaches the API over loopback via
+# EPIGRAPH_API_URL, and /api/v1 can stay private. The explorer's own sign-in
+# routes are /auth/*, distinct from the API's /oauth/*.
 #
-# RATE LIMITING /explorer/auth/login. Every anonymous GET of that path
-# stores a pending login in the explorer's process-local map (10-minute TTL,
-# 10 000 entries). The explorer keeps the map bounded by evicting its oldest
-# entries rather than refusing, so a flood can no longer lock anyone out of
-# sign-in — but it can still evict other people's in-flight attempts, which
-# makes them retry. An edge rate limit on that one path removes even that.
-# Caddy has no rate limiter in the standard build; with the
-# `caddy-ratelimit` module built in, add inside the handle_path block:
+# PASSKEYS. If the API serves WebAuthn (passkey) ceremonies, its relying-party
+# id must be the API's exact host, never a registrable parent domain that the
+# Explorer's host also sits under. Otherwise a script on the Explorer's origin
+# could run a ceremony for the API's credentials.
+#
+# RATE LIMITING /auth/login. Every anonymous GET of that path stores a
+# pending login in the explorer's process-local map (10-minute TTL, 10 000
+# entries). The explorer keeps the map bounded by evicting its oldest entries
+# rather than refusing, so a flood cannot lock anyone out of sign-in, but it
+# can still evict other people's in-flight attempts, which makes them retry.
+# An edge rate limit on that one path removes even that. Caddy has no rate
+# limiter in the standard build; with the `caddy-ratelimit` module built in,
+# add inside the site block:
 #
 #   @login path /auth/login
 #   rate_limit @login {
@@ -45,17 +66,18 @@
 #       }
 #   }
 #
-# (`handle_path` has already stripped `/explorer`, so the matcher is
-# `/auth/login`.) Do not rate-limit `/auth/callback`: one slow sign-in behind
-# a shared NAT would then fail at the last step.
+# Do not rate-limit `/auth/callback`: one slow sign-in behind a shared NAT
+# would then fail at the last step.
 #
 # HEADERS. The explorer sets its own Content-Security-Policy, including
-# `frame-ancestors` (the Notion embed depends on it), X-Content-Type-Options
-# and Referrer-Policy. Do not add X-Frame-Options or a second CSP for this
-# path in Caddy: a site-wide `X-Frame-Options: DENY` breaks the embed. Do not
-# strip the Origin request header (Caddy forwards it by default): POST
-# /auth/logout compares it with the public origin.
+# `frame-ancestors` (the Notion embed depends on it), X-Content-Type-Options,
+# Referrer-Policy and, on every response without its own cache policy,
+# `Cache-Control: private, no-store` with `Vary: Cookie`. Do not add
+# X-Frame-Options or a second CSP in Caddy: a site-wide
+# `X-Frame-Options: DENY` breaks the embed. Do not strip the Origin request
+# header (Caddy forwards it by default): POST /auth/logout and POST
+# /auth/redeem compare it with the public origin.
 
-handle_path /explorer* {
+explorer.example.com {
     reverse_proxy 127.0.0.1:8096
 }

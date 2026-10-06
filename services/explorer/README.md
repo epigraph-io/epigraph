@@ -29,10 +29,10 @@ service token of its own.
 ## Architecture
 
 ```
-                      https://explorer.example.com
+                      https://explorer.example.com/   (its own host, served at the root)
   browser ─────────────────────▶ Caddy (public edge)
      │                             │
-     │   /explorer/*               │ handle_path /explorer*  (prefix stripped)
+     │                             │ explorer.example.com { reverse_proxy … }
      │                             ▼
      │                   epigraph-explorer  127.0.0.1:8096
      │                     • askama pages + /bff JSON + /static (compiled in)
@@ -45,7 +45,8 @@ service token of its own.
      │   /oauth/authorize  epigraph-api  :8080   (systemd: epigraph-api.service)
      └─────────────────────▶   /api/v1/*  ── reads, filtered per viewer
         (top-level              /oauth/*   ── authorization server
-         navigation, to                   │
+         navigation to the API's          │
+         own host,                        │
          EPIGRAPH_OAUTH_BASE_URL)         │
                                      ▼
                               Google OIDC (email allowlist)
@@ -64,9 +65,11 @@ service token of its own.
 
 ### Routes
 
-The Explorer serves every route both at the root and under the configured
-base path, so it works behind either `handle_path` or `handle`. Every link it
-generates includes the base path.
+Deploy the Explorer at the root of its own host (see Deploy). It still
+supports a base path, for local testing: it then serves every route both at
+the root and under the base path, so it works behind a proxy that strips the
+prefix or one that does not, and every link it generates includes the base
+path. A base path costs the `__Host-` cookie prefix (see Security model).
 
 | Route | What it shows |
 |---|---|
@@ -99,7 +102,7 @@ code **2**.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL including the base path, e.g. `https://explorer.example.com/explorer`. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. Its **first** segment may not be one of the Explorer's own top-level routes (`agent`, `auth`, `bff`, `claim`, `community`, `evidence`, `frame`, `health`, `neighborhood`, `search`, `static`, `theme`): the routes are mounted both under the base path and at the root, so such a base path would make two handlers claim the same URL. The process refuses to start (exit 2) and names the offending segment. |
+| `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL. In production it is the root of the Explorer's own host, `https://explorer.example.com`, with an **empty path** (see Deploy); a base path such as `http://localhost:8096/explorer` is for local testing. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. Its **first** segment may not be one of the Explorer's own top-level routes (`agent`, `auth`, `bff`, `claim`, `community`, `evidence`, `frame`, `health`, `neighborhood`, `search`, `static`, `theme`): the routes are mounted both under the base path and at the root, so such a base path would make two handlers claim the same URL. The process refuses to start (exit 2) and names the offending segment. |
 | `EPIGRAPH_API_URL` | `http://127.0.0.1:8080` | The `epigraph-api` origin, called server to server. This is the repo-standard variable name. |
 | `EPIGRAPH_EXPLORER_PORT` | `8096` | Port to bind, always on `127.0.0.1`. Must be 1–65535. |
 | `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token` and `/oauth/revoke` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
@@ -123,7 +126,7 @@ Fixed limits, which are not configurable:
 Here is an example environment file for production (`/etc/epigraph/explorer.env`):
 
 ```sh
-EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com/explorer
+EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com
 EPIGRAPH_API_URL=http://127.0.0.1:8080
 EPIGRAPH_OAUTH_BASE_URL=https://api.example.com
 EPIGRAPH_EXPLORER_CLIENT_ID=epigraph_explorer
@@ -148,9 +151,12 @@ cargo run
 # → open http://localhost:8096/
 ```
 
-To exercise the base path the way Caddy serves it, set
+To exercise a base path, set
 `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=http://localhost:8096/explorer` and open
-`http://localhost:8096/explorer/`.
+`http://localhost:8096/explorer/`. Under a base path the cookies keep their
+plain names, scoped to that path, and the startup log says
+"base path set: `__Host-` cookie prefix unavailable". That is expected here
+and wrong in production.
 
 **Without Google sign-in (`EPIGRAPH_EXPLORER_DEV_BEARER`).** Local sign-in
 through the API needs real Google credentials, a `providers.toml`, and a
@@ -226,7 +232,7 @@ INSERT INTO oauth_clients
     (client_id, client_name, client_type, allowed_scopes, granted_scopes, status, redirect_uris)
 VALUES
     ('epigraph_explorer', 'EpiGraph Explorer', 'human', '{}', '{}', 'active',
-     ARRAY['https://explorer.example.com/explorer/auth/callback'])
+     ARRAY['https://explorer.example.com/auth/callback'])
 RETURNING id, client_id, client_type, status, redirect_uris;
 ```
 
@@ -241,9 +247,9 @@ The row has to meet these constraints:
   rejects any other status with `invalid_client`.
 - **`redirect_uris`** is compared with a **plain string match**, with no
   normalisation. The entry must equal
-  `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL + "/auth/callback"` byte for byte,
-  including the `/explorer` prefix that Caddy strips. There is no trailing
-  slash.
+  `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL + "/auth/callback"` byte for byte. At
+  the root of the Explorer's own host that is
+  `https://explorer.example.com/auth/callback`. There is no trailing slash.
 - **No secret.** The Explorer is a public client using PKCE S256, and the
   authorization-code grant never checks a secret.
 - **Empty scopes are correct.** The scopes a token carries come from the
@@ -265,7 +271,7 @@ To move the Explorer to a new public URL, update the row:
 
 ```sql
 UPDATE oauth_clients
-   SET redirect_uris = ARRAY['https://explorer.example.com/explorer/auth/callback'],
+   SET redirect_uris = ARRAY['https://explorer.example.com/auth/callback'],
        updated_at = now()
  WHERE client_id = 'epigraph_explorer';
 ```
@@ -312,9 +318,10 @@ Sign-in uses top-level browser navigation to the API itself:
 - the consent form's `POST /oauth/authorize/consent`
 
 These routes live at the root of the API's own `EPIGRAPH_PUBLIC_BASE_URL`, and
-the claude.ai connector already relies on them. Only `/api/v1/*` can stay
-hidden behind the Explorer. `EPIGRAPH_OAUTH_BASE_URL` must be that public API
-origin.
+the claude.ai connector already relies on them. They stay on the API's host:
+the Explorer's host proxies only to the Explorer, never `/oauth/*` or
+`/api/v1/*`. `/api/v1/*` can stay private, because the Explorer reaches it over
+loopback. `EPIGRAPH_OAUTH_BASE_URL` must be that public API origin.
 
 ### 5. Deploy
 
@@ -358,20 +365,44 @@ docker run -d --name epigraph-explorer --network host \
     --env-file /etc/epigraph/explorer.env epigraph-explorer
 ```
 
-**Caddy.** Add [`Caddyfile.snippet`](Caddyfile.snippet)
-(`handle_path /explorer* { reverse_proxy 127.0.0.1:8096 }`) to the public site
-block, then reload Caddy. `handle_path` strips `/explorer`, which is why the
-public base URL has to carry it. Do not add `X-Frame-Options` for this path:
-the Explorer's CSP `frame-ancestors` controls framing.
+**Caddy: a dedicated host, served at the root.** Add
+[`Caddyfile.snippet`](Caddyfile.snippet) as a site block of its own
+(`explorer.example.com { reverse_proxy 127.0.0.1:8096 }`), not as a stanza in
+the API's site block, then reload Caddy. Set
+`EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` to that host's root, with an empty path.
+Why its own host:
+
+- **Origin isolation.** Under a path of the API's site, the Explorer would
+  share one origin with the API's HTML pages (the consent page, and any
+  passkey ceremony page). An HTML-injection bug on either side would then
+  reach the other, and the Explorer's Origin check on `POST /auth/logout` and
+  `POST /auth/redeem` would accept requests from any API page. A cookie
+  `Path` is no boundary inside one origin.
+- **`__Host-` cookies.** Only at the root of a secure origin can the session
+  and login-binding cookies carry the `__Host-` prefix, which stops any other
+  host (a sibling under the same parent domain included) from setting or
+  shadowing them. That closes login CSRF by cookie tossing even when the
+  parent domain is not a public suffix.
+
+If the API's site block still routes `/explorer*` from an earlier deploy,
+remove that stanza: serving the Explorer on both origins keeps the exposure.
+If the API serves WebAuthn (passkey) ceremonies, its relying-party id must be
+the API's **exact host**, never a registrable parent domain that the
+Explorer's host also sits under. Do not add `X-Frame-Options` on the
+Explorer's host: the Explorer's CSP `frame-ancestors` controls framing.
 
 ### 6. Smoke test
 
 ```sh
 curl -fsS http://127.0.0.1:8096/health          # {"status":"ok","version":"0.1.0"}
-curl -sI https://explorer.example.com/explorer/  # 303 → /explorer/auth/login?return_to=…
+curl -sI https://explorer.example.com/          # 303 → /auth/login?return_to=…
+curl -sI https://explorer.example.com/auth/login # Set-Cookie: __Host-epx_login=…; Path=/; Secure
 ```
 
-Then sign in through the browser and open a claim.
+Then sign in through the browser and open a claim. The deploy is right only
+if the login response's cookie starts `__Host-` and the startup log
+(`journalctl -u epigraph-explorer`) has **no**
+"base path set: `__Host-` cookie prefix unavailable" line.
 
 ## Security model
 

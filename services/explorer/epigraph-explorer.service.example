@@ -3,7 +3,11 @@
 # epigraph-api runs on the host under systemd (not in Docker), so the simplest
 # deployment is the same: the explorer reaches the API on loopback
 # (EPIGRAPH_API_URL=http://127.0.0.1:8080, the default) and Caddy reaches the
-# explorer on 127.0.0.1:8096 (Caddyfile.snippet).
+# explorer on 127.0.0.1:8096 from a site block of the Explorer's own host
+# (Caddyfile.snippet). Serve it at that host's root: explorer.env sets
+# EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com with an empty
+# path, and `journalctl -u epigraph-explorer` must show no "base path set"
+# warning after start.
 #
 # Install (see README.md "Deploy"):
 #   sudo install -m 0755 <target-dir>/release/epigraph-explorer /usr/local/bin/epigraph-explorer
