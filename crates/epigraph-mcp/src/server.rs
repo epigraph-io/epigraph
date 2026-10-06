@@ -1681,7 +1681,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label and truth_value), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only."
+        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label and truth_value), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only. Edges are only those between returned nodes; edges_omitted counts the edges followed to nodes not returned (node limit reached or min_truth filtered), so a positive edges_omitted with limit nodes returned means raise limit to see more."
     )]
     async fn traverse(
         &self,

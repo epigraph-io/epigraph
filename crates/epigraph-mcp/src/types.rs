@@ -2316,7 +2316,13 @@ pub struct TraverseEdge {
 pub struct TraverseResponse {
     pub start_id: String,
     pub nodes: Vec<TraverseNode>,
+    /// Only edges whose source AND target are in `nodes`.
     pub edges: Vec<TraverseEdge>,
+    /// Edges the walk followed (relationship filter already applied) that are
+    /// not in `edges` because an endpoint was not returned: the node `limit`
+    /// was reached, or `min_truth` dropped it. Always present, 0 when nothing
+    /// was left out (backlog cdd8d097).
+    pub edges_omitted: usize,
     pub depth_reached: i32,
 }
 
