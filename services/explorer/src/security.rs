@@ -29,6 +29,15 @@ pub const DEFAULT_CACHE_CONTROL: &str = "private, no-store";
 /// Route paths (base path stripped) that no site may frame and that send
 /// no referrer: `/acts` links out to the API's own confirmation page for an
 /// admin act, so it must not be clickjacked or name itself to that page.
+///
+/// Every other page is framable by `frame-ancestors`, and its default
+/// admits pages anyone can publish: every Notion page shares the `notion.so`
+/// site, so a viewer signed in to the embed on their own page is signed in
+/// inside an Explorer frame on a stranger's public page too (the partitioned
+/// cookie is keyed by that site). Today the only consequential control on a
+/// framable page is Sign out. A page that adds a control with consequences
+/// (anything that changes state, or links out to a confirmation) must be
+/// listed here.
 pub const UNFRAMABLE_ROUTES: &[&str] = &["/acts"];
 
 /// The CSP with `frame-ancestors` from config (already validated to be a

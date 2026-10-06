@@ -698,6 +698,17 @@ if the login response's cookie starts `__Host-` and the startup log
   example `https://www.notion.so` for the Notion app plus your own
   `https://<workspace>.notion.site` if you publish there. Set it explicitly
   empty to forbid framing altogether, which turns the embed off.
+
+  Even narrowed, treat the allowlist as attacker-publishable. Every page on
+  `www.notion.so` belongs to the same site, which is what the embed's
+  partitioned cookie is keyed by, so a viewer who signed in to the embed on
+  their own page is also signed in inside an Explorer frame on any public
+  Notion page someone else made, at a size and in surroundings that person
+  chose. The pages are read-only and the only consequential control in them
+  is Sign out, so the exposure today is UI redress, not an action taken on
+  the viewer's behalf. `/acts`, which links out to confirm an admin act, is
+  never framable, and any future page with a consequential control has to
+  join it (`security.rs`, `UNFRAMABLE_ROUTES`).
 - **Loopback bind.** The process listens on `127.0.0.1` only, so Caddy is the
   only way in.
 
