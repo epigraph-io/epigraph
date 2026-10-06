@@ -559,6 +559,16 @@ pub struct RecallHit {
     pub corroborates: Vec<CorroboratesEdge>,
     pub corroborates_total: usize,
     pub corroborates_truncated: bool,
+    /// Epistemic-edge neighbours (supports / refutes / contradicts / specializes /
+    /// elaborates / cites), capped at `epistemic_limit` PER RELATIONSHIP. `direction`
+    /// is from this paragraph's view: incoming `refutes` = "is refuted by".
+    /// Always serialized (like `corroborates`), so an empty list means "none
+    /// visible", not "not computed" (backlog 922a1e54).
+    pub epistemic_edges: Vec<EpistemicEdgeNeighbor>,
+    /// Every epistemic neighbour visible to the caller, across relationships,
+    /// before the per-relationship cap.
+    pub epistemic_edges_total: usize,
+    pub epistemic_edges_truncated: bool,
     pub neighbor_paragraphs: Vec<NeighborParagraph>,
     pub neighbor_paragraphs_total: usize,
     pub neighbor_paragraphs_truncated: bool,
@@ -1310,6 +1320,18 @@ async fn recall_with_context_post_embed(
             .unwrap_or(corroborates.len());
         let corroborates_truncated = corroborates_total > corroborates.len();
 
+        let epistemic_edges = ctx
+            .epistemic_edges_by_paragraph
+            .get(&paragraph_id)
+            .cloned()
+            .unwrap_or_default();
+        let epistemic_edges_total = ctx
+            .epistemic_edges_total_by_paragraph
+            .get(&paragraph_id)
+            .copied()
+            .unwrap_or(epistemic_edges.len());
+        let epistemic_edges_truncated = epistemic_edges_total > epistemic_edges.len();
+
         let (neighbor_paragraphs, neighbor_paragraphs_total, neighbor_paragraphs_truncated) =
             assemble_neighbor_paragraphs(
                 paragraph_id,
@@ -1341,6 +1363,9 @@ async fn recall_with_context_post_embed(
             corroborates,
             corroborates_total,
             corroborates_truncated,
+            epistemic_edges,
+            epistemic_edges_total,
+            epistemic_edges_truncated,
             neighbor_paragraphs,
             neighbor_paragraphs_total,
             neighbor_paragraphs_truncated,
