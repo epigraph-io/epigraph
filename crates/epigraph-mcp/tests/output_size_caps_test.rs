@@ -251,8 +251,9 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
     for _ in 0..TARGET_EVIDENCE {
         seed_evidence(&pool, target).await;
     }
-    seed_trace(&pool, target).await;
+    let target_trace = seed_trace(&pool, target).await;
     let mut parents = Vec::new();
+    let mut parent_traces = std::collections::HashMap::new();
     for i in 0..PARENTS {
         let parent = seed_claim(
             &pool,
@@ -264,8 +265,22 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
         for _ in 0..EVIDENCE_PER_PARENT {
             seed_evidence(&pool, parent).await;
         }
-        seed_trace(&pool, parent).await;
+        parent_traces.insert(parent, seed_trace(&pool, parent).await);
         parents.push(parent);
+    }
+
+    // Trace DAG: the target's trace cites every parent's trace and one trace
+    // OUTSIDE the lineage (on an unrelated claim). `get_lineage` reads
+    // `trace_parents` for the traces named by `claims.trace_id`, unscoped
+    // and unfiltered, so the bundle sees all 81. The node cap and the budget
+    // drop most parents, and the outside trace is never in the lineage: the
+    // emitted list must be pruned to traces the bundle contains.
+    let outsider = seed_claim(&pool, agent, "unrelated claim").await;
+    let outside_trace = seed_trace(&pool, outsider).await;
+    set_claim_trace(&pool, target, target_trace).await;
+    seed_trace_parent(&pool, target_trace, outside_trace).await;
+    for t in parent_traces.values() {
+        seed_trace_parent(&pool, target_trace, *t).await;
     }
 
     let server = build_test_server(pool.clone());
@@ -391,6 +406,47 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
         Value::Bool(true),
         "{}",
         bundle["limits"]
+    );
+
+    assert_eq!(
+        bundle["limits"]["max_output_chars"],
+        Value::from(EXPECTED_DEFAULT_MAX_OUTPUT_CHARS),
+        "the defaults-only call must echo the default budget"
+    );
+
+    // The trace DAG survives, pruned to what was emitted: the target trace
+    // names exactly the traces of the parent claims the bundle kept. This is
+    // the non-vacuous half of check (2): without it an empty list passes.
+    let target_trace_entity = entities
+        .iter()
+        .find(|e| e["@id"] == format!("trace:{target_trace}").as_str())
+        .expect("the target's trace must be emitted");
+    let mut got: Vec<&str> = target_trace_entity["parent_trace_ids"]
+        .as_array()
+        .expect("parent_trace_ids array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<String> = entities
+        .iter()
+        .filter_map(|e| e["@id"].as_str()?.strip_prefix("claim:"))
+        .filter_map(|c| c.parse::<Uuid>().ok())
+        .filter_map(|c| parent_traces.get(&c))
+        .map(|t| format!("trace:{t}"))
+        .collect();
+    want.sort_unstable();
+    assert!(
+        !want.is_empty(),
+        "at least one parent claim (and its trace) must be emitted"
+    );
+    assert_eq!(
+        got, want,
+        "target trace's parent_trace_ids must be exactly the emitted parents' traces"
+    );
+    assert!(
+        !got.contains(&format!("trace:{outside_trace}").as_str()),
+        "a trace outside the lineage must not be referenced"
     );
 
     // ---- Control: a lineage inside every budget is NOT reported as cut ----
@@ -803,6 +859,27 @@ async fn seed_trace(pool: &PgPool, claim_id: Uuid) -> Uuid {
     .fetch_one(pool)
     .await
     .expect("seed reasoning trace")
+}
+
+/// Point `claims.trace_id` at `trace_id`. `get_lineage` reads `trace_parents`
+/// only for traces named by `claims.trace_id`.
+async fn set_claim_trace(pool: &PgPool, claim_id: Uuid, trace_id: Uuid) {
+    sqlx::query("UPDATE claims SET trace_id = $2 WHERE id = $1")
+        .bind(claim_id)
+        .bind(trace_id)
+        .execute(pool)
+        .await
+        .expect("set claims.trace_id");
+}
+
+/// A `trace_parents` edge: `trace_id` depends on `parent_id`.
+async fn seed_trace_parent(pool: &PgPool, trace_id: Uuid, parent_id: Uuid) {
+    sqlx::query("INSERT INTO trace_parents (trace_id, parent_id) VALUES ($1, $2)")
+        .bind(trace_id)
+        .bind(parent_id)
+        .execute(pool)
+        .await
+        .expect("seed trace parent");
 }
 
 async fn seed_paper(pool: &PgPool, doi: &str) -> Uuid {
