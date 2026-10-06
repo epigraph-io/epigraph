@@ -1013,6 +1013,14 @@ impl EdgeRepository {
     /// Endpoint types are hard-coded `'claim'` / `'claim'` like the sibling
     /// functions: symmetry is only established between two claims.
     ///
+    /// The dedup is best-effort, like the siblings': `INSERT ... WHERE NOT
+    /// EXISTS` under READ COMMITTED with no advisory lock or unique index, so
+    /// two concurrent calls `(a, b)` / `(b, a)` can both insert, and an
+    /// in-force reverse edge this connection cannot see (RLS) does not block
+    /// the insert. Losing either race falls back to the pre-dedup two-row
+    /// behaviour; a database-level backstop waits on canonical relationship
+    /// spelling (migration 090 rejected a broad unique index).
+    ///
     /// Runtime `sqlx::query*` throughout — no `.sqlx/` prepared-cache entry.
     ///
     /// # Errors
