@@ -594,6 +594,10 @@ async fn submit_atom(
                 "evidence_type": "logical"
             },
             "labels": ["atom", format!("generality:{generality}")],
+            // Derivation provenance (U041): the API records one `document`
+            // evidence row carrying the parent's text, in the atom's own
+            // transaction. No belief mass — see the module doc.
+            "derived_from": {"claim_id": parent.claim_id, "method": "decompose_claims"},
         }))
         .send()
         .await
@@ -905,15 +909,21 @@ fn report_selection(
     explicit: bool,
     priority: PriorityArg,
 ) {
+    use epigraph_cli::decompose::Ineligible;
     let backlog = sel
         .skipped
         .iter()
-        .filter(|(_, w)| matches!(w, epigraph_cli::decompose::Ineligible::Backlog))
+        .filter(|(_, w)| matches!(w, Ineligible::Backlog))
         .count();
-    let atomic = sel.skipped.len() - backlog;
+    let not_public = sel
+        .skipped
+        .iter()
+        .filter(|(_, w)| matches!(w, Ineligible::NotPublic { .. }))
+        .count();
+    let atomic = sel.skipped.len() - backlog - not_public;
     eprintln!(
         "selection: priority={priority:?}{} scanned={} chosen={} skipped_backlog={backlog} \
-         skipped_looks_atomic={atomic}",
+         skipped_looks_atomic={atomic} skipped_not_public={not_public}",
         if explicit { " (ids-file order)" } else { "" },
         sel.scanned,
         sel.chosen.len(),

@@ -277,6 +277,28 @@ pub fn check_eligibility(
     Ok(())
 }
 
+/// The one eligibility rule no flag overrides: only a `visibility = 'public'`
+/// claim is decomposed.
+///
+/// Selection runs under a maintenance BYPASS viewer and so sees group-private
+/// claims, but every atom is POSTed public (`if_not_exists` is public-tier
+/// only) and records the parent's text as its derivation evidence (U041). A
+/// group-private parent would be republished as public atoms, and the API
+/// refuses its `derived_from` — which would abort a normal run. So it is
+/// skipped here and reported.
+///
+/// # Errors
+/// [`Ineligible::NotPublic`] for any other visibility.
+pub fn check_publicly_decomposable(visibility: &str) -> Result<(), Ineligible> {
+    if visibility == "public" {
+        Ok(())
+    } else {
+        Err(Ineligible::NotPublic {
+            visibility: visibility.to_string(),
+        })
+    }
+}
+
 // =============================================================================
 // PLAN FILE: what `--plan` writes and `--apply-plan` persists
 // =============================================================================
@@ -765,9 +787,8 @@ mod db_writes {
     {
         let mut totals = BatchTotals::default();
         for plan in planned {
-            // STUB (red step): the parent id is not threaded yet.
             let parent = AtomParent {
-                claim_id: Uuid::nil(),
+                claim_id: plan.claim_id,
                 agent_id: plan.agent_id,
             };
             match persist_decomposition(
@@ -942,6 +963,10 @@ mod db_writes {
                 if !taken.insert(r.id) {
                     continue;
                 }
+                if let Err(why) = super::check_publicly_decomposable(&r.visibility) {
+                    sel.skipped.push((r.id, why));
+                    continue;
+                }
                 match super::check_eligibility(&r.content, &r.labels, filters) {
                     // Past `--limit`: named, eligible, and NOT silently dropped.
                     Ok(()) if sel.chosen.len() >= limit => sel.over_limit.push(r.id),
@@ -993,6 +1018,10 @@ mod db_writes {
             for r in page {
                 if sel.chosen.len() >= limit {
                     break;
+                }
+                if let Err(why) = super::check_publicly_decomposable(&r.visibility) {
+                    sel.skipped.push((r.id, why));
+                    continue;
                 }
                 match super::check_eligibility(&r.content, &r.labels, filters) {
                     Ok(()) => sel.chosen.push(r),
