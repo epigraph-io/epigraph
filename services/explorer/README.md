@@ -137,10 +137,13 @@ bare date, and `since` defaults to 24 hours ago.
   scope lacks it, the page explains that and does not call the API; an API
   403 gets the same answer.
 
-  Which events a viewer may read is the API's decision. The page says "you
-  see only your own security events" unless the rows it read show more (an
-  event with no agent, or events of two agents), and then says this account
-  reads more than its own events. It also says, on every view, that it shows
+  Which events a viewer may read is the API's decision. The page compares
+  the rows it read with the viewer's own agent (the one the access token
+  names, as the identity strip shows it): when every row is the viewer's
+  own it says "you see only your own security events"; when a row has no
+  agent or another agent's id, it says this account reads more than its own
+  events; when the window holds no event, or the token names no agent, it
+  says the window cannot tell. It also says, on every view, that it shows
   only events the viewer may read, and that refresh-token volume and
   liveness are not in this trail.
 - **`/activity`** shows, for each agent in `EPIGRAPH_EXPLORER_WATCH_AGENTS`,
