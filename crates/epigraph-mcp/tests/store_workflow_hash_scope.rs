@@ -609,8 +609,10 @@ async fn scope_marked_row_without_an_executing_workflow_is_not_applicable(pool: 
     .bind(&body)
     .bind(compound_content_hash(&content_hash(&body), "orphan-wf").as_slice())
     .bind(agent)
-    .bind(serde_json::json!({"level": 2, "source_type": "workflow", "kind": "workflow_step",
-                             CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME}))
+    .bind(
+        serde_json::json!({"level": 2, "source_type": "workflow", "kind": "workflow_step",
+                             CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME}),
+    )
     .execute(&pool)
     .await
     .expect("seed marked orphan step");

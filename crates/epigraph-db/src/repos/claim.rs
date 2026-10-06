@@ -1260,7 +1260,9 @@ impl ClaimRepository {
     /// disagreement. Deliberately the whole object and not a `->>` projection:
     /// the predicate lives next to the writer in
     /// `epigraph_ingest::document::stored_content_hash_is_seed_scoped`, so the
-    /// repo layer must not re-encode which keys matter.
+    /// repo layer must not re-encode which keys matter. (Its workflow subset is
+    /// re-derived rather than left undecided: the seed is recovered through
+    /// `WorkflowRepository::executing_canonical_names`.)
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.

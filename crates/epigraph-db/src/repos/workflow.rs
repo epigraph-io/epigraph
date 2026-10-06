@@ -307,6 +307,46 @@ impl WorkflowRepository {
         })
     }
 
+    /// The distinct `canonical_name`s of the workflows that EXECUTE `claim_id`
+    /// (a visible `workflow —executes→ claim` edge).
+    ///
+    /// Exists for MCP `verify_claim`: a workflow level-0..2 row marked
+    /// `content_hash_scope = "canonical_name"` stores
+    /// `compound_content_hash(blake3(content), canonical_name)`, and its seed is
+    /// the name of the workflow that wrote it, which links the row by this edge
+    /// in the same transaction (the executor's `executes` loop, and
+    /// `workflow_steps::add_step`). Returning every executing workflow rather
+    /// than one keeps the caller's rule simple — a match against ANY of them is
+    /// sound — and an empty result (no edge, or none visible to `viewer`) means
+    /// the seed is unrecoverable, which the caller reports as undecided.
+    ///
+    /// Viewer-scoped on the edge like `resolve_steps_to_heads`; the `workflows`
+    /// table carries no visibility columns.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn executing_canonical_names(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Vec<String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT DISTINCT w.canonical_name \
+             FROM edges e \
+             JOIN workflows w ON w.id = e.source_id \
+             WHERE e.target_id = $1 AND e.relationship = 'executes' \
+               AND e.source_type = 'workflow' AND e.target_type = 'claim' \
+               /* {EDGE_VISIBILITY:e} */ \
+             ORDER BY w.canonical_name",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(pool).await.map_err(DbError::from)
+    }
+
     /// Look up a workflow root by `(canonical_name, generation)`.
     pub async fn find_root_by_canonical<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
