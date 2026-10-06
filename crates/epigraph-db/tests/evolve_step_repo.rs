@@ -124,13 +124,15 @@ async fn evolve_step_supersedes_nulls_parent_embedding(pool: PgPool) {
         v[0] = "0.1";
         format!("[{}]", v.join(","))
     };
-    sqlx::query("UPDATE claims SET embedding = $1::vector, embedding_3072 = $2::vector WHERE id = $3")
-        .bind(stub(1536))
-        .bind(stub(3072))
-        .bind(parent)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE claims SET embedding = $1::vector, embedding_3072 = $2::vector WHERE id = $3",
+    )
+    .bind(stub(1536))
+    .bind(stub(3072))
+    .bind(parent)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     ClaimRepository::evolve_step(
         &pool,

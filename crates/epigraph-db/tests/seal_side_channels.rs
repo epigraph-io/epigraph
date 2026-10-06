@@ -1446,10 +1446,10 @@ async fn the_restore_write_refuses_a_claim_superseded_since_the_text_was_read(po
         "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
           WHERE id = $1",
     )
-        .bind(stale)
-        .execute(&pool)
-        .await
-        .expect("supersede the claim out from under the in-flight job");
+    .bind(stale)
+    .execute(&pool)
+    .await
+    .expect("supersede the claim out from under the in-flight job");
 
     let refused = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
         &mut conn, &bypass, stale, &vector,

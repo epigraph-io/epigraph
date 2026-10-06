@@ -113,7 +113,10 @@ async fn merge_nulls_both_embeddings_on_retired_sources(pool: PgPool) {
         .expect("read source");
         assert!(!is_current, "source {s} retired");
         assert!(!has_1536, "source {s} embedding nulled with is_current");
-        assert!(!has_3072, "source {s} embedding_3072 nulled with is_current");
+        assert!(
+            !has_3072,
+            "source {s} embedding_3072 nulled with is_current"
+        );
     }
 
     let (m_current, m_1536, m_3072): (bool, bool, bool) = sqlx::query_as(

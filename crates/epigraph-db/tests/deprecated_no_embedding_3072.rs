@@ -61,8 +61,12 @@ async fn retiring_a_row_that_still_holds_a_3072_vector_is_refused(pool: PgPool) 
         .bind(id)
         .execute(&pool)
         .await
-        .expect_err("chk_deprecated_no_embedding must refuse a retirement that keeps embedding_3072");
-    let db = err.as_database_error().expect("a database error, not a driver one");
+        .expect_err(
+            "chk_deprecated_no_embedding must refuse a retirement that keeps embedding_3072",
+        );
+    let db = err
+        .as_database_error()
+        .expect("a database error, not a driver one");
     assert_eq!(db.code().as_deref(), Some("23514"), "check_violation");
     assert_eq!(db.constraint(), Some("chk_deprecated_no_embedding"));
 
