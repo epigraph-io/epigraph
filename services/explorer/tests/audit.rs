@@ -858,6 +858,11 @@ async fn bff_audit_serves_the_counted_window_as_json() {
     assert_eq!(v["result"]["partial"], Value::Null);
     assert_eq!(v["result"]["reads_beyond_own"], false);
     assert_eq!(
+        v["result"]["rows"],
+        json!([]),
+        "an undrilled window carries no raw rows (addresses, details)"
+    );
+    assert_eq!(
         v["result"]["types"],
         json!([
             {"event_type": "auth_attempt", "total": 2, "failures": 1},
