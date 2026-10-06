@@ -253,9 +253,20 @@ async fn mount_sub_calls(app: &TestApp, times: u64) {
     mount_get(app, &claim_path("/placement"), 200, placement_json(), times).await;
 }
 
-/// Paths of the page's own upstream calls (the capability probe a signed-in
-/// page makes for the section nav is not one of them).
 async fn upstream_paths(app: &TestApp) -> Vec<String> {
+    app.upstream
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect()
+}
+
+/// Paths of the pages' own upstream calls: [`upstream_paths`] without the
+/// capability probe a signed-in page makes for the section nav. Anonymous
+/// and `/bff` requests never probe, so their tests keep the strict helper.
+async fn data_paths(app: &TestApp) -> Vec<String> {
     app.upstream
         .received_requests()
         .await
@@ -585,7 +596,7 @@ async fn invisible_claim_is_the_same_404_as_a_missing_one() {
     // Only `GET /claims/:id` was called, for each of the three requests:
     // the 404 stops the compose before any other sub-call, exactly as the
     // old short-circuit did.
-    let calls = upstream_paths(&app).await;
+    let calls = data_paths(&app).await;
     assert_eq!(
         calls,
         vec![
@@ -706,7 +717,7 @@ async fn bad_or_unknown_claim_ids_are_404_pages() {
     assert_eq!(res.status, StatusCode::NOT_FOUND, "anonymous too");
     assert!(res.body.contains("We could not find that claim."));
     assert!(
-        upstream_paths(&app).await.is_empty(),
+        data_paths(&app).await.is_empty(),
         "no upstream call for a malformed id"
     );
 
@@ -1083,7 +1094,7 @@ async fn search_empty_results_blank_queries_and_failures() {
     assert!(res.body.contains("That search is too long."));
 
     assert_eq!(
-        upstream_paths(&app).await.len(),
+        data_paths(&app).await.len(),
         2,
         "only the two real searches"
     );
@@ -1197,7 +1208,7 @@ async fn landing_shows_stats_themes_and_communities() {
     // (each mock expects exactly one hit).
     let res = app.get_as("/explorer/", &sid).await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(upstream_paths(&app).await.len(), 3);
+    assert_eq!(data_paths(&app).await.len(), 3);
 }
 
 #[tokio::test]

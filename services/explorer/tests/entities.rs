@@ -51,17 +51,8 @@ async fn get_ok(app: &TestApp, route: &str, body: Value) {
         .await;
 }
 
-/// Fails the test (on `verify`) if anything but the section nav's
-/// capability probe reaches upstream. The probe (made by a signed-in page
-/// before its own calls) is answered 404, "no admin acts", like main.
+/// Fails the test (on `verify`) if anything reaches upstream.
 async fn forbid_upstream(app: &TestApp) {
-    Mock::given(method("GET"))
-        .and(|r: &wiremock::Request| common::is_capability_probe(r))
-        .respond_with(ResponseTemplate::new(404))
-        .with_priority(1)
-        .named("capability probe")
-        .mount(&app.upstream)
-        .await;
     Mock::given(any())
         .respond_with(ResponseTemplate::new(500))
         .expect(0)
@@ -69,6 +60,20 @@ async fn forbid_upstream(app: &TestApp) {
         .with_priority(u8::MAX)
         .mount(&app.upstream)
         .await;
+}
+
+/// [`forbid_upstream`] for signed-in pages: the section nav's capability
+/// probe (made before a page's own calls) is answered 404, "no admin acts",
+/// as on main; any other request still fails the test.
+async fn forbid_data_calls(app: &TestApp) {
+    Mock::given(method("GET"))
+        .and(|r: &wiremock::Request| common::is_capability_probe(r))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .named("capability probe")
+        .mount(&app.upstream)
+        .await;
+    forbid_upstream(app).await;
 }
 
 fn assert_escaped(body: &str) {
@@ -125,7 +130,7 @@ async fn entity_pages_require_sign_in() {
 #[tokio::test]
 async fn malformed_ids_are_404_without_an_upstream_call() {
     let app = spawn().await;
-    forbid_upstream(&app).await;
+    forbid_data_calls(&app).await;
     let sid = app.sign_in("tok");
     let whats = ["claim", "claim", "agent", "frame", "evidence"];
     for bad in ["not-a-uuid", "0b9a5a4e-5f43-4c4b-9a52", "%3Cscript%3E"] {
