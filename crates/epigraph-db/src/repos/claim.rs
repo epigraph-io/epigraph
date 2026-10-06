@@ -3026,15 +3026,22 @@ impl ClaimRepository {
     /// `THEME_COVERAGE_PROBE_K` probe). `ROLLBACK TO SAVEPOINT` reverts them;
     /// for a read-only statement the two are otherwise equivalent.
     ///
-    /// Residual: `hnsw.max_scan_tuples` stays at its default (20,000), which
-    /// bounds the worst case. A scope whose share of embedded current claims
-    /// is below about `candidate_pool / 20,000` (0.25% at a pool of 50) can
-    /// still under-fill the dense leg.
+    /// Residual: the iterative scan still stops at `hnsw.max_scan_tuples`
+    /// (default 20,000) or at its memory budget (`hnsw.scan_mem_multiplier` x
+    /// `work_mem`), whichever comes first; neither is changed here. A scope
+    /// whose share of embedded current claims is below about
+    /// `candidate_pool / 20,000` (0.25% at a pool of 50) can still under-fill
+    /// the dense leg.
     ///
     /// Requires pgvector >= 0.8.0, the release that added
-    /// `hnsw.iterative_scan`. Check the deployed extension version before
-    /// shipping: pgvector reserves the `hnsw.` GUC prefix, so on an older
-    /// extension this `set_config` is expected to fail the whole call.
+    /// `hnsw.iterative_scan`; check the deployed extension version before
+    /// shipping. On an older extension the call is unsupported, and how it
+    /// misbehaves depends on the backend: where the `vector` library is
+    /// already loaded, pgvector has reserved the `hnsw.` GUC prefix and the
+    /// `set_config` is expected to fail the whole call; on a fresh pooled
+    /// backend the unknown name may be accepted as a placeholder and then
+    /// discarded (with a WARNING) when the library loads, so the query runs
+    /// silently without iterative scan.
     #[allow(clippy::too_many_arguments)]
     pub async fn search_hybrid_scoped_since_in_theme<'a, A>(
         executor: A,
