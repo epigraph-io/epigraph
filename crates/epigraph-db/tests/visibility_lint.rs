@@ -2254,6 +2254,21 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          nothing for a viewer to filter; the one row it reads is the caller's own token client.",
     ),
     (
+        "security_event.rs",
+        "query",
+        "READ of `security_events` for `GET /api/v1/audit/security`. The table has no \
+         `visibility` or `owner_group_id` column (it is not in migration 062's tier_a array), so \
+         there is no in-query predicate for a viewer to splice. Its row narrowing is the \
+         `security_events_read` RLS policy (migration 083), keyed on the session's STAMPED \
+         principal: the agent's own rows, or every row for a live instance admin. So the caller \
+         must pass its `AppState::read_as` connection, which \
+         `routes/audit.rs::query_security_events` does and \
+         `epigraph-api/tests/audit_security_route_test.rs` pins on the application role; on an \
+         unstamped application connection it returns no rows (fails closed). \
+         `routes/timeline.rs` still passes the raw pool and stays counted in \
+         `no_unscoped_pool.rs`.",
+    ),
+    (
         "workflow.rs",
         "record_submitter",
         "WRITE of one `workflows` row's `metadata.epigraph_submitted_by`, once (batch H-b, H3). \

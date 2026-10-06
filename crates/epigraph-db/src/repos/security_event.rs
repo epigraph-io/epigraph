@@ -188,11 +188,21 @@ impl SecurityEventRepository {
     ///
     /// Results are ordered by `created_at DESC` (most recent first).
     ///
+    /// # Which executor
+    ///
+    /// Generic so a request handler can pass its viewer-stamped connection
+    /// (`&mut *read` from `AppState::read_as`). The `security_events_read`
+    /// policy narrows rows by the session's STAMPED principal (its own rows,
+    /// or every row for a live instance admin); on an unstamped
+    /// application-role connection every arm of it is false and this returns
+    /// no rows. A `&PgPool` is still accepted for the callers that have not
+    /// been converted.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the SELECT fails.
-    #[instrument(skip(pool))]
-    pub async fn query(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn query<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         filter: SecurityEventFilter,
     ) -> Result<Vec<SecurityEventRow>, DbError> {
         let limit = filter.limit.unwrap_or(1000).min(10_000);
@@ -230,7 +240,7 @@ impl SecurityEventRepository {
             filter.failures_only,
             limit,
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(DbError::from)?;
 
