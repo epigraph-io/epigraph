@@ -176,6 +176,7 @@ pub struct HarvestResult {
 ///
 /// This allows the handler to work with both a real gRPC client
 /// and a mock client for testing.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait::async_trait]
 pub trait HarvesterClient: Send + Sync {
     async fn process_fragment(

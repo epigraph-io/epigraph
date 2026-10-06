@@ -756,6 +756,10 @@ fn non_admin_owner(owner: Uuid) -> epigraph_auth::AuthContext {
         client_type: epigraph_auth::ClientType::Service,
         scopes: vec!["claims:write".to_string()],
         jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
     }
 }
 

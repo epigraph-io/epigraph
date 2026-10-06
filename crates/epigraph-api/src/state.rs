@@ -2,7 +2,7 @@
 // the entity-type cache load, the tenancy-trigger and RLS-posture assertions and the
 // maintenance-viewer path all run at startup or on the maintenance connection. Scoping the probe
 // to a Viewer would make it prove a property of that viewer instead of the pool.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -409,12 +409,6 @@ pub struct AppState {
     ///
     /// Stored once at startup via `Arc` to avoid recreating per request.
     pub jwt_config: Arc<crate::oauth::JwtConfig>,
-    /// In-memory set of revoked access tokens (JWTs)
-    ///
-    /// Bounded by token TTL — entries auto-expire when the token would have expired.
-    /// Used by the /oauth/revoke and bearer middleware.
-    revoked_tokens: Arc<std::sync::RwLock<HashSet<String>>>,
-
     /// Write-authorization gate.
     ///
     /// Defaults to [`epigraph_authz::GroupPolicyGate`], which denies unless the
@@ -434,8 +428,8 @@ pub struct AppState {
     ///
     /// The single source of truth (in-process) for BOTH edge entity-type
     /// validity (`is_valid_entity_type` = `contains_key`) and existence
-    /// checking (`entity_exists`). Uses a `std::sync::RwLock` (like
-    /// `revoked_tokens`) so reads stay synchronous on the hot path.
+    /// checking (`entity_exists`). Uses a `std::sync::RwLock` so reads stay
+    /// synchronous on the hot path.
     ///
     /// Primed by [`AppState::load_entity_type_cache`] at startup (the sync
     /// `with_db` constructors can't `SELECT`, so it starts empty and is loaded
@@ -443,6 +437,21 @@ pub struct AppState {
     /// read-through-on-miss in `entity_exists` / the admin write-through.
     #[cfg(feature = "db")]
     pub entity_type_cache: Arc<std::sync::RwLock<HashMap<String, epigraph_db::EntityTypeEntry>>>,
+
+    /// The admin-scope switch (migration 128) as this process reads it, behind
+    /// a short cache (elevation plan EL-10): every authenticated request's
+    /// [`epigraph_auth::AuthContext::admin_scopes`] comes from here
+    /// ([`Self::admin_scope_posture`]). One per process (cloned states share
+    /// it).
+    #[cfg(feature = "db")]
+    admin_scope_arming: Arc<epigraph_db::AdminScopeArmingCache>,
+
+    /// The WebAuthn relying party for the passkey ceremonies (elevation plan
+    /// EL-3), built once at boot from `EPIGRAPH_WEBAUTHN_*`. `None` when
+    /// passkeys are not configured: every enrollment endpoint then answers 503
+    /// (fail closed; dev and CI run this way).
+    #[cfg(feature = "db")]
+    pub passkeys: Option<Arc<epigraph_passkey::Passkeys>>,
 }
 
 /// API configuration options
@@ -581,6 +590,24 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // The evidence visibility pins (110), FORCEd by the migration that creates
     // them, on the same precedent.
     "evidence_visibility_pins",
+    // The custodian role's catalog and assignments (123), FORCEd by the
+    // migration that creates them, on the same precedent.
+    "platform_roles",
+    "role_assignments",
+    // A registered human's passkeys and their enrollment tickets (124),
+    // FORCEd by the migration that creates them, on the same precedent.
+    "passkey_enrollments",
+    "person_authenticators",
+    // A human's elevation tickets and elevation sessions (125), FORCEd by the
+    // migration that creates them, on the same precedent.
+    "elevation_tickets",
+    "elevation_sessions",
+    // The log of elevated reads (127), FORCEd by the migration that creates
+    // it, on the same precedent.
+    "elevated_access",
+    // The pending admin acts (130), FORCEd by the migration that creates
+    // them, on the same precedent.
+    "pending_admin_acts",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
@@ -1011,7 +1038,6 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
@@ -1058,10 +1084,11 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
+            passkeys: None,
         }
     }
 
@@ -1088,7 +1115,6 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
@@ -1322,6 +1348,15 @@ impl AppState {
             }
         })?;
         scoped.begin_as(viewer).await.map_err(|e| {
+            // An elevated request asking to write is a DENIAL, not a fault.
+            if matches!(e, epigraph_db::DbError::ElevatedReadOnly) {
+                tracing::info!(
+                    target: "tenancy.scoped_write",
+                    handler,
+                    "write refused: the request is elevated (read-only)"
+                );
+                return crate::errors::ApiError::from(e);
+            }
             tracing::error!(
                 target: "tenancy.scoped_write",
                 error = %e,
@@ -1361,6 +1396,11 @@ impl AppState {
         viewer: &epigraph_db::visibility::Viewer,
         handler: &'static str,
     ) -> Result<ClaimWriteTx<'_>, crate::errors::ApiError> {
+        // Refused BEFORE the branch, so the unscoped fallback below cannot
+        // become a way for an elevated request to write.
+        if viewer.is_elevated() {
+            return Err(epigraph_db::DbError::ElevatedReadOnly.into());
+        }
         if self.scoped.is_some() {
             return Ok(ClaimWriteTx::Stamped(self.write_as(viewer, handler).await?));
         }
@@ -1406,10 +1446,11 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
+            passkeys: None,
         }
     }
 
@@ -1438,7 +1479,6 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
@@ -1474,10 +1514,11 @@ impl AppState {
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
+            passkeys: None,
         }
     }
 
@@ -1493,19 +1534,28 @@ impl AppState {
         Arc::new(crate::oauth::JwtConfig::from_secret(secret.as_bytes()))
     }
 
-    /// Add a JWT token to the revocation set.
-    pub fn revoke_access_token(&self, token: &str) {
-        if let Ok(mut set) = self.revoked_tokens.write() {
-            set.insert(token.to_string());
+    /// The admin-scope switch for one request (elevation plan EL-10): read on
+    /// the request pool through this process's cache, failing closed
+    /// ([`epigraph_db::AdminScopeArmingCache::armed`]). A build without a
+    /// database has no switch: unarmed, as before the switch existed.
+    pub async fn admin_scope_posture(&self) -> epigraph_auth::AdminScopePosture {
+        #[cfg(feature = "db")]
+        {
+            if self.admin_scope_arming.armed(&self.db_pool).await {
+                return epigraph_auth::AdminScopePosture::Armed;
+            }
         }
+        epigraph_auth::AdminScopePosture::Unarmed
     }
 
-    /// Check if a JWT token has been revoked.
-    pub fn is_token_revoked(&self, token: &str) -> bool {
-        self.revoked_tokens
-            .read()
-            .map(|set| set.contains(token))
-            .unwrap_or(false)
+    /// Replace the admin-scope switch's cache with one whose reads stand for
+    /// `ttl` (`Duration::ZERO`: every request reads the switch). For tests that
+    /// arm or disarm mid-run.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_admin_scope_arming_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.admin_scope_arming = Arc::new(epigraph_db::AdminScopeArmingCache::with_ttl(ttl));
+        self
     }
 
     /// Get a reference to the audit log for logging security events
@@ -2044,6 +2094,15 @@ impl AppState {
     #[must_use]
     pub fn with_providers(mut self, providers: Arc<ProviderRegistry>) -> Self {
         self.providers = providers;
+        self
+    }
+
+    /// Install the passkey relying party (`None`: passkeys off, the ceremony
+    /// endpoints answer 503).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_passkeys(mut self, passkeys: Option<Arc<epigraph_passkey::Passkeys>>) -> Self {
+        self.passkeys = passkeys;
         self
     }
 }

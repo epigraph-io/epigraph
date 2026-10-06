@@ -83,6 +83,7 @@ pub struct ToolDescriptor {
 }
 
 /// A tool that agents can invoke
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Unique tool identifier
