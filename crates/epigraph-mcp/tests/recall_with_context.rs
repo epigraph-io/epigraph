@@ -543,6 +543,70 @@ async fn corroborates_appears_on_both_endpoints_when_both_in_result_set(pool: Pg
     );
 }
 
+/// U014 PR-1 (backlog 3ce5e00c): the batched CORROBORATES context matched only
+/// the upper-case spelling the cross-source matcher writes. MCP
+/// `link_epistemic` writes `corroborates`, and a later normalise-on-write or
+/// data fold makes every row lower case, so a lower-case edge must be read as
+/// the same corroboration. The fixture's `CORROBORATES` edge from
+/// `paragraphs[0]` is the control.
+#[sqlx::test(migrations = "../../migrations")]
+async fn fetch_batched_context_counts_lowercase_corroborates(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let lower_target = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        lower_target,
+        "lower-case corroboration partner",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        fx.paragraphs[1],
+        "claim",
+        lower_target,
+        "claim",
+        "corroborates",
+        Some(r#"{"strength": 0.8}"#),
+    )
+    .await;
+
+    let ctx = fetch_batched_context(
+        &pool,
+        &viewerfx::public_viewer(&pool).await,
+        &[fx.paragraphs[0], fx.paragraphs[1]],
+        8,
+        4,
+        4,
+    )
+    .await
+    .expect("fetch_batched_context");
+
+    let control = ctx
+        .corroborates_by_paragraph
+        .get(&fx.paragraphs[0])
+        .expect("control: the CORROBORATES edge is read");
+    assert!(control.iter().any(|e| e.claim_id == fx.corroborates_target));
+
+    let lower = ctx
+        .corroborates_by_paragraph
+        .get(&fx.paragraphs[1])
+        .expect("a lower-case `corroborates` edge must appear in the batched context");
+    assert!(
+        lower.iter().any(|e| e.claim_id == lower_target),
+        "paragraphs[1]'s corroborates list must include the lower-case partner",
+    );
+    assert_eq!(
+        ctx.corroborates_total_by_paragraph
+            .get(&fx.paragraphs[1])
+            .copied(),
+        Some(1),
+        "and it is counted once in the per-paragraph total"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
     let viewer = viewerfx::public_viewer(&pool).await;

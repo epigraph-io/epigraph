@@ -119,6 +119,34 @@ async fn shared_atom_unifies_components(pool: PgPool) {
     assert!(large.claim_ids.contains(&a2));
 }
 
+/// U014 PR-1 (backlog 3ce5e00c): `STRUCTURAL_RELATIONSHIPS` named only the
+/// cross-source matcher's `CORROBORATES`. MCP `link_epistemic` writes
+/// `corroborates`, and the planned normalise-on-write / data fold makes every
+/// row lower case, so a lower-case corroboration must unify components exactly
+/// as `shared_atom_unifies_components` shows the upper-case one does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lowercase_corroborates_unifies_components(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let p1 = seed_claim(&pool, agent, 2).await;
+    let a1 = seed_claim(&pool, agent, 3).await;
+    seed_edge(&pool, p1, "claim", a1, "claim", "decomposes_to").await;
+
+    let p2 = seed_claim(&pool, agent, 2).await;
+    let a2 = seed_claim(&pool, agent, 3).await;
+    seed_edge(&pool, p2, "claim", a2, "claim", "decomposes_to").await;
+
+    seed_edge(&pool, a1, "claim", a2, "claim", "corroborates").await;
+
+    let components = compute_components(&pool).await.unwrap();
+    let sizes: Vec<usize> = components.iter().map(|c| c.size).collect();
+    let large = components.iter().find(|c| c.size == 4).unwrap_or_else(|| {
+        panic!("a lower-case corroborates must join both halves; sizes={sizes:?}")
+    });
+    for id in [p1, a1, p2, a2] {
+        assert!(large.claim_ids.contains(&id));
+    }
+}
+
 #[test]
 fn structural_relationships_includes_all_five() {
     let names: Vec<&str> = STRUCTURAL_RELATIONSHIPS.to_vec();
