@@ -151,7 +151,13 @@ pub mod relationships {
     /// keep the btree index on `edges.relationship` usable.
     #[must_use]
     pub fn relationship_spellings(relationship: &str) -> Vec<String> {
-        vec![relationship.to_string()]
+        match CASE_FOLDED_RELATIONSHIPS
+            .iter()
+            .find(|r| r.eq_ignore_ascii_case(relationship))
+        {
+            Some(r) => vec![(*r).to_string(), r.to_ascii_uppercase()],
+            None => vec![relationship.to_string()],
+        }
     }
 
     /// Claim A supports Claim B (evidence relationship)
