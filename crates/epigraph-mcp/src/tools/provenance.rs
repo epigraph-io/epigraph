@@ -128,25 +128,7 @@ pub async fn get_provenance(
     params: GetProvenanceParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
-
-    let limits = Limits {
-        max_depth: params
-            .max_depth
-            .unwrap_or(DEFAULT_MAX_DEPTH)
-            .clamp(1, MAX_MAX_DEPTH),
-        max_nodes: params
-            .max_nodes
-            .unwrap_or(DEFAULT_MAX_NODES)
-            .clamp(1, MAX_MAX_NODES),
-        max_content_chars: params
-            .max_content_chars
-            .unwrap_or(DEFAULT_MAX_CONTENT_CHARS)
-            .clamp(MIN_MAX_CONTENT_CHARS, MAX_MAX_CONTENT_CHARS),
-        max_output_chars: params
-            .max_output_chars
-            .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS)
-            .clamp(MIN_MAX_OUTPUT_CHARS, MAX_MAX_OUTPUT_CHARS),
-    };
+    let limits = Limits::from_params(&params);
 
     let lineage = LineageRepository::get_lineage(
         &server.pool,
@@ -170,6 +152,32 @@ struct Limits {
     max_nodes: usize,
     max_content_chars: usize,
     max_output_chars: usize,
+}
+
+impl Limits {
+    /// Apply the defaults and clamp every caller-supplied cap into its range.
+    /// The floors stop a caller starving the bundle (e.g. `max_output_chars:
+    /// 1` would leave only the target); the ceilings keep it bounded.
+    fn from_params(params: &GetProvenanceParams) -> Self {
+        Self {
+            max_depth: params
+                .max_depth
+                .unwrap_or(DEFAULT_MAX_DEPTH)
+                .clamp(1, MAX_MAX_DEPTH),
+            max_nodes: params
+                .max_nodes
+                .unwrap_or(DEFAULT_MAX_NODES)
+                .clamp(1, MAX_MAX_NODES),
+            max_content_chars: params
+                .max_content_chars
+                .unwrap_or(DEFAULT_MAX_CONTENT_CHARS)
+                .clamp(MIN_MAX_CONTENT_CHARS, MAX_MAX_CONTENT_CHARS),
+            max_output_chars: params
+                .max_output_chars
+                .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS)
+                .clamp(MIN_MAX_OUTPUT_CHARS, MAX_MAX_OUTPUT_CHARS),
+        }
+    }
 }
 
 /// One admitted claim with the evidence and trace entities emitted for it.
@@ -768,6 +776,74 @@ mod tests {
         assert_eq!(b["claim_node_count"], Value::from(1));
         assert_eq!(b["budget_exhausted"], Value::Bool(true));
         assert_eq!(b["truncated"], Value::Bool(true));
+    }
+
+    fn params(
+        max_depth: Option<i32>,
+        max_nodes: Option<usize>,
+        max_content_chars: Option<usize>,
+        max_output_chars: Option<usize>,
+    ) -> GetProvenanceParams {
+        GetProvenanceParams {
+            claim_id: uuid(1).to_string(),
+            max_depth,
+            max_nodes,
+            max_content_chars,
+            max_output_chars,
+        }
+    }
+
+    /// The applied caps, as the bundle echoes them in `limits`.
+    fn echoed(p: &GetProvenanceParams) -> Value {
+        let b: Value = serde_json::from_str(&build_bundle(
+            uuid(1),
+            &lineage(0, 0, 10),
+            Limits::from_params(p),
+        ))
+        .unwrap();
+        b["limits"].clone()
+    }
+
+    #[test]
+    fn caller_caps_are_defaulted_and_clamped_into_range() {
+        // Defaults only.
+        assert_eq!(
+            echoed(&params(None, None, None, None)),
+            serde_json::json!({
+                "max_depth": 5, "max_nodes": 50,
+                "max_content_chars": 500, "max_output_chars": 40_000,
+            })
+        );
+        // Below every floor: a 1-char output budget would starve the bundle
+        // to the target alone, so it is raised to 10,000.
+        assert_eq!(
+            echoed(&params(Some(0), Some(0), Some(1), Some(1))),
+            serde_json::json!({
+                "max_depth": 1, "max_nodes": 1,
+                "max_content_chars": 50, "max_output_chars": 10_000,
+            })
+        );
+        // Above every ceiling: the response stays bounded.
+        assert_eq!(
+            echoed(&params(
+                Some(1_000),
+                Some(1_000_000),
+                Some(10_000_000),
+                Some(10_000_000)
+            )),
+            serde_json::json!({
+                "max_depth": 20, "max_nodes": 500,
+                "max_content_chars": 20_000, "max_output_chars": 500_000,
+            })
+        );
+        // In range: passed through untouched.
+        assert_eq!(
+            echoed(&params(Some(3), Some(7), Some(80), Some(12_345))),
+            serde_json::json!({
+                "max_depth": 3, "max_nodes": 7,
+                "max_content_chars": 80, "max_output_chars": 12_345,
+            })
+        );
     }
 
     #[test]
