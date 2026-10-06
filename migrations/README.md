@@ -823,6 +823,18 @@ Current reservation:
   is in the file's header. **Applied to a throwaway database only, NOT to any
   deployed database.**
 
+- **144**: public `null_retired_claim_embedding_3072` (drain U016, backlog
+  9217b3fb) — backfills `embedding_3072 = NULL` on retired claims and widens
+  052's `chk_deprecated_no_embedding` (same name) to
+  `is_current OR (embedding IS NULL AND embedding_3072 IS NULL)`. Slot from the
+  drain's migration-slot register; checked before claiming: no open PR branch
+  carries a `144`. Sets `lock_timeout = '3s'`. Behaviour in
+  `epigraph-db/tests/deprecated_no_embedding_3072.rs`. **Deploy order:** the
+  `epigraph-cli reembed` binary that selects only current claims first (an
+  older run raises 23514 after this file); apply as a role that bypasses row
+  security. Undo is in the file's header. **Applied to throwaway databases
+  only, NOT to any deployed database.**
+
 - **123+**: public next
 
 Next public migration **outside both reserved tenancy ranges** must be `123` or
