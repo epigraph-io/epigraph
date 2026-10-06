@@ -777,6 +777,118 @@ mod tests {
         );
     }
 
+    // ── supports-edge floor coherence (backlog b3476233) ──────────────────
+    //
+    // `restrict_epistemic_positive` gives expected.pl = 1-(1-pl_s)*f, which
+    // RISES toward 1 as the edge weakens (f → 0). A floor on pl therefore
+    // demands MORE of the target the weaker the support, and a vacuous message
+    // (f → 0) would impose the maximal constraint pl_t ≥ 1. Only the bel floor
+    // (bel_s*f, falling to 0 as f → 0) is a coherent "at least" constraint.
+
+    #[test]
+    fn test_supports_full_plausibility_source_does_not_flag_target_above_bel_floor() {
+        // pl_s == 1.0 is the degenerate case behind ~97% of positive
+        // obstructions >= 0.15 in the 2026-09-17 replay: expected.pl = 1.0 for
+        // every factor, so ANY target with pl < 1 was flagged.
+        let s = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.50, 1.0, 0.0);
+        // bel 0.50 is above the floor 0.50*0.80 = 0.40; pl 0.60 < 1.
+        let target = EpistemicInterval::new(0.50, 0.60, 0.0);
+
+        let obs = compute_cdst_edge_inconsistency(s, t, source, target, "supports", &sci());
+
+        assert!(
+            obs.interval_inconsistency < 1e-9,
+            "target above the bel floor must not be flagged by a pl=1 supporter, got {}",
+            obs.interval_inconsistency
+        );
+        assert!(
+            obs.conflict_component < 1e-9,
+            "conflict_component must also be 0, got {}",
+            obs.conflict_component
+        );
+    }
+
+    #[test]
+    fn test_supports_weaker_edge_never_demands_more() {
+        // Same source/target; `elaborates` (f=0.60) is a weaker positive edge
+        // than `supports` (f=0.80), so it must never impose a larger shortfall.
+        let s = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.50, 0.90, 0.0);
+        let target = EpistemicInterval::new(0.50, 0.90, 0.0);
+
+        let inc = |rel: &str| {
+            compute_cdst_edge_inconsistency(s, t, source, target, rel, &sci())
+                .interval_inconsistency
+        };
+        let sup = inc("supports");
+        let ela = inc("elaborates");
+
+        assert!(
+            ela <= sup + 1e-12,
+            "weaker edge demanded more: elaborates={ela} > supports={sup}"
+        );
+        // Target bel 0.50 clears both bel floors (0.40, 0.30): no shortfall.
+        assert!(sup < 1e-9, "supports shortfall must be 0, got {sup}");
+        assert!(ela < 1e-9, "elaborates shortfall must be 0, got {ela}");
+    }
+
+    #[test]
+    fn test_supports_shortfall_monotone_in_factor_and_vanishes_at_zero() {
+        // Sweep the transmission factor directly via the CDST edge properties
+        // (`cdst_pl > 0.5` → Positive(cdst_bel)). The shortfall must be
+        // non-increasing as f falls, and tend to 0 as the message goes vacuous.
+        let s = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.80, 0.90, 0.0);
+        // Below the bel floor for strong edges (0.80*0.99 = 0.792 > 0.30), above
+        // it for weak ones (0.80*0.30 = 0.24 < 0.30), so the sweep is non-trivial.
+        let target = EpistemicInterval::new(0.30, 0.50, 0.0);
+
+        let factors = [0.99, 0.90, 0.80, 0.60, 0.50, 0.40, 0.30, 0.10, 0.01];
+        let shortfalls: Vec<f64> = factors
+            .iter()
+            .map(|&f| {
+                let props = serde_json::json!({ "cdst_bel": f, "cdst_pl": 0.95 });
+                compute_cdst_edge_inconsistency_with_properties(
+                    s,
+                    t,
+                    source,
+                    target,
+                    "supports",
+                    &props,
+                    &sci(),
+                )
+                .interval_inconsistency
+            })
+            .collect();
+
+        for (w, f) in shortfalls.windows(2).zip(factors.windows(2)) {
+            assert!(
+                w[1] <= w[0] + 1e-12,
+                "shortfall rose as factor fell {}→{}: {}→{} (all: {shortfalls:?})",
+                f[0],
+                f[1],
+                w[0],
+                w[1]
+            );
+        }
+        // Strong edge: genuine bel shortfall 0.80*0.99 - 0.30 = 0.492.
+        assert!(
+            (shortfalls[0] - 0.492).abs() < 1e-9,
+            "f=0.99 shortfall should be the bel shortfall 0.492, got {}",
+            shortfalls[0]
+        );
+        // Near-vacuous edge imposes (almost) no constraint.
+        let last = *shortfalls.last().unwrap();
+        assert!(
+            last < 1e-9,
+            "f=0.01 (near-vacuous) must impose no shortfall, got {last} (all: {shortfalls:?})"
+        );
+    }
+
     #[test]
     fn test_contradicts_conflict_unchanged() {
         // The Negative (contradicts) arm must keep the symmetric Bel/Pl distance
