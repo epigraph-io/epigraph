@@ -279,8 +279,10 @@ async fn candidates_switcher_asks_upstream_for_the_chosen_status() {
     app.upstream.verify().await;
 }
 
-/// An empty list is an answer ("none you can read"), not an error; a failed
-/// one is "unavailable", not empty.
+/// An empty list is an answer, not an error; a failed one is "unavailable",
+/// not empty. The answer is reported as what the API returned, never as
+/// "none you can read": the API's candidate listing does not read with the
+/// viewer's own tenancy, so it can leave out pairs the viewer may read.
 #[tokio::test]
 async fn candidates_empty_state_is_not_an_error() {
     let app = spawn().await;
@@ -296,8 +298,12 @@ async fn candidates_empty_state_is_not_an_error() {
     let s = section(&res.body);
     assert!(s.contains(EMPTY_MARK), "{s}");
     assert!(
-        s.contains("No pending candidates that you can read."),
+        s.contains("The API returned no pending candidates for you."),
         "{s}"
+    );
+    assert!(
+        !s.contains("that you can read"),
+        "an empty answer is not a claim about everything the viewer may read: {s}"
     );
     assert!(!s.contains(UNAVAILABLE_MARK));
     app.upstream.verify().await;

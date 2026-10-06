@@ -158,8 +158,13 @@ bare date, and `since` defaults to 24 hours ago.
   switcher), highest score first, at most the top 100 per status with a
   "there may be more" marker. Each candidate is a side-by-side pair of claim
   excerpts, each linked to its own claim page, with score, verifier verdict
-  and rationale. Only pairs whose **both** claims the viewer may read are
-  listed. There are no decide controls: deciding stays on MCP and the CLI.
+  and rationale. The API returns a pair only when the viewer may read
+  **both** claims, but its listing reads on the API's unstamped application
+  pool, so on an application-role deployment pairs whose claims are private
+  to the viewer's groups can be missing: the page reports what the API
+  returned ("The API returned no pending candidates for you"), never "none
+  you can read". There are no decide controls: deciding stays on MCP and the
+  CLI.
 - **`/acts`** lists the viewer's own admin acts, newest first (at most 50,
   marked when cut): kind, target, reason, status and times. The listing
   route exists only on an API that has the elevation routes. Each signed-in

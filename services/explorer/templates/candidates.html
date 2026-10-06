@@ -6,7 +6,7 @@
 
 {% block content %}
 <h1>Match candidates</h1>
-<p class="muted">Pairs of claims from different sources that the matcher scored as possibly the same finding. Only pairs where you may read both claims are listed, highest score first. This page is read-only; candidates are decided through MCP or the CLI.</p>
+<p class="muted">Pairs of claims from different sources that the matcher scored as possibly the same finding, as the API returned them for you, highest score first. The API never returns a pair unless you may read both claims, and it may also leave out pairs whose claims are private to your groups. This page is read-only; candidates are decided through MCP or the CLI.</p>
 
 <nav class="candidates-status" aria-label="Candidate status">
   <ul class="candidates-status__list">
@@ -27,7 +27,7 @@
   {%- match list %}
   {%- when Degraded::Available { data } %}
   {%- if data.rows.is_empty() %}
-  <p class="muted" data-candidates="empty">No {{ st }} candidates that you can read.</p>
+  <p class="muted" data-candidates="empty">The API returned no {{ st }} candidates for you.</p>
   {%- else %}
   {%- if data.capped %}
   <p class="notice notice--warn" data-candidates="capped">Showing the top {{ limit }} by score; there may be more.</p>

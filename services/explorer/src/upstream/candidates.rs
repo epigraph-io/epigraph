@@ -6,7 +6,12 @@
 //! refused before the handler runs) and is not clamped upstream. An absent
 //! `status` means every status, so the page always sends one. A candidate is
 //! returned only when the viewer may read BOTH claims it names, so an empty
-//! list means "none you can read", not "none".
+//! list never means "none". It does not reliably mean "none you can read"
+//! either: the route reads on the API's unstamped application pool, where
+//! row-level security admits only public claims, so on an application-role
+//! deployment a pair whose claims are private to the viewer's groups can be
+//! missing. The page therefore reports what the API returned, not what the
+//! viewer may read.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
