@@ -6,6 +6,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::middleware::from_fn_with_state;
 use axum::routing::get;
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde::Serialize;
 use tower::{service_fn, ServiceExt};
 use tower_http::trace::TraceLayer;
@@ -191,21 +192,37 @@ fn top_level_segments() -> Vec<String> {
     segments
 }
 
-/// Purge expired sessions, pending logins, handoff codes and cache entries
-/// once a minute.
+/// Run [`housekeep`] once a minute.
 pub fn spawn_housekeeping(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
-            let sessions = state.sessions.purge_older_than(SESSION_MAX_AGE);
-            let flow = state.auth_flow.purge_expired();
-            let cached = state.cache.purge_expired();
-            if sessions + flow + cached > 0 {
-                tracing::debug!(sessions, flow, cached, "housekeeping purged entries");
-            }
+            housekeep(&state, SESSION_MAX_AGE).await;
         }
     })
+}
+
+/// Revocations one housekeeping pass runs at once.
+const HOUSEKEEPING_REVOKE_CONCURRENCY: usize = 4;
+
+/// One housekeeping pass: purge sessions created more than
+/// `session_max_age` ago, expired pending logins and handoff codes, and
+/// expired cache entries, then revoke the refresh tokens the expired
+/// handoffs still held (nothing will redeem them). The revocations are
+/// awaited, a few at a time, before the pass returns.
+pub async fn housekeep(state: &AppState, session_max_age: chrono::Duration) {
+    let sessions = state.sessions.purge_older_than(session_max_age);
+    let (flow, unredeemed) = state.auth_flow.purge_expired();
+    let cached = state.cache.purge_expired();
+    if sessions + flow + cached > 0 {
+        tracing::debug!(sessions, flow, cached, "housekeeping purged entries");
+    }
+    futures::stream::iter(unredeemed)
+        .for_each_concurrent(HOUSEKEEPING_REVOKE_CONCURRENCY, |tokens| async move {
+            auth::oauth::revoke_abandoned(state, &tokens.refresh_token, "expired handoff").await;
+        })
+        .await;
 }
 
 #[cfg(test)]

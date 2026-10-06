@@ -77,6 +77,17 @@ impl<K: Eq + Hash, V: Clone> TtlMap<K, V> {
         }
     }
 
+    /// Remove `key` whatever its deadline: `Ok` with a live value, `Err`
+    /// with an expired one. For values that must be disposed of rather than
+    /// forgotten when they expire (a handoff's tokens); everything else uses
+    /// [`TtlMap::take`].
+    pub fn take_entry(&self, key: &K) -> Option<Result<V, V>> {
+        let now = Instant::now();
+        self.lock()
+            .remove(key)
+            .map(|(deadline, v)| if deadline > now { Ok(v) } else { Err(v) })
+    }
+
     pub fn remove(&self, key: &K) {
         self.lock().remove(key);
     }
@@ -88,6 +99,22 @@ impl<K: Eq + Hash, V: Clone> TtlMap<K, V> {
         let before = map.len();
         map.retain(|_, (deadline, _)| *deadline > now);
         before - map.len()
+    }
+
+    /// Remove every expired entry and return the values, in no particular
+    /// order. [`TtlMap::purge_expired`] for values that must be disposed of.
+    pub fn drain_expired(&self) -> Vec<V> {
+        let now = Instant::now();
+        let mut map = self.lock();
+        let mut expired = Vec::new();
+        for (key, (deadline, v)) in std::mem::take(&mut *map) {
+            if deadline > now {
+                map.insert(key, (deadline, v));
+            } else {
+                expired.push(v);
+            }
+        }
+        expired
     }
 
     /// Entries currently held, including expired ones not yet purged.
@@ -194,6 +221,27 @@ mod tests {
 
         m.insert("late".into(), 8, Duration::ZERO);
         assert_eq!(m.take(&"late".into()), None);
+    }
+
+    /// The disposing forms hand back what they remove, live or expired, and
+    /// leave live entries in place.
+    #[test]
+    fn expired_values_are_handed_back_not_dropped() {
+        let m: TtlMap<String, u32> = TtlMap::new();
+        m.insert("live".into(), 1, Duration::from_secs(60));
+        m.insert("old-a".into(), 2, Duration::ZERO);
+        m.insert("old-b".into(), 3, Duration::ZERO);
+        let mut drained = m.drain_expired();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![2, 3]);
+        assert_eq!(m.len(), 1);
+        assert!(m.drain_expired().is_empty());
+
+        m.insert("late".into(), 4, Duration::ZERO);
+        assert_eq!(m.take_entry(&"late".into()), Some(Err(4)));
+        assert_eq!(m.take_entry(&"live".into()), Some(Ok(1)));
+        assert_eq!(m.take_entry(&"live".into()), None, "single use");
+        assert!(m.is_empty());
     }
 
     #[test]

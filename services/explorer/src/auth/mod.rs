@@ -13,12 +13,16 @@
 //!   `{oauth_base}/oauth/authorize`. A navigation inside an iframe
 //!   (`Sec-Fetch-Dest: iframe`, i.e. the Notion embed) gets a page with a
 //!   button that opens the popup instead, because the AS cannot be framed.
-//! - `GET /auth/callback` checks `state` and the binding, redeems the code at
-//!   once (upstream codes live 60 s), and creates the session. Page mode sets
-//!   the first-party cookie and 303s to `return_to`; popup mode renders a page
-//!   that hands a single-use code to the opening iframe (`static/embed.js`).
-//! - `POST /auth/redeem` (Origin-checked) swaps that code for the
-//!   `SameSite=None; Partitioned` cookie the iframe can hold.
+//! - `GET /auth/callback` checks `state` and the binding and redeems the code
+//!   at once (upstream codes live 60 s). Page mode creates the session, sets
+//!   the first-party cookie and 303s to `return_to`. Popup mode creates no
+//!   session: it holds the minted tokens under a single-use handoff code and
+//!   renders a page that hands the code to the opening iframe
+//!   (`static/embed.js`).
+//! - `POST /auth/redeem` (Origin-checked) swaps that code for a new session
+//!   and the `SameSite=None; Partitioned` cookie the iframe can hold. A code
+//!   that expires unredeemed has its refresh token revoked (by housekeeping,
+//!   or by the late redeem).
 //! - `POST /auth/logout` (Origin-checked) revokes the refresh token upstream,
 //!   drops the session and clears both cookies.
 
@@ -51,6 +55,7 @@ pub use session::{
 };
 
 use flow::{Handoff, PendingLogin, HANDOFF_TTL, MAX_PENDING_LOGINS, PENDING_LOGIN_TTL};
+use oauth::TokenSet;
 
 /// `/auth/*`. Merged into the app router by `app::build_app`.
 pub fn routes() -> Router<AppState> {
@@ -164,6 +169,19 @@ fn page_ctx(state: &AppState, headers: &HeaderMap, current_path: String) -> Page
     let signed_in = read_session_cookie(&state.config, headers)
         .is_some_and(|id| state.sessions.get(&id).is_some());
     PageCtx::new(state.links.clone(), current_path, signed_in)
+}
+
+/// Store a freshly minted token set as a new session: at the page-mode
+/// callback, or when an embed handoff is redeemed. The one place a sign-in
+/// becomes a session, so the token's wider-than-requested flag is carried
+/// over on both paths.
+fn start_session(state: &AppState, tokens: TokenSet) -> SessionId {
+    let scope_widened = tokens.scope_widened;
+    let id = state
+        .sessions
+        .create(tokens.access_token, tokens.refresh_token, tokens.expires_at);
+    state.sessions.set_scope_widened(&id, scope_widened);
+    id
 }
 
 fn html(status: StatusCode, body: Html<String>) -> Response {
@@ -379,12 +397,6 @@ async fn callback(
             );
         }
     };
-    let scope_widened = tokens.scope_widened;
-    let session_id =
-        state
-            .sessions
-            .create(tokens.access_token, tokens.refresh_token, tokens.expires_at);
-    state.sessions.set_scope_widened(&session_id, scope_widened);
     tracing::info!(
         popup = pending.popup,
         took_ms = pending.created_at.elapsed().as_millis() as u64,
@@ -392,14 +404,14 @@ async fn callback(
     );
 
     if pending.popup {
+        // No session yet: the iframe's redeem creates it. Until then the
+        // tokens wait under the handoff code, and are revoked if the code
+        // expires unredeemed.
         let code = random_token(32);
-        state.auth_flow.handoffs.insert(
-            code.clone(),
-            Handoff {
-                session_id: session_id.clone(),
-            },
-            HANDOFF_TTL,
-        );
+        state
+            .auth_flow
+            .handoffs
+            .insert(code.clone(), Handoff { tokens }, HANDOFF_TTL);
         let page = PopupPage {
             ctx: page_ctx(&state, &headers, pending.return_to.clone()),
             status: "ok",
@@ -412,6 +424,7 @@ async fn callback(
 
     // A fresh id on every sign-in (no fixation); the browser's previous
     // session, if any, is replaced rather than left in the store.
+    let session_id = start_session(&state, tokens);
     if let Some(old) = read_session_cookie(&state.config, &headers) {
         state.sessions.remove(&old);
     }
@@ -469,24 +482,33 @@ async fn redeem(
     let code = url::form_urlencoded::parse(&body)
         .find(|(k, _)| k == "code")
         .map(|(_, v)| v.into_owned());
-    let handoff = code
+    let held = code
         .filter(|c| flow::is_token_shaped(c))
-        .and_then(|c| state.auth_flow.handoffs.take(&c))
-        .filter(|h| state.sessions.get(&h.session_id).is_some());
-    let Some(handoff) = handoff else {
-        return Err(AppError::BadRequest(
-            "This sign-in code has expired or was already used. Sign in again.".into(),
-        ));
+        .and_then(|c| state.auth_flow.handoffs.take_entry(&c));
+    let tokens = match held {
+        Some(Ok(handoff)) => handoff.tokens,
+        Some(Err(expired)) => {
+            // Too late: nothing will redeem this code again, so its refresh
+            // token is revoked now rather than left live upstream.
+            oauth::revoke_abandoned(&state, &expired.tokens.refresh_token, "expired handoff").await;
+            return Err(handoff_refused());
+        }
+        None => return Err(handoff_refused()),
     };
+    let session_id = start_session(&state, tokens);
 
     let mut resp = StatusCode::NO_CONTENT.into_response();
     let h = resp.headers_mut();
     h.insert(header::CACHE_CONTROL, NO_STORE);
     h.append(
         header::SET_COOKIE,
-        embed_session_cookie(&state.config, &handoff.session_id),
+        embed_session_cookie(&state.config, &session_id),
     );
     Ok(resp)
+}
+
+fn handoff_refused() -> AppError {
+    AppError::BadRequest("This sign-in code has expired or was already used. Sign in again.".into())
 }
 
 // ---- POST /auth/logout --------------------------------------------------------

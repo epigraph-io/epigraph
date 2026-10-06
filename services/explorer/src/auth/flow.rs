@@ -8,7 +8,8 @@ use axum::http::{HeaderMap, HeaderValue};
 use cookie::{Cookie, SameSite};
 use url::Url;
 
-use super::session::{read_cookie, SessionId};
+use super::oauth::TokenSet;
+use super::session::read_cookie;
 use crate::config::Config;
 use crate::links::Links;
 use crate::ttl::TtlMap;
@@ -52,16 +53,23 @@ pub struct PendingLogin {
 }
 
 /// A popup-issued code the iframe redeems at `POST /auth/redeem`.
+///
+/// It holds the token set the callback minted; the session is created only
+/// when the code is redeemed. So a popup whose code is never redeemed leaves
+/// no session behind, and its refresh token is revoked when the code expires
+/// ([`FlowState::purge_expired`], or a redeem that comes too late). `Debug`
+/// hides the tokens.
 #[derive(Clone, Debug)]
 pub struct Handoff {
-    pub session_id: SessionId,
+    pub tokens: TokenSet,
 }
 
 #[derive(Clone, Default)]
 pub struct FlowState {
     /// OAuth `state` → pending login. Use `take` (single use).
     pub pending: TtlMap<String, PendingLogin>,
-    /// Handoff code → session. Use `take` (single use).
+    /// Handoff code → the tokens it will start a session with. Use
+    /// `take_entry` (single use; an expired entry's tokens are revoked).
     pub handoffs: TtlMap<String, Handoff>,
 }
 
@@ -71,9 +79,17 @@ impl FlowState {
     }
 
     /// Drop expired pending logins and handoff codes (run by the
-    /// housekeeping task in `app.rs`).
-    pub fn purge_expired(&self) -> usize {
-        self.pending.purge_expired() + self.handoffs.purge_expired()
+    /// housekeeping task in `app.rs`). Returns how many entries were
+    /// dropped, and the token sets the expired handoffs still held: the
+    /// caller revokes them.
+    pub fn purge_expired(&self) -> (usize, Vec<TokenSet>) {
+        let unredeemed: Vec<TokenSet> = self
+            .handoffs
+            .drain_expired()
+            .into_iter()
+            .map(|h| h.tokens)
+            .collect();
+        (self.pending.purge_expired() + unredeemed.len(), unredeemed)
     }
 }
 

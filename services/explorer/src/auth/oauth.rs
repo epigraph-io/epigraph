@@ -290,6 +290,18 @@ pub async fn revoke_refresh_token(state: &AppState, refresh_token: &str) -> Resu
     }
 }
 
+/// Revoke a refresh token nothing will present again (`held_by` says what
+/// held it: an unredeemed handoff, a purged session). Best effort, as at
+/// logout: a failure is logged, never the token. An empty token is skipped.
+pub async fn revoke_abandoned(state: &AppState, refresh_token: &str, held_by: &'static str) {
+    if refresh_token.is_empty() {
+        return;
+    }
+    if let Err(e) = revoke_refresh_token(state, refresh_token).await {
+        tracing::warn!(error = %e, held_by, "revoking an abandoned refresh token failed");
+    }
+}
+
 /// POST a form to `{api}/oauth/token` and return the 2xx body, or the
 /// failure as a [`TokenError`].
 ///

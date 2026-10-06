@@ -764,24 +764,24 @@ async fn popup_flow_hands_off_a_single_use_code() {
     app.state.auth_flow.handoffs.insert(
         stale.clone(),
         Handoff {
-            session_id: sid.clone(),
+            tokens: held_tokens(""),
         },
         StdDuration::ZERO,
     );
     let res = redeem(Some(ORIGIN), format!("code={stale}")).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert_eq!(app.state.sessions.len(), 1, "only the redeemed session");
+}
 
-    // A code whose session has since ended is worthless.
-    let orphan = epigraph_explorer::auth::random_token(32);
-    let gone = app.sign_in("x");
-    app.state.sessions.remove(&gone);
-    app.state.auth_flow.handoffs.insert(
-        orphan.clone(),
-        Handoff { session_id: gone },
-        StdDuration::from_secs(60),
-    );
-    let res = redeem(Some(ORIGIN), format!("code={orphan}")).await;
-    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+/// A token set as a handoff holds it (`refresh_token` empty: nothing to
+/// revoke).
+fn held_tokens(refresh_token: &str) -> oauth::TokenSet {
+    oauth::TokenSet {
+        access_token: "held-access".into(),
+        refresh_token: refresh_token.into(),
+        expires_at: Utc::now() + Duration::hours(1),
+        scope_widened: false,
+    }
 }
 
 #[tokio::test]
@@ -1406,14 +1406,14 @@ async fn housekeeping_evicts_expired_sign_in_state() {
     flow.handoffs.insert(
         "expired".into(),
         Handoff {
-            session_id: SessionId::generate(),
+            tokens: held_tokens(""),
         },
         StdDuration::ZERO,
     );
     flow.handoffs.insert(
         "live".into(),
         Handoff {
-            session_id: SessionId::generate(),
+            tokens: held_tokens(""),
         },
         StdDuration::from_secs(60),
     );
@@ -1425,6 +1425,163 @@ async fn housekeeping_evicts_expired_sign_in_state() {
     task.abort();
     assert_eq!(flow.pending.len(), 0);
     assert_eq!(flow.handoffs.len(), 1, "live entries stay");
+}
+
+// ---- tokens nobody will use again -----------------------------------------------------
+
+/// A popup sign-in through the real callback, whose code exchange mints
+/// `access-1` / `refresh-1` with `scope`. Returns the handoff code the popup
+/// page carries.
+async fn popup_sign_in(app: &TestApp, scope: &str) -> String {
+    let started = start_login(app, "?mode=popup").await;
+    any_token_call()
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "access-1",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "refresh-1",
+            "scope": scope
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let res = finish_login(app, &started, "&code=c0de").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(attr(&res.body, "data-status"), Some("ok"));
+    attr(&res.body, "data-handoff")
+        .expect("handoff code")
+        .to_string()
+}
+
+/// `/oauth/revoke` accepts anything, `times` times in all.
+async fn mount_revoke(app: &TestApp, times: u64) {
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(times)
+        .mount(&app.upstream)
+        .await;
+}
+
+/// Let a handoff's 60 s run out now: put it back with no time left.
+fn expire_handoff(app: &TestApp, code: &str) {
+    let handoffs = &app.state.auth_flow.handoffs;
+    let held = handoffs.take(&code.to_string()).expect("handoff held");
+    handoffs.insert(code.to_string(), held, StdDuration::ZERO);
+}
+
+async fn redeem_handoff(app: &TestApp, code: &str) -> TestResponse {
+    send_with(
+        app,
+        Method::POST,
+        "/explorer/auth/redeem",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("origin", ORIGIN),
+        ],
+        &format!("code={code}"),
+    )
+    .await
+}
+
+/// An embed sign-in whose handoff is never redeemed (the iframe was closed,
+/// the redeem POST was lost) leaves no live refresh token behind: the
+/// callback holds the minted tokens in the handoff, not in a session, and
+/// when the handoff expires housekeeping revokes the refresh token it held.
+#[tokio::test]
+async fn an_unredeemed_handoff_leaves_no_live_refresh_token() {
+    let app = app().await;
+    mount_revoke(&app, 1).await;
+    let code = popup_sign_in(&app, "claims:read").await;
+    assert!(
+        app.state.sessions.is_empty(),
+        "no session exists before the handoff is redeemed"
+    );
+    assert_eq!(app.state.auth_flow.handoffs.len(), 1);
+
+    // While the code is live, housekeeping leaves it and its token alone.
+    explorer_app::housekeep(&app.state, explorer_app::SESSION_MAX_AGE).await;
+    assert_eq!(app.state.auth_flow.handoffs.len(), 1);
+    assert_eq!(revocations_of(&app, "refresh-1").await, 0);
+
+    expire_handoff(&app, &code);
+    explorer_app::housekeep(&app.state, explorer_app::SESSION_MAX_AGE).await;
+    assert!(app.state.auth_flow.handoffs.is_empty());
+    assert!(app.state.sessions.is_empty());
+    assert_eq!(
+        revocations_of(&app, "refresh-1").await,
+        1,
+        "the expired handoff's refresh token is revoked"
+    );
+    assert_eq!(
+        token_posts_presenting(&app, "refresh-1").await,
+        0,
+        "and never presented to /oauth/token"
+    );
+
+    // Nothing is left to revoke on a later pass.
+    explorer_app::housekeep(&app.state, explorer_app::SESSION_MAX_AGE).await;
+    assert_eq!(revocations_of(&app, "refresh-1").await, 1);
+}
+
+/// The twin: redeeming the handoff creates exactly one session, from the
+/// tokens the callback minted (scope flag included), and housekeeping then
+/// revokes nothing, because the token now belongs to a live session.
+#[tokio::test]
+async fn a_redeemed_handoff_yields_exactly_one_session() {
+    let app = app().await;
+    mount_revoke(&app, 0).await;
+    let code = popup_sign_in(&app, "claims:read claims:write").await;
+    assert!(
+        app.state.sessions.is_empty(),
+        "the callback creates no session in popup mode"
+    );
+
+    let res = redeem_handoff(&app, &code).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let (sid, _) = set_cookie(&res, "epx_session").expect("embed cookie");
+    let sid = SessionId::parse(&sid).unwrap();
+    assert_eq!(app.state.sessions.len(), 1);
+    let session = app.state.sessions.get(&sid).expect("the redeemed session");
+    assert_eq!(
+        (
+            session.access_token.as_str(),
+            session.refresh_token.as_str()
+        ),
+        ("access-1", "refresh-1")
+    );
+    assert!(
+        session.scope_widened,
+        "the minted token's wider-than-requested flag reaches the session"
+    );
+
+    // Single use: a second redeem is refused and creates nothing.
+    let res = redeem_handoff(&app, &code).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert!(set_cookie(&res, "epx_session").is_none());
+    assert_eq!(app.state.sessions.len(), 1);
+
+    explorer_app::housekeep(&app.state, explorer_app::SESSION_MAX_AGE).await;
+    assert!(app.state.sessions.get(&sid).is_some());
+    assert!(app.state.auth_flow.handoffs.is_empty());
+    assert_eq!(revocations_of(&app, "refresh-1").await, 0);
+}
+
+/// A handoff redeemed after it expired is refused, and the tokens it held
+/// are revoked there and then rather than dropped unrevoked.
+#[tokio::test]
+async fn redeeming_an_expired_handoff_revokes_its_tokens() {
+    let app = app().await;
+    mount_revoke(&app, 1).await;
+    let code = popup_sign_in(&app, "claims:read").await;
+    expire_handoff(&app, &code);
+
+    let res = redeem_handoff(&app, &code).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert!(set_cookie(&res, "epx_session").is_none());
+    assert!(app.state.sessions.is_empty());
+    assert!(app.state.auth_flow.handoffs.is_empty());
+    assert_eq!(revocations_of(&app, "refresh-1").await, 1);
 }
 
 // ---- duplicated cookies -------------------------------------------------------------
