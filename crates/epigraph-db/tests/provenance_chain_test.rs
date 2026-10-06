@@ -513,3 +513,102 @@ async fn an_unreadable_root_yields_an_empty_chain(pool: PgPool) {
         "CALIBRATION: and the walk stops at the depth bound with q still ahead"
     );
 }
+
+/// `chain_conn` on its own transaction with a short `lock_timeout`, so a
+/// statement that waits on a lock another session holds fails instead of
+/// hanging. The error is returned as its message.
+async fn chain_under_lock_timeout(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    root: Uuid,
+) -> Result<epigraph_db::ProvenanceChain, String> {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL lock_timeout = '300ms'")
+        .execute(&mut *tx)
+        .await
+        .expect("set lock_timeout");
+    ProvenanceChainRepository::chain_conn(&mut tx, viewer, root, 1, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// An unreadable root is refused BEFORE the walk, not only after it.
+///
+/// Gating after the walk gives an unreadable root the same body as a missing
+/// one, but not the same cost: the walk still expands from it over public
+/// edges onto readable claims, while a missing root stops at its anchor row,
+/// so response time can tell a private claim with readable ancestry from no
+/// claim at all. Whether the walk ran is observable here, because the walk is
+/// the only statement that reads `edges`: another session holds an ACCESS
+/// EXCLUSIVE lock on `edges`, and the chain runs under a short
+/// `lock_timeout`. A repo that walks first waits on the lock and fails; one
+/// that refuses the root first answers without touching `edges`.
+///
+/// ```text
+///   r (PRIVATE) <- p (public) <- q (public)
+/// ```
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unreadable_root_is_refused_before_the_walk(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "pc-pre-owner").await;
+    let (stranger, _stranger_group) =
+        fixture::seed_agent_with_group(&pool, "pc-pre-stranger").await;
+
+    let r = fixture::seed_group_claim(&pool, owner, owner_group, "pc pre: the private root").await;
+    let p = fixture::seed_public_claim(&pool, owner, "pc pre: public premise p").await;
+    let q = fixture::seed_public_claim(&pool, owner, "pc pre: public premise q").await;
+    let world = fixture::world_group(&pool).await;
+    fixture::seed_edge_owned_by(&pool, p, r, "public", world).await;
+    fixture::seed_edge_owned_by(&pool, q, p, "public", world).await;
+
+    let stranger_viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve the stranger");
+    let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("resolve the owner");
+
+    let mut locker = pool.begin().await.expect("begin the locking session");
+    sqlx::query("LOCK TABLE edges IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *locker)
+        .await
+        .expect("lock edges");
+
+    let chain = chain_under_lock_timeout(&pool, &stranger_viewer, r)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("the walk ran for a root the viewer cannot read (it waited on edges): {e}")
+        });
+    assert!(
+        chain.nodes.is_empty() && chain.edges.is_empty() && chain.cycles.is_empty(),
+        "an unreadable root is an empty chain: {chain:?}"
+    );
+    assert!(!chain.truncated);
+
+    let absent = chain_under_lock_timeout(&pool, &stranger_viewer, Uuid::new_v4())
+        .await
+        .unwrap_or_else(|e| panic!("a missing root does not walk either: {e}"));
+    assert!(absent.nodes.is_empty() && absent.edges.is_empty() && !absent.truncated);
+
+    // CALIBRATION: a root the viewer CAN read walks, so under the same lock
+    // the owner's chain must fail on it. Without this, a lock that `edges`
+    // reads did not wait on would pass the arms above whatever the order.
+    let err = chain_under_lock_timeout(&pool, &owner_viewer, r)
+        .await
+        .expect_err("CALIBRATION: the owner's walk reads edges and must wait on the lock");
+    assert!(
+        err.contains("lock timeout"),
+        "CALIBRATION: the owner's walk failed on the lock, not on something else: {err}"
+    );
+
+    locker.rollback().await.expect("release the lock");
+
+    // And with the lock gone the owner's walk completes.
+    let chain = chain_under_lock_timeout(&pool, &owner_viewer, r)
+        .await
+        .expect("the owner walks once edges is free");
+    let mut ids: Vec<Uuid> = chain.nodes.iter().map(|n| n.id).collect();
+    ids.sort();
+    let mut expected = vec![r, p];
+    expected.sort();
+    assert_eq!(ids, expected);
+}
