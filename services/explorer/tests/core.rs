@@ -1261,3 +1261,82 @@ async fn landing_degrades_each_overview_independently() {
     ));
     assert!(!res.body.contains("secret"));
 }
+
+// ---- cache policy -------------------------------------------------------------------
+
+/// `Vary` lists `Cookie` (in any of the response's `Vary` headers).
+fn varies_on_cookie(res: &common::TestResponse) -> bool {
+    res.header_all("vary")
+        .iter()
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case("cookie"))
+}
+
+/// A signed-in page shows what this viewer may read, so neither the
+/// browser's history cache nor any shared cache may keep a copy.
+#[tokio::test]
+async fn signed_in_html_is_never_stored() {
+    let app = spawn().await;
+    mount_claim_page(&app, 1).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/search/semantic"))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [semantic_hit(CLAIM, CONTENT, 0.9)],
+            "total": 1, "query_time_ms": 3
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+
+    for uri in [
+        format!("/explorer/claim/{CLAIM}"),
+        "/explorer/search?q=water+boils".to_string(),
+    ] {
+        let res = app.get_as(&uri, &sid).await;
+        assert_eq!(res.status, StatusCode::OK, "{uri}: {}", res.body);
+        assert!(
+            res.header("content-type")
+                .is_some_and(|c| c.starts_with("text/html")),
+            "{uri}"
+        );
+        assert!(
+            res.body.contains(CONTENT),
+            "{uri}: the viewer's data is on the page"
+        );
+        assert_eq!(
+            res.header("cache-control"),
+            Some("private, no-store"),
+            "{uri}"
+        );
+        assert!(varies_on_cookie(&res), "{uri}: {:?}", res.headers);
+    }
+}
+
+/// Twin against over-reach: a response that sets its own cache policy keeps
+/// it, even for a signed-in browser.
+#[tokio::test]
+async fn static_assets_keep_their_own_cache_policy() {
+    let app = spawn().await;
+    let sid = app.sign_in("tok");
+
+    let res = app.get_as("/explorer/static/app.css", &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.header("cache-control"), Some("public, max-age=300"));
+    assert!(!varies_on_cookie(&res), "{:?}", res.headers);
+    assert!(res.header_all("set-cookie").is_empty());
+
+    let versioned = app.state.links.static_asset("app.css");
+    let res = app.get_as(&versioned, &sid).await;
+    assert_eq!(
+        res.header("cache-control"),
+        Some("public, max-age=31536000, immutable")
+    );
+    assert!(!varies_on_cookie(&res), "{:?}", res.headers);
+
+    // Error pages keep their own `no-store`, and are not also made `private`.
+    let res = app.get_as("/explorer/no/such/page", &sid).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert_eq!(res.header("cache-control"), Some("no-store"));
+}
