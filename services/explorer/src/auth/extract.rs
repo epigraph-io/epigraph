@@ -2,7 +2,8 @@
 //!
 //! Handlers take one of two extractors:
 //!
-//! - [`Caller`] never rejects: anonymous, session, or dev-bearer. Use it for
+//! - [`Caller`] does not reject for being anonymous: anonymous, session, or
+//!   dev-bearer (only a session found over is `SessionExpired`). Use it for
 //!   the few pages that render for anonymous viewers (`/claim/:id` returns 200
 //!   with a sign-in prompt and OG tags, plan §3.3) and for auth routes.
 //! - [`SignedIn`] rejects anonymous viewers with [`AppError::Unauthorized`],
@@ -13,7 +14,7 @@
 
 use axum::extract::{FromRequestParts, OriginalUri};
 use axum::http::request::Parts;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Method};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
@@ -22,6 +23,7 @@ use super::session::{read_session_cookie, Session, SessionId};
 use crate::error::AppError;
 use crate::links::Links;
 use crate::state::AppState;
+use crate::upstream::capabilities::Capability;
 use crate::upstream::{Api, Degraded};
 
 /// The product name shown in the header and OG `site_name`.
@@ -159,9 +161,10 @@ pub struct PageCtx {
     /// The header's identity strip: set for a signed-in session, `None`
     /// for anonymous viewers and the dev bearer.
     pub identity: Option<IdentityStrip>,
-    /// Whether the section nav shows "Admin acts". False until a capability
-    /// probe has seen the API's admin-acts route: against an API without it
-    /// the item is left out of the HTML, not hidden.
+    /// Whether the section nav shows "Admin acts": only when the capability
+    /// probe has seen the API's admin-acts route (`Present`). Against an API
+    /// without it, or while the answer is unknown, the item is left out of
+    /// the HTML, not hidden.
     pub admin_acts: bool,
 }
 
@@ -181,6 +184,17 @@ impl PageCtx {
     /// The same context with the session's identity strip.
     pub fn with_identity(mut self, identity: Option<IdentityStrip>) -> Self {
         self.identity = identity;
+        self
+    }
+
+    /// The same context with "Admin acts" shown iff the API is remembered
+    /// to have the route. For builders that must not call upstream (error
+    /// and auth pages): they read the remembered answer only.
+    pub fn with_remembered_capabilities(mut self, state: &AppState) -> Self {
+        self.admin_acts = state
+            .capabilities
+            .cached_admin_acts()
+            .is_some_and(Capability::is_present);
         self
     }
 
@@ -303,7 +317,9 @@ async fn resolve_cached(parts: &mut Parts, state: &AppState) -> RequestAuth {
     auth
 }
 
-/// Any viewer. Never rejects.
+/// Any viewer. Never rejects, except with [`AppError::SessionExpired`] when
+/// the section nav's capability probe found the session over (see
+/// [`probe_capabilities`]), as the page's own upstream call would have.
 pub struct Caller {
     pub auth: RequestAuth,
     pub ctx: PageCtx,
@@ -316,6 +332,48 @@ impl Caller {
     }
 }
 
+/// Whether this request renders a page with the section nav: a signed-in
+/// `GET`/`HEAD` outside `/bff/*` (JSON, no layout). Only those probe the
+/// API's optional routes; anonymous pages have no section nav.
+fn renders_section_nav(state: &AppState, parts: &Parts, auth: &RequestAuth) -> bool {
+    if !auth.is_signed_in() || !matches!(parts.method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    let uri = parts
+        .extensions
+        .get::<OriginalUri>()
+        .map(|o| &o.0)
+        .unwrap_or(&parts.uri);
+    let route = state.links.strip_base(uri.path());
+    !(route == "/bff" || route.starts_with("/bff/"))
+}
+
+/// "Admin acts" for this page: the remembered answer, or a probe with the
+/// viewer's own token. Returns the auth to carry on with: a probe that
+/// refreshed the session hands over the new token, so the page never
+/// presents the rotated-out one. A probe that ended the session (its
+/// refresh was refused or its answer lost) is
+/// [`AppError::SessionExpired`], exactly what the page's own first call
+/// would have met: sign-in again, with the cookie cleared.
+async fn probe_capabilities(
+    parts: &mut Parts,
+    state: &AppState,
+    auth: RequestAuth,
+) -> Result<(RequestAuth, bool), AppError> {
+    let api = Api::new(state, &auth);
+    let admin_acts = state.capabilities.admin_acts(&api).await.is_present();
+    let now = api.current_auth();
+    if let Some(id) = now.session_id() {
+        if state.sessions.get(id).is_none() {
+            return Err(AppError::SessionExpired);
+        }
+    }
+    if now != auth {
+        parts.extensions.insert(Resolved(now.clone()));
+    }
+    Ok((now, admin_acts))
+}
+
 impl FromRequestParts<AppState> for Caller {
     type Rejection = AppError;
 
@@ -323,17 +381,22 @@ impl FromRequestParts<AppState> for Caller {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let auth = resolve_cached(parts, state).await;
+        let mut auth = resolve_cached(parts, state).await;
+        let mut admin_acts = false;
+        if renders_section_nav(state, parts, &auth) {
+            (auth, admin_acts) = probe_capabilities(parts, state, auth).await?;
+        }
         let identity = auth
             .session_id()
             .and_then(|id| state.sessions.get(id))
             .map(|s| IdentityStrip::of(&s));
-        let ctx = PageCtx::new(
+        let mut ctx = PageCtx::new(
             state.links.clone(),
             browser_path(state, parts),
             auth.is_signed_in(),
         )
         .with_identity(identity);
+        ctx.admin_acts = admin_acts && auth.is_signed_in();
         Ok(Caller { auth, ctx })
     }
 }

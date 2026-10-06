@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::links::Links;
 use crate::security;
 use crate::ttl::ResponseCache;
+use crate::upstream::capabilities::{Capabilities, CAPABILITY_TTL};
 use crate::upstream::{Api, Upstream};
 
 /// Everything is behind an `Arc` or is itself a cheap handle, so cloning is
@@ -27,6 +28,9 @@ pub struct AppState {
     pub cache: ResponseCache,
     /// Precomputed `Content-Security-Policy` value.
     pub csp: HeaderValue,
+    /// Which optional API routes this deployment has (admin acts), as
+    /// probed with a viewer's own token and remembered per process.
+    pub capabilities: Arc<Capabilities>,
 }
 
 impl AppState {
@@ -41,6 +45,7 @@ impl AppState {
             auth_flow: FlowState::new(),
             cache: ResponseCache::new(),
             csp,
+            capabilities: Arc::new(Capabilities::new(CAPABILITY_TTL)),
         })
     }
 

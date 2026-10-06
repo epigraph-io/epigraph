@@ -173,6 +173,7 @@ fn page_ctx(state: &AppState, headers: &HeaderMap, current_path: String) -> Page
         read_session_cookie(&state.config, headers).and_then(|id| state.sessions.get(&id));
     PageCtx::new(state.links.clone(), current_path, session.is_some())
         .with_identity(session.as_ref().map(IdentityStrip::of))
+        .with_remembered_capabilities(state)
 }
 
 /// Store a freshly minted token set as a new session: at the page-mode

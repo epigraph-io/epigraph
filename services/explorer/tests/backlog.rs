@@ -167,7 +167,7 @@ async fn backlog_refuses_a_multi_label_filter_without_calling_upstream() {
         .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(res.body.contains("one label at a time"), "{}", res.body);
-    let calls = app.upstream.received_requests().await.unwrap_or_default();
+    let calls = common::data_calls(&app).await;
     assert!(calls.is_empty(), "called upstream: {calls:?}");
 }
 

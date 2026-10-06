@@ -51,8 +51,17 @@ async fn get_ok(app: &TestApp, route: &str, body: Value) {
         .await;
 }
 
-/// Fails the test (on `verify`) if anything reaches upstream.
+/// Fails the test (on `verify`) if anything but the section nav's
+/// capability probe reaches upstream. The probe (made by a signed-in page
+/// before its own calls) is answered 404, "no admin acts", like main.
 async fn forbid_upstream(app: &TestApp) {
+    Mock::given(method("GET"))
+        .and(|r: &wiremock::Request| common::is_capability_probe(r))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .named("capability probe")
+        .mount(&app.upstream)
+        .await;
     Mock::given(any())
         .respond_with(ResponseTemplate::new(500))
         .expect(0)

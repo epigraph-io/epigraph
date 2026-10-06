@@ -225,7 +225,8 @@ pub async fn render_errors(State(state): State<AppState>, req: Request, next: Ne
             state.links.browser_path(&received),
             signed_in,
         )
-        .with_identity(session.as_ref().map(auth::IdentityStrip::of));
+        .with_identity(session.as_ref().map(auth::IdentityStrip::of))
+        .with_remembered_capabilities(&state);
         let page = ErrorPage {
             ctx,
             status: err.status().as_u16(),

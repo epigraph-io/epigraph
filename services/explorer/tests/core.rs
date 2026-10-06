@@ -253,12 +253,15 @@ async fn mount_sub_calls(app: &TestApp, times: u64) {
     mount_get(app, &claim_path("/placement"), 200, placement_json(), times).await;
 }
 
+/// Paths of the page's own upstream calls (the capability probe a signed-in
+/// page makes for the section nav is not one of them).
 async fn upstream_paths(app: &TestApp) -> Vec<String> {
     app.upstream
         .received_requests()
         .await
         .expect("request recording is on")
         .iter()
+        .filter(|r| !common::is_capability_probe(r))
         .map(|r| r.url.path().to_string())
         .collect()
 }

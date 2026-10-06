@@ -307,6 +307,20 @@ impl<'a> Api<'a> {
         self.token.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    /// The caller's auth as it stands now: a session carries the access
+    /// token this client last used, which differs from the one it started
+    /// with after a refresh. Hand it to whatever calls upstream next, so a
+    /// rotated-out token is never presented again.
+    pub fn current_auth(&self) -> RequestAuth {
+        match (&self.auth, self.current_token()) {
+            (RequestAuth::Session { id, .. }, Some(access_token)) => RequestAuth::Session {
+                id: id.clone(),
+                access_token,
+            },
+            (auth, _) => auth.clone(),
+        }
+    }
+
     /// `GET {api}{path}` → `T`. `path` starts with `/api/v1/…`.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, UpstreamError> {
         self.send::<T, ()>(Method::GET, path, None, None).await

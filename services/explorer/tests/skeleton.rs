@@ -335,7 +335,7 @@ async fn new_page_stubs_answer_501_not_404() {
         let res = app.get(&format!("{BASE}/{page}")).await;
         assert_eq!(res.status, StatusCode::SEE_OTHER, "{page} anonymous");
     }
-    let calls = app.upstream.received_requests().await.unwrap_or_default();
+    let calls = common::data_calls(&app).await;
     assert!(calls.is_empty(), "a stub called upstream: {calls:?}");
 }
 

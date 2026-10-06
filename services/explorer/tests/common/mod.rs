@@ -24,6 +24,7 @@ use epigraph_explorer::auth::{RequestAuth, SessionId, SESSION_COOKIE};
 use epigraph_explorer::config::{
     Config, ENV_API_URL, ENV_PUBLIC_BASE_URL, ENV_UPSTREAM_TIMEOUT_MS,
 };
+use epigraph_explorer::upstream::capabilities::ADMIN_ACTS_PROBE;
 use epigraph_explorer::{app, AppState};
 use tower::ServiceExt;
 use wiremock::MockServer;
@@ -65,6 +66,29 @@ pub async fn spawn_with(env: &[(&str, &str)], extra: Router<AppState>) -> TestAp
         router,
         upstream,
     }
+}
+
+/// Whether `r` is the admin-acts capability probe
+/// (`upstream::capabilities::ADMIN_ACTS_PROBE`), which a signed-in page
+/// makes before its own calls until the answer is remembered. It is the
+/// section nav's concern, not the page's data.
+pub fn is_capability_probe(r: &wiremock::Request) -> bool {
+    let sent = match r.url.query() {
+        Some(q) => format!("{}?{q}", r.url.path()),
+        None => r.url.path().to_string(),
+    };
+    sent == ADMIN_ACTS_PROBE
+}
+
+/// Every upstream request but the capability probe: what a page asked for.
+pub async fn data_calls(app: &TestApp) -> Vec<wiremock::Request> {
+    app.upstream
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| !is_capability_probe(r))
+        .collect()
 }
 
 pub struct TestResponse {

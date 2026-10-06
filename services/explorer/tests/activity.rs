@@ -339,7 +339,7 @@ async fn activity_without_watch_list_explains_configuration() {
         res.body
     );
     assert!(res.body.contains(ENV_WATCH), "names the variable");
-    let calls = app.upstream.received_requests().await.unwrap_or_default();
+    let calls = common::data_calls(&app).await;
     assert!(calls.is_empty(), "called upstream: {calls:?}");
 }
 
@@ -353,7 +353,7 @@ async fn activity_rejects_a_bad_since_without_calling_upstream() {
         .await;
     assert_eq!(res.status, StatusCode::OK);
     assert!(res.body.contains("is not a time"), "{}", res.body);
-    let calls = app.upstream.received_requests().await.unwrap_or_default();
+    let calls = common::data_calls(&app).await;
     assert!(calls.is_empty(), "called upstream: {calls:?}");
 }
 
