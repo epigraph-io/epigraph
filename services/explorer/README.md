@@ -452,6 +452,26 @@ loopback. `EPIGRAPH_OAUTH_BASE_URL` must be that public API origin.
 
 ### 5. Deploy
 
+**The API must have the Explorer's kernel routes first.** The claim pages
+call four routes that an API built without the Explorer's kernel changes
+does not have:
+
+| Route | Used by |
+|---|---|
+| `GET /api/v1/claims/{id}/ego` | `/claim/{id}/graph` and `/bff/graph/ego/{id}` |
+| `GET /api/v1/claims/{id}/provenance-chain` | `/claim/{id}/provenance` |
+| `GET /api/v1/claims/{id}/placement` | the claim page's placement section |
+| `GET /api/v1/stats` | the landing page's counts |
+
+Against an API without them, the graph and provenance pages answer "claim
+not found" for a claim that exists (the API's answer for an unknown route is
+the same 404 as for an unknown claim), while placement and the counts
+degrade to "unavailable". The audit page also needs that API to read
+security events on the viewer's own connection, or it shows no events at
+all. So deploy the API with those changes before the Explorer, and check
+after deploying both that `/claim/{id}/graph` and `/claim/{id}/provenance`
+render for a claim you can read.
+
 Build the release binary from `services/explorer`:
 
 ```sh
