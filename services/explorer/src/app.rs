@@ -28,13 +28,19 @@ pub const MAX_REQUEST_BODY: usize = 64 * 1024;
 /// needs to stop restart-looping on a config typo.
 ///
 /// KEEP IN SYNC with the `.route(..)` / `.merge(..)` calls below and in
-/// `auth::routes`, `pages::{core,entities,graph}::routes` and
+/// `auth::routes`, `pages::{core,entities,graph}::routes`,
+/// `pages::{backlog,audit,activity,candidates,acts}::routes` and
 /// `bff::{core,graph}::routes`. Adding a top-level route whose first segment
 /// is new means adding it here too.
 pub const RESERVED_BASE_PATH_SEGMENTS: &[&str] = &[
+    "activity",
+    "acts",
     "agent",
+    "audit",
     "auth",
+    "backlog",
     "bff",
+    "candidates",
     "claim",
     "community",
     "evidence",
@@ -70,6 +76,11 @@ pub fn build_app_with(state: AppState, extra: Router<AppState>) -> Router {
         .merge(pages::core::routes())
         .merge(pages::entities::routes())
         .merge(pages::graph::routes())
+        .merge(pages::backlog::routes())
+        .merge(pages::audit::routes())
+        .merge(pages::activity::routes())
+        .merge(pages::candidates::routes())
+        .merge(pages::acts::routes())
         .merge(bff::core::routes())
         .merge(bff::graph::routes())
         .merge(extra);
@@ -176,6 +187,11 @@ fn top_level_segments() -> Vec<String> {
         "/theme/{id}",
         "/community/{id}",
         "/neighborhood/{id}",
+        "/backlog",
+        "/audit",
+        "/activity",
+        "/candidates",
+        "/acts",
         "/bff/claim/{id}",
         "/bff/search",
         "/bff/graph/ego/{id}",

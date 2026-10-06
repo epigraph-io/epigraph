@@ -27,7 +27,8 @@
 //! exactly one refresh attempt per request, so a flapping upstream cannot loop.
 //!
 //! Area agents add typed methods as `impl Api<'_>` blocks in their own
-//! `upstream/{core,entities,graph}.rs`, built on [`Api::get`],
+//! `upstream/<area>.rs` (`core`, `entities`, `graph`, and the MVP pages'
+//! `audit`, `activity`, `candidates`, `capabilities`, `acts`), built on [`Api::get`],
 //! [`Api::get_query`] and [`Api::post`].
 
 use std::collections::HashMap;
@@ -46,6 +47,11 @@ use crate::auth::{self, RequestAuth};
 use crate::config::Config;
 use crate::state::AppState;
 
+pub mod activity;
+pub mod acts;
+pub mod audit;
+pub mod candidates;
+pub mod capabilities;
 pub mod core;
 pub mod degraded;
 pub mod entities;

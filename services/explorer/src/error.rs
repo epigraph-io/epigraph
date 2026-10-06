@@ -53,6 +53,11 @@ pub enum AppError {
     /// 503: the page as a whole cannot be served right now.
     #[error("degraded: {0}")]
     Degraded(String),
+    /// 501 from a page registered ahead of its body (`pages::{backlog,
+    /// audit,activity,candidates,acts}`). The string names the page and is
+    /// shown to the viewer. Delete this variant with the last such stub.
+    #[error("not yet available: {0}")]
+    NotYetAvailable(&'static str),
     /// Internal error (500). The detail is logged, never shown.
     #[error("internal error: {0}")]
     Internal(String),
@@ -98,6 +103,7 @@ impl AppError {
             AppError::Upstream(UpstreamError::Timeout) => StatusCode::GATEWAY_TIMEOUT,
             AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
             AppError::Degraded(_) => StatusCode::SERVICE_UNAVAILABLE,
+            AppError::NotYetAvailable(_) => StatusCode::NOT_IMPLEMENTED,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -113,6 +119,7 @@ impl AppError {
             AppError::Upstream(UpstreamError::Timeout) => "upstream_timeout",
             AppError::Upstream(_) => "upstream_unavailable",
             AppError::Degraded(_) => "degraded",
+            AppError::NotYetAvailable(_) => "not_yet_available",
             AppError::Internal(_) => "internal",
         }
     }
@@ -127,6 +134,7 @@ impl AppError {
             AppError::Forbidden(_) => "No access",
             AppError::Upstream(_) => "EpiGraph is unavailable",
             AppError::Degraded(_) => "Temporarily unavailable",
+            AppError::NotYetAvailable(_) => "Not yet available",
             AppError::Internal(_) => "Something went wrong",
         }
     }
@@ -139,6 +147,7 @@ impl AppError {
             AppError::Unauthorized => "Sign in to continue.".into(),
             AppError::SessionExpired => "Your session has expired. Sign in again.".into(),
             AppError::Upstream(e) => e.user_message().into(),
+            AppError::NotYetAvailable(what) => format!("The {what} page is not yet available."),
             AppError::Internal(_) => "An unexpected error occurred.".into(),
         }
     }

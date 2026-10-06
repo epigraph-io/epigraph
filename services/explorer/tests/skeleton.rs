@@ -290,6 +290,46 @@ async fn every_area_route_is_mounted() {
     }
 }
 
+/// The MVP pages registered ahead of their bodies (one registration, so the
+/// batches that fill them in never touch the router or the reserved
+/// segments again). Each must answer as a mounted page that says "not yet
+/// available" with 501, never as the router fallback's 404, and must not call
+/// upstream. A batch that fills a page in removes its path from here and adds
+/// it to `every_area_route_is_mounted`.
+#[tokio::test]
+async fn new_page_stubs_answer_501_not_404() {
+    let app = spawn().await;
+    let sid = app.sign_in("tok");
+    for page in ["backlog", "audit", "activity", "candidates", "acts"] {
+        // Mounted twice, like every route: under the base path and at the root.
+        for uri in [format!("{BASE}/{page}"), format!("/{page}")] {
+            let res = app.get_as(&uri, &sid).await;
+            assert_eq!(res.status, StatusCode::NOT_IMPLEMENTED, "{uri}");
+            assert!(
+                res.header("content-type")
+                    .unwrap_or_default()
+                    .starts_with("text/html"),
+                "{uri} renders a page"
+            );
+            assert!(res.body.contains("Not yet available"), "{uri}");
+            assert!(
+                !res.body.contains("could not find that page"),
+                "{uri} fell through to the router fallback"
+            );
+            assert!(
+                res.body.contains("href=\"/explorer/\""),
+                "inside the layout"
+            );
+            assert_eq!(res.header("cache-control"), Some("no-store"), "{uri}");
+        }
+        // Like the pages they stand in for, the stubs are for signed-in viewers.
+        let res = app.get(&format!("{BASE}/{page}")).await;
+        assert_eq!(res.status, StatusCode::SEE_OTHER, "{page} anonymous");
+    }
+    let calls = app.upstream.received_requests().await.unwrap_or_default();
+    assert!(calls.is_empty(), "a stub called upstream: {calls:?}");
+}
+
 // ---- error pages ---------------------------------------------------------------
 
 #[tokio::test]
@@ -419,6 +459,37 @@ fn a_base_path_that_shadows_a_route_fails_config_not_the_router_build() {
     }
     start("https://explorer.example.com/explorer").expect("an ordinary base path still starts");
     start("http://localhost:8096").expect("the root base path still starts");
+}
+
+/// The MVP pages claim new top-level segments. A base path naming one must
+/// be refused by config like any other shadowing base path: unreserved, the
+/// router build panics instead (exit 101, restart loop).
+#[test]
+fn every_new_page_segment_is_refused_as_a_base_path() {
+    for page in ["backlog", "audit", "activity", "candidates", "acts"] {
+        let base = format!("https://explorer.example.com/{page}");
+        let lookup = |k: &str| (k == ENV_PUBLIC_BASE_URL).then(|| base.clone());
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match Config::from_lookup(lookup) {
+                Ok(config) => {
+                    let state = AppState::new(config).expect("state builds");
+                    let _router = epigraph_explorer::app::build_app(state);
+                    None
+                }
+                Err(e) => Some(e),
+            }
+        }));
+        assert!(
+            matches!(
+                refused,
+                Ok(Some(ConfigError::Invalid {
+                    var: ENV_PUBLIC_BASE_URL,
+                    ..
+                }))
+            ),
+            "{base} must be refused by config validation, not panic the router build"
+        );
+    }
 }
 
 #[tokio::test]
