@@ -412,14 +412,26 @@ async fn hnsw_graph_reaches_every_row(conn: &mut sqlx::PgConnection, n: i64) {
         .execute(&mut *conn)
         .await
         .expect("SET LOCAL ef_search");
-    let reached: i64 = sqlx::query_scalar(&format!(
+    let probe = format!(
         "SELECT COUNT(*) FROM (SELECT c.id FROM claims c \
          WHERE c.embedding IS NOT NULL AND c.is_current \
          ORDER BY c.embedding <=> '{q}'::vector LIMIT 1000) s"
-    ))
-    .fetch_one(&mut *conn)
-    .await
-    .expect("graph reach probe");
+    );
+    // The probe only measures the graph if it actually walks the index: on a
+    // seq-scan plan it would count every row and calibrate nothing.
+    let plan = sqlx::query_scalar::<_, String>(&format!("EXPLAIN (COSTS OFF) {probe}"))
+        .fetch_all(&mut *conn)
+        .await
+        .expect("EXPLAIN graph reach probe")
+        .join("\n");
+    assert!(
+        plan.contains("idx_claims_embedding_hnsw"),
+        "calibration: graph reach probe not on HNSW plan:\n{plan}"
+    );
+    let reached: i64 = sqlx::query_scalar(&probe)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("graph reach probe");
     sqlx::query("ROLLBACK")
         .execute(&mut *conn)
         .await
@@ -427,6 +439,28 @@ async fn hnsw_graph_reaches_every_row(conn: &mut sqlx::PgConnection, n: i64) {
     assert_eq!(
         reached, n,
         "calibration: HNSW graph reaches only {reached} of {n} rows"
+    );
+}
+
+/// Calibration: the HNSW knobs on `conn` are at pgvector's defaults
+/// (`ef_search = 40`, no iterative scan) right before the act step. Both red
+/// results on origin/main (40 of 50 unscoped rows, 0 of 5 tagged rows) depend
+/// on the scan being truncated at 40; a different image default or a
+/// role/database-level setting would make the tests pass without the fix, so
+/// abort instead. Also proves the reach probe's `SET LOCAL` did not leak.
+/// Needs the `vector` library loaded on `conn` (any prior `::vector` cast):
+/// before that, the `hnsw.*` names are unrecognized.
+async fn assert_hnsw_knobs_at_default(conn: &mut sqlx::PgConnection) {
+    let (iterative, ef): (String, String) = sqlx::query_as(
+        "SELECT current_setting('hnsw.iterative_scan'), current_setting('hnsw.ef_search')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("read hnsw settings");
+    assert_eq!(
+        (iterative.as_str(), ef.as_str()),
+        ("off", "40"),
+        "calibration: hnsw.iterative_scan/ef_search not at pgvector defaults on the test connection"
     );
 }
 
@@ -528,6 +562,7 @@ async fn tag_scoped_dense_leg_returns_every_matching_row_beyond_ef_search(pool: 
     let mut conn = pool.acquire().await.expect("acquire");
     force_hnsw_plan(&mut conn, Some("backlog")).await;
     hnsw_graph_reaches_every_row(&mut conn, 85).await;
+    assert_hnsw_knobs_at_default(&mut conn).await;
 
     let tags = vec!["backlog".to_string()];
     let hits = ClaimRepository::search_hybrid_scoped_since_in_theme(
@@ -566,6 +601,34 @@ async fn tag_scoped_dense_leg_returns_every_matching_row_beyond_ef_search(pool: 
         hits.iter().all(|h| !h.in_lexical),
         "query text matches nothing, so no row may come from the lexical leg"
     );
+    // Rank stability under the iterative scan: with no lexical leg the fused
+    // order is the dense `row_number()` order, which must be the true distance
+    // order — the 50°, 52°, ..., 58° insertion order, with strictly falling
+    // cosine similarity.
+    assert_eq!(
+        dense, tagged,
+        "dense hits must come back in distance (angle) order"
+    );
+    assert_dense_similarity_strictly_falls(&hits);
+}
+
+/// Every hit is dense-only and `dense_similarity` strictly decreases in hit
+/// (i.e. `rrf_score`) order: the dense ranks agree with the actual distances.
+fn assert_dense_similarity_strictly_falls(hits: &[epigraph_db::HybridHit]) {
+    let sims: Vec<f64> = hits
+        .iter()
+        .map(|h| h.dense_similarity.expect("dense-only fixture"))
+        .collect();
+    for (r, w) in sims.windows(2).enumerate() {
+        assert!(
+            w[0] > w[1],
+            "dense rank {} has similarity {} not above rank {}'s {}",
+            r + 1,
+            w[0],
+            r + 2,
+            w[1]
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -573,11 +636,15 @@ async fn unscoped_dense_leg_fills_the_candidate_pool(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
-    // 60 rows > candidate_pool 50 > default ef_search 40.
+    // 60 rows > candidate_pool 50 > default ef_search 40. `ids[i]` is the row
+    // at 0.5 * i degrees, i.e. the i-th nearest to the query.
+    let mut ids = Vec::new();
     for i in 0..60usize {
+        let id = Uuid::new_v4();
+        ids.push(id);
         insert_claim(
             &pool,
-            Uuid::new_v4(),
+            id,
             agent,
             10 + i as u8,
             &format!("unscoped filler row number {i}"),
@@ -591,6 +658,7 @@ async fn unscoped_dense_leg_fills_the_candidate_pool(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire");
     force_hnsw_plan(&mut conn, None).await;
     hnsw_graph_reaches_every_row(&mut conn, 60).await;
+    assert_hnsw_knobs_at_default(&mut conn).await;
 
     // limit 100 (the fused `LIMIT $5`) so the outer cut cannot mask the pool.
     let hits = ClaimRepository::search_hybrid_scoped_since_in_theme(
@@ -610,10 +678,24 @@ async fn unscoped_dense_leg_fills_the_candidate_pool(pool: PgPool) {
     .await
     .expect("hybrid search");
 
-    let dense = hits.iter().filter(|h| h.dense_similarity.is_some()).count();
+    let dense: Vec<Uuid> = hits
+        .iter()
+        .filter(|h| h.dense_similarity.is_some())
+        .map(|h| h.claim_id)
+        .collect();
     assert_eq!(
-        dense, 50,
+        dense.len(),
+        50,
         "unscoped dense leg must fill candidate_pool (50) when 60 rows are \
-         embedded; got {dense}"
+         embedded; got {}",
+        dense.len()
     );
+    // Not just any 50: exactly the 50 nearest rows (0°..24.5°), in distance
+    // order.
+    assert_eq!(
+        dense,
+        ids[..50].to_vec(),
+        "dense leg must be the 50 nearest rows in distance order"
+    );
+    assert_dense_similarity_strictly_falls(&hits);
 }
