@@ -29,10 +29,13 @@ use crate::config::Config;
 use crate::state::AppState;
 use crate::upstream::truncate_chars;
 
-/// The scope the Explorer asks for. Upstream widens it to the user's full
-/// grant on the first refresh (oauth-auth.md §3); it is a statement of
-/// intent, not a boundary.
-pub const SCOPE: &str = "claims:read";
+/// The scopes the Explorer asks for: reading claims, and reading the
+/// security-event trail. The authorization server grants the intersection
+/// of this and what the user holds, so a user without `audit:read` signs in
+/// with `claims:read` alone. Upstream widens it to the user's full grant on
+/// the first refresh (oauth-auth.md §3); it is a statement of intent, not a
+/// boundary.
+pub const SCOPE: &str = "claims:read audit:read";
 /// Largest token-endpoint body the BFF will buffer.
 const MAX_TOKEN_BODY: usize = 64 * 1024;
 /// `expires_in` is believed only up to this (upstream issues 1 h tokens).
@@ -481,7 +484,7 @@ mod tests {
             "https://api.example.com/oauth/authorize?response_type=code\
              &client_id=epigraph_explorer_abc\
              &redirect_uri=https%3A%2F%2Fexplorer.example.com%2Fexplorer%2Fauth%2Fcallback\
-             &code_challenge=chal&code_challenge_method=S256&state=st%26ate&scope=claims%3Aread"
+             &code_challenge=chal&code_challenge_method=S256&state=st%26ate&scope=claims%3Aread+audit%3Aread"
         );
     }
 

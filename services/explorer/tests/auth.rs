@@ -199,7 +199,9 @@ async fn login_redirects_to_authorize_with_pkce_s256() {
     assert_eq!(p["client_id"], CLIENT_ID);
     assert_eq!(p["redirect_uri"], REDIRECT_URI);
     assert_eq!(p["code_challenge_method"], "S256");
-    assert_eq!(p["scope"], "claims:read");
+    // Both scopes are asked for; the API grants only what the user holds
+    // (requested ∩ granted), so asking is safe either way.
+    assert_eq!(p["scope"], "claims:read audit:read");
     assert_eq!(p.len(), 7, "{p:?}");
 
     // challenge == base64url_nopad(sha256(verifier)), verifier = 32 random bytes.
