@@ -3525,6 +3525,29 @@ mod db_tests {
         assert_reverse_symmetric_collapses(pool, "CORROBORATES", false).await;
     }
 
+    /// Option A covers the SAME direction too: `A CONTRADICTS B` filed twice
+    /// without `if_not_exists` is one disagreement, not two (before, the
+    /// second POST was 201 with a second in-force row).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_same_direction_repost_returns_stored_edge(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "same-direction A").await;
+        let b = seed_claim(&pool, agent_id, "same-direction B").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "CONTRADICTS", false)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        let (s2, body2) = post_edge(&router, create_edge_body(a, b, "CONTRADICTS", false)).await;
+
+        assert_eq!(
+            unordered_pair_count(&pool, a, b, "CONTRADICTS").await,
+            1,
+            "a same-direction re-POST must not add a row; second response {s2} {body2}"
+        );
+        assert_eq!(s2, StatusCode::OK, "a dedup hit is 200, not 201: {body2}");
+        assert_eq!(body_id(&body2, "id"), body_id(&body1, "id"));
+    }
+
     /// Negative control: `SUPPORTS` is DIRECTIONAL (A supports B is not B
     /// supports A), so the two orders are two distinct facts and two rows.
     #[sqlx::test(migrations = "../../migrations")]
