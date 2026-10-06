@@ -118,12 +118,12 @@ impl ProvenanceChainRepository {
     /// viewer's tenancy GUCs, and reaching past it to the raw pool is the exact
     /// failure `AppState::read_as` documents — an unstamped connection makes
     /// the RLS policy and the in-query predicate disagree, which hides rows
-    /// from their own owners with no error. Both statements run here, so both
-    /// see the same corpus.
+    /// from their own owners with no error. Every statement runs here, so all
+    /// of them see the same corpus.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the traversal or hydration query
-    /// fails.
+    /// Returns `DbError::QueryFailed` if the root check, the traversal or the
+    /// hydration query fails.
     #[instrument(skip(conn, viewer))]
     pub async fn chain_conn(
         conn: &mut sqlx::PgConnection,
@@ -162,6 +162,16 @@ impl ProvenanceChainRepository {
             ),
         };
 
+        // A root the viewer cannot read gets the answer a missing root gets,
+        // and gets it before the walk. Gating only after the walk (below) gave
+        // the same body but not the same cost: the walk still expanded from
+        // the unreadable root over public edges onto readable claims, up to
+        // the row and node caps, while a missing root stops at one anchor row,
+        // so the response time could tell the two apart.
+        if !Self::root_is_readable(&mut *conn, viewer, claim_id).await? {
+            return Ok(ProvenanceChain::empty(claim_id));
+        }
+
         // The recursive term walks BOTH directions in one frontier (see module
         // docs). `is_cycle` rows are emitted so the caller can see the loop,
         // but are not expanded further — that is what makes this terminate.
@@ -188,13 +198,15 @@ impl ProvenanceChainRepository {
         // endpoint changed) passes the edge predicate while naming a private
         // claim.
         //
-        // The root (the anchor row) is NOT gated here: the caller supplied its
-        // id. It is gated after hydration instead, where a root the viewer
-        // cannot read turns the whole answer into an empty chain (see below).
-        // Gating it here would change this query's text, and with it the
-        // offline `.sqlx` entry. A cycle path always begins at the root, which
-        // is why the cycle filter after hydration exists (see `cycles.retain`
-        // below).
+        // The root (the anchor row) is NOT gated in this query: the caller
+        // supplied its id, and gating it here would change the query's text,
+        // and with it the offline `.sqlx` entry. It is gated twice instead:
+        // BEFORE the walk by `root_is_readable` above, so an unreadable root
+        // costs the same single lookup as a root that does not exist, and
+        // after hydration (see below), for a root that stopped being readable
+        // between the two statements. A cycle path always begins at the root,
+        // which is why the cycle filter after hydration exists (see
+        // `cycles.retain` below).
         let rows = sqlx::query!(
             r#"
             WITH RECURSIVE chain AS (
@@ -315,10 +327,12 @@ impl ProvenanceChainRepository {
             .collect();
 
         // A root the viewer cannot read is the same answer as a root that does
-        // not exist: an empty chain. The anchor row seeds the root
-        // unconditionally (see the walk above), so the walk itself can step
-        // from an unreadable root onto readable claims over a public edge, and
-        // the filters below only remove ids. What they leave would still say
+        // not exist: an empty chain. `root_is_readable` already refused such a
+        // root before the walk; this second gate covers a root whose tenancy
+        // changed between that check and the walk. The anchor row seeds the
+        // root unconditionally (see the walk above), so the walk itself can
+        // step from an unreadable root onto readable claims over a public
+        // edge, and the filters below only remove ids. What they leave would still say
         // that the root exists: readable neighbours at depth 1 and beyond, the
         // depth those neighbours sit at, and `truncated` when the depth bound
         // was reached. The HTTP route already answers 404 here (it looks for
@@ -326,13 +340,7 @@ impl ProvenanceChainRepository {
         // `get_provenance_chain` the same answer, since it serialises whatever
         // this returns.
         if !nodes.iter().any(|n| n.id == claim_id) {
-            return Ok(ProvenanceChain {
-                root: claim_id,
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                truncated: false,
-                cycles: Vec::new(),
-            });
+            return Ok(ProvenanceChain::empty(claim_id));
         }
 
         // Retain the edges against the HYDRATED node set, not against the walk.
@@ -375,6 +383,38 @@ impl ProvenanceChainRepository {
             truncated,
             cycles,
         })
+    }
+
+    /// Whether `viewer` may read claim `claim_id`: one scoped lookup that
+    /// reads `claims` only. A root that does not exist is `false` too, so
+    /// [`Self::chain_conn`] answers both the same way, at the same cost.
+    async fn root_is_readable(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS (SELECT 1 FROM claims r WHERE r.id = $1 /* {VISIBILITY:r} */)",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+}
+
+impl ProvenanceChain {
+    /// The answer for a root the viewer cannot read, or that does not exist.
+    fn empty(root: Uuid) -> Self {
+        Self {
+            root,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            truncated: false,
+            cycles: Vec::new(),
+        }
     }
 }
 
