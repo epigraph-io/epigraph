@@ -488,7 +488,7 @@ impl MatchCandidateRepo {
              FROM edges e
              JOIN claims far
                ON far.id = CASE WHEN e.source_id = $1 THEN e.target_id ELSE e.source_id END
-             WHERE e.relationship = 'CORROBORATES'
+             WHERE e.relationship IN ('CORROBORATES', 'corroborates')
                AND (e.source_id = $1 OR e.target_id = $1)
                /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:far} */",
             2,

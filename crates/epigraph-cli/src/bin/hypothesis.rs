@@ -228,7 +228,7 @@ async fn create(
               SELECT 1 FROM edges e
               WHERE e.target_id = c.id AND e.target_type = 'claim'
                 AND e.source_type IN ('paper', 'evidence', 'analysis')
-                AND e.relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
+                AND e.relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
           )
         ORDER BY similarity DESC LIMIT 50
         "#,

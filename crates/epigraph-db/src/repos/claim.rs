@@ -1040,7 +1040,7 @@ impl ClaimRepository {
                   WHERE e.target_id = c.id
                     AND e.target_type = 'claim'
                     AND e.source_type IN ('paper', 'evidence', 'analysis')
-                    AND e.relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
+                    AND e.relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                     /* {EDGE_VISIBILITY:e} */
               )
               /* {VISIBILITY:c} */
@@ -1967,8 +1967,9 @@ impl ClaimRepository {
                                  THEN e.target_id ELSE e.source_id END
                 WHERE (e.source_id = ANY($2) OR e.target_id = ANY($2))
                   AND e.source_type = 'claim' AND e.target_type = 'claim'
-                  AND e.relationship IN ('CORROBORATES', 'supports', 'refines',
-                                         'continues_argument', 'contradicts')
+                  AND e.relationship IN ('CORROBORATES', 'corroborates', 'supports',
+                                         'refines', 'continues_argument',
+                                         'contradicts')
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{embedding_col} <=> $1::vector
                 LIMIT 50
@@ -5905,7 +5906,7 @@ impl ClaimRepository {
     ///
     /// Grounded evidence means at least one of:
     /// - `paper  --asserts-->          claim`
-    /// - `evidence --SUPPORTS-->       claim`
+    /// - `evidence --SUPPORTS-->       claim` (either spelling, `SUPPORTS` or `supports`)
     /// - `analysis --concludes-->      claim`
     /// - `analysis --provides_evidence--> claim`
     pub async fn has_grounded_evidence<'e, E: sqlx::PgExecutor<'e>>(
@@ -5920,7 +5921,7 @@ impl ClaimRepository {
                 WHERE target_id = $1
                   AND target_type = 'claim'
                   AND source_type IN ('paper', 'evidence', 'analysis')
-                  AND relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
+                  AND relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                   /* {EDGE_VISIBILITY:edges} */
             )
             "#,
