@@ -49,6 +49,41 @@ async fn evidence_rows(
     .expect("read evidence rows")
 }
 
+async fn evidence_visibility(pool: &PgPool, evidence_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT visibility FROM evidence WHERE id = $1")
+        .bind(evidence_id)
+        .fetch_one(pool)
+        .await
+        .expect("read evidence visibility")
+}
+
+/// The evidence ids `GET /lineage/:id` lists on node `claim_id`, as `token`.
+async fn lineage_evidence(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    token: &str,
+    claim_id: Uuid,
+) -> (Vec<String>, serde_json::Value) {
+    let lineage: serde_json::Value = client
+        .get(format!("http://{addr}/lineage/{claim_id}?max_depth=1"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("GET /lineage")
+        .json()
+        .await
+        .expect("lineage json");
+    let ids = lineage["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|n| n["claim_id"].as_str() == Some(claim_id.to_string().as_str()))
+        .flat_map(|n| n["evidence"].as_array().cloned().unwrap_or_default())
+        .filter_map(|e| e["id"].as_str().map(str::to_string))
+        .collect();
+    (ids, lineage)
+}
+
 async fn post_claim(
     client: &reqwest::Client,
     endpoint: &str,
@@ -127,6 +162,12 @@ async fn create_claim_with_derived_from_records_derivation_evidence() {
          evidence row; got {rows:?}"
     );
     let (evidence_id, ev_type, props, raw) = &rows[0];
+    assert_eq!(
+        evidence_visibility(&pool, *evidence_id).await,
+        "public",
+        "the derivation evidence of a public atom must be public, or every other \
+         viewer still reads evidence_ids=[]"
+    );
     assert_eq!(
         ev_type, "document",
         "derivation evidence is stored as `document`"
@@ -327,5 +368,138 @@ async fn derived_from_an_unavailable_parent_is_refused_without_writing_the_atom(
         answers.windows(2).all(|w| w[0] == w[1]),
         "invisible, non-public and nonexistent parents must get one identical \
          answer (no existence oracle); got {answers:?}"
+    );
+}
+
+/// The production shape of a dedup hit: `submit_atom` posts the PARENT's author
+/// as `agent_id`, so when the atom text already exists for that author (a
+/// legacy import, say) `if_not_exists` returns a public claim the calling
+/// service client does NOT own. The derivation row is then attached by a
+/// non-owner (migration 114 arm (e): writer-owned, still public). It must be
+/// written — not refused with a 500 that would abort a whole decompose run —
+/// it must be public, and an unrelated viewer must see it through the lineage
+/// read, which is the viewer the original report was filed from.
+#[tokio::test(flavor = "multi_thread")]
+async fn derived_from_on_a_dedup_hit_of_a_claim_the_caller_does_not_own() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, client_row) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let (stranger_token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let client = reqwest::Client::new();
+    let endpoint = format!("http://{addr}/api/v1/claims");
+    let run = Uuid::new_v4();
+
+    // The legacy author, and an existing public claim of theirs whose text the
+    // decomposition will produce again. Real BLAKE3 hash, so the API dedups.
+    let legacy_author = common::seed_system_agent(&pool).await;
+    let atom_text = format!("U041 pre-existing atom {run}: the string is inextensible.");
+    let existing = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels) \
+         VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[])",
+    )
+    .bind(existing)
+    .bind(&atom_text)
+    .bind(epigraph_crypto::ContentHasher::hash(atom_text.as_bytes()).as_slice())
+    .bind(legacy_author)
+    .execute(&pool)
+    .await
+    .expect("seed the pre-existing claim");
+    let caller_agent: Uuid = sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+        .bind(client_row)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let caller_group = common::personal_group_of(&pool, caller_agent).await;
+    let (vis, owner): (String, Uuid) =
+        sqlx::query_as("SELECT visibility, owner_group_id FROM claims WHERE id = $1")
+            .bind(existing)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(vis, "public", "fixture: the pre-existing claim is public");
+    assert_ne!(
+        owner, caller_group,
+        "fixture: the pre-existing claim must NOT be owned by the caller"
+    );
+
+    // A public parent, created by the caller.
+    let parent_text =
+        format!("U041 dedup parent {run}: the string is inextensible. The pulley is frictionless.");
+    let (st, body) = post_claim(
+        &client,
+        &endpoint,
+        &token,
+        serde_json::json!({ "content": parent_text, "agent_id": legacy_author }),
+    )
+    .await;
+    assert!(st.is_success(), "seeding the parent failed: {st} {body}");
+    let parent = id_of(&body);
+
+    let (st, body) = post_claim(
+        &client,
+        &endpoint,
+        &token,
+        serde_json::json!({
+            "content": atom_text,
+            "agent_id": legacy_author,
+            "initial_truth": 0.5,
+            "if_not_exists": true,
+            "labels": ["atom", "generality:0"],
+            "derived_from": {"claim_id": parent, "method": "decompose_claims"},
+        }),
+    )
+    .await;
+    assert!(
+        st.is_success(),
+        "a dedup hit on a claim the caller does not own must still succeed (a 500 \
+         here aborts a whole decompose run); got {st} {body}"
+    );
+    assert_eq!(
+        id_of(&body),
+        existing,
+        "the POST must dedup onto the existing claim"
+    );
+    assert!(
+        !body
+            .get("was_created")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        "must be a dedup hit; body={body}"
+    );
+
+    let rows = evidence_rows(&pool, existing).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the non-owned dedup hit must get exactly one derivation row; got {rows:?}"
+    );
+    let (evidence_id, _, props, _) = &rows[0];
+    assert_eq!(
+        props
+            .get("derived_from_claim")
+            .and_then(serde_json::Value::as_str),
+        Some(parent.to_string().as_str()),
+        "props={props}"
+    );
+    assert_eq!(
+        evidence_visibility(&pool, *evidence_id).await,
+        "public",
+        "a writer-owned derivation row on a public claim must stay public"
+    );
+
+    let (seen, lineage) = lineage_evidence(&client, addr, &stranger_token, existing).await;
+    assert!(
+        seen.contains(&evidence_id.to_string()),
+        "an unrelated viewer must see the derivation evidence through lineage; \
+         lineage={lineage}"
     );
 }
