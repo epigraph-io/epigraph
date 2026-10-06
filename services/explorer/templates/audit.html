@@ -38,8 +38,10 @@
   {%- if let Some(c) = v.result.counts() %}
   {%- if c.reads_beyond_own %}
   <p class="notice" data-audit="beyond-own">This window includes events of other agents, or of no agent: this account reads more than its own security events.</p>
-  {%- else %}
+  {%- else if c.is_own() %}
   <p class="small muted" data-audit="own">You see only your own security events.</p>
+  {%- else %}
+  <p class="small muted" data-audit="scope-unknown">This window does not show whose security events this account may read: it holds no event, or your access token names no agent to compare them with.</p>
   {%- endif %}
 
   {%- if c.capped_at.is_some() %}

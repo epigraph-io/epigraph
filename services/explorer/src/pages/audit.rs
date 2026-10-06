@@ -14,9 +14,17 @@
 //!   the counts read so far under an "incomplete" banner;
 //! - a window holding more than the ceiling is marked "capped".
 //!
-//! Which rows the viewer may read is the kernel's decision. The page says
-//! "you see only your own security events" unless the rows it read show
-//! more: an event with no agent, or events of two agents.
+//! Which rows the viewer may read is the kernel's decision. The page compares
+//! the rows it read with the viewer's own agent id (the `agent_id` its access
+//! token names, [`crate::upstream::identity::token_agent_id`]), which is the
+//! id the kernel writes on the viewer's own events:
+//! - every row is the viewer's own: "you see only your own security events";
+//! - a row has no agent, or another agent's id: this account reads more than
+//!   its own events;
+//! - no row, or the viewer's own id is not known (a token that names no
+//!   agent): the window cannot say, and the page says that rather than guess.
+//!   Without the viewer's id, rows of two agents or an unattributed row still
+//!   show the account reads beyond one agent's trail.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -37,6 +45,7 @@ use crate::state::AppState;
 use crate::upstream::audit::{
     rfc3339, AuditFilter, AuditPull, PullStop, SecurityEvent, AUDIT_PAGE_ROWS, AUDIT_READ_SCOPE,
 };
+use crate::upstream::identity::token_agent_id;
 use crate::upstream::{truncate_chars, UpstreamError};
 use crate::view::render;
 
@@ -174,6 +183,31 @@ pub struct EventRow {
     pub agent_url: Option<String>,
 }
 
+/// Whose events a window shows, judged against the viewer's own agent id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventScope {
+    /// Every row is the viewer's own.
+    Own,
+    /// A row has no agent, or names an agent that is not the viewer.
+    BeyondOwn,
+    /// No row, or the viewer's own agent id is not known.
+    Unknown,
+}
+
+/// Judge `rows` against `viewer` (see the module doc).
+pub fn event_scope(rows: &[SecurityEvent], viewer: Option<Uuid>) -> EventScope {
+    let unattributed = rows.iter().any(|e| e.agent_id.is_none());
+    let agents: HashSet<Uuid> = rows.iter().filter_map(|e| e.agent_id).collect();
+    match viewer {
+        _ if unattributed => EventScope::BeyondOwn,
+        Some(v) if agents.iter().any(|a| *a != v) => EventScope::BeyondOwn,
+        None if agents.len() > 1 => EventScope::BeyondOwn,
+        Some(_) if !agents.is_empty() => EventScope::Own,
+        _ => EventScope::Unknown,
+    }
+}
+
 /// What was counted in a window.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AuditCounts {
@@ -184,10 +218,18 @@ pub struct AuditCounts {
     pub capped_at: Option<usize>,
     /// Why the counts stop short of the window, when they do.
     pub partial: Option<String>,
-    /// The rows show events of no agent, or of more than one agent.
+    /// Whose events the rows show.
+    pub scope: EventScope,
+    /// `scope` is [`EventScope::BeyondOwn`].
     pub reads_beyond_own: bool,
     /// Drill-down only: the newest [`DRILL_ROWS`] rows.
     pub rows: Vec<EventRow>,
+}
+
+impl AuditCounts {
+    pub fn is_own(&self) -> bool {
+        self.scope == EventScope::Own
+    }
 }
 
 /// The audit section's state.
@@ -261,30 +303,25 @@ fn event_row(e: SecurityEvent, links: &Links) -> EventRow {
 }
 
 /// Count a pull by type. `drill` keeps the newest [`DRILL_ROWS`] rows;
-/// `drill_url` builds a type's drill-down link.
+/// `drill_url` builds a type's drill-down link; `viewer` is the viewer's own
+/// agent id, if known.
 pub fn tally(
     pull: AuditPull,
     ceiling: usize,
     drill: bool,
+    viewer: Option<Uuid>,
     links: &Links,
     drill_url: impl Fn(&str) -> String,
 ) -> AuditCounts {
     let mut by_type: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-    let mut agents: HashSet<Uuid> = HashSet::new();
-    let mut unattributed = false;
     for e in &pull.rows {
         let entry = by_type.entry(e.event_type.clone()).or_default();
         entry.0 += 1;
         if e.success == Some(false) {
             entry.1 += 1;
         }
-        match e.agent_id {
-            Some(a) => {
-                agents.insert(a);
-            }
-            None => unattributed = true,
-        }
     }
+    let scope = event_scope(&pull.rows, viewer);
     let mut types: Vec<TypeCount> = by_type
         .into_iter()
         .map(|(event_type, (total, failures))| TypeCount {
@@ -332,7 +369,8 @@ pub fn tally(
         events_read,
         capped_at,
         partial,
-        reads_beyond_own: unattributed || agents.len() > 1,
+        scope,
+        reads_beyond_own: scope == EventScope::BeyondOwn,
         rows,
     }
 }
@@ -368,10 +406,15 @@ pub async fn compose(
                         filter.failures_only,
                     )
                 };
+                // The viewer's own agent, read from its own token for
+                // display (the request's current token: a refresh mid-pull
+                // keeps the agent).
+                let viewer = user.auth.bearer().and_then(token_agent_id);
                 AuditResult::Counted(tally(
                     pull,
                     ceiling,
                     filter.event_type.is_some(),
+                    viewer,
                     &state.links,
                     drill_url,
                 ))
@@ -582,6 +625,66 @@ mod tests {
         };
         assert!(flags("1") && flags("true") && flags(" ON "));
         assert!(!flags("0") && !flags("") && !flags("no"));
+    }
+
+    fn row(n: u128, agent: Option<u128>) -> SecurityEvent {
+        SecurityEvent {
+            id: Uuid::from_u128(n),
+            event_type: "auth_attempt".into(),
+            agent_id: agent.map(Uuid::from_u128),
+            success: Some(false),
+            details: serde_json::Value::Null,
+            ip_address: None,
+            correlation_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn whose_events_is_judged_against_the_viewers_own_agent() {
+        use EventScope::*;
+        let me = Some(Uuid::from_u128(7));
+        for (label, rows, viewer, want) in [
+            ("all mine", vec![row(1, Some(7)), row(2, Some(7))], me, Own),
+            // One agent that is not the viewer: an admin's window filled by
+            // one client's failures is not "your own".
+            ("one other agent", vec![row(1, Some(42))], me, BeyondOwn),
+            (
+                "mine and another",
+                vec![row(1, Some(7)), row(2, Some(42))],
+                me,
+                BeyondOwn,
+            ),
+            (
+                "unattributed",
+                vec![row(1, Some(7)), row(2, None)],
+                me,
+                BeyondOwn,
+            ),
+            ("empty window", vec![], me, Unknown),
+            // The viewer's id is not known: one agent cannot be called own.
+            (
+                "one agent, viewer unknown",
+                vec![row(1, Some(7))],
+                None,
+                Unknown,
+            ),
+            (
+                "two agents, viewer unknown",
+                vec![row(1, Some(7)), row(2, Some(42))],
+                None,
+                BeyondOwn,
+            ),
+            (
+                "unattributed, viewer unknown",
+                vec![row(1, None)],
+                None,
+                BeyondOwn,
+            ),
+            ("empty, viewer unknown", vec![], None, Unknown),
+        ] {
+            assert_eq!(event_scope(&rows, viewer), want, "{label}");
+        }
     }
 
     #[test]

@@ -36,6 +36,13 @@ const SINCE: &str = "2026-10-01T00:00:00Z";
 const AGENT: &str = "1b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
 const OTHER_AGENT: &str = "2c8b6b5f-6054-4d5c-8b63-4a1e2f3d8b21";
 const NOT_GRANTED: &str = "not granted audit:read";
+const SCOPE_UNKNOWN: &str = "does not show whose security events this account may read";
+
+/// The viewer's access token: shaped like the API's, naming [`AGENT`] as
+/// its agent. The page compares the rows' `agent_id` with it.
+fn tok() -> String {
+    common::jwt_with_agent(AGENT)
+}
 const OWN_EVENTS: &str = "You see only your own security events";
 const BEYOND_OWN: &str = "reads more than its own security events";
 
@@ -83,7 +90,10 @@ fn event_at(
 fn security_page(since: &str) -> MockBuilder {
     Mock::given(method("GET"))
         .and(path("/api/v1/audit/security"))
-        .and(header("authorization", "Bearer tok"))
+        .and(header(
+            "authorization",
+            format!("Bearer {}", tok()).as_str(),
+        ))
         .and(query_param("since", since))
         .and(query_param("limit", "1000"))
 }
@@ -145,7 +155,7 @@ async fn audit_groups_by_type_with_failure_counts() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
 
     let res = app.get_as(&audit_url(""), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -221,7 +231,7 @@ async fn audit_pages_with_until_and_marks_a_capped_window() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
 
     let res = app.get_as(&audit_url(""), &sid).await;
     assert_eq!(res.status, StatusCode::OK);
@@ -292,7 +302,7 @@ async fn audit_window_until_bounds_the_first_page_and_survives_its_links() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
 
     let res = app
         .get_as(&audit_url(&format!("&until={until}")), &sid)
@@ -366,7 +376,7 @@ async fn audit_page_over_the_body_cap_shows_partial_not_500() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
 
     let res = app.get_as(&audit_url(""), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -398,7 +408,7 @@ async fn audit_without_scope_explains_and_makes_no_call() {
         .expect(0)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
     // The token response granted claims:read only.
     app.state
         .sessions
@@ -435,7 +445,7 @@ async fn audit_upstream_403_is_the_not_granted_state() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok"); // scope not reported
+    let sid = app.sign_in(&tok()); // scope not reported
 
     let res = app.get_as(&audit_url(""), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -455,7 +465,7 @@ async fn audit_first_page_failure_is_unavailable_not_an_error() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
     let res = app.get_as(&audit_url(""), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(
@@ -471,7 +481,7 @@ async fn audit_first_page_failure_is_unavailable_not_an_error() {
 
     // Nothing mounted: wiremock answers 404.
     let app = spawn().await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
     let res = app.get_as(&audit_url(""), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(
@@ -499,7 +509,7 @@ async fn audit_failures_only_asks_upstream_for_failures() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
 
     let res = app.get_as(&audit_url("&failures=1"), &sid).await;
     assert_eq!(res.status, StatusCode::OK);
@@ -556,7 +566,7 @@ async fn audit_filters_reach_every_page_of_a_long_window() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
     let res = app.get_as(&audit_url("&failures=1"), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(
@@ -590,7 +600,7 @@ async fn audit_filters_reach_every_page_of_a_long_window() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
     let res = app.get_as(&audit_url("&type=token_rotation"), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(
@@ -631,7 +641,7 @@ async fn audit_session_ending_on_a_later_page_signs_the_viewer_out() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
 
     let res = app.get_as(&audit_url(""), &sid).await;
     assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
@@ -674,7 +684,7 @@ async fn audit_drill_down_lists_one_types_rows() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
 
     let res = app.get_as(&audit_url("&type=auth_attempt"), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -708,7 +718,7 @@ async fn audit_rejects_a_bad_window_without_calling_upstream() {
         .expect(0)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
     for (uri, why) in [
         (format!("{BASE}/audit?since=yesterday"), "is not a time"),
         (
@@ -726,19 +736,22 @@ async fn audit_rejects_a_bad_window_without_calling_upstream() {
     app.upstream.verify().await;
 }
 
-/// Whose events (P4 unmeasured): the page says "your own" unless the rows
-/// themselves show more: an event with no agent, or events of two agents,
-/// mean this account reads more than its own trail, and the page says so.
+/// Whose events (P4 unmeasured): the rows are judged against the viewer's
+/// own agent, the one its access token names. All of them the viewer's own:
+/// "your own". A row with no agent, or with another agent's id (even when
+/// it is the only agent in the window, as when one client's failures fill
+/// an admin's window): this account reads more. No row: the window cannot
+/// say, and the page says so rather than "your own".
 #[tokio::test]
-async fn audit_scope_note_says_own_events_unless_the_rows_show_more() {
-    for (label, rows, beyond) in [
+async fn audit_scope_note_judges_the_rows_against_the_viewers_own_agent() {
+    for (label, rows, note) in [
         (
-            "one agent",
+            "the viewer's own events",
             vec![
                 event(0, "auth_attempt", Some(AGENT), Some(true)),
                 event(1, "auth_attempt", Some(AGENT), Some(false)),
             ],
-            false,
+            OWN_EVENTS,
         ),
         (
             "an unattributed event",
@@ -746,7 +759,7 @@ async fn audit_scope_note_says_own_events_unless_the_rows_show_more() {
                 event(0, "auth_attempt", Some(AGENT), Some(true)),
                 event(1, "suspicious_activity", None, None),
             ],
-            true,
+            BEYOND_OWN,
         ),
         (
             "two agents",
@@ -754,35 +767,64 @@ async fn audit_scope_note_says_own_events_unless_the_rows_show_more() {
                 event(0, "auth_attempt", Some(AGENT), Some(true)),
                 event(1, "auth_attempt", Some(OTHER_AGENT), Some(true)),
             ],
-            true,
+            BEYOND_OWN,
         ),
+        (
+            "only another agent",
+            vec![
+                event(0, "auth_attempt", Some(OTHER_AGENT), Some(false)),
+                event(1, "auth_attempt", Some(OTHER_AGENT), Some(false)),
+            ],
+            BEYOND_OWN,
+        ),
+        ("an empty window", vec![], SCOPE_UNKNOWN),
     ] {
         let app = spawn().await;
+        let read = rows.len();
         first_page()
             .respond_with(ok(rows))
             .expect(1)
             .mount(&app.upstream)
             .await;
-        let sid = app.sign_in("tok");
+        let sid = app.sign_in(&tok());
         let res = app.get_as(&audit_url(""), &sid).await;
         assert!(
-            res.body.contains("data-events-read=\"2\""),
+            res.body.contains(&format!("data-events-read=\"{read}\"")),
             "{label}: {}",
             res.body
         );
-        assert_eq!(
-            res.body.contains(BEYOND_OWN),
-            beyond,
-            "{label}: {}",
-            res.body
-        );
-        assert_eq!(
-            res.body.contains(OWN_EVENTS),
-            !beyond,
-            "{label}: {}",
-            res.body
-        );
+        for marker in [OWN_EVENTS, BEYOND_OWN, SCOPE_UNKNOWN] {
+            assert_eq!(
+                res.body.contains(marker),
+                marker == note,
+                "{label}: {marker:?} {}",
+                res.body
+            );
+        }
     }
+
+    // A token that names no agent (not a JWT): one agent's rows cannot be
+    // called the viewer's own.
+    let app = spawn().await;
+    security_page_any_bearer()
+        .respond_with(ok(vec![event(0, "auth_attempt", Some(AGENT), Some(true))]))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("opaque-token");
+    let res = app.get_as(&audit_url(""), &sid).await;
+    assert!(res.body.contains("data-events-read=\"1\""), "{}", res.body);
+    assert!(res.body.contains(SCOPE_UNKNOWN), "{}", res.body);
+    assert!(!res.body.contains(OWN_EVENTS), "{}", res.body);
+}
+
+/// The audit route for any bearer, first page of an unfiltered pull.
+fn security_page_any_bearer() -> MockBuilder {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/audit/security"))
+        .and(query_param("since", SINCE))
+        .and(query_param("limit", "1000"))
+        .and(query_param_is_missing("until"))
 }
 
 /// More than a page of events sharing one timestamp cannot be paged past
@@ -806,7 +848,7 @@ async fn audit_a_window_it_cannot_page_past_is_partial() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
 
     let res = app.get_as(&audit_url(""), &sid).await;
     assert_eq!(res.status, StatusCode::OK);
@@ -843,7 +885,7 @@ async fn bff_audit_serves_the_counted_window_as_json() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    let sid = app.sign_in("tok");
+    let sid = app.sign_in(&tok());
 
     let res = app
         .get_as(&format!("{BASE}/bff/audit?since={SINCE}"), &sid)
