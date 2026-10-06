@@ -773,6 +773,214 @@ async fn writer_rejects_span_text_drift(pool: PgPool) {
     );
 }
 
+// ── Backlog a55aac45 / U039: placeholder author names ──────────────────────
+//
+// arXiv:2606.16707 was ingested with `source.authors = [{"name": "Authors Not
+// Specified"}]`. The byline back-fill only fired on an EMPTY list and the author
+// loop only skipped EMPTY names, so the placeholder string minted a deterministic
+// author agent that `authored` the paper and `asserts`-ed every one of its 269
+// claims. These tests pin the tool-boundary behaviour: a placeholder-shaped name
+// never becomes an agent, and an all-placeholder list is treated as "no real
+// author" so the body-byline backstop gets its chance.
+
+/// `FIXTURE` with its DOI and author list replaced, and an optional
+/// `source_text`. Paragraphs carry no `span`, so the D9 verbatim guard has
+/// nothing to compare and the byline parser sees exactly `source_text`.
+fn placeholder_fixture(
+    doi: &str,
+    authors: serde_json::Value,
+    source_text: Option<&str>,
+) -> DocumentExtraction {
+    let mut v: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+    v["source"]["doi"] = serde_json::json!(doi);
+    v["source"]["authors"] = authors;
+    if let Some(text) = source_text {
+        v["source_text"] = serde_json::json!(text);
+    }
+    serde_json::from_value(v).expect("modified fixture parses")
+}
+
+async fn agents_named(pool: &PgPool, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE display_name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+/// `authored` edges into `paper_id` from the agent(s) whose display name is `name`.
+async fn authored_by(pool: &PgPool, paper_id: uuid::Uuid, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored'
+          AND e.source_type = 'agent' AND a.display_name = $2
+        "#,
+    )
+    .bind(paper_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+async fn authored_total(pool: &PgPool, paper_id: uuid::Uuid) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM edges WHERE target_id = $1 AND relationship = 'authored'",
+    )
+    .bind(paper_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+/// agent→claim `asserts` edges from the agent(s) whose display name is `name`.
+async fn claim_asserts_by(pool: &PgPool, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.source_type = 'agent' AND e.target_type = 'claim'
+          AND e.relationship = 'asserts' AND a.display_name = $1
+        "#,
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+fn paper_id_of(result: &rmcp::model::CallToolResult) -> uuid::Uuid {
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(result)).expect("response JSON");
+    uuid::Uuid::parse_str(json["paper_id"].as_str().expect("paper_id in response"))
+        .expect("paper_id is a uuid")
+}
+
+/// The 2606.16707 defect at the tool boundary: a lone placeholder author (no
+/// `source_text`, so no byline to recover) must leave the paper with NO author
+/// rather than a shared fake one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn placeholder_author_name_mints_no_author_agent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction = placeholder_fixture(
+        "10.1234/placeholder-author",
+        serde_json::json!([
+            {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]}
+        ]),
+        None,
+    );
+
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest_document succeeds — a bad author name is dropped, not fatal");
+    let paper_id = paper_id_of(&result);
+
+    assert_eq!(
+        agents_named(&pool, "Authors Not Specified").await,
+        0,
+        "a placeholder author name must not mint an agent"
+    );
+    assert_eq!(
+        authored_total(&pool, paper_id).await,
+        0,
+        "with only a placeholder author the paper has no authored edge"
+    );
+    assert_eq!(
+        claim_asserts_by(&pool, "Authors Not Specified").await,
+        0,
+        "no placeholder agent asserts the paper's claims"
+    );
+    // The ingest itself still lands: dropping a bad name must not cost the claims.
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    assert_eq!(json["claims_ingested"].as_u64().unwrap(), 5);
+}
+
+/// An all-placeholder structured list counts as "no real author", so the
+/// body-byline backstop (previously gated on an EMPTY list) recovers the real
+/// names. Byline-recovered authors get `authored → paper` only: the planner
+/// emitted no `author_placeholder` edges (every structured entry was dropped),
+/// so they assert no claims — the same as today's empty-list fallback.
+#[sqlx::test(migrations = "../../migrations")]
+async fn placeholder_only_authors_fall_back_to_body_byline(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let byline_text = "Test Hierarchical Paper\n\nAlice Smith, Bob Jones\n\nAbstract: Hierarchies converge through layered claims.";
+    assert_eq!(
+        epigraph_ingest::document::byline::parse_byline_authors(byline_text).len(),
+        2,
+        "CALIBRATION: the body byline parses to two authors"
+    );
+    let extraction = placeholder_fixture(
+        "10.1234/placeholder-byline",
+        serde_json::json!([
+            {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]}
+        ]),
+        Some(byline_text),
+    );
+
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest_document succeeds");
+    let paper_id = paper_id_of(&result);
+
+    assert_eq!(authored_by(&pool, paper_id, "Alice Smith").await, 1);
+    assert_eq!(authored_by(&pool, paper_id, "Bob Jones").await, 1);
+    assert_eq!(
+        authored_total(&pool, paper_id).await,
+        2,
+        "exactly the two byline authors author the paper"
+    );
+    assert_eq!(agents_named(&pool, "Authors Not Specified").await, 0);
+    assert_eq!(
+        claim_asserts_by(&pool, "Alice Smith").await + claim_asserts_by(&pool, "Bob Jones").await,
+        0,
+        "byline-recovered authors get authored→paper only, never per-claim asserts"
+    );
+}
+
+/// A placeholder BEFORE a real author: the planner and the walk must skip the
+/// same ORIGINAL index, so the real author's `asserts` edges (keyed by
+/// `author_index`) still resolve to her. A filter-then-enumerate on either side
+/// shifts Alice to index 0 on one side only and drops (or misattributes) her
+/// per-claim assertions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mixed_real_and_placeholder_authors_keep_index_alignment(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction = placeholder_fixture(
+        "10.1234/placeholder-mixed",
+        serde_json::json!([
+            {"name": "Unknown", "affiliations": [], "roles": ["author"]},
+            {"name": "Alice Author", "affiliations": [], "roles": ["author"]}
+        ]),
+        None,
+    );
+
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest_document succeeds");
+    let paper_id = paper_id_of(&result);
+
+    assert_eq!(
+        agents_named(&pool, "Unknown").await,
+        0,
+        "no 'Unknown' agent"
+    );
+    assert_eq!(authored_total(&pool, paper_id).await, 1);
+    assert_eq!(authored_by(&pool, paper_id, "Alice Author").await, 1);
+    assert_eq!(
+        claim_asserts_by(&pool, "Alice Author").await,
+        5,
+        "the real author asserts every one of the 5 claims"
+    );
+}
+
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     let content = result.content.first().expect("at least one content block");
     content.as_text().expect("text content").text.clone()

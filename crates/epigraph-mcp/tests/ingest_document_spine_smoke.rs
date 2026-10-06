@@ -225,3 +225,79 @@ async fn full_reingest_returns_already_ingested(pool: PgPool) {
         .expect("new_paragraph_paths is an array");
     assert!(paths.is_empty(), "no new paragraph paths on full re-ingest");
 }
+
+/// Backlog a55aac45 / U039: the spine walk has its OWN copy of the author loop
+/// and byline gate, so it needs its own guard. A placeholder ahead of a real
+/// author must mint no agent, and the real author must keep her per-claim
+/// `asserts` edges (planner and walk skip the same original index).
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_rejects_placeholder_author(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let mut v: serde_json::Value = serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
+    v["source"]["doi"] = serde_json::json!("10.1234/spine-placeholder-author");
+    v["source"]["authors"] = serde_json::json!([
+        {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]},
+        {"name": "Alice Author", "affiliations": [], "roles": ["author"]}
+    ]);
+    let extraction: DocumentExtraction = serde_json::from_value(v).expect("fixture parses");
+
+    let result = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction,
+        None,
+    )
+    .await
+    .expect("spine ingest succeeds — a bad author name is dropped, not fatal");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    let paper_id =
+        uuid::Uuid::parse_str(json["paper_id"].as_str().expect("paper_id")).expect("uuid");
+
+    let placeholder_agents: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM agents WHERE display_name = 'Authors Not Specified'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        placeholder_agents.0, 0,
+        "a placeholder author name must not mint an agent on the spine path"
+    );
+
+    let authored: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored'
+          AND a.display_name = 'Alice Author'
+        "#,
+    )
+    .bind(paper_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let authored_total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM edges WHERE target_id = $1 AND relationship = 'authored'",
+    )
+    .bind(paper_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(authored.0, 1, "the real author authors the paper");
+    assert_eq!(authored_total.0, 1, "and nobody else does");
+
+    // thesis + 2 sections + 3 paragraphs = 6 spine claims (levels 0–2).
+    let alice_asserts: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.source_type = 'agent' AND e.target_type = 'claim'
+          AND e.relationship = 'asserts' AND a.display_name = 'Alice Author'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        alice_asserts.0, 6,
+        "the real author asserts every spine claim despite the placeholder ahead of her"
+    );
+}
