@@ -6,7 +6,7 @@ claim embeddings) produced by the GUI's offline analysis. For each group, picks
 a canonical claim, redirects its high-signal references (mass_functions, edges,
 evidence, reasoning_traces), preserves AUTHORED-edge provenance from each
 duplicate's agent, and RETRACTS the duplicates — `supersedes = canonical`,
-`is_current = false`, `embedding = NULL` — while also labelling them `deduped`
+`is_current = false`, `embedding = NULL`, `embedding_3072 = NULL` — while also labelling them `deduped`
 with a `deduped_into` pointer, so the GUI's collapse behaviour and any
 downstream label-aware reader stay coherent.
 
@@ -311,18 +311,18 @@ def merge_cluster(
         #    alongside its canonical partner. A single-origin figure then reads
         #    as two to four independently corroborating nodes.
         #
-        #    The four columns below are exactly what the canonical Rust path
-        #    ClaimRepository::mark_duplicate_with_repair writes, deliberately
-        #    matched so the two implementations cannot diverge. In particular
-        #    `embedding_3072` is NOT nulled here because that path does not null
-        #    it either; if it should be, that is one fix in the repo layer, not
-        #    two half-fixes in two languages.
+        #    The five columns below are exactly what the canonical Rust path
+        #    (`mark_duplicate_act` in crates/epigraph-db/src/repos/claim.rs,
+        #    behind ClaimRepository::mark_duplicate_with_repair) writes,
+        #    deliberately matched so the two implementations cannot diverge.
+        #    That includes `embedding_3072`: recall at centroid_dim=3072 reads
+        #    it with no is_current filter.
         #
-        #    ONE STATEMENT, NOT TWO. Migration 052 adds
-        #    `chk_deprecated_no_embedding CHECK (is_current OR embedding IS NULL)`,
-        #    which is evaluated per row per statement: splitting `is_current =
-        #    false` from `embedding = NULL` violates it in between and aborts
-        #    the cluster transaction.
+        #    ONE STATEMENT, NOT TWO. `chk_deprecated_no_embedding` (052, widened
+        #    to both columns by 144) reads `CHECK (is_current OR (embedding IS
+        #    NULL AND embedding_3072 IS NULL))` and is evaluated per row per
+        #    statement: splitting `is_current = false` from either null
+        #    violates it in between and aborts the cluster transaction.
         #
         #    Flipping is_current also fires the `claims_deactivate_factors`
         #    AFTER UPDATE trigger, which runs `DELETE FROM factors WHERE
@@ -336,6 +336,7 @@ def merge_cluster(
                SET supersedes = %s::uuid,
                    is_current = false,
                    embedding = NULL,
+                   embedding_3072 = NULL,
                    updated_at = NOW(),
                    labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'),
                    properties = COALESCE(properties, '{}'::jsonb)
