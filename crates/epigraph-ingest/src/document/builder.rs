@@ -62,7 +62,8 @@ const WORKFLOW_SOURCE_TYPE: &str = "workflow";
 /// it to the stored digest therefore gets a disagreement on every *untampered*
 /// structural row of every ingested document. That disagreement is not
 /// evidence of tampering and must not be reported as such — MCP `verify_claim`
-/// routes on this predicate to answer "not applicable" instead.
+/// routes on this predicate to answer "not applicable" instead for document
+/// rows, and to re-derive the digest for the workflow subset (see below).
 ///
 /// The WORKFLOW builder (`workflow::build_ingest_plan`) and
 /// `epigraph_ingest_executor::add_step` do the same on their level-0/1/2 nodes
@@ -97,9 +98,12 @@ const WORKFLOW_SOURCE_TYPE: &str = "workflow";
 /// database access: `ClaimRepository::patch_claim_atomic_conn` merges
 /// caller-supplied properties with `properties = COALESCE(properties,'{}') || $1`,
 /// reachable from MCP `patch_claim` and HTTP `PATCH /claims/:id`. A caller with
-/// patch rights can therefore add `{"level":0,"source_type":"Paper"}` (or the
-/// workflow stamp plus its scope marker) to a plain-hash claim and turn a
-/// future `mismatch` verdict into `not_applicable`.
+/// patch rights can therefore add `{"level":0,"source_type":"Paper"}` to a
+/// plain-hash claim and turn a future `mismatch` verdict into `not_applicable`.
+/// The workflow stamp plus its scope marker does the same only on a claim no
+/// visible workflow executes; on one that a workflow does execute,
+/// `verify_claim` re-derives the digest from that workflow's `canonical_name`,
+/// which a plain digest does not reproduce, and still reports `mismatch`.
 ///
 /// That is a defence-in-depth degradation rather than a bypass, for one specific
 /// reason worth stating so a later reader does not have to re-derive it: no API
