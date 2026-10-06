@@ -23,6 +23,20 @@ pub struct EvidenceAtTimeRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// What [`EvidenceRepository::record_derivation_conn`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivationEvidence {
+    /// A new derivation evidence row, with its id.
+    Recorded(Uuid),
+    /// The parent's text was already evidence on the claim; nothing written.
+    AlreadyPresent,
+    /// The claim names itself as its parent; nothing written.
+    SelfReference,
+    /// The parent is absent, retired, non-public, or invisible to the viewer;
+    /// nothing written. The caller must not distinguish these.
+    ParentUnavailable,
+}
+
 /// Result row for [`EvidenceRepository::detail_by_id`].
 ///
 /// The flattened projection `GET /api/v1/evidence/:id` returns. It lived as an
@@ -235,6 +249,105 @@ impl EvidenceRepository {
             signature,
             row.created_at,
         ))
+    }
+
+    /// Record that `claim_id` was derived from `parent_id`'s text: one
+    /// `document` evidence row whose `raw_content` is the parent's content and
+    /// whose `properties` carry `derived_from_claim` and `method`.
+    ///
+    /// This is derivation PROVENANCE, not support: no mass function is written
+    /// and the claim's truth value is not touched (backlog 3590a2d8, U041
+    /// option A). A decomposition atom's only warrant at birth is "the parent
+    /// states it", and when the parent is itself evidence-free any belief
+    /// given to the atom would be laundered from it.
+    ///
+    /// # The parent is read through `viewer`, and must be PUBLIC
+    ///
+    /// The row inherits the claim's tenancy (migration 070 arm (c)), and the
+    /// only claims this is written for are public (`if_not_exists` is
+    /// public-tier only). Copying a group-private parent's text into a public
+    /// row would republish it, so a parent that is not current, not public, not
+    /// visible to `viewer`, or absent all answer
+    /// [`DerivationEvidence::ParentUnavailable`] — one answer, so the caller
+    /// cannot use it as an existence oracle.
+    ///
+    /// # Idempotent on `(content_hash, claim_id)`
+    ///
+    /// `content_hash` is BLAKE3 of the parent text, and migration 001's
+    /// `evidence_content_hash_claim_unique` makes the INSERT a no-op when the
+    /// same text is already evidence on the claim — a re-applied plan line or
+    /// a concurrent duplicate request. `properties` is the serialized
+    /// [`EvidenceType::Document`] plus the two derivation keys, so every reader
+    /// that parses `properties` as an [`EvidenceType`] still does.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if a statement fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn record_derivation_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        parent_id: Uuid,
+        method: &str,
+    ) -> Result<DerivationEvidence, DbError> {
+        if claim_id == parent_id {
+            return Ok(DerivationEvidence::SelfReference);
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT c.content
+            FROM claims c
+            WHERE c.id = $1
+              AND COALESCE(c.is_current, true) = true
+              AND c.visibility = 'public'
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql).bind(parent_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let Some(parent_content) = q.fetch_optional(&mut *conn).await? else {
+            return Ok(DerivationEvidence::ParentUnavailable);
+        };
+
+        let content_hash = epigraph_crypto::ContentHasher::hash(parent_content.as_bytes());
+        let mut properties = serde_json::to_value(EvidenceType::Document {
+            source_url: None,
+            mime_type: "text/plain".to_string(),
+            checksum: None,
+        })?;
+        if let Some(obj) = properties.as_object_mut() {
+            obj.insert(
+                "derived_from_claim".to_string(),
+                serde_json::Value::String(parent_id.to_string()),
+            );
+            obj.insert(
+                "method".to_string(),
+                serde_json::Value::String(method.to_string()),
+            );
+        }
+
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO evidence (content_hash, evidence_type, raw_content, claim_id, properties)
+            VALUES ($1, 'document', $2, $3, $4)
+            ON CONFLICT (content_hash, claim_id) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(content_hash.as_slice())
+        .bind(&parent_content)
+        .bind(claim_id)
+        .bind(&properties)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        Ok(match inserted {
+            Some(id) => DerivationEvidence::Recorded(id),
+            None => DerivationEvidence::AlreadyPresent,
+        })
     }
 
     /// Get evidence by ID
