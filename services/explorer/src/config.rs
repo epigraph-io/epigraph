@@ -25,6 +25,7 @@ pub const ENV_DEV_BEARER: &str = "EPIGRAPH_EXPLORER_DEV_BEARER";
 pub const ENV_KANBAN_URL: &str = "EPIGRAPH_EXPLORER_KANBAN_URL";
 pub const ENV_AUDIT_ROW_CEILING: &str = "EPIGRAPH_EXPLORER_AUDIT_ROW_CEILING";
 pub const ENV_WATCH_AGENTS: &str = "EPIGRAPH_EXPLORER_WATCH_AGENTS";
+pub const ENV_ALLOW_PLAINTEXT_API: &str = "EPIGRAPH_EXPLORER_ALLOW_PLAINTEXT_API";
 
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_PORT: u16 = 8096;
@@ -170,6 +171,23 @@ impl Config {
             Some(v) => parse_http_url(ENV_API_URL, &v)?,
             None => Url::parse(DEFAULT_API_URL).expect("default API URL parses"),
         };
+        // Every viewer's bearer, every refresh token and every authorization
+        // code redemption travels to this URL. Plain http is fine on the
+        // host's own loopback and nowhere else unless the operator says the
+        // link is private.
+        let allow_plaintext_api =
+            parse_bool(ENV_ALLOW_PLAINTEXT_API, get(ENV_ALLOW_PLAINTEXT_API), false)?;
+        if api_url.scheme() == "http" && !is_loopback_url(&api_url) && !allow_plaintext_api {
+            return Err(invalid(
+                ENV_API_URL,
+                format!(
+                    "refused: plain http to a host that is not loopback would carry every \
+                     viewer's bearer, refresh token and authorization code in cleartext. Use \
+                     https, or set {ENV_ALLOW_PLAINTEXT_API}=true for a link you know is \
+                     private (a host-local container bridge)"
+                ),
+            ));
+        }
 
         let port = match get(ENV_PORT) {
             Some(v) => match v.parse::<u16>() {
@@ -490,6 +508,17 @@ fn clamp_logged<T: Ord + Copy + std::fmt::Display>(var: &str, value: T, (lo, hi)
 
 fn is_loopback_host(url: &Url) -> bool {
     matches!(url.host_str(), Some("localhost") | Some("127.0.0.1"))
+}
+
+/// `localhost`, an IPv4 loopback address or `[::1]`: traffic to it never
+/// leaves the host.
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(a)) => a.is_loopback(),
+        Some(url::Host::Ipv6(a)) => a.is_loopback(),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -935,15 +964,51 @@ mod tests {
     }
 
     #[test]
+    fn plain_http_api_url_must_be_loopback_or_explicitly_allowed() {
+        for loopback in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.2:8080",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(cfg(&[BASE, (ENV_API_URL, loopback)]).is_ok(), "{loopback}");
+        }
+        assert!(
+            cfg(&[BASE, (ENV_API_URL, "https://api.example.com")]).is_ok(),
+            "https anywhere"
+        );
+        for remote in [
+            "http://api.example.com:8080",
+            "http://host.docker.internal:8080",
+            "http://10.0.0.5:8080",
+            "http://[2001:db8::1]:8080",
+        ] {
+            let err = cfg(&[BASE, (ENV_API_URL, remote)]).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::Invalid { var: ENV_API_URL, reason } if reason.contains("cleartext")),
+                "{remote}: {err:?}"
+            );
+            let c = cfg(&[
+                BASE,
+                (ENV_API_URL, remote),
+                (ENV_ALLOW_PLAINTEXT_API, "true"),
+            ])
+            .unwrap_or_else(|e| panic!("{remote} allowed explicitly: {e:?}"));
+            assert_eq!(c.api_url.scheme(), "http");
+        }
+        assert!(cfg(&[BASE, (ENV_ALLOW_PLAINTEXT_API, "maybe")]).is_err());
+    }
+
+    #[test]
     fn urls_and_client_id_validated() {
         let c = cfg(&[
             BASE,
-            (ENV_API_URL, "http://api.example.com:9000"),
+            (ENV_API_URL, "https://api.example.com:9000"),
             (ENV_OAUTH_BASE_URL, "https://api.example.com"),
             (ENV_CLIENT_ID, "epigraph_explorer_abc"),
         ])
         .unwrap();
-        assert_eq!(c.api_url.as_str(), "http://api.example.com:9000/");
+        assert_eq!(c.api_url.as_str(), "https://api.example.com:9000/");
         assert_eq!(c.oauth_base_url.as_str(), "https://api.example.com/");
         assert_eq!(c.client_id.as_deref(), Some("epigraph_explorer_abc"));
 

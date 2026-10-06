@@ -10,7 +10,9 @@
 #   - Outbound: on a bridge network, 127.0.0.1:8080 inside the container is
 #     the container itself, not the host API. A host-gateway
 #     (`--add-host=host.docker.internal:host-gateway` plus
-#     EPIGRAPH_API_URL=http://host.docker.internal:8080) fixes this side only.
+#     EPIGRAPH_API_URL=http://host.docker.internal:8080 and, because that host
+#     is not loopback, EPIGRAPH_EXPLORER_ALLOW_PLAINTEXT_API=true) fixes this
+#     side only.
 #   - Inbound: a loopback bind inside a bridge network is unreachable from the
 #     host, so `-p 8096:8096` does NOT work.
 # So run it with host networking, where 127.0.0.1 is the host's loopback on
