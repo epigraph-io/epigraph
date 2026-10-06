@@ -1,9 +1,11 @@
 //! Typed client for epigraph-api.
 //!
 //! Every call goes through one global semaphore (`UPSTREAM_CONCURRENCY`, well
-//! under the API's 10-connection pool) under a single per-call deadline
+//! under the API's 10-connection pool), behind a per-viewer in-flight cap
+//! (`SESSION_CONCURRENCY`, keyed by [`RequestAuth::cache_key`]) so one viewer
+//! cannot hold every permit, under a single per-call deadline
 //! (`EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS` from the moment the call starts,
-//! covering the queue wait *and* the request), forwards the caller's own
+//! covering both queue waits *and* the request), forwards the caller's own
 //! bearer (never a service token) or calls anonymously, and maps every
 //! failure into [`UpstreamError`].
 //!
@@ -28,6 +30,7 @@
 //! `upstream/{core,entities,graph}.rs`, built on [`Api::get`],
 //! [`Api::get_query`] and [`Api::post`].
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +39,7 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::auth::{self, RequestAuth};
@@ -130,6 +133,7 @@ pub struct Upstream {
     http: reqwest::Client,
     base: String,
     semaphore: Arc<Semaphore>,
+    per_viewer: PerViewerLimit,
     timeout: Duration,
     token_timeout: Duration,
 }
@@ -146,6 +150,7 @@ impl Upstream {
             http,
             base: config.api_url.as_str().trim_end_matches('/').to_string(),
             semaphore: Arc::new(Semaphore::new(config.upstream_concurrency)),
+            per_viewer: PerViewerLimit::new(config.session_concurrency),
             timeout: config.upstream_timeout,
             token_timeout: config.token_timeout,
         })
@@ -174,6 +179,89 @@ impl Upstream {
     /// Slots currently free in the global semaphore.
     pub fn available_permits(&self) -> usize {
         self.semaphore.available_permits()
+    }
+
+    /// Viewers with an upstream call in flight or queued (the per-viewer
+    /// limiter forgets a viewer once it has none).
+    pub fn viewers_in_flight(&self) -> usize {
+        self.per_viewer.tracked()
+    }
+}
+
+/// The per-viewer in-flight cap: one semaphore of `cap` permits per
+/// [`RequestAuth::cache_key`], taken *before* the global semaphore, so a
+/// viewer over its cap waits without holding a global permit. A viewer's
+/// entry exists only while one of its calls holds or waits for a permit.
+struct PerViewerLimit {
+    cap: usize,
+    slots: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl PerViewerLimit {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Semaphore>>> {
+        self.slots.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Register interest in `key`'s slot. Dropping the returned guard
+    /// releases any permit it took and forgets the slot if nothing else
+    /// holds or waits on it.
+    fn enter(&self, key: String) -> ViewerSlot<'_> {
+        let sem = Arc::clone(
+            self.slots()
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.cap))),
+        );
+        ViewerSlot {
+            limit: self,
+            key,
+            sem: Some(sem),
+            permit: None,
+        }
+    }
+
+    fn tracked(&self) -> usize {
+        self.slots().len()
+    }
+}
+
+/// One call's claim on its viewer's slot.
+struct ViewerSlot<'a> {
+    limit: &'a PerViewerLimit,
+    key: String,
+    sem: Option<Arc<Semaphore>>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ViewerSlot<'_> {
+    /// Wait for one of the viewer's permits (cancel-safe: dropping the
+    /// future drops its own reference to the slot).
+    async fn acquire(&mut self) -> Result<(), tokio::sync::AcquireError> {
+        let sem = Arc::clone(self.sem.as_ref().expect("held until drop"));
+        self.permit = Some(sem.acquire_owned().await?);
+        Ok(())
+    }
+}
+
+impl Drop for ViewerSlot<'_> {
+    fn drop(&mut self) {
+        // Both the permit and this guard hold the slot; let go of them first
+        // so the count below sees only the map and other callers.
+        self.permit.take();
+        self.sem.take();
+        let mut slots = self.limit.slots();
+        if slots
+            .get(&self.key)
+            .is_some_and(|s| Arc::strong_count(s) == 1)
+        {
+            slots.remove(&self.key);
+        }
     }
 }
 
@@ -333,6 +421,16 @@ impl<'a> Api<'a> {
         // (and a page composing N sub-calls stacked that up). Everything below
         // shares this deadline.
         let deadline = tokio::time::Instant::now() + up.timeout;
+        // This viewer's own cap first, so a viewer over it queues without
+        // holding a global permit that another viewer could use.
+        let mut viewer_slot = up.per_viewer.enter(self.auth.cache_key());
+        tokio::time::timeout_at(deadline, viewer_slot.acquire())
+            .await
+            .map_err(|_| {
+                tracing::warn!(%path, "per-viewer upstream cap wait timed out");
+                UpstreamError::Timeout
+            })?
+            .map_err(|_| UpstreamError::Transport("upstream client shut down".into()))?;
         let _permit = tokio::time::timeout_at(deadline, up.semaphore.acquire())
             .await
             .map_err(|_| {
@@ -619,6 +717,39 @@ mod tests {
         assert_eq!(unit, None);
         let e = decode::<Vec<u32>>(ex(200, "application/json", "{")).unwrap_err();
         assert!(matches!(e, UpstreamError::Decode(_)));
+    }
+
+    /// A viewer's slot exists only while one of its calls holds or waits
+    /// for a permit, a waiter that gives up (a deadline) leaves nothing
+    /// behind, and viewers do not share permits.
+    #[tokio::test]
+    async fn per_viewer_slots_are_forgotten_once_idle() {
+        let limit = PerViewerLimit::new(1);
+        let mut held = limit.enter("v".into());
+        held.acquire().await.unwrap();
+
+        // A second call for the same viewer waits, then gives up.
+        let mut waiter = limit.enter("v".into());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), waiter.acquire())
+                .await
+                .is_err(),
+            "the cap of 1 is held"
+        );
+        drop(waiter);
+        assert_eq!(limit.tracked(), 1, "still held by the first call");
+
+        // Another viewer is not behind this one.
+        let mut other = limit.enter("w".into());
+        tokio::time::timeout(Duration::from_millis(20), other.acquire())
+            .await
+            .expect("another viewer is not capped by this one")
+            .unwrap();
+        assert_eq!(limit.tracked(), 2);
+
+        drop(other);
+        drop(held);
+        assert_eq!(limit.tracked(), 0, "idle viewers are forgotten");
     }
 
     #[test]

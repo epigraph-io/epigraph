@@ -7,12 +7,15 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use axum::Router;
 use common::{spawn, spawn_with, TestApp};
-use epigraph_explorer::config::{ENV_DEV_BEARER, ENV_PUBLIC_BASE_URL, ENV_UPSTREAM_TIMEOUT_MS};
+use epigraph_explorer::config::{
+    ENV_DEV_BEARER, ENV_PUBLIC_BASE_URL, ENV_UPSTREAM_CONCURRENCY, ENV_UPSTREAM_TIMEOUT_MS,
+};
+use epigraph_explorer::upstream::UpstreamError;
 use serde_json::{json, Value};
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
@@ -1339,4 +1342,78 @@ async fn static_assets_keep_their_own_cache_policy() {
     let res = app.get_as("/explorer/no/such/page", &sid).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     assert_eq!(res.header("cache-control"), Some("no-store"));
+}
+
+// ---- upstream fairness ----------------------------------------------------------
+
+/// One signed-in viewer firing more parallel upstream calls than there are
+/// permits holds at most its own cap of them (default 3), so another
+/// viewer's call still gets a permit at once and completes well inside its
+/// deadline. Without the cap, B queues for a permit until A's calls reach
+/// their own deadline (~900 ms here).
+#[tokio::test]
+async fn one_session_cannot_hold_every_upstream_permit() {
+    // 4 global permits, the default per-viewer cap of 3, a 1 s deadline.
+    let app = spawn_with(
+        &[
+            (ENV_UPSTREAM_CONCURRENCY, "4"),
+            (ENV_UPSTREAM_TIMEOUT_MS, "1000"),
+        ],
+        Router::new(),
+    )
+    .await;
+    // Session A's calls never answer inside the deadline, so each one holds
+    // whatever permits it got until it times out.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/stats"))
+        .and(header("authorization", "Bearer token-a"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"claims": 1}))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/stats"))
+        .and(header("authorization", "Bearer token-b"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"claims": 2})))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let a = app.sign_in("token-a");
+    let b = app.sign_in("token-b");
+    let api_a = app.state.api(&app.session_auth(&a, "token-a"));
+    let api_b = app.state.api(&app.session_auth(&b, "token-b"));
+
+    let flood = futures::future::join_all((0..8).map(|_| api_a.stats()));
+    let other_viewer = async {
+        // Let A's eight calls take every permit they can.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let held_by_a = 4 - app.state.upstream.available_permits();
+        let started = Instant::now();
+        let result = api_b.stats().await;
+        (held_by_a, result, started.elapsed())
+    };
+    let (a_results, (held_by_a, b_result, b_elapsed)) = tokio::join!(flood, other_viewer);
+
+    assert_eq!(
+        b_result.expect("session B is served while A floods").claims,
+        2
+    );
+    assert!(
+        b_elapsed < Duration::from_millis(500),
+        "B waited {b_elapsed:?} for a permit"
+    );
+    assert_eq!(held_by_a, 3, "A holds exactly its cap of the 4 permits");
+    assert!(
+        a_results.iter().all(|r| *r == Err(UpstreamError::Timeout)),
+        "A's calls time out, queued ones included: {a_results:?}"
+    );
+    assert_eq!(app.state.upstream.available_permits(), 4);
+    assert_eq!(
+        app.state.upstream.viewers_in_flight(),
+        0,
+        "no per-viewer state outlives the calls"
+    );
 }

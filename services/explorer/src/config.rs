@@ -16,6 +16,7 @@ pub const ENV_OAUTH_BASE_URL: &str = "EPIGRAPH_OAUTH_BASE_URL";
 pub const ENV_CLIENT_ID: &str = "EPIGRAPH_EXPLORER_CLIENT_ID";
 pub const ENV_FRAME_ANCESTORS: &str = "EPIGRAPH_EXPLORER_FRAME_ANCESTORS";
 pub const ENV_UPSTREAM_CONCURRENCY: &str = "EPIGRAPH_EXPLORER_UPSTREAM_CONCURRENCY";
+pub const ENV_SESSION_CONCURRENCY: &str = "EPIGRAPH_EXPLORER_SESSION_CONCURRENCY";
 pub const ENV_UPSTREAM_TIMEOUT_MS: &str = "EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS";
 pub const ENV_TOKEN_TIMEOUT_MS: &str = "EPIGRAPH_EXPLORER_TOKEN_TIMEOUT_MS";
 pub const ENV_INSECURE_COOKIES: &str = "EPIGRAPH_EXPLORER_INSECURE_COOKIES";
@@ -26,6 +27,9 @@ pub const DEFAULT_PORT: u16 = 8096;
 pub const DEFAULT_FRAME_ANCESTORS: &str =
     "https://www.notion.so https://*.notion.so https://*.notion.site";
 pub const DEFAULT_UPSTREAM_CONCURRENCY: usize = 6;
+/// Half the default global semaphore: one viewer can hold at most this many
+/// upstream permits at once, so it can never hold them all.
+pub const DEFAULT_SESSION_CONCURRENCY: usize = 3;
 pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 8000;
 /// Longer than [`DEFAULT_UPSTREAM_TIMEOUT_MS`]: a refresh whose answer is
 /// lost may already have rotated the token upstream, and that ends the
@@ -36,6 +40,8 @@ pub const DEFAULT_TOKEN_TIMEOUT_MS: u64 = 20_000;
 /// Clamp range for the upstream semaphore. The API's pool is 10 connections
 /// shared with every other client, so the ceiling stays well under it.
 pub const UPSTREAM_CONCURRENCY_RANGE: (usize, usize) = (1, 8);
+/// Clamp range for the per-viewer in-flight cap.
+pub const SESSION_CONCURRENCY_RANGE: (usize, usize) = (1, 8);
 /// Clamp range for the per-call upstream timeout, in milliseconds.
 pub const UPSTREAM_TIMEOUT_MS_RANGE: (u64, u64) = (250, 60_000);
 /// Clamp range for the `/oauth/token` timeout, in milliseconds.
@@ -78,6 +84,11 @@ pub struct Config {
     pub frame_ancestors: String,
     /// Global upstream semaphore size.
     pub upstream_concurrency: usize,
+    /// Upstream calls one viewer (one [`crate::auth::RequestAuth::cache_key`])
+    /// may have in flight at once, enforced in front of the global semaphore.
+    /// It only protects other viewers while it is below
+    /// [`Config::upstream_concurrency`].
+    pub session_concurrency: usize,
     /// Per-call upstream timeout.
     pub upstream_timeout: Duration,
     /// Timeout for `POST /oauth/token` (code exchange and refresh), separate
@@ -101,6 +112,7 @@ impl std::fmt::Debug for Config {
             .field("client_id", &self.client_id)
             .field("frame_ancestors", &self.frame_ancestors)
             .field("upstream_concurrency", &self.upstream_concurrency)
+            .field("session_concurrency", &self.session_concurrency)
             .field("upstream_timeout", &self.upstream_timeout)
             .field("token_timeout", &self.token_timeout)
             .field("insecure_cookies", &self.insecure_cookies)
@@ -193,6 +205,23 @@ impl Config {
             None => DEFAULT_UPSTREAM_CONCURRENCY,
         };
 
+        let session_concurrency = match get(ENV_SESSION_CONCURRENCY) {
+            Some(v) => {
+                let n = v
+                    .parse::<usize>()
+                    .map_err(|_| invalid(ENV_SESSION_CONCURRENCY, "expected a positive integer"))?;
+                clamp_logged(ENV_SESSION_CONCURRENCY, n, SESSION_CONCURRENCY_RANGE)
+            }
+            None => DEFAULT_SESSION_CONCURRENCY,
+        };
+        if session_concurrency >= upstream_concurrency {
+            tracing::warn!(
+                session = session_concurrency,
+                global = upstream_concurrency,
+                "per-viewer upstream cap is not below the global one; one viewer can hold every permit"
+            );
+        }
+
         let timeout_ms = match get(ENV_UPSTREAM_TIMEOUT_MS) {
             Some(v) => {
                 let n = v.parse::<u64>().map_err(|_| {
@@ -234,6 +263,7 @@ impl Config {
             client_id,
             frame_ancestors,
             upstream_concurrency,
+            session_concurrency,
             upstream_timeout: Duration::from_millis(timeout_ms),
             token_timeout: Duration::from_millis(token_timeout_ms),
             insecure_cookies,
@@ -549,6 +579,29 @@ mod tests {
             c.upstream_timeout,
             Duration::from_millis(UPSTREAM_TIMEOUT_MS_RANGE.1)
         );
+    }
+
+    /// The per-viewer cap defaults below the global semaphore, is clamped,
+    /// and rejects junk.
+    #[test]
+    fn session_concurrency_is_capped_below_the_global_semaphore() {
+        let c = cfg(&[BASE]).unwrap();
+        assert_eq!(c.session_concurrency, DEFAULT_SESSION_CONCURRENCY);
+        assert!(c.session_concurrency < c.upstream_concurrency, "{c:?}");
+
+        let c = cfg(&[BASE, (ENV_SESSION_CONCURRENCY, "2")]).unwrap();
+        assert_eq!(c.session_concurrency, 2);
+        let c = cfg(&[BASE, (ENV_SESSION_CONCURRENCY, "0")]).unwrap();
+        assert_eq!(c.session_concurrency, SESSION_CONCURRENCY_RANGE.0);
+        let c = cfg(&[BASE, (ENV_SESSION_CONCURRENCY, "99")]).unwrap();
+        assert_eq!(c.session_concurrency, SESSION_CONCURRENCY_RANGE.1);
+        assert!(matches!(
+            cfg(&[BASE, (ENV_SESSION_CONCURRENCY, "three")]).unwrap_err(),
+            ConfigError::Invalid {
+                var: ENV_SESSION_CONCURRENCY,
+                ..
+            }
+        ));
     }
 
     /// The token call has its own knob, independent of the data timeout,
