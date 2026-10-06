@@ -165,6 +165,24 @@ pub struct CreateClaimRequest {
     /// See docs/architecture/noun-claims-and-verb-edges.md.
     #[serde(default)]
     pub if_not_exists: bool,
+    /// When set, record a derivation evidence row on the created (or
+    /// deduplicated) claim: a `document` row carrying the named parent's text,
+    /// with `properties.derived_from_claim` and `properties.method`. It is
+    /// provenance only — no mass function, no truth change (backlog 3590a2d8).
+    /// Written in the same transaction as the claim. The parent must be a
+    /// current, PUBLIC claim the caller can see; otherwise the whole request is
+    /// refused with 400 and nothing is written. Public tier only.
+    #[serde(default)]
+    pub derived_from: Option<DerivedFrom>,
+}
+
+/// The parent a claim was derived from, for [`CreateClaimRequest::derived_from`].
+#[derive(Deserialize, Debug, Clone)]
+pub struct DerivedFrom {
+    /// The parent claim whose text the new claim was derived from.
+    pub claim_id: Uuid,
+    /// The derivation that produced the claim (e.g. `decompose_claims`).
+    pub method: String,
 }
 
 /// Claim response structure
@@ -417,6 +435,24 @@ pub async fn create_claim(
             return Err(ApiError::ValidationError {
                 field: "if_not_exists".to_string(),
                 reason: "if_not_exists=true is incompatible with the content_hash override; new ingestion paths should compute hashes server-side".to_string(),
+            });
+        }
+    }
+
+    // Derivation evidence copies the parent's text into an evidence row that
+    // inherits THIS claim's tenancy; only a public claim has a coherent
+    // answer for that, and the encrypted tiers have their own evidence path.
+    if let Some(ref d) = request.derived_from {
+        if privacy_tier != "public" {
+            return Err(ApiError::ValidationError {
+                field: "derived_from".to_string(),
+                reason: "derived_from is only supported for privacy_tier=public".to_string(),
+            });
+        }
+        if d.method.trim().is_empty() {
+            return Err(ApiError::ValidationError {
+                field: "derived_from.method".to_string(),
+                reason: "derived_from.method cannot be empty".to_string(),
             });
         }
     }
@@ -784,6 +820,38 @@ pub async fn create_claim(
             .map_err(|e| ApiError::DatabaseError {
                 message: format!("Failed to set labels: {e}"),
             })?;
+    }
+
+    // Derivation provenance (U041 option A), on BOTH arms: a dedup hit is a
+    // re-applied plan line or a second parent stating the same atom, and each
+    // still deserves its row. In the claim's own stamped transaction, so a
+    // refused parent rolls the claim back with it and the evidence can never
+    // exist without the claim (nor the claim, on this request, without it).
+    if let Some(ref d) = request.derived_from {
+        match epigraph_db::EvidenceRepository::record_derivation_conn(
+            &mut tx,
+            &viewer,
+            claim_uuid,
+            d.claim_id,
+            d.method.trim(),
+        )
+        .await?
+        {
+            epigraph_db::DerivationEvidence::ParentUnavailable => {
+                // One answer for absent, retired, invisible and non-public:
+                // the caller must not learn which.
+                return Err(ApiError::ValidationError {
+                    field: "derived_from.claim_id".to_string(),
+                    reason: format!(
+                        "derived_from.claim_id {} does not name a current public claim",
+                        d.claim_id
+                    ),
+                });
+            }
+            epigraph_db::DerivationEvidence::Recorded(_)
+            | epigraph_db::DerivationEvidence::AlreadyPresent
+            | epigraph_db::DerivationEvidence::SelfReference => {}
+        }
     }
 
     let mut encryption_response = (None, None, None, None);
