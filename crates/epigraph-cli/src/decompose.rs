@@ -228,6 +228,11 @@ pub enum Ineligible {
     Backlog,
     /// [`looks_atomic`] accepted it.
     LooksAtomic { sentences: usize, chars: usize },
+    /// Not `visibility = 'public'`. Atoms are POSTed with `if_not_exists`,
+    /// which the API allows only for the public tier, and their derivation
+    /// evidence copies the parent's text; decomposing a group-private parent
+    /// would republish it. Not overridable.
+    NotPublic { visibility: String },
 }
 
 impl std::fmt::Display for Ineligible {
@@ -241,6 +246,11 @@ impl std::fmt::Display for Ineligible {
                 f,
                 "looks atomic ({sentences} sentence, {chars} chars <= {ATOMIC_MAX_CHARS}; \
                  pass --include-short to decompose it)"
+            ),
+            Self::NotPublic { visibility } => write!(
+                f,
+                "visibility is `{visibility}`, not `public` (atoms are public and carry the \
+                 parent's text as derivation evidence; never decomposed)"
             ),
         }
     }
@@ -391,7 +401,8 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
 pub use db_writes::{
     persist_decomposition, persist_planned, plan_decomposition_batches,
     plan_decomposition_batches_with_gaps, run_decomposition_batches, select_candidates,
-    verify_plan, BatchClaim, BatchTotals, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
+    verify_plan, AtomParent, BatchClaim, BatchTotals, PersistOutcome, PlanDrift, PlanGaps,
+    Priority, Selection,
 };
 
 #[cfg(feature = "db")]
@@ -513,6 +524,21 @@ mod db_writes {
         })
     }
 
+    /// The parent an atom is being written for, as the submit closure of
+    /// [`run_decomposition_batches`] / [`persist_planned`] receives it.
+    ///
+    /// A struct rather than two adjacent `Uuid` arguments: the closure needs
+    /// both the parent's id (the atom POST names it in `derived_from`, which
+    /// records the atom's derivation evidence) and its author (atoms inherit it
+    /// as `agent_id`), and a swapped pair of bare `Uuid`s would compile.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AtomParent {
+        /// The compound claim being decomposed.
+        pub claim_id: Uuid,
+        /// Its author, which the atom inherits.
+        pub agent_id: Uuid,
+    }
+
     /// One undecomposed compound claim, as [`run_decomposition_batches`] needs
     /// it. Deliberately not `epigraph_core::Claim` — the runner only needs the
     /// parent id, the author to inherit, and the text to decompose, and a
@@ -549,9 +575,10 @@ mod db_writes {
     /// wired to — is reachable from a test. `main` keeps only credential
     /// resolution and the HTTP submit closure.
     ///
-    /// `submit_via` receives `(atom_text, generality, parent_agent_id)`; atoms
-    /// inherit their parent compound claim's author, and the parent varies
-    /// across a batch, so the author cannot be captured once by the caller.
+    /// `submit_via` receives `(atom_text, generality, parent)`; atoms inherit
+    /// their parent compound claim's author and record it as their derivation
+    /// source, and the parent varies across a batch, so neither can be
+    /// captured once by the caller.
     ///
     /// A batch whose LLM call fails is logged and skipped (the run continues);
     /// a persist failure aborts the run.
@@ -565,7 +592,7 @@ mod db_writes {
         submit_via: F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
     where
-        F: Fn(String, i64, Uuid) -> Fut,
+        F: Fn(String, i64, AtomParent) -> Fut,
         Fut: std::future::Future<Output = Result<Uuid, Box<dyn std::error::Error>>>,
     {
         let mut totals = BatchTotals::default();
@@ -733,19 +760,23 @@ mod db_writes {
         submit_via: &F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
     where
-        F: Fn(String, i64, Uuid) -> Fut,
+        F: Fn(String, i64, AtomParent) -> Fut,
         Fut: std::future::Future<Output = Result<Uuid, Box<dyn std::error::Error>>>,
     {
         let mut totals = BatchTotals::default();
         for plan in planned {
-            let parent_agent_id = plan.agent_id;
+            // STUB (red step): the parent id is not threaded yet.
+            let parent = AtomParent {
+                claim_id: Uuid::nil(),
+                agent_id: plan.agent_id,
+            };
             match persist_decomposition(
                 pool,
                 viewer,
                 plan.claim_id,
                 &plan.decomposition(),
                 embedder.clone(),
-                move |atom_text, generality| submit_via(atom_text, generality, parent_agent_id),
+                move |atom_text, generality| submit_via(atom_text, generality, parent),
             )
             .await
             {

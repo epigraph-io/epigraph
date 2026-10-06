@@ -83,8 +83,8 @@
 use clap::Parser;
 use epigraph_cli::decompose::{
     persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
-    run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, BatchClaim,
-    EligibilityFilters, PlanGaps, Priority,
+    run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, AtomParent,
+    BatchClaim, EligibilityFilters, PlanGaps, Priority,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -574,7 +574,7 @@ async fn submit_atom(
     token: String,
     atom_text: String,
     generality: i64,
-    parent_agent_id: uuid::Uuid,
+    parent: AtomParent,
 ) -> Result<uuid::Uuid, Box<dyn std::error::Error>> {
     // Diagnostic-only (backlog a422da87): build+log the URL BEFORE sending, so
     // a RelativeUrlWithoutBase-style construction bug is visible even if the
@@ -586,7 +586,7 @@ async fn submit_atom(
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "content": atom_text,
-            "agent_id": parent_agent_id,
+            "agent_id": parent.agent_id,
             "initial_truth": 0.5,
             "if_not_exists": true,
             "properties": {
@@ -767,8 +767,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("REFUSED {}: {why:?}", p.claim_id);
             }
             let embedder = epigraph_cli::embedding_service();
-            let submit = move |t: String, g: i64, a: uuid::Uuid| {
-                submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a)
+            let submit = move |t: String, g: i64, p: AtomParent| {
+                submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p)
             };
             let totals = persist_planned(pool, viewer, &ok, embedder, &submit).await?;
             for (id, why) in &totals.failed {
@@ -870,7 +870,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 llm.as_ref(),
                 cli.batch_size,
                 embedder,
-                move |t, g, a| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a),
+                move |t, g, p| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p),
             )
             .await?;
             report_unplanned(&totals.gaps, &totals.singletons);

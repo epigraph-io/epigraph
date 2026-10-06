@@ -11,7 +11,7 @@ mod viewer_fixture;
 
 use epigraph_cli::decompose::{
     persist_planned, plan_decomposition_batches, read_plan_jsonl, select_candidates, verify_plan,
-    write_plan_jsonl, BatchClaim, EligibilityFilters, Ineligible, PlanDrift, Priority,
+    write_plan_jsonl, AtomParent, BatchClaim, EligibilityFilters, Ineligible, PlanDrift, Priority,
 };
 use epigraph_cli::enrichment::llm_client::FixtureLlmClient;
 use sqlx::PgPool;
@@ -431,9 +431,9 @@ async fn plan_then_apply_plan_persists_the_reviewed_atoms_with_no_second_llm_cal
     assert_eq!(drifted[0].1, PlanDrift::ContentChanged);
 
     let pool_c = pool.clone();
-    let submit = move |t: String, _g: i64, a: Uuid| {
+    let submit = move |t: String, _g: i64, p: AtomParent| {
         let pool_c = pool_c.clone();
-        async move { Ok(insert_atom(&pool_c, a, &t).await) }
+        async move { Ok(insert_atom(&pool_c, p.agent_id, &t).await) }
     };
     let totals = persist_planned(&pool, &viewer, &ok, None, &submit)
         .await
@@ -529,7 +529,8 @@ async fn a_submit_failure_mid_parent_leaves_it_reapplicable(pool: PgPool) {
 
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (pool_c, calls_c) = (pool.clone(), calls.clone());
-    let flaky = move |t: String, _g: i64, a: Uuid| {
+    let flaky = move |t: String, _g: i64, p: AtomParent| {
+        let a = p.agent_id;
         let pool_c = pool_c.clone();
         // The 2nd submit of the whole run is atom 2 of the first parent.
         let n = calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -568,7 +569,8 @@ async fn a_submit_failure_mid_parent_leaves_it_reapplicable(pool: PgPool) {
         "the failed parent is still undecomposed; the applied one drifts: {drifted2:?}"
     );
     let pool_h = pool.clone();
-    let healthy = move |t: String, _g: i64, a: Uuid| {
+    let healthy = move |t: String, _g: i64, p: AtomParent| {
+        let a = p.agent_id;
         let pool_h = pool_h.clone();
         async move { Ok(get_or_insert_atom(&pool_h, a, &t).await) }
     };
@@ -628,5 +630,76 @@ async fn verify_plan_refuses_duplicate_parents_and_foreign_authors(pool: PgPool)
             (dup, PlanDrift::DuplicateInPlan),
             (foreign, PlanDrift::AgentChanged),
         ]
+    );
+}
+
+/// Production selects under the maintenance BYPASS viewer
+/// (`SystemReason::TenancyBackfill`), so it sees group-private claims — but
+/// atoms are POSTed public (`if_not_exists` is public-tier only) and carry the
+/// parent's text as derivation evidence (U041). A non-public parent must
+/// therefore never be chosen: not by the paged crawl, and not from
+/// `--ids-file` even with every overridable filter off, and each one is
+/// reported with the reason. Without this the API's `derived_from` refusal of
+/// a non-public parent would abort the whole normal run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn non_public_parents_are_never_selected_under_the_bypass_viewer(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "u041-selection").await;
+    let public = viewer_fixture::seed_public_claim(&pool, agent, &compound("public")).await;
+    let private = viewer_fixture::seed_group_claim(&pool, agent, group, &compound("private")).await;
+
+    let crawl = select_candidates(
+        &pool,
+        &viewer,
+        Priority::Oldest,
+        None,
+        EligibilityFilters::default(),
+        100,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert!(
+        ids(&crawl).contains(&public),
+        "the public parent is chosen: {crawl:?}"
+    );
+    assert!(
+        !ids(&crawl).contains(&private),
+        "a group-private parent must not be chosen by the crawl: {crawl:?}"
+    );
+    assert!(
+        crawl.skipped.iter().any(|(id, why)| *id == private
+            && *why
+                == Ineligible::NotPublic {
+                    visibility: "group".to_string()
+                }),
+        "the private parent is reported as NotPublic: {crawl:?}"
+    );
+
+    let named = select_candidates(
+        &pool,
+        &viewer,
+        Priority::Oldest,
+        Some(&[private, public]),
+        EligibilityFilters {
+            skip_backlog: false,
+            skip_short: false,
+        },
+        100,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ids(&named),
+        vec![public],
+        "--ids-file with every overridable filter off still refuses the private parent"
+    );
+    assert!(
+        named
+            .skipped
+            .iter()
+            .any(|(id, why)| *id == private && matches!(why, Ineligible::NotPublic { .. })),
+        "the named private parent is reported, not silently dropped: {named:?}"
     );
 }
