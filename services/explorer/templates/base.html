@@ -27,11 +27,16 @@
     <nav class="auth-nav" aria-label="Account">
       {%- if ctx.signed_in %}
       {%- if let Some(who) = ctx.identity %}
-      <p class="identity-strip" title="Shown as the principal is the token's subject. EpiGraph's token introspection reports the same value as the client id, so which sign-in application a session uses cannot be shown.">
+      <p class="identity-strip" title="Signed in as: the agent your access token names, read from the token for display. Sign-in client: the OAuth client record EpiGraph's token introspection reports as the token's subject.">
         {%- if let Some(short) = who.principal_short() %}
         <span class="identity-strip__principal">signed in as <code title="{{ who.principal().unwrap_or_default() }}">{{ short }}</code></span>
         {%- else %}
         <span class="identity-strip__principal">principal unavailable</span>
+        {%- endif %}
+        {%- if let Some(short) = who.client_short() %}
+        <span class="identity-strip__client">sign-in client <code title="{{ who.client().unwrap_or_default() }}">{{ short }}</code></span>
+        {%- else %}
+        <span class="identity-strip__client">sign-in client unavailable</span>
         {%- endif %}
         <span class="identity-strip__scope">token scope: {{ who.scope_text() }}</span>
         {%- if who.widened() %}

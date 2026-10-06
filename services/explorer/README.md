@@ -591,19 +591,29 @@ if the login response's cookie starts `__Host-` and the startup log
   code lives 60 s upstream and is redeemed immediately. No token ever appears
   in a URL.
 - **Identity strip.** Every signed-in page header shows a short principal
-  id, the scopes the current token **actually** carries, the minutes left
-  until it expires, and a Sign out button. Scope and expiry come from the
-  token response itself. The principal comes from **one**
-  `POST /oauth/introspect` per access token, made when the token is minted or
-  refreshed (never per page), server to server on `EPIGRAPH_API_URL`, with
-  the token in a JSON body and no bearer. If that call fails, the strip says
-  "principal unavailable" until the next token, and the page still renders.
+  id, the sign-in client, the scopes the current token **actually** carries,
+  the minutes left until it expires, and a Sign out button. Scope and expiry
+  come from the token response itself.
+  - The **principal** ("signed in as") is the agent the access token names,
+    its `agent_id` claim: the id the API's row-level security is stamped
+    with, and the `agent_id` on your own security events, claims and events.
+    The Explorer reads it from its own token for display, without verifying
+    the signature (the API verifies the token on every call; nothing in the
+    Explorer authorizes on this value). A token without one shows
+    "principal unavailable".
+  - The **sign-in client** is the token subject that **one**
+    `POST /oauth/introspect` per access token reports, made when the token is
+    minted or refreshed (never per page), server to server on
+    `EPIGRAPH_API_URL`, with the token in a JSON body and no bearer. The API
+    mints access tokens with the OAuth client record's id as the subject, so
+    this names the (per-user) sign-in client, not the agent. If that call
+    fails, the strip says "sign-in client unavailable" until the next token,
+    and the page still renders.
+
   A token wider than the scopes requested is shown as neutral information,
   "wider than requested": the API's refresh currently issues the user's full
   granted scopes (see Caveats), so expect it on most sessions after the first
-  refresh. The strip **cannot** say which sign-in application a session uses:
-  introspection reports a `client_id` equal to the subject. The strip is
-  display only; no authorization decision reads it.
+  refresh. The strip is display only; no authorization decision reads it.
 - **Session cookie.** At the root of a secure origin (the production
   topology, see Deploy) the session cookie is `__Host-epx_session` with
   `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain` and a 30-day

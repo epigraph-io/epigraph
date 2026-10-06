@@ -1882,8 +1882,13 @@ async fn identity_strip_shows_the_tokens_actual_scopes() {
     );
     assert!(!s.contains("wider than requested"), "{s}");
     assert!(
-        strip_part(s, "principal").contains(&SUB_1[..8]),
-        "a short principal id: {s}"
+        strip_part(s, "client").contains(&SUB_1[..8]),
+        "the introspected subject is shown as the sign-in client: {s}"
+    );
+    assert_eq!(
+        strip_part(s, "principal"),
+        "principal unavailable",
+        "an opaque token names no agent, and the subject is not shown as one: {s}"
     );
     let expiry = strip_part(s, "expiry");
     assert!(
@@ -1891,8 +1896,8 @@ async fn identity_strip_shows_the_tokens_actual_scopes() {
         "{expiry}"
     );
     assert!(
-        s.contains("which sign-in application a session uses cannot be shown"),
-        "the client limit is stated: {s}"
+        s.contains("the agent your access token names"),
+        "what the principal is, stated: {s}"
     );
     // The sign-out button is still there.
     assert!(res.body.contains("action=\"/explorer/auth/logout\""));
@@ -1926,11 +1931,11 @@ async fn identity_strip_shows_a_widened_token_as_neutral_info() {
     assert!(!s.contains("notice"), "neutral, not a notice box: {s}");
 }
 
-/// Introspection is for the principal only. When it fails, the principal
+/// Introspection is for the sign-in client only. When it fails, the client
 /// reads "unavailable" and everything else still renders: the scope and
 /// expiry come from the token response itself.
 #[tokio::test]
-async fn introspect_failure_degrades_the_principal_not_the_page() {
+async fn introspect_failure_degrades_the_client_not_the_page() {
     let app = app().await;
     introspect_call("access-1")
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
@@ -1944,9 +1949,45 @@ async fn introspect_failure_degrades_the_principal_not_the_page() {
     let res = header_of(&app, &sid).await;
     assert!(res.body.contains("role=\"search\""), "the page renders");
     let s = strip(&res.body);
-    assert_eq!(strip_part(s, "principal"), "principal unavailable", "{s}");
+    assert_eq!(strip_part(s, "client"), "sign-in client unavailable", "{s}");
     assert_eq!(strip_part(s, "scope"), "token scope: claims:read", "{s}");
     assert!(strip_part(s, "expiry").starts_with("expires in "), "{s}");
+}
+
+/// "Signed in as" names the agent the access token carries (its
+/// `agent_id`), which is the kernel's principal and the id on the viewer's
+/// own rows, not the token subject: the API sets `sub` to the OAuth client
+/// record, and introspection reports that, so it is labelled the sign-in
+/// client.
+#[tokio::test]
+async fn identity_strip_names_the_tokens_agent_and_labels_the_subject_as_the_client() {
+    const AGENT_ID: &str = "1b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
+    let app = app().await;
+    let access = common::jwt_with_agent(AGENT_ID);
+    introspect_call(&access)
+        .respond_with(introspected(SUB_1))
+        .mount(&app.upstream)
+        .await;
+    let sid = sign_in_answering(&app, token_json(&access, "refresh-1")).await;
+
+    let res = header_of(&app, &sid).await;
+    let s = strip(&res.body);
+    let principal = strip_part(s, "principal");
+    assert!(
+        principal.starts_with(
+            "signed in as <code title=\"1b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10\">1b9a5a4e</code>"
+        ),
+        "the token's agent is the principal: {s}"
+    );
+    assert!(!principal.contains(&SUB_1[..8]), "never the subject: {s}");
+    let client = strip_part(s, "client");
+    assert!(
+        client.starts_with(&format!(
+            "sign-in client <code title=\"{SUB_1}\">{}</code>",
+            &SUB_1[..8]
+        )),
+        "the subject is the sign-in client: {s}"
+    );
 }
 
 /// The principal is looked up once per token (at mint, and again for each

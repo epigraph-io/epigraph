@@ -68,6 +68,28 @@ pub async fn spawn_with(env: &[(&str, &str)], extra: Router<AppState>) -> TestAp
     }
 }
 
+/// An access token shaped like the API's: a JWT whose payload names
+/// `agent_id` (and a different `sub`, the client record, as the API sets it).
+/// The signature is a placeholder: the Explorer reads the claims for display
+/// only and never verifies them, and wiremock does not either.
+pub fn jwt_with_agent(agent_id: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let payload = serde_json::json!({
+        "sub": "00000000-0000-4000-8000-00000000c11e",
+        "iss": "epigraph",
+        "aud": "epigraph-api",
+        "exp": 4_102_444_800i64,
+        "scopes": ["claims:read", "audit:read"],
+        "agent_id": agent_id,
+    });
+    format!(
+        "{}.{}.placeholder-signature",
+        URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#),
+        URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+    )
+}
+
 /// Whether `r` is the admin-acts capability probe
 /// (`upstream::capabilities::ADMIN_ACTS_PROBE`), which a signed-in page
 /// makes before its own calls until the answer is remembered. It is the

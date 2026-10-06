@@ -24,6 +24,7 @@ use crate::error::AppError;
 use crate::links::Links;
 use crate::state::AppState;
 use crate::upstream::capabilities::Capability;
+use crate::upstream::identity::token_agent_id;
 use crate::upstream::{Api, Degraded};
 
 /// The product name shown in the header and OG `site_name`.
@@ -93,16 +94,21 @@ impl RequestAuth {
     }
 }
 
-/// Characters of the principal shown in the header; the whole id is in the
+/// Characters of an id shown in the header; the whole id is in the
 /// element's tooltip.
 const PRINCIPAL_SHORT_CHARS: usize = 8;
 
 /// The header's identity strip (who the viewer is signed in as, and what
 /// their token carries), copied from the session when the page is built.
 /// Display only: no authorization decision reads it.
+///
+/// It names two ids, each as what it is (see [`crate::upstream::identity`]):
+/// the principal is the agent the access token names, and the sign-in client
+/// is the token subject introspection reports, which is the OAuth client row.
 #[derive(Clone, Debug)]
 pub struct IdentityStrip {
-    principal: Degraded<String>,
+    principal: Option<uuid::Uuid>,
+    client: Degraded<String>,
     scope: Option<String>,
     widened: bool,
     expires_at: DateTime<Utc>,
@@ -111,22 +117,34 @@ pub struct IdentityStrip {
 impl IdentityStrip {
     pub fn of(session: &Session) -> Self {
         Self {
-            principal: session.principal.clone(),
+            principal: token_agent_id(&session.access_token),
+            client: session.principal.clone(),
             scope: session.scope.clone(),
             widened: session.scope_widened,
             expires_at: session.expires_at,
         }
     }
 
-    /// The token subject, if introspection named one.
-    pub fn principal(&self) -> Option<&str> {
-        self.principal.get().map(String::as_str)
+    /// The agent the access token names (its `agent_id`), if it names one.
+    pub fn principal(&self) -> Option<String> {
+        self.principal.map(|p| p.to_string())
     }
 
     /// Its first few characters, for the header.
     pub fn principal_short(&self) -> Option<String> {
         self.principal()
             .map(|p| p.chars().take(PRINCIPAL_SHORT_CHARS).collect())
+    }
+
+    /// The sign-in client: the token subject, if introspection named one.
+    pub fn client(&self) -> Option<&str> {
+        self.client.get().map(String::as_str)
+    }
+
+    /// Its first few characters, for the header.
+    pub fn client_short(&self) -> Option<String> {
+        self.client()
+            .map(|c| c.chars().take(PRINCIPAL_SHORT_CHARS).collect())
     }
 
     /// The scopes the token was granted, as its token response listed
@@ -448,9 +466,12 @@ mod tests {
         assert_eq!(RequestAuth::DevBearer("x".into()).cache_key(), "dev");
     }
 
-    fn strip(principal: Degraded<String>, scope: Option<&str>, mins: i64) -> IdentityStrip {
+    fn strip(client: Degraded<String>, scope: Option<&str>, mins: i64) -> IdentityStrip {
         IdentityStrip {
-            principal,
+            principal: Some(uuid::Uuid::from_u128(
+                0x0123_4567_89ab_4cde_8f01_2345_6789_abcd,
+            )),
+            client,
             scope: scope.map(str::to_string),
             widened: false,
             expires_at: Utc::now()
@@ -466,12 +487,19 @@ mod tests {
             Some("claims:read"),
             42,
         );
-        assert_eq!(s.principal(), Some("0123456789abcdef"));
+        assert_eq!(s.client(), Some("0123456789abcdef"));
+        assert_eq!(s.client_short().as_deref(), Some("01234567"));
+        assert_eq!(
+            s.principal().as_deref(),
+            Some("01234567-89ab-4cde-8f01-23456789abcd")
+        );
         assert_eq!(s.principal_short().as_deref(), Some("01234567"));
         assert_eq!(s.scope_text(), "claims:read");
         assert_eq!(s.minutes_left(), 42);
 
-        let s = strip(Degraded::unavailable("down"), None, -5);
+        let mut s = strip(Degraded::unavailable("down"), None, -5);
+        assert_eq!(s.client_short(), None);
+        s.principal = None;
         assert_eq!(s.principal_short(), None);
         assert_eq!(s.scope_text(), "not reported", "never the requested set");
         assert_eq!(

@@ -86,7 +86,10 @@ pub struct Session {
     /// decision reads it.
     pub scope_widened: bool,
     /// The token subject `/oauth/introspect` reported for the current
-    /// token, or why it is unavailable. Display only.
+    /// token, or why it is unavailable. The API sets `sub` to the OAuth
+    /// client record, so the identity strip shows this as the sign-in
+    /// client; the principal it shows is the token's own `agent_id`
+    /// ([`crate::upstream::identity::token_agent_id`]). Display only.
     pub principal: Degraded<String>,
 }
 
