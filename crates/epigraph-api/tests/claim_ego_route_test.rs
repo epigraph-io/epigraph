@@ -958,6 +958,153 @@ async fn a_derived_neighbour_of_a_private_root_is_absent_for_a_stranger(pool: Pg
     assert_eq!(body["total_edges"], 0, "body: {body}");
 }
 
+/// One group-private neighbour of every remaining tier arm, each over a forced-
+/// public edge from a public centre: the `columns` tier's `frame`, `context`,
+/// `perspective` and `community` (judged on their own tenancy columns), and the
+/// rooted `derived` tier's `experiment` and `experiment_result` (judged by the
+/// hypothesis claim they derive from). `evidence` and `trace` have their own
+/// tests above.
+///
+/// Neither the six types' node hydration nor `routes/ego.rs`'s defence in depth
+/// can hide a leak here: none of the six is a hydrated type, so a neighbour
+/// whose edge survived the SQL filter is emitted as a bare typed node carrying
+/// its id. The SQL arm for each type is therefore the only thing withholding
+/// it, and `total_edges` (counted inside the same predicate) says how many got
+/// through.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_other_tier_arm_withholds_a_private_neighbour_from_a_stranger(pool: PgPool) {
+    let owner = Uuid::new_v4();
+    let center = common::seed_claim_with_agent(&pool, "public centre", owner).await;
+    let group = common::personal_group_of(&pool, owner).await;
+
+    // `columns` tier: declared group-private at INSERT, as migration 074
+    // requires of these parentless roots.
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses, visibility, owner_group_id) \
+         VALUES ($1, ARRAY['h0','h1']::text[], 'group', $2) RETURNING id",
+    )
+    .bind(format!("ego-tier-frame-{}", Uuid::new_v4()))
+    .bind(group)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a private frame");
+    let context: Uuid = sqlx::query_scalar(
+        "INSERT INTO contexts (name, context_type, visibility, owner_group_id) \
+         VALUES ($1, 'temporal', 'group', $2) RETURNING id",
+    )
+    .bind(format!("ego-tier-context-{}", Uuid::new_v4()))
+    .bind(group)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a private context");
+    let perspective: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, visibility, owner_group_id) \
+         VALUES ($1, 'group', $2) RETURNING id",
+    )
+    .bind(format!("ego-tier-perspective-{}", Uuid::new_v4()))
+    .bind(group)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a private perspective");
+    let community: Uuid = sqlx::query_scalar(
+        "INSERT INTO communities (name, visibility, owner_group_id) \
+         VALUES ($1, 'group', $2) RETURNING id",
+    )
+    .bind(format!("ego-tier-community-{}", Uuid::new_v4()))
+    .bind(group)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a private community");
+    for (table, id) in [
+        ("frames", frame),
+        ("contexts", context),
+        ("perspectives", perspective),
+        ("communities", community),
+    ] {
+        assert_eq!(
+            tenancy_of(&pool, table, id).await,
+            ("group".to_string(), group),
+            "{table} row must be group-private"
+        );
+    }
+
+    // Rooted `derived` tier: an experiment on a private hypothesis, and a
+    // result of that experiment.
+    let hypothesis = common::seed_claim_with_agent(&pool, "classified hypothesis", owner).await;
+    common::seed_private_ownership(&pool, hypothesis, owner).await;
+    assert_eq!(
+        tenancy_of(&pool, "claims", hypothesis).await,
+        ("group".to_string(), group)
+    );
+    let experiment: Uuid = sqlx::query_scalar(
+        "INSERT INTO experiments (hypothesis_id, created_by) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(hypothesis)
+    .bind(owner)
+    .fetch_one(&pool)
+    .await
+    .expect("seed an experiment on the private hypothesis");
+    let result: Uuid = sqlx::query_scalar(
+        "INSERT INTO experiment_results (experiment_id, data_source) \
+         VALUES ($1, 'manual') RETURNING id",
+    )
+    .bind(experiment)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a result of that experiment");
+
+    let neighbours = [
+        (frame, "frame"),
+        (context, "context"),
+        (perspective, "perspective"),
+        (community, "community"),
+        (experiment, "experiment"),
+        (result, "experiment_result"),
+    ];
+    let mut edges = Vec::new();
+    for (id, entity_type) in neighbours {
+        edges
+            .push(common::insert_edge(&pool, center, id, "claim", entity_type, "relates_to").await);
+    }
+    force_edges_public(&pool, &edges).await;
+
+    let app = router(&pool).await;
+    let path = format!("/api/v1/claims/{center}/ego");
+
+    let (status, body) = get(&app, &path, Some(&reader())).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let text = body.to_string();
+    for (id, entity_type) in neighbours {
+        assert!(
+            !text.contains(&id.to_string()),
+            "the private {entity_type} neighbour leaked to a stranger: {body}"
+        );
+    }
+    assert!(node_ids(&body).is_empty(), "body: {body}");
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 0);
+    assert_eq!(
+        body["total_edges"], 0,
+        "`total_edges` counts only what the viewer may see, so any arm that let its \
+         neighbour through shows here; got {body}"
+    );
+
+    // CALIBRATION: the owner gets all six, each as its own type, so the
+    // stranger's empty answer is about tenancy and not about these types being
+    // dropped wholesale.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let (status, body) = get(&app, &path, Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let mut ids = node_ids(&body);
+    ids.sort();
+    let mut want: Vec<String> = neighbours.iter().map(|(id, _)| id.to_string()).collect();
+    want.sort();
+    assert_eq!(ids, want, "body: {body}");
+    for (id, entity_type) in neighbours {
+        assert_eq!(node(&body, id)["entity_type"], entity_type, "body: {body}");
+    }
+    assert_eq!(body["total_edges"], 6, "body: {body}");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_public_non_claim_neighbour_is_still_shown(pool: PgPool) {
     // Twin of the columns-tier test: the filter must not over-reach and drop
