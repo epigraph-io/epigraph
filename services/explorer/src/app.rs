@@ -112,7 +112,7 @@ pub fn build_app_with(state: AppState, extra: Router<AppState>) -> Router {
             state.clone(),
             security::security_headers,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .with_state(state)
 }
 
@@ -127,6 +127,20 @@ async fn health() -> Json<Health> {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+/// The span every request runs in: method, version and the path only.
+///
+/// `TraceLayer`'s default span records the whole URI, query included, and
+/// the OAuth callback's query carries a live authorization code and
+/// `state`. Same level (`DEBUG`) as the default; `path` replaces its `uri`.
+pub fn request_span(req: &Request) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %req.method(),
+        path = %req.uri().path(),
+        version = ?req.version(),
+    )
 }
 
 async fn fallback() -> AppError {
@@ -213,6 +227,69 @@ mod tests {
             reserved,
             top_level_segments(),
             "RESERVED_BASE_PATH_SEGMENTS has drifted from the app's routes"
+        );
+    }
+
+    /// Every field value of every span opened while it is the subscriber.
+    #[derive(Clone, Default)]
+    struct SpanFields(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanFields {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visit<'a>(&'a mut Vec<(String, String)>);
+            impl tracing::field::Visit for Visit<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .push((field.name().to_string(), format!("{value:?}")));
+                }
+            }
+            let mut fields = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            attrs.record(&mut Visit(&mut fields));
+        }
+    }
+
+    /// The OAuth callback carries a live authorization code and `state` in
+    /// its query, so the request span must record the path alone.
+    #[test]
+    fn request_span_omits_the_query() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let seen = SpanFields::default();
+        let subscriber = tracing_subscriber::registry().with(seen.clone());
+        let req = Request::builder()
+            .uri("/auth/callback?code=x&state=y")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = request_span(&req);
+        });
+
+        let fields = seen.0.lock().unwrap().clone();
+        let path = fields
+            .iter()
+            .find(|(name, _)| name == "path")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(path, Some("/auth/callback"), "{fields:?}");
+        assert!(
+            fields
+                .iter()
+                .all(|(_, v)| !v.contains('?') && !v.contains("code=") && !v.contains("state=")),
+            "a recorded field carries the query: {fields:?}"
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|(name, v)| name == "method" && v == "GET"),
+            "the method is still recorded: {fields:?}"
         );
     }
 }
