@@ -7,8 +7,22 @@
 //! prefers CLAUDE_CODE_OAUTH_TOKEN — NEVER the Anthropic-SDK pay-per-token
 //! variant the V2 `_api.py`/`_openai.py` scripts used), parses with
 //! `epigraph_cli::decompose::parse_batch_response`, and persists atoms through
-//! the canonical API claim path so embedding + DS auto-wire + signing happen
-//! on write.
+//! the canonical API claim path so embedding, author-key signing and the
+//! atom's derivation evidence happen on write. NO DS mass function is written
+//! for an atom: `POST /api/v1/claims` has no DS auto-wire.
+//!
+//! # Evidence policy for atoms (U041, backlog 3590a2d8)
+//!
+//! Atoms carry derivation PROVENANCE, not derived BELIEF, until
+//! `decomposes_to` propagation exists. Each atom POST names its parent in
+//! `derived_from`, and the API records one `document` evidence row on the atom
+//! (the parent's text, `properties.derived_from_claim` = parent id) in the
+//! atom's own transaction, so `get_provenance` shows where it came from. The
+//! atom's truth stays at 0.5 until INDEPENDENT evidence arrives: its only
+//! warrant at birth is "the parent states it", and when the parent is itself
+//! evidence-free (the legacy 2026-02/03 imports) any belief given to the atom
+//! would be laundered from it. Only `visibility = 'public'` parents are
+//! selected ([`epigraph_cli::decompose::check_publicly_decomposable`]).
 //!
 //! Required: DATABASE_URL, and CLAUDE_CODE_OAUTH_TOKEN.
 //! API base: EPIGRAPH_API (primary) or EPIGRAPH_API_URL (container fallback),
@@ -559,8 +573,9 @@ async fn resolve_token(
     })
 }
 
-/// Canonical atom create via `POST /api/v1/claims`: signing + DS + embed on
-/// write.
+/// Canonical atom create via `POST /api/v1/claims`: author-key signing, embed
+/// on write, and one derivation evidence row naming `parent` (no DS mass; see
+/// the module doc's evidence policy).
 ///
 /// methodology/evidence_type belong in `properties` (JSONB); top-level they
 /// were unknown fields and silently dropped. `if_not_exists=true`: when a

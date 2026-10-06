@@ -452,7 +452,8 @@ mod db_writes {
     ///
     /// Atom claims are written through `submit_via` — a closure the caller
     /// supplies that goes through the CANONICAL claim-create path so signing,
-    /// provenance, DS auto-wire and embed-on-write are preserved. In the
+    /// derivation provenance and embed-on-write are preserved (that path
+    /// writes no DS mass function for an atom). In the
     /// binary this closure POSTs to the local API `/api/v1/claims` (or calls
     /// the in-process submit helper); in tests it is a fake that inserts a
     /// minimal claim row, letting us verify the edge/label wiring WITHOUT an
