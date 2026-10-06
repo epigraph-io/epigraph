@@ -521,6 +521,24 @@ pub fn aggregate_conflict(reports: &[CombinationReport]) -> f64 {
     (1.0 - survived).clamp(0.0, 1.0)
 }
 
+/// The conflict a `combine_multiple` call saw, given its result and reports.
+///
+/// With one or more fold steps this is [`aggregate_conflict`]; Dempster
+/// normalised the conflict out of `combined`, so reading
+/// `combined.mass_of_conflict()` would report 0. With no steps (a single
+/// input, returned as-is) there was no fold, and the input's own empty-set
+/// mass is the conflict. Every caller that caches or reports "mass on
+/// conflict" for a combined belief should read it through this function so
+/// the recompute, the write paths and the framed reads agree.
+#[must_use]
+pub fn fold_conflict(combined: &MassFunction, reports: &[CombinationReport]) -> f64 {
+    if reports.is_empty() {
+        combined.mass_of_conflict()
+    } else {
+        aggregate_conflict(reports)
+    }
+}
+
 /// Combine multiple mass functions by pairwise Dempster folding
 ///
 /// Every pairwise step uses Dempster's rule (CDST conjunctive combination,
@@ -1876,6 +1894,30 @@ mod tests {
         // It is not just the last step's K.
         assert!(got > reports.last().unwrap().conflict_k + 1e-6);
         assert_eq!(aggregate_conflict(&[]), 0.0);
+    }
+
+    #[test]
+    fn fold_conflict_reads_input_conflict_without_a_fold_and_aggregate_with_one() {
+        let frame = binary_frame();
+        // A single stored BBA that itself carries conflict mass (as a
+        // cautious-combined or TBM-stored row can): no fold, so its own
+        // empty-set mass is the conflict.
+        let mut raw = BTreeMap::new();
+        raw.insert(FocalElement::conflict(), 0.2);
+        raw.insert(FocalElement::positive(BTreeSet::from([0])), 0.5);
+        raw.insert(FocalElement::theta(&frame), 0.3);
+        let lone = MassFunction::from_raw(frame.clone(), raw);
+        let (c1, r1) = combine_multiple(std::slice::from_ref(&lone), 0.9).unwrap();
+        assert!(r1.is_empty());
+        assert!((fold_conflict(&c1, &r1) - 0.2).abs() < 1e-12);
+
+        // Two opposing BBAs: Dempster leaves 0 on the empty set, but the fold
+        // saw K = 0.56; fold_conflict must report the latter.
+        let a = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.8).unwrap();
+        let b = MassFunction::simple(frame, BTreeSet::from([1]), 0.7).unwrap();
+        let (c2, r2) = combine_multiple(&[a, b], 0.9).unwrap();
+        assert!(c2.mass_of_conflict() < 1e-12);
+        assert!((fold_conflict(&c2, &r2) - 0.56).abs() < 1e-12);
     }
 
     // ======== Plausibility ratchet regression ========

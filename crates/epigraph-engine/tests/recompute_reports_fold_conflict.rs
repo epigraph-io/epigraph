@@ -128,4 +128,15 @@ async fn head_on_conflict_is_cached_and_classified(pool: PgPool) {
         "claims.mass_on_empty must keep meaning 'conflict seen': got {mass_on_empty}"
     );
     assert_eq!(classification.as_deref(), Some("contradicted"));
+
+    // The framed compute-on-read path must report the same conflict the cache
+    // holds; otherwise `get_belief` with and without a frame disagree.
+    let framed = epigraph_engine::belief_query::get_belief(&pool, &viewer, claim, Some(frame.id))
+        .await
+        .unwrap();
+    assert!(
+        (framed.mass_on_conflict - 0.64).abs() < 1e-9,
+        "framed get_belief reported mass_on_conflict {}, cache holds 0.64",
+        framed.mass_on_conflict
+    );
 }
