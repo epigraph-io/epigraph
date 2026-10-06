@@ -23,8 +23,9 @@
 //!   drops the session and clears both cookies.
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -57,6 +58,56 @@ pub fn routes() -> Router<AppState> {
         .route("/auth/callback", get(callback))
         .route("/auth/logout", post(logout))
         .route("/auth/redeem", post(redeem))
+}
+
+// ---- duplicated session cookies ------------------------------------------------
+
+/// The response half of the duplicate-cookie refusal ([`session::read_cookie`]).
+///
+/// A request that carried the session cookie more than once was served
+/// signed out. Its response clears both jar entries this site sets (the
+/// first-party cookie and the partitioned embed cookie), unless the
+/// response already sets the session cookie itself (sign-in, logout, an
+/// expired session) or is publicly cacheable (`/static/*`). A cookie set
+/// with another `Domain` or `Path` cannot be cleared from here.
+pub async fn clear_duplicated_session_cookies(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let duplicated = session::cookie_count(req.headers(), SESSION_COOKIE) > 1;
+    let mut resp = next.run(req).await;
+    if duplicated && !sets_session_cookie(&resp) && !is_publicly_cacheable(&resp) {
+        tracing::warn!(
+            "request carried the session cookie more than once; served signed out and cleared"
+        );
+        let h = resp.headers_mut();
+        h.append(header::SET_COOKIE, clear_session_cookie(&state.config));
+        h.append(
+            header::SET_COOKIE,
+            clear_embed_session_cookie(&state.config),
+        );
+    }
+    resp
+}
+
+fn sets_session_cookie(resp: &Response) -> bool {
+    let prefix = format!("{SESSION_COOKIE}=");
+    resp.headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.starts_with(&prefix))
+}
+
+fn is_publicly_cacheable(resp: &Response) -> bool {
+    resp.headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case("public"))
+        })
 }
 
 // ---- templates ----------------------------------------------------------------

@@ -106,6 +106,10 @@ pub fn build_app_with(state: AppState, extra: Router<AppState>) -> Router {
         .layer(from_fn_with_state(state.clone(), error::render_errors))
         .layer(from_fn_with_state(
             state.clone(),
+            auth::clear_duplicated_session_cookies,
+        ))
+        .layer(from_fn_with_state(
+            state.clone(),
             security::security_headers,
         ))
         .layer(TraceLayer::new_for_http())

@@ -239,19 +239,40 @@ pub fn clear_embed_session_cookie(config: &Config) -> HeaderValue {
     to_header(&c)
 }
 
-/// Read one cookie's value from every `Cookie` header on the request.
-pub fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+/// Every value of cookie `name`, across every `Cookie` header on the request.
+fn cookie_values<'h>(headers: &'h HeaderMap, name: &'h str) -> impl Iterator<Item = &'h str> + 'h {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v.trim().to_string())
+        .filter(move |(k, _)| *k == name)
+        .map(|(_, v)| v.trim())
 }
 
-/// The session id from `epx_session`, if well-formed. Does not check the
+/// How many times cookie `name` occurs on the request.
+pub fn cookie_count(headers: &HeaderMap, name: &str) -> usize {
+    cookie_values(headers, name).count()
+}
+
+/// Read one cookie's value from every `Cookie` header on the request.
+///
+/// `None` when the name occurs more than once. A browser sends two cookies of
+/// one name when its jar holds a second entry with another `Domain` or
+/// `Path`, for example one tossed in by a sibling host. Nothing on the
+/// request says which one this site set, so neither is trusted.
+pub fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    let mut values = cookie_values(headers, name);
+    let first = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(first.to_string())
+}
+
+/// The session id from `epx_session`, if well-formed and sent exactly once
+/// (a duplicated session cookie reads as signed out). Does not check the
 /// store.
 pub fn read_session_cookie(headers: &HeaderMap) -> Option<SessionId> {
     read_cookie(headers, SESSION_COOKIE).and_then(|v| SessionId::parse(&v))
@@ -393,5 +414,42 @@ mod tests {
             HeaderValue::from_static("epx_session=../../etc"),
         );
         assert_eq!(read_session_cookie(&junk), None);
+    }
+
+    #[test]
+    fn a_duplicated_cookie_reads_as_absent() {
+        let a = SessionId::generate();
+        let b = SessionId::generate();
+        // Two values in one header, and one value in each of two headers.
+        let mut one_header = HeaderMap::new();
+        one_header.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "epx_session={}; epx_session={}",
+                a.as_str(),
+                b.as_str()
+            ))
+            .unwrap(),
+        );
+        let mut two_headers = HeaderMap::new();
+        for id in [&a, &a] {
+            two_headers.append(
+                header::COOKIE,
+                HeaderValue::from_str(&format!("epx_session={}", id.as_str())).unwrap(),
+            );
+        }
+        for h in [&one_header, &two_headers] {
+            assert_eq!(cookie_count(h, SESSION_COOKIE), 2);
+            assert_eq!(
+                read_cookie(h, SESSION_COOKIE),
+                None,
+                "even an identical repeat"
+            );
+            assert_eq!(read_session_cookie(h), None);
+        }
+        // Another cookie on the same request is unaffected.
+        one_header.append(header::COOKIE, HeaderValue::from_static("epx_login=x"));
+        assert_eq!(read_cookie(&one_header, "epx_login").as_deref(), Some("x"));
+        assert_eq!(cookie_count(&one_header, "absent"), 0);
     }
 }

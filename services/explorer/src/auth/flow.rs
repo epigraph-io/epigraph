@@ -93,7 +93,9 @@ pub fn pre_auth_cookie(config: &Config, binding: &str) -> HeaderValue {
     HeaderValue::from_str(&c.to_string()).expect("cookie built from validated parts")
 }
 
-/// The pre-auth binding from the request, if well-formed.
+/// The pre-auth binding from the request, if well-formed and sent exactly
+/// once. A duplicated binding reads as absent, so the callback is refused
+/// and the next `/auth/login` mints a fresh binding.
 pub fn read_pre_auth_cookie(headers: &HeaderMap) -> Option<String> {
     read_cookie(headers, PRE_AUTH_COOKIE).filter(|v| is_token_shaped(v))
 }

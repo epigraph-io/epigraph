@@ -1221,3 +1221,108 @@ async fn housekeeping_evicts_expired_sign_in_state() {
     assert_eq!(flow.pending.len(), 0);
     assert_eq!(flow.handoffs.len(), 1, "live entries stay");
 }
+
+// ---- duplicated cookies -------------------------------------------------------------
+
+/// Two `epx_session` values (one possibly tossed in by a sibling host) mean
+/// the request cannot tell whose session it is: it is signed out, and both
+/// jar entries this site owns are cleared.
+#[tokio::test]
+async fn two_session_cookies_mean_signed_out() {
+    let app = app().await;
+    let sid = app.sign_in("access-1");
+    // One upstream call in total: the calibration below, never the
+    // duplicated request.
+    mount_probe(&app, "access-1", 200, 1).await;
+
+    // Calibration: this session alone is signed in.
+    let res = app.get_as("/explorer/probe", &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.header_all("set-cookie").is_empty());
+
+    // The valid session FIRST, so a first-match reader would sign it in.
+    let other = epigraph_explorer::auth::random_token(32);
+    let cookie = format!("epx_session={}; epx_session={other}", sid.as_str());
+    let res = app
+        .get_with("/explorer/probe", &[("cookie", &cookie)])
+        .await;
+    assert_eq!(
+        res.status,
+        StatusCode::SEE_OTHER,
+        "a duplicated session cookie must be treated as signed out: {}",
+        res.body
+    );
+    assert!(
+        res.location()
+            .is_some_and(|l| l.starts_with("/explorer/auth/login?return_to=")),
+        "{:?}",
+        res.location()
+    );
+    let cleared = res.header_all("set-cookie");
+    assert_eq!(cleared.len(), 2, "{cleared:?}");
+    assert!(
+        cleared
+            .iter()
+            .all(|c| c.starts_with("epx_session=;") && c.contains("Max-Age=0")),
+        "{cleared:?}"
+    );
+    assert!(
+        cleared.iter().any(|c| c.contains("Partitioned")),
+        "the embed cookie is a separate jar entry: {cleared:?}"
+    );
+    assert!(cleared.iter().any(|c| !c.contains("Partitioned")));
+
+    // In either order.
+    let cookie = format!("epx_session={other}; epx_session={}", sid.as_str());
+    let res = app
+        .get_with("/explorer/probe", &[("cookie", &cookie)])
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER);
+    assert_eq!(res.header_all("set-cookie").len(), 2);
+}
+
+/// Two `epx_login` bindings: the callback cannot tell which browser started
+/// the login, so it is refused and the next login mints a fresh binding.
+#[tokio::test]
+async fn two_login_binding_cookies_restart_the_login() {
+    let app = app().await;
+    any_token_call()
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_json("a", "r")))
+        .expect(0)
+        .mount(&app.upstream)
+        .await;
+    let started = start_login(&app, &format!("?return_to={CLAIM_PATH}")).await;
+
+    // This browser's own binding FIRST, so a first-match reader would accept.
+    let other = epigraph_explorer::auth::random_token(32);
+    let cookie = format!("epx_login={}; epx_login={other}", started.binding);
+    let res = app
+        .get_with(
+            &format!("/explorer/auth/callback?code=c&state={}", started.state),
+            &[("cookie", &cookie)],
+        )
+        .await;
+    assert_eq!(
+        res.status,
+        StatusCode::BAD_REQUEST,
+        "a duplicated login binding must refuse the callback: {}",
+        res.body
+    );
+    assert!(res.body.contains("started in this browser"), "{}", res.body);
+    assert!(
+        res.body
+            .contains("/explorer/auth/login?return_to=%2Fexplorer%2Fclaim%2F"),
+        "the retry link restarts the same login: {}",
+        res.body
+    );
+    assert_eq!(app.state.sessions.len(), 0);
+
+    // The restart: a login with the same two cookies reuses neither.
+    let res = app
+        .get_with("/explorer/auth/login", &[("cookie", &cookie)])
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER);
+    let (binding, _) = set_cookie(&res, "epx_login").expect("a fresh binding is set");
+    assert_ne!(binding, started.binding);
+    assert_ne!(binding, other);
+}
