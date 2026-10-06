@@ -295,8 +295,14 @@ The API's authorization server signs people in **only through Google**, and
 - The allowlist is checked again when a token is refreshed, so removing an
   email cuts that user off within about an hour. That is the access-token
   lifetime.
-- On `main`, an empty allowlist lets **everyone** in (the API logs a
-  warning). Populate it before exposing the Explorer.
+- An **empty** allowlist (no `allowed_emails` and no `allowed_domains`) lets
+  **nobody** in: the API refuses to provision any identity through that
+  provider and refuses every refresh for its users, unless the API runs with
+  `EPIGRAPH_ALLOW_ALL_IDENTITIES=true`, which admits every identity Google
+  authenticates. With `auto_provision` on and no allowlist, the API does not
+  even boot unless that variable is `true` or `EPIGRAPH_ENV` names a
+  non-production environment. Populate the allowlist; do not use the
+  allow-all switch for the Explorer.
 - Restart `epigraph-api.service` after editing the file.
 
 ### 3. The consent page
