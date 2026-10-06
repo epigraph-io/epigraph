@@ -7,6 +7,19 @@ RECON_WINDOW_DAYS that mention the backlog UUID. PATCHes unambiguous matches.
 Ambiguous matches are appended to docs/superpowers/reports/reconciler-needs-review.log
 for human triage.
 
+Output, last line: `Reconciler: patched=N needs_review=M apply=<bool>`.
+
+- Dry run (default): N is the number of unambiguous matches an `--apply`
+  run WOULD patch. Each one is also printed, before the summary, as
+  `WOULD-PATCH <backlog_id> via <resolved_claim_id>`; those lines are the
+  operator's apply list. Nothing is written.
+- `--apply`: N is the number of PATCHes that SUCCEEDED. A refused PATCH
+  prints `FAIL <backlog_id>: <error>` to stderr, and the run exits 1 if any
+  FAIL was printed, so a scheduled apply alerts instead of reporting a
+  quiet `patched=0`.
+
+M counts open backlog items whose match is ambiguous, in both modes.
+
 Schedule: daily. Idempotent. Safe to run repeatedly.
 """
 import argparse
@@ -144,8 +157,12 @@ def main() -> int:
 
     log_path = Path("docs/superpowers/reports/reconciler-needs-review.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # `patched` = successful PATCHes under --apply, would-patch count in a
+    # dry run (see the module docstring). Before U058 the dry run never
+    # incremented it, so it always reported patched=0.
     patched = 0
     review = 0
+    failed = 0
     for bc in open_backlog:
         matches = matches_for_backlog.get(bc["id"], [])
         prefix_peers = backlog_by_prefix.get(bc["id"][:8].lower(), [])
@@ -159,6 +176,10 @@ def main() -> int:
                     patched += 1
                 except httpx.HTTPError as e:
                     print(f"FAIL {bc['id']}: {e}", file=sys.stderr)
+                    failed += 1
+            else:
+                print(f"WOULD-PATCH {bc['id']} via {matches[0]['id']}")
+                patched += 1
         else:
             with log_path.open("a") as f:
                 f.write(
@@ -168,7 +189,8 @@ def main() -> int:
             review += 1
 
     print(f"Reconciler: patched={patched} needs_review={review} apply={args.apply}")
-    return 0
+    # Non-zero when any PATCH was refused, so a scheduled --apply run alerts.
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
