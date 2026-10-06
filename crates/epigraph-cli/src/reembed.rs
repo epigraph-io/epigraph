@@ -21,8 +21,9 @@
 //! retrievable again through recall at `centroid_dim = 3072`
 //! (`ClaimRepository::search_by_embedding_since` has no `is_current` filter),
 //! and `chk_deprecated_no_embedding` (migration 144) refuses the write, so one
-//! retired row would abort the whole run. See
-//! [`ReembedTarget::eligible_predicate`].
+//! retired row would abort the whole run. The UPDATE re-checks the same
+//! predicate, so a claim retired between the fetch and the write is skipped
+//! rather than fatal. See [`ReembedTarget::eligible_predicate`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -169,8 +170,9 @@ pub async fn run(pool: &PgPool, config: ReembedConfig) -> Result<ReembedSummary,
 
         for ((row_id, _), embedding) in rows.iter().zip(embeddings.iter()) {
             let pgvec = format_pgvector(embedding);
-            update_embedding_3072(pool, config.target, *row_id, &pgvec).await?;
-            rows_written += 1;
+            if update_embedding_3072(pool, config.target, *row_id, &pgvec).await? {
+                rows_written += 1;
+            }
         }
 
         // Advance checkpoint to last id of this batch.
@@ -227,17 +229,27 @@ async fn fetch_batch(
     Ok(rows)
 }
 
-/// UPDATE one row's `embedding_3072` column.
+/// UPDATE one row's `embedding_3072` column, if the row is still eligible.
+///
+/// Re-checks [`ReembedTarget::eligible_predicate`] at write time because the
+/// provider round trip between [`fetch_batch`] and this UPDATE is a window in
+/// which a claim can be retired (supersede, deprecate, mark_duplicate, ...).
+/// Writing anyway would raise 23514 on `chk_deprecated_no_embedding` and abort
+/// the run; the predicate turns it into a zero-row no-op instead.
+///
+/// Returns whether a row was written.
 async fn update_embedding_3072(
     pool: &PgPool,
     target: ReembedTarget,
     id: Uuid,
     pgvec: &str,
-) -> Result<(), ReembedError> {
+) -> Result<bool, ReembedError> {
     let table = target.table();
-    let sql = format!("UPDATE {table} SET embedding_3072 = $1::vector WHERE id = $2");
-    sqlx::query(&sql).bind(pgvec).bind(id).execute(pool).await?;
-    Ok(())
+    let eligible = target.eligible_predicate();
+    let sql =
+        format!("UPDATE {table} SET embedding_3072 = $1::vector WHERE id = $2 AND {eligible}");
+    let done = sqlx::query(&sql).bind(pgvec).bind(id).execute(pool).await?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// Format a `&[f32]` as pgvector literal `[a,b,c,...]`.
