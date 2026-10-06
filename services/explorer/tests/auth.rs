@@ -1610,6 +1610,155 @@ async fn a_purged_session_revokes_its_refresh_token() {
     assert_eq!(revocations_of(&app, "r-old").await, 1);
 }
 
+/// Signing in again in a browser that already has a session replaces that
+/// session, and the refresh token the replaced session held is revoked: it
+/// is live upstream and nothing will present it again.
+#[tokio::test]
+async fn signing_in_again_revokes_the_replaced_sessions_refresh_token() {
+    let app = app().await;
+    mount_revoke(&app, 1).await;
+    let old = app.state.sessions.create(
+        "a-old".into(),
+        "r-old".into(),
+        Utc::now() + Duration::hours(1),
+    );
+
+    let started = start_login(&app, "").await;
+    let verifier = pending_verifier(&app, &started);
+    token_call(&[
+        ("grant_type", "authorization_code"),
+        ("code", "c0de"),
+        ("code_verifier", &verifier),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(token_json("a-new", "r-new")))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    let cookie = format!(
+        "epx_login={}; epx_session={}",
+        started.binding,
+        old.as_str()
+    );
+    let res = app
+        .get_with(
+            &format!("/explorer/auth/callback?state={}&code=c0de", started.state),
+            &[("cookie", &cookie)],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let (new_sid, _) = set_cookie(&res, "epx_session").expect("new session cookie");
+    assert_ne!(new_sid, old.as_str(), "a fresh session id");
+
+    assert!(
+        app.state.sessions.get(&old).is_none(),
+        "the old session is gone"
+    );
+    assert_eq!(
+        revocations_of(&app, "r-old").await,
+        1,
+        "the replaced session's refresh token is revoked"
+    );
+    assert_eq!(revocations_of(&app, "r-new").await, 0, "the new one is not");
+    app.upstream.verify().await;
+}
+
+/// A refresh that succeeds but whose new token upstream still refuses ends
+/// the session. The refresh just minted a live refresh token, and the
+/// session ending holds it: it is revoked, not dropped.
+#[tokio::test]
+async fn a_session_refused_after_its_refresh_revokes_the_new_refresh_token() {
+    let app = app().await;
+    mount_probe(&app, "a1", 401, 1).await;
+    token_call(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "r1"),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(token_json("a2", "r2")))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    mount_probe(&app, "a2", 401, 1).await;
+    mount_revoke(&app, 1).await;
+    let sid = app
+        .state
+        .sessions
+        .create("a1".into(), "r1".into(), Utc::now() + Duration::hours(1));
+
+    let res = app.get_as("/explorer/probe", &sid).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert!(app.state.sessions.get(&sid).is_none(), "the session ended");
+    assert_eq!(
+        revocations_of(&app, "r2").await,
+        1,
+        "the refresh token the session held when it ended is revoked"
+    );
+    assert_eq!(
+        revocations_of(&app, "r1").await,
+        0,
+        "r1 was rotated, not abandoned"
+    );
+    app.upstream.verify().await;
+}
+
+/// A session that ends while its refresh is in flight (here housekeeping
+/// purges it) does not drop the refresh token that refresh minted: upstream
+/// has rotated, the new token is live, and no session will hold it, so it is
+/// revoked. Housekeeping revokes the token the session held when purged.
+#[tokio::test]
+async fn a_session_ended_during_its_refresh_revokes_the_token_the_refresh_minted() {
+    let app = app().await;
+    token_call(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "r1"),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(
+        ResponseTemplate::new(200)
+            .set_body_json(token_json("a2", "r2"))
+            .set_delay(StdDuration::from_millis(400)),
+    )
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&app.upstream)
+        .await;
+    // Expired: the extractor refreshes before the page runs.
+    let sid =
+        app.state
+            .sessions
+            .create("a1".into(), "r1".into(), Utc::now() - Duration::seconds(5));
+
+    let page = app.get_as("/explorer/probe", &sid);
+    let purge = async {
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        explorer_app::housekeep(&app.state, Duration::seconds(-1)).await;
+    };
+    let (res, ()) = tokio::join!(page, purge);
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert!(
+        app.state.sessions.get(&sid).is_none(),
+        "the session is gone"
+    );
+    assert_eq!(token_posts_presenting(&app, "r1").await, 1, "one refresh");
+    assert_eq!(
+        revocations_of(&app, "r2").await,
+        1,
+        "the token the refresh minted for a session that no longer exists is revoked"
+    );
+    assert_eq!(
+        revocations_of(&app, "r1").await,
+        1,
+        "housekeeping revoked the token the session held when it was purged"
+    );
+    app.upstream.verify().await;
+}
+
 // ---- duplicated cookies -------------------------------------------------------------
 
 /// Two `epx_session` values (one possibly tossed in by a sibling host) mean

@@ -50,7 +50,7 @@ pub mod session;
 pub use extract::{
     resolve_auth, Caller, IdentityStrip, PageCtx, RequestAuth, SignedIn, PRODUCT_NAME,
 };
-pub use refresh::{refresh_session, RefreshError};
+pub use refresh::{end_session_revoking, refresh_session, RefreshError};
 pub use session::{
     clear_embed_session_cookie, clear_session_cookie, embed_session_cookie, random_token,
     read_session_cookie, session_cookie, session_cookie_name, Session, SessionId, SessionStore,
@@ -436,7 +436,9 @@ async fn callback(
     // session, if any, is replaced rather than left in the store.
     let session_id = start_session(&state, tokens).await;
     if let Some(old) = read_session_cookie(&state.config, &headers) {
-        state.sessions.remove(&old);
+        // Its refresh token is still live upstream and nothing will present
+        // it again.
+        end_session_revoking(&state, &old, "replaced session").await;
     }
     see_other(
         &pending.return_to,
@@ -527,21 +529,8 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
     require_same_origin(&state, &headers)?;
 
     if let Some(id) = read_session_cookie(&state.config, &headers) {
-        // Wait out an in-flight refresh so the token revoked below is the
-        // latest rotation, not one that was replaced a moment later.
-        let lock = state.sessions.refresh_lock(&id);
-        let _guard = match &lock {
-            Some(l) => Some(l.lock().await),
-            None => None,
-        };
-        if let Some(session) = state.sessions.remove(&id) {
-            if !session.refresh_token.is_empty() {
-                // Best effort: the local session is gone either way.
-                if let Err(e) = oauth::revoke_refresh_token(&state, &session.refresh_token).await {
-                    tracing::warn!(error = %e, "refresh-token revocation failed at logout");
-                }
-            }
-        }
+        // Best effort: the local session is gone either way.
+        end_session_revoking(&state, &id, "logout").await;
     }
 
     see_other(

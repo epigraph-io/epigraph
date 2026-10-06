@@ -79,9 +79,13 @@ pub async fn refresh_session(
     if !state.sessions.update_tokens(
         id,
         access_token.clone(),
-        tokens.refresh_token,
+        tokens.refresh_token.clone(),
         tokens.expires_at,
     ) {
+        // The session ended while the refresh was in flight (housekeeping
+        // purged it; it was replaced). Upstream has already rotated, so the
+        // refresh token just minted is live and nothing holds it any more.
+        oauth::revoke_abandoned(state, &tokens.refresh_token, "session ended during refresh").await;
         return Err(RefreshError::NoSession);
     }
     // Upstream may widen (or narrow) the scope on any refresh.
@@ -95,6 +99,23 @@ pub async fn refresh_session(
     let principal = token_principal(state, &access_token).await;
     state.sessions.set_principal(id, &access_token, principal);
     Ok(access_token)
+}
+
+/// End session `id` and revoke the refresh token it holds, best effort, as
+/// logout does. It first waits out an in-flight refresh (the session's
+/// refresh lock), so the token revoked is the latest rotation, not one that
+/// was replaced a moment later. `held_by` names the path in the log line. A
+/// session that is already gone is a no-op. The caller must not hold this
+/// session's refresh lock.
+pub async fn end_session_revoking(state: &AppState, id: &SessionId, held_by: &'static str) {
+    let lock = state.sessions.refresh_lock(id);
+    let _guard = match &lock {
+        Some(l) => Some(l.lock().await),
+        None => None,
+    };
+    if let Some(session) = state.sessions.remove(id) {
+        oauth::revoke_abandoned(state, &session.refresh_token, held_by).await;
+    }
 }
 
 /// The refresh's outcome is unknown: drop the session (the caller holds its

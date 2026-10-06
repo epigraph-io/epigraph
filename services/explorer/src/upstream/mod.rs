@@ -418,7 +418,9 @@ impl<'a> Api<'a> {
             // `principal_agent_id`, so this is not a missing principal:
             // the session is genuinely over.
             tracing::info!(%path, first_reason = %reason, upstream_reason = %error_message(&second), "upstream 401 after refresh; ending session");
-            self.state.sessions.remove(id);
+            // The refresh just rotated, so the session holds a live refresh
+            // token that nothing will present again.
+            auth::end_session_revoking(self.state, id, "session refused after refresh").await;
             return Err(UpstreamError::SessionExpired);
         }
         decode(second)
