@@ -16,9 +16,18 @@
 //!
 //! `Present` and `Absent` are facts about the deployment, not the viewer, so
 //! they are remembered per process for [`CAPABILITY_TTL`], outside the
-//! per-viewer page cache. `Unknown` is never remembered: one viewer's
-//! transient failure must not hide the feature for everyone, so the next
-//! page asks again. The UI shows the feature only on `Present`.
+//! per-viewer page cache. The UI shows the feature only on `Present`.
+//!
+//! An `Unknown` is remembered only when the API itself caused it (5xx, 429,
+//! timeout, transport: [`is_api_side`]), and then only for
+//! [`UNKNOWN_CAPABILITY_TTL`]. The probe runs before a signed-in page's own
+//! calls, so without that memory an API that answers the probe slowly or
+//! with errors would add a full upstream deadline to every page, and a
+//! rate-limited one would get one extra request per page. An `Unknown` that
+//! came from one viewer's session (401, session expired) or from an answer
+//! of the wrong shape is never remembered: it says nothing about the
+//! deployment, and remembering it would hide the feature from everyone.
+//! A remembered `Unknown` never replaces a fresh `Present` or `Absent`.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -35,6 +44,10 @@ pub const ADMIN_ACTS_PROBE: &str = "/api/v1/admin/acts?mine&limit=1";
 
 /// How long a `Present` / `Absent` answer is trusted.
 pub const CAPABILITY_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// How long an `Unknown` the API caused ([`is_api_side`]) is remembered
+/// before the next page asks again.
+pub const UNKNOWN_CAPABILITY_TTL: Duration = Duration::from_secs(30);
 
 /// Whether the API has a feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +81,19 @@ pub fn classify(answer: &Result<(), UpstreamError>) -> Capability {
     }
 }
 
+/// Whether a probe answer is the API's own failure (5xx, 429, timeout,
+/// transport), which is the same for every viewer, rather than one viewer's
+/// session or an answer of the wrong shape.
+pub fn is_api_side(answer: &Result<(), UpstreamError>) -> bool {
+    matches!(
+        answer,
+        Err(UpstreamError::Server { .. }
+            | UpstreamError::Timeout
+            | UpstreamError::Transport(_)
+            | UpstreamError::Rejected { status: 429, .. })
+    )
+}
+
 impl Api<'_> {
     /// [`ADMIN_ACTS_PROBE`]: `Ok` only for a 2xx carrying the listing's
     /// envelope; a 2xx of any other shape is a decode error.
@@ -79,24 +105,38 @@ impl Api<'_> {
 /// The per-process memory of probe answers.
 pub struct Capabilities {
     ttl: Duration,
+    unknown_ttl: Duration,
     admin_acts: Mutex<Option<(Instant, Capability)>>,
 }
 
 impl Capabilities {
-    pub fn new(ttl: Duration) -> Self {
+    /// `ttl` for `Present` / `Absent`; `unknown_ttl` for an `Unknown` the API
+    /// caused.
+    pub fn new(ttl: Duration, unknown_ttl: Duration) -> Self {
         Self {
             ttl,
+            unknown_ttl,
             admin_acts: Mutex::new(None),
         }
+    }
+
+    /// How long a `Present` / `Absent` answer is trusted.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// How long an API-caused `Unknown` is remembered.
+    pub fn unknown_ttl(&self) -> Duration {
+        self.unknown_ttl
     }
 
     fn slot(&self) -> std::sync::MutexGuard<'_, Option<(Instant, Capability)>> {
         self.admin_acts.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// The remembered admin-acts answer, if one is still fresh. Never
-    /// `Unknown`, which is never remembered. Error pages and auth pages read
-    /// this and make no call.
+    /// The remembered admin-acts answer, if one is still fresh: `Present`,
+    /// `Absent`, or briefly an `Unknown` the API caused. Error pages and auth
+    /// pages read this and make no call.
     pub fn cached_admin_acts(&self) -> Option<Capability> {
         match *self.slot() {
             Some((until, cap)) if Instant::now() < until => Some(cap),
@@ -112,14 +152,29 @@ impl Capabilities {
         }
     }
 
+    /// Record an `Unknown` the API caused, for the short TTL, unless a fresh
+    /// answer is already remembered (it is never replaced by an `Unknown`).
+    pub fn remember_api_side_unknown(&self) {
+        let now = Instant::now();
+        let mut slot = self.slot();
+        if !matches!(*slot, Some((until, _)) if now < until) {
+            *slot = Some((now + self.unknown_ttl, Capability::Unknown));
+        }
+    }
+
     /// Whether the API has the admin-acts route: the remembered answer, or
     /// a probe with `api`'s (the viewer's) token.
     pub async fn admin_acts(&self, api: &Api<'_>) -> Capability {
         if let Some(cap) = self.cached_admin_acts() {
             return cap;
         }
-        let cap = classify(&api.probe_admin_acts().await);
-        self.remember_admin_acts(cap);
+        let answer = api.probe_admin_acts().await;
+        let cap = classify(&answer);
+        if cap == Capability::Unknown && is_api_side(&answer) {
+            self.remember_api_side_unknown();
+        } else {
+            self.remember_admin_acts(cap);
+        }
         cap
     }
 }
@@ -184,7 +239,7 @@ mod tests {
 
     #[test]
     fn only_present_and_absent_are_remembered_and_only_for_the_ttl() {
-        let caps = Capabilities::new(Duration::from_millis(40));
+        let caps = Capabilities::new(Duration::from_millis(40), Duration::from_millis(40));
         assert_eq!(caps.cached_admin_acts(), None);
 
         caps.remember_admin_acts(Capability::Unknown);
@@ -203,5 +258,49 @@ mod tests {
         assert_eq!(caps.cached_admin_acts(), Some(Capability::Present));
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(caps.cached_admin_acts(), None, "expired after the TTL");
+    }
+
+    #[test]
+    fn only_an_api_side_unknown_is_remembered_and_only_briefly() {
+        let rejected429 = Err(rejected(429));
+        for (answer, api_side) in [
+            (
+                Err(UpstreamError::Server {
+                    status: 502,
+                    message: String::new(),
+                }),
+                true,
+            ),
+            (Err(UpstreamError::Timeout), true),
+            (Err(UpstreamError::Transport("reset".into())), true),
+            (rejected429, true),
+            (Err(UpstreamError::SessionExpired), false),
+            (
+                Err(UpstreamError::Unauthorized {
+                    message: String::new(),
+                }),
+                false,
+            ),
+            (Err(UpstreamError::Decode("not the envelope".into())), false),
+            (Err(rejected(400)), false),
+            (Ok(()), false),
+        ] {
+            assert_eq!(is_api_side(&answer), api_side, "{answer:?}");
+        }
+
+        let caps = Capabilities::new(Duration::from_secs(300), Duration::from_millis(40));
+        caps.remember_api_side_unknown();
+        assert_eq!(caps.cached_admin_acts(), Some(Capability::Unknown));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            caps.cached_admin_acts(),
+            None,
+            "expired after the short TTL"
+        );
+
+        // Never over a fresh answer.
+        caps.remember_admin_acts(Capability::Absent);
+        caps.remember_api_side_unknown();
+        assert_eq!(caps.cached_admin_acts(), Some(Capability::Absent));
     }
 }

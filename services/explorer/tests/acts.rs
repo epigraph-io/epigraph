@@ -10,9 +10,10 @@
 //! The probe is `GET /api/v1/admin/acts?mine&limit=1` with the viewer's own
 //! token, made by signed-in page requests: 2xx (with the `{acts: [...]}`
 //! envelope) and 403 mean the route exists, 404/405 mean it does not, and
-//! anything else is unknown. Only present/absent are remembered (per
-//! process, for a TTL); an unknown answer hides the item for that page and
-//! is asked again on the next.
+//! anything else is unknown. Present/absent are remembered (per process, for
+//! a TTL); an unknown the API itself caused (5xx, 429, timeout, transport) is
+//! remembered for a short TTL; any other unknown hides the item for that
+//! page and is asked again on the next.
 //!
 //! `/activity` with no watch list configured is the page used to look at the
 //! header: it makes no data call of its own, so every upstream request it
@@ -240,6 +241,27 @@ async fn probe_unknown_on_500_hides_the_nav_and_renders_the_page() {
     assert!(!res.body.contains("Admin acts"), "{}", res.body);
     assert!(!res.body.contains("/explorer/acts"), "{}", res.body);
     app.upstream.verify().await;
+}
+
+/// An unknown the API itself caused (here a 502) is remembered briefly, so a
+/// failing API does not get a probe, and the page a probe deadline, in front
+/// of every signed-in page. It still hides the item.
+#[tokio::test]
+async fn probe_unknown_on_a_server_error_is_remembered_briefly() {
+    let app = spawn().await;
+    probe_answers(&app, 502, 1).await;
+    let sid = app.sign_in("tok");
+    for _ in 0..3 {
+        let res = app.get_as(&header_page(), &sid).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert!(!res.body.contains("Admin acts"), "{}", res.body);
+    }
+    // One probe for three pages.
+    app.upstream.verify().await;
+    assert_eq!(
+        app.state.capabilities.cached_admin_acts(),
+        Some(epigraph_explorer::upstream::capabilities::Capability::Unknown)
+    );
 }
 
 /// A 2xx whose body is not the listing's envelope is not evidence of the

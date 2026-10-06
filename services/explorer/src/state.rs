@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::links::Links;
 use crate::security;
 use crate::ttl::ResponseCache;
-use crate::upstream::capabilities::{Capabilities, CAPABILITY_TTL};
+use crate::upstream::capabilities::{Capabilities, CAPABILITY_TTL, UNKNOWN_CAPABILITY_TTL};
 use crate::upstream::{Api, Upstream};
 
 /// Everything is behind an `Arc` or is itself a cheap handle, so cloning is
@@ -50,7 +50,7 @@ impl AppState {
             cache: ResponseCache::new(),
             csp,
             csp_unframable,
-            capabilities: Arc::new(Capabilities::new(CAPABILITY_TTL)),
+            capabilities: Arc::new(Capabilities::new(CAPABILITY_TTL, UNKNOWN_CAPABILITY_TTL)),
         })
     }
 

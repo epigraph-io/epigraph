@@ -167,9 +167,12 @@ bare date, and `since` defaults to 24 hours ago.
   /api/v1/admin/acts?mine&limit=1`, with the viewer's own token), and the
   "Admin acts" link appears only when it does (an answer of 200 or 403).
   A 404 or 405 hides it. That answer and a "has it" answer are remembered
-  for 5 minutes per process. Any other answer (a server error, a timeout,
-  an unexpected body) hides the link for that page and is asked again on
-  the next. Visited directly on an API without the route, the page says so.
+  for 5 minutes per process. Any other answer hides the link. A failure of
+  the API itself (a server error, 429, a timeout, a refused connection) is
+  remembered for 30 seconds, so a slow or failing API does not add a probe
+  deadline to every page; an unexpected body or a session problem is asked
+  again on the next page. Visited directly on an API without the route, the
+  page says so.
 
   A **pending** act (not yet answered by a passkey, not executed, not
   expired) links to the API's own confirmation page,
