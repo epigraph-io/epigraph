@@ -307,8 +307,17 @@ async fn mock_provider_writes_nothing(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_closure_receives_each_atoms_own_parent_id(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
+    // Two DISTINCT authors (`seed_agent` reuses one public key, and
+    // `agents_public_key_unique` admits it once), so a closure handed the
+    // wrong parent's author is caught too.
     let agent_a = seed_agent(&pool).await;
-    let agent_b = seed_agent(&pool).await;
+    let agent_b = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, decode($2,'hex'))")
+        .bind(agent_b)
+        .bind("dd".repeat(32))
+        .execute(&pool)
+        .await
+        .unwrap();
     let parent_a = insert_min_claim(&pool, agent_a, COMPOUND_A).await;
     let parent_b = insert_min_claim(&pool, agent_b, COMPOUND_B).await;
 
