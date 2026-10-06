@@ -120,6 +120,7 @@ pub mod binding_client;
 pub mod client_scope;
 pub mod confirmations;
 pub mod custodian;
+pub mod delete_frames;
 pub mod elevation;
 pub mod hide;
 pub mod human;
