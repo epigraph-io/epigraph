@@ -76,17 +76,26 @@ async fn ingest(
     token: Option<&epigraph_auth::AuthContext>,
     canonical: &str,
 ) -> Uuid {
+    ingest_extraction(pool, server, viewer, token, extraction(canonical)).await
+}
+
+async fn ingest_extraction(
+    pool: &PgPool,
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    token: Option<&epigraph_auth::AuthContext>,
+    extraction: WorkflowExtraction,
+) -> Uuid {
+    let canonical = extraction.source.canonical_name.clone();
     tools::workflow_ingest::ingest_workflow(
         server,
         viewer,
-        IngestWorkflowParams {
-            extraction: extraction(canonical),
-        },
+        IngestWorkflowParams { extraction },
         token,
     )
     .await
     .expect("ingest");
-    workflow_row(pool, canonical, 0).await
+    workflow_row(pool, &canonical, 0).await
 }
 
 /// Generation 1 of `canonical`: the same step and operation text (so the same
@@ -98,8 +107,21 @@ async fn improve(
     token: Option<&epigraph_auth::AuthContext>,
     canonical: &str,
 ) -> Uuid {
+    improve_to(pool, server, viewer, token, canonical, 1).await
+}
+
+/// The next generation of `canonical` (`generation` is the one it must land
+/// at): the same step and operation text, a phase summary of its own.
+async fn improve_to(
+    pool: &PgPool,
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    token: Option<&epigraph_auth::AuthContext>,
+    canonical: &str,
+    generation: i32,
+) -> Uuid {
     let mut refined = extraction(canonical);
-    refined.phases[0].summary = format!("U017 refined phase for {canonical}");
+    refined.phases[0].summary = format!("U017 refined phase {generation} for {canonical}");
     tools::workflow_ingest::improve_workflow_hierarchy(
         server,
         viewer,
@@ -111,7 +133,57 @@ async fn improve(
     )
     .await
     .expect("improve");
-    workflow_row(pool, canonical, 1).await
+    workflow_row(pool, canonical, generation).await
+}
+
+async fn parent_of(pool: &PgPool, wf: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT parent_id FROM workflows WHERE id = $1")
+        .bind(wf)
+        .fetch_one(pool)
+        .await
+        .expect("workflow parent")
+}
+
+/// Record `agent` as `wf`'s submitter, as if another caller had submitted it.
+async fn set_submitter(pool: &PgPool, wf: Uuid, agent: Uuid) {
+    sqlx::query(
+        "UPDATE workflows \
+            SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', to_jsonb($2::text)) \
+          WHERE id = $1",
+    )
+    .bind(wf)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("re-record the submitter");
+    let got: Option<String> = sqlx::query_scalar(
+        "SELECT metadata->>'epigraph_submitted_by' FROM workflows WHERE id = $1",
+    )
+    .bind(wf)
+    .fetch_one(pool)
+    .await
+    .expect("read the submitter back");
+    assert_eq!(
+        got,
+        Some(agent.to_string()),
+        "calibration: {wf}'s submitter is {agent}"
+    );
+}
+
+async fn level_of(pool: &PgPool, claim: Uuid) -> String {
+    sqlx::query_scalar("SELECT properties->>'level' FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("claim level")
+}
+
+async fn claim_truth(pool: &PgPool, claim: Uuid) -> f64 {
+    sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("claim truth")
 }
 
 async fn workflow_row(pool: &PgPool, canonical: &str, generation: i32) -> Uuid {
@@ -216,20 +288,32 @@ async fn workflow_admin_audits(pool: &PgPool, admin: Uuid) -> i64 {
     .expect("count audit rows")
 }
 
-/// THE DEFECT. The workflow's phase and step claims are retired with it, both
-/// ANN columns nulled, and the operation atom (a global, content-addressed id
-/// a document may share) is left alone.
+/// THE DEFECT. The workflow's thesis, phase and step claims are retired with
+/// it, both ANN columns nulled, and the operation atom (a global,
+/// content-addressed id a document may share) is left alone.
 #[sqlx::test(migrations = "../../migrations")]
 async fn deprecating_a_hierarchical_workflow_retires_its_claims(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let (_owner, token, viewer) = seed_caller(&pool, &["claims:write"]).await;
-    let wf = ingest(&pool, &server, &viewer, Some(&token), "u017-solo").await;
+    let mut with_thesis = extraction("u017-solo");
+    with_thesis.thesis = Some("U017 thesis for u017-solo".to_string());
+    let wf = ingest_extraction(&pool, &server, &viewer, Some(&token), with_thesis).await;
     let owned = executed(&pool, wf, &["0", "1", "2"]).await;
     let atoms = executed(&pool, wf, &["3"]).await;
     assert_eq!(
         owned.len(),
-        2,
-        "calibration: one phase and one step claim (no thesis in this extraction)"
+        3,
+        "calibration: one thesis, one phase and one step claim"
+    );
+    let mut levels = Vec::new();
+    for c in &owned {
+        levels.push(level_of(&pool, *c).await);
+    }
+    levels.sort();
+    assert_eq!(
+        levels,
+        vec!["0", "1", "2"],
+        "calibration: exactly one claim per structural level, the thesis at level 0"
     );
     assert_eq!(atoms.len(), 1, "calibration: one operation atom");
     for c in owned.iter().chain(&atoms) {
@@ -420,10 +504,10 @@ async fn a_flat_rerun_reports_nothing(pool: PgPool) {
     assert!(ids(&body, "deprecated_ids").is_empty(), "{body}");
 }
 
-/// An id that is neither a workflow claim nor a `workflows` row is an error,
-/// not a reported deprecation.
+/// An id that is neither a claim the caller can read nor a `workflows` row is
+/// an error, not a reported deprecation.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_unknown_id_is_an_error_and_writes_nothing(pool: PgPool) {
+async fn an_unknown_id_is_an_error(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let viewer = fixture::public_viewer(&pool).await;
     let ghost = Uuid::new_v4();
@@ -617,4 +701,344 @@ async fn stdio_deprecates_without_an_authority_check(pool: PgPool) {
     for c in &owned {
         assert!(!is_current(&pool, *c).await, "claim {c} retired over stdio");
     }
+}
+
+/// The authority rule runs over EVERY target of a cascade, not only the root,
+/// and one refusal writes nothing: an owner whose lineage has a generation
+/// another agent submitted cannot retire that generation through a cascade
+/// from its own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cascade_refuses_when_any_descendant_is_anothers(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (stranger, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let gen0 = ingest(
+        &pool,
+        &server,
+        &owner_viewer,
+        Some(&owner_token),
+        "u017-mixed",
+    )
+    .await;
+    let gen1 = improve(
+        &pool,
+        &server,
+        &owner_viewer,
+        Some(&owner_token),
+        "u017-mixed",
+    )
+    .await;
+    assert_eq!(
+        parent_of(&pool, gen1).await,
+        Some(gen0),
+        "calibration: gen1 descends from gen0"
+    );
+    set_submitter(&pool, gen1, stranger).await;
+    let gen0_claims = executed(&pool, gen0, &["0", "1", "2"]).await;
+    assert!(
+        !gen0_claims.is_empty(),
+        "calibration: gen0 executes structural claims"
+    );
+
+    let err = tools::workflows::deprecate_workflow(
+        &server,
+        &owner_viewer,
+        params(gen0, true),
+        Some(&owner_token),
+    )
+    .await
+    .expect_err("the owner of gen0 must not retire gen1, which another agent submitted");
+    assert!(
+        err.message.contains("was submitted by agent")
+            && err.message.contains(&stranger.to_string()),
+        "refused over gen1's submitter: {}",
+        err.message
+    );
+    // ALL OR NOTHING: gen0, which the caller may deprecate, is untouched too.
+    assert!(
+        (truth(&pool, gen0).await - 1.0).abs() < 1e-12,
+        "gen0 row untouched"
+    );
+    assert!(
+        (truth(&pool, gen1).await - 1.0).abs() < 1e-12,
+        "gen1 row untouched"
+    );
+    for c in &gen0_claims {
+        assert!(is_current(&pool, *c).await, "gen0 claim {c} untouched");
+    }
+
+    // CALIBRATION: gen1's submitter may deprecate gen1 on its own.
+    tools::workflows::deprecate_workflow(
+        &server,
+        &stranger_viewer,
+        params(gen1, false),
+        Some(&stranger_token),
+    )
+    .await
+    .expect("gen1's submitter deprecates gen1");
+    assert!((truth(&pool, gen1).await - 0.05).abs() < 1e-12);
+}
+
+/// The audited admin arm records one `workflows.admin_write` row PER target
+/// of a cascade, each naming its own workflow.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_cascade_audits_every_target(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let gen0 = ingest(
+        &pool,
+        &server,
+        &owner_viewer,
+        Some(&owner_token),
+        "u017-admin-cascade",
+    )
+    .await;
+    let gen1 = improve(
+        &pool,
+        &server,
+        &owner_viewer,
+        Some(&owner_token),
+        "u017-admin-cascade",
+    )
+    .await;
+    let (admin_token, admin_viewer) = common::server_admin(&server).await;
+    seed_admin_grant(&pool, &admin_token).await;
+    let admin = admin_token.agent_id.expect("admin agent");
+    assert_eq!(
+        workflow_admin_audits(&pool, admin).await,
+        0,
+        "calibration: no audit yet"
+    );
+
+    tools::workflows::deprecate_workflow(
+        &server,
+        &admin_viewer,
+        params(gen0, true),
+        Some(&admin_token),
+    )
+    .await
+    .expect("the audited admin arm cascades over another agent's lineage");
+    for wf in [gen0, gen1] {
+        assert!(
+            (truth(&pool, wf).await - 0.05).abs() < 1e-12,
+            "{wf} deprecated"
+        );
+    }
+    assert_eq!(
+        workflow_admin_audits(&pool, admin).await,
+        2,
+        "one audit row per target"
+    );
+    let mut audited: Vec<String> = sqlx::query_scalar(
+        "SELECT details->>'workflow_id' FROM security_events \
+          WHERE event_type = 'workflows.admin_write' AND agent_id = $1",
+    )
+    .bind(admin)
+    .fetch_all(&pool)
+    .await
+    .expect("audit rows");
+    audited.sort();
+    let mut want = vec![gen0.to_string(), gen1.to_string()];
+    want.sort();
+    assert_eq!(audited, want, "each audit row names its own target");
+}
+
+/// The cascade follows the lineage TRANSITIVELY and only DOWNWARD: from gen0
+/// it reaches gen2 through gen1; from gen1 it takes gen1 and gen2 and leaves
+/// gen0 (and gen0's own phase) live, keeping the step gen0 still executes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cascade_is_transitive_and_never_climbs(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, token, viewer) = seed_caller(&pool, &["claims:write"]).await;
+
+    // Lineage A: cascade from the root reaches the grandchild.
+    let a0 = ingest(&pool, &server, &viewer, Some(&token), "u017-deep-a").await;
+    let a1 = improve_to(&pool, &server, &viewer, Some(&token), "u017-deep-a", 1).await;
+    let a2 = improve_to(&pool, &server, &viewer, Some(&token), "u017-deep-a", 2).await;
+    assert_eq!(
+        parent_of(&pool, a1).await,
+        Some(a0),
+        "calibration: a1 descends from a0"
+    );
+    assert_eq!(
+        parent_of(&pool, a2).await,
+        Some(a1),
+        "calibration: a2 descends from a1, not a0, so reaching it is transitive"
+    );
+    tools::workflows::deprecate_workflow(&server, &viewer, params(a0, true), Some(&token))
+        .await
+        .expect("cascade from a0");
+    for wf in [a0, a1, a2] {
+        assert!(
+            (truth(&pool, wf).await - 0.05).abs() < 1e-12,
+            "workflow {wf} is reached by the cascade from a0"
+        );
+    }
+
+    // Lineage B: cascade from the middle never reaches the ancestor.
+    let b0 = ingest(&pool, &server, &viewer, Some(&token), "u017-deep-b").await;
+    let b1 = improve_to(&pool, &server, &viewer, Some(&token), "u017-deep-b", 1).await;
+    let b2 = improve_to(&pool, &server, &viewer, Some(&token), "u017-deep-b", 2).await;
+    assert_eq!(
+        parent_of(&pool, b2).await,
+        Some(b1),
+        "calibration: b2 descends from b1"
+    );
+    let b0_phase = executed(&pool, b0, &["1"]).await;
+    let step = executed(&pool, b0, &["2"]).await;
+    assert_eq!(
+        step,
+        executed(&pool, b2, &["2"]).await,
+        "calibration: one shared step row"
+    );
+    let res =
+        tools::workflows::deprecate_workflow(&server, &viewer, params(b1, true), Some(&token))
+            .await
+            .expect("cascade from b1");
+    for wf in [b1, b2] {
+        assert!(
+            (truth(&pool, wf).await - 0.05).abs() < 1e-12,
+            "{wf} deprecated"
+        );
+    }
+    assert!(
+        (truth(&pool, b0).await - 1.0).abs() < 1e-12,
+        "the cascade never climbs to the ancestor b0"
+    );
+    assert!(
+        is_current(&pool, b0_phase[0]).await,
+        "b0's own phase stays current"
+    );
+    assert!(
+        is_current(&pool, step[0]).await,
+        "the step b0 still executes stays current"
+    );
+    let body = first_text(&res);
+    assert_eq!(
+        ids(&body, "kept_shared_claim_ids"),
+        vec![step[0].to_string()],
+        "{body}"
+    );
+}
+
+/// The FLAT cascade reports only real changes too: a re-run over a parent and
+/// its `variant_of` child lists nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_flat_cascade_rerun_reports_nothing(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = fixture::public_viewer(&pool).await;
+    let parent = common::seed_workflow_claim(&pool, "u017-flat-parent", &["s1"]).await;
+    let child = common::seed_workflow_claim(&pool, "u017-flat-child", &["s1"]).await;
+    common::insert_claim_edge(&pool, child, parent, "variant_of").await;
+
+    let first = tools::workflows::deprecate_workflow(&server, &viewer, params(parent, true), None)
+        .await
+        .expect("first cascade");
+    let mut want = vec![parent.to_string(), child.to_string()];
+    want.sort();
+    assert_eq!(
+        ids(&first_text(&first), "deprecated_ids"),
+        want,
+        "calibration: the first cascade deprecates the parent and its variant"
+    );
+    assert!(
+        !is_current(&pool, child).await,
+        "calibration: the child is retired"
+    );
+
+    let res = tools::workflows::deprecate_workflow(&server, &viewer, params(parent, true), None)
+        .await
+        .expect("a re-run is not an error");
+    let body = first_text(&res);
+    assert!(ids(&body, "deprecated_ids").is_empty(), "{body}");
+}
+
+/// Over HTTP a flat workflow claim the caller cannot read is NOT reported as
+/// deprecated. Before U017 the dispatch-free flat path ran the UPDATE on the
+/// caller's own stamp, which may not write the claim's group, so it changed
+/// nothing and listed the id anyway. Its owner still may.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unreadable_flat_claim_is_an_error_not_a_deprecation(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (_other, other_token, other_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let id = common::seed_workflow_claim(&pool, "u017-private-flat", &["s1"]).await;
+    common::seed_private_tenancy(&pool, id, owner).await;
+    let before = claim_truth(&pool, id).await;
+
+    let err = tools::workflows::deprecate_workflow(
+        &server,
+        &other_viewer,
+        params(id, false),
+        Some(&other_token),
+    )
+    .await
+    .expect_err("a claim the caller cannot read must not be reported as deprecated");
+    assert!(
+        err.message.contains("nothing was deprecated"),
+        "{}",
+        err.message
+    );
+    assert!(is_current(&pool, id).await, "the claim stays current");
+    assert!(
+        (claim_truth(&pool, id).await - before).abs() < 1e-12,
+        "the claim's truth is unchanged"
+    );
+
+    // CALIBRATION: the owner's group reads and writes it, so the owner may.
+    let res = tools::workflows::deprecate_workflow(
+        &server,
+        &owner_viewer,
+        params(id, false),
+        Some(&owner_token),
+    )
+    .await
+    .expect("the owner deprecates its own flat workflow claim");
+    assert_eq!(
+        ids(&first_text(&res), "deprecated_ids"),
+        vec![id.to_string()]
+    );
+    assert!(!is_current(&pool, id).await, "the owner's call retired it");
+}
+
+/// Two deprecations of one lineage cannot both keep a step each thinks the
+/// other still runs. gen1's deprecation is held open (its truth is already
+/// 0.05, uncommitted) while gen0 is deprecated; gen0's call must wait for it
+/// and then see gen1 as dead, so the step they share is retired. Without the
+/// lineage lock, gen0's call reads gen1 as live under READ COMMITTED, keeps
+/// the step, and the step is stranded current with no live workflow.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_concurrent_deprecation_of_the_sharing_generation_is_waited_for(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, token, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let gen0 = ingest(&pool, &server, &viewer, Some(&token), "u017-race").await;
+    let gen1 = improve(&pool, &server, &viewer, Some(&token), "u017-race").await;
+    let step = executed(&pool, gen0, &["2"]).await;
+    assert_eq!(
+        step,
+        executed(&pool, gen1, &["2"]).await,
+        "calibration: one shared step row"
+    );
+    let step = step[0];
+
+    let mut held = pool.begin().await.expect("begin the held deprecation");
+    sqlx::query("UPDATE workflows SET truth_value = 0.05 WHERE id = $1")
+        .bind(gen1)
+        .execute(&mut *held)
+        .await
+        .expect("gen1 deprecated, uncommitted");
+
+    let deprecate =
+        tools::workflows::deprecate_workflow(&server, &viewer, params(gen0, false), Some(&token));
+    let release = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        held.commit().await.expect("commit the held deprecation");
+    };
+    let (res, ()) = tokio::join!(deprecate, release);
+    res.expect("deprecate gen0");
+
+    assert!(
+        !is_current(&pool, step).await,
+        "with both generations deprecated, the step they shared must be retired"
+    );
 }
