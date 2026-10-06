@@ -13,7 +13,8 @@
 //! anything else is unknown. Present/absent are remembered (per process, for
 //! a TTL); an unknown the API itself caused (5xx, 429, timeout, transport) is
 //! remembered for a short TTL; any other unknown hides the item for that
-//! page and is asked again on the next.
+//! page and is asked again on the next. The probe never queues: with no free
+//! upstream slot it is not sent, and that unknown is not remembered.
 //!
 //! `/activity` with no watch list configured is the page used to look at the
 //! header: it makes no data call of its own, so every upstream request it
@@ -24,7 +25,11 @@ mod common;
 use axum::Router;
 use chrono::{Duration, Utc};
 use common::{spawn, spawn_with, TestApp, BASE};
-use epigraph_explorer::config::{ENV_DEV_BEARER, ENV_OAUTH_BASE_URL, ENV_PUBLIC_BASE_URL};
+use epigraph_explorer::config::{
+    ENV_DEV_BEARER, ENV_OAUTH_BASE_URL, ENV_PUBLIC_BASE_URL, ENV_SESSION_CONCURRENCY,
+    ENV_UPSTREAM_TIMEOUT_MS,
+};
+use epigraph_explorer::upstream::capabilities::Capability;
 use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
@@ -262,6 +267,79 @@ async fn probe_unknown_on_a_server_error_is_remembered_briefly() {
         app.state.capabilities.cached_admin_acts(),
         Some(epigraph_explorer::upstream::capabilities::Capability::Unknown)
     );
+}
+
+/// A probe never waits behind the viewer's own calls. One viewer's busy
+/// session says nothing about the API, so it must not become an unknown that
+/// is remembered for every viewer, and it must not delay the page. Here the
+/// session's only slot is held by a call that outlasts the deadline: the
+/// probe is not sent, answers unknown at once, and nothing is remembered.
+/// (A probe that queued would get the slot only when that call timed out, be
+/// sent with almost no budget left, time out itself, and have that timeout
+/// remembered process-wide as the API's.)
+#[tokio::test]
+async fn a_probe_never_waits_behind_the_viewers_own_calls() {
+    let app = spawn_with(
+        &[
+            (ENV_SESSION_CONCURRENCY, "1"),
+            (ENV_UPSTREAM_TIMEOUT_MS, "1000"),
+        ],
+        Router::new(),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/stats"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"claims": 1}))
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&app.upstream)
+        .await;
+    // One probe in all: the calibration's, at the end.
+    probe_answers(&app, 200, 1).await;
+    let sid = app.sign_in("tok");
+    let api = app.state.api(&app.session_auth(&sid, "tok"));
+    let permits = app.state.upstream.available_permits();
+
+    let slow = api.stats();
+    let probe = async {
+        // Observe, not sleep: the slow call holds a global permit, so it
+        // also holds the session's only slot.
+        let waited = std::time::Instant::now();
+        while app.state.upstream.available_permits() == permits {
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(2),
+                "the slow call never took its permit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let started = std::time::Instant::now();
+        let cap = app.state.capabilities.admin_acts(&api).await;
+        (cap, started.elapsed())
+    };
+    let (_slow, (cap, took)) = tokio::join!(slow, probe);
+
+    assert_eq!(cap, Capability::Unknown);
+    assert!(
+        took < std::time::Duration::from_millis(300),
+        "the probe waited {took:?} for the session's slot"
+    );
+    assert_eq!(
+        app.state.capabilities.cached_admin_acts(),
+        None,
+        "one viewer's busy session is not remembered for everyone"
+    );
+    assert!(probe_calls(&app).await.is_empty(), "the probe was not sent");
+
+    // CALIBRATION: with the slot free again the same probe is sent and
+    // answers, so the arm above was the busy slot, not a broken probe.
+    assert_eq!(
+        app.state.capabilities.admin_acts(&api).await,
+        Capability::Present
+    );
+    assert_eq!(probe_calls(&app).await.len(), 1);
+    app.upstream.verify().await;
 }
 
 /// The app's capability memory is built with the documented lifetimes: five

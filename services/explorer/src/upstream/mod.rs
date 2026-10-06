@@ -107,6 +107,11 @@ pub enum UpstreamError {
     /// for the response, or the two together.
     #[error("upstream timed out")]
     Timeout,
+    /// A call that may not queue ([`Slot::IfFree`]) found no free slot (the
+    /// viewer's own or a global one), so it was not sent. Only the
+    /// capability probe makes such calls.
+    #[error("no free upstream slot; the call was not sent")]
+    Busy,
     /// Connection refused/reset/dropped (a handler panic upstream drops the
     /// connection with no response).
     #[error("upstream transport error: {0}")]
@@ -130,6 +135,7 @@ impl UpstreamError {
                 "The EpiGraph API is unavailable right now."
             }
             UpstreamError::Timeout => "The EpiGraph API took too long to answer.",
+            UpstreamError::Busy => "The Explorer is busy right now. Try again.",
             UpstreamError::Decode(_) => "The EpiGraph API sent an unexpected response.",
         }
     }
@@ -254,6 +260,13 @@ impl ViewerSlot<'_> {
         self.permit = Some(sem.acquire_owned().await?);
         Ok(())
     }
+
+    /// Take one of the viewer's permits only if one is free now.
+    fn try_acquire(&mut self) -> bool {
+        let sem = Arc::clone(self.sem.as_ref().expect("held until drop"));
+        self.permit = sem.try_acquire_owned().ok();
+        self.permit.is_some()
+    }
 }
 
 impl Drop for ViewerSlot<'_> {
@@ -270,6 +283,18 @@ impl Drop for ViewerSlot<'_> {
             slots.remove(&self.key);
         }
     }
+}
+
+/// Whether a call may wait for an upstream slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Slot {
+    /// Queue for the viewer's slot and a global permit, within the call's
+    /// deadline. Every page and BFF call.
+    Wait,
+    /// Take both only if they are free now; otherwise fail at once with
+    /// [`UpstreamError::Busy`], unsent. A call made this way that is sent
+    /// therefore has its whole deadline in flight.
+    IfFree,
 }
 
 /// Raw result of one HTTP exchange.
@@ -323,7 +348,8 @@ impl<'a> Api<'a> {
 
     /// `GET {api}{path}` → `T`. `path` starts with `/api/v1/…`.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, UpstreamError> {
-        self.send::<T, ()>(Method::GET, path, None, None).await
+        self.send::<T, ()>(Method::GET, path, None, None, Slot::Wait)
+            .await
     }
 
     /// `GET {api}{path}?{query}`; `query` is anything `serde_urlencoded`
@@ -334,7 +360,8 @@ impl<'a> Api<'a> {
         T: DeserializeOwned,
         Q: Serialize + ?Sized,
     {
-        self.send(Method::GET, path, Some(query), None).await
+        self.send(Method::GET, path, Some(query), None, Slot::Wait)
+            .await
     }
 
     /// `POST {api}{path}` with a JSON body.
@@ -345,16 +372,19 @@ impl<'a> Api<'a> {
     {
         let bytes = serde_json::to_vec(body)
             .map_err(|e| UpstreamError::Decode(format!("encoding request body: {e}")))?;
-        self.send::<T, ()>(Method::POST, path, None, Some(bytes))
+        self.send::<T, ()>(Method::POST, path, None, Some(bytes), Slot::Wait)
             .await
     }
 
-    async fn send<T, Q>(
+    /// `method {api}{path}`, with refresh-and-retry on a session's 401.
+    /// `slot` applies to both attempts.
+    pub(crate) async fn send<T, Q>(
         &self,
         method: Method,
         path: &str,
         query: Option<&Q>,
         body: Option<Vec<u8>>,
+        slot: Slot,
     ) -> Result<T, UpstreamError>
     where
         T: DeserializeOwned,
@@ -362,7 +392,14 @@ impl<'a> Api<'a> {
     {
         let token = self.current_token();
         let first = self
-            .exchange(&method, path, query, body.as_deref(), token.as_deref())
+            .exchange(
+                &method,
+                path,
+                query,
+                body.as_deref(),
+                token.as_deref(),
+                slot,
+            )
             .await?;
         if first.status != StatusCode::UNAUTHORIZED {
             return decode(first);
@@ -411,7 +448,7 @@ impl<'a> Api<'a> {
         *self.token.lock().unwrap_or_else(|p| p.into_inner()) = Some(fresh.clone());
 
         let second = self
-            .exchange(&method, path, query, body.as_deref(), Some(&fresh))
+            .exchange(&method, path, query, body.as_deref(), Some(&fresh), slot)
             .await?;
         if second.status == StatusCode::UNAUTHORIZED {
             // A refreshed token still rejected. The refresh grant runs
@@ -433,6 +470,7 @@ impl<'a> Api<'a> {
         query: Option<&Q>,
         body: Option<&[u8]>,
         bearer: Option<&str>,
+        slot: Slot,
     ) -> Result<Exchange, UpstreamError>
     where
         Q: Serialize + ?Sized,
@@ -447,20 +485,34 @@ impl<'a> Api<'a> {
         // This viewer's own cap first, so a viewer over it queues without
         // holding a global permit that another viewer could use.
         let mut viewer_slot = up.per_viewer.enter(self.auth.cache_key());
-        tokio::time::timeout_at(deadline, viewer_slot.acquire())
-            .await
-            .map_err(|_| {
-                tracing::warn!(%path, "per-viewer upstream cap wait timed out");
-                UpstreamError::Timeout
-            })?
-            .map_err(|_| UpstreamError::Transport("upstream client shut down".into()))?;
-        let _permit = tokio::time::timeout_at(deadline, up.semaphore.acquire())
-            .await
-            .map_err(|_| {
-                tracing::warn!(%path, "upstream semaphore wait timed out");
-                UpstreamError::Timeout
-            })?
-            .map_err(|_| UpstreamError::Transport("upstream client shut down".into()))?;
+        let _permit = match slot {
+            Slot::Wait => {
+                tokio::time::timeout_at(deadline, viewer_slot.acquire())
+                    .await
+                    .map_err(|_| {
+                        tracing::warn!(%path, "per-viewer upstream cap wait timed out");
+                        UpstreamError::Timeout
+                    })?
+                    .map_err(|_| UpstreamError::Transport("upstream client shut down".into()))?;
+                tokio::time::timeout_at(deadline, up.semaphore.acquire())
+                    .await
+                    .map_err(|_| {
+                        tracing::warn!(%path, "upstream semaphore wait timed out");
+                        UpstreamError::Timeout
+                    })?
+                    .map_err(|_| UpstreamError::Transport("upstream client shut down".into()))?
+            }
+            Slot::IfFree => {
+                if !viewer_slot.try_acquire() {
+                    tracing::debug!(%path, "viewer's upstream slots busy; not queueing");
+                    return Err(UpstreamError::Busy);
+                }
+                up.semaphore.try_acquire().map_err(|_| {
+                    tracing::debug!(%path, "no free upstream permit; not queueing");
+                    UpstreamError::Busy
+                })?
+            }
+        };
 
         // Whatever the queue left us. Zero is the same timeout the caller
         // already handles; reqwest would not treat `Duration::ZERO` that way.

@@ -12,11 +12,17 @@
 //! | 403 | `Present`: the route exists, this viewer may not use it |
 //! | 404 / 405 | `Absent` |
 //! | 401 / session expired | `Unknown`: [`Api`] already turned a 401 into refresh-and-retry, so a 401 here is a session problem, not route evidence |
-//! | anything else (5xx, timeout, transport, a 2xx of another shape) | `Unknown` |
+//! | anything else (5xx, timeout, transport, a 2xx of another shape, no free slot) | `Unknown` |
 //!
 //! `Present` and `Absent` are facts about the deployment, not the viewer, so
 //! they are remembered per process for [`CAPABILITY_TTL`], outside the
 //! per-viewer page cache. The UI shows the feature only on `Present`.
+//!
+//! The probe never queues for an upstream slot ([`Slot::IfFree`]): when the
+//! viewer's own slots or the global permits are all taken, it is not sent,
+//! and the answer is `Unknown` ([`UpstreamError::Busy`]). So a probe that was
+//! sent had its whole deadline in flight, and a timeout it meets is the
+//! API's, not the time it spent behind one viewer's other calls.
 //!
 //! An `Unknown` is remembered only when the API itself caused it (5xx, 429,
 //! timeout, transport: [`is_api_side`]), and then only for
@@ -24,9 +30,10 @@
 //! calls, so without that memory an API that answers the probe slowly or
 //! with errors would add a full upstream deadline to every page, and a
 //! rate-limited one would get one extra request per page. An `Unknown` that
-//! came from one viewer's session (401, session expired) or from an answer
-//! of the wrong shape is never remembered: it says nothing about the
-//! deployment, and remembering it would hide the feature from everyone.
+//! came from one viewer's session (401, session expired, its slots busy) or
+//! from an answer of the wrong shape is never remembered: it says nothing
+//! about the deployment, and remembering it would hide the feature from
+//! everyone.
 //! A remembered `Unknown` never replaces a fresh `Present` or `Absent`.
 
 use std::sync::Mutex;
@@ -35,7 +42,7 @@ use std::time::{Duration, Instant};
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 
-use super::{Api, UpstreamError};
+use super::{Api, Slot, UpstreamError};
 
 /// The probe request, byte for byte. The kernel's
 /// `crates/epigraph-api/tests/unregistered_route_status_test.rs` sends the
@@ -83,7 +90,8 @@ pub fn classify(answer: &Result<(), UpstreamError>) -> Capability {
 
 /// Whether a probe answer is the API's own failure (5xx, 429, timeout,
 /// transport), which is the same for every viewer, rather than one viewer's
-/// session or an answer of the wrong shape.
+/// session, a probe that was not sent ([`UpstreamError::Busy`]) or an answer
+/// of the wrong shape.
 pub fn is_api_side(answer: &Result<(), UpstreamError>) -> bool {
     matches!(
         answer,
@@ -96,9 +104,18 @@ pub fn is_api_side(answer: &Result<(), UpstreamError>) -> bool {
 
 impl Api<'_> {
     /// [`ADMIN_ACTS_PROBE`]: `Ok` only for a 2xx carrying the listing's
-    /// envelope; a 2xx of any other shape is a decode error.
+    /// envelope; a 2xx of any other shape is a decode error. Sent only if an
+    /// upstream slot is free now ([`Slot::IfFree`]), never queued.
     pub async fn probe_admin_acts(&self) -> Result<(), UpstreamError> {
-        self.get::<ActsEnvelope>(ADMIN_ACTS_PROBE).await.map(|_| ())
+        self.send::<ActsEnvelope, ()>(
+            reqwest::Method::GET,
+            ADMIN_ACTS_PROBE,
+            None,
+            None,
+            Slot::IfFree,
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -226,6 +243,7 @@ mod tests {
                 Unknown,
             ),
             (Err(UpstreamError::Timeout), Unknown),
+            (Err(UpstreamError::Busy), Unknown),
             (Err(UpstreamError::Transport("reset".into())), Unknown),
             (
                 Err(UpstreamError::Decode("not the envelope".into())),
@@ -273,6 +291,8 @@ mod tests {
             ),
             (Err(UpstreamError::Timeout), true),
             (Err(UpstreamError::Transport("reset".into())), true),
+            // Not sent: the viewer's own slots (or every permit) were taken.
+            (Err(UpstreamError::Busy), false),
             (rejected429, true),
             (Err(UpstreamError::SessionExpired), false),
             (

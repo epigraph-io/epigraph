@@ -23,7 +23,7 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{decode, degrade, truncate_chars, Api, Degraded, UpstreamError};
+use super::{decode, degrade, truncate_chars, Api, Degraded, Slot, UpstreamError};
 use crate::auth::RequestAuth;
 use crate::state::AppState;
 
@@ -127,6 +127,7 @@ async fn introspect(
             None::<&()>,
             Some(&body),
             None,
+            Slot::Wait,
         )
         .await?;
     decode(exchange)
