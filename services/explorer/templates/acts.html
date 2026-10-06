@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block title %}Admin acts · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}<link rel="stylesheet" href="{{ ctx.static_url("core.css") }}">{% endblock %}
+
+{% block content %}
+<h1>Admin acts</h1>
+<p class="muted">Your own admin acts, newest first. A pending act is confirmed with your passkey on the EpiGraph API's own page, which its link opens in a new tab. This page only lists them; it never confirms or executes anything.</p>
+
+<section class="section acts" aria-labelledby="acts-title">
+  <h2 id="acts-title" class="section__title">Your acts</h2>
+  {%- match view %}
+  {%- when ActsView::Listed(list) %}
+  {%- if list.rows.is_empty() %}
+  <p class="muted" data-acts="empty">You have no admin acts.</p>
+  {%- else %}
+  {%- if list.capped %}
+  <p class="notice notice--warn" data-acts="capped">Showing your newest {{ limit }} acts; older ones are not listed.</p>
+  {%- endif %}
+  <ol class="acts__list" data-acts="listed">
+    {%- for a in list.rows %}
+    <li class="act" data-act="{{ a.id }}" data-act-status="{{ a.status }}">
+      <p class="act__head"><strong>{{ a.kind }}</strong> · <span>{{ a.status }}</span></p>
+      <p class="small">Target: {{ a.target }}</p>
+      <p class="small act__reason">{{ a.reason }}</p>
+      {%- if let Some(r) = a.refusal %}
+      <p class="small">Refused: {{ r }}</p>
+      {%- endif %}
+      <p class="small muted">Proposed {{ a.proposed }} · expires {{ a.expires }}</p>
+      {%- if let Some(url) = a.confirm_url %}
+      <p><a href="{{ url }}" target="_blank" rel="noreferrer noopener">Confirm with your passkey</a></p>
+      {%- endif %}
+    </li>
+    {%- endfor %}
+  </ol>
+  {%- endif %}
+  {%- when ActsView::Absent %}
+  <p class="muted" data-acts="absent">This EpiGraph API has no admin acts.</p>
+  {%- when ActsView::Forbidden %}
+  <p class="muted" data-acts="forbidden">Your account may not list admin acts.</p>
+  {%- when ActsView::Unavailable(reason) %}
+  <p class="section-unavailable" data-acts="unavailable">Admin acts are unavailable. {{ reason }}</p>
+  {%- endmatch %}
+</section>
+{% endblock %}

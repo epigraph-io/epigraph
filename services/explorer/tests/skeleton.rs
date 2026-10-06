@@ -237,6 +237,7 @@ async fn every_area_route_is_mounted() {
         "/explorer/audit".to_string(),
         "/explorer/activity".to_string(),
         "/explorer/candidates".to_string(),
+        "/explorer/acts".to_string(),
     ];
     for uri in &pages {
         let res = app.get_as(uri, &sid).await;
@@ -297,46 +298,6 @@ async fn every_area_route_is_mounted() {
         );
         assert_ne!(res.json()["error"], "not_built", "still a stub: {uri}");
     }
-}
-
-/// The MVP pages registered ahead of their bodies (one registration, so the
-/// batches that fill them in never touch the router or the reserved
-/// segments again). Each must answer as a mounted page that says "not yet
-/// available" with 501, never as the router fallback's 404, and must not call
-/// upstream. A batch that fills a page in removes its path from here and adds
-/// it to `every_area_route_is_mounted`.
-#[tokio::test]
-async fn new_page_stubs_answer_501_not_404() {
-    let app = spawn().await;
-    let sid = app.sign_in("tok");
-    for page in ["acts"] {
-        // Mounted twice, like every route: under the base path and at the root.
-        for uri in [format!("{BASE}/{page}"), format!("/{page}")] {
-            let res = app.get_as(&uri, &sid).await;
-            assert_eq!(res.status, StatusCode::NOT_IMPLEMENTED, "{uri}");
-            assert!(
-                res.header("content-type")
-                    .unwrap_or_default()
-                    .starts_with("text/html"),
-                "{uri} renders a page"
-            );
-            assert!(res.body.contains("Not yet available"), "{uri}");
-            assert!(
-                !res.body.contains("could not find that page"),
-                "{uri} fell through to the router fallback"
-            );
-            assert!(
-                res.body.contains("href=\"/explorer/\""),
-                "inside the layout"
-            );
-            assert_eq!(res.header("cache-control"), Some("no-store"), "{uri}");
-        }
-        // Like the pages they stand in for, the stubs are for signed-in viewers.
-        let res = app.get(&format!("{BASE}/{page}")).await;
-        assert_eq!(res.status, StatusCode::SEE_OTHER, "{page} anonymous");
-    }
-    let calls = common::data_calls(&app).await;
-    assert!(calls.is_empty(), "a stub called upstream: {calls:?}");
 }
 
 /// Signed-in pages carry a section nav to the MVP pages, at base-path hrefs.

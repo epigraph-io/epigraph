@@ -1,4 +1,11 @@
-//! J7: the admin-acts capability probe behind the "Admin acts" nav item.
+//! J7: the admin-acts capability probe and the `/acts` link-out page.
+//!
+//! The listing is the elevation stack's `routes/admin_acts.rs::list_acts`
+//! response, `{"acts": [ProposedAct (flattened) + "path"]}`, copied from
+//! `feat/mt-c-elevation` at `3387413f` (`admin_acts.rs`,
+//! `repos/admin_act_ceremony.rs::ProposedAct` and the `/elevate/act/:id`
+//! routes are unchanged through `121d6cca`). Re-check it when that stack
+//! gets a PR.
 //!
 //! The probe is `GET /api/v1/admin/acts?mine&limit=1` with the viewer's own
 //! token, made by signed-in page requests: 2xx (with the `{acts: [...]}`
@@ -14,13 +21,27 @@
 mod common;
 
 use axum::Router;
+use chrono::{Duration, Utc};
 use common::{spawn, spawn_with, TestApp, BASE};
-use epigraph_explorer::config::{ENV_DEV_BEARER, ENV_PUBLIC_BASE_URL};
-use serde_json::json;
+use epigraph_explorer::config::{ENV_DEV_BEARER, ENV_OAUTH_BASE_URL, ENV_PUBLIC_BASE_URL};
+use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 const ACTS_PATH: &str = "/api/v1/admin/acts";
+/// The API's public origin for the link-out: distinct from the mock API
+/// (`EPIGRAPH_API_URL`) and from the Explorer's own origin, so a link that
+/// pointed at either would not pass by accident.
+const API_ORIGIN: &str = "https://api.example.com";
+
+const ACT_PENDING: &str = "00000000-0000-4000-8000-0000000000a1";
+const ACT_CONFIRMED: &str = "00000000-0000-4000-8000-0000000000a2";
+const ACT_EXECUTED: &str = "00000000-0000-4000-8000-0000000000a3";
+const ACT_EXPIRED: &str = "00000000-0000-4000-8000-0000000000a4";
+const ACT_REFUSED: &str = "00000000-0000-4000-8000-0000000000a5";
+const ACT_OTHER: &str = "00000000-0000-4000-8000-0000000000a6";
+const TARGET: &str = "00000000-0000-4000-8000-0000000000b1";
+const ELEVATION: &str = "00000000-0000-4000-8000-0000000000c1";
 
 /// The nav item, exactly as `templates/base.html` renders it.
 const NAV_ITEM: &str = "href=\"/explorer/acts\">Admin acts</a>";
@@ -29,12 +50,70 @@ fn header_page() -> String {
     format!("{BASE}/activity")
 }
 
+/// One listed act in the kernel's shape. `when` fields are offsets from now
+/// in minutes; `None` leaves the field null.
+struct ActSpec<'a> {
+    id: &'a str,
+    expires_in_min: i64,
+    asserted: bool,
+    outcome: Option<&'a str>,
+    consumed: bool,
+    path: Option<String>,
+}
+
+impl<'a> ActSpec<'a> {
+    fn pending(id: &'a str) -> Self {
+        ActSpec {
+            id,
+            expires_in_min: 30,
+            asserted: false,
+            outcome: None,
+            consumed: false,
+            path: None,
+        }
+    }
+
+    fn json(&self) -> Value {
+        let now = Utc::now();
+        let at = |min: i64| (now + Duration::minutes(min)).to_rfc3339();
+        json!({
+            "id": self.id,
+            "kind": "role.grant",
+            "args": {"agent_id": TARGET, "role": "platform-custodian"},
+            "args_digest": "ab".repeat(32),
+            "target_type": "agent",
+            "target_id": TARGET,
+            "reason": format!("reason for {}", self.id),
+            "elevation_id": ELEVATION,
+            "proposed_at": at(-10),
+            "expires_at": at(self.expires_in_min),
+            "asserted_at": if self.asserted { Value::String(at(-5)) } else { Value::Null },
+            "outcome": self.outcome,
+            "refusal": if self.outcome == Some("refused") { json!("credential_revoked") } else { Value::Null },
+            "consumed_at": if self.consumed { Value::String(at(-1)) } else { Value::Null },
+            "path": self.path.clone().unwrap_or_else(|| format!("/elevate/act/{}", self.id)),
+        })
+    }
+}
+
 /// The probe: `?mine&limit=1`.
 fn probe() -> wiremock::MockBuilder {
     Mock::given(method("GET"))
         .and(path(ACTS_PATH))
         .and(query_param("mine", ""))
         .and(query_param("limit", "1"))
+}
+
+/// The page's own listing: `?mine&limit=50`.
+fn listing() -> wiremock::MockBuilder {
+    Mock::given(method("GET"))
+        .and(path(ACTS_PATH))
+        .and(query_param("mine", ""))
+        .and(query_param("limit", "50"))
+}
+
+fn acts_body(acts: &[ActSpec<'_>]) -> Value {
+    json!({ "acts": acts.iter().map(ActSpec::json).collect::<Vec<_>>() })
 }
 
 async fn probe_answers(app: &TestApp, status: u16, times: u64) {
@@ -59,6 +138,21 @@ async fn probe_calls(app: &TestApp) -> Vec<wiremock::Request> {
         .into_iter()
         .filter(|r| r.url.path() == ACTS_PATH && r.url.query() == Some("mine&limit=1"))
         .collect()
+}
+
+/// App whose link-out origin is [`API_ORIGIN`].
+async fn with_api_origin() -> TestApp {
+    spawn_with(&[(ENV_OAUTH_BASE_URL, API_ORIGIN)], Router::new()).await
+}
+
+/// The `<li>` of one act, sliced from the page.
+fn act_row<'b>(body: &'b str, id: &str) -> &'b str {
+    let start = body
+        .find(&format!("data-act=\"{id}\""))
+        .unwrap_or_else(|| panic!("no row for act {id} in: {body}"));
+    let rest = &body[start..];
+    let end = rest.find("</li>").expect("row closes");
+    &rest[..end]
 }
 
 // ---- the probe and the nav item ------------------------------------------------
@@ -330,4 +424,228 @@ async fn a_probe_that_ends_the_session_signs_the_viewer_out() {
     );
     assert!(app.state.sessions.get(&sid).is_none(), "session ended");
     app.upstream.verify().await;
+}
+
+// ---- the /acts page ------------------------------------------------------------
+
+/// Present: the page lists the viewer's acts (decoding `{acts: [...]}`), and
+/// a pending act links out to the API's own confirmation page, on the API's
+/// public origin, in a new tab, with no referrer. Never the Explorer's
+/// origin, never the internal API URL.
+#[tokio::test]
+async fn probe_present_lists_acts_with_api_origin_links() {
+    let app = with_api_origin().await;
+    probe_answers(&app, 200, 1).await;
+    listing()
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(acts_body(&[ActSpec::pending(ACT_PENDING)])),
+        )
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("{BASE}/acts"), &sid).await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(res.body.contains(NAV_ITEM), "nav item on the page itself");
+    assert!(res.body.contains("data-acts=\"listed\""), "{}", res.body);
+
+    let row = act_row(&res.body, ACT_PENDING);
+    assert!(row.contains("data-act-status=\"pending\""), "{row}");
+    assert!(row.contains("role.grant"), "kind shown: {row}");
+    assert!(row.contains(&format!("reason for {ACT_PENDING}")), "{row}");
+    let link = format!(
+        "<a href=\"{API_ORIGIN}/elevate/act/{ACT_PENDING}\" target=\"_blank\" rel=\"noreferrer noopener\""
+    );
+    assert!(row.contains(&link), "link to the API origin: {row}");
+    assert!(
+        !res.body.contains(&app.upstream.uri()),
+        "internal API URL leaked"
+    );
+    assert!(
+        !res.body.contains("explorer.example.com/elevate"),
+        "the Explorer never serves or proxies the ceremony"
+    );
+    app.upstream.verify().await;
+}
+
+/// Only a pending act (unasserted, unconsumed, unexpired) gets a link:
+/// confirmed, refused, executed and expired acts are listed without one.
+#[tokio::test]
+async fn only_pending_acts_get_a_link() {
+    let app = with_api_origin().await;
+    probe_answers(&app, 200, 1).await;
+    let acts = [
+        ActSpec::pending(ACT_PENDING),
+        ActSpec {
+            asserted: true,
+            outcome: Some("confirmed"),
+            ..ActSpec::pending(ACT_CONFIRMED)
+        },
+        ActSpec {
+            asserted: true,
+            outcome: Some("confirmed"),
+            consumed: true,
+            ..ActSpec::pending(ACT_EXECUTED)
+        },
+        ActSpec {
+            expires_in_min: -1,
+            ..ActSpec::pending(ACT_EXPIRED)
+        },
+        ActSpec {
+            asserted: true,
+            outcome: Some("refused"),
+            ..ActSpec::pending(ACT_REFUSED)
+        },
+    ];
+    listing()
+        .respond_with(ResponseTemplate::new(200).set_body_json(acts_body(&acts)))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("{BASE}/acts"), &sid).await;
+    assert_eq!(res.status, 200, "{}", res.body);
+
+    assert!(act_row(&res.body, ACT_PENDING).contains("/elevate/act/"));
+    for (id, status) in [
+        (ACT_CONFIRMED, "confirmed"),
+        (ACT_EXECUTED, "executed"),
+        (ACT_EXPIRED, "expired"),
+        (ACT_REFUSED, "refused"),
+    ] {
+        let row = act_row(&res.body, id);
+        assert!(
+            row.contains(&format!("data-act-status=\"{status}\"")),
+            "{id}: {row}"
+        );
+        assert!(!row.contains("/elevate/act/"), "{id} must not link: {row}");
+        assert!(!row.contains("<a "), "{id} must not link: {row}");
+    }
+    assert_eq!(
+        res.body.matches("/elevate/act/").count(),
+        1,
+        "exactly one link"
+    );
+}
+
+/// The link is the response's own `path`, used only when it is exactly the
+/// act's own confirmation page. Anything else (another origin, another
+/// page, another act, a query, a traversal) renders the row with no link.
+#[tokio::test]
+async fn act_link_with_a_foreign_path_is_not_rendered() {
+    let app = with_api_origin().await;
+    probe_answers(&app, 200, 1).await;
+    let ids = [
+        "00000000-0000-4000-8000-0000000000e1",
+        "00000000-0000-4000-8000-0000000000e2",
+        "00000000-0000-4000-8000-0000000000e3",
+        "00000000-0000-4000-8000-0000000000e4",
+        "00000000-0000-4000-8000-0000000000e5",
+        "00000000-0000-4000-8000-0000000000e6",
+        "00000000-0000-4000-8000-0000000000e7",
+    ];
+    let paths = [
+        "//evil.example/x".to_string(),
+        "/elsewhere".to_string(),
+        format!("/elevate/act/{ACT_OTHER}"),
+        format!("/elevate/act/{}?next=//evil.example", ids[3]),
+        format!("/elevate/act/../../{}", ids[4]),
+        format!("https://evil.example/elevate/act/{}", ids[5]),
+        format!("/elevate/act//{}", ids[6]),
+    ];
+    let acts: Vec<ActSpec<'_>> = ids
+        .iter()
+        .zip(paths.iter())
+        .map(|(id, p)| ActSpec {
+            path: Some(p.clone()),
+            ..ActSpec::pending(id)
+        })
+        .collect();
+    listing()
+        .respond_with(ResponseTemplate::new(200).set_body_json(acts_body(&acts)))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("{BASE}/acts"), &sid).await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    for id in ids {
+        let row = act_row(&res.body, id);
+        assert!(row.contains("data-act-status=\"pending\""), "{row}");
+        assert!(!row.contains("<a "), "{id}: a foreign path linked: {row}");
+    }
+    assert!(!res.body.contains("evil.example"), "{}", res.body);
+    assert!(!res.body.contains("/elsewhere"), "{}", res.body);
+}
+
+/// Visited directly against an API without the route: the page says so,
+/// with 200, never 501 or 500, and shows no nav item.
+#[tokio::test]
+async fn acts_page_without_the_route_says_so() {
+    let app = spawn().await;
+    probe_answers(&app, 404, 1).await;
+    listing()
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "NotFound"})))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("{BASE}/acts"), &sid).await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(res.body.contains("data-acts=\"absent\""), "{}", res.body);
+    assert!(!res.body.contains("Not yet available"));
+    assert!(!res.body.contains(NAV_ITEM));
+    app.upstream.verify().await;
+}
+
+/// 403 from the listing: "no access", not an error page; a 5xx: unavailable.
+#[tokio::test]
+async fn acts_page_forbidden_and_failed_states() {
+    let app = spawn().await;
+    probe_answers(&app, 403, 1).await;
+    listing()
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({"error": "Forbidden"})))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&app.upstream)
+        .await;
+    listing()
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(2)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("{BASE}/acts"), &sid).await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(res.body.contains("data-acts=\"forbidden\""), "{}", res.body);
+    let res = app.get_as(&format!("{BASE}/acts"), &sid).await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(
+        res.body.contains("data-acts=\"unavailable\""),
+        "{}",
+        res.body
+    );
+}
+
+/// An empty listing is a state of its own, not an error.
+#[tokio::test]
+async fn acts_page_with_no_acts_says_so() {
+    let app = spawn().await;
+    probe_answers(&app, 200, 1).await;
+    listing()
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"acts": []})))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("{BASE}/acts"), &sid).await;
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert!(res.body.contains("data-acts=\"empty\""), "{}", res.body);
+}
+
+#[tokio::test]
+async fn acts_require_sign_in_and_make_no_anonymous_call() {
+    let app = spawn().await;
+    let res = app.get(&format!("{BASE}/acts")).await;
+    assert_eq!(res.status, 303);
+    let calls = app.upstream.received_requests().await.unwrap_or_default();
+    assert!(calls.is_empty(), "called upstream: {calls:?}");
 }
