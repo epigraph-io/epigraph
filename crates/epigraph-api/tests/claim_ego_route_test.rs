@@ -42,6 +42,19 @@ async fn router(pool: &PgPool) -> Router {
     ))
 }
 
+/// The same router on a `ScopedPool` downgraded to the application role, so
+/// row-level security is live (`common::app_role_scoped_pool`). The superuser
+/// router above observes only the in-query viewer predicate; this one also
+/// observes whether the read was stamped with the viewer's tenancy, which is
+/// what lets an owner see their own group-private rows under FORCE RLS.
+async fn app_role_router(pool: &PgPool) -> Router {
+    let url = fixture::database_url_for(pool).await;
+    create_router(AppState::with_scoped_pool(
+        common::app_role_scoped_pool(pool, &url).await,
+        ApiConfig::default(),
+    ))
+}
+
 /// A token for a principal with no group memberships: it reads exactly the
 /// public corpus, which is the default position of any signed-in stranger.
 fn reader() -> String {
@@ -507,42 +520,49 @@ async fn a_private_neighbour_and_its_edges_are_dropped_for_everyone_but_its_owne
         .await
         .expect("force the connecting edge public");
 
-    let app = router(&pool).await;
-    let path = format!("/api/v1/claims/{center}/ego");
+    // Both roles: the superuser router observes the in-query viewer predicate,
+    // the application-role one also observes the tenancy stamp the owner arm
+    // needs under FORCE RLS.
+    for (role, app) in [
+        ("superuser", router(&pool).await),
+        ("epigraph_app", app_role_router(&pool).await),
+    ] {
+        let path = format!("/api/v1/claims/{center}/ego");
 
-    // No credential at all: 401, because there is no anonymous read of claim
-    // content left anywhere on this router.
-    let (status, _, _) = raw(&app, &path, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // No credential at all: 401, because there is no anonymous read of claim
+        // content left anywhere on this router.
+        let (status, _, _) = raw(&app, &path, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // A signed-in stranger: the neighbour and the edge to it are GONE, not
-    // blanked — a bare claim id plus a relationship already says too much.
-    let stranger = reader();
-    let (status, body) = get(&app, &path, Some(&stranger)).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(node_ids(&body), vec![public_neighbour.to_string()]);
-    assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
-    assert_eq!(body["center"]["content"], "public centre");
+        // A signed-in stranger: the neighbour and the edge to it are GONE, not
+        // blanked — a bare claim id plus a relationship already says too much.
+        let stranger = reader();
+        let (status, body) = get(&app, &path, Some(&stranger)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(node_ids(&body), vec![public_neighbour.to_string()]);
+        assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
+        assert_eq!(body["center"]["content"], "public centre");
 
-    // A spoofed query parameter buys nothing: visibility comes from the token's
-    // principal and never from the wire.
-    let (status, body) = get(&app, &format!("{path}?agent_id={owner}"), Some(&stranger)).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(node_ids(&body), vec![public_neighbour.to_string()]);
+        // A spoofed query parameter buys nothing: visibility comes from the token's
+        // principal and never from the wire.
+        let (status, body) = get(&app, &format!("{path}?agent_id={owner}"), Some(&stranger)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(node_ids(&body), vec![public_neighbour.to_string()]);
 
-    // The owner sees both, with content. CALIBRATION: without this arm the
-    // stranger assertions would pass just as well against a handler that
-    // returned nothing at all.
-    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
-    let (status, body) = get(&app, &path, Some(&owner_token)).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let mut ids = node_ids(&body);
-    ids.sort();
-    let mut want = vec![public_neighbour.to_string(), secret.to_string()];
-    want.sort();
-    assert_eq!(ids, want);
-    assert_eq!(node(&body, secret)["content"], "classified neighbour");
-    assert_eq!(body["edges"].as_array().expect("edges").len(), 2);
+        // The owner sees both, with content. CALIBRATION: without this arm the
+        // stranger assertions would pass just as well against a handler that
+        // returned nothing at all.
+        let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+        let (status, body) = get(&app, &path, Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let mut ids = node_ids(&body);
+        ids.sort();
+        let mut want = vec![public_neighbour.to_string(), secret.to_string()];
+        want.sort();
+        assert_eq!(ids, want, "[{role}] the owner sees the private neighbour");
+        assert_eq!(node(&body, secret)["content"], "classified neighbour");
+        assert_eq!(body["edges"].as_array().expect("edges").len(), 2);
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -552,45 +572,55 @@ async fn a_private_centre_is_the_same_404_as_a_claim_that_does_not_exist(pool: P
     let neighbour = common::seed_claim(&pool, "public neighbour").await;
     common::insert_edge(&pool, center, neighbour, "claim", "claim", "supports").await;
     common::seed_private_ownership(&pool, center, owner).await;
-    let app = router(&pool).await;
+    // Both roles: the superuser router observes the in-query viewer predicate,
+    // the application-role one also observes the tenancy stamp the owner arm
+    // needs under FORCE RLS.
+    for (role, app) in [
+        ("superuser", router(&pool).await),
+        ("epigraph_app", app_role_router(&pool).await),
+    ] {
+        let path = format!("/api/v1/claims/{center}/ego");
+        let stranger = reader();
 
-    let path = format!("/api/v1/claims/{center}/ego");
-    let stranger = reader();
+        // Byte-identical to the answer for a uuid that names nothing, modulo the
+        // echoed id. A status-code-only assertion would pass while the oracle
+        // stood: the old shape here was a 200 carrying the centre with a zeroed
+        // degree, which confirmed the claim existed.
+        let (private_status, private_ct, private_body) = raw(&app, &path, Some(&stranger)).await;
+        assert_eq!(private_status, StatusCode::NOT_FOUND, "{private_body}");
 
-    // Byte-identical to the answer for a uuid that names nothing, modulo the
-    // echoed id. A status-code-only assertion would pass while the oracle
-    // stood: the old shape here was a 200 carrying the centre with a zeroed
-    // degree, which confirmed the claim existed.
-    let (private_status, private_ct, private_body) = raw(&app, &path, Some(&stranger)).await;
-    assert_eq!(private_status, StatusCode::NOT_FOUND, "{private_body}");
+        let absent = Uuid::new_v4();
+        let (absent_status, absent_ct, absent_body) = raw(
+            &app,
+            &format!("/api/v1/claims/{absent}/ego"),
+            Some(&stranger),
+        )
+        .await;
+        assert_eq!(
+            private_status, absent_status,
+            "status must not discriminate"
+        );
+        assert_eq!(private_ct, absent_ct, "content-type must not discriminate");
+        assert_eq!(
+            private_body.replace(&center.to_string(), "<ID>"),
+            absent_body.replace(&absent.to_string(), "<ID>"),
+            "the body must not discriminate either: a private claim and a \
+             nonexistent one are one answer"
+        );
 
-    let absent = Uuid::new_v4();
-    let (absent_status, absent_ct, absent_body) = raw(
-        &app,
-        &format!("/api/v1/claims/{absent}/ego"),
-        Some(&stranger),
-    )
-    .await;
-    assert_eq!(
-        private_status, absent_status,
-        "status must not discriminate"
-    );
-    assert_eq!(private_ct, absent_ct, "content-type must not discriminate");
-    assert_eq!(
-        private_body.replace(&center.to_string(), "<ID>"),
-        absent_body.replace(&absent.to_string(), "<ID>"),
-        "the body must not discriminate either: a private claim and a \
-         nonexistent one are one answer"
-    );
-
-    // CALIBRATION: the owner still gets the whole ego view, so the assertions
-    // above are about tenancy and not about a route that 404s unconditionally.
-    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
-    let (status, body) = get(&app, &path, Some(&owner_token)).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["center"]["content"], "classified centre");
-    assert_eq!(node_ids(&body), vec![neighbour.to_string()]);
-    assert_eq!(body["total_edges"], 1);
+        // CALIBRATION: the owner still gets the whole ego view, so the assertions
+        // above are about tenancy and not about a route that 404s unconditionally.
+        let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+        let (status, body) = get(&app, &path, Some(&owner_token)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "[{role}] the owner reads the private centre; body: {body}"
+        );
+        assert_eq!(body["center"]["content"], "classified centre");
+        assert_eq!(node_ids(&body), vec![neighbour.to_string()]);
+        assert_eq!(body["total_edges"], 1);
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]

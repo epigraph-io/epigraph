@@ -32,6 +32,19 @@ async fn router(pool: &PgPool) -> Router {
     ))
 }
 
+/// The same router on a `ScopedPool` downgraded to the application role, so
+/// row-level security is live (`common::app_role_scoped_pool`). The superuser
+/// router above observes only the in-query viewer predicate; this one also
+/// observes whether the read was stamped with the viewer's tenancy, which is
+/// what lets an owner see their own group-private rows under FORCE RLS.
+async fn app_role_router(pool: &PgPool) -> Router {
+    let url = fixture::database_url_for(pool).await;
+    create_router(AppState::with_scoped_pool(
+        common::app_role_scoped_pool(pool, &url).await,
+        ApiConfig::default(),
+    ))
+}
+
 /// A token for a principal with no group memberships: it reads exactly the
 /// public corpus.
 fn reader() -> String {
@@ -258,48 +271,59 @@ async fn a_private_ancestor_and_its_edge_are_absent_for_everyone_but_its_owner(p
     .await
     .expect("force the derivation edge public");
 
-    let app = router(&pool).await;
-    let path = format!("/api/v1/claims/{root}/provenance-chain");
+    // Both roles: the superuser router observes the in-query viewer predicate,
+    // the application-role one also observes the tenancy stamp the owner arm
+    // needs under FORCE RLS.
+    for (role, app) in [
+        ("superuser", router(&pool).await),
+        ("epigraph_app", app_role_router(&pool).await),
+    ] {
+        let path = format!("/api/v1/claims/{root}/provenance-chain");
 
-    // No credential: 401. There is no anonymous read of claim content left.
-    let (status, _, _) = raw(&app, &path, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // No credential: 401. There is no anonymous read of claim content left.
+        let (status, _, _) = raw(&app, &path, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // A signed-in stranger: the ancestor is ABSENT, not blanked — and so is the
-    // edge naming it. This is the regression test for the dangling-edge fix in
-    // `ProvenanceChainRepository::chain`: before it, `edges` was retained
-    // against the WALK (edge-filtered) rather than against the HYDRATED node
-    // set (claim-filtered), so this edge came back carrying `secret`'s uuid and
-    // the relationship it stands in. A uuid plus "supports" is a disclosure
-    // with no content attached, which is still a disclosure.
-    let stranger = reader();
-    let (status, body) = get(&app, &path, Some(&stranger)).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(node_ids(&body), vec![root.to_string()]);
-    assert_eq!(
-        body["edges"],
-        serde_json::json!([]),
-        "an edge naming an invisible claim must not survive hydration, got {body}"
-    );
-    assert_eq!(node(&body, root)["content"], "public conclusion");
-    assert!(
-        !body.to_string().contains(&secret.to_string()),
-        "the invisible claim's uuid must not appear anywhere in the response, got {body}"
-    );
+        // A signed-in stranger: the ancestor is ABSENT, not blanked — and so is the
+        // edge naming it. This is the regression test for the dangling-edge fix in
+        // `ProvenanceChainRepository::chain`: before it, `edges` was retained
+        // against the WALK (edge-filtered) rather than against the HYDRATED node
+        // set (claim-filtered), so this edge came back carrying `secret`'s uuid and
+        // the relationship it stands in. A uuid plus "supports" is a disclosure
+        // with no content attached, which is still a disclosure.
+        let stranger = reader();
+        let (status, body) = get(&app, &path, Some(&stranger)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(node_ids(&body), vec![root.to_string()]);
+        assert_eq!(
+            body["edges"],
+            serde_json::json!([]),
+            "an edge naming an invisible claim must not survive hydration, got {body}"
+        );
+        assert_eq!(node(&body, root)["content"], "public conclusion");
+        assert!(
+            !body.to_string().contains(&secret.to_string()),
+            "the invisible claim's uuid must not appear anywhere in the response, got {body}"
+        );
 
-    // A spoofed `agent_id` must not buy access: the route has no such parameter
-    // and visibility comes from the token's principal.
-    let (status, body) = get(&app, &format!("{path}?agent_id={owner}"), Some(&stranger)).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(node_ids(&body), vec![root.to_string()]);
+        // A spoofed `agent_id` must not buy access: the route has no such parameter
+        // and visibility comes from the token's principal.
+        let (status, body) = get(&app, &format!("{path}?agent_id={owner}"), Some(&stranger)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(node_ids(&body), vec![root.to_string()]);
 
-    // CALIBRATION: the owner sees both nodes and the edge, so the assertions
-    // above are about tenancy rather than about a walk that returns nothing.
-    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
-    let (status, body) = get(&app, &path, Some(&owner_token)).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(node(&body, secret)["content"], "classified premise");
-    assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
+        // CALIBRATION: the owner sees both nodes and the edge, so the assertions
+        // above are about tenancy rather than about a walk that returns nothing.
+        let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+        let (status, body) = get(&app, &path, Some(&owner_token)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            node_ids(&body).contains(&secret.to_string()),
+            "[{role}] the owner sees the private ancestor; body: {body}"
+        );
+        assert_eq!(node(&body, secret)["content"], "classified premise");
+        assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -307,42 +331,52 @@ async fn a_private_root_is_the_same_404_as_a_root_that_does_not_exist(pool: PgPo
     let owner = Uuid::new_v4();
     let root = common::seed_claim_with_agent(&pool, "classified conclusion", owner).await;
     common::seed_private_ownership(&pool, root, owner).await;
-    let app = router(&pool).await;
+    // Both roles: the superuser router observes the in-query viewer predicate,
+    // the application-role one also observes the tenancy stamp the owner arm
+    // needs under FORCE RLS.
+    for (role, app) in [
+        ("superuser", router(&pool).await),
+        ("epigraph_app", app_role_router(&pool).await),
+    ] {
+        let stranger = reader();
+        let (private_status, private_ct, private_body) = raw(
+            &app,
+            &format!("/api/v1/claims/{root}/provenance-chain"),
+            Some(&stranger),
+        )
+        .await;
+        assert_eq!(private_status, StatusCode::NOT_FOUND, "{private_body}");
 
-    let stranger = reader();
-    let (private_status, private_ct, private_body) = raw(
-        &app,
-        &format!("/api/v1/claims/{root}/provenance-chain"),
-        Some(&stranger),
-    )
-    .await;
-    assert_eq!(private_status, StatusCode::NOT_FOUND, "{private_body}");
+        let absent = Uuid::new_v4();
+        let (absent_status, absent_ct, absent_body) = raw(
+            &app,
+            &format!("/api/v1/claims/{absent}/provenance-chain"),
+            Some(&stranger),
+        )
+        .await;
+        assert_eq!(private_status, absent_status);
+        assert_eq!(private_ct, absent_ct);
+        assert_eq!(
+            private_body.replace(&root.to_string(), "<ID>"),
+            absent_body.replace(&absent.to_string(), "<ID>"),
+            "a private root and a nonexistent one are one answer"
+        );
 
-    let absent = Uuid::new_v4();
-    let (absent_status, absent_ct, absent_body) = raw(
-        &app,
-        &format!("/api/v1/claims/{absent}/provenance-chain"),
-        Some(&stranger),
-    )
-    .await;
-    assert_eq!(private_status, absent_status);
-    assert_eq!(private_ct, absent_ct);
-    assert_eq!(
-        private_body.replace(&root.to_string(), "<ID>"),
-        absent_body.replace(&absent.to_string(), "<ID>"),
-        "a private root and a nonexistent one are one answer"
-    );
-
-    // CALIBRATION.
-    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
-    let (status, body) = get(
-        &app,
-        &format!("/api/v1/claims/{root}/provenance-chain"),
-        Some(&owner_token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(node_ids(&body), vec![root.to_string()]);
+        // CALIBRATION.
+        let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+        let (status, body) = get(
+            &app,
+            &format!("/api/v1/claims/{root}/provenance-chain"),
+            Some(&owner_token),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "[{role}] the owner reads the private root; body: {body}"
+        );
+        assert_eq!(node_ids(&body), vec![root.to_string()]);
+    }
 }
 
 /// Force every edge touching `claim` public, then read the tenancy back.

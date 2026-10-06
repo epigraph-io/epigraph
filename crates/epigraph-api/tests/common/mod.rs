@@ -147,6 +147,54 @@ pub async fn spawn_app_with_mock_embedding(
     (addr, tx)
 }
 
+/// A `ScopedPool` over `database_url` whose every connection is DOWNGRADED to
+/// the application role `epigraph_app`, so row-level security is live on it.
+///
+/// `#[sqlx::test]` connects as a superuser with `BYPASSRLS`. On that pool no
+/// policy filters anything, so a route test observes only the in-query viewer
+/// predicate. That is the stricter direction for a leak, but it cannot see an
+/// owner's own rows going missing when a read was not stamped with the
+/// viewer's tenancy: under FORCE RLS an unstamped application-role read hides
+/// group-private rows from their owner, with a 200. An `AppState` built from
+/// this pool (`AppState::with_scoped_pool` derives `db_pool` from the same
+/// pool) answers as a real deployment does.
+///
+/// Calibrated before it is returned: `epigraph_app` must not hold
+/// `BYPASSRLS`, and the scoped pool's `session_user` must be it, or every
+/// owner arm built on this would be vacuous. `pool` is the superuser pool, used
+/// only for the role lookup; seed on it, never on this one.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub async fn app_role_scoped_pool(pool: &PgPool, database_url: &str) -> epigraph_db::ScopedPool {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(
+        !bypassrls,
+        "CALIBRATION: epigraph_app holds BYPASSRLS, so an app-role arm would be vacuous"
+    );
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        database_url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let session_user: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(scoped.inner())
+        .await
+        .expect("session_user on the app-role pool");
+    assert_eq!(
+        session_user, "epigraph_app",
+        "CALIBRATION: the scoped pool must run as the application role"
+    );
+    scoped
+}
+
 /// Returns a real signed JWT that the production bearer_auth_middleware will accept.
 /// Uses the same secret-fallback logic as `AppState::default_jwt_config`.
 #[allow(
