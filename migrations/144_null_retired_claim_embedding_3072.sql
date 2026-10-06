@@ -33,9 +33,11 @@
 -- ROW SECURITY. `claims` is FORCE ROW LEVEL SECURITY (079), so the backfill
 -- UPDATE reaches only the rows the applying session can see. Apply as a role
 -- that bypasses row security (superuser or BYPASSRLS). If it does not, the
--- ADD CONSTRAINT below fails closed: constraint validation scans the whole
--- heap regardless of policies, raises 23514 on a row the backfill could not
--- see, and the whole file rolls back with nothing half-applied.
+-- ADD CONSTRAINT below is expected to fail closed: constraint validation
+-- scans the whole heap regardless of policies, so it should raise 23514 on a
+-- row the backfill could not see and roll the whole file back with nothing
+-- half-applied. No test exercises this path (the replay test runs as the
+-- sqlx::test superuser), so treat the BYPASSRLS requirement as mandatory.
 --
 -- LOCKING. One transaction (sqlx default). The DROP/ADD takes ACCESS EXCLUSIVE
 -- on `claims` and the ADD validates every row in one pass with no rewrite, the
