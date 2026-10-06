@@ -3481,6 +3481,38 @@ mod db_tests {
         .unwrap()
     }
 
+    /// The stored `(properties, valid_from, valid_to)` of edge `id`.
+    async fn stored_edge_fields(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> (
+        serde_json::Value,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        sqlx::query_as("SELECT properties, valid_from, valid_to FROM edges WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A timestamp field of a response body, parsed (the serializer may write
+    /// `+00:00` where the request wrote `Z`, so strings are not compared).
+    fn body_ts(body: &serde_json::Value, field: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        body[field].as_str().map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap_or_else(|e| panic!("`{field}` is not RFC 3339 ({e}): {body}"))
+                .with_timezone(&chrono::Utc)
+        })
+    }
+
+    fn ts(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
     /// Shared body of the reverse-direction tests: `A <relationship> B`, then
     /// `B <relationship> A`, both with the given `if_not_exists`.
     async fn assert_reverse_symmetric_collapses(
@@ -3622,6 +3654,79 @@ mod db_tests {
             2,
             "the retired row survives beside the new one"
         );
+    }
+
+    /// The symmetric arm writes its own INSERT, so it must persist the
+    /// request's `properties` / `valid_from` / `valid_to` like the other arms;
+    /// and on a reverse dedup hit it answers with the STORED values, not the
+    /// second request's.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_persists_properties_and_validity_window(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "windowed A").await;
+        let b = seed_claim(&pool, agent_id, "windowed B").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let body = |src: Uuid, tgt: Uuid, props: serde_json::Value, from: &str, to: &str| {
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "source_id": src,
+                    "target_id": tgt,
+                    "source_type": "claim",
+                    "target_type": "claim",
+                    "relationship": "CONTRADICTS",
+                    "properties": props,
+                    "valid_from": from,
+                    "valid_to": to,
+                }))
+                .unwrap(),
+            )
+        };
+        let props1 = serde_json::json!({"note": "first", "weight": 0.7});
+        let (from1, to1) = ("2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z");
+
+        let (s1, body1) = post_edge(&router, body(a, b, props1.clone(), from1, to1)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        let id1 = body_id(&body1, "id");
+        assert_eq!(
+            body1["properties"], props1,
+            "response carries the properties"
+        );
+        assert_eq!(body_ts(&body1, "valid_from"), Some(ts(from1)));
+        assert_eq!(body_ts(&body1, "valid_to"), Some(ts(to1)));
+        assert_eq!(
+            stored_edge_fields(&pool, id1).await,
+            (props1.clone(), Some(ts(from1)), Some(ts(to1))),
+            "the stored row carries the request's properties and validity window"
+        );
+
+        // Reverse re-POST with a different (valid) payload: the stored values
+        // win, and nothing is written.
+        let (s2, body2) = post_edge(
+            &router,
+            body(
+                b,
+                a,
+                serde_json::json!({"note": "second"}),
+                "2026-02-01T00:00:00Z",
+                "2098-01-01T00:00:00Z",
+            ),
+        )
+        .await;
+        assert_eq!(s2, StatusCode::OK, "{body2}");
+        assert_eq!(body_id(&body2, "id"), id1);
+        assert_eq!(
+            body2["properties"], props1,
+            "dedup hit reports STORED properties"
+        );
+        assert_eq!(body_ts(&body2, "valid_from"), Some(ts(from1)));
+        assert_eq!(body_ts(&body2, "valid_to"), Some(ts(to1)));
+        assert_eq!(
+            stored_edge_fields(&pool, id1).await,
+            (props1, Some(ts(from1)), Some(ts(to1))),
+            "a dedup hit must not rewrite the stored row"
+        );
+        assert_eq!(unordered_pair_count(&pool, a, b, "CONTRADICTS").await, 1);
     }
 
     /// Negative control: `SUPPORTS` is DIRECTIONAL (A supports B is not B
