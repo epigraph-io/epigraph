@@ -734,6 +734,16 @@ if the login response's cookie starts `__Host-` and the startup log
 
 ## Caveats
 
+- **The graph shows no paper or activity neighbours.** The API's ego route
+  shows a neighbour only when it can judge the viewer's right to read it: by
+  the row's own tenancy (claims, evidence, frames, contexts, perspectives,
+  communities), by the claim it derives from (reasoning traces,
+  experiments and their results), or because it is public by design
+  (agents). Papers, activities and every other type have no such row, so the
+  route drops them for every viewer that is not a maintenance bypass. A
+  claim ingested from a paper therefore has no paper node on its canvas,
+  and its Relationships section lists no paper outlink. This is the API
+  failing closed, not a missing link; showing papers needs an API change.
 - **Theme, community and neighbourhood ids are not permalinks.** They are
   regenerated every time clustering re-runs, which an operator triggers.
   When an id has gone stale, its view says "view expired — clustering has
