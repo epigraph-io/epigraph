@@ -72,7 +72,8 @@ pub struct Config {
     pub upstream_concurrency: usize,
     /// Per-call upstream timeout.
     pub upstream_timeout: Duration,
-    /// Drop `Secure` from the session cookie (plain-http local dev only).
+    /// Drop `Secure` from the session cookie (plain-http local dev only;
+    /// refused when the public base URL is https).
     pub insecure_cookies: bool,
     /// Dev-only bearer used for every anonymous request (localhost only).
     pub dev_bearer: Option<String>,
@@ -154,6 +155,14 @@ impl Config {
         };
 
         let insecure_cookies = parse_bool(ENV_INSECURE_COOKIES, get(ENV_INSECURE_COOKIES), false)?;
+        // A plain-http dev aid. Over https it would only strip `Secure` from
+        // cookies the browser could have kept.
+        if insecure_cookies && public_base_url.scheme() == "https" {
+            return Err(invalid(
+                ENV_INSECURE_COOKIES,
+                "refused: only allowed when the public base URL is plain http (local development)",
+            ));
+        }
 
         let frame_ancestors = match lookup(ENV_FRAME_ANCESTORS) {
             // Explicitly empty means "no framing at all".
@@ -527,9 +536,47 @@ mod tests {
 
     #[test]
     fn bools_parse() {
-        let c = cfg(&[BASE, (ENV_INSECURE_COOKIES, "TRUE")]).unwrap();
+        // A plain-http base: insecure cookies are refused on an https one.
+        let c = cfg(&[
+            (ENV_PUBLIC_BASE_URL, "http://localhost:8096"),
+            (ENV_INSECURE_COOKIES, "TRUE"),
+        ])
+        .unwrap();
         assert!(c.insecure_cookies);
         assert!(!c.cookie_secure());
+    }
+
+    /// Insecure cookies are a plain-http dev aid. On an https base they would
+    /// only drop `Secure` from a cookie the browser could have kept, so the
+    /// combination is a configuration error, not a warning.
+    #[test]
+    fn insecure_cookies_refused_for_https_base() {
+        for base in [
+            "https://explorer.example.com/explorer",
+            "https://explorer.example.com",
+        ] {
+            let err = cfg(&[(ENV_PUBLIC_BASE_URL, base), (ENV_INSECURE_COOKIES, "true")])
+                .err()
+                .unwrap_or_else(|| panic!("{base} with insecure cookies must be refused"));
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: ENV_INSECURE_COOKIES,
+                        ..
+                    }
+                ),
+                "{base} gave {err:?}"
+            );
+            // Explicitly off is still accepted.
+            let c = cfg(&[(ENV_PUBLIC_BASE_URL, base), (ENV_INSECURE_COOKIES, "false")]).unwrap();
+            assert!(c.cookie_secure(), "{base}");
+        }
+        // Plain http keeps working, with or without a base path.
+        for base in ["http://localhost:8096", "http://127.0.0.1:8096/explorer"] {
+            let c = cfg(&[(ENV_PUBLIC_BASE_URL, base), (ENV_INSECURE_COOKIES, "true")]).unwrap();
+            assert!(!c.cookie_secure(), "{base}");
+        }
     }
 
     #[test]

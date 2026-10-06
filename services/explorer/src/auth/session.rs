@@ -383,8 +383,10 @@ mod tests {
 
     #[test]
     fn embed_cookie_is_partitioned_and_always_secure() {
+        // Insecure cookies on a plain-http base (they are refused on https):
+        // the embed cookie keeps `Secure` regardless.
         let c = config(&[
-            (ENV_PUBLIC_BASE_URL, "https://explorer.example.com/explorer"),
+            (ENV_PUBLIC_BASE_URL, "http://localhost:8096/explorer"),
             (ENV_INSECURE_COOKIES, "true"),
         ]);
         let v = embed_session_cookie(&c, &SessionId::generate())
