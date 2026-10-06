@@ -714,9 +714,10 @@ pub async fn set_claim_embedding(pool: &PgPool, claim: Uuid, vec: &str) {
 /// and so cannot be omitted) matches nothing; the pointer has to go the other
 /// way too.
 ///
-/// `reasoning_type` must be one of the five values
+/// `reasoning_type` must be one of the six values
 /// `reasoning_type_valid` admits: deductive, inductive, abductive, analogical,
-/// statistical.
+/// statistical, observational (migration 121). The list is
+/// `ReasoningTraceRepository::REASONING_TYPES`.
 ///
 /// # No tenancy columns are declared, deliberately
 ///
