@@ -456,3 +456,86 @@ async fn a_min_truth_filtered_node_leaves_no_dangling_edge(pool: PgPool) {
     assert_eq!(edges.len(), targets.len() - 1, "{t}");
     assert_eq!(t["edges_omitted"], serde_json::json!(1), "{t}");
 }
+
+/// MEASURED ground truth: the public claim->claim edges (plan edges such as
+/// `decomposes_to`) whose source AND target the paper asserts.
+async fn edges_among_asserted_claims(pool: &PgPool, paper: Uuid) -> Vec<(Uuid, Uuid, String)> {
+    sqlx::query_as(
+        "SELECT e.source_id, e.target_id, e.relationship FROM edges e \
+         WHERE e.source_type = 'claim' AND e.target_type = 'claim' \
+           AND e.visibility = 'public' \
+           AND e.source_id IN (SELECT target_id FROM edges WHERE source_id = $1 \
+                               AND source_type = 'paper' AND relationship = 'asserts') \
+           AND e.target_id IN (SELECT target_id FROM edges WHERE source_id = $1 \
+                               AND source_type = 'paper' AND relationship = 'asserts')",
+    )
+    .bind(paper)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// The filter must keep an edge between two RETURNED nodes even when its target
+/// was already visited, i.e. a cross-edge in the BFS. A depth-2 walk from the
+/// paper reaches every asserted claim at depth 1 over `asserts`, then follows
+/// the claim->claim plan edges between them at depth 1 -> already-visited
+/// targets. Emitting an edge only on a target's first visit would drop all of
+/// those, and no depth-1 fan-out test can see it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unclipped_depth_two_walk_keeps_edges_between_already_visited_nodes(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let paper = ingest_high_degree_paper(&server, &viewer).await;
+
+    let cross = edges_among_asserted_claims(&pool, paper).await;
+    assert!(
+        !cross.is_empty(),
+        "calibration: ingest must write claim->claim edges between asserted claims"
+    );
+
+    let t = traverse_with(
+        &server,
+        &viewer,
+        serde_json::json!({
+            "start_id": paper.to_string(),
+            "max_depth": 2,
+            "limit": 100,
+        }),
+    )
+    .await;
+
+    let nodes = node_ids(&t);
+    assert!(
+        nodes.len() < 100,
+        "calibration: the walk must not reach the node cap ({}): {t}",
+        nodes.len()
+    );
+    for (s, d, _) in &cross {
+        assert!(
+            nodes.contains(&s.to_string()) && nodes.contains(&d.to_string()),
+            "calibration: both endpoints of {s} -> {d} must be returned: {t}"
+        );
+    }
+
+    let returned: std::collections::HashSet<(String, String, String)> = t["edges"]
+        .as_array()
+        .expect("edges")
+        .iter()
+        .map(|e| {
+            (
+                e["source_id"].as_str().unwrap().to_string(),
+                e["target_id"].as_str().unwrap().to_string(),
+                e["relationship"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    for (s, d, rel) in &cross {
+        assert!(
+            returned.contains(&(s.to_string(), d.to_string(), rel.clone())),
+            "edge {s} -{rel}-> {d} joins two returned nodes and must be returned: {t}"
+        );
+    }
+    // Nothing was clipped (no node cap reached, no min_truth), so the field is
+    // present and zero rather than absent.
+    assert_eq!(t["edges_omitted"], serde_json::json!(0), "{t}");
+}
