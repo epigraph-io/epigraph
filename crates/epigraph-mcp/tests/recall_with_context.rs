@@ -1661,6 +1661,220 @@ async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
     );
 }
 
+// ============================================================================
+// Epistemic-edge neighbours at the TOOL-RESPONSE boundary (backlog 922a1e54)
+// ============================================================================
+//
+// `fetch_batched_context` has filled `epistemic_edges_by_paragraph` since #462,
+// and the ctx-level tests further down pin that. But the hit-assembly loop never
+// read the map, so no caller ever saw a single supports / refutes / specializes
+// neighbour — and the ctx tests stayed green throughout. These assert on the
+// serialized response a caller actually receives.
+
+/// A claim inserted for its role as an epistemic-edge endpoint: public (the
+/// insert trigger stamps tenancy from the default visibility), current, no
+/// embedding — so it is never itself a recall hit.
+async fn seed_neighbour_claim(pool: &PgPool, agent: Uuid, content: &str, truth: f64) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+         VALUES ($1, sha256($1::bytea), $2, $3, true) RETURNING id",
+    )
+    .bind(content)
+    .bind(truth)
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("seed epistemic neighbour claim")
+}
+
+async fn seed_claim_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship)
+         VALUES ($1, $2, 'claim', 'claim', $3)",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .expect("seed epistemic edge");
+}
+
+/// Run `recall_with_context` end to end and return the raw JSON row for
+/// `paragraph`. Raw `serde_json::Value`, not a typed struct: the defect is a
+/// MISSING key, and a typed struct with `#[serde(default)]` would mask it.
+async fn recall_row_for(
+    pool: &PgPool,
+    params: epigraph_mcp::tools::recall::RecallWithContextParams,
+    pgvec: &str,
+    paragraph: Uuid,
+) -> serde_json::Value {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+    let viewer = viewerfx::public_viewer(pool).await;
+    let server = build_test_server(pool.clone());
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, pgvec)
+        .await
+        .expect("recall_with_context ok");
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text content");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse JSON");
+    json["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .find(|r| r["paragraph_id"] == paragraph.to_string())
+        .cloned()
+        .unwrap_or_else(|| panic!("paragraph {paragraph} not returned by recall_with_context"))
+}
+
+fn epistemic_edges_of(row: &serde_json::Value) -> Vec<serde_json::Value> {
+    let edges = row.get("epistemic_edges");
+    assert!(
+        edges.is_some(),
+        "recall_with_context fetched epistemic edges but dropped them before RecallHit \
+         (backlog 922a1e54); hit keys were: {:?}",
+        row.as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>())
+    );
+    edges
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("epistemic_edges must be a JSON array")
+}
+
+fn has_edge(edges: &[serde_json::Value], claim: Uuid, relationship: &str, direction: &str) -> bool {
+    edges.iter().any(|e| {
+        e["claim_id"] == claim.to_string()
+            && e["relationship"] == relationship
+            && e["direction"] == direction
+    })
+}
+
+/// The hit itself must carry its epistemic neighbours, with direction: an
+/// INCOMING `refutes` is "is refuted by", the opposite credibility signal from
+/// an outgoing one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_hit_carries_epistemic_edges(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/epi-edges", "Epistemic edges").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para = diverse_fixture::seed_paragraph(&pool, agent, paper, "epi para", &pgvec, None).await;
+
+    let refuter = seed_neighbour_claim(&pool, agent, "a refutation of epi para", 0.9).await;
+    let supported = seed_neighbour_claim(&pool, agent, "a claim epi para supports", 0.6).await;
+    seed_claim_edge(&pool, refuter, para, "refutes").await; // incoming, from para's view
+    seed_claim_edge(&pool, para, supported, "supports").await; // outgoing
+
+    let row = recall_row_for(&pool, diverse_params(false, None, None, 10), &pgvec, para).await;
+    let edges = epistemic_edges_of(&row);
+
+    assert!(
+        has_edge(&edges, refuter, "refutes", "incoming"),
+        "the refuter is the edge SOURCE, so the hit must report it as an incoming \
+         `refutes` (\"is refuted by\"); got {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, supported, "supports", "outgoing"),
+        "the hit is the edge SOURCE of `supports`, so it must be reported outgoing; got {edges:?}"
+    );
+    let refuter_entry = edges
+        .iter()
+        .find(|e| e["claim_id"] == refuter.to_string())
+        .expect("refuter entry");
+    assert_eq!(refuter_entry["content"], "a refutation of epi para");
+    assert_eq!(refuter_entry["truth_value"], serde_json::json!(0.9));
+    assert_eq!(
+        edges.len(),
+        2,
+        "exactly the two seeded epistemic neighbours"
+    );
+    assert_eq!(row["epistemic_edges_total"], serde_json::json!(2));
+    assert_eq!(row["epistemic_edges_truncated"], serde_json::json!(false));
+}
+
+/// `epistemic_limit` caps PER RELATIONSHIP, keeps the strongest neighbour of
+/// each, and `epistemic_edges_total` / `_truncated` report what the cap hid.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_epistemic_edges_cap_per_relationship(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/epi-cap", "Epistemic cap").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "capped para", &pgvec, None).await;
+
+    let strong = seed_neighbour_claim(&pool, agent, "strong support", 0.9).await;
+    let middling = seed_neighbour_claim(&pool, agent, "middling support", 0.5).await;
+    let weak = seed_neighbour_claim(&pool, agent, "weak support", 0.3).await;
+    let refuter = seed_neighbour_claim(&pool, agent, "lone refutation", 0.4).await;
+    for s in [middling, weak, strong] {
+        seed_claim_edge(&pool, s, para, "supports").await;
+    }
+    seed_claim_edge(&pool, refuter, para, "refutes").await;
+
+    let mut params = diverse_params(false, None, None, 10);
+    params.epistemic_limit = Some(1);
+    let row = recall_row_for(&pool, params, &pgvec, para).await;
+    let edges = epistemic_edges_of(&row);
+
+    let supports: Vec<_> = edges
+        .iter()
+        .filter(|e| e["relationship"] == "supports")
+        .collect();
+    assert_eq!(
+        supports.len(),
+        1,
+        "epistemic_limit=1 caps EACH relationship at one; got {edges:?}"
+    );
+    assert_eq!(
+        supports[0]["claim_id"],
+        serde_json::json!(strong.to_string()),
+        "the cap must keep the highest-truth neighbour of the relationship"
+    );
+    assert!(
+        has_edge(&edges, refuter, "refutes", "incoming"),
+        "a cap on `supports` must not starve `refutes` — the limit is per relationship; \
+         got {edges:?}"
+    );
+    assert_eq!(edges.len(), 2);
+    assert_eq!(
+        row["epistemic_edges_total"],
+        serde_json::json!(4),
+        "total counts every visible epistemic neighbour, not the returned page"
+    );
+    assert_eq!(row["epistemic_edges_truncated"], serde_json::json!(true));
+}
+
+/// The tool description is the only place a caller learns the field exists.
+/// No DB: the description is static router metadata.
+#[test]
+fn recall_with_context_description_advertises_epistemic_edges() {
+    let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
+    let description = tools
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == "recall_with_context")
+        .and_then(|t| t["description"].as_str())
+        .expect("recall_with_context is registered with a description")
+        .to_string();
+    for needle in [
+        "epistemic-edge neighbours",
+        "supports / refutes / contradicts / specializes / elaborates / cites",
+        "direction incoming|outgoing",
+        "epistemic_limit",
+        "epistemic_edges_total",
+    ] {
+        assert!(
+            description.contains(needle),
+            "recall_with_context description must advertise the epistemic-edge payload \
+             ({needle:?} missing); got: {description}"
+        );
+    }
+}
+
 /// F5 (backlog 8cbffa0e): `recall_with_context` must write its OWN audit row,
 /// tagged with its own tool name. The plain `recall` path logging is not
 /// evidence that this surface does — they are separate handlers.
@@ -1936,6 +2150,184 @@ async fn epistemic_edges_respect_the_viewer_boundary(pool: PgPool) {
         "a public viewer received an epistemic-edge neighbour owned by another group: \
          {leaked:?}. The query in `7b. Epistemic-edge neighbours` is missing the \
          visibility predicate its ten sibling queries carry."
+    );
+}
+
+/// Run `fetch_batched_context` for one paragraph under `viewer` and return
+/// `(neighbours, total)`. The total is asserted alongside the neighbours: a
+/// hidden row that still counts toward `epistemic_edges_total` discloses its
+/// existence through the count and the truncation flag.
+async fn ctx_edges_for(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    paragraph: Uuid,
+) -> (
+    Vec<epigraph_mcp::tools::recall::EpistemicEdgeNeighbor>,
+    Option<usize>,
+) {
+    let ctx = fetch_batched_context(pool, viewer, &[paragraph], 8, 4, 4)
+        .await
+        .expect("fetch_batched_context");
+    (
+        ctx.epistemic_edges_by_paragraph
+            .get(&paragraph)
+            .cloned()
+            .unwrap_or_default(),
+        ctx.epistemic_edges_total_by_paragraph
+            .get(&paragraph)
+            .copied(),
+    )
+}
+
+/// Edge tenancy, distinct from `epistemic_edges_respect_the_viewer_boundary`
+/// (which covers a private NEIGHBOUR CLAIM): here both endpoints are public and
+/// only the EDGE is group-private. Migration 070's trigger honours exactly that
+/// declaration, so such edges exist; `ClaimRepository::dispute_batch` filters on
+/// the edge's own tenancy columns and query 7b must too, or wiring 7b onto the
+/// hit discloses another group's private assertion that two public claims are
+/// related.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_omit_a_group_private_edge_between_public_claims(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let para = fx.paragraphs[0];
+    let (member, other_group) =
+        viewerfx::seed_agent_with_group(&pool, "epistemic-private-edge").await;
+
+    // Positive control: a public claim on an ordinary (trigger-stamped public) edge.
+    let control = Uuid::new_v4();
+    fixture::insert_claim(&pool, fx.agent_id, control, "public refutation", 2, None).await;
+    fixture::insert_edge(&pool, control, "claim", para, "claim", "refutes", None).await;
+
+    // A public claim reached ONLY through a group-private `supports` edge.
+    let behind_private_edge = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        behind_private_edge,
+        "public claim linked by a private edge",
+        2,
+        None,
+    )
+    .await;
+    viewerfx::seed_edge_owned_by(&pool, para, behind_private_edge, "group", other_group).await;
+
+    let public = viewerfx::public_viewer(&pool).await;
+    let (edges, total) = ctx_edges_for(&pool, &public, para).await;
+    assert!(
+        edges.iter().any(|e| e.claim_id == control),
+        "positive control: the public-edge neighbour must be returned; got {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == behind_private_edge),
+        "a public viewer received a neighbour reachable only through another group's \
+         private edge: {edges:?}. Query 7b checks the neighbour claim's visibility but \
+         not the edge's own tenancy columns."
+    );
+    assert_eq!(
+        total,
+        Some(1),
+        "the private edge must not count toward the public viewer's total either"
+    );
+
+    // Calibration: a member of the edge's group DOES see it, so the predicate
+    // filters on tenancy rather than dropping group edges outright.
+    let insider = epigraph_db::visibility::Viewer::resolve(&pool, member)
+        .await
+        .expect("resolve group member");
+    let (edges, total) = ctx_edges_for(&pool, &insider, para).await;
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == behind_private_edge && e.relationship == "supports"),
+        "a member of the edge's owning group must see the private edge; got {edges:?}"
+    );
+    assert_eq!(total, Some(2));
+}
+
+/// An edge retracted by `delete_edge` (`valid_to` set) is no longer in force
+/// (`EdgeRepository`'s `EDGE_IN_FORCE`); presenting it as a live `supports` would
+/// report an argument its author withdrew.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_omit_retracted_edges(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let para = fx.paragraphs[0];
+
+    let control = Uuid::new_v4();
+    fixture::insert_claim(&pool, fx.agent_id, control, "live refutation", 2, None).await;
+    fixture::insert_edge(&pool, control, "claim", para, "claim", "refutes", None).await;
+
+    let withdrawn = Uuid::new_v4();
+    fixture::insert_claim(&pool, fx.agent_id, withdrawn, "withdrawn support", 2, None).await;
+    fixture::insert_edge(&pool, withdrawn, "claim", para, "claim", "supports", None).await;
+    // Retract it the way `EdgeRepository::retract_by_id` does, backdated a second
+    // so `valid_to > now()` cannot hold at read time.
+    let retracted = sqlx::query(
+        "UPDATE edges SET valid_to = now() - interval '1 second'
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'supports'",
+    )
+    .bind(withdrawn)
+    .bind(para)
+    .execute(&pool)
+    .await
+    .expect("retract edge");
+    assert_eq!(
+        retracted.rows_affected(),
+        1,
+        "fixture: exactly one edge retracted"
+    );
+
+    let (edges, total) = ctx_edges_for(&pool, &viewerfx::public_viewer(&pool).await, para).await;
+    assert!(
+        edges.iter().any(|e| e.claim_id == control),
+        "positive control: the in-force edge must be returned; got {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == withdrawn),
+        "a retracted (valid_to in the past) edge was reported as a live epistemic \
+         neighbour: {edges:?}"
+    );
+    assert_eq!(
+        total,
+        Some(1),
+        "a retracted edge must not count toward the total"
+    );
+}
+
+/// A superseded neighbour (`is_current = false`) is not live argument;
+/// `dispute_batch` already joins `src.is_current` for the same page.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_omit_superseded_neighbours(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let para = fx.paragraphs[0];
+
+    let control = Uuid::new_v4();
+    fixture::insert_claim(&pool, fx.agent_id, control, "current refutation", 2, None).await;
+    fixture::insert_edge(&pool, control, "claim", para, "claim", "refutes", None).await;
+
+    let superseded: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+         VALUES ('superseded refutation', sha256('superseded refutation'::bytea), 0.9, $1, false)
+         RETURNING id",
+    )
+    .bind(fx.agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed superseded neighbour");
+    fixture::insert_edge(&pool, superseded, "claim", para, "claim", "refutes", None).await;
+
+    let (edges, total) = ctx_edges_for(&pool, &viewerfx::public_viewer(&pool).await, para).await;
+    assert!(
+        edges.iter().any(|e| e.claim_id == control),
+        "positive control: the current neighbour must be returned; got {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == superseded),
+        "a superseded (is_current = false) neighbour was reported as live argument: {edges:?}"
+    );
+    assert_eq!(
+        total,
+        Some(1),
+        "a superseded neighbour must not count toward the total"
     );
 }
 
