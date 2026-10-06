@@ -236,6 +236,13 @@ VALUES
 RETURNING id, client_id, client_type, status, redirect_uris;
 ```
 
+**Untested since migration 122.** This statement has not been run against a
+database migrated to `122_operator_binding.sql` or later. Reading the
+migration, 122 adds no NOT NULL column and no INSERT trigger on
+`oauth_clients` (its one new trigger there fires `BEFORE UPDATE OF status`),
+so the row should still insert as written. Run it inside a transaction the
+first time, and check the `RETURNING` row before committing.
+
 The row has to meet these constraints:
 
 - **`client_id`** must be at most 64 characters (`varchar(64)`) and unique,
