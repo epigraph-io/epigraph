@@ -312,13 +312,21 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
         RestrictionKind::Neutral => target_interval,
     };
 
-    // For a `supports` edge the expected interval is a one-sided FLOOR — the
-    // target should be AT LEAST this strongly believed AND plausible
-    // (`restrict_epistemic_positive` sets `expected.bel = source.bel * factor`
-    // and `expected.pl = 1-(1-source.pl)*factor`). Only UNDER-support — the
-    // target sitting *below* that corroborated floor on bel OR pl — is a genuine
-    // conflict; a strongly corroborated hub that *exceeds* a discounted weak
-    // supporter is benign corroboration, not contradiction.
+    // For a `supports` edge the expected interval is a one-sided FLOOR on
+    // BELIEF only — a supporter commits the target to AT LEAST
+    // `expected.bel = source.bel * factor` (`restrict_epistemic_positive`).
+    // Only UNDER-support — the target's bel sitting *below* that corroborated
+    // floor — is a genuine conflict; a strongly corroborated hub that *exceeds*
+    // a discounted weak supporter is benign corroboration, not contradiction.
+    //
+    // Plausibility is deliberately NOT a floor. `expected.pl = 1-(1-source.pl)
+    // *factor` RISES toward 1 as the edge weakens, so a pl floor would demand
+    // MORE of the target the weaker the support, impose the maximal constraint
+    // pl_t >= 1 for a vacuous (factor -> 0) message, and flag every pl < 1
+    // target of a pl_s = 1.0 supporter (backlog b3476233; the pl half of
+    // 6c5dcca5). Nor is it a ceiling: "target more plausible than its doubted
+    // supporter" is exactly the over-support case above (denying the
+    // antecedent), see `test_supports_over_support_is_benign`.
     //
     // So the Positive arm is directional for BOTH twin fields: `interval_
     // inconsistency` (which `compute_cdst_cohomology` filters/sorts/sums to form
@@ -334,11 +342,9 @@ pub fn compute_cdst_edge_inconsistency_with_properties(
     // Hausdorff distance and `conflict_component` its (equal) symmetric form.
     let (interval_inconsistency, conflict_component) = match kind {
         RestrictionKind::Positive(_) => {
-            // Floor shortfall: only mass BELOW the corroborated floor on either
-            // endpoint is inconsistency; over-support contributes 0.
-            let below = (expected_interval.bel - target_interval.bel)
-                .max(0.0)
-                .max((expected_interval.pl - target_interval.pl).max(0.0));
+            // Bel-floor shortfall: only belief BELOW the corroborated floor is
+            // inconsistency; over-support contributes 0.
+            let below = (expected_interval.bel - target_interval.bel).max(0.0);
             (below, below)
         }
         _ => {
@@ -590,7 +596,7 @@ mod tests {
         // Stale support: source is strong but target is very low
         // source: [0.8, 0.95, 0.1], target: [0.1, 0.2, 0.1]
         // expected bel = 0.8*0.8=0.64, pl = 1-(1-0.95)*0.8=0.96, ow=0.1
-        // hausdorff = max(|0.1-0.64|, |0.2-0.96|) = max(0.54, 0.76) = 0.76
+        // supports is a bel floor: shortfall = 0.64-0.1 = 0.54
         let src_id = Uuid::new_v4();
         let tgt_id = Uuid::new_v4();
         let source = EpistemicInterval::new(0.8, 0.95, 0.1);
@@ -751,21 +757,20 @@ mod tests {
             &sci(),
         );
 
-        // The floor shortfall is the MAX over both endpoints:
-        //   expected.bel = 0.90*0.80 = 0.72, target.bel = 0.10 → bel shortfall 0.62
-        //   expected.pl  = 1-(1-1.0)*0.80 = 1.0, target.pl = 0.30 → pl shortfall 0.70
-        //   below = max(0.62, 0.70) = 0.70.
-        // (The pl shortfall dominates; the prior bel-only formula pinned 0.62.
-        // Still a real conflict, still classifies BeliefConflict — the metric is
-        // merely corrected to the larger, true endpoint shortfall.)
+        // The floor is on bel only:
+        //   expected.bel = 0.90*0.80 = 0.72, target.bel = 0.10 → shortfall 0.62.
+        // expected.pl = 1-(1-1.0)*0.80 = 1.0 is NOT a floor: it rises toward 1
+        // as the edge weakens (and is 1.0 for every factor when pl_s = 1.0), so
+        // the former pl shortfall 1.0-0.30 = 0.70 measured nothing about this
+        // edge (backlog b3476233).
         assert!(
             obs.conflict_component > 0.0,
             "under-support must still flag a conflict, got {}",
             obs.conflict_component
         );
         assert!(
-            (obs.conflict_component - 0.70).abs() < 1e-9,
-            "under-support shortfall should be max(0.72-0.10, 1.0-0.30)=0.70, got {}",
+            (obs.conflict_component - 0.62).abs() < 1e-9,
+            "under-support shortfall should be the bel shortfall 0.72-0.10=0.62, got {}",
             obs.conflict_component
         );
         // Twin field equality for supports edges.

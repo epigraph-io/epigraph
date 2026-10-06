@@ -671,8 +671,10 @@ mod tests {
         let id_b = Uuid::new_v4();
         let id_c = Uuid::new_v4();
 
+        // B's bel sits below A's supports floor (0.3*0.8 = 0.24) so A→B carries a
+        // genuine bel shortfall of 0.09; plausibility is not a floor (b3476233).
         let iv_a = EpistemicInterval::new(0.3, 0.8, 0.4); // A: wide, high OW
-        let iv_b = EpistemicInterval::new(0.35, 0.75, 0.3); // B: wide, moderate OW
+        let iv_b = EpistemicInterval::new(0.15, 0.75, 0.3); // B: wide, moderate OW
         let iv_c = EpistemicInterval::new(0.85, 0.88, 0.01); // C: narrow, low OW
 
         let profile = RestrictionProfile::scientific();
