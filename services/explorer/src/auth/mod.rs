@@ -276,12 +276,18 @@ async fn login(
         return Ok(html(StatusCode::OK, render(&page)?));
     }
 
-    // The cap bounds memory; it must never bound *sign-in*. Anyone can start
-    // a pending login without a session, so refusing at the cap let one
-    // flooder lock every user out of `/auth/login` — and every page but
+    // The cap bounds memory; it must not bound *starting* a sign-in. Anyone
+    // can start a pending login without a session, so refusing at the cap let
+    // one flooder lock every user out of `/auth/login` — and every page but
     // `/claim/:id` sends a signed-out viewer here. Evict instead: purge what
     // has expired, then drop the entries nearest their deadline until there
     // is room for this one. The map still holds at most MAX_PENDING_LOGINS.
+    //
+    // Eviction does not make a flood harmless: a client that starts logins
+    // fast enough to cycle the whole map evicts a slow viewer's entry before
+    // they come back from the identity provider, and that callback is
+    // refused as expired. Rate-limiting `/auth/login` at the proxy is what
+    // bounds that (README, Known limits).
     let pending = &state.auth_flow.pending;
     if pending.len() >= MAX_PENDING_LOGINS {
         pending.purge_expired();

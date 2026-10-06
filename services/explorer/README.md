@@ -765,6 +765,17 @@ if the login response's cookie starts `__Host-` and the startup log
   started that way, keeping a loopback `Host`, would sign every visitor in
   with that token. It is a loopback-only development aid; never set it on a
   host anything else can reach.
+- **A login flood can expire slow sign-ins.** `/auth/login` needs no
+  session and calls nothing upstream, and the pending sign-ins it starts are
+  held in memory, at most 10,000 at a time. At the cap the oldest are
+  evicted rather than new ones refused, so a flood cannot stop anyone from
+  starting a sign-in. But a client sending a few hundred requests a second
+  cycles the whole table in well under a minute, and a viewer who takes
+  longer than that at the identity provider comes back to "This sign-in
+  link has expired or was already used." Rate-limit `/auth/login` per client
+  address at the reverse proxy if the Explorer is reachable by untrusted
+  clients; `Caddyfile.snippet` shows a rule for the `caddy-ratelimit`
+  module, which the standard Caddy build does not include.
 - **A refresh whose answer is lost can leave a live token behind.** When
   the call to `/oauth/token` times out or fails without an answer, the
   Explorer ends the session and revokes the refresh token it held, and never
