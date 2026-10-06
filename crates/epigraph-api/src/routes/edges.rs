@@ -3463,35 +3463,33 @@ mod db_tests {
         .unwrap()
     }
 
-    /// Shared body of the two reverse-direction tests: `A CONTRADICTS B`, then
-    /// `B CONTRADICTS A`, both with the given `if_not_exists`.
-    async fn assert_reverse_contradicts_collapses(pool: PgPool, if_not_exists: bool) {
+    /// Shared body of the reverse-direction tests: `A <relationship> B`, then
+    /// `B <relationship> A`, both with the given `if_not_exists`.
+    async fn assert_reverse_symmetric_collapses(
+        pool: PgPool,
+        relationship: &str,
+        if_not_exists: bool,
+    ) {
         let agent_id = ensure_system_agent(&pool).await;
-        let a = seed_claim(&pool, agent_id, "symmetric A").await;
-        let b = seed_claim(&pool, agent_id, "symmetric B").await;
+        let a = seed_claim(&pool, agent_id, &format!("symmetric {relationship} A")).await;
+        let b = seed_claim(&pool, agent_id, &format!("symmetric {relationship} B")).await;
 
         let state = test_state(pool.clone()).await;
         let router = edges_router_with_auth(state, auth_ctx(agent_id));
 
-        let (s1, body1) = post_edge(
-            &router,
-            create_edge_body(a, b, "CONTRADICTS", if_not_exists),
-        )
-        .await;
+        let (s1, body1) =
+            post_edge(&router, create_edge_body(a, b, relationship, if_not_exists)).await;
         assert_eq!(s1, StatusCode::CREATED, "first POST creates: {body1}");
         let id1 = body_id(&body1, "id");
 
-        let (s2, body2) = post_edge(
-            &router,
-            create_edge_body(b, a, "CONTRADICTS", if_not_exists),
-        )
-        .await;
+        let (s2, body2) =
+            post_edge(&router, create_edge_body(b, a, relationship, if_not_exists)).await;
 
         assert_eq!(
-            unordered_pair_count(&pool, a, b, "CONTRADICTS").await,
+            unordered_pair_count(&pool, a, b, relationship).await,
             1,
-            "`B CONTRADICTS A` after `A CONTRADICTS B` (if_not_exists={if_not_exists}) \
-             is the same disagreement and must not write a second in-force row; \
+            "`B {relationship} A` after `A {relationship} B` (if_not_exists={if_not_exists}) \
+             is the same fact and must not write a second in-force row; \
              second response was {s2} {body2}"
         );
         assert_eq!(
@@ -3509,7 +3507,7 @@ mod db_tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_edge_symmetric_reverse_direction_returns_existing_edge(pool: PgPool) {
-        assert_reverse_contradicts_collapses(pool, true).await;
+        assert_reverse_symmetric_collapses(pool, "CONTRADICTS", true).await;
     }
 
     /// Option A: the symmetric dedup does not depend on `if_not_exists`. The
@@ -3517,28 +3515,14 @@ mod db_tests {
     /// claims is a noun-fact, and the MCP twin is always idempotent.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_edge_symmetric_reverse_direction_dedups_without_if_not_exists(pool: PgPool) {
-        assert_reverse_contradicts_collapses(pool, false).await;
+        assert_reverse_symmetric_collapses(pool, "CONTRADICTS", false).await;
     }
 
     /// `CORROBORATES` is the other symmetric relationship REST admits; filed in
-    /// both orders it is likewise one row.
+    /// both orders it is likewise one row, reported in the stored orientation.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_edge_corroborates_reverse_direction_collapses(pool: PgPool) {
-        let agent_id = ensure_system_agent(&pool).await;
-        let a = seed_claim(&pool, agent_id, "corroborating A").await;
-        let b = seed_claim(&pool, agent_id, "corroborating B").await;
-        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
-
-        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "CORROBORATES", false)).await;
-        assert_eq!(s1, StatusCode::CREATED, "{body1}");
-        let (s2, body2) = post_edge(&router, create_edge_body(b, a, "CORROBORATES", false)).await;
-
-        assert_eq!(
-            unordered_pair_count(&pool, a, b, "CORROBORATES").await,
-            1,
-            "reverse CORROBORATES must not add a row; second response {s2} {body2}"
-        );
-        assert_eq!(body_id(&body2, "id"), body_id(&body1, "id"));
+        assert_reverse_symmetric_collapses(pool, "CORROBORATES", false).await;
     }
 
     /// Negative control: `SUPPORTS` is DIRECTIONAL (A supports B is not B
