@@ -180,7 +180,8 @@ struct Group {
     parents: Vec<Uuid>,
     claim_entity: serde_json::Value,
     evidence_entities: Vec<serde_json::Value>,
-    /// `(trace id, its full parent_trace_ids, entity)`.
+    /// `(trace id, its parent_trace_ids that are in the lineage, entity)`;
+    /// pruned to the emitted traces in the closure pass.
     trace_entities: Vec<(Uuid, Vec<Uuid>, serde_json::Value)>,
     /// Some of this claim's evidence or traces were left out by the per-claim caps.
     capped: bool,
@@ -233,8 +234,9 @@ fn bundle_scaffold(
 /// * Each admitted claim brings its own evidence (sorted by id, at most
 ///   [`MAX_EVIDENCE_PER_CLAIM`]) and traces (sorted, at most
 ///   [`MAX_TRACES_PER_CLAIM`]).
-/// * Each group is charged its compact-JSON size with its reference lists at
-///   their FULL length, plus its `topological_order` entry, against
+/// * Each group is charged its compact-JSON size with its reference lists
+///   before closure pruning (every in-lineage parent and parent trace), plus
+///   its `topological_order` entry, against
 ///   `max_output_chars` minus a worst-case scaffold. The closure pass only
 ///   shrinks those lists, so the charge is an upper bound and the returned
 ///   string fits the budget. The one exception is a target claim whose group
@@ -320,18 +322,25 @@ fn build_bundle(root: Uuid, lineage: &LineageResult, limits: Limits) -> String {
         let trace_entities: Vec<(Uuid, Vec<Uuid>, serde_json::Value)> = traces
             .iter()
             .map(|lt| {
-                (
-                    lt.id,
-                    lt.parent_trace_ids.clone(),
-                    serde_json::json!({
-                        "@type": "prov:Activity",
-                        "@id": format!("trace:{}", lt.id),
-                        "claim_id": format!("claim:{}", lt.claim_id),
-                        "reasoning_type": lt.reasoning_type,
-                        "confidence": lt.confidence,
-                        "parent_trace_ids": lt.parent_trace_ids.iter().map(|p| format!("trace:{p}")).collect::<Vec<_>>(),
-                    }),
-                )
+                // `trace_parents` is read unfiltered and can name traces
+                // outside the lineage; the closure pass always drops those,
+                // so charging them would only stop admission early. Keeping
+                // the in-lineage ones keeps the charge an upper bound.
+                let parent_trace_ids: Vec<Uuid> = lt
+                    .parent_trace_ids
+                    .iter()
+                    .copied()
+                    .filter(|p| lineage.traces.contains_key(p))
+                    .collect();
+                let entity = serde_json::json!({
+                    "@type": "prov:Activity",
+                    "@id": format!("trace:{}", lt.id),
+                    "claim_id": format!("claim:{}", lt.claim_id),
+                    "reasoning_type": lt.reasoning_type,
+                    "confidence": lt.confidence,
+                    "parent_trace_ids": parent_trace_ids.iter().map(|p| format!("trace:{p}")).collect::<Vec<_>>(),
+                });
+                (lt.id, parent_trace_ids, entity)
             })
             .collect();
 
@@ -682,6 +691,39 @@ mod tests {
         assert_eq!(
             t["parent_trace_ids"],
             serde_json::json!([format!("trace:{parent_trace}")])
+        );
+    }
+
+    #[test]
+    fn out_of_lineage_parent_traces_are_not_charged_against_the_budget() {
+        // `trace_parents` is read unscoped and uncapped, and can name traces
+        // outside the lineage. Those can never survive the closure pass, so
+        // charging them only makes the budget stop early: 1,000 of them are
+        // ~45K of `"trace:<uuid>",` and would collapse the bundle to the
+        // target alone with `budget_exhausted` although the real output is a
+        // few KB.
+        let mut l = lineage(3, 4, 100);
+        let target_trace = uuid(3_000_001);
+        let in_lineage_parent_trace = uuid(3_000_100);
+        let mut parents = vec![in_lineage_parent_trace];
+        parents.extend((0..1_000u128).map(|k| uuid(10_000_000 + k)));
+        l.traces.get_mut(&target_trace).unwrap().parent_trace_ids = parents;
+        let raw = build_bundle(uuid(1), &l, limits(DEFAULT_MAX_OUTPUT_CHARS));
+        assert!(raw.len() <= DEFAULT_MAX_OUTPUT_CHARS, "{}", raw.len());
+        let b: Value = serde_json::from_str(&raw).unwrap();
+        assert_closed(&b);
+        assert_eq!(b["budget_exhausted"], Value::Bool(false));
+        assert_eq!(b["truncated"], Value::Bool(false));
+        assert_eq!(b["claim_node_count"], Value::from(4));
+        let t = b["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["@id"] == format!("trace:{target_trace}").as_str())
+            .unwrap();
+        assert_eq!(
+            t["parent_trace_ids"],
+            serde_json::json!([format!("trace:{in_lineage_parent_trace}")])
         );
     }
 
