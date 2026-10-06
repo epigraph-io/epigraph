@@ -818,6 +818,44 @@ async fn audit_scope_note_judges_the_rows_against_the_viewers_own_agent() {
     assert!(!res.body.contains(OWN_EVENTS), "{}", res.body);
 }
 
+/// `/bff/audit` names whose events the window shows as `scope`, the
+/// three-way answer the page's note gives. `reads_beyond_own` alone cannot
+/// tell an own window from one that cannot tell (both are `false`), so the
+/// field is pinned for each answer.
+#[tokio::test]
+async fn bff_audit_says_whose_events_the_window_shows() {
+    for (label, rows, scope, beyond) in [
+        (
+            "the viewer's own",
+            vec![event(0, "auth_attempt", Some(AGENT), Some(true))],
+            "own",
+            false,
+        ),
+        (
+            "another agent's",
+            vec![event(0, "auth_attempt", Some(OTHER_AGENT), Some(true))],
+            "beyond_own",
+            true,
+        ),
+        ("an empty window", vec![], "unknown", false),
+    ] {
+        let app = spawn().await;
+        first_page()
+            .respond_with(ok(rows))
+            .expect(1)
+            .mount(&app.upstream)
+            .await;
+        let sid = app.sign_in(&tok());
+        let res = app
+            .get_as(&format!("{BASE}/bff/audit?since={SINCE}"), &sid)
+            .await;
+        assert_eq!(res.status, StatusCode::OK, "{label}: {}", res.body);
+        let v = res.json();
+        assert_eq!(v["result"]["scope"], scope, "{label}: {v}");
+        assert_eq!(v["result"]["reads_beyond_own"], beyond, "{label}: {v}");
+    }
+}
+
 /// The audit route for any bearer, first page of an unfiltered pull.
 fn security_page_any_bearer() -> MockBuilder {
     Mock::given(method("GET"))
@@ -898,6 +936,7 @@ async fn bff_audit_serves_the_counted_window_as_json() {
     assert_eq!(v["result"]["events_read"], 3);
     assert_eq!(v["result"]["capped_at"], Value::Null);
     assert_eq!(v["result"]["partial"], Value::Null);
+    assert_eq!(v["result"]["scope"], "own", "every row is the viewer's");
     assert_eq!(v["result"]["reads_beyond_own"], false);
     assert_eq!(
         v["result"]["rows"],
