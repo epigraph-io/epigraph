@@ -824,12 +824,17 @@ if the login response's cookie starts `__Host-` and the startup log
   module, which the standard Caddy build does not include.
 - **A refresh whose answer is lost can leave a live token behind.** When
   the call to `/oauth/token` times out or fails without an answer, the
-  Explorer ends the session and revokes the refresh token it held, and never
-  presents that token again (that would read as reuse and revoke the whole
-  family). If the API had already rotated it, that revocation does nothing,
-  and the successor it minted stays valid until it expires, held by no one,
-  because the answer naming it never arrived. Only the API can close this,
-  by revoking a rotated-out token's family on `/oauth/revoke`.
+  Explorer ends the session, revokes the refresh token it held, and never
+  sends that token to `/oauth/token` again. If the API had already rotated
+  it, that revocation does nothing, and the successor it minted stays valid
+  until it expires, held by no one, because the answer naming it never
+  arrived. The Explorer could revoke that successor itself: presenting the
+  spent token to `/oauth/token` after the API's reuse grace window makes the
+  API revoke its whole rotation family, which here belongs only to the ended
+  session. It does not, because the API records every such presentation as a
+  refresh-token reuse security event, the signal a stolen token's replay
+  raises, and an operator could not tell the two apart. The clean fix is for
+  the API to revoke a rotated-out token's family on `/oauth/revoke`.
 - **The consent page shows a name the registrant chose.** The API's consent
   page names the requesting client by its `client_name`, which whoever
   registered the client picked, so the name alone does not prove which

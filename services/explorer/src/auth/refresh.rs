@@ -120,16 +120,26 @@ pub async fn end_session_revoking(state: &AppState, id: &SessionId, held_by: &'s
 
 /// The refresh's outcome is unknown: drop the session (the caller holds its
 /// refresh lock) and revoke the refresh token it held. Revocation is best
-/// effort, as at logout; it presents the token to `/oauth/revoke`, never to
-/// `/oauth/token`, so it cannot trip reuse detection.
+/// effort, as at logout, and presents the token to `/oauth/revoke` only.
 ///
 /// What this guarantees is that the session ends and the held token is never
-/// replayed. The revocation helps only when upstream did NOT rotate: if it
-/// did, the held token is already spent, `/oauth/revoke` matches no live row
-/// and does nothing, and the successor upstream minted stays live until its
-/// own expiry, held by no one, because the answer naming it was lost. The
-/// Explorer cannot revoke a token it never received; closing that needs the
-/// API to revoke a rotated-out token's whole family on `/oauth/revoke`.
+/// sent to `/oauth/token` again. The revocation helps only when upstream did
+/// NOT rotate: if it did, the held token is already spent, `/oauth/revoke`
+/// matches no live row and does nothing, and the successor upstream minted
+/// stays live until its own expiry, held by no one, because the answer naming
+/// it was lost.
+///
+/// The Explorer could close that gap itself and deliberately does not. The
+/// API treats a rotated-out token presented to `/oauth/token` after its short
+/// grace window as reuse and revokes the token's whole rotation family,
+/// successor included. That family belongs to this ended session alone, so
+/// the revocation is exactly what is wanted. But the API also records the
+/// presentation as a refresh-token reuse security event, the signal an
+/// operator reads as a stolen token being replayed, and the Explorer would
+/// raise it on every lost refresh. Inside the grace window the token is
+/// refused and nothing is revoked, so it would also need a task that outlives
+/// the request to wait the window out. The clean close is the API revoking a
+/// rotated-out token's family on `/oauth/revoke`.
 async fn end_after_lost_refresh(
     state: &AppState,
     id: &SessionId,
