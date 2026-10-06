@@ -528,14 +528,20 @@ mod tests {
         assert_eq!(l.entity("Agent", i), Some(l.agent(i)));
         assert_eq!(l.entity("EVIDENCE", i), Some(l.evidence(i)));
         assert_eq!(l.entity("frame", i), Some(l.frame(i)));
+        // Every type the API's ego and provenance routes can return without
+        // an Explorer page (trace, perspective, context, community,
+        // experiment, experiment_result), then types they never return but
+        // that must still fail closed (paper, activity, ...).
         for no_page in [
-            "paper",
             "trace",
+            "perspective",
+            "context",
+            "community",
+            "experiment",
+            "experiment_result",
+            "paper",
             "node",
             "activity",
-            "perspective",
-            "community",
-            "context",
             "analysis",
             "source_artifact",
             "span",

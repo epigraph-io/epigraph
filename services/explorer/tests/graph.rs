@@ -19,7 +19,7 @@ const SECOND: &str = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a11";
 const ABSENT: &str = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a13";
 const OTHER: &str = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a12";
 const AGENT: &str = "1b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
-const PAPER: &str = "5b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
+const EXPERIMENT: &str = "5b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
 const THEME: &str = "2c9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
 const NBH: &str = "3d9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
 const NBH2: &str = "3d9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a11";
@@ -34,7 +34,8 @@ const HOSTILE: &str = "\"><script>alert(1)</script>";
 
 /// `GET /api/v1/claims/:id/ego` as plan §2.2 specifies it, post-tenancy:
 /// every node it returns is one this viewer may read (a claim they may not
-/// read is absent, `68b8a8b1`), a paper (no page), an agent, and optional
+/// read is absent, `68b8a8b1`), an experiment (a type the route returns that
+/// has no page), an agent, and optional
 /// fields omitted.
 fn ego_json(center_label: &str) -> Value {
     json!({
@@ -47,7 +48,7 @@ fn ego_json(center_label: &str) -> Value {
              "is_current": true},
             {"id": OTHER, "entity_type": "claim", "label": HOSTILE, "content": HOSTILE,
              "truth_value": 0.4, "labels": [], "is_current": false},
-            {"id": PAPER, "entity_type": "paper", "label": "paper"},
+            {"id": EXPERIMENT, "entity_type": "experiment", "label": "experiment"},
             {"id": AGENT, "entity_type": "agent", "label": "Ada Lovelace"}
         ],
         "edges": [
@@ -55,8 +56,9 @@ fn ego_json(center_label: &str) -> Value {
              "target_type": "claim", "relationship": "SUPPORTS", "direction": "out"},
             {"id": EDGE2, "source_id": OTHER, "target_id": CLAIM, "source_type": "claim",
              "target_type": "claim", "relationship": "contradicts", "direction": "in"},
-            {"id": EDGE3, "source_id": PAPER, "target_id": CLAIM, "source_type": "paper",
-             "target_type": "claim", "relationship": "asserts", "direction": "in"},
+            {"id": EDGE3, "source_id": EXPERIMENT, "target_id": CLAIM,
+             "source_type": "experiment", "target_type": "claim",
+             "relationship": "tests_hypothesis", "direction": "in"},
             {"id": EDGE4, "source_id": CLAIM, "target_id": AGENT, "source_type": "claim",
              "target_type": "agent", "relationship": "attributed_to", "direction": "out"}
         ],
@@ -132,8 +134,8 @@ async fn ego_bff_clamps_degree_and_returns_the_canvas_shape() {
     let agent = node(&body, AGENT);
     assert_eq!(agent["href"], format!("/explorer/agent/{AGENT}"));
     assert_eq!(agent["expand_href"], Value::Null, "only claims have an ego");
-    let paper = node(&body, PAPER);
-    assert_eq!(paper["href"], Value::Null, "papers have no page");
+    let experiment = node(&body, EXPERIMENT);
+    assert_eq!(experiment["href"], Value::Null, "experiments have no page");
 
     let second = node(&body, SECOND);
     assert_eq!(second["label"], "A second claim");

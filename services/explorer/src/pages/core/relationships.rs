@@ -464,7 +464,7 @@ mod tests {
             nodes: vec![
                 node(2, "claim", "two"),
                 node(3, "claim", "three"),
-                node(4, "paper", "paper"),
+                node(4, "experiment", "experiment"),
                 node(5, "claim", "five"),
             ],
             edges: vec![
@@ -503,16 +503,19 @@ mod tests {
 
     #[test]
     fn neighbours_link_by_entity_type_and_fall_back_to_text() {
-        let mut paper_edge = edge(4, 1, "asserts", "in");
-        paper_edge.source_type = "paper".into();
+        let mut experiment_edge = edge(4, 1, "tests_hypothesis", "in");
+        experiment_edge.source_type = "experiment".into();
         let mut agent_edge = edge(1, 6, "ATTRIBUTED_TO", "out");
         agent_edge.target_type = "agent".into();
         let ego = EgoResponse {
             center: node(1, "claim", "c"),
-            // `paper` is hydrated, `agent` is one of upstream's unhydrated
-            // nodes (label == entity_type, no content).
-            nodes: vec![node(4, "paper", "paper"), node(6, "agent", "agent")],
-            edges: vec![paper_edge, agent_edge],
+            // `experiment` is hydrated, `agent` is one of upstream's
+            // unhydrated nodes (label == entity_type, no content).
+            nodes: vec![
+                node(4, "experiment", "experiment"),
+                node(6, "agent", "agent"),
+            ],
+            edges: vec![experiment_edge, agent_edge],
             total_edges: 2,
             truncated: false,
         };
@@ -522,9 +525,9 @@ mod tests {
             .iter()
             .flat_map(|f| f.groups.iter().flat_map(|g| g.neighbours.iter()))
             .collect();
-        let paper = all.iter().find(|n| n.id == id(4)).unwrap();
-        assert_eq!(paper.href, None, "papers have no page");
-        assert_eq!(paper.text, format!("paper {}", short_id(id(4))));
+        let experiment = all.iter().find(|n| n.id == id(4)).unwrap();
+        assert_eq!(experiment.href, None, "experiments have no page");
+        assert_eq!(experiment.text, format!("experiment {}", short_id(id(4))));
         let agent = all.iter().find(|n| n.id == id(6)).unwrap();
         assert_eq!(
             agent.href.as_deref(),

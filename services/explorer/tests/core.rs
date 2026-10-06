@@ -28,7 +28,9 @@ const SUPPORTED: &str = "2a2a2a2a-0000-4000-8000-000000000002";
 const SUPPORTER: &str = "3b3b3b3b-0000-4000-8000-000000000003";
 /// A superseded claim that contradicts the centre.
 const CONTRADICTOR: &str = "4c4c4c4c-0000-4000-8000-000000000004";
-const PAPER: &str = "5d5d5d5d-0000-4000-8000-000000000005";
+/// An experiment on the centre (a hypothesis): a type with no Explorer page
+/// that the API's ego route does return (its tier arm reads the hypothesis).
+const EXPERIMENT: &str = "5d5d5d5d-0000-4000-8000-000000000005";
 const AUTHOR: &str = "6e6e6e6e-0000-4000-8000-000000000006";
 const EVIDENCE: &str = "7f7f7f7f-0000-4000-8000-000000000007";
 const SIBLING: &str = "8a8a8a8a-0000-4000-8000-000000000008";
@@ -86,8 +88,8 @@ fn ego_edge(n: u8, source: (&str, &str), target: (&str, &str), rel: &str, dir: &
     })
 }
 
-/// Plan §2.2 shape: mixed-case relationships, an inbound paper edge, an
-/// outbound agent edge, and a degree cap that truncated 57 edges to 7.
+/// Plan §2.2 shape: mixed-case relationships, an inbound experiment edge (a
+/// type with no page), an outbound agent edge, and a degree cap that truncated 57 edges to 7.
 fn ego_json() -> Value {
     let mut contradictor = ego_node(CONTRADICTOR, "claim", "Water boils at 90 °C at sea level.");
     contradictor["is_current"] = json!(false);
@@ -97,7 +99,7 @@ fn ego_json() -> Value {
             ego_node(SUPPORTED, "claim", "Pasta cooks faster at sea level."),
             ego_node(SUPPORTER, "claim", "Measured boiling point: 99.97 °C."),
             contradictor,
-            ego_node(PAPER, "paper", "paper"),
+            ego_node(EXPERIMENT, "experiment", "experiment"),
             ego_node(AUTHOR, "agent", "Ada Example"),
             ego_node(EVIDENCE, "evidence", "Thermometer log"),
             ego_node(SIBLING, "claim", "Sibling paragraph."),
@@ -106,7 +108,13 @@ fn ego_json() -> Value {
             ego_edge(1, (CLAIM, "claim"), (SUPPORTED, "claim"), "SUPPORTS", "out"),
             ego_edge(2, (SUPPORTER, "claim"), (CLAIM, "claim"), "supports", "in"),
             ego_edge(3, (CONTRADICTOR, "claim"), (CLAIM, "claim"), "CONTRADICTS", "in"),
-            ego_edge(4, (PAPER, "paper"), (CLAIM, "claim"), "asserts", "in"),
+            ego_edge(
+                4,
+                (EXPERIMENT, "experiment"),
+                (CLAIM, "claim"),
+                "tests_hypothesis",
+                "in",
+            ),
             ego_edge(5, (CLAIM, "claim"), (AUTHOR, "agent"), "ATTRIBUTED_TO", "out"),
             ego_edge(6, (EVIDENCE, "evidence"), (CLAIM, "claim"), "provides_evidence", "in"),
             ego_edge(7, (CLAIM, "claim"), (SIBLING, "claim"), "same_source", "out"),
@@ -339,7 +347,10 @@ async fn claim_page_groups_outlinks_by_family_and_direction() {
     let inbound = body.find("← Supported by").expect("backlink heading");
     assert!(out < inbound, "outgoing before incoming");
     assert!(body.contains("← Contradicted by"));
-    assert!(body.contains("← Asserted by"));
+    assert!(
+        body.contains("← tests hypothesis"),
+        "non-allowlisted → Other"
+    );
     assert!(body.contains("← Evidence from"));
     assert!(body.contains("same source →"), "non-allowlisted → Other");
     assert!(body.contains("attributed to →"));
@@ -363,10 +374,10 @@ async fn claim_page_groups_outlinks_by_family_and_direction() {
         "<a href=\"/explorer/evidence/{EVIDENCE}\">Thermometer log</a>"
     )));
     assert!(
-        body.contains("<span class=\"outlinks__plain\">paper 5d5d5d5d</span>"),
-        "papers have no page: plain text"
+        body.contains("<span class=\"outlinks__plain\">experiment 5d5d5d5d</span>"),
+        "experiments have no page: plain text"
     );
-    assert!(!body.contains(&format!("/paper/{PAPER}")));
+    assert!(!body.contains(&format!("/experiment/{EXPERIMENT}")));
     assert!(body.contains("claim · superseded"));
 
     // Truncation notice with the graph link. The fixture sets upstream's

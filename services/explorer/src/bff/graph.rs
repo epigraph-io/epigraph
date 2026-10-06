@@ -663,7 +663,7 @@ mod tests {
             "nodes": [
                 {"id": uuid(2), "entity_type": "claim", "label": "Second", "content": "Second claim",
                  "truth_value": 0.2, "labels": ["private"], "is_current": true},
-                {"id": uuid(3), "entity_type": "paper", "label": "paper"},
+                {"id": uuid(3), "entity_type": "experiment", "label": "experiment"},
                 {"id": uuid(4), "entity_type": "Agent", "label": "Ada"},
                 {"id": uuid(4), "entity_type": "Agent", "label": "Ada again"}
             ],
@@ -672,11 +672,11 @@ mod tests {
                  "source_type": "claim", "target_type": "claim",
                  "relationship": "SUPPORTS", "direction": "out"},
                 {"id": uuid(11), "source_id": uuid(3), "target_id": uuid(1),
-                 "source_type": "paper", "target_type": "claim",
-                 "relationship": "asserts", "direction": "in"},
+                 "source_type": "experiment", "target_type": "claim",
+                 "relationship": "tests_hypothesis", "direction": "in"},
                 {"id": uuid(11), "source_id": uuid(3), "target_id": uuid(1),
-                 "source_type": "paper", "target_type": "claim",
-                 "relationship": "asserts", "direction": "in"},
+                 "source_type": "experiment", "target_type": "claim",
+                 "relationship": "tests_hypothesis", "direction": "in"},
                 {"id": uuid(12), "source_id": uuid(1), "target_id": uuid(99),
                  "relationship": "refutes", "direction": "out"}
             ],
@@ -724,9 +724,9 @@ mod tests {
         );
         assert_eq!(second.href.as_deref(), Some(&*links().claim(uuid(2))));
 
-        let paper = &g.nodes[2];
-        assert!(paper.href.is_none(), "papers have no page");
-        assert!(paper.expand_href.is_none(), "only claims have an ego");
+        let experiment = &g.nodes[2];
+        assert!(experiment.href.is_none(), "experiments have no page");
+        assert!(experiment.expand_href.is_none(), "only claims have an ego");
         assert_eq!(g.nodes[3].href.as_deref(), Some(&*links().agent(uuid(4))));
         assert_eq!(g.nodes[3].label, "Ada");
 
