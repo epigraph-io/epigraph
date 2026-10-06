@@ -34,6 +34,19 @@ async fn router(pool: &PgPool) -> Router {
     ))
 }
 
+/// The same router on a `ScopedPool` downgraded to the application role, so
+/// row-level security is live (`common::app_role_scoped_pool`). The superuser
+/// router above observes only the in-query viewer predicate; this one also
+/// observes whether the read was stamped with the viewer's tenancy, which is
+/// what lets an owner see their own group-private rows under FORCE RLS.
+async fn app_role_router(pool: &PgPool) -> Router {
+    let url = fixture::database_url_for(pool).await;
+    create_router(AppState::with_scoped_pool(
+        common::app_role_scoped_pool(pool, &url).await,
+        ApiConfig::default(),
+    ))
+}
+
 /// A token for a principal with no group memberships: it reads exactly the
 /// public corpus.
 fn reader() -> String {
@@ -311,46 +324,56 @@ async fn a_private_claims_placement_is_the_same_404_as_a_missing_claim(pool: PgP
         .await
         .expect("reassign claim");
     common::seed_private_ownership(&pool, claim_id, owner).await;
-    let app = router(&pool).await;
+    // Both roles: the superuser router observes the in-query viewer predicate,
+    // the application-role one also observes the tenancy stamp the owner arm
+    // needs under FORCE RLS.
+    for (role, app) in [
+        ("superuser", router(&pool).await),
+        ("epigraph_app", app_role_router(&pool).await),
+    ] {
+        let path = format!("/api/v1/claims/{claim_id}/placement");
 
-    let path = format!("/api/v1/claims/{claim_id}/placement");
+        // No credential: 401.
+        let (status, _, _) = raw(&app, &path, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // No credential: 401.
-    let (status, _, _) = raw(&app, &path, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // A signed-in stranger gets the 404 a nonexistent uuid gets, byte for byte
+        // modulo the echoed id. The old shape was a 200 with every field null —
+        // not a "[REDACTED]" string, but the same disclosure: it echoed the id
+        // back, which confirms the claim exists.
+        let stranger = reader();
+        let (private_status, private_ct, private_body) = raw(&app, &path, Some(&stranger)).await;
+        assert_eq!(private_status, StatusCode::NOT_FOUND, "{private_body}");
 
-    // A signed-in stranger gets the 404 a nonexistent uuid gets, byte for byte
-    // modulo the echoed id. The old shape was a 200 with every field null —
-    // not a "[REDACTED]" string, but the same disclosure: it echoed the id
-    // back, which confirms the claim exists.
-    let stranger = reader();
-    let (private_status, private_ct, private_body) = raw(&app, &path, Some(&stranger)).await;
-    assert_eq!(private_status, StatusCode::NOT_FOUND, "{private_body}");
+        let absent = Uuid::new_v4();
+        let (absent_status, absent_ct, absent_body) = raw(
+            &app,
+            &format!("/api/v1/claims/{absent}/placement"),
+            Some(&stranger),
+        )
+        .await;
+        assert_eq!(
+            private_status, absent_status,
+            "status must not discriminate"
+        );
+        assert_eq!(private_ct, absent_ct, "content-type must not discriminate");
+        assert_eq!(
+            private_body.replace(&claim_id.to_string(), "<ID>"),
+            absent_body.replace(&absent.to_string(), "<ID>"),
+            "the body must not discriminate either"
+        );
 
-    let absent = Uuid::new_v4();
-    let (absent_status, absent_ct, absent_body) = raw(
-        &app,
-        &format!("/api/v1/claims/{absent}/placement"),
-        Some(&stranger),
-    )
-    .await;
-    assert_eq!(
-        private_status, absent_status,
-        "status must not discriminate"
-    );
-    assert_eq!(private_ct, absent_ct, "content-type must not discriminate");
-    assert_eq!(
-        private_body.replace(&claim_id.to_string(), "<ID>"),
-        absent_body.replace(&absent.to_string(), "<ID>"),
-        "the body must not discriminate either"
-    );
-
-    // CALIBRATION: the owner still gets the full placement.
-    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
-    let (status, body) = get(&app, &path, Some(&owner_token)).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["theme_id"], seeded.theme_id.to_string());
-    assert_eq!(body["cluster_id"], seeded.cluster_id.to_string());
-    assert_eq!(body["neighborhood_id"], seeded.neighborhood_id.to_string());
-    assert_eq!(body["cluster_run_id"], seeded.run_id.to_string());
+        // CALIBRATION: the owner still gets the full placement.
+        let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+        let (status, body) = get(&app, &path, Some(&owner_token)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "[{role}] the owner reads the private placement; body: {body}"
+        );
+        assert_eq!(body["theme_id"], seeded.theme_id.to_string());
+        assert_eq!(body["cluster_id"], seeded.cluster_id.to_string());
+        assert_eq!(body["neighborhood_id"], seeded.neighborhood_id.to_string());
+        assert_eq!(body["cluster_run_id"], seeded.run_id.to_string());
+    }
 }

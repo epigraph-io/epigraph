@@ -427,3 +427,89 @@ async fn a_cycle_path_naming_an_unreadable_root_is_dropped_whole(pool: PgPool) {
         "CALIBRATION: the owner gets exactly the one cycle r, p, q, p"
     );
 }
+
+/// A root the viewer cannot read yields an EMPTY chain: no nodes, no edges, no
+/// cycles, and `truncated = false`.
+///
+/// The anchor row seeds the root unconditionally, so before this rule the walk
+/// stepped from an unreadable root over a public edge onto readable claims and
+/// returned them. A non-empty answer for an id the viewer cannot read says the
+/// claim exists and names its readable neighbours, and `truncated` says the
+/// walk reached the depth bound. The HTTP route already 404s here; MCP
+/// `get_provenance_chain` serialises whatever the repo returns, so the repo has
+/// to give the answer a missing root gets.
+///
+/// ```text
+///   r (PRIVATE) <- p (public) <- q (public)
+/// ```
+///
+/// Every edge is forced public, and the walk is bounded at depth 1 so that it
+/// reaches the bound at `p` with `q` still ahead: a repo that kept walking
+/// returns `p` at depth 1 and `truncated = true`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unreadable_root_yields_an_empty_chain(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "pc-root-owner").await;
+    let (stranger, _stranger_group) =
+        fixture::seed_agent_with_group(&pool, "pc-root-stranger").await;
+
+    let r = fixture::seed_group_claim(&pool, owner, owner_group, "pc root: the private root").await;
+    let p = fixture::seed_public_claim(&pool, owner, "pc root: public premise p").await;
+    let q = fixture::seed_public_claim(&pool, owner, "pc root: public premise q").await;
+
+    let world = fixture::world_group(&pool).await;
+    fixture::seed_edge_owned_by(&pool, p, r, "public", world).await;
+    fixture::seed_edge_owned_by(&pool, q, p, "public", world).await;
+
+    let r_visibility: String = sqlx::query_scalar("SELECT visibility FROM claims WHERE id = $1")
+        .bind(r)
+        .fetch_one(&pool)
+        .await
+        .expect("read the root's tenancy back");
+    assert_eq!(r_visibility, "group", "the root must be group-private");
+
+    // ── the stranger ──
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve the stranger");
+    let chain = ProvenanceChainRepository::chain(&pool, &viewer, r, 1, None)
+        .await
+        .expect("an unreadable root is an empty answer, not an error");
+    let ids: Vec<Uuid> = chain.nodes.iter().map(|n| n.id).collect();
+    assert!(
+        ids.is_empty(),
+        "no claim may be returned for a root the viewer cannot read; got {ids:?}"
+    );
+    assert!(chain.edges.is_empty(), "got edges {:?}", chain.edges);
+    assert!(chain.cycles.is_empty(), "got cycles {:?}", chain.cycles);
+    assert!(
+        !chain.truncated,
+        "`truncated` would say the walk from the unreadable root reached its depth bound"
+    );
+    assert_eq!(chain.root, r, "the root echoes the id the caller supplied");
+
+    // The same answer as a root that names nothing at all.
+    let absent = ProvenanceChainRepository::chain(&pool, &viewer, Uuid::new_v4(), 1, None)
+        .await
+        .expect("chain");
+    assert!(absent.nodes.is_empty() && absent.edges.is_empty() && !absent.truncated);
+
+    // ── CALIBRATION: the owner walks the same graph ──
+    //
+    // Without this, a fixture whose edges never connected would pass the
+    // stranger's arm.
+    let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("resolve the owner");
+    let chain = ProvenanceChainRepository::chain(&pool, &owner_viewer, r, 1, None)
+        .await
+        .expect("chain");
+    let mut ids: Vec<Uuid> = chain.nodes.iter().map(|n| n.id).collect();
+    ids.sort();
+    let mut expected = vec![r, p];
+    expected.sort();
+    assert_eq!(ids, expected, "CALIBRATION: the owner reaches p at depth 1");
+    assert!(
+        chain.truncated,
+        "CALIBRATION: and the walk stops at the depth bound with q still ahead"
+    );
+}

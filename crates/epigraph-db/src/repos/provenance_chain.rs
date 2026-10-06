@@ -189,9 +189,12 @@ impl ProvenanceChainRepository {
         // claim.
         //
         // The root (the anchor row) is NOT gated here: the caller supplied its
-        // id, and the route answers an unreadable root with the same 404 as a
-        // missing one. A cycle path always begins at the root, which is why the
-        // cycle filter after hydration exists (see `cycles.retain` below).
+        // id. It is gated after hydration instead, where a root the viewer
+        // cannot read turns the whole answer into an empty chain (see below).
+        // Gating it here would change this query's text, and with it the
+        // offline `.sqlx` entry. A cycle path always begins at the root, which
+        // is why the cycle filter after hydration exists (see `cycles.retain`
+        // below).
         let rows = sqlx::query!(
             r#"
             WITH RECURSIVE chain AS (
@@ -310,6 +313,27 @@ impl ProvenanceChainRepository {
                 depth: depth_of.get(&r.id).copied().unwrap_or(0),
             })
             .collect();
+
+        // A root the viewer cannot read is the same answer as a root that does
+        // not exist: an empty chain. The anchor row seeds the root
+        // unconditionally (see the walk above), so the walk itself can step
+        // from an unreadable root onto readable claims over a public edge, and
+        // the filters below only remove ids. What they leave would still say
+        // that the root exists: readable neighbours at depth 1 and beyond, the
+        // depth those neighbours sit at, and `truncated` when the depth bound
+        // was reached. The HTTP route already answers 404 here (it looks for
+        // the root among `nodes`); returning nothing from the repo gives MCP
+        // `get_provenance_chain` the same answer, since it serialises whatever
+        // this returns.
+        if !nodes.iter().any(|n| n.id == claim_id) {
+            return Ok(ProvenanceChain {
+                root: claim_id,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                truncated: false,
+                cycles: Vec::new(),
+            });
+        }
 
         // Retain the edges against the HYDRATED node set, not against the walk.
         //

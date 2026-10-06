@@ -36,6 +36,19 @@ async fn router(pool: &PgPool) -> Router {
     ))
 }
 
+/// The same router on a `ScopedPool` downgraded to the application role, so
+/// row-level security is live (`common::app_role_scoped_pool`). The superuser
+/// router above observes only the in-query viewer predicate; this one also
+/// observes whether the read was stamped with the viewer's tenancy, which is
+/// what lets an owner count their own group-private rows under FORCE RLS.
+async fn app_role_router(pool: &PgPool) -> Router {
+    let url = fixture::database_url_for(pool).await;
+    create_router(AppState::with_scoped_pool(
+        common::app_role_scoped_pool(pool, &url).await,
+        ApiConfig::default(),
+    ))
+}
+
 /// A token for a principal with no group memberships: it reads exactly the
 /// public corpus.
 fn reader() -> String {
@@ -205,31 +218,37 @@ async fn a_group_private_claim_counts_for_its_owner_and_not_for_a_stranger(pool:
     // directions are asserted: a route that counted nothing would satisfy the
     // stranger half alone.
     let (owner, _group) = fixture::seed_agent_with_group(&pool, "stats-owner").await;
-    let app = router(&pool).await;
+    // Both roles: the superuser router observes the in-query viewer predicate,
+    // the application-role one also observes the tenancy stamp the owner arm
+    // needs under FORCE RLS. Each pass seeds its own pair and measures deltas.
+    for (role, app) in [
+        ("superuser", router(&pool).await),
+        ("epigraph_app", app_role_router(&pool).await),
+    ] {
+        let stranger = reader();
+        let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
 
-    let stranger = reader();
-    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+        let stranger_before = count(&stats_as(&app, &stranger).await, "claims");
+        let owner_before = count(&stats_as(&app, &owner_token).await, "claims");
 
-    let stranger_before = count(&stats_as(&app, &stranger).await, "claims");
-    let owner_before = count(&stats_as(&app, &owner_token).await, "claims");
+        let public = common::seed_claim(&pool, "a public claim").await;
+        let secret = common::seed_claim_with_agent(&pool, "a group-private claim", owner).await;
+        common::seed_private_ownership(&pool, secret, owner).await;
+        let _ = public;
 
-    let public = common::seed_claim(&pool, "a public claim").await;
-    let secret = common::seed_claim_with_agent(&pool, "a group-private claim", owner).await;
-    common::seed_private_ownership(&pool, secret, owner).await;
-    let _ = public;
+        let stranger_after = count(&stats_as(&app, &stranger).await, "claims");
+        let owner_after = count(&stats_as(&app, &owner_token).await, "claims");
 
-    let stranger_after = count(&stats_as(&app, &stranger).await, "claims");
-    let owner_after = count(&stats_as(&app, &owner_token).await, "claims");
-
-    assert_eq!(
-        stranger_after - stranger_before,
-        1,
-        "a stranger counts the public claim and not the private one"
-    );
-    assert_eq!(
-        owner_after - owner_before,
-        2,
-        "the owner counts both, so the stranger's number is a filter and not a \
-         route that undercounts for everyone"
-    );
+        assert_eq!(
+            stranger_after - stranger_before,
+            1,
+            "[{role}] a stranger counts the public claim and not the private one"
+        );
+        assert_eq!(
+            owner_after - owner_before,
+            2,
+            "[{role}] the owner counts both, so the stranger's number is a filter and \
+             not a route that undercounts for everyone"
+        );
+    }
 }
