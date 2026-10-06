@@ -161,8 +161,7 @@ def main() -> int:
     log_path = Path("docs/superpowers/reports/reconciler-needs-review.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # `patched` = successful PATCHes under --apply, would-patch count in a
-    # dry run (see the module docstring). Before U058 the dry run never
-    # incremented it, so it always reported patched=0.
+    # dry run (see the module docstring).
     patched = 0
     review = 0
     failed = 0
