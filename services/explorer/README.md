@@ -207,7 +207,8 @@ EPIGRAPH_OAUTH_BASE_URL=https://api.example.com
 EPIGRAPH_EXPLORER_CLIENT_ID=epigraph_explorer
 # Optional:
 # EPIGRAPH_EXPLORER_KANBAN_URL=https://kanban.example.com/
-# EPIGRAPH_EXPLORER_WATCH_AGENTS=00000000-0000-0000-0000-000000000000   (comma-separated)
+# Comma-separated agent ids:
+# EPIGRAPH_EXPLORER_WATCH_AGENTS=00000000-0000-0000-0000-000000000000
 # EPIGRAPH_EXPLORER_AUDIT_ROW_CEILING=10000
 # RUST_LOG=info
 ```
@@ -722,4 +723,4 @@ if the login response's cookie starts `__Host-` and the startup log
   application is asking. That is the API's consent UI to fix.
 - **Untested surfaces.** The `Dockerfile` has never been built, and neither
   the Notion embed nor Safari is exercised by any test; every test stubs the
-  API. Build the image and check those browsers at deploy (Deploy §7).
+  API. Build the image and check those browsers at deploy (Operator setup §7).
