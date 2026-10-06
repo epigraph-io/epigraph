@@ -26,11 +26,13 @@
 //! Its act, the flip to `stale`, is administrative too: migration 118's
 //! `match_candidates_stale_guard` refuses it on a non-privileged session. So
 //! [`apply_match_retire`] runs the flip AND the cascade in one transaction on
-//! the maintenance connection, with the applied row naming the caller. Without
-//! a maintenance connection nothing about the candidate changes: the request
-//! path records the whole retirement as deferred ([`record_deferral`], whose
-//! definer records the candidate's status at that moment), and the replay
-//! carries it out only while the candidate still has that status.
+//! the maintenance connection, with the applied row naming the caller, then
+//! re-derives the belief of the pair's endpoints like the other causes do
+//! (when the retirement withdrew anything). Without a maintenance connection
+//! nothing about the candidate changes: the request path records the whole
+//! retirement as deferred ([`record_deferral`], whose definer records the
+//! candidate's status at that moment), and the replay carries it out only
+//! while the candidate still has that status.
 //!
 //! # The audit trail
 //!
@@ -107,7 +109,9 @@ pub enum CascadeCause {
     Dedup,
     /// Two or more claims were consolidated into one merged claim.
     Consolidate,
-    /// A promoted match candidate was retired.
+    /// A promoted match candidate was retired: its matcher edge retracted, its
+    /// derived factors, bp_messages and edge-keyed BBAs removed, and both
+    /// endpoints' belief re-derived from the BBAs that survive.
     MatchRetire,
     /// An edge's owner retracted or deleted it (migration 120): every OTHER
     /// writer's edge-keyed BBA on it is removed administratively and the
@@ -791,14 +795,33 @@ pub async fn apply_after_consolidate(
 /// ([`MatchCandidateRepo::retire_conn`]), and write its audit row, in ONE
 /// transaction. `trigger.candidate_status`, when set, is the status the
 /// retirement was requested against, and a candidate decided again since is
-/// refused (the status is `failed` and nothing changed). The returned outcome
-/// is filtered to `caller`.
+/// refused (the status is `failed` and nothing changed).
+///
+/// Then, when the retirement withdrew anything (an edge, a factor or an
+/// edge-keyed BBA), the belief of both endpoints is re-derived from the
+/// `mass_functions` that survive, like every other cascade that removes belief
+/// inputs ([`crate::retraction_cascade::cascade_after_edge_withdrawal`]: each
+/// endpoint is recomputed on `binary_truth`, or has its cache cleared when no
+/// BBA on any frame backs it), and the re-derivation writes its own
+/// [`EVENT_BELIEF`] row. This is the only operation that repairs a
+/// `pignistic_prob` a past `POST /api/v1/bp/propagate` with
+/// `apply_updates: true` biased through the retired factor: a later propagate
+/// builds its variables from the surviving `factors` only, so an endpoint whose
+/// only factor was the matcher edge is no longer a variable at all, and scalar
+/// BP seeds its priors from the stored (biased) value. A retirement that
+/// withdrew nothing (a candidate never promoted, or retired already) changed no
+/// belief input, and re-deriving would only rewrite caches it never fed.
+///
+/// `admin` / `admin_viewer` / `caller` as for [`apply_after_supersede`]: the
+/// re-derivation runs with the bypass viewer, and the returned outcome and
+/// belief report are filtered to `caller`.
 pub async fn apply_match_retire(
     admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
     caller: &Viewer,
     trigger: &CascadeTrigger,
     candidate_id: Uuid,
-) -> (CascadeStatus, Option<RetirementOutcome>) {
+) -> (CascadeStatus, Option<RetirementOutcome>, CascadeReport) {
     let expected = trigger.candidate_status.clone();
     let repaired = repair_with_audit!(
         admin,
@@ -819,17 +842,38 @@ pub async fn apply_match_retire(
             "affected_claims": o.affected_claims,
         })
     );
-    match repaired {
-        Ok((outcome, applied_id, touched)) => {
-            let status = applied(applied_id, &touched, None);
-            let outcome = retirement_for_caller(admin, caller, &outcome).await;
-            (status, Some(outcome))
+    let (outcome, applied_id, touched) = match repaired {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                failed(admin, trigger, "the match-candidate retirement", e).await,
+                None,
+                CascadeReport::default(),
+            )
         }
-        Err(e) => (
-            failed(admin, trigger, "the match-candidate retirement", e).await,
-            None,
-        ),
-    }
+    };
+    let withdrew = outcome.edges_retracted + outcome.factors_deleted + outcome.bbas_invalidated > 0;
+    let (status, report) = if withdrew {
+        // Over the UNFILTERED endpoints, with the bypass viewer: the caller's
+        // view filters what it is told, never what is repaired.
+        let report = crate::retraction_cascade::cascade_after_edge_withdrawal(
+            &mut *admin,
+            admin_viewer,
+            &outcome.affected_claims,
+            outcome.bbas_invalidated,
+        )
+        .await;
+        let belief = record_belief(admin, trigger, applied_id, &report).await;
+        let status = applied(applied_id, &touched, Some((&report, belief)));
+        (status, report_for_caller(admin, caller, &report).await)
+    } else {
+        (
+            applied(applied_id, &touched, None),
+            CascadeReport::default(),
+        )
+    };
+    let outcome = retirement_for_caller(admin, caller, &outcome).await;
+    (status, Some(outcome), report)
 }
 
 /// The `edge_retract` cascade (migration 120), on the maintenance connection:
@@ -1096,7 +1140,7 @@ pub async fn replay_deferred(
             }
             (CascadeCause::Consolidate, _) => apply_after_consolidate(admin, &trigger).await,
             (CascadeCause::MatchRetire, _) => {
-                apply_match_retire(admin, admin_viewer, &trigger, subject)
+                apply_match_retire(admin, admin_viewer, admin_viewer, &trigger, subject)
                     .await
                     .0
             }
