@@ -564,7 +564,10 @@ pub struct CreateEdgeRequest {
     /// id without inserting a duplicate. Idempotent for drainer / outbox-style
     /// retry use cases. Defaults to false (raw INSERT semantics; per
     /// migration 018 every relationship may multi-emit by default, so
-    /// callers needing dedup must opt in via this flag).
+    /// callers needing dedup must opt in via this flag). Exception: symmetric
+    /// claim/claim relationships
+    /// (`epigraph_core::edge::relationships::is_symmetric_claim_relationship`)
+    /// always dedup on the UNORDERED in-force pair, whatever this flag says.
     #[serde(default)]
     pub if_not_exists: bool,
 }
@@ -735,7 +738,11 @@ pub async fn create_edge(
 
     // Branch on if_not_exists: drainer / outbox callers opt in to
     // (source_id, target_id, relationship) idempotency; the default path
-    // preserves the post-migration-018 multi-emit semantics.
+    // preserves the post-migration-018 multi-emit semantics. Exception:
+    // symmetric claim/claim relationships
+    // (`epigraph_core::edge::relationships::is_symmetric_claim_relationship`)
+    // always dedup on the unordered in-force pair, whatever `if_not_exists`
+    // says (the first arm below).
     //
     // For the if_not_exists path, the repo returns `was_created=false` on
     // a dedup hit. We then SKIP all post-create side effects (provenance,
