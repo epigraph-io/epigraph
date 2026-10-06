@@ -21,6 +21,16 @@
 //! trigger is now "not in the hydrated set" rather than "redacted", which also
 //! covers the id that matches no row in any entity table.
 //!
+//! That holds for every entity type, not only claims. `EgoRepository::edges`
+//! checks each far endpoint by its `entity_types.tenancy_tier`: a `columns`
+//! type (claim, evidence, frame, context, perspective, community) on its own
+//! row, a `derived` type on the row it derives from (a trace's claim, an
+//! experiment's hypothesis), an unrooted `derived` type (a paper, an activity)
+//! not at all for anyone but a bypass viewer, and an `identity` type (agent)
+//! shown. So an edge reaching this handler already points at something the
+//! viewer may see, and a non-claim neighbour is no longer emitted bare merely
+//! because it is not a claim.
+//!
 //! `total_edges` needs no correction here. `EgoRepository::edges` counts the
 //! degree inside the same viewer predicate that produces the edge rows, so the
 //! number is the visible degree by construction rather than the true degree
@@ -160,8 +170,15 @@ fn to_node(entity: EgoEntity) -> EgoNode {
     }
 }
 
-/// A neighbour that no entity table knows about: the edge still declares its
-/// type, so it is rendered as a bare typed node rather than dropped.
+/// Entity types `EgoRepository::hydrate` reads. A declared neighbour of one of
+/// these types that hydration did not return is either a row this viewer may
+/// not read or an id that names nothing, and both are dropped.
+const HYDRATED_TYPES: &[&str] = &["claim", "agent", "evidence", "trace", "paper"];
+
+/// A neighbour of a type no hydration query reads (a frame, an activity, …):
+/// the edge still declares its type, so it is rendered as a bare typed node
+/// rather than dropped. The edge statement has already applied the viewer to
+/// it, so a bare node here is one the viewer may see.
 fn unhydrated_node(id: Uuid, entity_type: &str) -> EgoNode {
     EgoNode {
         id,
@@ -264,13 +281,15 @@ pub async fn claim_ego(
         }
     }
     // A declared neighbour that hydration did not return is either an id no
-    // entity table knows about or a claim this viewer may not read, and this
+    // entity table knows about or a row this viewer may not read, and this
     // handler cannot tell the two apart — by design, since telling them apart
-    // IS the existence oracle. Only ids whose declared type is not `claim` are
-    // emitted as bare typed nodes; a `claim` that did not hydrate is dropped,
-    // and the loop below drops its edges with it.
+    // IS the existence oracle. Only ids of a type no hydration query reads are
+    // emitted as bare typed nodes; one of a hydrated type that did not hydrate
+    // is dropped, and the loop below drops its edges with it. The edge
+    // statement already withheld what the viewer may not see, so this is
+    // defence in depth, not the filter.
     for (id, entity_type) in &declared_type {
-        if !seen.contains(id) && entity_type != "claim" {
+        if !seen.contains(id) && !HYDRATED_TYPES.contains(&entity_type.as_str()) {
             nodes.push(unhydrated_node(*id, entity_type));
             seen.insert(*id);
         }

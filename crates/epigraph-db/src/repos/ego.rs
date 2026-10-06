@@ -22,24 +22,46 @@
 //! three `edges` reads carry `/* {EDGE_VISIBILITY:e} */` — the co-ownership
 //! spelling, because migration 072 stores an edge between two differently-owned
 //! endpoints as `(owner = G, co_owner = H)` and the single-owner predicate
-//! would show it to a principal in G alone. Each of them ALSO carries
-//! `/* {VISIBILITY:fc} */` on an `EXISTS` over the FAR endpoint's `claims` row,
-//! so an edge is counted and listed only when the claim at its other end is one
-//! the viewer may read. Both markers in one statement resolve to the same bind
+//! would show it to a principal in G alone. Each of them ALSO carries the
+//! far-endpoint rule below, whose `/* {VISIBILITY:…} */` markers sit on an
+//! `EXISTS` over the FAR endpoint's own row or the row it derives from, so an
+//! edge is counted and listed only when the entity at its other end is one the
+//! viewer may read. Every marker in one statement resolves to the same bind
 //! index, which `Viewer::splice` asserts.
 //!
-//! That second marker is what makes [`EgoEdges::total_edges`] safe to serialise
+//! That far-endpoint rule is what makes [`EgoEdges::total_edges`] safe to serialise
 //! as-is. An unfiltered degree beside a filtered edge list states exactly how
 //! many neighbours the viewer cannot see — the same metadata leak, dressed as a
 //! count. Computing the number inside the same predicate that produces the rows
 //! makes it a function only of visible rows by construction, rather than
 //! something every caller has to remember to correct afterwards.
 //!
-//! Non-claim endpoints (evidence, agents, papers, reasoning traces) are not
-//! constrained by the `claims` half of that predicate: `evidence` and
-//! `reasoning_traces` are filtered where they are hydrated, and `agents` /
-//! `papers` are not in migration 062's `tier_a` array and carry no
-//! `owner_group_id` to filter on.
+//! # Non-claim far endpoints: one rule per tenancy tier
+//!
+//! A viewer-stamped connection filters only the rows a statement reads, so a
+//! far endpoint the SQL never dereferences is not filtered at all: its id,
+//! type and relationship would reach any authenticated viewer, and
+//! `total_edges` would count it. Every far endpoint is therefore checked in
+//! the edge statement itself, by `FAR_ENDPOINT_VISIBLE`, according to its
+//! type's `entity_types.tenancy_tier` (migration 069):
+//!
+//! * **`columns`** — `claim`, `evidence`, `frame`, `context`, `perspective`,
+//!   `community`: the backing table carries `(visibility, owner_group_id)`, so
+//!   the row is judged on its own columns.
+//! * **`derived`**, rooted — gated by the row it derives from:
+//!   `trace` → its `claim_id` claim (and its own columns, which hydration also
+//!   applies); `experiment` → its `hypothesis_id` claim; `experiment_result` →
+//!   its experiment's hypothesis claim.
+//! * **`derived`**, unrooted — every other type, including papers, activities
+//!   and any API-registered type: there is no single row to apply the viewer
+//!   to, so the neighbour is dropped for every viewer that is not bypassed.
+//!   Fail-closed by design; a bypass viewer still gets it.
+//! * **`identity`** — `agent`: shown. Agents are rendered on public content by
+//!   design and carry no `owner_group_id`.
+//!
+//! `claim_ego_route_test.rs::the_ego_tier_arms_match_the_registry` pins this
+//! map against the registry, so a migration that reclassifies a type fails a
+//! test instead of silently changing what leaks.
 
 use uuid::Uuid;
 
@@ -115,6 +137,68 @@ struct EvidenceHydrationRow {
     source_url: Option<String>,
 }
 
+/// The far-endpoint visibility rule shared by the three statements in
+/// [`EgoRepository::edges`], one arm per tenancy tier (see the module doc).
+///
+/// `{far_id}` / `{far_type}` are the far endpoint's id and type expressions;
+/// `{unrooted}` is `TRUE` for a bypass viewer and `FALSE` otherwise. Every
+/// marker resolves to the statement's one group bind, which `Viewer::splice`
+/// asserts, and for a bypass viewer every arm reduces to an existence check.
+const FAR_ENDPOINT_VISIBLE: &str = r#"
+              AND (
+                    -- identity tier
+                    {far_type} = 'agent'
+                    -- columns tier: the row's own tenancy columns
+                 OR ({far_type} = 'claim' AND EXISTS (
+                        SELECT 1 FROM claims fc
+                         WHERE fc.id = {far_id} /* {VISIBILITY:fc} */))
+                 OR ({far_type} = 'evidence' AND EXISTS (
+                        SELECT 1 FROM evidence fev
+                         WHERE fev.id = {far_id} /* {VISIBILITY:fev} */))
+                 OR ({far_type} = 'frame' AND EXISTS (
+                        SELECT 1 FROM frames ffr
+                         WHERE ffr.id = {far_id} /* {VISIBILITY:ffr} */))
+                 OR ({far_type} = 'context' AND EXISTS (
+                        SELECT 1 FROM contexts fcx
+                         WHERE fcx.id = {far_id} /* {VISIBILITY:fcx} */))
+                 OR ({far_type} = 'perspective' AND EXISTS (
+                        SELECT 1 FROM perspectives fpe
+                         WHERE fpe.id = {far_id} /* {VISIBILITY:fpe} */))
+                 OR ({far_type} = 'community' AND EXISTS (
+                        SELECT 1 FROM communities fcm
+                         WHERE fcm.id = {far_id} /* {VISIBILITY:fcm} */))
+                    -- derived tier, rooted: the row it derives from
+                 OR ({far_type} = 'trace' AND EXISTS (
+                        SELECT 1 FROM reasoning_traces frt
+                          JOIN claims frc ON frc.id = frt.claim_id
+                         WHERE frt.id = {far_id}
+                           /* {VISIBILITY:frt} */ /* {VISIBILITY:frc} */))
+                 OR ({far_type} = 'experiment' AND EXISTS (
+                        SELECT 1 FROM experiments fex
+                          JOIN claims fxc ON fxc.id = fex.hypothesis_id
+                         WHERE fex.id = {far_id} /* {VISIBILITY:fxc} */))
+                 OR ({far_type} = 'experiment_result' AND EXISTS (
+                        SELECT 1 FROM experiment_results fer
+                          JOIN experiments frx ON frx.id = fer.experiment_id
+                          JOIN claims frh ON frh.id = frx.hypothesis_id
+                         WHERE fer.id = {far_id} /* {VISIBILITY:frh} */))
+                    -- derived tier, unrooted: bypass only
+                 OR ({unrooted} AND {far_type} NOT IN (
+                        'agent', 'claim', 'evidence', 'frame', 'context',
+                        'perspective', 'community', 'trace', 'experiment',
+                        'experiment_result'))
+              )
+"#;
+
+/// [`FAR_ENDPOINT_VISIBLE`] for one statement's far-endpoint expressions.
+fn far_endpoint_visible(viewer: &Viewer, far_id: &str, far_type: &str) -> String {
+    let unrooted = if viewer.is_bypass() { "TRUE" } else { "FALSE" };
+    FAR_ENDPOINT_VISIBLE
+        .replace("{far_id}", far_id)
+        .replace("{far_type}", far_type)
+        .replace("{unrooted}", unrooted)
+}
+
 pub struct EgoRepository;
 
 impl EgoRepository {
@@ -151,12 +235,11 @@ impl EgoRepository {
         // The far endpoint has to be computed before it can be constrained,
         // because this statement walks both directions at once: `far` is the
         // target for an edge leaving the centre and the source for one arriving
-        // at it. `far.entity_type <> 'claim'` leaves evidence / agent / paper /
-        // trace endpoints alone — they have no `claims` row for the EXISTS to
-        // find, and dropping them would silently empty the non-claim half of
-        // every ego view.
+        // at it. Every far endpoint, claim or not, goes through the same
+        // per-tier rule as the two list statements below, so the count and the
+        // lists describe one set.
         let count_sql = viewer.splice(
-            r#"
+            &r#"
             SELECT COUNT(*)
             FROM edges e
             CROSS JOIN LATERAL (
@@ -169,11 +252,13 @@ impl EgoRepository {
               AND ( (e.source_id = $1 AND e.source_type = 'claim')
                  OR (e.target_id = $1 AND e.target_type = 'claim') )
               AND ($2::text[] IS NULL OR lower(e.relationship) = ANY($2))
-              AND ( far.entity_type <> 'claim'
-                    OR EXISTS (SELECT 1 FROM claims fc
-                                WHERE fc.id = far.id /* {VISIBILITY:fc} */) )
+              {far_visible}
               /* {EDGE_VISIBILITY:e} */
-            "#,
+            "#
+            .replace(
+                "{far_visible}",
+                &far_endpoint_visible(viewer, "far.id", "far.entity_type"),
+            ),
             3,
         );
         let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql)
@@ -193,19 +278,21 @@ impl EgoRepository {
         let limit = max_degree as i64;
 
         let outbound_sql = viewer.splice(
-            r#"
+            &r#"
             SELECT e.id, e.source_id, e.target_id, e.source_type, e.target_type, e.relationship
             FROM edges e
             WHERE e.source_id = $1 AND e.source_type = 'claim'
               AND (e.valid_to IS NULL OR e.valid_to > now())
               AND ($2::text[] IS NULL OR lower(e.relationship) = ANY($2))
-              AND ( e.target_type <> 'claim'
-                    OR EXISTS (SELECT 1 FROM claims fc
-                                WHERE fc.id = e.target_id /* {VISIBILITY:fc} */) )
+              {far_visible}
               /* {EDGE_VISIBILITY:e} */
             ORDER BY e.created_at DESC, e.id DESC
             LIMIT $3
-            "#,
+            "#
+            .replace(
+                "{far_visible}",
+                &far_endpoint_visible(viewer, "e.target_id", "e.target_type"),
+            ),
             4,
         );
         let mut out_q = sqlx::query_as::<_, EgoEdgeRow>(&outbound_sql)
@@ -220,20 +307,22 @@ impl EgoRepository {
         // `NOT (source_id = $1 AND source_type = 'claim')` keeps a degenerate
         // self-edge out of both lists, so no edge is counted twice.
         let inbound_sql = viewer.splice(
-            r#"
+            &r#"
             SELECT e.id, e.source_id, e.target_id, e.source_type, e.target_type, e.relationship
             FROM edges e
             WHERE e.target_id = $1 AND e.target_type = 'claim'
               AND NOT (e.source_id = $1 AND e.source_type = 'claim')
               AND (e.valid_to IS NULL OR e.valid_to > now())
               AND ($2::text[] IS NULL OR lower(e.relationship) = ANY($2))
-              AND ( e.source_type <> 'claim'
-                    OR EXISTS (SELECT 1 FROM claims fc
-                                WHERE fc.id = e.source_id /* {VISIBILITY:fc} */) )
+              {far_visible}
               /* {EDGE_VISIBILITY:e} */
             ORDER BY e.created_at DESC, e.id DESC
             LIMIT $3
-            "#,
+            "#
+            .replace(
+                "{far_visible}",
+                &far_endpoint_visible(viewer, "e.source_id", "e.source_type"),
+            ),
             4,
         );
         let mut in_q = sqlx::query_as::<_, EgoEdgeRow>(&inbound_sql)
