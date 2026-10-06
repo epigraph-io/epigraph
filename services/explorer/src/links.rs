@@ -154,6 +154,31 @@ impl Links {
         self.path(&format!("/evidence/{id}"))
     }
 
+    /// `/backlog`: open backlog items.
+    pub fn backlog(&self) -> String {
+        self.path("/backlog")
+    }
+
+    /// `/audit`: the viewer's readable security events.
+    pub fn audit(&self) -> String {
+        self.path("/audit")
+    }
+
+    /// `/activity`: what the watched agents did recently.
+    pub fn activity(&self) -> String {
+        self.path("/activity")
+    }
+
+    /// `/candidates`: cross-source match candidates.
+    pub fn candidates(&self) -> String {
+        self.path("/candidates")
+    }
+
+    /// `/acts`: the viewer's own admin acts.
+    pub fn acts(&self) -> String {
+        self.path("/acts")
+    }
+
     /// The page for an edge endpoint, by its upstream `entity_type`
     /// (case-insensitive). Only `claim`, `agent`, `evidence` and `frame` have
     /// pages (plan §3.4 "Entity links"); every other type — paper, trace,

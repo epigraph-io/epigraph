@@ -159,6 +159,10 @@ pub struct PageCtx {
     /// The header's identity strip: set for a signed-in session, `None`
     /// for anonymous viewers and the dev bearer.
     pub identity: Option<IdentityStrip>,
+    /// Whether the section nav shows "Admin acts". False until a capability
+    /// probe has seen the API's admin-acts route: against an API without it
+    /// the item is left out of the HTML, not hidden.
+    pub admin_acts: bool,
 }
 
 impl PageCtx {
@@ -170,6 +174,7 @@ impl PageCtx {
             current_path,
             search_query: String::new(),
             identity: None,
+            admin_acts: false,
         }
     }
 

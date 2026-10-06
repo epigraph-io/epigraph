@@ -48,6 +48,19 @@
       {%- endif %}
     </nav>
   </div>
+  {%- if ctx.signed_in %}
+  <nav class="section-nav" aria-label="Sections">
+    <div class="section-nav__inner">
+      <a href="{{ ctx.links.backlog() }}">Backlog</a>
+      <a href="{{ ctx.links.audit() }}">Audit</a>
+      <a href="{{ ctx.links.activity() }}">Activity</a>
+      <a href="{{ ctx.links.candidates() }}">Candidates</a>
+      {%- if ctx.admin_acts %}
+      <a href="{{ ctx.links.acts() }}">Admin acts</a>
+      {%- endif %}
+    </div>
+  </nav>
+  {%- endif %}
 </header>
 <main id="main" class="site-main">
 {% block content %}{% endblock %}

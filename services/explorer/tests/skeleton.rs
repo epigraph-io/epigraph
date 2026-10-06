@@ -330,6 +330,41 @@ async fn new_page_stubs_answer_501_not_404() {
     assert!(calls.is_empty(), "a stub called upstream: {calls:?}");
 }
 
+/// Signed-in pages carry a section nav to the MVP pages, at base-path hrefs.
+/// The admin-acts slot stays out of the HTML until the capability probe
+/// says the API has the route (plan J7: no nav item against an API without
+/// it), and anonymous viewers get no section nav at all.
+#[tokio::test]
+async fn signed_in_header_links_the_sections_and_omits_admin_acts() {
+    let app = spawn().await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as("/explorer/definitely/not/here", &sid).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(
+        res.body.contains("aria-label=\"Sections\""),
+        "no section nav in: {}",
+        res.body
+    );
+    for (href, label) in [
+        ("/explorer/backlog", "Backlog"),
+        ("/explorer/audit", "Audit"),
+        ("/explorer/activity", "Activity"),
+        ("/explorer/candidates", "Candidates"),
+    ] {
+        assert!(
+            res.body.contains(&format!("href=\"{href}\">{label}</a>")),
+            "missing {label} link in: {}",
+            res.body
+        );
+    }
+    assert!(!res.body.contains("/explorer/acts"), "acts slot rendered");
+    assert!(!res.body.contains("Admin acts"), "acts slot rendered");
+
+    let anon = app.get("/explorer/definitely/not/here").await;
+    assert!(!anon.body.contains("aria-label=\"Sections\""));
+    assert!(!anon.body.contains("/explorer/backlog"));
+}
+
 // ---- error pages ---------------------------------------------------------------
 
 #[tokio::test]

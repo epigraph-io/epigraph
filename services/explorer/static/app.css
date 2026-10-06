@@ -275,6 +275,32 @@ samp,
   font-style: italic;
 }
 
+/* Signed-in sections: a second header row of plain links. */
+.section-nav {
+  border-top: 1px solid var(--border);
+}
+
+.section-nav__inner {
+  max-width: var(--page-width);
+  margin: 0 auto;
+  padding: var(--space-2) var(--space-4);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  font-size: 0.875rem;
+}
+
+.section-nav a {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.section-nav a:hover,
+.section-nav a:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
 .site-main {
   flex: 1;
   width: 100%;
