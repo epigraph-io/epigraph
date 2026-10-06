@@ -1,4 +1,4 @@
-"""Tests for scripts/reconcile_backlog_labels.py (drain unit U058, item I007).
+"""Tests for scripts/reconcile_backlog_labels.py.
 
 The reconciler's dry run used to count `patched` only inside `if args.apply:`,
 so every dry run printed `patched=0` however many unambiguous free-text
@@ -31,6 +31,11 @@ B3_PEER = "33333333-dddd-4ddd-8ddd-000000000004"
 R1 = "aaaaaaaa-0000-4000-8000-0000000000a1"
 R2 = "bbbbbbbb-0000-4000-8000-0000000000b2"
 R3 = "cccccccc-0000-4000-8000-0000000000c3"
+# An open backlog item with a unique prefix, named by TWO resolved claims:
+# ambiguous by multiplicity, not by prefix collision.
+B4 = "44444444-eeee-4eee-8eee-000000000005"
+R4A = "dddddddd-0000-4000-8000-0000000000d4"
+R4B = "eeeeeeee-0000-4000-8000-0000000000e4"
 
 
 def _now_iso() -> str:
@@ -86,10 +91,11 @@ class ReconcilerMainTests(unittest.TestCase):
             rc = rbl.main()
         return rc, out.getvalue(), err.getvalue(), patch
 
-    @staticmethod
-    def _summary(stdout: str) -> str:
+    def _summary(self, stdout: str) -> str:
         lines = [ln for ln in stdout.splitlines() if ln.startswith("Reconciler:")]
-        assert len(lines) == 1, stdout
+        self.assertEqual(len(lines), 1, stdout)
+        # The summary is the last line; WOULD-PATCH lines come before it.
+        self.assertEqual(stdout.splitlines()[-1], lines[0], stdout)
         return lines[0]
 
     def test_dry_run_reports_unambiguous_match_without_patching(self):
@@ -103,10 +109,9 @@ class ReconcilerMainTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         patch.assert_not_called()
-        summary = self._summary(out)
-        self.assertIn("patched=1", summary)
-        self.assertIn("needs_review=0", summary)
-        self.assertIn("apply=False", summary)
+        self.assertEqual(
+            self._summary(out), "Reconciler: patched=1 needs_review=0 apply=False"
+        )
         self.assertIn(f"WOULD-PATCH {B1} via {R1}", out.splitlines())
 
     def test_dry_run_lists_only_unambiguous_matches(self):
@@ -133,10 +138,10 @@ class ReconcilerMainTests(unittest.TestCase):
         patch.assert_not_called()
         would = sorted(ln for ln in out.splitlines() if ln.startswith("WOULD-PATCH "))
         self.assertEqual(would, [f"WOULD-PATCH {B1} via {R1}", f"WOULD-PATCH {B2} via {R2}"])
-        summary = self._summary(out)
-        self.assertIn("patched=2", summary)
         # B3 and B3_PEER both carry the ambiguous prefix; both go to review.
-        self.assertIn("needs_review=2", summary)
+        self.assertEqual(
+            self._summary(out), "Reconciler: patched=2 needs_review=2 apply=False"
+        )
 
     def test_apply_exits_nonzero_when_a_patch_is_refused(self):
         now = _now_iso()
@@ -148,9 +153,9 @@ class ReconcilerMainTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         patch.assert_called_once()
         self.assertIn(f"FAIL {B1}", err)
-        summary = self._summary(out)
-        self.assertIn("patched=0", summary)
-        self.assertIn("apply=True", summary)
+        self.assertEqual(
+            self._summary(out), "Reconciler: patched=0 needs_review=0 apply=True"
+        )
         self.assertNotIn("WOULD-PATCH", out)
 
     def test_apply_counts_successful_patches_and_exits_zero(self):
@@ -179,7 +184,9 @@ class ReconcilerMainTests(unittest.TestCase):
             sorted(f"http://api.test/api/v1/claims/{b}/labels" for b in (B1, B2)),
         )
         self.assertEqual(err, "")
-        self.assertIn("patched=2", self._summary(out))
+        self.assertEqual(
+            self._summary(out), "Reconciler: patched=2 needs_review=0 apply=True"
+        )
 
     def test_apply_partial_refusal_counts_successes_and_still_fails(self):
         now = _now_iso()
@@ -204,7 +211,72 @@ class ReconcilerMainTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn(f"FAIL {B2}", err)
         self.assertNotIn(f"FAIL {B1}", err)
-        self.assertIn("patched=1", self._summary(out))
+        self.assertEqual(
+            self._summary(out), "Reconciler: patched=1 needs_review=0 apply=True"
+        )
+
+    def test_dry_run_does_not_list_item_named_by_two_resolution_claims(self):
+        # B1: one resolving claim (positive control: must be listed).
+        # B4: unique prefix, but named by R4A (full UUID) AND R4B (8-hex
+        # prefix) -> ambiguous by multiplicity, so it must NOT reach the
+        # operator's WOULD-PATCH apply list.
+        now = _now_iso()
+        backlog = [
+            {"id": B1, "content": "x", "created_at": now},
+            {"id": B4, "content": "x", "created_at": now},
+        ]
+        resolved = [
+            {"id": R1, "content": f"Resolves {B1}", "created_at": now},
+            {"id": R4A, "content": f"Resolves {B4}", "created_at": now},
+            {"id": R4B, "content": f"closes {B4[:8]}", "created_at": now},
+        ]
+
+        rc, out, _err, patch = self._run(
+            [], backlog, resolved, AssertionError("dry run must not PATCH")
+        )
+
+        self.assertEqual(rc, 0)
+        patch.assert_not_called()
+        would = [ln for ln in out.splitlines() if ln.startswith("WOULD-PATCH ")]
+        self.assertEqual(would, [f"WOULD-PATCH {B1} via {R1}"])
+        self.assertEqual(
+            self._summary(out), "Reconciler: patched=1 needs_review=1 apply=False"
+        )
+        log = Path("docs/superpowers/reports/reconciler-needs-review.log").read_text()
+        ambiguous = [ln for ln in log.splitlines() if " AMBIGUOUS " in ln]
+        self.assertEqual(len(ambiguous), 1, log)
+        self.assertIn(f"AMBIGUOUS {B4} ", ambiguous[0])
+        self.assertIn(R4A, ambiguous[0])
+        self.assertIn(R4B, ambiguous[0])
+        self.assertIn("prefix_peers=1", ambiguous[0])
+
+    def test_apply_transport_error_is_a_failure_and_the_run_continues(self):
+        now = _now_iso()
+        backlog = [
+            {"id": B1, "content": "x", "created_at": now},
+            {"id": B2, "content": "x", "created_at": now},
+        ]
+        resolved = [
+            {"id": R1, "content": f"Resolves {B1}", "created_at": now},
+            {"id": R2, "content": f"Resolves {B2}", "created_at": now},
+        ]
+
+        def unreachable_for_b1(url, json=None, headers=None, timeout=None):
+            if B1 in url:
+                raise rbl.httpx.ConnectError(
+                    "connection refused", request=rbl.httpx.Request("PATCH", url)
+                )
+            return _Resp({})
+
+        rc, out, err, patch = self._run(["--apply"], backlog, resolved, unreachable_for_b1)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(patch.call_count, 2)
+        self.assertIn(f"FAIL {B1}: connection refused", err)
+        self.assertNotIn(f"FAIL {B2}", err)
+        self.assertEqual(
+            self._summary(out), "Reconciler: patched=1 needs_review=0 apply=True"
+        )
 
 
 if __name__ == "__main__":
