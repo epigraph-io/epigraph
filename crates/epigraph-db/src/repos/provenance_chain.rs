@@ -75,6 +75,9 @@ pub struct ProvenanceChain {
     /// Cycles found during traversal, each as the node path that closed the
     /// loop. Reported, never fatal — a cyclic graph is a data-quality signal
     /// the caller should see, not an error that hides the rest of the chain.
+    ///
+    /// Only paths whose every id is in [`Self::nodes`] are reported; a path
+    /// naming a claim the viewer cannot read is dropped whole.
     pub cycles: Vec<Vec<Uuid>>,
 }
 
@@ -163,12 +166,32 @@ impl ProvenanceChainRepository {
         // docs). `is_cycle` rows are emitted so the caller can see the loop,
         // but are not expanded further — that is what makes this terminate.
         //
-        // MACRO SITE — static three-bind spelling. The predicate lives on the
-        // RECURSIVE term, which is the only place `edges` is read: an edge the
-        // viewer cannot see must not extend the frontier, or the walk leaks the
-        // shape of another tenant's graph one hop at a time. The hydration
-        // query below filters `claims` the same way, so a node id that survived
-        // the walk still yields no content unless the claim itself is visible.
+        // MACRO SITE — static three-bind spelling. Both predicates live on the
+        // RECURSIVE term, because that is where the frontier grows, and both
+        // must hold before a hop is taken:
+        //
+        // * the EDGE: an edge the viewer cannot see must not extend the
+        //   frontier, or the walk leaks the shape of another tenant's graph one
+        //   hop at a time;
+        // * the FAR CLAIM (`fc`): a claim the viewer cannot read must not be
+        //   stepped onto, even over a public edge. Hydration below would drop
+        //   its content, but by then the walk has already gone THROUGH it: its
+        //   uuid sits in every cycle path that crosses it, every ancestor
+        //   reached via it is returned, and a node reachable both through it
+        //   and by a longer visible route reports the shorter, hidden depth.
+        //   Filtering after the walk cannot undo any of that; not taking the
+        //   hop can.
+        //
+        // The edge alone is not enough: migration 070's trigger usually derives
+        // an edge's tenancy from its endpoints, but an edge whose tenancy does
+        // not track them (stamped independently, or not re-derived after an
+        // endpoint changed) passes the edge predicate while naming a private
+        // claim.
+        //
+        // The root (the anchor row) is NOT gated here: the caller supplied its
+        // id, and the route answers an unreadable root with the same 404 as a
+        // missing one. A cycle path always begins at the root, which is why the
+        // cycle filter after hydration exists (see `cycles.retain` below).
         let rows = sqlx::query!(
             r#"
             WITH RECURSIVE chain AS (
@@ -202,6 +225,11 @@ impl ProvenanceChainRepository {
                        OR (e.owner_group_id = ANY($6::uuid[])
                            AND (e.co_owner_group_id IS NULL
                                 OR e.co_owner_group_id = ANY($6::uuid[]))))
+                  AND EXISTS (
+                        SELECT 1 FROM claims fc
+                         WHERE fc.id = nxt.id
+                           AND ($5::bool OR fc.visibility = 'public'
+                                OR fc.owner_group_id = ANY($6::uuid[])))
             )
             SELECT node AS "node!", depth AS "depth!", is_cycle AS "is_cycle!",
                    path AS "path!", e_source, e_target, e_rel
@@ -300,6 +328,19 @@ impl ProvenanceChainRepository {
         // and by what relation.
         let node_ids: HashSet<Uuid> = nodes.iter().map(|n| n.id).collect();
         edges.retain(|e| node_ids.contains(&e.source) && node_ids.contains(&e.target));
+
+        // Cycles obey the same rule as edges: a path is returned only if EVERY
+        // id on it is in `nodes`. The walk no longer steps onto an unreadable
+        // claim, but every path begins at the root, which the anchor row seeds
+        // unconditionally — so a caller that names a root it cannot read
+        // (the repo is reachable through MCP `get_provenance_chain` as well as
+        // the route) would otherwise get that root back inside each cycle.
+        //
+        // The path is DROPPED, never filtered down to its visible ids: a
+        // shortened path still states that a cycle exists, where it closes and
+        // how long it is. The same retain also drops a cycle naming a node the
+        // node cap cut, which `truncated` already reports.
+        cycles.retain(|path| path.iter().all(|id| node_ids.contains(id)));
 
         let nodes = topo_sort(nodes, &edges);
 

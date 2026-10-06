@@ -15,12 +15,15 @@
 //! a claim the viewer may not read takes exactly the same branch and produces
 //! exactly the same body.
 //!
-//! This handler applies no access pass of its own. Both halves of the walk are
-//! filtered in the repo: an edge the viewer cannot see does not extend the
-//! frontier, and a claim the viewer cannot read is absent from `nodes` — and,
-//! since the repo retains edges against the hydrated node set, absent from
-//! `edges` too. An ancestor that is not there is not there; there is no
-//! placeholder node and no blanked field.
+//! This handler applies no access pass of its own. The walk is filtered in the
+//! repo: a hop is taken only over an edge the viewer can see AND onto a claim
+//! the viewer can read, so an unreadable claim is never walked through — it
+//! cannot lend its depth to a node behind it, surface an ancestor reachable
+//! only via it, or sit inside a reported cycle. A claim the viewer cannot read
+//! is absent from `nodes` — and, since the repo retains edges and cycles
+//! against the hydrated node set, absent from `edges` and `cycles` too. An
+//! ancestor that is not there is not there; there is no placeholder node and
+//! no blanked field.
 //!
 //! All SQL lives in `epigraph_db::ProvenanceChainRepository`.
 //!
