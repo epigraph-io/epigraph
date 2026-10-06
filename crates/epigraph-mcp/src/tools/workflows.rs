@@ -1297,17 +1297,19 @@ pub async fn deprecate_workflow(
     // today's behaviour), else a `workflows` row takes the hierarchical one,
     // else nothing was deprecated and the call says so.
     //
-    // TWO AUTHORITIES IN ONE LOOP, deliberately. The transaction's session GUCs
-    // carry the SERVER AGENT's groups (the write authority), while the traversal
-    // below splices the CALLER's `viewer` (the read authority). That divergence is
-    // intentional and neither half may take the other's: stamping the caller would
-    // refuse the write this tool exists to perform, and reading with the server
-    // agent's viewer would let a caller cascade into workflow claims it cannot
-    // see. The widened USING side does mean the cascade can ENUMERATE rows the
-    // caller's viewer would not reach on the unstamped pool; the `viewer.splice`
-    // label oracle below is what keeps that from turning into a write, and it is
-    // filtered rather than exempted for exactly this reason. On stdio the caller
-    // and the server agent coincide, so this only differs on authenticated HTTP.
+    // TWO AUTHORITIES IN ONE LOOP, AND THEY NAME ONE PRINCIPAL. The stamp is
+    // `write_identity`'s: the token's principal over authenticated HTTP (batch
+    // H-b), this server's own agent on stdio. The traversal below splices the
+    // caller's `viewer` (the read authority), which `write_identity` has
+    // already checked names the same principal. So over HTTP the UPDATE reaches
+    // only rows the caller's groups may write (`claims_tenancy`'s USING side
+    // filters any other row to zero rows, silently, with no `42501`), and the
+    // cascade enumerates only children the caller can read; on stdio both are
+    // the server agent. (This paragraph used to say the session GUCs carried
+    // the SERVER agent's groups on every transport; that predates
+    // `write_identity`, and U017's council caught the stale claim.) The
+    // `viewer.splice` label oracle below is filtered rather than exempted so a
+    // child the caller cannot read is never cascaded into.
     //
     // The traversal reads run on the same stamped connection as the writes, which
     // is the correct direction: an unstamped read returns FEWER rows, so a
@@ -1317,10 +1319,15 @@ pub async fn deprecate_workflow(
         crate::claim_helper::begin_author_stamped_tx(server, caller, "deprecate_workflow").await?;
 
     // DISPATCH. The claim read uses the CALLER's viewer, the read authority
-    // the cascade below already uses: an id the caller cannot read is not
-    // deprecated as a claim (it used to be, silently, when the server agent
-    // could write it). `workflows` has no row security, so its existence
-    // check reads the same on any connection.
+    // the cascade below already uses. An id the caller cannot read is an
+    // error, not a reported deprecation. The caller-stamped UPDATE that used
+    // to run on it was USING-filtered to zero rows, yet the id was listed
+    // (pinned by `an_unreadable_flat_claim_is_an_error_not_a_deprecation`).
+    // The read accepts ANY readable claim, not only a `workflow`-labelled one,
+    // as the flat path always has. The HTTP twin requires the label, and
+    // narrowing this path is flat-path authority, which U017 leaves alone.
+    // `workflows` has no row security, so its existence check reads the same
+    // on any connection.
     let is_claim = ClaimRepository::get_by_id(
         &mut *tx,
         viewer,
@@ -1336,7 +1343,7 @@ pub async fn deprecate_workflow(
         tx.rollback().await.map_err(internal_error)?;
         if !is_row {
             return Err(invalid_params(format!(
-                "no workflow claim you can read and no hierarchical workflows row has id \
+                "no claim you can read and no hierarchical workflows row has id \
                  {workflow_id}; nothing was deprecated"
             )));
         }
@@ -1512,6 +1519,16 @@ pub async fn deprecate_workflow(
 /// * An admin-arm target is audited (`workflows.admin_write`) on the same
 ///   transaction.
 /// * Only what changed is reported.
+///
+/// KNOWN LIMITATION (follow-up, not fixed here): a retired level 0-2 claim is
+/// not revived when a later generation (`improve_workflow_hierarchy`) or
+/// `add_step` reuses its exact text. The claim id depends only on the text and
+/// the `canonical_name`, the executor's dedup-by-id skips an existing row, and
+/// `add_step` inserts with `ON CONFLICT (id) DO NOTHING`. So the new live
+/// workflow executes a claim that has `is_current = false` and no embeddings.
+/// A correct revival has to tell this deprecation's retirements apart from an
+/// `evolve_step` supersede, which also sets `is_current = false` on purpose,
+/// so it needs a retirement marker and touches the shared executor.
 async fn deprecate_hierarchical_workflow(
     server: &EpiGraphMcpFull,
     auth: Option<&epigraph_auth::AuthContext>,
