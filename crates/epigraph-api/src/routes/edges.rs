@@ -3463,6 +3463,24 @@ mod db_tests {
         .unwrap()
     }
 
+    /// Every in-force or retired row over the UNORDERED pair `{a, b}` with
+    /// `relationship` — the retired ones included, so a test can tell "the old
+    /// row survived and a new one was written" from "the old row was reused".
+    async fn unordered_pair_count_all(pool: &PgPool, a: Uuid, b: Uuid, relationship: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges \
+             WHERE LEAST(source_id, target_id) = LEAST($1, $2) \
+               AND GREATEST(source_id, target_id) = GREATEST($1, $2) \
+               AND relationship = $3",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     /// Shared body of the reverse-direction tests: `A <relationship> B`, then
     /// `B <relationship> A`, both with the given `if_not_exists`.
     async fn assert_reverse_symmetric_collapses(
@@ -3546,6 +3564,64 @@ mod db_tests {
         );
         assert_eq!(s2, StatusCode::OK, "a dedup hit is 200, not 201: {body2}");
         assert_eq!(body_id(&body2, "id"), body_id(&body1, "id"));
+    }
+
+    /// The dedup is IN FORCE only: once `A CONTRADICTS B` is retired, a
+    /// `B CONTRADICTS A` is a new disagreement and a new row (in its own
+    /// orientation), not a silent 200 on the retired edge.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_symmetric_reasserted_after_retirement_is_a_new_edge(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "retired-then-reasserted A").await;
+        let b = seed_claim(&pool, agent_id, "retired-then-reasserted B").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "CONTRADICTS", false)).await;
+        assert_eq!(s1, StatusCode::CREATED, "{body1}");
+        let id1 = body_id(&body1, "id");
+
+        // Retire it through the route (an hour in the past, so the test does
+        // not hinge on clock skew between this process and the database).
+        let retire = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/edges/{id1}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "valid_to": chrono::Utc::now() - chrono::Duration::hours(1),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retire.status(), StatusCode::OK, "PATCH valid_to retires");
+        assert_eq!(unordered_pair_count(&pool, a, b, "CONTRADICTS").await, 0);
+
+        let (s2, body2) = post_edge(&router, create_edge_body(b, a, "CONTRADICTS", false)).await;
+        assert_eq!(
+            s2,
+            StatusCode::CREATED,
+            "a re-assertion after retirement is a new edge, not a dedup hit on the \
+             retired one: {body2}"
+        );
+        let id2 = body_id(&body2, "id");
+        assert_ne!(id2, id1, "the retired edge must not be returned");
+        assert_eq!(
+            (body_id(&body2, "source_id"), body_id(&body2, "target_id")),
+            (b, a),
+            "the new edge is stored in the request's orientation"
+        );
+        assert_eq!(unordered_pair_count(&pool, a, b, "CONTRADICTS").await, 1);
+        assert_eq!(
+            unordered_pair_count_all(&pool, a, b, "CONTRADICTS").await,
+            2,
+            "the retired row survives beside the new one"
+        );
     }
 
     /// Negative control: `SUPPORTS` is DIRECTIONAL (A supports B is not B
