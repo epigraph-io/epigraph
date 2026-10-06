@@ -354,3 +354,76 @@ async fn an_edge_naming_an_invisible_claim_is_dropped_from_the_returned_edges(po
     assert_eq!(chain.edges[0].source, secret);
     assert_eq!(chain.edges[0].target, root);
 }
+
+/// A cycle path naming a claim the viewer cannot read is DROPPED, not returned
+/// and not shortened.
+///
+/// The far-claim predicate keeps the walk off unreadable claims, but every
+/// cycle path begins at the ROOT, which the anchor row seeds unconditionally.
+/// The repo is reachable through MCP `get_provenance_chain` with any root id, so
+/// a stranger naming a private root `r` used to get `r` back inside each cycle
+/// path. The cycle here closes at `p`, not at `r`, on purpose: a cycle closing
+/// at `r` is already refused by the far-claim predicate (the closing hop steps
+/// onto `r`), so it would pass without the cycle filter and prove nothing.
+///
+/// ```text
+///   r (PRIVATE) <- p (public) <- q (public) <- p      (cycle r, p, q, p)
+/// ```
+///
+/// Every edge is forced public, so the edge predicate cannot be what drops it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cycle_path_naming_an_unreadable_root_is_dropped_whole(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "pc-cycle-owner").await;
+    let (stranger, _stranger_group) =
+        fixture::seed_agent_with_group(&pool, "pc-cycle-stranger").await;
+
+    let r =
+        fixture::seed_group_claim(&pool, owner, owner_group, "pc cycle: the private root").await;
+    let p = fixture::seed_public_claim(&pool, owner, "pc cycle: public premise p").await;
+    let q = fixture::seed_public_claim(&pool, owner, "pc cycle: public premise q").await;
+
+    let world = fixture::world_group(&pool).await;
+    fixture::seed_edge_owned_by(&pool, p, r, "public", world).await;
+    fixture::seed_edge_owned_by(&pool, q, p, "public", world).await;
+    fixture::seed_edge_owned_by(&pool, p, q, "public", world).await;
+
+    let r_visibility: String = sqlx::query_scalar("SELECT visibility FROM claims WHERE id = $1")
+        .bind(r)
+        .fetch_one(&pool)
+        .await
+        .expect("read the root's tenancy back");
+    assert_eq!(r_visibility, "group", "the root must be group-private");
+
+    // ── the stranger ──
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve the stranger");
+    let chain = ProvenanceChainRepository::chain(&pool, &viewer, r, 6, None)
+        .await
+        .expect("chain");
+    assert!(
+        chain.cycles.is_empty(),
+        "a cycle path that names the unreadable root must be dropped whole; got {:?}",
+        chain.cycles
+    );
+    assert!(
+        !chain.nodes.iter().any(|n| n.id == r),
+        "the unreadable root is not hydrated"
+    );
+
+    // ── CALIBRATION: the owner sees the same cycle ──
+    //
+    // Without this, a fixture that never formed a cycle would pass the
+    // stranger's arm.
+    let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("resolve the owner");
+    let chain = ProvenanceChainRepository::chain(&pool, &owner_viewer, r, 6, None)
+        .await
+        .expect("chain");
+    assert_eq!(
+        chain.cycles,
+        vec![vec![r, p, q, p]],
+        "CALIBRATION: the owner gets exactly the one cycle r, p, q, p"
+    );
+}

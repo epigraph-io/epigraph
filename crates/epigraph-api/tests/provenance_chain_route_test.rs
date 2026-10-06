@@ -344,3 +344,146 @@ async fn a_private_root_is_the_same_404_as_a_root_that_does_not_exist(pool: PgPo
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(node_ids(&body), vec![root.to_string()]);
 }
+
+/// Force every edge touching `claim` public, then read the tenancy back.
+///
+/// Migration 070's trigger derives an edge's tenancy from its endpoints, so an
+/// edge left to it tracks the private claim and the recursive term's EDGE
+/// predicate alone would stop the walk — the arm would then stay green with the
+/// far-claim check deleted. Forced public, the edges survive the edge predicate
+/// and only the far-claim check can keep the walk off the private claim.
+async fn force_edges_public_around(pool: &PgPool, claim: Uuid) {
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', co_owner_group_id = NULL \
+         WHERE source_id = $1 OR target_id = $1",
+    )
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("force the edges around the private claim public");
+
+    let not_public: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+          WHERE (source_id = $1 OR target_id = $1) \
+            AND (visibility <> 'public' OR co_owner_group_id IS NOT NULL)",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("read the forced edges back");
+    assert_eq!(
+        not_public, 0,
+        "every edge touching {claim} must be public, or the far-claim arm is vacuous"
+    );
+}
+
+/// The walk must not go THROUGH a claim the viewer cannot read.
+///
+/// Graph (`x <- y` means "y supports x", i.e. y is an ancestor of x):
+///
+/// ```text
+///   a (root, public) <- b (PRIVATE, another principal's group) <- c (public)
+///   a <- d (public) <- e (public) <- f (public)
+///                       b <- f            (f is reached via b at depth 2,
+///                                          and via d, e at depth 3)
+///   b <- a                                (a cycle a -> b -> a, through b)
+/// ```
+///
+/// Every edge touching `b` is forced public, so only the far-claim predicate
+/// stands between a stranger and `b`. Before it, hydration dropped `b`'s content
+/// but the walk had already gone through `b`: its uuid came back inside
+/// `cycles`, `c` (reachable only via `b`) came back as an ancestor, and `f`
+/// reported depth 2, the length of a route the stranger cannot see.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_intermediate_claim_is_absent_from_cycles_depth_and_ancestors(pool: PgPool) {
+    let owner = Uuid::new_v4();
+    let a = common::seed_claim(&pool, "public conclusion").await;
+    let b = common::seed_claim_with_agent(&pool, "classified intermediate", owner).await;
+    let c = common::seed_claim(&pool, "public premise behind the private one").await;
+    let d = common::seed_claim(&pool, "public intermediate").await;
+    let e = common::seed_claim(&pool, "public intermediate two").await;
+    let f = common::seed_claim(&pool, "public premise on two routes").await;
+
+    supports(&pool, b, a).await;
+    supports(&pool, c, b).await;
+    supports(&pool, d, a).await;
+    supports(&pool, e, d).await;
+    supports(&pool, f, e).await;
+    supports(&pool, f, b).await;
+    supports(&pool, a, b).await;
+
+    common::seed_private_ownership(&pool, b, owner).await;
+    force_edges_public_around(&pool, b).await;
+
+    let app = router(&pool).await;
+    let path = format!("/api/v1/claims/{a}/provenance-chain?max_depth=8");
+
+    // ── a signed-in stranger ──
+    let (status, body) = get(&app, &path, Some(&reader())).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    assert!(
+        !body.to_string().contains(&b.to_string()),
+        "the private intermediate's uuid must not appear anywhere in the response \
+         (nodes, edges, cycles), got {body}"
+    );
+    assert!(
+        !body.to_string().contains(&c.to_string()),
+        "an ancestor reachable only THROUGH the private claim must not be returned, got {body}"
+    );
+    let mut ids = node_ids(&body);
+    ids.sort();
+    let mut expected = vec![a.to_string(), d.to_string(), e.to_string(), f.to_string()];
+    expected.sort();
+    assert_eq!(ids, expected, "only the visible route, got {body}");
+    assert_eq!(
+        node(&body, f)["depth"],
+        3,
+        "f's depth must come from the visible route (a <- d <- e <- f), not from the \
+         shorter route through the private claim, got {body}"
+    );
+    assert_eq!(
+        body["cycles"],
+        serde_json::json!([]),
+        "the only cycle runs through the private claim, got {body}"
+    );
+    assert_eq!(
+        body["edges"].as_array().expect("edges").len(),
+        3,
+        "d->a, e->d, f->e only, got {body}"
+    );
+
+    // ── CALIBRATION: the owner walks through b ──
+    //
+    // Without this the stranger's assertions are satisfied by a fixture that
+    // never connected b, c or the cycle at all.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let (status, body) = get(&app, &path, Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let mut ids = node_ids(&body);
+    ids.sort();
+    let mut expected = vec![
+        a.to_string(),
+        b.to_string(),
+        c.to_string(),
+        d.to_string(),
+        e.to_string(),
+        f.to_string(),
+    ];
+    expected.sort();
+    assert_eq!(
+        ids, expected,
+        "CALIBRATION: the owner sees every node, got {body}"
+    );
+    assert_eq!(node(&body, b)["content"], "classified intermediate");
+    assert_eq!(
+        node(&body, f)["depth"],
+        2,
+        "CALIBRATION: through b, f is two hops from a, got {body}"
+    );
+    assert_eq!(
+        body["cycles"],
+        serde_json::json!([[a.to_string(), b.to_string(), a.to_string()]]),
+        "CALIBRATION: exactly one cycle, a -> b -> a, got {body}"
+    );
+}
