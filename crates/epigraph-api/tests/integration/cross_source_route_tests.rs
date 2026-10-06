@@ -1422,3 +1422,291 @@ async fn a_promote_racing_a_verdict_rescore_is_refused_with_409(pool: PgPool) {
         "no edge may be written from a verdict the row no longer carries"
     );
 }
+
+// ---------------------------------------------------------------------------
+// U043 (backlog 110f666a, gap 3): a retirement re-derives its endpoints' belief.
+//
+// `apply_match_retire` deletes the edge-keyed BBAs, factors and bp_messages of
+// the matcher edge it retracts. Every other cascade that removes belief inputs
+// (supersede, dedup, edge_retract) then re-derives the affected claims from
+// the `mass_functions` that survive. A retirement did not, so an endpoint kept
+// whatever `pignistic_prob` was last written to it. A past
+// `POST /api/v1/bp/propagate {"apply_updates": true}` is such a writer, and a
+// later propagate cannot repair it: it builds its variables from the surviving
+// `factors` only, so an endpoint whose only factor was the matcher edge is no
+// longer a variable, and scalar BP seeds its priors from the stored (biased)
+// value. A DS re-derivation from `mass_functions` is the only repair.
+// ---------------------------------------------------------------------------
+
+/// A stale BP-written value, far from any value the BBA below derives.
+const POISONED_BETP: f64 = 0.93;
+
+/// Give `claim` one BBA on the engine's own `binary_truth` frame, NOT keyed on
+/// any edge (`perspective_id` NULL, so the retirement's edge-keyed delete
+/// leaves it in place), derive its cache from it through the same entry point
+/// the cascade uses, and return the derived `pignistic_prob`.
+///
+/// The frame must be the engine's: the cascade re-derives on `binary_truth`,
+/// and a BBA on a test-local frame would leave it nothing to recombine.
+async fn seed_surviving_bba_and_derive(pool: &PgPool, claim: Uuid, source_agent: Uuid) -> f64 {
+    let scoped = epigraph_db::ScopedPool::connect(
+        &database_url_of(pool),
+        epigraph_db::SessionGucMode::Session,
+    )
+    .await
+    .expect("ScopedPool over the test database")
+    .with_maintenance_pool(pool.clone());
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, viewer) = session.split();
+    let frame = epigraph_engine::edge_factor::ensure_binary_frame(&mut *conn, viewer)
+        .await
+        .expect("the engine's binary frame");
+    sqlx::query(
+        "INSERT INTO mass_functions \
+           (claim_id, frame_id, source_agent_id, perspective_id, masses, source_strength, \
+            evidence_type) \
+         VALUES ($1, $2, $3, NULL, $4, 1.0, 'empirical')",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(source_agent)
+    .bind(serde_json::json!({"0": 0.6, "1": 0.1, "0,1": 0.3}))
+    .execute(&mut *conn)
+    .await
+    .expect("seed a surviving BBA");
+    let derived =
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut *conn, viewer, claim)
+            .await
+            .expect("derive the claim's belief from its BBA");
+    assert!(
+        derived,
+        "CALIBRATION: the BBA is on a frame the recompute reads"
+    );
+    let d: Option<f64> = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read the derived value");
+    let d = d.expect("CALIBRATION: the recompute wrote pignistic_prob");
+    assert!(
+        (d - POISONED_BETP).abs() > 0.1,
+        "CALIBRATION: the derived value ({d}) must be distinguishable from the poison"
+    );
+    d
+}
+
+/// Simulate a past `bp/propagate` with `apply_updates: true`: it overwrites the
+/// cached `pignistic_prob` with a value the factor graph biased.
+async fn poison_betp(pool: &PgPool, claim: Uuid) {
+    sqlx::query("UPDATE claims SET pignistic_prob = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(POISONED_BETP)
+        .execute(pool)
+        .await
+        .expect("simulate a BP-written value");
+}
+
+async fn betp_of(pool: &PgPool, claim: Uuid) -> Option<f64> {
+    sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read pignistic_prob")
+}
+
+/// The `security_events` row type a belief audit id names.
+async fn event_type_of(pool: &PgPool, id: Uuid) -> String {
+    sqlx::query_scalar("SELECT event_type::text FROM security_events WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("the audit row exists")
+}
+
+/// A promoted candidate between two fresh claims of a grouped agent, and the
+/// admin token that may retire it.
+async fn promoted_pair(pool: &PgPool, label: &str) -> (Uuid, Uuid, Uuid, Uuid, String) {
+    let (w, _) = viewer_fixture::seed_agent_with_group(pool, label).await;
+    let a = insert_claim(pool, w).await;
+    let b = insert_claim(pool, w).await;
+    let candidate = insert_pending_candidate(pool, a, b).await;
+    let promote = decide_bearer_token(w, Some(w), "agent");
+    let resp = post_decide(pool.clone(), candidate, &promote, "promote").await;
+    assert_eq!(resp.status(), StatusCode::OK, "promote must succeed");
+    (w, a, b, candidate, admin_bearer_token(w, Some(w), "agent"))
+}
+
+async fn retire_on(state: AppState, candidate: Uuid, token: &str) -> serde_json::Value {
+    let resp = post_decide_on(state, candidate, token, "retire").await;
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }));
+    assert_eq!(status, StatusCode::OK, "{json}");
+    json
+}
+
+/// The retire request, with a maintenance connection, on the production roles
+/// (`epigraph_app` for the request, `epigraph_maintenance` for the cascade):
+/// the endpoint's BP-written value is replaced by the DS value its surviving
+/// BBA derives, and the re-derivation has its own audit row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_rederives_endpoint_belief_from_surviving_bbas(pool: PgPool) {
+    let (w, _a, b, candidate, admin) = promoted_pair(&pool, "u043-direct").await;
+    let d = seed_surviving_bba_and_derive(&pool, b, w).await;
+    poison_betp(&pool, b).await;
+
+    let json = retire_on(app_role_state(&pool, true).await, candidate, &admin).await;
+    assert_eq!(json["cascade"]["status"], "applied", "{json}");
+    assert_eq!(json["retired"], true, "{json}");
+
+    let after = betp_of(&pool, b)
+        .await
+        .expect("b keeps a cache: a BBA backs it");
+    assert!(
+        (after - d).abs() < 1e-9,
+        "the retirement must re-derive b from its surviving BBA: expected {d}, found {after} \
+         (still {POISONED_BETP} means nothing re-derived it)"
+    );
+    let belief_event: Uuid = json["cascade"]["belief_audit_event_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("the re-derivation names its audit row: {json}"));
+    assert_eq!(
+        event_type_of(&pool, belief_event).await,
+        "cascade.belief_rederived"
+    );
+    assert_eq!(
+        json["belief_cascade"]["recomputed"],
+        serde_json::json!([b]),
+        "the caller sees which endpoint was re-derived: {json}"
+    );
+}
+
+/// Default decision (scope Q2): an endpoint with NO BBA on any frame whose
+/// cache a retirement leaves unbacked is cleared, the `edge_retract` cascade's
+/// semantics. The only writer that can have put a value there without a BBA
+/// is the factor graph that just lost an edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_clears_an_unbacked_endpoint_cache(pool: PgPool) {
+    let (_w, a, _b, candidate, admin) = promoted_pair(&pool, "u043-unbacked").await;
+    sqlx::query(
+        "UPDATE claims SET belief = 0.5, plausibility = 0.95, pignistic_prob = $2 WHERE id = $1",
+    )
+    .bind(a)
+    .bind(POISONED_BETP)
+    .execute(&pool)
+    .await
+    .expect("a BP-written cache with no BBA behind it");
+
+    let json = retire_on(app_role_state(&pool, true).await, candidate, &admin).await;
+    assert_eq!(json["cascade"]["status"], "applied", "{json}");
+    assert_eq!(
+        betp_of(&pool, a).await,
+        None,
+        "an endpoint no BBA backs must have its stale cache cleared: {json}"
+    );
+    assert_eq!(
+        json["belief_cascade"]["unbacked"],
+        serde_json::json!([a]),
+        "{json}"
+    );
+}
+
+/// Production's path under D9: the request defers, and the replay timer carries
+/// the retirement out on the `epigraph_maintenance` role. The re-derivation
+/// must happen there too, and its audit row is named on the replay item.
+#[sqlx::test(migrations = "../../migrations")]
+async fn replayed_match_retire_rederives_endpoint_belief(pool: PgPool) {
+    let (w, _a, b, candidate, admin) = promoted_pair(&pool, "u043-replay").await;
+    let d = seed_surviving_bba_and_derive(&pool, b, w).await;
+    poison_betp(&pool, b).await;
+
+    let json = retire_on(app_role_state(&pool, false).await, candidate, &admin).await;
+    assert_eq!(json["cascade"]["status"], "deferred", "{json}");
+    assert_eq!(
+        betp_of(&pool, b).await,
+        Some(POISONED_BETP),
+        "CALIBRATION: a deferred retirement changes nothing yet"
+    );
+
+    let maintenance = viewer_fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &database_url_of(&pool),
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool")
+    .with_maintenance_pool(maintenance);
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, admin_viewer) = session.split();
+    let report = epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        admin_viewer,
+        "u043-test",
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("replay");
+    let item = report
+        .items
+        .iter()
+        .find(|i| i.subject_id == Some(candidate))
+        .unwrap_or_else(|| panic!("the replay carried out the retirement: {report:?}"));
+    assert_eq!(
+        status_of(&pool, candidate).await,
+        "stale",
+        "CALIBRATION: the replay retired the candidate: {report:?}"
+    );
+
+    let after = betp_of(&pool, b)
+        .await
+        .expect("b keeps a cache: a BBA backs it");
+    assert!(
+        (after - d).abs() < 1e-9,
+        "the replayed retirement must re-derive b: expected {d}, found {after}"
+    );
+    let belief_event = item
+        .status
+        .belief_audit_event_id
+        .unwrap_or_else(|| panic!("the replayed re-derivation names its audit row: {report:?}"));
+    assert_eq!(
+        event_type_of(&pool, belief_event).await,
+        "cascade.belief_rederived"
+    );
+}
+
+/// The re-derivation is gated on the retirement having withdrawn something. A
+/// candidate that was never promoted has no matcher edge, factor or BBA to
+/// remove, and retiring it must not rewrite caches it never fed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retiring_an_unpromoted_candidate_leaves_endpoint_beliefs_alone(pool: PgPool) {
+    let (w, _) = viewer_fixture::seed_agent_with_group(&pool, "u043-unpromoted").await;
+    let a = insert_claim(&pool, w).await;
+    let b = insert_claim(&pool, w).await;
+    let candidate = insert_pending_candidate(&pool, a, b).await;
+    seed_surviving_bba_and_derive(&pool, b, w).await;
+    poison_betp(&pool, b).await;
+
+    let admin = admin_bearer_token(w, Some(w), "agent");
+    let json = retire_on(app_role_state(&pool, true).await, candidate, &admin).await;
+    assert_eq!(json["cascade"]["status"], "applied", "{json}");
+    assert_eq!(json["edges_retracted"], 0, "{json}");
+    assert_eq!(
+        betp_of(&pool, b).await,
+        Some(POISONED_BETP),
+        "nothing this retirement removed fed b's cache: {json}"
+    );
+    assert!(
+        json["cascade"]["belief_audit_event_id"].is_null(),
+        "no re-derivation ran, so none is audited: {json}"
+    );
+}
