@@ -501,6 +501,23 @@ if the login response's cookie starts `__Host-` and the startup log
 (`journalctl -u epigraph-explorer`) has **no**
 "base path set: `__Host-` cookie prefix unavailable" line.
 
+### 7. Before exposing it beyond loopback
+
+- `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` is the root of the Explorer's **own**
+  https host, with an empty path; the API's site no longer routes
+  `/explorer*`; the smoke test above shows `__Host-` cookies and no
+  "base path set" startup line.
+- `EPIGRAPH_EXPLORER_INSECURE_COOKIES` and `EPIGRAPH_EXPLORER_DEV_BEARER` are
+  unset.
+- `EPIGRAPH_EXPLORER_FRAME_ANCESTORS` is narrowed to your own workspace's
+  origins, or set empty if you do not embed (Security model, "Notion embed
+  sign-in").
+- The Google allowlist is populated (Operator setup §2).
+- If you deploy with Docker, build the image first and run the smoke test
+  against it: the `Dockerfile` has never been built in CI.
+- Check sign-in, a claim page and the Notion embed by hand in the browsers
+  your users have. Safari and the embed are not exercised by any test.
+
 ## Security model
 
 - **Bearer forwarding, and no service token.** Every upstream call carries the
@@ -684,3 +701,25 @@ if the login response's cookie starts `__Host-` and the startup log
   `/oauth/token` populates `agent_id`, so the retry succeeds. Users whose
   refresh *also* fails are asked to sign in again. `EPIGRAPH_EXPLORER_DEV_BEARER`
   has no refresh and does not recover (see Local development).
+
+### Known limits
+
+- **Login CSRF is closed only by the topology.** Minting a fresh login
+  binding on every `/auth/login` would not close it: an attacker learns their
+  own fresh value from their own `Set-Cookie` and tosses that to the victim.
+  What closes it is the `__Host-` prefix, which needs the Explorer at the
+  root of its own secure host (Deploy). A base-path or co-hosted deploy
+  leaves it open.
+- **The dev-bearer guard checks configuration, not the request.**
+  `EPIGRAPH_EXPLORER_DEV_BEARER` is refused unless the *configured* public
+  base URL is `localhost` or `127.0.0.1`. It does not look at where a request
+  came from, so a proxy that forwards outside traffic to an Explorer started
+  that way would sign every visitor in with that token. It is a loopback-only
+  development aid; never set it on a host anything else can reach.
+- **The consent page shows a name the registrant chose.** The API's consent
+  page names the requesting client by its `client_name`, which whoever
+  registered the client picked, so the name alone does not prove which
+  application is asking. That is the API's consent UI to fix.
+- **Untested surfaces.** The `Dockerfile` has never been built, and neither
+  the Notion embed nor Safari is exercised by any test; every test stubs the
+  API. Build the image and check those browsers at deploy (Deploy §7).
