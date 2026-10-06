@@ -1389,6 +1389,74 @@ async fn logout_survives_a_failed_revocation() {
     assert_eq!(res.header_all("set-cookie").len(), 2);
 }
 
+/// Logout during a refresh waits for it, then revokes the token the refresh
+/// minted: exactly one revocation, of the rotated token `r2`, and none of
+/// `r1`, which upstream has already rotated out. (Without the wait, logout
+/// would revoke the spent `r1`, a no-op upstream, and leave `r2` to the
+/// refresh's abandoned-token path.) The logout is sent once the refresh POST
+/// presenting `r1` has reached upstream, observed rather than slept for, and
+/// that POST's answer is delayed, so the two overlap.
+#[tokio::test]
+async fn logout_during_a_refresh_revokes_the_rotated_token_once() {
+    let app = app().await;
+    token_call(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "r1"),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(
+        ResponseTemplate::new(200)
+            .set_body_json(token_json("a2", "r2"))
+            .set_delay(StdDuration::from_millis(400)),
+    )
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/probe"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&app.upstream)
+        .await;
+    // Expired: the extractor refreshes before the page runs.
+    let sid =
+        app.state
+            .sessions
+            .create("a1".into(), "r1".into(), Utc::now() - Duration::seconds(5));
+
+    let page = app.get_as("/explorer/probe", &sid);
+    let logout = async {
+        let waited = std::time::Instant::now();
+        while token_posts_presenting(&app, "r1").await == 0 {
+            assert!(
+                waited.elapsed() < StdDuration::from_secs(2),
+                "the refresh never reached upstream"
+            );
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        post_logout(&app, Some(&sid), Some(ORIGIN)).await
+    };
+    let (_page, out) = tokio::join!(page, logout);
+    assert_eq!(out.status, StatusCode::SEE_OTHER);
+    assert!(app.state.sessions.get(&sid).is_none(), "signed out");
+    assert_eq!(token_posts_presenting(&app, "r1").await, 1, "one refresh");
+    assert_eq!(
+        revocations_of(&app, "r2").await,
+        1,
+        "the token the refresh minted is revoked, once"
+    );
+    assert_eq!(
+        revocations_of(&app, "r1").await,
+        0,
+        "logout waited for the refresh: the rotated-out token is not presented"
+    );
+    app.upstream.verify().await;
+}
+
 // ---- housekeeping -----------------------------------------------------------------
 
 #[tokio::test]
