@@ -563,10 +563,15 @@ mod tests {
                 "limits must echo the budget"
             );
         }
-        // Deterministic: the same lineage serialises byte-identically.
+        // Secondary check: two INDEPENDENTLY built lineages (separate
+        // HashMaps, separate random hash seeds, so different iteration
+        // orders) serialise byte-identically. The id pin in
+        // `per_claim_caps_bound_evidence_and_traces_and_flag_the_cut` is the
+        // real guard on which rows a cut keeps.
+        let other = lineage(80, 6, 2_000);
         assert_eq!(
             build_bundle(uuid(1), &l, limits(DEFAULT_MAX_OUTPUT_CHARS)),
-            build_bundle(uuid(1), &l, limits(DEFAULT_MAX_OUTPUT_CHARS))
+            build_bundle(uuid(1), &other, limits(DEFAULT_MAX_OUTPUT_CHARS))
         );
     }
 
@@ -621,6 +626,33 @@ mod tests {
             Value::from(MAX_EVIDENCE_PER_CLAIM)
         );
         assert_eq!(b["trace_entity_count"], Value::from(MAX_TRACES_PER_CLAIM));
+        // WHICH rows the cap keeps: the smallest ids, in id order, not a
+        // HashMap-order sample that changes from call to call. `from_u128`
+        // is big-endian, so Uuid order is numeric order here.
+        let expected_evidence: Vec<String> = (0..MAX_EVIDENCE_PER_CLAIM as u128)
+            .map(|k| format!("evidence:{}", uuid(1_000_000 + 1_000 + k)))
+            .collect();
+        assert_eq!(target["evidence_ids"], serde_json::json!(expected_evidence));
+        let emitted_evidence: Vec<&str> = b["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["@id"].as_str().filter(|i| i.starts_with("evidence:")))
+            .collect();
+        assert_eq!(emitted_evidence, expected_evidence);
+        // The target's own trace `uuid(3_000_001)` sorts before the 15 extra
+        // `uuid(5_000_000 + k)`, so the kept ten are it plus k = 0..9.
+        let expected_traces: Vec<String> = std::iter::once(uuid(3_000_001))
+            .chain((0..MAX_TRACES_PER_CLAIM as u128 - 1).map(|k| uuid(5_000_000 + k)))
+            .map(|t| format!("trace:{t}"))
+            .collect();
+        let emitted_traces: Vec<&str> = b["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["@id"].as_str().filter(|i| i.starts_with("trace:")))
+            .collect();
+        assert_eq!(emitted_traces, expected_traces);
         // The lineage itself was not cut and the budget was not hit; the
         // per-claim cap alone must still mark the bundle incomplete.
         assert_eq!(b["budget_exhausted"], Value::Bool(false));
