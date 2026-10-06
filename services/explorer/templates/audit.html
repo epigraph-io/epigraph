@@ -39,7 +39,7 @@
   {%- if c.reads_beyond_own %}
   <p class="notice" data-audit="beyond-own">This window includes events of other agents, or of no agent: this account reads more than its own security events.</p>
   {%- else if c.is_own() %}
-  <p class="small muted" data-audit="own">You see only your own security events.</p>
+  <p class="small muted" data-audit="own">Every event in this window is one of your own security events. That alone does not show whether this account may read other agents' events: a quiet window, failures only or one event type can hold only your own rows either way.</p>
   {%- else %}
   <p class="small muted" data-audit="scope-unknown">This window does not show whose security events this account may read: it holds no event, or your access token names no agent to compare them with.</p>
   {%- endif %}

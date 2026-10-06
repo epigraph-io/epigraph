@@ -43,7 +43,14 @@ const SCOPE_UNKNOWN: &str = "does not show whose security events this account ma
 fn tok() -> String {
     common::jwt_with_agent(AGENT)
 }
-const OWN_EVENTS: &str = "You see only your own security events";
+/// The own-window note states a fact about the WINDOW. Whether the account
+/// may read other agents' events is not something a window of the viewer's
+/// own rows can show (an instance admin's quiet window holds only their own
+/// rows too), so the note must not claim it.
+const OWN_EVENTS: &str = "Every event in this window is one of your own security events";
+const OWN_NOT_PROVEN: &str = "does not show whether this account may read other agents";
+/// The account-level sentence the own note used to make from a window.
+const ACCOUNT_CLAIM: &str = "You see only your own security events";
 const BEYOND_OWN: &str = "reads more than its own security events";
 
 fn event_id(n: u64) -> String {
@@ -801,6 +808,17 @@ async fn audit_scope_note_judges_the_rows_against_the_viewers_own_agent() {
                 res.body
             );
         }
+        assert_eq!(
+            res.body.contains(OWN_NOT_PROVEN),
+            note == OWN_EVENTS,
+            "{label}: an own window says what it cannot show: {}",
+            res.body
+        );
+        assert!(
+            !res.body.contains(ACCOUNT_CLAIM),
+            "{label}: no window proves the account reads only its own events: {}",
+            res.body
+        );
     }
 
     // A token that names no agent (not a JWT): one agent's rows cannot be

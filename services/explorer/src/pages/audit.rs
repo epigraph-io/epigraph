@@ -18,7 +18,11 @@
 //! the rows it read with the viewer's own agent id (the `agent_id` its access
 //! token names, [`crate::upstream::identity::token_agent_id`]), which is the
 //! id the kernel writes on the viewer's own events:
-//! - every row is the viewer's own: "you see only your own security events";
+//! - every row is the viewer's own: "every event in this window is one of
+//!   your own security events", stated as a fact about the window only. A
+//!   window of the viewer's own rows does not show what the ACCOUNT may read
+//!   (an instance admin's quiet, failures-only or drilled window holds only
+//!   their own rows too), so the note says that it does not;
 //! - a row has no agent, or another agent's id: this account reads more than
 //!   its own events;
 //! - no row, or the viewer's own id is not known (a token that names no
@@ -187,7 +191,8 @@ pub struct EventRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventScope {
-    /// Every row is the viewer's own.
+    /// Every row is the viewer's own. A fact about the window only: it does
+    /// not show that the account may read no one else's events.
     Own,
     /// A row has no agent, or names an agent that is not the viewer.
     BeyondOwn,

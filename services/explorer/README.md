@@ -140,10 +140,12 @@ bare date, and `since` defaults to 24 hours ago.
   Which events a viewer may read is the API's decision. The page compares
   the rows it read with the viewer's own agent (the one the access token
   names, as the identity strip shows it): when every row is the viewer's
-  own it says "you see only your own security events"; when a row has no
-  agent or another agent's id, it says this account reads more than its own
-  events; when the window holds no event, or the token names no agent, it
-  says the window cannot tell. It also says, on every view, that it shows
+  own it says every event in this window is one of your own, and that this
+  alone does not show whether the account may read other agents' events (an
+  instance admin's quiet window holds only their own rows too); when a row
+  has no agent or another agent's id, it says this account reads more than
+  its own events; when the window holds no event, or the token names no
+  agent, it says the window cannot tell. It also says, on every view, that it shows
   only events the viewer may read, and that refresh-token volume and
   liveness are not in this trail.
 - **`/activity`** shows, for each agent in `EPIGRAPH_EXPLORER_WATCH_AGENTS`,
