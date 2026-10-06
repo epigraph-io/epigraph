@@ -2299,6 +2299,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "workflow.rs",
+        "lock_lineages_for_deprecation",
+        "READ of `workflows` only, `FOR UPDATE`: locks the rows sharing a `canonical_name` with \
+         a deprecation's targets, so two concurrent deprecations cannot each keep a claim the \
+         other retires. `workflows` has no row security and no policy, so there is nothing for \
+         a viewer to filter; the caller's authority is `require_workflow_authority`.",
+    ),
+    (
+        "workflow.rs",
         "executed_structural_claims",
         "READ of `edges`/`claims`/`workflows`: the level 0-2 claims a hierarchical workflow \
          `executes`, each with whether another live workflow executes it. It plans the WRITE \

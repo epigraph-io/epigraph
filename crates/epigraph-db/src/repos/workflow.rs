@@ -1396,6 +1396,47 @@ impl WorkflowRepository {
         .await
     }
 
+    /// Lock, `FOR UPDATE` and in id order, every `workflows` row that shares a
+    /// `canonical_name` with any of `ids` (U017; backlog fe874d2a).
+    ///
+    /// # Why
+    ///
+    /// [`Self::executed_structural_claims`] decides a claim is `shared` by
+    /// reading OTHER workflows' `truth_value`. Under READ COMMITTED two
+    /// concurrent deprecations of one lineage (say gen0 and gen1) would each
+    /// read the other as live, because the other's `truth_value = 0.05` is not
+    /// yet committed, and each would keep the step they share. Both commit, and
+    /// the step stays current with no live workflow executing it: the stranded
+    /// state the deprecation exists to prevent (write skew).
+    ///
+    /// Every possible sharer of a level 0-2 claim carries the same
+    /// `canonical_name`, because that claim's id is
+    /// `compound_claim_id(hash(text), canonical_name)` in both the ingest
+    /// builder and `add_step`. So locking the rows of those canonical names
+    /// serializes every pair of deprecations that could share a claim. A
+    /// second deprecation waits for the first to commit, and its next
+    /// statement takes a fresh snapshot that sees the first one's 0.05. Taking
+    /// the locks in id order means two such calls cannot deadlock each other.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn lock_lineages_for_deprecation<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        ids: &[Uuid],
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT w.id FROM workflows w \
+              WHERE w.canonical_name IN ( \
+                    SELECT t.canonical_name FROM workflows t WHERE t.id = ANY($1::uuid[])) \
+              ORDER BY w.id \
+                FOR UPDATE",
+        )
+        .bind(ids)
+        .fetch_all(executor)
+        .await?;
+        Ok(())
+    }
+
     /// The thesis, phase and step claims (levels 0-2) that hierarchical
     /// workflow `workflow_id` executes and that are still current, each with
     /// whether ANOTHER live workflow also executes it (U017; backlog

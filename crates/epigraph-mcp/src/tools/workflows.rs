@@ -1500,6 +1500,9 @@ pub async fn deprecate_workflow(
 ///   refusal writes nothing. A legacy row with no recorded submitter gets
 ///   U005's rule (admin-only over the authenticated transport); stdio is
 ///   unchecked, the batch H-b bar.
+/// * Every `workflows` row sharing a `canonical_name` with a target is locked
+///   first, so two concurrent deprecations of one lineage cannot each keep a
+///   claim the other is retiring.
 /// * Per target: `workflows.truth_value` to 0.05, then every level 0-2 claim
 ///   it executes that no live workflow outside the target set also executes
 ///   is retired (`is_current = false`, both ANN columns nulled). A claim a
@@ -1533,6 +1536,13 @@ async fn deprecate_hierarchical_workflow(
             }
         }
     }
+
+    // Serialize against any other deprecation that could share a claim with
+    // this target set, BEFORE the sharing rule reads other workflows' truth
+    // (write skew; see `lock_lineages_for_deprecation`).
+    WorkflowRepository::lock_lineages_for_deprecation(&mut *tx, &targets)
+        .await
+        .map_err(internal_error)?;
 
     // Authority over the WHOLE target set before the first write.
     let mut grants = Vec::with_capacity(targets.len());
