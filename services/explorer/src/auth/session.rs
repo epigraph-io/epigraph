@@ -1,4 +1,6 @@
-//! In-memory sessions and the `epx_session` cookie (plan §3.3).
+//! In-memory sessions and the session cookie (plan §3.3): `__Host-epx_session`
+//! when served securely at the root, else `epx_session`
+//! ([`Config::cookie_host_prefix`]).
 //!
 //! A session id is 256 random bits, base64url (43 chars). The store maps it to
 //! the user's upstream tokens. A restart empties the store and every user
@@ -17,7 +19,10 @@ use rand::RngCore;
 
 use crate::config::Config;
 
+/// The session cookie's name under a base path or with insecure cookies.
 pub const SESSION_COOKIE: &str = "epx_session";
+/// The session cookie's name when served securely at the root.
+pub const HOST_SESSION_COOKIE: &str = "__Host-epx_session";
 /// Cookie lifetime; matches the upstream refresh token's 30 days.
 pub const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 
@@ -209,15 +214,27 @@ fn to_header(c: &Cookie<'_>) -> HeaderValue {
     HeaderValue::from_str(&c.to_string()).expect("cookie built from validated parts")
 }
 
+/// The session cookie's name for this deployment. It is the only name read:
+/// in `__Host-` mode a plain `epx_session`, which a sibling host could have
+/// set with `Domain=`, is ignored.
+pub fn session_cookie_name(config: &Config) -> &'static str {
+    if config.cookie_host_prefix() {
+        HOST_SESSION_COOKIE
+    } else {
+        SESSION_COOKIE
+    }
+}
+
 fn base_cookie<'c>(config: &Config, value: String) -> Cookie<'c> {
-    let mut c = Cookie::new(SESSION_COOKIE, value);
+    let mut c = Cookie::new(session_cookie_name(config), value);
     c.set_path(config.cookie_path().to_string());
     c.set_http_only(true);
     c
 }
 
 /// `Set-Cookie` for a first-party sign-in: `HttpOnly; SameSite=Lax;
-/// Path={base_path}; Secure` (unless `INSECURE_COOKIES`), 30-day max-age.
+/// Path={base_path}; Secure` (unless `INSECURE_COOKIES`), 30-day max-age,
+/// named per [`session_cookie_name`].
 pub fn session_cookie(config: &Config, id: &SessionId) -> HeaderValue {
     let mut c = base_cookie(config, id.as_str().to_string());
     c.set_same_site(SameSite::Lax);
@@ -290,11 +307,11 @@ pub fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     Some(first.to_string())
 }
 
-/// The session id from `epx_session`, if well-formed and sent exactly once
-/// (a duplicated session cookie reads as signed out). Does not check the
-/// store.
-pub fn read_session_cookie(headers: &HeaderMap) -> Option<SessionId> {
-    read_cookie(headers, SESSION_COOKIE).and_then(|v| SessionId::parse(&v))
+/// The session id from this deployment's session cookie
+/// ([`session_cookie_name`]), if well-formed and sent exactly once (a
+/// duplicated session cookie reads as signed out). Does not check the store.
+pub fn read_session_cookie(config: &Config, headers: &HeaderMap) -> Option<SessionId> {
+    read_cookie(headers, session_cookie_name(config)).and_then(|v| SessionId::parse(&v))
 }
 
 #[cfg(test)]
@@ -352,15 +369,55 @@ mod tests {
         assert!(s.is_empty());
     }
 
+    /// A `Set-Cookie` line as `name=value` followed by its attributes, each
+    /// trimmed, so `Path=` can be compared exactly (`contains("Path=/")` would
+    /// also match `Path=/explorer`).
+    fn parts(v: &HeaderValue) -> Vec<String> {
+        v.to_str()
+            .unwrap()
+            .split(';')
+            .map(|p| p.trim().to_string())
+            .collect()
+    }
+
+    fn has(parts: &[String], attr: &str) -> bool {
+        parts.iter().skip(1).any(|p| p == attr)
+    }
+
+    /// What a browser requires of a `__Host-` cookie: `Secure`, exactly
+    /// `Path=/` and no `Domain`. A line that misses any is dropped.
+    fn assert_host_prefix_rules(parts: &[String]) {
+        assert!(parts[0].starts_with("__Host-"), "{parts:?}");
+        assert!(has(parts, "Secure"), "{parts:?}");
+        assert!(has(parts, "Path=/"), "{parts:?}");
+        assert!(
+            !parts
+                .iter()
+                .any(|p| p.to_ascii_lowercase().starts_with("domain")),
+            "{parts:?}"
+        );
+    }
+
     #[test]
     fn session_cookie_attributes() {
-        let c = config(&[(ENV_PUBLIC_BASE_URL, "https://explorer.example.com/explorer")]);
         let id = SessionId::generate();
-        let v = session_cookie(&c, &id).to_str().unwrap().to_string();
-        assert!(
-            v.starts_with(&format!("epx_session={}", id.as_str())),
-            "{v}"
-        );
+
+        // Secure, at the root: the `__Host-` prefix, so no sibling host can
+        // set or shadow it.
+        let root = config(&[(ENV_PUBLIC_BASE_URL, "https://explorer.example.com")]);
+        let p = parts(&session_cookie(&root, &id));
+        assert_eq!(p[0], format!("__Host-epx_session={}", id.as_str()));
+        assert_host_prefix_rules(&p);
+        for attr in ["HttpOnly", "SameSite=Lax", "Max-Age=2592000"] {
+            assert!(has(&p, attr), "{attr} missing from {p:?}");
+        }
+        assert!(!has(&p, "Partitioned"), "{p:?}");
+
+        // Secure, under a base path: `__Host-` needs `Path=/`, so the plain
+        // name, scoped to the base path.
+        let based = config(&[(ENV_PUBLIC_BASE_URL, "https://explorer.example.com/explorer")]);
+        let p = parts(&session_cookie(&based, &id));
+        assert_eq!(p[0], format!("epx_session={}", id.as_str()));
         for attr in [
             "HttpOnly",
             "SameSite=Lax",
@@ -368,17 +425,41 @@ mod tests {
             "Path=/explorer",
             "Max-Age=2592000",
         ] {
-            assert!(v.contains(attr), "{attr} missing from {v}");
+            assert!(has(&p, attr), "{attr} missing from {p:?}");
         }
-        assert!(!v.contains("Partitioned"));
+        assert!(!has(&p, "Partitioned"), "{p:?}");
 
+        // Insecure loopback dev: the plain name (a browser drops a `__Host-`
+        // cookie without `Secure`), no `Secure`.
         let insecure = config(&[
             (ENV_PUBLIC_BASE_URL, "http://localhost:8096"),
             (ENV_INSECURE_COOKIES, "true"),
         ]);
-        let v = session_cookie(&insecure, &id).to_str().unwrap().to_string();
-        assert!(!v.contains("Secure"), "{v}");
-        assert!(v.contains("Path=/"), "{v}");
+        let p = parts(&session_cookie(&insecure, &id));
+        assert_eq!(p[0], format!("epx_session={}", id.as_str()));
+        assert!(has(&p, "Path=/"), "{p:?}");
+        assert!(!has(&p, "Secure"), "{p:?}");
+    }
+
+    /// In `__Host-` mode every line that sets or clears the session cookie
+    /// uses the prefixed name and the browser's rules for it: the embed
+    /// cookie and both clears are separate jar entries of the same name.
+    #[test]
+    fn prefixed_mode_names_every_session_cookie_line() {
+        let root = config(&[(ENV_PUBLIC_BASE_URL, "https://explorer.example.com")]);
+        let id = SessionId::generate();
+        let embed = parts(&embed_session_cookie(&root, &id));
+        assert_eq!(embed[0], format!("__Host-epx_session={}", id.as_str()));
+        assert!(has(&embed, "Partitioned") && has(&embed, "SameSite=None"));
+        for line in [
+            &embed,
+            &parts(&clear_session_cookie(&root)),
+            &parts(&clear_embed_session_cookie(&root)),
+        ] {
+            assert!(line[0].starts_with("__Host-epx_session="), "{line:?}");
+            assert_host_prefix_rules(line);
+        }
+        assert!(has(&parts(&clear_session_cookie(&root)), "Max-Age=0"));
     }
 
     #[test]
@@ -389,10 +470,7 @@ mod tests {
             (ENV_PUBLIC_BASE_URL, "http://localhost:8096/explorer"),
             (ENV_INSECURE_COOKIES, "true"),
         ]);
-        let v = embed_session_cookie(&c, &SessionId::generate())
-            .to_str()
-            .unwrap()
-            .to_string();
+        let p = parts(&embed_session_cookie(&c, &SessionId::generate()));
         for attr in [
             "HttpOnly",
             "SameSite=None",
@@ -400,7 +478,7 @@ mod tests {
             "Partitioned",
             "Path=/explorer",
         ] {
-            assert!(v.contains(attr), "{attr} missing from {v}");
+            assert!(has(&p, attr), "{attr} missing from {p:?}");
         }
     }
 
@@ -419,6 +497,7 @@ mod tests {
 
     #[test]
     fn reads_cookie_from_any_header() {
+        let c = config(&[(ENV_PUBLIC_BASE_URL, "https://explorer.example.com/explorer")]);
         let id = SessionId::generate();
         let mut h = HeaderMap::new();
         h.append(header::COOKIE, HeaderValue::from_static("a=1; b=2"));
@@ -427,18 +506,19 @@ mod tests {
             HeaderValue::from_str(&format!("x=y; epx_session={}", id.as_str())).unwrap(),
         );
         assert_eq!(read_cookie(&h, "b").as_deref(), Some("2"));
-        assert_eq!(read_session_cookie(&h), Some(id));
+        assert_eq!(read_session_cookie(&c, &h), Some(id));
 
         let mut junk = HeaderMap::new();
         junk.insert(
             header::COOKIE,
             HeaderValue::from_static("epx_session=../../etc"),
         );
-        assert_eq!(read_session_cookie(&junk), None);
+        assert_eq!(read_session_cookie(&c, &junk), None);
     }
 
     #[test]
     fn a_duplicated_cookie_reads_as_absent() {
+        let c = config(&[(ENV_PUBLIC_BASE_URL, "https://explorer.example.com/explorer")]);
         let a = SessionId::generate();
         let b = SessionId::generate();
         // Two values in one header, and one value in each of two headers.
@@ -466,7 +546,7 @@ mod tests {
                 None,
                 "even an identical repeat"
             );
-            assert_eq!(read_session_cookie(h), None);
+            assert_eq!(read_session_cookie(&c, h), None);
         }
         // Another cookie on the same request is unaffected.
         one_header.append(header::COOKIE, HeaderValue::from_static("epx_login=x"));

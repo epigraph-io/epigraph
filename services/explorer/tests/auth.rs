@@ -19,7 +19,9 @@ use chrono::{Duration, Utc};
 use common::{spawn, spawn_with, TestApp, TestResponse};
 use epigraph_explorer::auth::flow::{Handoff, PendingLogin, MAX_PENDING_LOGINS};
 use epigraph_explorer::auth::{oauth, RefreshError, SessionId, SignedIn};
-use epigraph_explorer::config::{ENV_CLIENT_ID, ENV_OAUTH_BASE_URL};
+use epigraph_explorer::config::{
+    ENV_CLIENT_ID, ENV_INSECURE_COOKIES, ENV_OAUTH_BASE_URL, ENV_PUBLIC_BASE_URL,
+};
 use epigraph_explorer::{app as explorer_app, AppError, AppState};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1383,4 +1385,262 @@ async fn a_token_wider_than_requested_is_flagged_on_the_session() {
         !app.state.sessions.get(&sid).unwrap().scope_widened,
         "a refresh to the requested scope clears the flag"
     );
+}
+
+// ---- cookie names per deployment mode ---------------------------------------------
+
+/// An app at `base` (a public base URL) with sign-in configured.
+async fn app_at(base: &str, extra: &[(&str, &str)]) -> TestApp {
+    let mut env = vec![
+        (ENV_PUBLIC_BASE_URL, base),
+        (ENV_CLIENT_ID, CLIENT_ID),
+        (ENV_OAUTH_BASE_URL, OAUTH_BASE),
+    ];
+    env.extend_from_slice(extra);
+    spawn_with(
+        &env,
+        Router::new()
+            .route("/probe", get(probe))
+            .route("/bff/probe", get(probe)),
+    )
+    .await
+}
+
+/// A `Set-Cookie` line's attributes, trimmed, so `Path=` compares exactly.
+fn cookie_attrs(line: &str) -> Vec<&str> {
+    line.split(';').skip(1).map(str::trim).collect()
+}
+
+/// A browser keeps a `__Host-` cookie only with `Secure`, exactly `Path=/`
+/// and no `Domain`.
+fn assert_host_prefix_rules(line: &str) {
+    let a = cookie_attrs(line);
+    assert!(line.starts_with("__Host-"), "{line}");
+    assert!(a.contains(&"Secure"), "{line}");
+    assert!(
+        a.contains(&"Path=/"),
+        "`__Host-` needs exactly Path=/: {line}"
+    );
+    assert!(
+        !a.iter()
+            .any(|x| x.to_ascii_lowercase().starts_with("domain")),
+        "{line}"
+    );
+}
+
+/// Run `/auth/login` then `/auth/callback` through the real routes of an app
+/// served at `base_path`, sending back the binding under `login_name`.
+/// Returns the session id and the two `Set-Cookie` lines (session, binding).
+async fn sign_in_through_the_flow(
+    app: &TestApp,
+    base_path: &str,
+    redirect_uri: &str,
+    login_name: &str,
+    session_name: &str,
+) -> (SessionId, String, String) {
+    let res = app.get(&format!("{base_path}/auth/login")).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let (binding, login_line) = set_cookie(&res, login_name)
+        .unwrap_or_else(|| panic!("no {login_name}: {:?}", res.header_all("set-cookie")));
+    let location = Url::parse(res.location().expect("Location")).unwrap();
+    let params: HashMap<String, String> = location.query_pairs().into_owned().collect();
+    assert_eq!(params["redirect_uri"], redirect_uri);
+    let verifier = app
+        .state
+        .auth_flow
+        .pending
+        .get(&params["state"])
+        .expect("pending login")
+        .pkce_verifier;
+    token_call(&[
+        ("grant_type", "authorization_code"),
+        ("code", "c0de"),
+        ("code_verifier", &verifier),
+        ("redirect_uri", redirect_uri),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(token_json("access-1", "refresh-1")))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+
+    let res = app
+        .get_with(
+            &format!(
+                "{base_path}/auth/callback?code=c0de&state={}",
+                params["state"]
+            ),
+            &[("cookie", &format!("{login_name}={binding}"))],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let (sid, session_line) = set_cookie(&res, session_name)
+        .unwrap_or_else(|| panic!("no {session_name}: {:?}", res.header_all("set-cookie")));
+    let sid = SessionId::parse(&sid).expect("well-formed session id");
+    (sid, session_line, login_line)
+}
+
+/// Secure at the root, both cookies carry `__Host-`: a sibling host can toss
+/// a `Domain=` cookie of a plain name, never of a `__Host-` one, so the
+/// session swap and login CSRF that tossing enables are closed.
+#[tokio::test]
+async fn session_cookie_is_host_prefixed_at_root_when_secure() {
+    let app = app_at("https://explorer.example.com", &[]).await;
+    let (sid, session_line, login_line) = sign_in_through_the_flow(
+        &app,
+        "",
+        "https://explorer.example.com/auth/callback",
+        "__Host-epx_login",
+        "__Host-epx_session",
+    )
+    .await;
+    for line in [&session_line, &login_line] {
+        assert_host_prefix_rules(line);
+        assert!(cookie_attrs(line).contains(&"HttpOnly"), "{line}");
+        assert!(cookie_attrs(line).contains(&"SameSite=Lax"), "{line}");
+    }
+
+    // The session round-trips under the prefixed name. One upstream call in
+    // total: none of the refused requests below reaches upstream.
+    mount_probe(&app, "access-1", 200, 1).await;
+    let prefixed = format!("__Host-epx_session={}", sid.as_str());
+    let res = app.get_with("/probe", &[("cookie", &prefixed)]).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.json()["token_seen"], "access-1");
+
+    // The plain name is not read in this mode, even carrying a live id.
+    let plain = format!("epx_session={}", sid.as_str());
+    let res = app.get_with("/probe", &[("cookie", &plain)]).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert!(
+        res.location()
+            .is_some_and(|l| l.starts_with("/auth/login?return_to=")),
+        "{:?}",
+        res.location()
+    );
+
+    // A duplicated prefixed cookie is still refused, and both prefixed jar
+    // entries are cleared.
+    let other = epigraph_explorer::auth::random_token(32);
+    let twice = format!("{prefixed}; __Host-epx_session={other}");
+    let res = app.get_with("/probe", &[("cookie", &twice)]).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let cleared = res.header_all("set-cookie");
+    assert_eq!(cleared.len(), 2, "{cleared:?}");
+    for c in &cleared {
+        assert!(c.starts_with("__Host-epx_session=;"), "{c}");
+        assert!(cookie_attrs(c).contains(&"Max-Age=0"), "{c}");
+        assert_host_prefix_rules(c);
+    }
+
+    // A login binding under the plain name is not this browser's.
+    let res = app.get("/auth/login").await;
+    let (binding, _) = set_cookie(&res, "__Host-epx_login").expect("prefixed binding");
+    let state = Url::parse(res.location().unwrap())
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+    let res = app
+        .get_with(
+            &format!("/auth/callback?code=c0de&state={state}"),
+            &[("cookie", &format!("epx_login={binding}"))],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert!(res.body.contains("started in this browser"), "{}", res.body);
+
+    // Logout reads the prefixed cookie and clears both prefixed entries.
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let res = send_with(
+        &app,
+        Method::POST,
+        "/auth/logout",
+        &[
+            ("origin", "https://explorer.example.com"),
+            ("cookie", &prefixed),
+        ],
+        "",
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert!(app.state.sessions.get(&sid).is_none(), "session dropped");
+    let cleared = res.header_all("set-cookie");
+    assert_eq!(cleared.len(), 2, "{cleared:?}");
+    for c in &cleared {
+        assert!(c.starts_with("__Host-epx_session=;"), "{c}");
+        assert_host_prefix_rules(c);
+    }
+}
+
+/// Plain-http loopback dev keeps the plain names (a browser drops a `__Host-`
+/// cookie without `Secure`), so local sign-in still works.
+#[tokio::test]
+async fn insecure_loopback_cookie_is_unprefixed_and_sign_in_works() {
+    let app = app_at("http://localhost:8096", &[(ENV_INSECURE_COOKIES, "true")]).await;
+    let (sid, session_line, login_line) = sign_in_through_the_flow(
+        &app,
+        "",
+        "http://localhost:8096/auth/callback",
+        "epx_login",
+        "epx_session",
+    )
+    .await;
+    assert!(
+        cookie_attrs(&session_line).contains(&"Path=/"),
+        "{session_line}"
+    );
+    assert!(
+        cookie_attrs(&login_line).contains(&"Path=/auth"),
+        "{login_line}"
+    );
+    for line in [&session_line, &login_line] {
+        assert!(!cookie_attrs(line).contains(&"Secure"), "{line}");
+    }
+
+    mount_probe(&app, "access-1", 200, 1).await;
+    let res = app
+        .get_with(
+            "/probe",
+            &[("cookie", &format!("epx_session={}", sid.as_str()))],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.json()["token_seen"], "access-1");
+}
+
+/// Under a base path `__Host-` is unavailable (it needs `Path=/`), so the
+/// plain names, scoped to the base path, and sign-in still works.
+#[tokio::test]
+async fn base_path_deploy_uses_unprefixed_cookies() {
+    let app = app().await;
+    let (sid, session_line, login_line) =
+        sign_in_through_the_flow(&app, "/explorer", REDIRECT_URI, "epx_login", "epx_session").await;
+    assert!(
+        cookie_attrs(&session_line).contains(&"Path=/explorer"),
+        "{session_line}"
+    );
+    assert!(
+        cookie_attrs(&login_line).contains(&"Path=/explorer/auth"),
+        "{login_line}"
+    );
+    for line in [&session_line, &login_line] {
+        assert!(cookie_attrs(line).contains(&"Secure"), "{line}");
+    }
+
+    mount_probe(&app, "access-1", 200, 1).await;
+    let res = app
+        .get_with(
+            "/explorer/probe",
+            &[("cookie", &format!("epx_session={}", sid.as_str()))],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.json()["token_seen"], "access-1");
 }

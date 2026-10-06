@@ -24,8 +24,14 @@ pub const MAX_PENDING_LOGINS: usize = 10_000;
 /// Binds a pending login to the browser that started it, so a callback URL
 /// replayed into another browser (login CSRF) is refused. `Path={base}/auth`,
 /// `SameSite=Lax` (the callback is a top-level GET navigation back from the
-/// API origin, which Lax allows), 10-minute max-age.
+/// API origin, which Lax allows), 10-minute max-age. The name under a base
+/// path or with insecure cookies.
 pub const PRE_AUTH_COOKIE: &str = "epx_login";
+/// The binding's name when served securely at the root
+/// ([`Config::cookie_host_prefix`]). No other host can set a `__Host-`
+/// cookie, so a binding tossed in by a sibling host cannot pass. It has
+/// `Path=/`, which `__Host-` requires.
+pub const HOST_PRE_AUTH_COOKIE: &str = "__Host-epx_login";
 /// Longest `return_to` accepted.
 const MAX_RETURN_TO: usize = 2048;
 
@@ -39,7 +45,8 @@ pub struct PendingLogin {
     /// `mode=popup` (embed sign-in): the callback posts a handoff code to
     /// `window.opener` instead of setting a first-party cookie.
     pub popup: bool,
-    /// Value of the [`PRE_AUTH_COOKIE`] the login was started with.
+    /// Value of the pre-auth binding cookie ([`pre_auth_cookie_name`]) the
+    /// login was started with.
     pub binding: String,
     pub created_at: Instant,
 }
@@ -80,10 +87,24 @@ pub fn is_token_shaped(raw: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// The pre-auth binding's name for this deployment, and the only name read.
+pub fn pre_auth_cookie_name(config: &Config) -> &'static str {
+    if config.cookie_host_prefix() {
+        HOST_PRE_AUTH_COOKIE
+    } else {
+        PRE_AUTH_COOKIE
+    }
+}
+
 /// `Set-Cookie` for the pre-auth binding.
 pub fn pre_auth_cookie(config: &Config, binding: &str) -> HeaderValue {
-    let mut c = Cookie::new(PRE_AUTH_COOKIE, binding.to_string());
-    c.set_path(format!("{}/auth", config.base_path));
+    let mut c = Cookie::new(pre_auth_cookie_name(config), binding.to_string());
+    if config.cookie_host_prefix() {
+        // A browser drops a `__Host-` cookie whose path is not `/`.
+        c.set_path("/");
+    } else {
+        c.set_path(format!("{}/auth", config.base_path));
+    }
     c.set_http_only(true);
     c.set_same_site(SameSite::Lax);
     c.set_secure(config.cookie_secure());
@@ -96,8 +117,8 @@ pub fn pre_auth_cookie(config: &Config, binding: &str) -> HeaderValue {
 /// The pre-auth binding from the request, if well-formed and sent exactly
 /// once. A duplicated binding reads as absent, so the callback is refused
 /// and the next `/auth/login` mints a fresh binding.
-pub fn read_pre_auth_cookie(headers: &HeaderMap) -> Option<String> {
-    read_cookie(headers, PRE_AUTH_COOKIE).filter(|v| is_token_shaped(v))
+pub fn read_pre_auth_cookie(config: &Config, headers: &HeaderMap) -> Option<String> {
+    read_cookie(headers, pre_auth_cookie_name(config)).filter(|v| is_token_shaped(v))
 }
 
 /// `raw` if it is a safe post-login destination, else the home page.
@@ -316,6 +337,56 @@ mod tests {
         let c = Config::from_lookup(|k| map.get(k).cloned()).unwrap();
         let v = pre_auth_cookie(&c, &binding).to_str().unwrap().to_string();
         assert!(v.contains("Path=/auth") && !v.contains("Secure"), "{v}");
+    }
+
+    /// Secure, at the root, the binding is a `__Host-` cookie. `__Host-`
+    /// needs exactly `Path=/`, so it is not scoped to `/auth` there: a
+    /// browser drops a `__Host-` cookie with any other path, and every
+    /// callback would then be refused.
+    #[test]
+    fn pre_auth_cookie_is_host_prefixed_at_root() {
+        let map: HashMap<String, String> = [(
+            ENV_PUBLIC_BASE_URL.to_string(),
+            "https://explorer.example.com".to_string(),
+        )]
+        .into();
+        let c = Config::from_lookup(|k| map.get(k).cloned()).unwrap();
+        let binding = crate::auth::random_token(32);
+        let v = pre_auth_cookie(&c, &binding).to_str().unwrap().to_string();
+        let parts: Vec<&str> = v.split(';').map(str::trim).collect();
+        assert_eq!(parts[0], format!("__Host-epx_login={binding}"));
+        for attr in [
+            "HttpOnly",
+            "SameSite=Lax",
+            "Secure",
+            "Path=/",
+            "Max-Age=600",
+        ] {
+            assert!(parts[1..].contains(&attr), "{attr} missing from {v}");
+        }
+        assert!(
+            !parts
+                .iter()
+                .any(|p| p.to_ascii_lowercase().starts_with("domain")),
+            "{v}"
+        );
+
+        // Read back by the prefixed name only: an unprefixed binding, which
+        // a sibling host could have set, is not this site's.
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("epx_login={binding}")).unwrap(),
+        );
+        assert_eq!(read_pre_auth_cookie(&c, &h), None);
+        h.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("__Host-epx_login={binding}")).unwrap(),
+        );
+        assert_eq!(
+            read_pre_auth_cookie(&c, &h).as_deref(),
+            Some(binding.as_str())
+        );
     }
 
     #[test]

@@ -232,6 +232,17 @@ impl Config {
         !self.insecure_cookies
     }
 
+    /// Whether the session and login cookies carry the `__Host-` prefix.
+    ///
+    /// A browser keeps a `__Host-` cookie only when it is `Secure`, has
+    /// `Path=/` and names no `Domain`, and then no other host (a sibling
+    /// under the same parent included) can set or shadow it. So the prefix
+    /// applies only to secure cookies at the root; under a base path the
+    /// plain names are used, scoped to the base path.
+    pub fn cookie_host_prefix(&self) -> bool {
+        self.cookie_secure() && self.base_path.is_empty()
+    }
+
     /// The exact OAuth `redirect_uri` registered upstream.
     pub fn redirect_uri(&self) -> String {
         format!("{}{}/auth/callback", self.public_origin, self.base_path)

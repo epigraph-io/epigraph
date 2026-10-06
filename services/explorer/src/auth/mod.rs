@@ -46,7 +46,8 @@ pub use extract::{resolve_auth, Caller, PageCtx, RequestAuth, SignedIn, PRODUCT_
 pub use refresh::{refresh_session, RefreshError};
 pub use session::{
     clear_embed_session_cookie, clear_session_cookie, embed_session_cookie, random_token,
-    read_session_cookie, session_cookie, Session, SessionId, SessionStore, SESSION_COOKIE,
+    read_session_cookie, session_cookie, session_cookie_name, Session, SessionId, SessionStore,
+    HOST_SESSION_COOKIE, SESSION_COOKIE,
 };
 
 use flow::{Handoff, PendingLogin, HANDOFF_TTL, MAX_PENDING_LOGINS, PENDING_LOGIN_TTL};
@@ -75,9 +76,10 @@ pub async fn clear_duplicated_session_cookies(
     req: Request,
     next: Next,
 ) -> Response {
-    let duplicated = session::cookie_count(req.headers(), SESSION_COOKIE) > 1;
+    let name = session_cookie_name(&state.config);
+    let duplicated = session::cookie_count(req.headers(), name) > 1;
     let mut resp = next.run(req).await;
-    if duplicated && !sets_session_cookie(&resp) && !is_publicly_cacheable(&resp) {
+    if duplicated && !sets_session_cookie(&resp, name) && !is_publicly_cacheable(&resp) {
         tracing::warn!(
             "request carried the session cookie more than once; served signed out and cleared"
         );
@@ -91,8 +93,8 @@ pub async fn clear_duplicated_session_cookies(
     resp
 }
 
-fn sets_session_cookie(resp: &Response) -> bool {
-    let prefix = format!("{SESSION_COOKIE}=");
+fn sets_session_cookie(resp: &Response, name: &str) -> bool {
+    let prefix = format!("{name}=");
     resp.headers()
         .get_all(header::SET_COOKIE)
         .iter()
@@ -159,8 +161,8 @@ const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 /// and `state`, which must not be reflected into `og:url` or the header's
 /// sign-in link.
 fn page_ctx(state: &AppState, headers: &HeaderMap, current_path: String) -> PageCtx {
-    let signed_in =
-        read_session_cookie(headers).is_some_and(|id| state.sessions.get(&id).is_some());
+    let signed_in = read_session_cookie(&state.config, headers)
+        .is_some_and(|id| state.sessions.get(&id).is_some());
     PageCtx::new(state.links.clone(), current_path, signed_in)
 }
 
@@ -267,7 +269,8 @@ async fn login(
 
     // Reuse this browser's binding if it has one, so two tabs signing in at
     // once do not invalidate each other.
-    let binding = flow::read_pre_auth_cookie(&headers).unwrap_or_else(|| random_token(32));
+    let binding =
+        flow::read_pre_auth_cookie(&state.config, &headers).unwrap_or_else(|| random_token(32));
     let pkce_verifier = random_token(32);
     let code_challenge = oauth::pkce_challenge_s256(&pkce_verifier);
     let oauth_state = random_token(32);
@@ -320,7 +323,7 @@ async fn callback(
         );
     };
 
-    let bound = flow::read_pre_auth_cookie(&headers)
+    let bound = flow::read_pre_auth_cookie(&state.config, &headers)
         .is_some_and(|c| bool::from(c.as_bytes().ct_eq(pending.binding.as_bytes())));
     if !bound {
         tracing::warn!(
@@ -409,7 +412,7 @@ async fn callback(
 
     // A fresh id on every sign-in (no fixation); the browser's previous
     // session, if any, is replaced rather than left in the store.
-    if let Some(old) = read_session_cookie(&headers) {
+    if let Some(old) = read_session_cookie(&state.config, &headers) {
         state.sessions.remove(&old);
     }
     see_other(
@@ -491,7 +494,7 @@ async fn redeem(
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
     require_same_origin(&state, &headers)?;
 
-    if let Some(id) = read_session_cookie(&headers) {
+    if let Some(id) = read_session_cookie(&state.config, &headers) {
         // Wait out an in-flight refresh so the token revoked below is the
         // latest rotation, not one that was replaced a moment later.
         let lock = state.sessions.refresh_lock(&id);

@@ -208,7 +208,7 @@ pub async fn render_errors(State(state): State<AppState>, req: Request, next: Ne
         let browser = state.links.browser_path(&received);
         Redirect::to(&state.links.login(Some(&browser))).into_response()
     } else {
-        let signed_in = auth::read_session_cookie(&headers)
+        let signed_in = auth::read_session_cookie(&state.config, &headers)
             .is_some_and(|id| state.sessions.get(&id).is_some())
             || state.config.dev_bearer.is_some();
         let ctx = PageCtx::new(

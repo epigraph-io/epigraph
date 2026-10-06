@@ -43,6 +43,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
     if config.insecure_cookies {
         tracing::warn!("EPIGRAPH_EXPLORER_INSECURE_COOKIES is set: session cookies lack Secure");
     }
+    if !config.base_path.is_empty() {
+        // `__Host-` needs `Path=/`; serve the Explorer at its own host's root
+        // to get it.
+        tracing::warn!("base path set: `__Host-` cookie prefix unavailable");
+    }
 
     // Loopback only: the reverse proxy is the public edge.
     let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
