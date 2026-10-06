@@ -90,7 +90,7 @@ path. A base path costs the `__Host-` cookie prefix (see Security model).
 | `GET /audit?since=&until=&type=&failures=1` | Security events the viewer may read, counted by type, with a drill-down (see Operator pages) |
 | `GET /activity?since=` | The watched agents' newest claims, and an events tail (see Operator pages) |
 | `GET /candidates?status=` | Cross-source match candidates as side-by-side pairs (see Operator pages) |
-| `GET /acts` | Reserved for the viewer's own admin acts. It is not built yet: it answers 501 "not yet available", makes no upstream call, and has no navigation link |
+| `GET /acts` | The viewer's own admin acts, each pending one linking out to the API's confirmation page. Only APIs with the elevation routes have them; the navigation link appears only there (see Operator pages) |
 | `GET /bff/claim/{id}` · `/bff/search` · `/bff/graph/ego/{id}?max_degree=` · `/bff/themes` · `/bff/communities` · `/bff/neighborhood/{id}` | JSON for the canvas |
 | `GET /bff/audit?since=&until=&type=&failures=1` | The audit page's counted window as JSON |
 | `GET /auth/login` · `GET /auth/callback` · `POST /auth/logout` · `POST /auth/redeem` | Sign-in (see Security model) |
@@ -160,6 +160,26 @@ bare date, and `since` defaults to 24 hours ago.
   excerpts, each linked to its own claim page, with score, verifier verdict
   and rationale. Only pairs whose **both** claims the viewer may read are
   listed. There are no decide controls: deciding stays on MCP and the CLI.
+- **`/acts`** lists the viewer's own admin acts, newest first (at most 50,
+  marked when cut): kind, target, reason, status and times. The listing
+  route exists only on an API that has the elevation routes. Each signed-in
+  page asks the API once whether it has it (`GET
+  /api/v1/admin/acts?mine&limit=1`, with the viewer's own token), and the
+  "Admin acts" link appears only when it does (an answer of 200 or 403).
+  A 404 or 405 hides it. That answer and a "has it" answer are remembered
+  for 5 minutes per process. Any other answer (a server error, a timeout,
+  an unexpected body) hides the link for that page and is asked again on
+  the next. Visited directly on an API without the route, the page says so.
+
+  A **pending** act (not yet answered by a passkey, not executed, not
+  expired) links to the API's own confirmation page,
+  `EPIGRAPH_OAUTH_BASE_URL` followed by the path the API returned, and only
+  when that path is exactly `/elevate/act/<the act's id>`. It opens in a new
+  tab with no referrer. You confirm with your passkey there, on the API's
+  origin; the Explorer never hosts, proxies or frames that page, and never
+  confirms or executes anything. Confirmed, refused, executed and expired
+  acts are listed without a link. The page cannot be framed (see Security
+  model).
 
 ## Configuration
 
@@ -175,7 +195,7 @@ code **2**.
 | `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL. In production it is the root of the Explorer's own host, `https://explorer.example.com`, with an **empty path** (see Deploy); a base path such as `http://localhost:8096/explorer` is for local testing. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. Its **first** segment may not be one of the Explorer's own top-level routes (`activity`, `acts`, `agent`, `audit`, `auth`, `backlog`, `bff`, `candidates`, `claim`, `community`, `evidence`, `frame`, `health`, `neighborhood`, `search`, `static`, `theme`): the routes are mounted both under the base path and at the root, so such a base path would make two handlers claim the same URL. The process refuses to start (exit 2) and names the offending segment. |
 | `EPIGRAPH_API_URL` | `http://127.0.0.1:8080` | The `epigraph-api` origin, called server to server. This is the repo-standard variable name. |
 | `EPIGRAPH_EXPLORER_PORT` | `8096` | Port to bind, always on `127.0.0.1`. Must be 1–65535. |
-| `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token`, `/oauth/revoke` and `/oauth/introspect` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
+| `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`, and a pending admin act links to its confirmation page there (`{this}/elevate/act/<id>`). In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token`, `/oauth/revoke` and `/oauth/introspect` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
 | `EPIGRAPH_EXPLORER_CLIENT_ID` | unset | The `client_id` of the pre-registered OAuth client (see Operator setup). If it is unset, sign-in is disabled and a warning is logged at startup. Whitespace is rejected. |
 | `EPIGRAPH_EXPLORER_FRAME_ANCESTORS` | `https://www.notion.so https://*.notion.so https://*.notion.site` | The CSP `frame-ancestors` source list, space-separated. `;`, `,`, control characters and non-ASCII are rejected. Setting it **explicitly empty** means `'none'` (no framing at all). |
 | `EPIGRAPH_EXPLORER_UPSTREAM_CONCURRENCY` | `6` | Size of the global semaphore on upstream calls, clamped to 1–8. The API's database pool has 10 connections, shared with every other client. A clamped value is logged. |
@@ -613,6 +633,11 @@ if the login response's cookie starts `__Host-` and the startup log
   X-Content-Type-Options: nosniff
   Referrer-Policy: same-origin
   ```
+
+  `/acts` (both mounts, and every response for that path, including its
+  sign-in redirect and error pages) instead carries `frame-ancestors 'none'`
+  and `Referrer-Policy: no-referrer`: it links to the page where an admin
+  act is confirmed, so it must not be framed or name itself to that page.
 
   A response that sets no cache policy of its own (every page, and
   `/bff/audit`) also carries `Cache-Control: private, no-store` and
