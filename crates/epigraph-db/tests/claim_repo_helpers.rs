@@ -759,3 +759,181 @@ async fn the_dedup_race_is_absorbed_inside_a_caller_transaction(pool: PgPool) {
          bypassed rather than absorbed."
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// create_or_get — the dedup race WITHOUT the constraint (the production shape)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// How a racer reaches `create_or_get`: inside a transaction it opened itself
+/// (the `epigraph-mcp` submission path, POST /claims `if_not_exists=true`), or
+/// on a bare pool connection with no transaction around the call.
+///
+/// Both shapes are raced because they fail differently. A serialization taken
+/// with a transaction-scoped lock on a connection that is NOT in a transaction
+/// is released at the end of the lock's own statement, before the find even
+/// runs — so an implementation can pass the in-transaction arm and still mint
+/// duplicates for every autocommit caller.
+#[derive(Clone, Copy, Debug)]
+enum Racer {
+    InCallerTransaction,
+    OnBareConnection,
+}
+
+async fn run_racer(pool: PgPool, claim: Claim, how: Racer) -> (Uuid, bool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (returned, was_created) = match how {
+        Racer::InCallerTransaction => {
+            let mut tx = pool.begin().await.expect("begin the racer's transaction");
+            let out = ClaimRepository::create_or_get(
+                &mut tx,
+                &viewer,
+                &claim,
+                epigraph_core::TenancyDecl::Inherited,
+            )
+            .await
+            .expect("create_or_get inside a transaction");
+            tx.commit().await.expect("commit the racer's transaction");
+            out
+        }
+        Racer::OnBareConnection => {
+            let mut conn = pool
+                .acquire()
+                .await
+                .expect("acquire the racer's connection");
+            ClaimRepository::create_or_get(
+                &mut conn,
+                &viewer,
+                &claim,
+                epigraph_core::TenancyDecl::Inherited,
+            )
+            .await
+            .expect("create_or_get on a bare connection")
+        }
+    };
+    (returned.id.into(), was_created)
+}
+
+/// Two FIRST creates of one `(content_hash, agent_id)`, interleaved the way
+/// production interleaves them, on a database WITHOUT
+/// `uq_claims_content_hash_agent` — which is the long-lived database's shape
+/// (migrations/README.md, "Known schema drift") and, from migration 150, the
+/// migrated shape everywhere.
+///
+/// # The interleaving, and why it is forced rather than hoped for
+///
+/// Caller 1 is parked INSIDE its `INSERT` by the race barrier (its row exists
+/// but is uncommitted, so no other session can see it). Only then does caller 2
+/// start: its find misses caller 1's invisible row. With nothing serializing
+/// them, caller 2 inserts and commits, then caller 1 is released and commits
+/// too — two live rows for one `(content_hash, agent_id)`, which is how
+/// production keeps minting race duplicates. Caller 2 must start AFTER caller 1
+/// is parked: started first, it would commit before caller 1's find, and
+/// caller 1 would dedup against it whether or not anything serializes them.
+///
+/// Before releasing the barrier the arm waits until caller 2 has either
+/// FINISHED (unserialized: it inserted past caller 1) or is BLOCKED on a
+/// two-key advisory lock (`objsubid = 2`; the barrier is a one-key lock, so it
+/// is never counted). Either observation is final; the assertions decide which
+/// one was correct.
+///
+/// Returns the number of rows for the pair and each caller's
+/// `(returned id, was_created)`.
+async fn race_two_first_creates(pool: &PgPool, how: Racer) -> (i64, [(Uuid, bool); 2]) {
+    // The production shape. Explicit, so the arm cannot pass on the constraint.
+    drop_unique_constraint(pool).await;
+
+    let agent_id = Uuid::new_v4();
+    insert_test_agent(pool, agent_id).await;
+    let content = format!("cog unconstrained race {how:?} {}", Uuid::new_v4());
+    // Same content and author, distinct ids: only caller 1's id fires the barrier.
+    let first = make_claim(&content, agent_id);
+    let second = make_claim(&content, agent_id);
+    install_race_barrier(pool, first.id.into()).await;
+
+    let mut holder = pool.acquire().await.expect("acquire the barrier holder");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(RACE_BARRIER_KEY)
+        .execute(&mut *holder)
+        .await
+        .expect("take the barrier");
+
+    let caller_1 = tokio::spawn(run_racer(pool.clone(), first, how));
+    wait_until_blocked_on_the_barrier(pool).await;
+    let caller_2 = tokio::spawn(run_racer(pool.clone(), second, how));
+
+    let mut settled = false;
+    for _ in 0..600 {
+        if caller_2.is_finished() {
+            settled = true;
+            break;
+        }
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks \
+              WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if blocked > 0 {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        settled,
+        "caller 2 neither finished nor blocked on a dedup lock while caller 1 was parked in its \
+         INSERT; the arm cannot tell serialized from unserialized"
+    );
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(RACE_BARRIER_KEY)
+        .execute(&mut *holder)
+        .await
+        .expect("release the barrier");
+    drop(holder);
+
+    let r1 = caller_1.await.expect("caller 1 must not panic");
+    let r2 = caller_2.await.expect("caller 2 must not panic");
+
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content_hash = $1 AND agent_id = $2")
+            .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("count rows for the pair");
+    (rows, [r1, r2])
+}
+
+fn assert_one_row_one_creator(rows: i64, outcomes: [(Uuid, bool); 2]) {
+    assert_eq!(
+        rows, 1,
+        "two concurrent first creates of one (content_hash, agent_id) left {rows} rows: the find \
+         ran against a snapshot that could not see the other caller's uncommitted insert, and \
+         nothing serialized them. Outcomes: {outcomes:?}"
+    );
+    let creators = outcomes.iter().filter(|(_, created)| *created).count();
+    assert_eq!(
+        creators, 1,
+        "exactly one caller may report was_created=true: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes[0].0, outcomes[1].0,
+        "both callers must answer with the one surviving row: {outcomes:?}"
+    );
+}
+
+/// The race inside a caller's transaction, with the constraint absent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dedup_race_is_serialized_without_the_constraint(pool: PgPool) {
+    let (rows, outcomes) = race_two_first_creates(&pool, Racer::InCallerTransaction).await;
+    assert_one_row_one_creator(rows, outcomes);
+}
+
+/// The race on bare (autocommit) connections, with the constraint absent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dedup_race_is_serialized_on_a_bare_connection_without_the_constraint(pool: PgPool) {
+    let (rows, outcomes) = race_two_first_creates(&pool, Racer::OnBareConnection).await;
+    assert_one_row_one_creator(rows, outcomes);
+}
