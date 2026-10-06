@@ -189,14 +189,21 @@ impl SessionStore {
         self.read().get(&id.0).map(|e| Arc::clone(&e.refresh_lock))
     }
 
-    /// Drop sessions created more than `max_age` ago (their refresh token
-    /// has expired upstream anyway). Returns how many were dropped.
-    pub fn purge_older_than(&self, max_age: chrono::Duration) -> usize {
+    /// Drop sessions created more than `max_age` ago and return them. The
+    /// refresh token a dropped session holds may have been rotated recently
+    /// and still be live upstream, so the caller revokes it.
+    pub fn purge_older_than(&self, max_age: chrono::Duration) -> Vec<Session> {
         let cutoff = Utc::now() - max_age;
         let mut map = self.write();
-        let before = map.len();
-        map.retain(|_, e| e.session.created_at > cutoff);
-        before - map.len()
+        let mut dropped = Vec::new();
+        for (id, e) in std::mem::take(&mut *map) {
+            if e.session.created_at > cutoff {
+                map.insert(id, e);
+            } else {
+                dropped.push(e.session);
+            }
+        }
+        dropped
     }
 
     pub fn len(&self) -> usize {
@@ -364,8 +371,11 @@ mod tests {
     fn purge_by_age() {
         let s = SessionStore::new();
         s.create("a".into(), "r".into(), Utc::now());
-        assert_eq!(s.purge_older_than(chrono::Duration::days(30)), 0);
-        assert_eq!(s.purge_older_than(chrono::Duration::seconds(-1)), 1);
+        assert!(s.purge_older_than(chrono::Duration::days(30)).is_empty());
+        assert_eq!(s.len(), 1);
+        let dropped = s.purge_older_than(chrono::Duration::seconds(-1));
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].refresh_token, "r", "handed back for revocation");
         assert!(s.is_empty());
     }
 

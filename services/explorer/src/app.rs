@@ -45,7 +45,8 @@ pub const RESERVED_BASE_PATH_SEGMENTS: &[&str] = &[
     "static",
     "theme",
 ];
-/// Sessions older than the upstream refresh-token lifetime are dead.
+/// Sessions are dropped this long after sign-in (the session cookie's
+/// max-age), and the refresh token each still holds is revoked then.
 pub const SESSION_MAX_AGE: chrono::Duration = chrono::Duration::days(30);
 
 /// The whole app, ready to serve.
@@ -208,20 +209,33 @@ const HOUSEKEEPING_REVOKE_CONCURRENCY: usize = 4;
 
 /// One housekeeping pass: purge sessions created more than
 /// `session_max_age` ago, expired pending logins and handoff codes, and
-/// expired cache entries, then revoke the refresh tokens the expired
-/// handoffs still held (nothing will redeem them). The revocations are
-/// awaited, a few at a time, before the pass returns.
+/// expired cache entries, then revoke the refresh tokens the purged
+/// sessions and the expired handoffs still held (nothing will present them
+/// again; a session's may have been rotated recently and still be live).
+/// The revocations are awaited, a few at a time, before the pass returns.
 pub async fn housekeep(state: &AppState, session_max_age: chrono::Duration) {
-    let sessions = state.sessions.purge_older_than(session_max_age);
+    let purged = state.sessions.purge_older_than(session_max_age);
     let (flow, unredeemed) = state.auth_flow.purge_expired();
     let cached = state.cache.purge_expired();
+    let sessions = purged.len();
     if sessions + flow + cached > 0 {
         tracing::debug!(sessions, flow, cached, "housekeeping purged entries");
     }
-    futures::stream::iter(unredeemed)
-        .for_each_concurrent(HOUSEKEEPING_REVOKE_CONCURRENCY, |tokens| async move {
-            auth::oauth::revoke_abandoned(state, &tokens.refresh_token, "expired handoff").await;
-        })
+    let abandoned = purged
+        .into_iter()
+        .map(|s| (s.refresh_token, "purged session"))
+        .chain(
+            unredeemed
+                .into_iter()
+                .map(|t| (t.refresh_token, "expired handoff")),
+        );
+    futures::stream::iter(abandoned)
+        .for_each_concurrent(
+            HOUSEKEEPING_REVOKE_CONCURRENCY,
+            |(refresh_token, held_by)| async move {
+                auth::oauth::revoke_abandoned(state, &refresh_token, held_by).await;
+            },
+        )
         .await;
 }
 

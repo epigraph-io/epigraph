@@ -1584,6 +1584,29 @@ async fn redeeming_an_expired_handoff_revokes_its_tokens() {
     assert_eq!(revocations_of(&app, "refresh-1").await, 1);
 }
 
+/// Housekeeping drops a session created longer ago than the maximum age.
+/// Its refresh token may have been rotated recently and still be live
+/// upstream, so it is revoked, not just forgotten.
+#[tokio::test]
+async fn a_purged_session_revokes_its_refresh_token() {
+    let app = app().await;
+    mount_revoke(&app, 1).await;
+    let sid =
+        app.state
+            .sessions
+            .create("a1".into(), "r-old".into(), Utc::now() + Duration::hours(1));
+
+    // Calibration: within the age limit, the session and its token stay.
+    explorer_app::housekeep(&app.state, explorer_app::SESSION_MAX_AGE).await;
+    assert!(app.state.sessions.get(&sid).is_some());
+    assert_eq!(revocations_of(&app, "r-old").await, 0);
+
+    // A negative limit makes every session too old.
+    explorer_app::housekeep(&app.state, Duration::seconds(-1)).await;
+    assert!(app.state.sessions.get(&sid).is_none());
+    assert_eq!(revocations_of(&app, "r-old").await, 1);
+}
+
 // ---- duplicated cookies -------------------------------------------------------------
 
 /// Two `epx_session` values (one possibly tossed in by a sibling host) mean
