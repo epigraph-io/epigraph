@@ -2186,6 +2186,10 @@ async fn ctx_edges_for(
 /// the edge's own tenancy columns and query 7b must too, or wiring 7b onto the
 /// hit discloses another group's private assertion that two public claims are
 /// related.
+///
+/// Query 7b repeats the edge predicate in BOTH arms of its `UNION ALL`
+/// (outgoing and incoming), so the test seeds one private edge in each
+/// direction: dropping the predicate from a single arm must red this test.
 #[sqlx::test(migrations = "../../migrations")]
 async fn epistemic_edges_omit_a_group_private_edge_between_public_claims(pool: PgPool) {
     let fx = fixture::build(&pool).await;
@@ -2209,7 +2213,22 @@ async fn epistemic_edges_omit_a_group_private_edge_between_public_claims(pool: P
         None,
     )
     .await;
+    // OUTGOING from para's view (para --supports--> behind_private_edge).
     viewerfx::seed_edge_owned_by(&pool, para, behind_private_edge, "group", other_group).await;
+
+    // The mirror: a public claim reaching para ONLY through a group-private
+    // INCOMING `supports` edge (behind_private_incoming --supports--> para).
+    let behind_private_incoming = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        behind_private_incoming,
+        "public claim linked to the paragraph by a private incoming edge",
+        2,
+        None,
+    )
+    .await;
+    viewerfx::seed_edge_owned_by(&pool, behind_private_incoming, para, "group", other_group).await;
 
     let public = viewerfx::public_viewer(&pool).await;
     let (edges, total) = ctx_edges_for(&pool, &public, para).await;
@@ -2220,13 +2239,19 @@ async fn epistemic_edges_omit_a_group_private_edge_between_public_claims(pool: P
     assert!(
         !edges.iter().any(|e| e.claim_id == behind_private_edge),
         "a public viewer received a neighbour reachable only through another group's \
-         private edge: {edges:?}. Query 7b checks the neighbour claim's visibility but \
-         not the edge's own tenancy columns."
+         private OUTGOING edge: {edges:?}. Query 7b's outgoing arm checks the neighbour \
+         claim's visibility but not the edge's own tenancy columns."
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == behind_private_incoming),
+        "a public viewer received a neighbour reachable only through another group's \
+         private INCOMING edge: {edges:?}. Query 7b's incoming arm checks the neighbour \
+         claim's visibility but not the edge's own tenancy columns."
     );
     assert_eq!(
         total,
         Some(1),
-        "the private edge must not count toward the public viewer's total either"
+        "neither private edge may count toward the public viewer's total"
     );
 
     // Calibration: a member of the edge's group DOES see it, so the predicate
@@ -2236,17 +2261,160 @@ async fn epistemic_edges_omit_a_group_private_edge_between_public_claims(pool: P
         .expect("resolve group member");
     let (edges, total) = ctx_edges_for(&pool, &insider, para).await;
     assert!(
+        edges.iter().any(|e| e.claim_id == behind_private_edge
+            && e.relationship == "supports"
+            && matches!(e.direction, EdgeDirection::Outgoing)),
+        "a member of the edge's owning group must see the private outgoing edge; got {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|e| e.claim_id == behind_private_incoming
+            && e.relationship == "supports"
+            && matches!(e.direction, EdgeDirection::Incoming)),
+        "a member of the edge's owning group must see the private incoming edge; got {edges:?}"
+    );
+    assert_eq!(total, Some(3));
+}
+
+/// The co-owner half of the edge-tenancy predicate. A CO-OWNED edge (owner
+/// `GA`, co-owner `GB`, migration 072) is visible only to a viewer in BOTH
+/// groups — `dispute_batch`'s `(e.co_owner_group_id IS NULL OR
+/// e.co_owner_group_id = ANY(groups))`. A viewer in the owner group alone must
+/// not see it. One co-owned edge per `UNION ALL` arm, so the clause cannot be
+/// dropped from either arm unnoticed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_require_both_groups_for_a_co_owned_edge(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let para = fx.paragraphs[0];
+    let (owner_only, group_a) = viewerfx::seed_agent_with_group(&pool, "epi-co-owner-a").await;
+    let (in_both, group_b) = viewerfx::seed_agent_with_group(&pool, "epi-co-owner-b").await;
+    // `in_both` already belongs to group_b; add it to group_a as well.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(group_a)
+    .bind(in_both)
+    .execute(&pool)
+    .await
+    .expect("add in_both to group_a");
+
+    let control = Uuid::new_v4();
+    fixture::insert_claim(&pool, fx.agent_id, control, "public refutation", 2, None).await;
+    fixture::insert_edge(&pool, control, "claim", para, "claim", "refutes", None).await;
+
+    let co_out = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        co_out,
+        "co-owned outgoing target",
+        2,
+        None,
+    )
+    .await;
+    let co_in = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        co_in,
+        "co-owned incoming source",
+        2,
+        None,
+    )
+    .await;
+    for (source, target) in [(para, co_out), (co_in, para)] {
+        let edge = viewerfx::seed_edge_owned_by(&pool, source, target, "group", group_a).await;
+        sqlx::query("UPDATE edges SET co_owner_group_id = $2 WHERE id = $1")
+            .bind(edge)
+            .bind(group_b)
+            .execute(&pool)
+            .await
+            .expect("co-own edge with group_b");
+    }
+
+    let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner_only)
+        .await
+        .expect("resolve owner-group-only viewer");
+    let (edges, total) = ctx_edges_for(&pool, &owner_viewer, para).await;
+    assert!(
+        edges.iter().any(|e| e.claim_id == control),
+        "positive control: the public-edge neighbour must be returned; got {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == co_out),
+        "a viewer in the owner group ONLY received a co-owned OUTGOING edge: {edges:?}. \
+         Query 7b's outgoing arm is missing the co_owner_group_id clause."
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == co_in),
+        "a viewer in the owner group ONLY received a co-owned INCOMING edge: {edges:?}. \
+         Query 7b's incoming arm is missing the co_owner_group_id clause."
+    );
+    assert_eq!(
+        total,
+        Some(1),
+        "co-owned edges the viewer cannot see must not count toward its total"
+    );
+
+    // Calibration: a viewer in BOTH groups sees both co-owned edges.
+    let both_viewer = epigraph_db::visibility::Viewer::resolve(&pool, in_both)
+        .await
+        .expect("resolve two-group viewer");
+    let (edges, total) = ctx_edges_for(&pool, &both_viewer, para).await;
+    assert!(
         edges
             .iter()
-            .any(|e| e.claim_id == behind_private_edge && e.relationship == "supports"),
-        "a member of the edge's owning group must see the private edge; got {edges:?}"
+            .any(|e| e.claim_id == co_out && matches!(e.direction, EdgeDirection::Outgoing)),
+        "a viewer in both owner and co-owner groups must see the co-owned outgoing edge; \
+         got {edges:?}"
     );
-    assert_eq!(total, Some(2));
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == co_in && matches!(e.direction, EdgeDirection::Incoming)),
+        "a viewer in both owner and co-owner groups must see the co-owned incoming edge; \
+         got {edges:?}"
+    );
+    assert_eq!(total, Some(3));
+}
+
+/// Set `valid_to` on the single `source --relationship--> target` edge to
+/// `now() + offset` (a Postgres interval literal, e.g. `'-1 second'`).
+async fn set_edge_valid_to(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    relationship: &str,
+    offset: &str,
+) {
+    let updated = sqlx::query(
+        "UPDATE edges SET valid_to = now() + $4::interval
+         WHERE source_id = $1 AND target_id = $2 AND relationship = $3",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .bind(offset)
+    .execute(pool)
+    .await
+    .expect("set edge valid_to");
+    assert_eq!(
+        updated.rows_affected(),
+        1,
+        "fixture: exactly one {source} --{relationship}--> {target} edge"
+    );
 }
 
 /// An edge retracted by `delete_edge` (`valid_to` set) is no longer in force
 /// (`EdgeRepository`'s `EDGE_IN_FORCE`); presenting it as a live `supports` would
 /// report an argument its author withdrew.
+///
+/// Query 7b repeats the in-force predicate in BOTH arms of its `UNION ALL`, so
+/// a retracted edge is seeded in each direction. And because the predicate is
+/// `EDGE_IN_FORCE` (`valid_to IS NULL OR valid_to > now()`), not a bare
+/// `valid_to IS NULL`, an edge whose retraction is only SCHEDULED (future
+/// `valid_to`) is still live and must be returned and counted — again in each
+/// direction.
 #[sqlx::test(migrations = "../../migrations")]
 async fn epistemic_edges_omit_retracted_edges(pool: PgPool) {
     let fx = fixture::build(&pool).await;
@@ -2256,25 +2424,98 @@ async fn epistemic_edges_omit_retracted_edges(pool: PgPool) {
     fixture::insert_claim(&pool, fx.agent_id, control, "live refutation", 2, None).await;
     fixture::insert_edge(&pool, control, "claim", para, "claim", "refutes", None).await;
 
-    let withdrawn = Uuid::new_v4();
-    fixture::insert_claim(&pool, fx.agent_id, withdrawn, "withdrawn support", 2, None).await;
-    fixture::insert_edge(&pool, withdrawn, "claim", para, "claim", "supports", None).await;
-    // Retract it the way `EdgeRepository::retract_by_id` does, backdated a second
-    // so `valid_to > now()` cannot hold at read time.
-    let retracted = sqlx::query(
-        "UPDATE edges SET valid_to = now() - interval '1 second'
-         WHERE source_id = $1 AND target_id = $2 AND relationship = 'supports'",
+    // Retracted, INCOMING (withdrawn_in --supports--> para). Retracted the way
+    // `EdgeRepository::retract_by_id` does, backdated a second so
+    // `valid_to > now()` cannot hold at read time.
+    let withdrawn_in = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        withdrawn_in,
+        "withdrawn support",
+        2,
+        None,
     )
-    .bind(withdrawn)
-    .bind(para)
-    .execute(&pool)
-    .await
-    .expect("retract edge");
-    assert_eq!(
-        retracted.rows_affected(),
-        1,
-        "fixture: exactly one edge retracted"
-    );
+    .await;
+    fixture::insert_edge(
+        &pool,
+        withdrawn_in,
+        "claim",
+        para,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+    set_edge_valid_to(&pool, withdrawn_in, para, "supports", "-1 second").await;
+
+    // Retracted, OUTGOING (para --supports--> withdrawn_out).
+    let withdrawn_out = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        withdrawn_out,
+        "withdrawn supported",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        para,
+        "claim",
+        withdrawn_out,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+    set_edge_valid_to(&pool, para, withdrawn_out, "supports", "-1 second").await;
+
+    // Retraction SCHEDULED an hour out, one edge in each direction: still in force.
+    let scheduled_in = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        scheduled_in,
+        "expiring support",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        scheduled_in,
+        "claim",
+        para,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+    set_edge_valid_to(&pool, scheduled_in, para, "supports", "1 hour").await;
+
+    let scheduled_out = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        scheduled_out,
+        "expiring supported",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        para,
+        "claim",
+        scheduled_out,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+    set_edge_valid_to(&pool, para, scheduled_out, "supports", "1 hour").await;
 
     let (edges, total) = ctx_edges_for(&pool, &viewerfx::public_viewer(&pool).await, para).await;
     assert!(
@@ -2282,14 +2523,34 @@ async fn epistemic_edges_omit_retracted_edges(pool: PgPool) {
         "positive control: the in-force edge must be returned; got {edges:?}"
     );
     assert!(
-        !edges.iter().any(|e| e.claim_id == withdrawn),
-        "a retracted (valid_to in the past) edge was reported as a live epistemic \
-         neighbour: {edges:?}"
+        !edges.iter().any(|e| e.claim_id == withdrawn_in),
+        "a retracted (valid_to in the past) INCOMING edge was reported as a live \
+         epistemic neighbour: {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == withdrawn_out),
+        "a retracted (valid_to in the past) OUTGOING edge was reported as a live \
+         epistemic neighbour: {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == scheduled_in && matches!(e.direction, EdgeDirection::Incoming)),
+        "an INCOMING edge whose retraction is scheduled in the future (valid_to > now()) \
+         is still in force and must be returned; got {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == scheduled_out && matches!(e.direction, EdgeDirection::Outgoing)),
+        "an OUTGOING edge whose retraction is scheduled in the future (valid_to > now()) \
+         is still in force and must be returned; got {edges:?}"
     );
     assert_eq!(
         total,
-        Some(1),
-        "a retracted edge must not count toward the total"
+        Some(3),
+        "the total counts the live edge and the two scheduled-retraction edges, and \
+         neither retracted edge"
     );
 }
 
