@@ -699,3 +699,75 @@ async fn unscoped_dense_leg_fills_the_candidate_pool(pool: PgPool) {
     );
     assert_dense_similarity_strictly_falls(&hits);
 }
+
+/// The function sets `hnsw.iterative_scan` / `hnsw.ef_search` with
+/// `is_local = true` inside its own `begin()`. On a caller's transaction that
+/// `begin()` is a SAVEPOINT: `RELEASE` (i.e. `commit()`) would carry the
+/// values up into the caller's transaction and perturb its later HNSW reads,
+/// `ROLLBACK TO SAVEPOINT` (i.e. `rollback()`) reverts them. Guard on that
+/// invariant: the caller's transaction must see pgvector's defaults again
+/// after the call. `candidate_pool = 50` so the leaked ef_search would differ
+/// from the default 40, not just the iterative_scan value.
+#[sqlx::test(migrations = "../../migrations")]
+async fn caller_transaction_does_not_inherit_the_hnsw_settings(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    for i in 0..3usize {
+        insert_claim(
+            &pool,
+            Uuid::new_v4(),
+            agent,
+            10 + i as u8,
+            &format!("caller transaction row {i}"),
+            &vec_angle(10.0 * i as f64),
+            true,
+            &[],
+        )
+        .await;
+    }
+
+    // A real sqlx transaction (not a raw `BEGIN`), so the function's own
+    // `begin()` nests as a SAVEPOINT — the path this test is about.
+    let mut tx = pool.begin().await.expect("caller begin");
+    // Load the `vector` library on this backend so the `hnsw.*` names resolve.
+    sqlx::query("SELECT '[1]'::vector")
+        .execute(&mut *tx)
+        .await
+        .expect("load vector");
+    assert_hnsw_knobs_at_default(&mut tx).await;
+
+    let hits = ClaimRepository::search_hybrid_scoped_since_in_theme(
+        &mut *tx,
+        &viewer,
+        &vec_hot(0),
+        "zzqxnomatch",
+        50,
+        60,
+        10,
+        0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("hybrid search on a caller transaction");
+    assert_eq!(
+        hits.len(),
+        3,
+        "the call must still return the embedded rows on a caller transaction"
+    );
+
+    let (iterative, ef): (String, String) = sqlx::query_as(
+        "SELECT current_setting('hnsw.iterative_scan'), current_setting('hnsw.ef_search')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read hnsw settings after the call");
+    assert_eq!(
+        (iterative.as_str(), ef.as_str()),
+        ("off", "40"),
+        "the hybrid search leaked its SET LOCAL hnsw.* values into the caller's transaction"
+    );
+    tx.rollback().await.expect("caller rollback");
+}
