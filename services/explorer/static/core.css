@@ -344,3 +344,37 @@
 .signin-prompt h1 {
   margin-top: 0;
 }
+
+/* Audit page: the window form and the raw-event rows. */
+.audit-window__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-4);
+}
+
+.audit-window__row label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.audit-window__row .audit-window__check {
+  flex-direction: row;
+  align-items: center;
+}
+
+.audit-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+}
+
+.audit-details {
+  max-width: 32rem;
+  overflow-wrap: anywhere;
+}
+
+.audit-outcome--failure {
+  font-weight: 600;
+}

@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+
+{% block title %}{% if let Some(v) = view %}{% if let Some(t) = v.event_type %}{{ t }} · {% endif %}{% endif %}Audit · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}<link rel="stylesheet" href="{{ ctx.static_url("core.css") }}">{% endblock %}
+
+{% block content %}
+<h1>Audit</h1>
+<p class="muted">Security events since a time, counted by type. This view shows only events you may read; refresh-token volume and liveness are not in this trail. It is read-only.</p>
+
+<form class="audit-window" method="get" action="{{ action_url }}" aria-label="Audit window">
+  <div class="audit-window__row">
+    <label>Since <input name="since" value="{{ form.since }}" placeholder="2026-10-05T12:00:00Z" autocomplete="off"></label>
+    <label>Until <input name="until" value="{{ form.until }}" placeholder="now" autocomplete="off"></label>
+    <label>Event type <input name="type" value="{{ form.event_type }}" placeholder="every type" autocomplete="off"></label>
+    <label class="audit-window__check"><input type="checkbox" name="failures" value="1"{% if form.failures_only %} checked{% endif %}> Failures only</label>
+    <button type="submit">Show</button>
+  </div>
+  <p class="small muted">Times are UTC: RFC 3339, or a date and time such as 2026-10-05T12:00. With no “since”, the last 24 hours.</p>
+</form>
+
+{%- if let Some(p) = problem %}
+<p class="notice notice--warn">{{ p }}</p>
+{%- endif %}
+
+{%- if let Some(v) = view %}
+<section class="section audit" aria-labelledby="audit-title">
+  <h2 id="audit-title" class="section__title">Events since {{ since_text }}{% if let Some(u) = until_text %} until {{ u }}{% endif %}{% if let Some(t) = v.event_type %} <span class="muted small">type {{ t }}</span>{% endif %}</h2>
+
+  {%- if v.result.is_not_granted() %}
+  <p class="notice" data-audit="not-granted">Your account is not granted audit:read, so its security events cannot be shown here. The scope is granted per account by the API's operator; sign in again once it is.</p>
+  {%- endif %}
+
+  {%- if let Some(r) = v.result.unavailable() %}
+  <p class="section-unavailable" data-audit="unavailable">Security events are unavailable. {{ r }}</p>
+  {%- endif %}
+
+  {%- if let Some(c) = v.result.counts() %}
+  {%- if c.reads_beyond_own %}
+  <p class="notice" data-audit="beyond-own">This window includes events of other agents, or of no agent: this account reads more than its own security events.</p>
+  {%- else %}
+  <p class="small muted" data-audit="own">You see only your own security events.</p>
+  {%- endif %}
+
+  {%- if c.capped_at.is_some() %}
+  <p class="notice notice--warn" data-audit="capped">Capped at {{ capped_text }} events: the window holds more than this page reads. Narrow it (a later “since”, or an “until”) to count the rest.</p>
+  {%- endif %}
+
+  {%- if let Some(p) = c.partial %}
+  <p class="notice notice--warn" data-audit="partial">Incomplete: {{ p }} The counts below cover only the events read before it stopped.</p>
+  {%- endif %}
+
+  <p class="audit-toolbar small">
+    <span data-events-read="{{ c.events_read }}">{{ events_read_text }} events read.</span>
+    {%- if v.failures_only %}
+    <span>Showing failures only. <a href="{{ failures_toggle_url }}">Show every event</a></span>
+    {%- else %}
+    <a href="{{ failures_toggle_url }}">Show failures only</a>
+    {%- endif %}
+    {%- if v.event_type.is_some() %}
+    <a href="{{ all_types_url }}">All event types</a>
+    {%- endif %}
+  </p>
+
+  {%- if c.types.is_empty() %}
+  <p class="muted">No security events in this window.</p>
+  {%- else %}
+  <div class="table-wrap">
+  <table class="data">
+    <thead>
+      <tr><th scope="col">Event type</th><th scope="col" class="num">Events</th><th scope="col" class="num">Failures</th></tr>
+    </thead>
+    <tbody>
+      {%- for t in c.types %}
+      <tr data-event-type="{{ t.event_type }}" data-total="{{ t.total }}" data-failures="{{ t.failures }}">
+        <th scope="row"><a href="{{ t.drill_url }}">{{ t.event_type }}</a></th>
+        <td class="num">{{ t.total }}</td>
+        <td class="num">{{ t.failures }}</td>
+      </tr>
+      {%- endfor %}
+    </tbody>
+  </table>
+  </div>
+  {%- endif %}
+
+  {%- if v.event_type.is_some() && !c.rows.is_empty() %}
+  <h3 class="section__title">Events</h3>
+  <p class="small muted">{{ drill_note }}</p>
+  <div class="table-wrap">
+  <table class="data">
+    <thead>
+      <tr><th scope="col">Time</th><th scope="col">Outcome</th><th scope="col">Agent</th><th scope="col">Address</th><th scope="col">Correlation</th><th scope="col">Details</th></tr>
+    </thead>
+    <tbody>
+      {%- for r in c.rows %}
+      <tr data-drill-row>
+        <td><time datetime="{{ r.created_at }}">{{ r.created }}</time></td>
+        <td class="audit-outcome audit-outcome--{{ r.outcome }}">{{ r.outcome }}</td>
+        <td>{% if let Some(u) = r.agent_url %}<a href="{{ u }}"{% if let Some(a) = r.agent_id %} title="{{ a }}"{% endif %}>{% if let Some(s) = r.agent_short %}{{ s }}{% endif %}</a>{% else %}<span class="muted">none</span>{% endif %}</td>
+        <td>{% if let Some(ip) = r.ip_address %}{{ ip }}{% endif %}</td>
+        <td>{% if let Some(cid) = r.correlation_id %}<code>{{ cid }}</code>{% endif %}</td>
+        <td class="audit-details">{% if !r.details.is_empty() %}<code>{{ r.details }}</code>{% endif %}</td>
+      </tr>
+      {%- endfor %}
+    </tbody>
+  </table>
+  </div>
+  {%- endif %}
+  {%- endif %}
+</section>
+{%- endif %}
+{% endblock %}

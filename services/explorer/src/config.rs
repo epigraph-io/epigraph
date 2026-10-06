@@ -22,6 +22,7 @@ pub const ENV_TOKEN_TIMEOUT_MS: &str = "EPIGRAPH_EXPLORER_TOKEN_TIMEOUT_MS";
 pub const ENV_INSECURE_COOKIES: &str = "EPIGRAPH_EXPLORER_INSECURE_COOKIES";
 pub const ENV_DEV_BEARER: &str = "EPIGRAPH_EXPLORER_DEV_BEARER";
 pub const ENV_KANBAN_URL: &str = "EPIGRAPH_EXPLORER_KANBAN_URL";
+pub const ENV_AUDIT_ROW_CEILING: &str = "EPIGRAPH_EXPLORER_AUDIT_ROW_CEILING";
 
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_PORT: u16 = 8096;
@@ -37,6 +38,10 @@ pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 8000;
 /// session (`auth::refresh_session`), so the token call gets more room than a
 /// data call, which only degrades a section.
 pub const DEFAULT_TOKEN_TIMEOUT_MS: u64 = 20_000;
+/// Security events the audit page reads for one window, at most (in pages
+/// of [`crate::upstream::audit::AUDIT_PAGE_ROWS`]); a window holding more is
+/// shown as capped.
+pub const DEFAULT_AUDIT_ROW_CEILING: usize = 10_000;
 
 /// Clamp range for the upstream semaphore. The API's pool is 10 connections
 /// shared with every other client, so the ceiling stays well under it.
@@ -47,6 +52,10 @@ pub const SESSION_CONCURRENCY_RANGE: (usize, usize) = (1, 8);
 pub const UPSTREAM_TIMEOUT_MS_RANGE: (u64, u64) = (250, 60_000);
 /// Clamp range for the `/oauth/token` timeout, in milliseconds.
 pub const TOKEN_TIMEOUT_MS_RANGE: (u64, u64) = (250, 60_000);
+/// Clamp range for the audit row ceiling: at least one page, and few enough
+/// rows that one viewer's window stays a bounded amount of memory and
+/// upstream work.
+pub const AUDIT_ROW_CEILING_RANGE: (usize, usize) = (1_000, 50_000);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -104,6 +113,8 @@ pub struct Config {
     /// backlog page. Never carries a query or fragment (the board's pairing
     /// link puts a single-use code in the fragment).
     pub kanban_url: Option<Url>,
+    /// Most security events the audit page reads for one window.
+    pub audit_row_ceiling: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -123,6 +134,7 @@ impl std::fmt::Debug for Config {
             .field("insecure_cookies", &self.insecure_cookies)
             .field("dev_bearer", &self.dev_bearer.as_ref().map(|_| "<set>"))
             .field("kanban_url", &self.kanban_url.as_ref().map(Url::as_str))
+            .field("audit_row_ceiling", &self.audit_row_ceiling)
             .finish()
     }
 }
@@ -276,6 +288,16 @@ impl Config {
             None => None,
         };
 
+        let audit_row_ceiling = match get(ENV_AUDIT_ROW_CEILING) {
+            Some(v) => {
+                let n = v
+                    .parse::<usize>()
+                    .map_err(|_| invalid(ENV_AUDIT_ROW_CEILING, "expected a positive integer"))?;
+                clamp_logged(ENV_AUDIT_ROW_CEILING, n, AUDIT_ROW_CEILING_RANGE)
+            }
+            None => DEFAULT_AUDIT_ROW_CEILING,
+        };
+
         Ok(Config {
             api_url,
             port,
@@ -292,6 +314,7 @@ impl Config {
             insecure_cookies,
             dev_bearer,
             kanban_url,
+            audit_row_ceiling,
         })
     }
 
@@ -523,6 +546,38 @@ mod tests {
                     }
                 ),
                 "{bad} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_row_ceiling_defaults_clamps_and_rejects_garbage() {
+        assert_eq!(
+            cfg(&[BASE]).unwrap().audit_row_ceiling,
+            DEFAULT_AUDIT_ROW_CEILING
+        );
+        assert_eq!(DEFAULT_AUDIT_ROW_CEILING, 10_000);
+        let set = |v: &str| cfg(&[BASE, (ENV_AUDIT_ROW_CEILING, v)]);
+        assert_eq!(set(" 2500 ").unwrap().audit_row_ceiling, 2500);
+        assert_eq!(
+            set("10").unwrap().audit_row_ceiling,
+            AUDIT_ROW_CEILING_RANGE.0,
+            "below one page is raised to one page"
+        );
+        assert_eq!(
+            set("999999999").unwrap().audit_row_ceiling,
+            AUDIT_ROW_CEILING_RANGE.1
+        );
+        for bad in ["-1", "ten", "1e4"] {
+            assert!(
+                matches!(
+                    set(bad),
+                    Err(ConfigError::Invalid {
+                        var: ENV_AUDIT_ROW_CEILING,
+                        ..
+                    })
+                ),
+                "{bad}"
             );
         }
     }

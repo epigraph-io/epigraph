@@ -182,6 +182,35 @@ impl Links {
         self.path("/audit")
     }
 
+    /// `/audit?since=&until=&type=&failures=1`, keeping only what is set.
+    pub fn audit_page(
+        &self,
+        since: Option<&str>,
+        until: Option<&str>,
+        event_type: Option<&str>,
+        failures_only: bool,
+    ) -> String {
+        let mut qs = form_urlencoded::Serializer::new(String::new());
+        if let Some(s) = since {
+            qs.append_pair("since", s);
+        }
+        if let Some(u) = until {
+            qs.append_pair("until", u);
+        }
+        if let Some(t) = event_type {
+            qs.append_pair("type", t);
+        }
+        if failures_only {
+            qs.append_pair("failures", "1");
+        }
+        let qs = qs.finish();
+        if qs.is_empty() {
+            self.audit()
+        } else {
+            format!("{}?{qs}", self.audit())
+        }
+    }
+
     /// `/activity`: what the watched agents did recently.
     pub fn activity(&self) -> String {
         self.path("/activity")
@@ -397,6 +426,27 @@ mod tests {
         assert_eq!(l.backlog_page(None, Some(3)), "/explorer/backlog?page=3");
         let root = Links::new("https://explorer.example.com", "");
         assert_eq!(root.backlog_page(Some("ui"), None), "/backlog?label=ui");
+    }
+
+    #[test]
+    fn audit_page_orders_and_encodes_its_query() {
+        let l = Links::new("https://explorer.example.com", "/explorer");
+        assert_eq!(l.audit_page(None, None, None, false), "/explorer/audit");
+        assert_eq!(
+            l.audit_page(
+                Some("2026-10-01T00:00:00Z"),
+                Some("2026-10-02T00:00:00.5Z"),
+                Some("a b&c"),
+                true
+            ),
+            "/explorer/audit?since=2026-10-01T00%3A00%3A00Z\
+             &until=2026-10-02T00%3A00%3A00.5Z&type=a+b%26c&failures=1"
+        );
+        let root = Links::new("https://explorer.example.com", "");
+        assert_eq!(
+            root.audit_page(None, None, Some("x"), false),
+            "/audit?type=x"
+        );
     }
 
     #[test]
