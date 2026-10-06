@@ -1664,6 +1664,56 @@ async fn signing_in_again_revokes_the_replaced_sessions_refresh_token() {
     app.upstream.verify().await;
 }
 
+/// The embed's sign-in replaces the session its cookie names the same way:
+/// redeeming a handoff in a browser whose (partitioned) cookie already names
+/// a session ends that session and revokes its refresh token, instead of
+/// leaving it in the store, live upstream, with no cookie pointing at it.
+#[tokio::test]
+async fn redeeming_a_handoff_revokes_the_replaced_sessions_refresh_token() {
+    let app = app().await;
+    mount_revoke(&app, 1).await;
+    let old = app.state.sessions.create(
+        "a-old".into(),
+        "r-old".into(),
+        Utc::now() + Duration::hours(1),
+    );
+    let code = popup_sign_in(&app, "claims:read").await;
+
+    let cookie = format!("epx_session={}", old.as_str());
+    let res = send_with(
+        &app,
+        Method::POST,
+        "/explorer/auth/redeem",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("origin", ORIGIN),
+            ("cookie", &cookie),
+        ],
+        &format!("code={code}"),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let (new_sid, _) = set_cookie(&res, "epx_session").expect("embed cookie");
+    assert_ne!(new_sid, old.as_str(), "a fresh session id");
+
+    assert!(
+        app.state.sessions.get(&old).is_none(),
+        "the replaced session is gone"
+    );
+    assert_eq!(app.state.sessions.len(), 1, "only the redeemed session");
+    assert_eq!(
+        revocations_of(&app, "r-old").await,
+        1,
+        "the replaced session's refresh token is revoked"
+    );
+    assert_eq!(
+        revocations_of(&app, "refresh-1").await,
+        0,
+        "the redeemed one is not"
+    );
+    app.upstream.verify().await;
+}
+
 /// A refresh that succeeds but whose new token upstream still refuses ends
 /// the session. The refresh just minted a live refresh token, and the
 /// session ending holds it: it is revoked, not dropped.

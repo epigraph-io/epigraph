@@ -513,7 +513,13 @@ async fn redeem(
         }
         None => return Err(handoff_refused()),
     };
+    // As at the callback: a fresh id, and the session this browser had (in
+    // the embed's partitioned jar) is ended, not left in the store holding a
+    // live refresh token no cookie points at.
     let session_id = start_session(&state, tokens).await;
+    if let Some(old) = read_session_cookie(&state.config, &headers) {
+        end_session_revoking(&state, &old, "replaced embed session").await;
+    }
 
     let mut resp = StatusCode::NO_CONTENT.into_response();
     let h = resp.headers_mut();
