@@ -173,6 +173,27 @@ mod tests {
         ] {
             assert_eq!(token_agent_id(&not_known), None, "{not_known}");
         }
+
+        // A token past MAX_TOKEN_CHARS is not decoded, even one that would
+        // decode to a valid agent. Calibrated: the same claims padded to just
+        // under the bound still name the agent, so the refusal is the bound,
+        // not the padding.
+        let padded = |len: usize| {
+            let bare = jwt(&format!(r#"{{"agent_id":"{agent}","pad":""}}"#)).len();
+            // base64url: 4 output chars per 3 input bytes.
+            let pad = "x".repeat((len - bare) * 3 / 4);
+            jwt(&format!(r#"{{"agent_id":"{agent}","pad":"{pad}"}}"#))
+        };
+        let under = padded(MAX_TOKEN_CHARS - 8);
+        assert!(under.len() <= MAX_TOKEN_CHARS, "{}", under.len());
+        assert_eq!(
+            token_agent_id(&under),
+            Some(Uuid::parse_str(agent).unwrap()),
+            "CALIBRATION: a padded token under the bound still decodes"
+        );
+        let over = padded(MAX_TOKEN_CHARS + 64);
+        assert!(over.len() > MAX_TOKEN_CHARS, "{}", over.len());
+        assert_eq!(token_agent_id(&over), None, "over the bound: not decoded");
     }
 
     #[test]
