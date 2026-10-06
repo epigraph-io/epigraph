@@ -22,13 +22,17 @@
 //! beside the retired one as calibration: an exclusion that selected nothing
 //! would pass every negative assertion while breaking the tool.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use epigraph_cli::reembed::{run, ReembedConfig, ReembedTarget};
-use epigraph_embeddings::{EmbeddingConfig, MockProvider};
+use epigraph_embeddings::{
+    EmbeddingConfig, EmbeddingError, EmbeddingService, MockProvider, SimilarClaim, TokenUsage,
+};
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
     sqlx::query_scalar(
@@ -98,5 +102,120 @@ async fn reembed_never_writes_a_vector_onto_a_retired_claim(pool: PgPool) {
     assert_eq!(
         summary.rows_written, 1,
         "exactly the one current claim is written; the retired one is never selected"
+    );
+}
+
+/// A provider that RETIRES one claim the first time it is asked for vectors,
+/// i.e. inside the window between `fetch_batch` selecting the row and the
+/// UPDATE writing its vector. That window is the provider round trip on every
+/// batch, so a concurrent supersede / deprecate / mark_duplicate landing in it
+/// is the ordinary case, not a contrived one. The retirement is the statement
+/// the repo layer runs: `is_current = false` with BOTH vectors nulled.
+struct RetireMidBatch {
+    inner: MockProvider,
+    pool: PgPool,
+    victim: Uuid,
+    fired: AtomicBool,
+}
+
+#[async_trait]
+impl EmbeddingService for RetireMidBatch {
+    async fn generate(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.inner.generate(text).await
+    }
+
+    async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            sqlx::query(
+                "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+                  WHERE id = $1",
+            )
+            .bind(self.victim)
+            .execute(&self.pool)
+            .await
+            .expect("retire the victim mid-batch");
+        }
+        self.inner.batch_generate(texts).await
+    }
+
+    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
+        self.inner.store(claim_id, embedding).await
+    }
+
+    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
+        self.inner.get(claim_id).await
+    }
+
+    async fn similar(
+        &self,
+        embedding: &[f32],
+        k: usize,
+        min_similarity: f32,
+    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
+        self.inner.similar(embedding, k, min_similarity).await
+    }
+
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+
+    fn token_usage(&self) -> TokenUsage {
+        self.inner.token_usage()
+    }
+
+    fn reset_token_usage(&self) {
+        self.inner.reset_token_usage();
+    }
+
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        self.inner.health_check().await
+    }
+}
+
+/// A claim retired AFTER `fetch_batch` selected it must neither get a vector
+/// nor abort the run. Under `chk_deprecated_no_embedding` (migration 144) an
+/// unconditional `UPDATE ... SET embedding_3072 = $1 WHERE id = $2` raises
+/// 23514 on it and `run` returns Err, stopping the whole corpus pass; before
+/// 144 the same UPDATE silently resurrected the retired claim in recall.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_retired_mid_batch_is_skipped_not_fatal(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let live = seed_claim(&pool, agent, "reembed-race-test live claim", true).await;
+    let victim = seed_claim(&pool, agent, "reembed-race-test retired mid-batch", true).await;
+
+    let provider = Arc::new(RetireMidBatch {
+        inner: MockProvider::new(EmbeddingConfig::openai(3072)),
+        pool: pool.clone(),
+        victim,
+        fired: AtomicBool::new(false),
+    });
+
+    let summary = run(
+        &pool,
+        ReembedConfig {
+            target: ReembedTarget::Claims,
+            batch_size: 10,
+            embedding_provider: provider.clone(),
+            checkpoint_path: None,
+        },
+    )
+    .await
+    .expect("a claim retired between fetch and update must not abort the run");
+
+    assert!(
+        provider.fired.load(Ordering::SeqCst),
+        "calibration: the retirement really ran inside the batch window"
+    );
+    assert!(
+        has_vector(&pool, live).await,
+        "calibration: the claim still current at update time is re-embedded"
+    );
+    assert!(
+        !has_vector(&pool, victim).await,
+        "a claim retired mid-batch must not be given a 3072 vector"
+    );
+    assert_eq!(
+        summary.rows_written, 1,
+        "rows_written counts rows actually written, not rows fetched"
     );
 }
