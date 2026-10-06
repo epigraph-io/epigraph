@@ -448,6 +448,145 @@ mod tests {
         );
     }
 
+    fn two_steps() -> Vec<HierarchicalStepExecution> {
+        vec![
+            HierarchicalStepExecution {
+                step_index: 0,
+                planned: "Step A".to_string(),
+                actual: "Step A done".to_string(),
+                deviated: false,
+                deviation_reason: None,
+            },
+            HierarchicalStepExecution {
+                step_index: 1,
+                planned: "Step B".to_string(),
+                actual: "Step B done".to_string(),
+                deviated: false,
+                deviation_reason: None,
+            },
+        ]
+    }
+
+    async fn ingest_fixture(pool: &sqlx::PgPool, canonical_name: &str) -> Uuid {
+        let viewer = epigraph_db::visibility::Viewer::resolve(pool, uuid::Uuid::nil())
+            .await
+            .expect("resolve viewer");
+        let ingest = do_ingest_workflow_via_pool(pool, &viewer, &extraction(canonical_name))
+            .await
+            .unwrap();
+        Uuid::parse_str(&ingest.workflow_id).unwrap()
+    }
+
+    async fn counters_and_rows(pool: &sqlx::PgPool, workflow_id: Uuid) -> (serde_json::Value, i64) {
+        let (metadata,): (serde_json::Value,) =
+            sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM behavioral_executions WHERE workflow_id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (metadata, rows)
+    }
+
+    /// U033 / I229: a step row the database refuses must fail the whole
+    /// report. Real DB failure injection (a BEFORE INSERT trigger that
+    /// refuses only the second step), not a mock. On the pre-fix code the
+    /// counters were written first in their own autocommit, step A landed,
+    /// step B was skipped with a warn, and the tool reported success.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_outcome_is_all_or_nothing_when_a_step_row_fails(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-atomic").await;
+        sqlx::query(
+            "CREATE FUNCTION u033_fail() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
+             RETURN NEW; END $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER u033_fail BEFORE INSERT ON behavioral_executions \
+             FOR EACH ROW EXECUTE FUNCTION u033_fail()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let res = do_report_hierarchical_outcome_via_pool(
+            &pool,
+            workflow_id,
+            true,
+            &two_steps(),
+            None,
+            Some("atomicity run"),
+            None,
+        )
+        .await;
+        assert!(res.is_err(), "a refused step row must fail the report");
+
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "counters must not move when a step row fails: {metadata}"
+        );
+        assert_eq!(rows, 0, "step A must roll back with step B");
+    }
+
+    /// U033 / I229: `quality` is client-supplied and
+    /// `behavioral_executions.quality` carries CHECK (0..=1). An out-of-range
+    /// value must be refused as INVALID_PARAMS before anything is written. On
+    /// the pre-fix code the counters moved, the CHECK silently refused every
+    /// step row, and the tool reported success.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_outcome_rejects_out_of_range_quality_without_side_effects(pool: sqlx::PgPool) {
+        let workflow_id = ingest_fixture(&pool, "test-outcome-quality").await;
+        for bad in [1.5_f64, -0.1, f64::NAN] {
+            let err = do_report_hierarchical_outcome_via_pool(
+                &pool,
+                workflow_id,
+                true,
+                &two_steps(),
+                Some(bad),
+                Some("quality run"),
+                None,
+            )
+            .await
+            .expect_err("out-of-range quality must be refused");
+            assert_eq!(
+                err.code,
+                ErrorCode::INVALID_PARAMS,
+                "quality {bad}: {err:?}"
+            );
+        }
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "a refused report must not move counters: {metadata}"
+        );
+        assert_eq!(rows, 0, "a refused report must write no step rows");
+
+        // Positive control: the boundary value 1.0 is accepted and lands.
+        do_report_hierarchical_outcome_via_pool(
+            &pool,
+            workflow_id,
+            true,
+            &two_steps(),
+            Some(1.0),
+            Some("quality run"),
+            None,
+        )
+        .await
+        .expect("quality 1.0 is in range");
+        let (metadata, rows) = counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"].as_i64(), Some(1));
+        assert_eq!(rows, 2);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_outcome_404s_for_unknown_workflow(pool: sqlx::PgPool) {
         let bogus = Uuid::new_v4();
