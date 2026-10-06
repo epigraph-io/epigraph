@@ -523,6 +523,52 @@ async fn dev_bearer_signs_in_anonymous_requests_on_localhost() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 }
 
+/// The dev bearer is for the developer's own loopback requests. A request
+/// whose `Host` is another name (a DNS-rebinding page fetching this server
+/// same-origin from the developer's browser) is anonymous: it is sent to sign
+/// in, and the bearer never reaches upstream for it. Loopback names keep it.
+#[tokio::test]
+async fn dev_bearer_is_withheld_from_a_request_for_another_host() {
+    let app = spawn_with(
+        &[
+            (ENV_PUBLIC_BASE_URL, "http://localhost:8096/explorer"),
+            (ENV_DEV_BEARER, "dev-token"),
+        ],
+        probe_routes(),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}")))
+        .and(header("authorization", "Bearer dev-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(claim_json()))
+        .expect(2)
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}/belief")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(belief_json()))
+        .mount(&app.upstream)
+        .await;
+
+    let res = app
+        .get_with("/explorer/probe", &[("host", "attacker.example:8096")])
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert!(
+        res.location().unwrap_or_default().contains("/auth/login"),
+        "{:?}",
+        res.location()
+    );
+
+    // CALIBRATION: the loopback names the developer uses are signed in.
+    for host in ["localhost:8096", "127.0.0.1:8096"] {
+        let res = app.get_with("/explorer/probe", &[("host", host)]).await;
+        assert_eq!(res.status, StatusCode::OK, "{host}: {}", res.body);
+    }
+    // Two calls with the bearer, both from the loopback requests.
+    app.upstream.verify().await;
+}
+
 // ---- upstream error mapping ------------------------------------------------------
 
 #[tokio::test]

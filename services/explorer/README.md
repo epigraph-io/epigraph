@@ -749,12 +749,16 @@ if the login response's cookie starts `__Host-` and the startup log
   What closes it is the `__Host-` prefix, which needs the Explorer at the
   root of its own secure host (Deploy). A base-path or co-hosted deploy
   leaves it open.
-- **The dev-bearer guard checks configuration, not the request.**
-  `EPIGRAPH_EXPLORER_DEV_BEARER` is refused unless the *configured* public
-  base URL is `localhost` or `127.0.0.1`. It does not look at where a request
-  came from, so a proxy that forwards outside traffic to an Explorer started
-  that way would sign every visitor in with that token. It is a loopback-only
-  development aid; never set it on a host anything else can reach.
+- **The dev-bearer guard checks configuration and the `Host`, not who
+  is asking.** `EPIGRAPH_EXPLORER_DEV_BEARER` is refused unless the
+  *configured* public base URL is `localhost` or `127.0.0.1`, and a request
+  is signed in with it only when its `Host` is a loopback name (`localhost`,
+  an IPv4 loopback address or `[::1]`), so a DNS-rebinding page that points
+  its own name at 127.0.0.1 gets an anonymous Explorer. Nothing checks where
+  a request came from: a proxy that forwards outside traffic to an Explorer
+  started that way, keeping a loopback `Host`, would sign every visitor in
+  with that token. It is a loopback-only development aid; never set it on a
+  host anything else can reach.
 - **The consent page shows a name the registrant chose.** The API's consent
   page names the requesting client by its `client_name`, which whoever
   registered the client picked, so the name alone does not prove which

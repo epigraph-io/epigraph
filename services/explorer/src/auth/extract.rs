@@ -304,9 +304,49 @@ pub async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> RequestAuth 
         }
     }
     match &state.config.dev_bearer {
-        Some(t) => RequestAuth::DevBearer(t.clone()),
+        Some(t) if dev_bearer_host_allowed(headers) => RequestAuth::DevBearer(t.clone()),
+        Some(_) => {
+            tracing::warn!("dev bearer withheld: the request's Host is not a loopback name");
+            RequestAuth::Anonymous
+        }
         None => RequestAuth::Anonymous,
     }
+}
+
+/// Whether a request may be signed in with the dev bearer, judged by its
+/// `Host`: a loopback name (`localhost`, an IPv4 loopback address or
+/// `[::1]`, any port), or no `Host` header at all.
+///
+/// The dev bearer is accepted only when the public base URL is loopback,
+/// but a loopback bind does not stop DNS rebinding: a page on
+/// `attacker.example` that re-points its name at 127.0.0.1 can fetch this
+/// server same-origin from the developer's own browser, and every such
+/// request carries `Host: attacker.example`. A browser always sends `Host`;
+/// only an in-process request (tests) or a non-browser client omits it.
+pub fn dev_bearer_host_allowed(headers: &HeaderMap) -> bool {
+    let Some(raw) = headers.get(axum::http::header::HOST) else {
+        return true;
+    };
+    let Ok(host) = raw.to_str() else {
+        return false;
+    };
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // `[v6]` or `[v6]:port`.
+        match rest.split_once(']') {
+            Some((v6, _)) => {
+                return v6
+                    .parse::<std::net::Ipv6Addr>()
+                    .is_ok_and(|a| a.is_loopback())
+            }
+            None => return false,
+        }
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _port)| name)
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|a| a.is_loopback())
 }
 
 /// Browser-visible path + query of the request (works whether or not a
@@ -507,6 +547,40 @@ mod tests {
             0,
             "an expired token shows 0, not a negative"
         );
+    }
+
+    #[test]
+    fn only_a_loopback_host_may_carry_the_dev_bearer() {
+        let with = |host: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::header::HOST, host.parse().unwrap());
+            dev_bearer_host_allowed(&h)
+        };
+        for ok in [
+            "localhost",
+            "localhost:8096",
+            "LocalHost:8096",
+            "127.0.0.1",
+            "127.0.0.1:8096",
+            "127.1.2.3:80",
+            "[::1]",
+            "[::1]:8096",
+        ] {
+            assert!(with(ok), "{ok}");
+        }
+        for refused in [
+            "attacker.example",
+            "attacker.example:8096",
+            "localhost.attacker.example:8096",
+            "127.0.0.1.attacker.example",
+            "10.0.0.1:8096",
+            "[::2]:8096",
+            "[::1",
+            "",
+        ] {
+            assert!(!with(refused), "{refused}");
+        }
+        assert!(dev_bearer_host_allowed(&HeaderMap::new()), "no Host header");
     }
 
     #[test]
