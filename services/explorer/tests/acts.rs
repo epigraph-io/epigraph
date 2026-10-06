@@ -264,6 +264,24 @@ async fn probe_unknown_on_a_server_error_is_remembered_briefly() {
     );
 }
 
+/// The app's capability memory is built with the documented lifetimes: five
+/// minutes for a present/absent answer, thirty seconds for an API-side
+/// unknown. Pinned as values, so neither a never-expiring cache (an "absent"
+/// cached before the elevation stack deploys would hide the item until a
+/// restart) nor a change to the constants passes unnoticed.
+#[tokio::test]
+async fn the_app_remembers_probe_answers_for_the_documented_lifetimes() {
+    let app = spawn().await;
+    assert_eq!(
+        app.state.capabilities.ttl(),
+        std::time::Duration::from_secs(5 * 60)
+    );
+    assert_eq!(
+        app.state.capabilities.unknown_ttl(),
+        std::time::Duration::from_secs(30)
+    );
+}
+
 /// A 2xx whose body is not the listing's envelope is not evidence of the
 /// route either (a catch-all page, a proxy's own answer): unknown.
 #[tokio::test]
