@@ -361,3 +361,259 @@ async fn lexical_scoped_ranks_matches_and_honors_scope(pool: PgPool) {
     );
     assert!(h.rrf_score > 0.0);
 }
+
+// ── Dense-leg truncation under an HNSW index plan (backlog fdd8e494) ────────
+//
+// pgvector's HNSW index scan yields at most `hnsw.ef_search` (default 40)
+// candidates unless iterative scanning is on, and every scope predicate in the
+// dense CTE (`labels @>`, `agent_id`, `since`, `theme_id`, the visibility
+// splice) is applied AFTER that scan. So a scope that is rare among the ~40
+// nearest neighbours silently returns 0–2 dense rows, and even the unscoped
+// dense leg cannot fill a candidate pool larger than 40.
+//
+// Small tables are always cheaper to seq-scan, so these tests pin the plan
+// prod actually runs: ONE connection (the `SET`s are session-scoped and a pool
+// may hand the next statement another backend), with seq scans, bitmap scans
+// (GIN serves only bitmap scans) and explicit sorts disabled. A calibration
+// step EXPLAINs the dense CTE shape and aborts — never passes — if the planner
+// did not choose `idx_claims_embedding_hnsw`. `hnsw.ef_search` is left at its
+// default: the tests must not set the knob the implementation sets.
+
+/// A unit vector at `deg` degrees in the dim-0/dim-1 plane. The query is
+/// `vec_hot(0)` (angle 0; cosine is scale-free), so a row's cosine distance to
+/// it grows strictly with its angle and every row has its own distance.
+///
+/// The rows lie on one arc rather than as `e0 + eps_i * e_i` spokes on their
+/// own dims: with spokes, HNSW's neighbour-pruning heuristic keeps only the
+/// smallest-`eps` rows as neighbours and leaves most of the graph with no
+/// inbound edge, so the index cannot reach them at ANY `ef_search` (measured:
+/// 33 of 85 rows reachable at ef_search = 200). An arc is a well-formed graph,
+/// which [`hnsw_graph_reaches_every_row`] checks.
+fn vec_angle(deg: f64) -> String {
+    let (s, c) = deg.to_radians().sin_cos();
+    let mut v: Vec<String> = vec!["0.0".to_string(); 1536];
+    v[0] = format!("{c:.6}");
+    v[1] = format!("{s:.6}");
+    format!("[{}]", v.join(","))
+}
+
+/// Calibration: with a search list larger than the table (`ef_search = 1000`,
+/// no iterative scan, in a rolled-back transaction so nothing leaks into the
+/// call under test), the HNSW plan reaches all `n` embedded rows. Without this
+/// a badly-connected test graph would fail the tests for a reason that has
+/// nothing to do with `ef_search` truncation.
+async fn hnsw_graph_reaches_every_row(conn: &mut sqlx::PgConnection, n: i64) {
+    let q = vec_hot(0);
+    sqlx::query("BEGIN")
+        .execute(&mut *conn)
+        .await
+        .expect("BEGIN");
+    sqlx::query("SET LOCAL hnsw.ef_search = 1000")
+        .execute(&mut *conn)
+        .await
+        .expect("SET LOCAL ef_search");
+    let reached: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM (SELECT c.id FROM claims c \
+         WHERE c.embedding IS NOT NULL AND c.is_current \
+         ORDER BY c.embedding <=> '{q}'::vector LIMIT 1000) s"
+    ))
+    .fetch_one(&mut *conn)
+    .await
+    .expect("graph reach probe");
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("ROLLBACK");
+    assert_eq!(
+        reached, n,
+        "calibration: HNSW graph reaches only {reached} of {n} rows"
+    );
+}
+
+/// Force the dense CTE onto the HNSW index on `conn` and prove it did, plus
+/// prove the test database's pgvector has iterative index scans (>= 0.8.0).
+async fn force_hnsw_plan(conn: &mut sqlx::PgConnection, tags: Option<&str>) {
+    let ext: String =
+        sqlx::query_scalar("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("pgvector extension version");
+    let mut parts = ext.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    assert!(
+        (major, minor) >= (0, 8),
+        "calibration: pgvector {ext} < 0.8 on the test DB (no hnsw.iterative_scan)"
+    );
+
+    for s in [
+        "SET enable_seqscan = off",
+        "SET enable_bitmapscan = off",
+        "SET enable_sort = off",
+    ] {
+        sqlx::query(s).execute(&mut *conn).await.expect(s);
+    }
+
+    let tag_pred = match tags {
+        Some(t) => format!("AND c.labels @> ARRAY['{t}']::text[]"),
+        None => String::new(),
+    };
+    let q = vec_hot(0);
+    let plan = sqlx::query_scalar::<_, String>(&format!(
+        "EXPLAIN (COSTS OFF) \
+         SELECT c.id, row_number() OVER (ORDER BY c.embedding <=> '{q}'::vector) AS rank \
+         FROM claims c \
+         WHERE c.embedding IS NOT NULL AND c.is_current {tag_pred} \
+         ORDER BY c.embedding <=> '{q}'::vector \
+         LIMIT 50"
+    ))
+    .fetch_all(&mut *conn)
+    .await
+    .expect("EXPLAIN dense CTE")
+    .join("\n");
+    assert!(
+        plan.contains("idx_claims_embedding_hnsw"),
+        "calibration: dense leg not on HNSW plan:\n{plan}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn tag_scoped_dense_leg_returns_every_matching_row_beyond_ef_search(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+
+    // 80 UNTAGGED rows at 0°..39.5°, all nearer the query than any tagged
+    // row: they fill the default ef_search=40 window twice over.
+    for i in 0..80usize {
+        insert_claim(
+            &pool,
+            Uuid::new_v4(),
+            agent,
+            10 + i as u8,
+            &format!("untagged filler row number {i}"),
+            &vec_angle(0.5 * i as f64),
+            true,
+            &[],
+        )
+        .await;
+    }
+    // 5 TAGGED rows at 50°..58°, farther from the query than every untagged
+    // row, with no lexical overlap with the query text — the dense leg is the
+    // only way they can be returned.
+    let mut tagged = Vec::new();
+    for j in 0..5usize {
+        let id = Uuid::new_v4();
+        insert_claim(
+            &pool,
+            id,
+            agent,
+            200 + j as u8,
+            &format!("scoped backlog filler item {j}"),
+            &vec_angle(50.0 + 2.0 * j as f64),
+            true,
+            &["backlog"],
+        )
+        .await;
+        tagged.push(id);
+    }
+
+    let truth: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM claims \
+         WHERE labels @> '{backlog}' AND embedding IS NOT NULL AND is_current",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("ground truth");
+    assert_eq!(truth, 5, "calibration: 5 embedded current backlog rows");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    force_hnsw_plan(&mut conn, Some("backlog")).await;
+    hnsw_graph_reaches_every_row(&mut conn, 85).await;
+
+    let tags = vec!["backlog".to_string()];
+    let hits = ClaimRepository::search_hybrid_scoped_since_in_theme(
+        &mut *conn,
+        &viewer,
+        &vec_hot(0),
+        "zzqxnomatch",
+        50,
+        60,
+        10,
+        0,
+        Some(&tags),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("hybrid search");
+
+    let dense: Vec<Uuid> = hits
+        .iter()
+        .filter(|h| h.dense_similarity.is_some())
+        .map(|h| h.claim_id)
+        .collect();
+    assert_eq!(
+        dense.len(),
+        5,
+        "tag-scoped dense leg must return min(pool, matching embedded rows); \
+         got {} dense rows of 5 tagged",
+        dense.len()
+    );
+    for id in &tagged {
+        assert!(dense.contains(id), "tagged row {id} missing from dense leg");
+    }
+    assert!(
+        hits.iter().all(|h| !h.in_lexical),
+        "query text matches nothing, so no row may come from the lexical leg"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn unscoped_dense_leg_fills_the_candidate_pool(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+
+    // 60 rows > candidate_pool 50 > default ef_search 40.
+    for i in 0..60usize {
+        insert_claim(
+            &pool,
+            Uuid::new_v4(),
+            agent,
+            10 + i as u8,
+            &format!("unscoped filler row number {i}"),
+            &vec_angle(0.5 * i as f64),
+            true,
+            &[],
+        )
+        .await;
+    }
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    force_hnsw_plan(&mut conn, None).await;
+    hnsw_graph_reaches_every_row(&mut conn, 60).await;
+
+    // limit 100 (the fused `LIMIT $5`) so the outer cut cannot mask the pool.
+    let hits = ClaimRepository::search_hybrid_scoped_since_in_theme(
+        &mut *conn,
+        &viewer,
+        &vec_hot(0),
+        "zzqxnomatch",
+        50,
+        60,
+        100,
+        0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("hybrid search");
+
+    let dense = hits.iter().filter(|h| h.dense_similarity.is_some()).count();
+    assert_eq!(
+        dense, 50,
+        "unscoped dense leg must fill candidate_pool (50) when 60 rows are \
+         embedded; got {dense}"
+    );
+}
