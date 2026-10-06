@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block title %}{% if let Some(f) = filter %}{{ f }} · {% endif %}Backlog · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}<link rel="stylesheet" href="{{ ctx.static_url("core.css") }}">{% endblock %}
+
+{% block content %}
+<h1>Backlog</h1>
+<p class="muted">Open items: current claims labelled <span class="label">backlog</span> and not labelled <span class="label">resolved</span>, newest first. This page is read-only; items are resolved through MCP or the CLI.</p>
+
+{%- if let Some(f) = filter %}
+<p class="backlog-filter">Showing only items also labelled <span class="label">{{ f }}</span>. <a href="{{ all_url }}">Show the whole backlog</a></p>
+{%- endif %}
+
+{%- if let Some(p) = problem %}
+<p class="notice notice--warn">{{ p }}</p>
+<p><a href="{{ all_url }}">Show the whole backlog</a></p>
+{%- endif %}
+
+{%- if let Some(list) = rows %}
+<section class="section backlog" aria-labelledby="backlog-title">
+  <h2 id="backlog-title" class="section__title">Open items <span class="muted small">page {{ page }}</span></h2>
+  {%- match list %}
+  {%- when Degraded::Available { data } %}
+  {%- if data.is_empty() %}
+  <p class="muted">No open backlog items{% if let Some(f) = filter %} labelled “{{ f }}”{% endif %}{% if page > 1 %} on this page{% endif %}.</p>
+  {%- else %}
+  <ol class="results">
+    {%- for r in data %}
+    <li class="result">
+      <p class="result__text"><a href="{{ r.claim_url }}">{{ r.text }}</a></p>
+      {%- if let Some(d) = r.created %}
+      <p class="result__meta small muted"><span>{{ d }}</span></p>
+      {%- endif %}
+      {%- if !r.labels.is_empty() %}
+      <ul class="labels result__labels" aria-label="Labels">
+        {%- for l in r.labels %}
+        <li class="label"><a href="{{ l.url }}">{{ l.name }}</a></li>
+        {%- endfor %}
+      </ul>
+      {%- endif %}
+    </li>
+    {%- endfor %}
+  </ol>
+  {%- endif %}
+  {%- if prev_url.is_some() || next_url.is_some() %}
+  <nav class="pager" aria-label="Backlog pages">
+    {%- if let Some(u) = prev_url %}<a class="button-quiet button" href="{{ u }}" rel="prev">← Previous page</a>{% endif %}
+    {%- if let Some(u) = next_url %}<a class="button-quiet button" href="{{ u }}" rel="next">Next page →</a>{% endif %}
+  </nav>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">The backlog is unavailable. {{ reason }}</p>
+  {%- endmatch %}
+</section>
+{%- endif %}
+{% endblock %}

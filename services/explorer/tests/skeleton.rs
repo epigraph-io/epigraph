@@ -233,11 +233,16 @@ async fn every_area_route_is_mounted() {
         format!("/explorer/theme/{CLAIM}"),
         format!("/explorer/community/{CLAIM}"),
         format!("/explorer/neighborhood/{CLAIM}?mode=compound"),
+        "/explorer/backlog".to_string(),
     ];
     for uri in &pages {
         let res = app.get_as(uri, &sid).await;
         assert!(!res.body.contains(FALLBACK), "not mounted: {uri}");
         assert!(!res.body.contains("not built yet"), "still a stub: {uri}");
+        assert!(
+            !res.body.contains("Not yet available"),
+            "still a stub: {uri}"
+        );
     }
     // Auth routes are built (tests/auth.rs covers them). Here: mounted and no
     // longer stubs. With no client id sign-in is disabled (503), an unknown
@@ -300,7 +305,7 @@ async fn every_area_route_is_mounted() {
 async fn new_page_stubs_answer_501_not_404() {
     let app = spawn().await;
     let sid = app.sign_in("tok");
-    for page in ["backlog", "audit", "activity", "candidates", "acts"] {
+    for page in ["audit", "activity", "candidates", "acts"] {
         // Mounted twice, like every route: under the base path and at the root.
         for uri in [format!("{BASE}/{page}"), format!("/{page}")] {
             let res = app.get_as(&uri, &sid).await;

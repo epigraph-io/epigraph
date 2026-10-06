@@ -159,6 +159,24 @@ impl Links {
         self.path("/backlog")
     }
 
+    /// `/backlog?label=&page=`; each is omitted when `None`, so with neither
+    /// this is [`Links::backlog`].
+    pub fn backlog_page(&self, label: Option<&str>, page: Option<u32>) -> String {
+        let mut qs = form_urlencoded::Serializer::new(String::new());
+        if let Some(l) = label {
+            qs.append_pair("label", l);
+        }
+        if let Some(p) = page {
+            qs.append_pair("page", &p.to_string());
+        }
+        let qs = qs.finish();
+        if qs.is_empty() {
+            self.backlog()
+        } else {
+            format!("{}?{qs}", self.backlog())
+        }
+    }
+
     /// `/audit`: the viewer's readable security events.
     pub fn audit(&self) -> String {
         self.path("/audit")
@@ -366,6 +384,19 @@ mod tests {
             l.absolute(&l.claim(i)),
             format!("https://explorer.example.com/explorer/claim/{i}")
         );
+    }
+
+    #[test]
+    fn backlog_page_encodes_its_query_and_omits_what_is_unset() {
+        let l = Links::new("https://explorer.example.com", "/explorer");
+        assert_eq!(l.backlog_page(None, None), "/explorer/backlog");
+        assert_eq!(
+            l.backlog_page(Some("a b&c"), Some(2)),
+            "/explorer/backlog?label=a+b%26c&page=2"
+        );
+        assert_eq!(l.backlog_page(None, Some(3)), "/explorer/backlog?page=3");
+        let root = Links::new("https://explorer.example.com", "");
+        assert_eq!(root.backlog_page(Some("ui"), None), "/backlog?label=ui");
     }
 
     #[test]

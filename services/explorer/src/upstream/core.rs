@@ -227,10 +227,20 @@ pub struct LabelHit {
 #[derive(Debug, Clone, Serialize)]
 struct ByLabelsQuery<'q> {
     labels: &'q str,
+    /// Comma-separated; a claim carrying ANY of them is left out
+    /// (`ClaimsByLabelsQuery::exclude_labels`). Omitted from the query string
+    /// when `None`, so label search sends exactly what it always has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude_labels: Option<&'q str>,
     current_only: bool,
     limit: u32,
     offset: u64,
 }
+
+/// The label every backlog item carries.
+pub const BACKLOG_LABEL: &str = "backlog";
+/// The label that retires a backlog item (`resolve_backlog_item` adds it).
+pub const RESOLVED_LABEL: &str = "resolved";
 
 // ---- GET /api/v1/search/evidence (rag.rs::search_evidence) ------------------
 
@@ -375,6 +385,32 @@ impl Api<'_> {
     ) -> Result<Vec<LabelHit>, UpstreamError> {
         let q = ByLabelsQuery {
             labels,
+            exclude_labels: None,
+            current_only: true,
+            limit: limit.clamp(1, MAX_SEARCH_LIMIT),
+            offset,
+        };
+        self.get_query("/api/v1/claims/by-labels", &q).await
+    }
+
+    /// `GET /api/v1/claims/by-labels` for the open backlog: current claims
+    /// labelled [`BACKLOG_LABEL`] (and `sub_label`, when given) that are NOT
+    /// labelled [`RESOLVED_LABEL`], newest first (upstream orders by
+    /// `created_at DESC`). `sub_label` must be one label: upstream ANDs a
+    /// comma-separated list.
+    pub async fn backlog_open(
+        &self,
+        sub_label: Option<&str>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<LabelHit>, UpstreamError> {
+        let labels = match sub_label {
+            Some(sub) => format!("{BACKLOG_LABEL},{sub}"),
+            None => BACKLOG_LABEL.to_string(),
+        };
+        let q = ByLabelsQuery {
+            labels: &labels,
+            exclude_labels: Some(RESOLVED_LABEL),
             current_only: true,
             limit: limit.clamp(1, MAX_SEARCH_LIMIT),
             offset,
