@@ -1265,6 +1265,70 @@ async fn landing_degrades_each_overview_independently() {
     assert!(!res.body.contains("secret"));
 }
 
+/// The theme and community overviews are read without the viewer, over the
+/// whole corpus, and not every claim is in a theme: the landing page says so
+/// next to them, whether or not they loaded.
+#[tokio::test]
+async fn landing_overview_carries_the_partial_coverage_note() {
+    const PARTIAL: &str = "Theme coverage may be partial";
+    const CORPUS_WIDE: &str = "computed over the whole graph";
+
+    // Both overviews load: the note sits between the stats and the overviews.
+    let app = spawn().await;
+    mount_get(&app, "/api/v1/stats", 200, stats_json(), 1).await;
+    mount_get(&app, "/api/v1/graph/themes/overview", 200, themes_json(), 1).await;
+    mount_get(
+        &app,
+        "/api/v1/graph/communities/overview",
+        200,
+        communities_json(),
+        1,
+    )
+    .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as("/explorer/", &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let body = &res.body;
+    let note = body.find(PARTIAL).expect("partial-coverage note");
+    assert!(body.contains(CORPUS_WIDE), "corpus-wide note");
+    let stats = body.find("id=\"stats-title\"").expect("stats section");
+    let themes = body.find("id=\"themes-title\"").expect("themes section");
+    assert!(
+        stats < note && note < themes,
+        "the note introduces the overviews"
+    );
+    assert!(body.contains("Thermodynamics"), "the overviews rendered");
+
+    // Both overviews fail: the note does not depend on their data.
+    let app = spawn().await;
+    mount_get(&app, "/api/v1/stats", 200, stats_json(), 1).await;
+    mount_get(
+        &app,
+        "/api/v1/graph/themes/overview",
+        500,
+        json!({"error": "Internal"}),
+        1,
+    )
+    .await;
+    mount_get(
+        &app,
+        "/api/v1/graph/communities/overview",
+        500,
+        json!({"error": "Internal"}),
+        1,
+    )
+    .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as("/explorer/", &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.body.matches("class=\"section-unavailable\"").count(),
+        2,
+        "both overviews degraded"
+    );
+    assert!(res.body.contains(PARTIAL) && res.body.contains(CORPUS_WIDE));
+}
+
 // ---- cache policy -------------------------------------------------------------------
 
 /// `Vary` lists `Cookie` (in any of the response's `Vary` headers).
