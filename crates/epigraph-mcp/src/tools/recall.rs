@@ -1984,6 +1984,19 @@ pub async fn fetch_batched_context(
     // Direction is part of the payload because it carries the meaning: an
     // incoming `refutes` means "is refuted by", which is the opposite claim
     // about credibility from an outgoing one.
+    //
+    // Three predicates beyond the neighbour claim's visibility, all applied in
+    // `neighbors` / `joined` — BEFORE the window functions, so `total` (and the
+    // hit's `epistemic_edges_truncated`) never counts a row the caller cannot see:
+    //   * the EDGE's own tenancy, verbatim from `ClaimRepository::dispute_batch`.
+    //     Migration 070 honours a `('group', G)` edge between two public claims,
+    //     so the neighbour's visibility alone would disclose another group's
+    //     private assertion that two public claims are related;
+    //   * `EDGE_IN_FORCE` (`epigraph_db::repos::edge`), inlined because
+    //     `query!` needs a literal: a retracted edge (`delete_edge` sets
+    //     `valid_to`) is not live argument;
+    //   * neighbour `is_current`, as `dispute_batch` joins `src.is_current`: a
+    //     superseded claim is not live argument either.
     {
         let relationships: Vec<String> = EPISTEMIC_EDGE_RELATIONSHIPS
             .iter()
@@ -1996,17 +2009,28 @@ pub async fn fetch_batched_context(
                        e.relationship, 'outgoing' AS direction
                 FROM edges e
                 WHERE e.source_id = ANY($1) AND e.relationship = ANY($3)
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
+                  AND ($4::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($5::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($5::uuid[]))))
                 UNION ALL
                 SELECT e.target_id AS paragraph_id, e.source_id AS neighbor_id,
                        e.relationship, 'incoming' AS direction
                 FROM edges e
                 WHERE e.target_id = ANY($1) AND e.relationship = ANY($3)
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
+                  AND ($4::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($5::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($5::uuid[]))))
             ),
             joined AS (
                 SELECT n.paragraph_id, n.neighbor_id, n.relationship, n.direction,
                        c.content, c.truth_value
                 FROM neighbors n
                 JOIN claims c ON c.id = n.neighbor_id
+                  AND c.is_current
                   AND ($4::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($5::uuid[]))
             ),
