@@ -13,14 +13,16 @@
 //! on a second 401 drops the session and returns
 //! [`UpstreamError::SessionExpired`].
 //!
-//! A *failed* refresh is split by cause. [`crate::auth::RefreshError::Rejected`]
-//! and `NoSession` mean upstream refused the credential, so the session ends
-//! the same way. `Upstream`/`Unavailable` mean `/oauth/token` could not be
-//! reached — an API restart, a timeout, a 5xx — which says nothing about the
-//! refresh token; the session is kept and the call returns
-//! [`UpstreamError::Transport`], the ordinary transient failure a degraded
-//! section already renders. There is still exactly one refresh attempt per
-//! request, so a flapping upstream cannot loop.
+//! A *failed* refresh ends the session too, whatever the cause.
+//! [`crate::auth::RefreshError::Rejected`] and `NoSession` mean upstream
+//! refused the credential. `Upstream` means `/oauth/token` was unreachable or
+//! its answer was lost (a timeout, a reset, a 5xx): upstream may already have
+//! rotated the refresh token, and presenting the old one again would read as
+//! token reuse and revoke the whole rotation family. So
+//! [`crate::auth::refresh_session`] ends the session and revokes what it held
+//! instead of keeping it for a later replay, and the call returns
+//! [`UpstreamError::SessionExpired`]: the viewer signs in again. There is
+//! exactly one refresh attempt per request, so a flapping upstream cannot loop.
 //!
 //! Area agents add typed methods as `impl Api<'_>` blocks in their own
 //! `upstream/{core,entities,graph}.rs`, built on [`Api::get`],
@@ -129,6 +131,7 @@ pub struct Upstream {
     base: String,
     semaphore: Arc<Semaphore>,
     timeout: Duration,
+    token_timeout: Duration,
 }
 
 impl Upstream {
@@ -144,6 +147,7 @@ impl Upstream {
             base: config.api_url.as_str().trim_end_matches('/').to_string(),
             semaphore: Arc::new(Semaphore::new(config.upstream_concurrency)),
             timeout: config.upstream_timeout,
+            token_timeout: config.token_timeout,
         })
     }
 
@@ -160,6 +164,11 @@ impl Upstream {
 
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Timeout for `POST /oauth/token`, separate from [`Upstream::timeout`].
+    pub fn token_timeout(&self) -> Duration {
+        self.token_timeout
     }
 
     /// Slots currently free in the global semaphore.
@@ -268,20 +277,25 @@ impl<'a> Api<'a> {
         let stale = token.unwrap_or_default();
         let fresh = match auth::refresh_session(self.state, id, &stale).await {
             Ok(t) => t,
-            // Upstream said no (invalid_grant, revoked, no such session):
-            // the credential is dead, so the session is too.
-            Err(e @ (auth::RefreshError::Rejected(_) | auth::RefreshError::NoSession)) => {
-                tracing::info!(error = %e, %path, upstream_reason = %reason, "upstream 401 and refresh rejected; ending session");
+            // Upstream said no (invalid_grant, revoked, no such session),
+            // or its answer to the refresh was lost (transport, timeout,
+            // 5xx) and the token it held may already be spent. Either way
+            // the session is over: `refresh_session` has already ended it on
+            // a lost answer, and removing it again is a no-op.
+            Err(
+                e @ (auth::RefreshError::Rejected(_)
+                | auth::RefreshError::NoSession
+                | auth::RefreshError::Upstream(_)),
+            ) => {
+                tracing::info!(error = %e, %path, upstream_reason = %reason, "upstream 401 and the refresh failed; ending session");
                 self.state.sessions.remove(id);
                 return Err(UpstreamError::SessionExpired);
             }
-            // We could not *reach* `/oauth/token` (transport, timeout, 5xx).
-            // That says nothing about the refresh token, so keep the session
-            // and report a transient upstream failure: an API restart must
-            // not sign every user out. `degrade` renders this as an
-            // unavailable section, and the next request refreshes again.
+            // Refresh is not configured: nothing was presented upstream, so
+            // the session is kept and the call degrades like any transient
+            // failure.
             Err(e) => {
-                tracing::warn!(error = %e, %path, upstream_reason = %reason, "upstream 401 but the refresh could not reach upstream; keeping the session");
+                tracing::warn!(error = %e, %path, upstream_reason = %reason, "upstream 401 but refresh is unavailable; keeping the session");
                 return Err(UpstreamError::Transport(e.to_string()));
             }
         };

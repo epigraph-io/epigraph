@@ -21,6 +21,7 @@ use epigraph_explorer::auth::flow::{Handoff, PendingLogin, MAX_PENDING_LOGINS};
 use epigraph_explorer::auth::{oauth, RefreshError, SessionId, SignedIn};
 use epigraph_explorer::config::{
     ENV_CLIENT_ID, ENV_INSECURE_COOKIES, ENV_OAUTH_BASE_URL, ENV_PUBLIC_BASE_URL,
+    ENV_TOKEN_TIMEOUT_MS, ENV_UPSTREAM_TIMEOUT_MS,
 };
 use epigraph_explorer::{app as explorer_app, AppError, AppState};
 use serde_json::{json, Value};
@@ -1088,6 +1089,208 @@ async fn refresh_grant_maps_upstream_failures() {
     assert_eq!(
         (t.access_token.as_str(), t.refresh_token.as_str()),
         ("a9", "r-old")
+    );
+}
+
+// ---- a lost refresh answer ---------------------------------------------------------
+
+/// The auth test app with extra env (e.g. a short token timeout).
+async fn app_with(env: &[(&str, &str)]) -> TestApp {
+    let mut vars = vec![(ENV_CLIENT_ID, CLIENT_ID), (ENV_OAUTH_BASE_URL, OAUTH_BASE)];
+    vars.extend_from_slice(env);
+    spawn_with(
+        &vars,
+        Router::new()
+            .route("/probe", get(probe))
+            .route("/bff/probe", get(probe)),
+    )
+    .await
+}
+
+/// How many `POST /oauth/token` requests carried `refresh_token`. Only token
+/// calls count: the revocation also names the token, at `/oauth/revoke`.
+async fn token_posts_presenting(app: &TestApp, refresh_token: &str) -> usize {
+    app.upstream
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/oauth/token")
+        .filter(|r| form(r).get("refresh_token").map(String::as_str) == Some(refresh_token))
+        .count()
+}
+
+/// How many `POST /oauth/revoke` requests named `refresh_token`.
+async fn revocations_of(app: &TestApp, refresh_token: &str) -> usize {
+    app.upstream
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/oauth/revoke")
+        .filter(|r| {
+            serde_json::from_slice::<Value>(&r.body).ok()
+                == Some(json!({"token": refresh_token, "token_type_hint": "refresh_token"}))
+        })
+        .count()
+}
+
+/// `/oauth/token` stalls past the token timeout ONCE for `r1`, then answers
+/// at once with a fresh pair, so a replay of `r1` would be seen (and would
+/// succeed quickly) rather than hang. `/oauth/revoke` accepts anything.
+async fn mount_lost_refresh(app: &TestApp) {
+    token_call(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "r1"),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(
+        ResponseTemplate::new(200)
+            .set_body_json(token_json("a2", "r2"))
+            .set_delay(StdDuration::from_secs(3)),
+    )
+    .up_to_n_times(1)
+    .mount(&app.upstream)
+    .await;
+    token_call(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "r1"),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(token_json("a2", "r2")))
+    .mount(&app.upstream)
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&app.upstream)
+        .await;
+}
+
+/// A refresh whose answer is lost (here: the token call outlives its
+/// timeout) may already have rotated the token upstream. Presenting the old
+/// refresh token again would read as token reuse and revoke the whole
+/// rotation family, so the session ends at once: the held token is revoked
+/// (at `/oauth/revoke`, never replayed to `/oauth/token`), the viewer is sent
+/// to sign in, and no later request presents the old token again. Both entry
+/// points: the proactive refresh of an expired token, and the refresh after
+/// an upstream 401.
+#[tokio::test]
+async fn lost_refresh_response_ends_the_session_without_replaying() {
+    // Proactive: the access token has expired, so the extractor refreshes.
+    let app = app_with(&[(ENV_TOKEN_TIMEOUT_MS, "250")]).await;
+    mount_lost_refresh(&app).await;
+    let sid =
+        app.state
+            .sessions
+            .create("a1".into(), "r1".into(), Utc::now() - Duration::seconds(5));
+    for attempt in 0..2 {
+        let res = app.get_as("/explorer/probe", &sid).await;
+        assert_eq!(res.status, StatusCode::SEE_OTHER, "attempt {attempt}");
+        assert_eq!(
+            res.location(),
+            Some("/explorer/auth/login?return_to=%2Fexplorer%2Fprobe"),
+            "attempt {attempt}: sent to sign in"
+        );
+    }
+    assert!(app.state.sessions.get(&sid).is_none(), "the session ended");
+    assert_eq!(
+        token_posts_presenting(&app, "r1").await,
+        1,
+        "the refresh token whose rotation answer was lost is never presented again"
+    );
+    assert_eq!(
+        revocations_of(&app, "r1").await,
+        1,
+        "the held token is revoked"
+    );
+
+    // After an upstream 401 on a still-valid token.
+    let app = app_with(&[(ENV_TOKEN_TIMEOUT_MS, "250")]).await;
+    mount_lost_refresh(&app).await;
+    mount_probe(&app, "a1", 401, 1).await;
+    let sid = app
+        .state
+        .sessions
+        .create("a1".into(), "r1".into(), Utc::now() + Duration::hours(1));
+    let res = app.get_as("/explorer/probe", &sid).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert_eq!(
+        res.location(),
+        Some("/explorer/auth/login?return_to=%2Fexplorer%2Fprobe")
+    );
+    let (value, line) = set_cookie(&res, "epx_session").expect("cookie cleared");
+    assert!(value.is_empty() && line.contains("Max-Age=0"), "{line}");
+    assert!(app.state.sessions.get(&sid).is_none(), "the session ended");
+    let res = app.get_as("/explorer/probe", &sid).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "still signed out");
+    assert_eq!(token_posts_presenting(&app, "r1").await, 1);
+    assert_eq!(revocations_of(&app, "r1").await, 1);
+}
+
+/// The session ends while the refresh lock is still held, so requests that
+/// queued on that lock behind the lost refresh find the session gone. Had it
+/// been ended after the lock was released, the next request in the queue
+/// would re-read the session and replay the old refresh token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_requests_never_replay_a_lost_refresh() {
+    let app = app_with(&[(ENV_TOKEN_TIMEOUT_MS, "250")]).await;
+    mount_lost_refresh(&app).await;
+    let sid =
+        app.state
+            .sessions
+            .create("a1".into(), "r1".into(), Utc::now() - Duration::seconds(5));
+
+    let statuses = concurrent_probes(&app, &sid, 6).await;
+    assert!(
+        statuses.iter().all(|s| *s == StatusCode::SEE_OTHER),
+        "every request is sent to sign in: {statuses:?}"
+    );
+    assert!(app.state.sessions.get(&sid).is_none());
+    assert_eq!(
+        token_posts_presenting(&app, "r1").await,
+        1,
+        "one refresh attempt for the whole queue"
+    );
+    assert_eq!(revocations_of(&app, "r1").await, 1);
+}
+
+/// The token call has its own timeout: a refresh slower than the data
+/// timeout but inside the token timeout succeeds, and the page renders with
+/// the rotated token.
+#[tokio::test]
+async fn a_token_call_may_outlast_the_data_timeout() {
+    let app = app_with(&[
+        (ENV_UPSTREAM_TIMEOUT_MS, "250"),
+        (ENV_TOKEN_TIMEOUT_MS, "5000"),
+    ])
+    .await;
+    token_call(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "r1"),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(
+        ResponseTemplate::new(200)
+            .set_body_json(token_json("a2", "r2"))
+            .set_delay(StdDuration::from_millis(1000)),
+    )
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    mount_probe(&app, "a2", 200, 1).await;
+    let sid =
+        app.state
+            .sessions
+            .create("a1".into(), "r1".into(), Utc::now() - Duration::seconds(5));
+
+    let res = app.get_as("/explorer/probe", &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.json()["token_seen"], "a2");
+    let s = app.state.sessions.get(&sid).expect("session kept");
+    assert_eq!(
+        (s.access_token.as_str(), s.refresh_token.as_str()),
+        ("a2", "r2")
     );
 }
 

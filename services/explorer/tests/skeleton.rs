@@ -751,11 +751,26 @@ async fn failed_refresh_ends_the_session() {
     assert!(app.state.sessions.get(&sid).is_none(), "session dropped");
 }
 
-/// A refresh that could not *reach* `/oauth/token` is transient: the API
-/// restarting must not sign every user out, so the session survives and the
-/// call reports the ordinary "API unavailable" failure a section degrades on.
+/// `POST /oauth/revoke` for the harness's stored refresh token, `times` calls.
+async fn expect_revocation_of_the_held_token(app: &TestApp, times: u64) {
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .and(wiremock::matchers::body_json(json!({
+            "token": "refresh-token", "token_type_hint": "refresh_token"
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(times)
+        .mount(&app.upstream)
+        .await;
+}
+
+/// A refresh that got no usable answer from `/oauth/token` (here a 5xx) may
+/// still have rotated the token upstream, so its outcome is unknown. The
+/// session ends rather than keep a possibly spent refresh token to replay
+/// later: the held token is revoked and the call reports `SessionExpired`,
+/// which sends the viewer to sign in.
 #[tokio::test]
-async fn unreachable_refresh_keeps_the_session_and_degrades() {
+async fn unreachable_refresh_ends_the_session_and_revokes_its_token() {
     let app = spawn().await;
     mount_claim_for_token(&app, "stale", 401, 1).await;
     Mock::given(method("POST"))
@@ -764,39 +779,34 @@ async fn unreachable_refresh_keeps_the_session_and_degrades() {
         .expect(1)
         .mount(&app.upstream)
         .await;
+    expect_revocation_of_the_held_token(&app, 1).await;
 
     let sid = app.sign_in("stale");
     let api = app.state.api(&app.session_auth(&sid, "stale"));
-    let err = api.claim(claim_id()).await.unwrap_err();
-    assert!(
-        matches!(err, UpstreamError::Transport(_)),
-        "a transient refresh failure must not read as SessionExpired: {err:?}"
-    );
     assert_eq!(
-        err.user_message(),
-        "The EpiGraph API is unavailable right now."
+        api.claim(claim_id()).await.unwrap_err(),
+        UpstreamError::SessionExpired,
+        "an unknown refresh outcome ends the session"
     );
     assert!(
-        degrade::<()>(Err(err)).is_ok(),
-        "a section can degrade on it"
+        app.state.sessions.get(&sid).is_none(),
+        "the session is gone, so no later request can present its refresh token"
     );
-    assert!(
-        app.state.sessions.get(&sid).is_some(),
-        "the session survives an upstream that could not be reached"
-    );
+    app.upstream.verify().await;
 }
 
-/// Same split on the proactive path: an expired token whose refresh could not
-/// reach upstream keeps the session (with its stale token) instead of
-/// resolving to anonymous.
+/// Same on the proactive path: an expired token whose refresh got no usable
+/// answer resolves to anonymous, and the session and its token are gone.
 #[tokio::test]
-async fn unreachable_proactive_refresh_keeps_the_session() {
+async fn unreachable_proactive_refresh_ends_the_session() {
     let app = spawn().await;
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
         .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+        .expect(1)
         .mount(&app.upstream)
         .await;
+    expect_revocation_of_the_held_token(&app, 1).await;
 
     let sid = app.sign_in_expiring("stale", chrono::Duration::seconds(-5));
     let mut headers = axum::http::HeaderMap::new();
@@ -805,9 +815,10 @@ async fn unreachable_proactive_refresh_keeps_the_session() {
         TestApp::cookie(&sid).parse().unwrap(),
     );
     let auth = epigraph_explorer::auth::resolve_auth(&app.state, &headers).await;
-    assert_eq!(auth.session_id(), Some(&sid), "session kept: {auth:?}");
-    assert_eq!(auth.bearer(), Some("stale"), "stale token carried forward");
-    assert!(app.state.sessions.get(&sid).is_some());
+    assert_eq!(auth.session_id(), None, "signed out: {auth:?}");
+    assert_eq!(auth.bearer(), None, "no stale token carried forward");
+    assert!(app.state.sessions.get(&sid).is_none());
+    app.upstream.verify().await;
 }
 
 #[tokio::test]

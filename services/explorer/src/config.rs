@@ -17,6 +17,7 @@ pub const ENV_CLIENT_ID: &str = "EPIGRAPH_EXPLORER_CLIENT_ID";
 pub const ENV_FRAME_ANCESTORS: &str = "EPIGRAPH_EXPLORER_FRAME_ANCESTORS";
 pub const ENV_UPSTREAM_CONCURRENCY: &str = "EPIGRAPH_EXPLORER_UPSTREAM_CONCURRENCY";
 pub const ENV_UPSTREAM_TIMEOUT_MS: &str = "EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS";
+pub const ENV_TOKEN_TIMEOUT_MS: &str = "EPIGRAPH_EXPLORER_TOKEN_TIMEOUT_MS";
 pub const ENV_INSECURE_COOKIES: &str = "EPIGRAPH_EXPLORER_INSECURE_COOKIES";
 pub const ENV_DEV_BEARER: &str = "EPIGRAPH_EXPLORER_DEV_BEARER";
 
@@ -26,12 +27,19 @@ pub const DEFAULT_FRAME_ANCESTORS: &str =
     "https://www.notion.so https://*.notion.so https://*.notion.site";
 pub const DEFAULT_UPSTREAM_CONCURRENCY: usize = 6;
 pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 8000;
+/// Longer than [`DEFAULT_UPSTREAM_TIMEOUT_MS`]: a refresh whose answer is
+/// lost may already have rotated the token upstream, and that ends the
+/// session (`auth::refresh_session`), so the token call gets more room than a
+/// data call, which only degrades a section.
+pub const DEFAULT_TOKEN_TIMEOUT_MS: u64 = 20_000;
 
 /// Clamp range for the upstream semaphore. The API's pool is 10 connections
 /// shared with every other client, so the ceiling stays well under it.
 pub const UPSTREAM_CONCURRENCY_RANGE: (usize, usize) = (1, 8);
 /// Clamp range for the per-call upstream timeout, in milliseconds.
 pub const UPSTREAM_TIMEOUT_MS_RANGE: (u64, u64) = (250, 60_000);
+/// Clamp range for the `/oauth/token` timeout, in milliseconds.
+pub const TOKEN_TIMEOUT_MS_RANGE: (u64, u64) = (250, 60_000);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -72,6 +80,9 @@ pub struct Config {
     pub upstream_concurrency: usize,
     /// Per-call upstream timeout.
     pub upstream_timeout: Duration,
+    /// Timeout for `POST /oauth/token` (code exchange and refresh), separate
+    /// from and longer than [`Config::upstream_timeout`].
+    pub token_timeout: Duration,
     /// Drop `Secure` from the session cookie (plain-http local dev only;
     /// refused when the public base URL is https).
     pub insecure_cookies: bool,
@@ -91,6 +102,7 @@ impl std::fmt::Debug for Config {
             .field("frame_ancestors", &self.frame_ancestors)
             .field("upstream_concurrency", &self.upstream_concurrency)
             .field("upstream_timeout", &self.upstream_timeout)
+            .field("token_timeout", &self.token_timeout)
             .field("insecure_cookies", &self.insecure_cookies)
             .field("dev_bearer", &self.dev_bearer.as_ref().map(|_| "<set>"))
             .finish()
@@ -194,6 +206,16 @@ impl Config {
             None => DEFAULT_UPSTREAM_TIMEOUT_MS,
         };
 
+        let token_timeout_ms = match get(ENV_TOKEN_TIMEOUT_MS) {
+            Some(v) => {
+                let n = v.parse::<u64>().map_err(|_| {
+                    invalid(ENV_TOKEN_TIMEOUT_MS, "expected milliseconds as an integer")
+                })?;
+                clamp_logged(ENV_TOKEN_TIMEOUT_MS, n, TOKEN_TIMEOUT_MS_RANGE)
+            }
+            None => DEFAULT_TOKEN_TIMEOUT_MS,
+        };
+
         let dev_bearer = get(ENV_DEV_BEARER);
         if dev_bearer.is_some() && !is_loopback_host(&public_base_url) {
             return Err(invalid(
@@ -213,6 +235,7 @@ impl Config {
             frame_ancestors,
             upstream_concurrency,
             upstream_timeout: Duration::from_millis(timeout_ms),
+            token_timeout: Duration::from_millis(token_timeout_ms),
             insecure_cookies,
             dev_bearer,
         })
@@ -526,6 +549,50 @@ mod tests {
             c.upstream_timeout,
             Duration::from_millis(UPSTREAM_TIMEOUT_MS_RANGE.1)
         );
+    }
+
+    /// The token call has its own knob, independent of the data timeout,
+    /// with a longer default.
+    #[test]
+    fn token_timeout_is_its_own_knob() {
+        let c = cfg(&[BASE]).unwrap();
+        assert_eq!(
+            c.token_timeout,
+            Duration::from_millis(DEFAULT_TOKEN_TIMEOUT_MS)
+        );
+        assert!(c.token_timeout > c.upstream_timeout, "{c:?}");
+
+        // Setting one leaves the other alone.
+        let c = cfg(&[BASE, (ENV_TOKEN_TIMEOUT_MS, "12345")]).unwrap();
+        assert_eq!(c.token_timeout, Duration::from_millis(12_345));
+        assert_eq!(
+            c.upstream_timeout,
+            Duration::from_millis(DEFAULT_UPSTREAM_TIMEOUT_MS)
+        );
+        let c = cfg(&[BASE, (ENV_UPSTREAM_TIMEOUT_MS, "300")]).unwrap();
+        assert_eq!(
+            c.token_timeout,
+            Duration::from_millis(DEFAULT_TOKEN_TIMEOUT_MS)
+        );
+
+        // Clamped like the data timeout; malformed is an error.
+        let c = cfg(&[BASE, (ENV_TOKEN_TIMEOUT_MS, "1")]).unwrap();
+        assert_eq!(
+            c.token_timeout,
+            Duration::from_millis(TOKEN_TIMEOUT_MS_RANGE.0)
+        );
+        let c = cfg(&[BASE, (ENV_TOKEN_TIMEOUT_MS, "999999")]).unwrap();
+        assert_eq!(
+            c.token_timeout,
+            Duration::from_millis(TOKEN_TIMEOUT_MS_RANGE.1)
+        );
+        assert!(matches!(
+            cfg(&[BASE, (ENV_TOKEN_TIMEOUT_MS, "soon")]).unwrap_err(),
+            ConfigError::Invalid {
+                var: ENV_TOKEN_TIMEOUT_MS,
+                ..
+            }
+        ));
     }
 
     #[test]

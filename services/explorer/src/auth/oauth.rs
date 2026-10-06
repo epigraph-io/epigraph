@@ -292,12 +292,17 @@ pub async fn revoke_refresh_token(state: &AppState, refresh_token: &str) -> Resu
 
 /// POST a form to `{api}/oauth/token` and return the 2xx body, or the
 /// failure as a [`TokenError`].
+///
+/// Uses its own, longer timeout ([`crate::config::Config::token_timeout`]),
+/// not the data-call one: a refresh whose answer is lost may already have
+/// rotated the token upstream, which ends the session, so it is worth
+/// waiting longer for than a section of a page.
 async fn post_token_form(state: &AppState, form: &[(&str, &str)]) -> Result<Vec<u8>, TokenError> {
     let up = &state.upstream;
     let resp = up
         .http()
         .post(format!("{}/oauth/token", up.base_url()))
-        .timeout(up.timeout())
+        .timeout(up.token_timeout())
         .header(ACCEPT, "application/json")
         .form(form)
         .send()
