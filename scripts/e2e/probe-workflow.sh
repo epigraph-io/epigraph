@@ -54,11 +54,15 @@
 #
 # # The trap this probe had to avoid
 #
-# `deprecate_workflow` passes ONE id to both `ClaimRepository::deprecate_claim`
+# `deprecate_workflow` used to pass ONE id to both `ClaimRepository::deprecate_claim`
 # (a `claims` row) and `WorkflowRepository::set_truth_value` (a `workflows` row),
-# and those two ids come from different derivations. If the id is not a claim id,
-# `deprecate_claim` matches zero rows, NO 42501 is raised, and the tool reports
-# success -- which is indistinguishable from "the write was allowed". The
+# and those two ids come from different derivations. If the id was not a claim id,
+# `deprecate_claim` matched zero rows, NO 42501 was raised, and the tool reported
+# success -- indistinguishable from "the write was allowed". Since U017 the tool
+# forks on what the id is (a readable claim -> the flat path; a `workflows` row
+# -> the hierarchical path on the system agent's stamp, which retires the
+# unshared thesis/phase/step claims; neither -> an error), so ARM 2 below should
+# now show steps_still_current drop for an unshared workflow. The
 # IDENTITY CHECK below is printed before any verdict for exactly that reason:
 # read it first, because a `as_claim=0` line makes every refusal/success line
 # underneath it meaningless.
@@ -234,9 +238,9 @@ echo "# report_workflow_outcome probes \`workflows\` FIRST and, for a hierarchic
 echo "# id, returns through do_report_hierarchical_outcome_via_pool(&server.pool,..)"
 echo "# -- so ARM 1 above never executed a single stamped statement. The stamped"
 echo "# path is reached only for the legacy flat-workflow CLAIMS the tool's own"
-echo "# comment counts at ~144. deprecate_workflow has no such fork: it calls"
-echo "# deprecate_claim on whatever id it is handed, which is why ARM 2 above"
-echo "# matched zero rows."
+echo "# comment counts at ~144. deprecate_workflow now forks too (U017): a"
+echo "# workflows-row id takes the hierarchical path on the system agent's stamp,"
+echo "# so ARM 2 above did not exercise the author-stamped flat code either."
 echo "#"
 echo "# No tool creates that population any more, so it is seeded here as the"
 echo "# superuser in the two ownership shapes that decide the question:"
