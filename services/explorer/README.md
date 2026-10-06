@@ -4,8 +4,13 @@ The EpiGraph Explorer lets people browse the EpiGraph knowledge graph in a
 browser. It renders pages on the server for claims, their evidence, belief,
 history and provenance, and for agents, frames and evidence records. It also
 shows search results and graph views (ego graph, themes, communities,
-neighbourhoods). A small JSON surface under `/bff/*` feeds the client-side
-graph canvas.
+neighbourhoods). For the operator it adds four read-only pages: open
+backlog items, the security events the viewer may read, what a configured
+list of agents did, and pending cross-source match candidates. A small JSON
+surface under `/bff/*` feeds the client-side graph canvas and the audit page.
+
+The Explorer only reads. Resolving backlog items, deciding match candidates,
+challenging, labelling and superseding stay on MCP and the CLI.
 
 It is a **backend-for-frontend**. It holds no data. Every read goes to
 `epigraph-api` with the signed-in viewer's own bearer token, so the API's
@@ -79,7 +84,13 @@ path. A base path costs the `__Host-` cookie prefix (see Security model).
 | `GET /claim/{id}/history` · `/provenance` · `/graph` | Version history · derivation chain · graph canvas |
 | `GET /theme/{id}` · `/community/{id}` · `/neighborhood/{id}?mode=` | Clustering views (not permalinks; see Caveats) |
 | `GET /agent/{id}` · `/frame/{id}` · `/evidence/{id}` | Entity pages |
+| `GET /backlog?label=&page=` | Open backlog items, newest first (see Operator pages) |
+| `GET /audit?since=&until=&type=&failures=1` | Security events the viewer may read, counted by type, with a drill-down (see Operator pages) |
+| `GET /activity?since=` | The watched agents' newest claims, and an events tail (see Operator pages) |
+| `GET /candidates?status=` | Cross-source match candidates as side-by-side pairs (see Operator pages) |
+| `GET /acts` | Reserved for the viewer's own admin acts. It is not built yet: it answers 501 "not yet available", makes no upstream call, and has no navigation link |
 | `GET /bff/claim/{id}` · `/bff/search` · `/bff/graph/ego/{id}?max_degree=` · `/bff/themes` · `/bff/communities` · `/bff/neighborhood/{id}` | JSON for the canvas |
+| `GET /bff/audit?since=&until=&type=&failures=1` | The audit page's counted window as JSON |
 | `GET /auth/login` · `GET /auth/callback` · `POST /auth/logout` · `POST /auth/redeem` | Sign-in (see Security model) |
 | `GET /health` | Liveness: `{"status":"ok","version":"…"}` |
 | `GET /static/{path}` | Compiled-in CSS/JS |
@@ -90,6 +101,63 @@ anonymous `/bff/*` request gets a JSON `401 {"error":"unauthorized"}`. The one
 exception is `/claim/{id}`. For an anonymous visitor it returns **200** with a
 sign-in prompt and OpenGraph tags, because a redirect would unfurl in chat
 apps as a login page.
+
+### Operator pages
+
+Each page is read-only, needs a session, and reads with the viewer's own
+token. An empty answer and a failed one render differently: "no … that you
+can read" is a real empty result, and "unavailable" means the API call
+failed. A query value the page will not send (a bad time, status or label)
+is explained on the page, and the API is not called.
+Times are UTC; `since` and `until` take RFC 3339, `YYYY-MM-DDTHH:MM[:SS]` or a
+bare date, and `since` defaults to 24 hours ago.
+
+- **`/backlog`** lists current claims labelled `backlog` and not labelled
+  `resolved`, newest first, a page at a time. `label=` narrows the list to
+  one more label (a comma is refused, because the API would AND the labels).
+  With `EPIGRAPH_EXPLORER_KANBAN_URL` set, each row also has an
+  "Open in kanban" link. It opens the board, not the item: the board has no
+  per-item address.
+- **`/audit`** counts the security events of the window by `event_type`,
+  with each type's failures. `failures=1` keeps failures only, and `type=`
+  drills down to that type's newest 200 rows (the counts still cover the
+  whole window). The page reads the API in pages of 1 000 rows, moving an
+  `until` cursor back, up to `EPIGRAPH_EXPLORER_AUDIT_ROW_CEILING` rows:
+  - a window holding more than the ceiling is marked **capped**: narrow it;
+  - a page that fails after the first keeps the counts read so far under an
+    **incomplete** banner, and so does a window it cannot page past (more
+    than 1 000 events at one timestamp);
+  - a first page that fails leaves the section **unavailable**, never a 500.
+
+  It needs the `audit:read` scope **granted to the signing-in user's own
+  per-user client** (see Operator setup §1). The Explorer requests it, and
+  the API silently drops a scope the user was not granted. When the token's
+  scope lacks it, the page explains that and does not call the API; an API
+  403 gets the same answer.
+
+  Which events a viewer may read is the API's decision. The page says "you
+  see only your own security events" unless the rows it read show more (an
+  event with no agent, or events of two agents), and then says this account
+  reads more than its own events. It also says, on every view, that it shows
+  only events the viewer may read, and that refresh-token volume and
+  liveness are not in this trail.
+- **`/activity`** shows, for each agent in `EPIGRAPH_EXPLORER_WATCH_AGENTS`,
+  its newest 20 claims created since `since`, each linked to its claim page,
+  and marks a list the API counted more rows for as capped. One agent's
+  failed call leaves only that agent "unavailable". Below that is an **events
+  tail**: one read of the API's recent events since `since`, kept only where
+  a watched agent is the actor, newest first, at most 100 rows. The API's
+  event list cannot be filtered by agent and holds only a window of its
+  newest events, so the tail is labelled as corpus-wide and filtered here,
+  and it is **not a complete record** of the watched agents since `since`.
+  With no watch list, the page explains how to set one and calls nothing.
+- **`/candidates`** lists cross-source match candidates of one status
+  (`pending` by default; `promoted`, `rejected` and `stale` by the
+  switcher), highest score first, at most the top 100 per status with a
+  "there may be more" marker. Each candidate is a side-by-side pair of claim
+  excerpts, each linked to its own claim page, with score, verifier verdict
+  and rationale. Only pairs whose **both** claims the viewer may read are
+  listed. There are no decide controls: deciding stays on MCP and the CLI.
 
 ## Configuration
 
@@ -102,16 +170,21 @@ code **2**.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL. In production it is the root of the Explorer's own host, `https://explorer.example.com`, with an **empty path** (see Deploy); a base path such as `http://localhost:8096/explorer` is for local testing. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. Its **first** segment may not be one of the Explorer's own top-level routes (`agent`, `auth`, `bff`, `claim`, `community`, `evidence`, `frame`, `health`, `neighborhood`, `search`, `static`, `theme`): the routes are mounted both under the base path and at the root, so such a base path would make two handlers claim the same URL. The process refuses to start (exit 2) and names the offending segment. |
+| `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL. In production it is the root of the Explorer's own host, `https://explorer.example.com`, with an **empty path** (see Deploy); a base path such as `http://localhost:8096/explorer` is for local testing. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. Its **first** segment may not be one of the Explorer's own top-level routes (`activity`, `acts`, `agent`, `audit`, `auth`, `backlog`, `bff`, `candidates`, `claim`, `community`, `evidence`, `frame`, `health`, `neighborhood`, `search`, `static`, `theme`): the routes are mounted both under the base path and at the root, so such a base path would make two handlers claim the same URL. The process refuses to start (exit 2) and names the offending segment. |
 | `EPIGRAPH_API_URL` | `http://127.0.0.1:8080` | The `epigraph-api` origin, called server to server. This is the repo-standard variable name. |
 | `EPIGRAPH_EXPLORER_PORT` | `8096` | Port to bind, always on `127.0.0.1`. Must be 1–65535. |
 | `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token` and `/oauth/revoke` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
 | `EPIGRAPH_EXPLORER_CLIENT_ID` | unset | The `client_id` of the pre-registered OAuth client (see Operator setup). If it is unset, sign-in is disabled and a warning is logged at startup. Whitespace is rejected. |
 | `EPIGRAPH_EXPLORER_FRAME_ANCESTORS` | `https://www.notion.so https://*.notion.so https://*.notion.site` | The CSP `frame-ancestors` source list, space-separated. `;`, `,`, control characters and non-ASCII are rejected. Setting it **explicitly empty** means `'none'` (no framing at all). |
 | `EPIGRAPH_EXPLORER_UPSTREAM_CONCURRENCY` | `6` | Size of the global semaphore on upstream calls, clamped to 1–8. The API's database pool has 10 connections, shared with every other client. A clamped value is logged. |
+| `EPIGRAPH_EXPLORER_SESSION_CONCURRENCY` | `3` | Upstream calls one viewer may have in flight at once, enforced in front of the global semaphore so one viewer cannot hold every permit. Clamped to 1–8. Keep it **below** `EPIGRAPH_EXPLORER_UPSTREAM_CONCURRENCY`; a value that is not below it is logged as a warning, because it then protects nobody. |
 | `EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS` | `8000` | Timeout for each upstream call, clamped to 250–60000. The time spent waiting for the semaphore counts against it. |
-| `EPIGRAPH_EXPLORER_INSECURE_COOKIES` | `false` | Drops `Secure` from the first-party session cookie. **Only for plain-http local development.** Logged as a warning. |
+| `EPIGRAPH_EXPLORER_TOKEN_TIMEOUT_MS` | `20000` | Timeout for `POST /oauth/token` (the code exchange and every refresh), separate from and longer than the data timeout, clamped to 250–60000. A refresh whose answer is lost ends the session (see Security model), so the token call gets more room than a data call, which only degrades a section. |
+| `EPIGRAPH_EXPLORER_INSECURE_COOKIES` | `false` | Drops `Secure` from the session and login-binding cookies, and with it the `__Host-` prefix. **Only for plain-http local development**: the process refuses to start (exit 2) when it is set and `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` is `https`. Logged as a warning. The embed cookie stays `Secure` regardless. |
 | `EPIGRAPH_EXPLORER_DEV_BEARER` | unset | **Development only.** A bearer token used for every request that has no session. The process refuses to start with it unless the host of `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` is exactly `localhost` or `127.0.0.1`. Logged as a warning and redacted from logs. It must be a token minted by the **current** `/oauth/token`, because the API rejects a token that carries no `agent_id`; there is no refresh on this path, so it dies at its TTL (see Local development). |
+| `EPIGRAPH_EXPLORER_KANBAN_URL` | unset | The kanban board's **base URL**, e.g. `https://kanban.example.com/`. When set, each `/backlog` row links to it; unset, no kanban link renders. The viewer's browser opens it, so it must be reachable from there. It must be `http(s)` and may not carry a query string or fragment: never paste the board's pairing link, which carries a single-use code in its fragment (the process refuses to start). The link opens the board, not the item. |
+| `EPIGRAPH_EXPLORER_AUDIT_ROW_CEILING` | `10000` | Most security events `/audit` reads for one window (in pages of 1 000), clamped to 1000–50000. A window holding more is shown as capped. The page keeps every row of the window in memory while it counts, so at the 50 000 ceiling a window of detail-heavy rows costs tens of MB per request; the default is far below that. A clamped value is logged. |
+| `EPIGRAPH_EXPLORER_WATCH_AGENTS` | unset | The agents `/activity` shows: a comma-separated list of agent ids (uuids), shown in the order given, duplicates dropped, at most 20 (each is one upstream call per page view). A value that is not a uuid, or more than 20, stops the process at startup (exit 2). Unset, the page explains how to set it. Use the ids of your own agents; the repository names none. |
 | `RUST_LOG` | `info` | A `tracing-subscriber` filter, e.g. `info,epigraph_explorer=debug`. |
 
 Fixed limits, which are not configurable:
@@ -130,6 +203,10 @@ EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com
 EPIGRAPH_API_URL=http://127.0.0.1:8080
 EPIGRAPH_OAUTH_BASE_URL=https://api.example.com
 EPIGRAPH_EXPLORER_CLIENT_ID=epigraph_explorer
+# Optional:
+# EPIGRAPH_EXPLORER_KANBAN_URL=https://kanban.example.com/
+# EPIGRAPH_EXPLORER_WATCH_AGENTS=00000000-0000-0000-0000-000000000000   (comma-separated)
+# EPIGRAPH_EXPLORER_AUDIT_ROW_CEILING=10000
 # RUST_LOG=info
 ```
 
@@ -261,6 +338,11 @@ The row has to meet these constraints:
   authorization-code grant never checks a secret.
 - **Empty scopes are correct.** The scopes a token carries come from the
   signing-in user's own per-user client (`google:<sub>`), not from this row.
+  The Explorer requests `claims:read audit:read`, and the API grants the
+  intersection with that per-user client's granted scopes, silently dropping
+  the rest. So sign-in works either way, but `/audit` shows events only to a
+  user whose own per-user client is granted `audit:read`; everyone else gets
+  its "not granted" explanation.
 - **No `agent_id` column, on purpose.** The token endpoint materialises the
   principal at **mint** time and links it write-once
   (`principal_agent_id` → `AgentRepository::ensure_for_client`;
@@ -453,7 +535,9 @@ if the login response's cookie starts `__Host-` and the startup log
   read, so the landing page's numbers are "rows you can see", not the size of
   the corpus, and two signed-in readers get different ones. The page says so.
 - **Sign-in** uses the authorization-code flow with mandatory PKCE S256
-  against the API's own authorization server, with `scope=claims:read`. The
+  against the API's own authorization server, with
+  `scope=claims:read audit:read` (intersected upstream with the user's own
+  grant; see Operator setup §1). The
   code lives 60 s upstream and is redeemed immediately. No token ever appears
   in a URL.
 - **Session cookie** `epx_session` has `HttpOnly`, `Secure`, `SameSite=Lax`,
