@@ -50,6 +50,7 @@ pub mod core;
 pub mod degraded;
 pub mod entities;
 pub mod graph;
+pub mod identity;
 pub mod types;
 
 pub use degraded::{degrade, join_degraded, Degraded};

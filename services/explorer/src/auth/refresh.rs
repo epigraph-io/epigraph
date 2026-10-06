@@ -9,6 +9,7 @@ use thiserror::Error;
 use super::oauth;
 use super::session::SessionId;
 use crate::state::AppState;
+use crate::upstream::identity::token_principal;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum RefreshError {
@@ -37,7 +38,10 @@ pub enum RefreshError {
 ///   stored access token no longer equals `stale_access_token`, another task
 ///   already refreshed and that token is returned without calling upstream.
 /// - Otherwise calls [`oauth::refresh_grant`] with the stored refresh token
-///   and stores the rotated pair (upstream rotates on every use).
+///   and stores the rotated pair (upstream rotates on every use) with the
+///   scope its response granted. Then, after releasing the lock, it
+///   introspects the new token once for the identity strip's principal
+///   (display only; a failure leaves that field unavailable).
 /// - On [`RefreshError::Upstream`] (no usable answer: transport, timeout,
 ///   5xx) it **ends the session, still holding the lock**, and revokes the
 ///   refresh token it held, best effort. Upstream may already have rotated
@@ -56,7 +60,7 @@ pub async fn refresh_session(
         .sessions
         .refresh_lock(id)
         .ok_or(RefreshError::NoSession)?;
-    let _guard = lock.lock().await;
+    let guard = lock.lock().await;
 
     let session = state.sessions.get(id).ok_or(RefreshError::NoSession)?;
     if session.access_token != stale_access_token {
@@ -71,18 +75,26 @@ pub async fn refresh_session(
         }
         Err(e) => return Err(e),
     };
-    // Upstream may widen (or narrow) the scope on any refresh.
-    let scope_widened = tokens.scope_widened;
+    let access_token = tokens.access_token;
     if !state.sessions.update_tokens(
         id,
-        tokens.access_token.clone(),
+        access_token.clone(),
         tokens.refresh_token,
         tokens.expires_at,
     ) {
         return Err(RefreshError::NoSession);
     }
-    state.sessions.set_scope_widened(id, scope_widened);
-    Ok(tokens.access_token)
+    // Upstream may widen (or narrow) the scope on any refresh.
+    state
+        .sessions
+        .set_token_scope(id, tokens.scope, tokens.scope_widened);
+    // Requests queued on this session's lock can use the new token now; the
+    // principal lookup below is for display and need not hold them up. It
+    // is stored only while this is still the session's token.
+    drop(guard);
+    let principal = token_principal(state, &access_token).await;
+    state.sessions.set_principal(id, &access_token, principal);
+    Ok(access_token)
 }
 
 /// The refresh's outcome is unknown: drop the session (the caller holds its

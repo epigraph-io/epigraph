@@ -38,6 +38,7 @@ use subtle::ConstantTimeEq;
 
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::upstream::identity::token_principal;
 use crate::view::render;
 
 pub mod extract;
@@ -46,7 +47,9 @@ pub mod oauth;
 pub mod refresh;
 pub mod session;
 
-pub use extract::{resolve_auth, Caller, PageCtx, RequestAuth, SignedIn, PRODUCT_NAME};
+pub use extract::{
+    resolve_auth, Caller, IdentityStrip, PageCtx, RequestAuth, SignedIn, PRODUCT_NAME,
+};
 pub use refresh::{refresh_session, RefreshError};
 pub use session::{
     clear_embed_session_cookie, clear_session_cookie, embed_session_cookie, random_token,
@@ -166,21 +169,27 @@ const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 /// and `state`, which must not be reflected into `og:url` or the header's
 /// sign-in link.
 fn page_ctx(state: &AppState, headers: &HeaderMap, current_path: String) -> PageCtx {
-    let signed_in = read_session_cookie(&state.config, headers)
-        .is_some_and(|id| state.sessions.get(&id).is_some());
-    PageCtx::new(state.links.clone(), current_path, signed_in)
+    let session =
+        read_session_cookie(&state.config, headers).and_then(|id| state.sessions.get(&id));
+    PageCtx::new(state.links.clone(), current_path, session.is_some())
+        .with_identity(session.as_ref().map(IdentityStrip::of))
 }
 
 /// Store a freshly minted token set as a new session: at the page-mode
 /// callback, or when an embed handoff is redeemed. The one place a sign-in
-/// becomes a session, so the token's wider-than-requested flag is carried
-/// over on both paths.
-fn start_session(state: &AppState, tokens: TokenSet) -> SessionId {
-    let scope_widened = tokens.scope_widened;
+/// becomes a session, so the token's granted scope, its
+/// wider-than-requested flag and its introspected principal (one
+/// `/oauth/introspect` call per token) are recorded on both paths.
+async fn start_session(state: &AppState, tokens: TokenSet) -> SessionId {
+    let principal = token_principal(state, &tokens.access_token).await;
+    let access_token = tokens.access_token.clone();
     let id = state
         .sessions
         .create(tokens.access_token, tokens.refresh_token, tokens.expires_at);
-    state.sessions.set_scope_widened(&id, scope_widened);
+    state
+        .sessions
+        .set_token_scope(&id, tokens.scope, tokens.scope_widened);
+    state.sessions.set_principal(&id, &access_token, principal);
     id
 }
 
@@ -424,7 +433,7 @@ async fn callback(
 
     // A fresh id on every sign-in (no fixation); the browser's previous
     // session, if any, is replaced rather than left in the store.
-    let session_id = start_session(&state, tokens);
+    let session_id = start_session(&state, tokens).await;
     if let Some(old) = read_session_cookie(&state.config, &headers) {
         state.sessions.remove(&old);
     }
@@ -495,7 +504,7 @@ async fn redeem(
         }
         None => return Err(handoff_refused()),
     };
-    let session_id = start_session(&state, tokens);
+    let session_id = start_session(&state, tokens).await;
 
     let mut resp = StatusCode::NO_CONTENT.into_response();
     let h = resp.headers_mut();

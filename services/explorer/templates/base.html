@@ -26,6 +26,20 @@
     </form>
     <nav class="auth-nav" aria-label="Account">
       {%- if ctx.signed_in %}
+      {%- if let Some(who) = ctx.identity %}
+      <p class="identity-strip" title="Shown as the principal is the token's subject. EpiGraph's token introspection reports the same value as the client id, so which sign-in application a session uses cannot be shown.">
+        {%- if let Some(short) = who.principal_short() %}
+        <span class="identity-strip__principal">signed in as <code title="{{ who.principal().unwrap_or_default() }}">{{ short }}</code></span>
+        {%- else %}
+        <span class="identity-strip__principal">principal unavailable</span>
+        {%- endif %}
+        <span class="identity-strip__scope">token scope: {{ who.scope_text() }}</span>
+        {%- if who.widened() %}
+        <span class="identity-strip__note">wider than requested</span>
+        {%- endif %}
+        <span class="identity-strip__expiry">expires in {{ who.minutes_left() }} min</span>
+      </p>
+      {%- endif %}
       <form method="post" action="{{ ctx.logout_url() }}">
         <button type="submit" class="button-quiet">Sign out</button>
       </form>

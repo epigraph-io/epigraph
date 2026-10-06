@@ -18,6 +18,7 @@ use cookie::{Cookie, SameSite};
 use rand::RngCore;
 
 use crate::config::Config;
+use crate::upstream::Degraded;
 
 /// The session cookie's name under a base path or with insecure cookies.
 pub const SESSION_COOKIE: &str = "epx_session";
@@ -77,11 +78,20 @@ pub struct Session {
     /// Access-token expiry (from `expires_in` at mint/refresh time).
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// The scopes the current token's response said it granted; `None`
+    /// when it did not say. Shown in the identity strip.
+    pub scope: Option<String>,
     /// The current token carries a scope the Explorer did not request
     /// ("token wider than requested"). Display only: no authorization
     /// decision reads it.
     pub scope_widened: bool,
+    /// The token subject `/oauth/introspect` reported for the current
+    /// token, or why it is unavailable. Display only.
+    pub principal: Degraded<String>,
 }
+
+/// A session's principal before its token has been introspected.
+const PRINCIPAL_NOT_CHECKED: &str = "Not checked yet.";
 
 impl fmt::Debug for Session {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -90,7 +100,9 @@ impl fmt::Debug for Session {
             .field("refresh_token", &"<redacted>")
             .field("expires_at", &self.expires_at)
             .field("created_at", &self.created_at)
+            .field("scope", &self.scope)
             .field("scope_widened", &self.scope_widened)
+            .field("principal_known", &self.principal.is_available())
             .finish()
     }
 }
@@ -134,7 +146,9 @@ impl SessionStore {
                 refresh_token,
                 expires_at,
                 created_at: Utc::now(),
+                scope: None,
                 scope_widened: false,
+                principal: Degraded::unavailable(PRINCIPAL_NOT_CHECKED),
             },
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -166,16 +180,38 @@ impl SessionStore {
         }
     }
 
-    /// Record whether the session's current token is wider than requested
-    /// (set at mint and at every refresh). Returns false if the session is
+    /// Record the scope the session's current token was granted, and
+    /// whether it is wider than requested (set at mint and at every
+    /// refresh, from the token response). Returns false if the session is
     /// gone.
-    pub fn set_scope_widened(&self, id: &SessionId, widened: bool) -> bool {
+    pub fn set_token_scope(&self, id: &SessionId, scope: Option<String>, widened: bool) -> bool {
         match self.write().get_mut(&id.0) {
             Some(e) => {
+                e.session.scope = scope;
                 e.session.scope_widened = widened;
                 true
             }
             None => false,
+        }
+    }
+
+    /// Record the principal introspected for `access_token`, only if that
+    /// is still the session's current token. The lookup runs outside the
+    /// refresh lock, so a slower answer about a token that has since been
+    /// replaced is dropped rather than shown for the new one. Returns
+    /// whether it was stored.
+    pub fn set_principal(
+        &self,
+        id: &SessionId,
+        access_token: &str,
+        principal: Degraded<String>,
+    ) -> bool {
+        match self.write().get_mut(&id.0) {
+            Some(e) if e.session.access_token == access_token => {
+                e.session.principal = principal;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -365,6 +401,37 @@ mod tests {
         assert!(s.get(&id).is_none());
         assert!(!s.update_tokens(&id, "x".into(), "y".into(), exp));
         assert!(s.refresh_lock(&id).is_none());
+    }
+
+    #[test]
+    fn a_principal_is_stored_only_for_the_token_it_describes() {
+        let s = SessionStore::new();
+        let exp = Utc::now() + chrono::Duration::hours(1);
+        let id = s.create("a1".into(), "r1".into(), exp);
+        assert!(
+            !s.get(&id).unwrap().principal.is_available(),
+            "not checked yet"
+        );
+
+        assert!(s.set_principal(&id, "a1", Degraded::ok("p1".into())));
+        assert_eq!(s.get(&id).unwrap().principal, Degraded::ok("p1".into()));
+
+        // The token is replaced; a late answer about the old one is dropped.
+        assert!(s.update_tokens(&id, "a2".into(), "r2".into(), exp));
+        assert!(!s.set_principal(&id, "a1", Degraded::ok("stale".into())));
+        assert_eq!(s.get(&id).unwrap().principal, Degraded::ok("p1".into()));
+        assert!(s.set_principal(&id, "a2", Degraded::unavailable("down")));
+        assert_eq!(s.get(&id).unwrap().principal.reason(), Some("down"));
+
+        // Scope and the wider-than-requested flag are stored together.
+        assert!(s.set_token_scope(&id, Some("claims:read".into()), false));
+        let got = s.get(&id).unwrap();
+        assert_eq!(got.scope.as_deref(), Some("claims:read"));
+        assert!(!got.scope_widened);
+
+        s.remove(&id);
+        assert!(!s.set_principal(&id, "a2", Degraded::ok("gone".into())));
+        assert!(!s.set_token_scope(&id, None, true));
     }
 
     #[test]

@@ -14,15 +14,15 @@
 use axum::extract::{FromRequestParts, OriginalUri};
 use axum::http::request::Parts;
 use axum::http::HeaderMap;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use super::refresh::RefreshError;
-use super::session::{read_session_cookie, SessionId};
+use super::session::{read_session_cookie, Session, SessionId};
 use crate::error::AppError;
 use crate::links::Links;
 use crate::state::AppState;
-use crate::upstream::Api;
+use crate::upstream::{Api, Degraded};
 
 /// The product name shown in the header and OG `site_name`.
 pub const PRODUCT_NAME: &str = "EpiGraph Explorer";
@@ -91,6 +91,59 @@ impl RequestAuth {
     }
 }
 
+/// Characters of the principal shown in the header; the whole id is in the
+/// element's tooltip.
+const PRINCIPAL_SHORT_CHARS: usize = 8;
+
+/// The header's identity strip (who the viewer is signed in as, and what
+/// their token carries), copied from the session when the page is built.
+/// Display only: no authorization decision reads it.
+#[derive(Clone, Debug)]
+pub struct IdentityStrip {
+    principal: Degraded<String>,
+    scope: Option<String>,
+    widened: bool,
+    expires_at: DateTime<Utc>,
+}
+
+impl IdentityStrip {
+    pub fn of(session: &Session) -> Self {
+        Self {
+            principal: session.principal.clone(),
+            scope: session.scope.clone(),
+            widened: session.scope_widened,
+            expires_at: session.expires_at,
+        }
+    }
+
+    /// The token subject, if introspection named one.
+    pub fn principal(&self) -> Option<&str> {
+        self.principal.get().map(String::as_str)
+    }
+
+    /// Its first few characters, for the header.
+    pub fn principal_short(&self) -> Option<String> {
+        self.principal()
+            .map(|p| p.chars().take(PRINCIPAL_SHORT_CHARS).collect())
+    }
+
+    /// The scopes the token was granted, as its token response listed
+    /// them; never the scopes the Explorer asked for.
+    pub fn scope_text(&self) -> &str {
+        self.scope.as_deref().unwrap_or("not reported")
+    }
+
+    /// The token carries a scope the Explorer did not ask for.
+    pub fn widened(&self) -> bool {
+        self.widened
+    }
+
+    /// Whole minutes until the access token expires (never negative).
+    pub fn minutes_left(&self) -> i64 {
+        (self.expires_at - Utc::now()).num_minutes().max(0)
+    }
+}
+
 /// Everything `templates/base.html` needs. Every page template struct has a
 /// `ctx: PageCtx` field.
 #[derive(Clone, Debug)]
@@ -103,6 +156,9 @@ pub struct PageCtx {
     pub current_path: String,
     /// Prefill for the header search box; the search page sets it.
     pub search_query: String,
+    /// The header's identity strip: set for a signed-in session, `None`
+    /// for anonymous viewers and the dev bearer.
+    pub identity: Option<IdentityStrip>,
 }
 
 impl PageCtx {
@@ -113,7 +169,14 @@ impl PageCtx {
             signed_in,
             current_path,
             search_query: String::new(),
+            identity: None,
         }
+    }
+
+    /// The same context with the session's identity strip.
+    pub fn with_identity(mut self, identity: Option<IdentityStrip>) -> Self {
+        self.identity = identity;
+        self
     }
 
     pub fn product_name(&self) -> &'static str {
@@ -256,11 +319,16 @@ impl FromRequestParts<AppState> for Caller {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let auth = resolve_cached(parts, state).await;
+        let identity = auth
+            .session_id()
+            .and_then(|id| state.sessions.get(id))
+            .map(|s| IdentityStrip::of(&s));
         let ctx = PageCtx::new(
             state.links.clone(),
             browser_path(state, parts),
             auth.is_signed_in(),
-        );
+        )
+        .with_identity(identity);
         Ok(Caller { auth, ctx })
     }
 }
@@ -310,6 +378,39 @@ mod tests {
         assert_eq!(k, a.cache_key());
         assert_eq!(RequestAuth::Anonymous.cache_key(), "anon");
         assert_eq!(RequestAuth::DevBearer("x".into()).cache_key(), "dev");
+    }
+
+    fn strip(principal: Degraded<String>, scope: Option<&str>, mins: i64) -> IdentityStrip {
+        IdentityStrip {
+            principal,
+            scope: scope.map(str::to_string),
+            widened: false,
+            expires_at: Utc::now()
+                + chrono::Duration::minutes(mins)
+                + chrono::Duration::seconds(30),
+        }
+    }
+
+    #[test]
+    fn identity_strip_fields() {
+        let s = strip(
+            Degraded::ok("0123456789abcdef".into()),
+            Some("claims:read"),
+            42,
+        );
+        assert_eq!(s.principal(), Some("0123456789abcdef"));
+        assert_eq!(s.principal_short().as_deref(), Some("01234567"));
+        assert_eq!(s.scope_text(), "claims:read");
+        assert_eq!(s.minutes_left(), 42);
+
+        let s = strip(Degraded::unavailable("down"), None, -5);
+        assert_eq!(s.principal_short(), None);
+        assert_eq!(s.scope_text(), "not reported", "never the requested set");
+        assert_eq!(
+            s.minutes_left(),
+            0,
+            "an expired token shows 0, not a negative"
+        );
     }
 
     #[test]

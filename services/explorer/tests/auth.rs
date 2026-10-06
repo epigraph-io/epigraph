@@ -782,6 +782,7 @@ fn held_tokens(refresh_token: &str) -> oauth::TokenSet {
         access_token: "held-access".into(),
         refresh_token: refresh_token.into(),
         expires_at: Utc::now() + Duration::hours(1),
+        scope: Some("claims:read".into()),
         scope_widened: false,
     }
 }
@@ -1769,6 +1770,241 @@ async fn a_token_wider_than_requested_is_flagged_on_the_session() {
     assert!(
         !app.state.sessions.get(&sid).unwrap().scope_widened,
         "a refresh to the requested scope clears the flag"
+    );
+}
+
+// ---- identity strip -----------------------------------------------------------------
+
+/// Synthetic token subjects (what `/oauth/introspect` reports as `sub`).
+const SUB_1: &str = "11111111-1111-4111-8111-111111111111";
+const SUB_2: &str = "22222222-2222-4222-8222-222222222222";
+
+/// `POST /oauth/introspect` presenting exactly `token` (JSON, as upstream's
+/// `oauth/introspect.rs::introspect_endpoint` takes it).
+fn introspect_call(token: &str) -> wiremock::MockBuilder {
+    Mock::given(method("POST"))
+        .and(path("/oauth/introspect"))
+        .and(body_json(json!({ "token": token })))
+}
+
+/// An active token's introspection: upstream reports `client_id` = `sub`.
+fn introspected(sub: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "active": true,
+        "sub": sub,
+        "client_id": sub,
+        "scope": "claims:read",
+        "exp": 4_102_444_800i64,
+        "iat": 1_700_000_000i64,
+        "token_type": "Bearer"
+    }))
+}
+
+/// How many introspection calls presented `token`.
+async fn introspections_of(app: &TestApp, token: &str) -> usize {
+    app.upstream
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/oauth/introspect")
+        .filter(|r| serde_json::from_slice::<Value>(&r.body).is_ok_and(|b| b["token"] == token))
+        .count()
+}
+
+/// A page-mode sign-in through `/auth/login` and `/auth/callback` whose code
+/// redemption answers `token_body`; the new session's id.
+async fn sign_in_answering(app: &TestApp, token_body: Value) -> SessionId {
+    let started = start_login(app, "").await;
+    let verifier = pending_verifier(app, &started);
+    token_call(&[
+        ("grant_type", "authorization_code"),
+        ("code", "c0de"),
+        ("code_verifier", &verifier),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(token_body))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    let res = finish_login(app, &started, "&code=c0de").await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let (sid, _) = set_cookie(&res, "epx_session").expect("session cookie");
+    SessionId::parse(&sid).unwrap()
+}
+
+/// A signed-in HTML page that makes no upstream call (search, no query).
+async fn header_of(app: &TestApp, sid: &SessionId) -> TestResponse {
+    let res = app.get_as("/explorer/search", sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    res
+}
+
+/// The identity strip's markup in a page.
+fn strip(body: &str) -> &str {
+    let start = body
+        .find("<p class=\"identity-strip\"")
+        .unwrap_or_else(|| panic!("no identity strip in: {body}"));
+    let len = body[start..].find("</p>").expect("strip closes");
+    &body[start..start + len]
+}
+
+/// The text of the strip's `class` span (up to its first closing tag).
+fn strip_part<'a>(strip: &'a str, class: &str) -> &'a str {
+    let open = format!("<span class=\"identity-strip__{class}\">");
+    let start = strip
+        .find(&open)
+        .unwrap_or_else(|| panic!("no {class} in: {strip}"))
+        + open.len();
+    let len = strip[start..].find("</span>").expect("span closes");
+    &strip[start..start + len]
+}
+
+/// The header lists the scopes the token response granted, not the ones
+/// the Explorer asked for: a user without `audit:read` sees `claims:read`.
+#[tokio::test]
+async fn identity_strip_shows_the_tokens_actual_scopes() {
+    let app = app().await;
+    introspect_call("access-1")
+        .respond_with(introspected(SUB_1))
+        .mount(&app.upstream)
+        .await;
+    // Granted: `claims:read` only (requested: claims:read audit:read).
+    let sid = sign_in_answering(&app, token_json("access-1", "refresh-1")).await;
+
+    let res = header_of(&app, &sid).await;
+    let s = strip(&res.body);
+    assert_eq!(strip_part(s, "scope"), "token scope: claims:read", "{s}");
+    assert!(
+        !s.contains("audit:read"),
+        "the requested set is not shown: {s}"
+    );
+    assert!(!s.contains("wider than requested"), "{s}");
+    assert!(
+        strip_part(s, "principal").contains(&SUB_1[..8]),
+        "a short principal id: {s}"
+    );
+    let expiry = strip_part(s, "expiry");
+    assert!(
+        expiry == "expires in 59 min" || expiry == "expires in 60 min",
+        "{expiry}"
+    );
+    assert!(
+        s.contains("which sign-in application a session uses cannot be shown"),
+        "the client limit is stated: {s}"
+    );
+    // The sign-out button is still there.
+    assert!(res.body.contains("action=\"/explorer/auth/logout\""));
+
+    // Signed out: no strip.
+    let anon = app.get(CLAIM_PATH).await;
+    assert!(!anon.body.contains("identity-strip"), "{}", anon.body);
+}
+
+/// A token wider than requested is shown as neutral information until the
+/// kernel stops widening on refresh: the words, never warning styling.
+#[tokio::test]
+async fn identity_strip_shows_a_widened_token_as_neutral_info() {
+    let app = app().await;
+    introspect_call("access-1")
+        .respond_with(introspected(SUB_1))
+        .mount(&app.upstream)
+        .await;
+    let mut wide = token_json("access-1", "refresh-1");
+    wide["scope"] = json!("claims:read audit:read claims:write");
+    let sid = sign_in_answering(&app, wide).await;
+
+    let res = header_of(&app, &sid).await;
+    let s = strip(&res.body);
+    assert!(
+        s.contains("token scope: claims:read audit:read claims:write"),
+        "{s}"
+    );
+    assert_eq!(strip_part(s, "note"), "wider than requested", "{s}");
+    assert!(!s.contains("warn"), "neutral, not a warning: {s}");
+    assert!(!s.contains("notice"), "neutral, not a notice box: {s}");
+}
+
+/// Introspection is for the principal only. When it fails, the principal
+/// reads "unavailable" and everything else still renders: the scope and
+/// expiry come from the token response itself.
+#[tokio::test]
+async fn introspect_failure_degrades_the_principal_not_the_page() {
+    let app = app().await;
+    introspect_call("access-1")
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": "InternalError", "message": "introspection failed"
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = sign_in_answering(&app, token_json("access-1", "refresh-1")).await;
+
+    let res = header_of(&app, &sid).await;
+    assert!(res.body.contains("role=\"search\""), "the page renders");
+    let s = strip(&res.body);
+    assert_eq!(strip_part(s, "principal"), "principal unavailable", "{s}");
+    assert_eq!(strip_part(s, "scope"), "token scope: claims:read", "{s}");
+    assert!(strip_part(s, "expiry").starts_with("expires in "), "{s}");
+}
+
+/// The principal is looked up once per token (at mint, and again for each
+/// refreshed token), never per page.
+#[tokio::test]
+async fn introspect_is_called_once_per_token_not_per_page() {
+    let app = app().await;
+    introspect_call("access-1")
+        .respond_with(introspected(SUB_1))
+        .mount(&app.upstream)
+        .await;
+    introspect_call("access-2")
+        .respond_with(introspected(SUB_2))
+        .mount(&app.upstream)
+        .await;
+    let sid = sign_in_answering(&app, token_json("access-1", "refresh-1")).await;
+    assert_eq!(introspections_of(&app, "access-1").await, 1, "at mint");
+
+    for _ in 0..2 {
+        let res = header_of(&app, &sid).await;
+        assert!(strip(&res.body).contains(&SUB_1[..8]));
+    }
+    assert_eq!(
+        introspections_of(&app, "access-1").await,
+        1,
+        "two page loads, no further call"
+    );
+
+    // The token is refreshed: the new token is introspected once.
+    token_call(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "refresh-1"),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(token_json("access-2", "refresh-2")))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    app.state.sessions.update_tokens(
+        &sid,
+        "access-1".into(),
+        "refresh-1".into(),
+        Utc::now() - Duration::seconds(1),
+    );
+    for _ in 0..2 {
+        let res = header_of(&app, &sid).await;
+        let s = strip(&res.body);
+        assert!(
+            s.contains(&SUB_2[..8]),
+            "the refreshed token's principal: {s}"
+        );
+        assert!(!s.contains(&SUB_1[..8]), "{s}");
+    }
+    assert_eq!(introspections_of(&app, "access-1").await, 1);
+    assert_eq!(
+        introspections_of(&app, "access-2").await,
+        1,
+        "once for the refreshed token, not per page"
     );
 }
 

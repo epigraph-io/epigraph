@@ -246,10 +246,33 @@ samp,
 
 .auth-nav {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
 }
 
 .auth-nav form {
   margin: 0;
+}
+
+/* Who the viewer is signed in as, and what their token carries. Plain
+   information: a wider-than-requested token is not styled as a warning. */
+.identity-strip {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--space-3);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.identity-strip code {
+  font-family: var(--font-mono);
+}
+
+.identity-strip__note {
+  font-style: italic;
 }
 
 .site-main {
@@ -282,6 +305,11 @@ samp,
     order: 3;
     flex-basis: 100%;
     max-width: none;
+  }
+
+  .auth-nav {
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   .site-main {

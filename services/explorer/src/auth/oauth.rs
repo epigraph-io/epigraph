@@ -50,6 +50,9 @@ pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: DateTime<Utc>,
+    /// The scopes the token response says it granted, space-separated;
+    /// `None` when it did not say. Shown in the identity strip.
+    pub scope: Option<String>,
     /// The response's `scope` names a scope [`SCOPE`] did not ask for.
     pub scope_widened: bool,
 }
@@ -58,6 +61,7 @@ impl std::fmt::Debug for TokenSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenSet")
             .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
             .field("scope_widened", &self.scope_widened)
             .finish_non_exhaustive()
     }
@@ -430,8 +434,11 @@ fn token_set(body: Vec<u8>) -> Result<TokenSet, TokenError> {
         expires_in = r.expires_in,
         "tokens issued"
     );
-    let scope_widened = r
+    let scope = r
         .scope
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|s| !s.is_empty());
+    let scope_widened = scope
         .as_deref()
         .is_some_and(|granted| scope_widened(SCOPE, granted));
     if scope_widened {
@@ -444,6 +451,7 @@ fn token_set(body: Vec<u8>) -> Result<TokenSet, TokenError> {
         access_token: r.access_token,
         refresh_token: r.refresh_token.unwrap_or_default(),
         expires_at: Utc::now() + chrono::Duration::seconds(lifetime),
+        scope,
         scope_widened,
     })
 }
@@ -561,10 +569,15 @@ mod tests {
         let left = (t.expires_at - Utc::now()).num_seconds();
         assert!((3590..=3600).contains(&left), "{left}");
         assert!(!format!("{t:?}").contains("\"a\""), "Debug hides tokens");
+        assert_eq!(t.scope.as_deref(), Some("claims:read"), "the granted scope");
 
         // Optional fields omitted; absurd lifetimes clamped.
         let t = token_set(br#"{"access_token":"a","expires_in":999999999}"#.to_vec()).unwrap();
         assert_eq!(t.refresh_token, "");
+        assert_eq!(
+            t.scope, None,
+            "an omitted scope is recorded as not reported"
+        );
         assert!((t.expires_at - Utc::now()).num_seconds() <= MAX_TOKEN_LIFETIME_SECS);
         let t = token_set(br#"{"access_token":"a","expires_in":-5}"#.to_vec()).unwrap();
         assert!(t.expires_at <= Utc::now());
