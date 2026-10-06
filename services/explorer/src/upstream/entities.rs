@@ -9,8 +9,6 @@
 //! display-only field must never fail a whole page's decode. The pages parse
 //! them for display and fall back to the raw text.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -134,45 +132,6 @@ pub struct AttributedClaim {
     /// The edge's `properties` (`{}` by default).
     #[serde(default)]
     pub attribution: serde_json::Value,
-}
-
-// ---- GET /api/v1/agents/:id/epistemic-profile (political.rs::epistemic_profile) ---
-
-/// Unbounded upstream (every claim of the agent is loaded), so it can be
-/// slow; the page degrades it independently.
-///
-/// Its claim set is `claims.agent_id` OR attributed/originated edges — a
-/// different definition from [`AgentClaimsPage`].
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct EpistemicProfileResponse {
-    pub agent_id: Uuid,
-    #[serde(default)]
-    pub display_name: Option<String>,
-    #[serde(default)]
-    pub claim_count: u64,
-    /// `evidence.evidence_type` column values → fraction.
-    #[serde(default)]
-    pub evidence_distribution: BTreeMap<String, f64>,
-    /// `refuted` / `contested` / `verified` / `active` → fraction.
-    #[serde(default)]
-    pub epistemic_status_distribution: BTreeMap<String, f64>,
-    #[serde(default)]
-    pub mean_truth_value: Option<f64>,
-    #[serde(default)]
-    pub refutation_rate: Option<f64>,
-    /// Every distinct label on every claim; can be huge.
-    #[serde(default)]
-    pub topics: Vec<String>,
-    #[serde(default)]
-    pub time_range: Option<TimeRange>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct TimeRange {
-    #[serde(default)]
-    pub first: Option<String>,
-    #[serde(default)]
-    pub last: Option<String>,
 }
 
 // ---- GET /api/v1/frames/:id (belief.rs::get_frame) ---------------------------
@@ -306,15 +265,6 @@ impl Api<'_> {
             .await
     }
 
-    /// `GET /api/v1/agents/:id/epistemic-profile`.
-    pub async fn agent_epistemic_profile(
-        &self,
-        id: Uuid,
-    ) -> Result<EpistemicProfileResponse, UpstreamError> {
-        self.get(&format!("/api/v1/agents/{id}/epistemic-profile"))
-            .await
-    }
-
     /// `GET /api/v1/frames/:id`.
     pub async fn frame_detail(&self, id: Uuid) -> Result<FrameDetailResponse, UpstreamError> {
         self.get(&format!("/api/v1/frames/{id}")).await
@@ -412,17 +362,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(p.items[0].id, Uuid::parse_str(B).unwrap());
-
-        let e: EpistemicProfileResponse = serde_json::from_value(json!({
-            "agent_id": A, "display_name": "X", "claim_count": 3,
-            "evidence_distribution": {"document": 0.5, "observation": 0.5},
-            "epistemic_status_distribution": {"active": 1.0},
-            "mean_truth_value": 0.6, "refutation_rate": 0.0,
-            "topics": ["a"], "time_range": null
-        }))
-        .unwrap();
-        assert!(e.time_range.is_none());
-        assert_eq!(e.evidence_distribution.len(), 2);
     }
 
     #[test]

@@ -8,12 +8,8 @@
 
 mod common;
 
-use std::time::Duration;
-
 use axum::http::StatusCode;
-use axum::Router;
-use common::{spawn, spawn_with, TestApp};
-use epigraph_explorer::config::ENV_UPSTREAM_TIMEOUT_MS;
+use common::{spawn, TestApp};
 use serde_json::{json, Value};
 use wiremock::matchers::{any, header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
@@ -160,12 +156,6 @@ async fn entity_routes_answer_with_and_without_the_base_path() {
         &app,
         &format!("/api/v1/agents/{CLAIM}/claims"),
         json!({"items": [], "total": 0, "limit": 20, "offset": 0}),
-    )
-    .await;
-    get_ok(
-        &app,
-        &format!("/api/v1/agents/{CLAIM}/epistemic-profile"),
-        profile_json(CLAIM),
     )
     .await;
     get_ok(&app, &format!("/api/v1/frames/{CLAIM}"), frame_json(CLAIM)).await;
@@ -736,23 +726,8 @@ fn attributed_json(n: usize, total: i64, offset: i64) -> Value {
     json!({"items": items, "total": total, "limit": 20, "offset": offset})
 }
 
-fn profile_json(id: &str) -> Value {
-    let topics: Vec<String> = (0..45).map(|i| format!("topic-{i}")).collect();
-    json!({
-        "agent_id": id,
-        "display_name": "Ada Lovelace",
-        "claim_count": 57,
-        "evidence_distribution": {"document": 0.25, "observation": 0.75},
-        "epistemic_status_distribution": {"active": 0.9, "refuted": 0.1},
-        "mean_truth_value": 0.64,
-        "refutation_rate": 0.1,
-        "topics": topics,
-        "time_range": {"first": "2025-01-01T00:00:00Z", "last": "2026-01-01T00:00:00Z"}
-    })
-}
-
 #[tokio::test]
-async fn agent_page_renders_profile_attributed_claims_and_epistemic_profile() {
+async fn agent_page_renders_profile_and_attributed_claims() {
     let app = spawn().await;
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/agents/{AGENT}")))
@@ -769,12 +744,6 @@ async fn agent_page_renders_profile_attributed_claims_and_epistemic_profile() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    get_ok(
-        &app,
-        &format!("/api/v1/agents/{AGENT}/epistemic-profile"),
-        profile_json(AGENT),
-    )
-    .await;
     let sid = app.sign_in("tok");
     let res = app.get_as(&format!("/explorer/agent/{AGENT}"), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -790,17 +759,50 @@ async fn agent_page_renders_profile_attributed_claims_and_epistemic_profile() {
         "href=\"/explorer/agent/{AGENT}?page=2\" rel=\"next\""
     )));
     assert!(!b.contains("rel=\"prev\""));
-    // Profile.
-    assert!(b.contains("Epistemic profile"));
-    assert!(b.contains(">57<"));
-    assert!(b.contains("0.64"));
-    assert!(b.contains("<meter min=\"0\" max=\"1\" value=\"0.750\">75%</meter>"));
-    assert!(b.contains(">Observation<"), "evidence types are normalised");
+    app.upstream.verify().await;
+}
+
+/// The epistemic-profile section is gone (its upstream module was ruled
+/// dead): the agent page renders whole and never asks for the profile.
+#[tokio::test]
+async fn agent_page_makes_no_epistemic_profile_call() {
+    let app = spawn().await;
+    get_ok(&app, &format!("/api/v1/agents/{AGENT}"), agent_json(AGENT)).await;
+    get_ok(
+        &app,
+        &format!("/api/v1/agents/{AGENT}/claims"),
+        attributed_json(2, 2, 0),
+    )
+    .await;
+    // Answers 200 if called, so only the zero-call expectation can fail.
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/agents/{AGENT}/epistemic-profile")))
+        .respond_with(ok(
+            json!({"agent_id": AGENT, "claim_count": 1, "topics": ["t"]}),
+        ))
+        .expect(0)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("/explorer/agent/{AGENT}"), &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let b = &res.body;
+    assert!(b.contains("<h1>Ada Lovelace</h1>"), "the page rendered");
+    assert!(b.contains("Attributed claim number 1"), "claims rendered");
+    assert!(!b.contains("Epistemic profile"), "no profile section");
+    assert!(!b.contains("section-unavailable"), "nothing degraded");
+    let requests = app
+        .upstream
+        .received_requests()
+        .await
+        .expect("request recording is on");
     assert!(
-        b.contains("topic-39") && !b.contains("topic-40"),
-        "topics are capped"
+        requests
+            .iter()
+            .all(|r| !r.url.path().ends_with("/epistemic-profile")),
+        "profile requested: {:?}",
+        requests.iter().map(|r| r.url.path()).collect::<Vec<_>>()
     );
-    assert!(b.contains("and 5 more"));
     app.upstream.verify().await;
 }
 
@@ -815,12 +817,6 @@ async fn agent_attributed_claims_page_through_offsets() {
         .expect(1)
         .mount(&app.upstream)
         .await;
-    get_ok(
-        &app,
-        &format!("/api/v1/agents/{AGENT}/epistemic-profile"),
-        profile_json(AGENT),
-    )
-    .await;
     let sid = app.sign_in("tok");
     let res = app
         .get_as(&format!("/explorer/agent/{AGENT}?page=3&page=3"), &sid)
@@ -832,31 +828,6 @@ async fn agent_attributed_claims_page_through_offsets() {
     )));
     assert!(!res.body.contains("rel=\"next\""));
     app.upstream.verify().await;
-}
-
-#[tokio::test]
-async fn agent_epistemic_profile_timeout_degrades_only_that_section() {
-    let app = spawn_with(&[(ENV_UPSTREAM_TIMEOUT_MS, "400")], Router::new()).await;
-    get_ok(&app, &format!("/api/v1/agents/{AGENT}"), agent_json(AGENT)).await;
-    get_ok(
-        &app,
-        &format!("/api/v1/agents/{AGENT}/claims"),
-        attributed_json(2, 2, 0),
-    )
-    .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/api/v1/agents/{AGENT}/epistemic-profile")))
-        .respond_with(ok(profile_json(AGENT)).set_delay(Duration::from_secs(3)))
-        .mount(&app.upstream)
-        .await;
-    let sid = app.sign_in("tok");
-    let res = app.get_as(&format!("/explorer/agent/{AGENT}"), &sid).await;
-    assert_eq!(res.status, StatusCode::OK);
-    assert!(res.body.contains("Attributed claim number 1"));
-    assert!(res.body.contains(
-        "<p class=\"section-unavailable\">The EpiGraph API took too long to answer.</p>"
-    ));
-    assert!(!res.body.contains("topic-0"));
 }
 
 #[tokio::test]
@@ -872,12 +843,6 @@ async fn agent_attributed_claims_text_plain_400_degrades() {
         )
         .mount(&app.upstream)
         .await;
-    get_ok(
-        &app,
-        &format!("/api/v1/agents/{AGENT}/epistemic-profile"),
-        profile_json(AGENT),
-    )
-    .await;
     let sid = app.sign_in("tok");
     let res = app.get_as(&format!("/explorer/agent/{AGENT}"), &sid).await;
     assert_eq!(res.status, StatusCode::OK);
@@ -885,7 +850,10 @@ async fn agent_attributed_claims_text_plain_400_degrades() {
         .body
         .contains("<p class=\"section-unavailable\">The EpiGraph API rejected this request.</p>"));
     assert!(!res.body.contains("invalid digit"));
-    assert!(res.body.contains("topic-0"), "the profile still renders");
+    assert!(
+        res.body.contains("<h1>Ada Lovelace</h1>"),
+        "the agent header still renders"
+    );
 }
 
 #[tokio::test]
@@ -901,17 +869,12 @@ async fn agent_404_and_omitted_optionals() {
         .respond_with(json_404("Agent", AGENT))
         .mount(&app.upstream)
         .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/api/v1/agents/{AGENT}/epistemic-profile")))
-        .respond_with(json_404("Agent", AGENT))
-        .mount(&app.upstream)
-        .await;
     let sid = app.sign_in("tok");
     let res = app.get_as(&format!("/explorer/agent/{AGENT}"), &sid).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     assert!(res.body.contains("We could not find that agent."));
 
-    // No display name, key, labels or ids; empty claims; null time range.
+    // No display name, key, labels or ids; empty claims.
     let app = spawn().await;
     get_ok(
         &app,
@@ -925,20 +888,11 @@ async fn agent_404_and_omitted_optionals() {
         json!({"items": [], "total": 0, "limit": 20, "offset": 0}),
     )
     .await;
-    get_ok(
-        &app,
-        &format!("/api/v1/agents/{AGENT}/epistemic-profile"),
-        json!({"agent_id": AGENT, "claim_count": 0, "evidence_distribution": {},
-               "epistemic_status_distribution": {}, "mean_truth_value": 0.0,
-               "refutation_rate": 0.0, "topics": [], "time_range": null}),
-    )
-    .await;
     let sid = app.sign_in("tok");
     let res = app.get_as(&format!("/explorer/agent/{AGENT}"), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(res.body.contains("Agent a9e7c1d2"));
     assert!(res.body.contains("No claims are attributed to this agent."));
-    assert!(res.body.contains("No evidence recorded."));
 }
 
 #[tokio::test]
@@ -961,15 +915,6 @@ async fn agent_escapes_hostile_content_and_refuses_unsafe_links() {
                      "updated_at": "2026-01-02T03:04:05Z", "attribution": {}}),
     );
     get_ok(&app, &format!("/api/v1/agents/{AGENT}/claims"), claims).await;
-    let mut profile = profile_json(AGENT);
-    profile["topics"] = json!([HOSTILE_ATTR]);
-    profile["evidence_distribution"] = json!({ HOSTILE: 1.0 });
-    get_ok(
-        &app,
-        &format!("/api/v1/agents/{AGENT}/epistemic-profile"),
-        profile,
-    )
-    .await;
     let sid = app.sign_in("tok");
     let res = app.get_as(&format!("/explorer/agent/{AGENT}"), &sid).await;
     assert_eq!(res.status, StatusCode::OK);

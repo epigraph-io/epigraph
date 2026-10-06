@@ -19,8 +19,8 @@ use crate::error::{not_found_as, AppError};
 use crate::links::Links;
 use crate::state::AppState;
 use crate::upstream::entities::{
-    AgentClaimsPage, EpistemicProfileResponse, FrameClaimRow, FrameDetailResponse,
-    VersionHistoryResponse, FRAME_CLAIM_ORDERS, FRAME_CLAIM_SORTS,
+    AgentClaimsPage, FrameClaimRow, FrameDetailResponse, VersionHistoryResponse,
+    FRAME_CLAIM_ORDERS, FRAME_CLAIM_SORTS,
 };
 use crate::upstream::{
     degrade, truncate_chars, ClaimResponse, Degraded, UpstreamError, PROVENANCE_DEPTH_RANGE,
@@ -30,10 +30,9 @@ use crate::view::render;
 mod present;
 
 use present::{
-    claim_text, duplicate_of, evidence_kind, fmt_pct, fmt_prob, fmt_time, humanise_key,
-    layout_chain, one_of, orcid_url, parse_depth, parse_page, query_param, ror_url, share_rows,
-    short_id, source_links, ChainLayout, ClaimText, EvidenceKind, ExtLink, ShareRow,
-    DEFAULT_PROVENANCE_DEPTH,
+    claim_text, duplicate_of, evidence_kind, fmt_prob, fmt_time, layout_chain, one_of, orcid_url,
+    parse_depth, parse_page, query_param, ror_url, short_id, source_links, ChainLayout, ClaimText,
+    EvidenceKind, ExtLink, DEFAULT_PROVENANCE_DEPTH,
 };
 
 pub fn routes() -> Router<AppState> {
@@ -53,10 +52,6 @@ const FRAME_CLAIMS_PER_PAGE: u32 = 25;
 const LIST_TEXT_CHARS: usize = 320;
 /// Longest claim text in a page heading.
 const HEADING_TEXT_CHARS: usize = 500;
-/// Topics shown on the epistemic profile (upstream sends every label).
-const PROFILE_TOPICS: usize = 40;
-/// Rows per distribution table on the epistemic profile.
-const PROFILE_SHARE_ROWS: usize = 12;
 /// Longest evidence content shown before cutting.
 const EVIDENCE_TEXT_CHARS: usize = 20_000;
 
@@ -265,7 +260,6 @@ struct AgentPage {
     orcid: Option<ExtLink>,
     ror: Option<ExtLink>,
     claims: Degraded<AttributedView>,
-    profile: Degraded<ProfileView>,
 }
 
 struct AttributedView {
@@ -278,18 +272,6 @@ struct ClaimRow {
     text: ClaimText,
     truth: String,
     created: String,
-}
-
-struct ProfileView {
-    claim_count: u64,
-    mean_truth: String,
-    refutation_rate: String,
-    first: String,
-    last: String,
-    evidence: Vec<ShareRow>,
-    statuses: Vec<ShareRow>,
-    topics: Vec<String>,
-    more_topics: usize,
 }
 
 fn attributed_view(p: &AgentClaimsPage, page: u32, base: &str, links: &Links) -> AttributedView {
@@ -324,32 +306,6 @@ fn attributed_view(p: &AgentClaimsPage, page: u32, base: &str, links: &Links) ->
     }
 }
 
-fn profile_view(p: &EpistemicProfileResponse) -> ProfileView {
-    let range = p.time_range.as_ref();
-    ProfileView {
-        claim_count: p.claim_count,
-        mean_truth: fmt_prob(p.mean_truth_value),
-        refutation_rate: p.refutation_rate.map_or_else(|| "—".into(), fmt_pct),
-        first: fmt_time(range.and_then(|r| r.first.as_deref())),
-        last: fmt_time(range.and_then(|r| r.last.as_deref())),
-        evidence: share_rows(&p.evidence_distribution, PROFILE_SHARE_ROWS, |k| {
-            evidence_kind(Some(k)).label
-        }),
-        statuses: share_rows(
-            &p.epistemic_status_distribution,
-            PROFILE_SHARE_ROWS,
-            humanise_key,
-        ),
-        topics: p
-            .topics
-            .iter()
-            .take(PROFILE_TOPICS)
-            .map(|t| truncate_chars(t, 60))
-            .collect(),
-        more_topics: p.topics.len().saturating_sub(PROFILE_TOPICS),
-    }
-}
-
 async fn agent(
     State(state): State<AppState>,
     user: SignedIn,
@@ -360,16 +316,13 @@ async fn agent(
     let page = parse_page(query_param(query.as_deref(), "page").as_deref());
     let offset = u64::from(page - 1) * u64::from(AGENT_CLAIMS_PER_PAGE);
     let api = user.api(&state);
-    // The profile is unbounded upstream and may time out; it degrades alone.
-    let (detail, claims, profile) = tokio::join!(
+    let (detail, claims) = tokio::join!(
         api.agent_detail(id),
         api.agent_attributed_claims(id, AGENT_CLAIMS_PER_PAGE, offset),
-        api.agent_epistemic_profile(id),
     );
     let detail = detail.map_err(not_found_as("agent"))?;
     let base = state.links.agent(id);
     let claims = degrade(claims)?.map(|p| attributed_view(&p, page, &base, &state.links));
-    let profile = degrade(profile)?.map(|p| profile_view(&p));
 
     let name = detail
         .display_name
@@ -405,7 +358,6 @@ async fn agent(
         orcid: ext("ORCID", &detail.orcid, orcid_url),
         ror: ext("ROR", &detail.ror_id, ror_url),
         claims,
-        profile,
         ctx: user.ctx,
     })
 }

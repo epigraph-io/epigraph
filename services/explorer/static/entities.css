@@ -236,22 +236,6 @@
   margin-top: var(--space-3);
 }
 
-.share-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-  gap: 0 var(--space-5);
-}
-
-.share-table th {
-  font-weight: 500;
-  color: var(--text);
-}
-
-.share-table meter {
-  width: 100%;
-  min-width: 4rem;
-}
-
 .hypotheses li {
   overflow-wrap: break-word;
 }

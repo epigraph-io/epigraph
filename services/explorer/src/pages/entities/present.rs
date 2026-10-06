@@ -27,19 +27,6 @@ pub fn fmt_prob(v: Option<f64>) -> String {
     }
 }
 
-/// A fraction as a whole percentage; tiny non-zero shares read `<1%`.
-pub fn fmt_pct(v: f64) -> String {
-    if !v.is_finite() {
-        return "—".into();
-    }
-    let pct = v * 100.0;
-    if pct > 0.0 && pct < 0.5 {
-        "<1%".into()
-    } else {
-        format!("{pct:.0}%")
-    }
-}
-
 /// An upstream timestamp as `YYYY-MM-DD HH:MM UTC`. Upstream mixes `Z` and
 /// `+00:00`; anything unparseable is shown as sent (cut to 40 chars).
 pub fn fmt_time(raw: Option<&str>) -> String {
@@ -291,41 +278,6 @@ pub fn ror_url(raw: &str) -> Option<String> {
     valid.then(|| format!("https://ror.org/{}", id.to_ascii_lowercase()))
 }
 
-/// One row of a share table (`<meter>` value plus a percentage label).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ShareRow {
-    pub label: String,
-    /// `0..=1`, three places, for `<meter value>`.
-    pub value: String,
-    pub pct: String,
-}
-
-/// Largest shares first, at most `cap` rows; `label` maps each key.
-pub fn share_rows(
-    map: &BTreeMap<String, f64>,
-    cap: usize,
-    label: impl Fn(&str) -> String,
-) -> Vec<ShareRow> {
-    let mut rows: Vec<(&String, f64)> = map
-        .iter()
-        .map(|(k, v)| (k, if v.is_finite() { *v } else { 0.0 }))
-        .collect();
-    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    rows.into_iter()
-        .take(cap)
-        .map(|(k, v)| ShareRow {
-            label: label(k),
-            value: format!("{:.3}", v.clamp(0.0, 1.0)),
-            pct: fmt_pct(v),
-        })
-        .collect()
-}
-
-/// `refuted` → `Refuted`, `meta_analysis` → `Meta analysis`.
-pub fn humanise_key(key: &str) -> String {
-    sentence_case(&truncate_chars(key.trim(), 60).replace('_', " "))
-}
-
 // ---- history -----------------------------------------------------------------------
 
 /// For each version, the index of the version it is a duplicate of, when it
@@ -566,9 +518,6 @@ mod tests {
         assert_eq!(fmt_prob(Some(0.456)), "0.46");
         assert_eq!(fmt_prob(None), "—");
         assert_eq!(fmt_prob(Some(f64::NAN)), "—");
-        assert_eq!(fmt_pct(0.421), "42%");
-        assert_eq!(fmt_pct(0.001), "<1%");
-        assert_eq!(fmt_pct(0.0), "0%");
         assert_eq!(
             fmt_time(Some("2026-01-02T03:04:05Z")),
             "2026-01-02 03:04 UTC"
@@ -721,20 +670,6 @@ mod tests {
             Some("https://ror.org/05dxps055")
         );
         assert_eq!(ror_url("05dx/ps05"), None);
-    }
-
-    #[test]
-    fn share_rows_sort_and_cap() {
-        let m = BTreeMap::from([
-            ("a".to_string(), 0.2),
-            ("b".to_string(), 0.7),
-            ("c".to_string(), 0.1),
-        ]);
-        let rows = share_rows(&m, 2, humanise_key);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].label, "B");
-        assert_eq!(rows[0].value, "0.700");
-        assert_eq!(rows[0].pct, "70%");
     }
 
     fn version(n: u32, current: bool, superseded_by: Option<Uuid>) -> ClaimVersion {
