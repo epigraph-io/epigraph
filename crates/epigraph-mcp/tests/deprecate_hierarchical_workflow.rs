@@ -1042,3 +1042,188 @@ async fn a_concurrent_deprecation_of_the_sharing_generation_is_waited_for(pool: 
         "with both generations deprecated, the step they shared must be retired"
     );
 }
+
+/// Hold `FOR UPDATE` on workflow row `wf` from another connection, the way a
+/// concurrent deprecation of that row holds it, until the returned
+/// transaction ends.
+async fn hold_row_lock(pool: &PgPool, wf: Uuid) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut held = pool.begin().await.expect("begin the lock holder");
+    let locked: Uuid = sqlx::query_scalar("SELECT id FROM workflows WHERE id = $1 FOR UPDATE")
+        .bind(wf)
+        .fetch_one(&mut *held)
+        .await
+        .expect("lock the row");
+    assert_eq!(locked, wf, "calibration: the holder locked {wf}");
+    held
+}
+
+/// LOCK-BEFORE-AUTHZ (security review of U017). A caller with no authority
+/// over a lineage must be refused WITHOUT taking a single lineage row lock:
+/// otherwise every refused call queues behind, and then blocks, every honest
+/// deprecation of that lineage until its refusal rolls back, a contention
+/// lever any `claims:write` token can pull on anyone's workflow.
+///
+/// A sibling generation (gen1: same `canonical_name`, NOT a target, since the
+/// call does not cascade) is held `FOR UPDATE` from another connection for
+/// `HOLD`. The stranger's refusal must come back well inside `HOLD`; a
+/// stranger that tries to lock the lineage first waits out the whole `HOLD`
+/// and only then is refused.
+///
+/// CALIBRATION, so the fast refusal is not vacuous: the SUBMITTER's call
+/// against the same held lock does wait for it, so the held row is one the
+/// deprecation really locks.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unauthorized_deprecation_takes_no_lineage_lock(pool: PgPool) {
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(3000);
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (_stranger, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let gen0 = ingest(
+        &pool,
+        &server,
+        &owner_viewer,
+        Some(&owner_token),
+        "u017-lock-authz",
+    )
+    .await;
+    let gen1 = improve(
+        &pool,
+        &server,
+        &owner_viewer,
+        Some(&owner_token),
+        "u017-lock-authz",
+    )
+    .await;
+    assert_ne!(gen0, gen1, "calibration: two rows of one lineage");
+
+    // The stranger, against a held sibling lock.
+    let held = hold_row_lock(&pool, gen1).await;
+    let started = std::time::Instant::now();
+    let stranger_call = async {
+        let r = tools::workflows::deprecate_workflow(
+            &server,
+            &stranger_viewer,
+            params(gen0, false),
+            Some(&stranger_token),
+        )
+        .await;
+        (r, started.elapsed())
+    };
+    let release = async move {
+        tokio::time::sleep(HOLD).await;
+        held.commit().await.expect("release the sibling lock");
+    };
+    let ((res, stranger_took), ()) = tokio::join!(stranger_call, release);
+    let err = res.expect_err("a stranger must not deprecate another agent's workflow");
+    assert!(
+        err.message.contains("was submitted by agent"),
+        "refused by the workflow authority rule: {}",
+        err.message
+    );
+    assert!(
+        stranger_took < std::time::Duration::from_millis(1500),
+        "an unauthorized caller must be refused before it locks any lineage row, but its \
+         refusal waited {stranger_took:?} on a sibling generation's row lock held for {HOLD:?}"
+    );
+    assert!(
+        (truth(&pool, gen0).await - 1.0).abs() < 1e-12,
+        "row untouched"
+    );
+
+    // CALIBRATION: the submitter's call waits on the same held lock.
+    let held = hold_row_lock(&pool, gen1).await;
+    let started = std::time::Instant::now();
+    let owner_call = async {
+        let r = tools::workflows::deprecate_workflow(
+            &server,
+            &owner_viewer,
+            params(gen0, false),
+            Some(&owner_token),
+        )
+        .await;
+        (r, started.elapsed())
+    };
+    let release = async move {
+        tokio::time::sleep(HOLD).await;
+        held.commit().await.expect("release the sibling lock");
+    };
+    let ((res, owner_took), ()) = tokio::join!(owner_call, release);
+    res.expect("the submitter deprecates its own workflow");
+    assert!(
+        owner_took >= HOLD - std::time::Duration::from_millis(500),
+        "calibration: an authorized deprecation locks the lineage, so it waited on the held \
+         sibling lock (took {owner_took:?}, held {HOLD:?})"
+    );
+    assert!((truth(&pool, gen0).await - 0.05).abs() < 1e-12);
+}
+
+/// TOCTOU. Authority is checked before the lineage lock (so a refusal costs no
+/// lock) and RE-CHECKED under it, before any write: the decision that admits
+/// the write must be one no concurrent transaction can still change.
+///
+/// The owner's call passes the pre-lock check, then waits on the target row,
+/// which another transaction holds while it re-records the submitter as a
+/// stranger. When that commits, the owner no longer has authority, and the
+/// call must refuse with nothing written. A fix that checks only before the
+/// lock deprecates on a stale grant.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authority_is_rechecked_under_the_lineage_lock(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (stranger, _stranger_token, _stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let wf = ingest(
+        &pool,
+        &server,
+        &owner_viewer,
+        Some(&owner_token),
+        "u017-toctou",
+    )
+    .await;
+    let owned = executed(&pool, wf, &["0", "1", "2"]).await;
+    assert!(
+        !owned.is_empty(),
+        "calibration: the workflow executes claims"
+    );
+
+    let mut held = pool.begin().await.expect("begin the re-recording tx");
+    sqlx::query(
+        "UPDATE workflows \
+            SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', to_jsonb($2::text)) \
+          WHERE id = $1",
+    )
+    .bind(wf)
+    .bind(stranger)
+    .execute(&mut *held)
+    .await
+    .expect("re-record the submitter, uncommitted");
+
+    let owner_call = tools::workflows::deprecate_workflow(
+        &server,
+        &owner_viewer,
+        params(wf, false),
+        Some(&owner_token),
+    );
+    let release = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        held.commit()
+            .await
+            .expect("commit the re-recorded submitter");
+    };
+    let (res, ()) = tokio::join!(owner_call, release);
+    let err = res.expect_err(
+        "the submitter changed while the call waited on the lock; the stale grant must not write",
+    );
+    assert!(
+        err.message
+            .contains(&format!("was submitted by agent {stranger}")),
+        "refused by the re-check, naming the NEW submitter: {}",
+        err.message
+    );
+    assert!(
+        (truth(&pool, wf).await - 1.0).abs() < 1e-12,
+        "row untouched"
+    );
+    for c in &owned {
+        assert!(is_current(&pool, *c).await, "claim {c} untouched");
+    }
+}
