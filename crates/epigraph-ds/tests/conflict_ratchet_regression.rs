@@ -76,7 +76,10 @@ fn closed_world_high_conflict_combination_stays_closed_world() {
     assert_eq!(con.open_world_fraction(), 0.0);
 
     let k = combination::conflict_coefficient(&pro, &con).expect("same frame");
-    assert!(k >= 0.5, "test needs the old high-conflict branch, got K={k}");
+    assert!(
+        k >= 0.5,
+        "test needs the old high-conflict branch, got K={k}"
+    );
     assert_eq!(
         combination::select_combination_rule(k, 0.0),
         combination::CombinationRule::Inagaki,
@@ -91,8 +94,14 @@ fn closed_world_high_conflict_combination_stays_closed_world() {
         "closed-world inputs must combine to a closed-world result (U025)"
     );
     assert_eq!(combined.mass_of_missing(), 0.0);
-    assert_eq!(reports[0].method_used, combination::CombinationMethod::Dempster);
-    assert!((reports[0].conflict_k - k).abs() < 1e-12, "conflict is still reported");
+    assert_eq!(
+        reports[0].method_used,
+        combination::CombinationMethod::Dempster
+    );
+    assert!(
+        (reports[0].conflict_k - k).abs() < 1e-12,
+        "conflict is still reported"
+    );
 }
 
 /// The ratchet is gone, replayed on the exact BBAs prod holds for claim

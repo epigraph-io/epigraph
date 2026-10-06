@@ -1803,7 +1803,10 @@ mod tests {
         let m2 = MassFunction::simple(frame, BTreeSet::from([1]), 0.9).unwrap();
 
         let k = conflict_coefficient(&m1, &m2).unwrap();
-        assert!(k >= 0.5, "input must be in the old high-conflict regime; got {k}");
+        assert!(
+            k >= 0.5,
+            "input must be in the old high-conflict regime; got {k}"
+        );
         assert!(m1.open_world_fraction() > 0.03, "input must be open-world");
         assert_eq!(
             select_combination_rule(k, m1.open_world_fraction()),
@@ -1827,7 +1830,10 @@ mod tests {
         let frame = binary_frame();
         let yes = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 1.0).unwrap();
         let no = MassFunction::simple(frame.clone(), BTreeSet::from([1]), 1.0).unwrap();
-        assert!(matches!(dempster_combine(&yes, &no), Err(DsError::TotalConflict)));
+        assert!(matches!(
+            dempster_combine(&yes, &no),
+            Err(DsError::TotalConflict)
+        ));
 
         let (result, reports) = combine_multiple(&[yes, no], 0.9).unwrap();
         assert_eq!(reports.len(), 1);
@@ -1859,7 +1865,10 @@ mod tests {
         }
         let expected = tbm.mass_of_conflict();
         let got = aggregate_conflict(&reports);
-        assert!(expected > 0.5, "inputs must actually conflict; got {expected}");
+        assert!(
+            expected > 0.5,
+            "inputs must actually conflict; got {expected}"
+        );
         assert!(
             (got - expected).abs() < 1e-12,
             "aggregate_conflict {got} != TBM conflict {expected}"

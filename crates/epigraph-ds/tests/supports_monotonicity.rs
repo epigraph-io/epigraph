@@ -129,6 +129,11 @@ fn appending_a_supporting_bba_never_lowers_betp_exhaustive_grid() {
         violations.is_empty(),
         "{} of {checked} supporting appends LOWERED BetP(TRUE); first 10:\n{}",
         violations.len(),
-        violations.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+        violations
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
