@@ -122,6 +122,14 @@ pub async fn end_session_revoking(state: &AppState, id: &SessionId, held_by: &'s
 /// refresh lock) and revoke the refresh token it held. Revocation is best
 /// effort, as at logout; it presents the token to `/oauth/revoke`, never to
 /// `/oauth/token`, so it cannot trip reuse detection.
+///
+/// What this guarantees is that the session ends and the held token is never
+/// replayed. The revocation helps only when upstream did NOT rotate: if it
+/// did, the held token is already spent, `/oauth/revoke` matches no live row
+/// and does nothing, and the successor upstream minted stays live until its
+/// own expiry, held by no one, because the answer naming it was lost. The
+/// Explorer cannot revoke a token it never received; closing that needs the
+/// API to revoke a rotated-out token's whole family on `/oauth/revoke`.
 async fn end_after_lost_refresh(
     state: &AppState,
     id: &SessionId,
