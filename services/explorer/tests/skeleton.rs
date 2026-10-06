@@ -235,6 +235,7 @@ async fn every_area_route_is_mounted() {
         format!("/explorer/neighborhood/{CLAIM}?mode=compound"),
         "/explorer/backlog".to_string(),
         "/explorer/audit".to_string(),
+        "/explorer/activity".to_string(),
     ];
     for uri in &pages {
         let res = app.get_as(uri, &sid).await;
@@ -307,7 +308,7 @@ async fn every_area_route_is_mounted() {
 async fn new_page_stubs_answer_501_not_404() {
     let app = spawn().await;
     let sid = app.sign_in("tok");
-    for page in ["activity", "candidates", "acts"] {
+    for page in ["candidates", "acts"] {
         // Mounted twice, like every route: under the base path and at the root.
         for uri in [format!("{BASE}/{page}"), format!("/{page}")] {
             let res = app.get_as(&uri, &sid).await;

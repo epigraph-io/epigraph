@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block title %}Agent activity · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}<link rel="stylesheet" href="{{ ctx.static_url("core.css") }}">{% endblock %}
+
+{% block content %}
+<h1>Agent activity</h1>
+<p class="muted">What the watched agents did since a time: each agent's newest claims you may read. This page is read-only.</p>
+
+{%- if no_watch_list %}
+<p class="notice" data-activity="no-watch-list">No agents are watched. Set <code>{{ watch_var }}</code> in the Explorer's environment to a comma-separated list of agent ids, then restart the Explorer.</p>
+{%- else %}
+<form class="audit-window" method="get" action="{{ action_url }}" aria-label="Activity window">
+  <div class="audit-window__row">
+    <label>Since <input name="since" value="{{ since_input }}" placeholder="2026-10-05T12:00:00Z" autocomplete="off"></label>
+    <button type="submit">Show</button>
+  </div>
+  <p class="small muted">Times are UTC: RFC 3339, or a date and time such as 2026-10-05T12:00. With no “since”, the last 24 hours.</p>
+</form>
+
+{%- if let Some(p) = problem %}
+<p class="notice notice--warn">{{ p }}</p>
+{%- endif %}
+
+{%- for a in agents %}
+<section class="section activity-agent" aria-labelledby="agent-{{ a.id }}">
+  <h2 id="agent-{{ a.id }}" class="section__title"><a href="{{ a.agent_url }}">Agent <code title="{{ a.id }}">{{ a.short }}</code></a> <span class="muted small">claims since {{ since_text }}</span></h2>
+  {%- match a.claims %}
+  {%- when Degraded::Available { data } %}
+  <p class="small muted" data-agent="{{ a.id }}" data-claims-shown="{{ data.rows.len() }}" data-claims-total="{{ data.total }}">
+    {%- if data.capped %}
+    <span class="notice notice--warn" data-activity="capped">Showing the newest {{ data.rows.len() }} of {{ data.total_text }} claims since {{ since_text }}.</span>
+    {%- else if data.rows.is_empty() %}
+    No claims since {{ since_text }}.
+    {%- else %}
+    {{ data.total_text }} claims since {{ since_text }}, newest first.
+    {%- endif %}
+  </p>
+  {%- if !data.rows.is_empty() %}
+  <ol class="results">
+    {%- for c in data.rows %}
+    <li class="result">
+      <p class="result__text"><a data-claim="{{ c.id }}" href="{{ c.claim_url }}">{{ c.text }}</a></p>
+      <p class="result__meta small muted"><span>{{ c.created }}</span>{% if c.superseded %} <span class="label">superseded</span>{% endif %}</p>
+    </li>
+    {%- endfor %}
+  </ol>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable" data-agent="{{ a.id }}" data-activity="unavailable">This agent's claims are unavailable. {{ reason }}</p>
+  {%- endmatch %}
+</section>
+{%- endfor %}
+{%- endif %}
+{% endblock %}

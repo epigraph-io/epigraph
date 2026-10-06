@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 
 pub const ENV_API_URL: &str = "EPIGRAPH_API_URL";
 pub const ENV_PORT: &str = "EPIGRAPH_EXPLORER_PORT";
@@ -23,6 +24,7 @@ pub const ENV_INSECURE_COOKIES: &str = "EPIGRAPH_EXPLORER_INSECURE_COOKIES";
 pub const ENV_DEV_BEARER: &str = "EPIGRAPH_EXPLORER_DEV_BEARER";
 pub const ENV_KANBAN_URL: &str = "EPIGRAPH_EXPLORER_KANBAN_URL";
 pub const ENV_AUDIT_ROW_CEILING: &str = "EPIGRAPH_EXPLORER_AUDIT_ROW_CEILING";
+pub const ENV_WATCH_AGENTS: &str = "EPIGRAPH_EXPLORER_WATCH_AGENTS";
 
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_PORT: u16 = 8096;
@@ -56,6 +58,9 @@ pub const TOKEN_TIMEOUT_MS_RANGE: (u64, u64) = (250, 60_000);
 /// rows that one viewer's window stays a bounded amount of memory and
 /// upstream work.
 pub const AUDIT_ROW_CEILING_RANGE: (usize, usize) = (1_000, 50_000);
+/// Most agents the activity page watches. Each is one upstream call per
+/// page view, so the list stays short.
+pub const MAX_WATCH_AGENTS: usize = 20;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -115,6 +120,9 @@ pub struct Config {
     pub kanban_url: Option<Url>,
     /// Most security events the audit page reads for one window.
     pub audit_row_ceiling: usize,
+    /// The agents the activity page shows, in the configured order, each
+    /// once. Empty: the page explains how to set the list.
+    pub watch_agents: Vec<Uuid>,
 }
 
 impl std::fmt::Debug for Config {
@@ -135,6 +143,7 @@ impl std::fmt::Debug for Config {
             .field("dev_bearer", &self.dev_bearer.as_ref().map(|_| "<set>"))
             .field("kanban_url", &self.kanban_url.as_ref().map(Url::as_str))
             .field("audit_row_ceiling", &self.audit_row_ceiling)
+            .field("watch_agents", &self.watch_agents.len())
             .finish()
     }
 }
@@ -298,6 +307,11 @@ impl Config {
             None => DEFAULT_AUDIT_ROW_CEILING,
         };
 
+        let watch_agents = match get(ENV_WATCH_AGENTS) {
+            Some(v) => parse_watch_agents(&v)?,
+            None => Vec::new(),
+        };
+
         Ok(Config {
             api_url,
             port,
@@ -315,6 +329,7 @@ impl Config {
             dev_bearer,
             kanban_url,
             audit_row_ceiling,
+            watch_agents,
         })
     }
 
@@ -347,6 +362,31 @@ impl Config {
     pub fn redirect_uri(&self) -> String {
         format!("{}{}/auth/callback", self.public_origin, self.base_path)
     }
+}
+
+/// A comma-separated list of agent ids: each trimmed, empty entries (a
+/// trailing comma) skipped, each a uuid, each kept once in the order given,
+/// at most [`MAX_WATCH_AGENTS`].
+fn parse_watch_agents(raw: &str) -> Result<Vec<Uuid>, ConfigError> {
+    let mut agents: Vec<Uuid> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let id = Uuid::parse_str(entry).map_err(|_| {
+            invalid(
+                ENV_WATCH_AGENTS,
+                "expected a comma-separated list of agent ids (uuids)",
+            )
+        })?;
+        if !agents.contains(&id) {
+            agents.push(id);
+        }
+    }
+    if agents.len() > MAX_WATCH_AGENTS {
+        return Err(invalid(
+            ENV_WATCH_AGENTS,
+            format!("at most {MAX_WATCH_AGENTS} agents"),
+        ));
+    }
+    Ok(agents)
 }
 
 fn parse_http_url(var: &'static str, raw: &str) -> Result<Url, ConfigError> {
@@ -580,6 +620,52 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn watch_agents_rejects_a_non_uuid() {
+        const A: &str = "00000000-0000-4000-a000-000000000001";
+        const B: &str = "00000000-0000-4000-a000-000000000002";
+        let a = Uuid::parse_str(A).unwrap();
+        let b = Uuid::parse_str(B).unwrap();
+        assert!(cfg(&[BASE]).unwrap().watch_agents.is_empty());
+        let set = |v: &str| cfg(&[BASE, (ENV_WATCH_AGENTS, v)]);
+        assert_eq!(set(A).unwrap().watch_agents, [a]);
+        assert_eq!(
+            set(&format!(" {B} , {A},{B}, ")).unwrap().watch_agents,
+            [b, a],
+            "trimmed, order kept, each once, a trailing comma ignored"
+        );
+        let many: Vec<String> = (0..=MAX_WATCH_AGENTS)
+            .map(|n| format!("00000000-0000-4000-a000-{n:012x}"))
+            .collect();
+        assert_eq!(
+            set(&many[..MAX_WATCH_AGENTS].join(","))
+                .unwrap()
+                .watch_agents
+                .len(),
+            MAX_WATCH_AGENTS
+        );
+        for bad in [
+            "agent-a".to_string(),
+            format!("{A},not-a-uuid"),
+            format!("{A};{B}"),
+            many.join(","),
+        ] {
+            assert!(
+                matches!(
+                    set(&bad),
+                    Err(ConfigError::Invalid {
+                        var: ENV_WATCH_AGENTS,
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
+        // The ids are not logged with the rest of the config.
+        let c = set(A).unwrap();
+        assert!(!format!("{c:?}").contains(A));
     }
 
     #[test]
