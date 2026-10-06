@@ -12,9 +12,20 @@
 //! viewer's in-flight cap included, so starting them all at once would let
 //! the last ones of a long list spend their deadline waiting.
 //!
-//! One agent's failed call leaves that agent's section "unavailable"; only a
-//! session that ended escapes. With no watch list the page explains how to
-//! set one and asks upstream nothing.
+//! Below the agents, an events tail: one call for every agent's recent
+//! events since `since` ([`EVENTS_TAIL_LIMIT`] at most), kept here only when
+//! a watched agent is the actor, newest first. The API's event list cannot
+//! be filtered by agent and holds only a window of its newest events, so the
+//! tail is labelled as corpus-wide and filtered, and makes no claim to be
+//! every event of the watched agents since `since`. When the API counted
+//! more events than it returned, it cut the newest end, and the tail says so.
+//!
+//! One agent's failed call leaves that agent's section "unavailable", and a
+//! failed events call leaves only the tail "unavailable"; only a session
+//! that ended escapes. With no watch list the page explains how to set one
+//! and asks upstream nothing.
+
+use std::collections::HashSet;
 
 use askama::Template;
 use axum::extract::{Query, State};
@@ -33,8 +44,10 @@ use crate::links::Links;
 use crate::pages::audit::parse_time;
 use crate::pages::core::vocab::{fmt_count, one_line, short_id};
 use crate::state::AppState;
-use crate::upstream::activity::{AgentClaim, AgentClaims, AGENT_CLAIMS_LIMIT};
-use crate::upstream::{degrade, truncate_chars, Degraded};
+use crate::upstream::activity::{
+    AgentClaim, AgentClaims, EventList, AGENT_CLAIMS_LIMIT, EVENTS_TAIL_LIMIT,
+};
+use crate::upstream::{degrade, truncate_chars, Degraded, UpstreamError};
 use crate::view::render;
 
 /// The window when the viewer names no `since`.
@@ -43,6 +56,8 @@ pub const DEFAULT_WINDOW_HOURS: i64 = 24;
 const SNIPPET_CHARS: usize = 200;
 /// Characters of a rejected input echoed back in the notice.
 const ECHO_CHARS: usize = 64;
+/// Watched agents' events the tail shows at most (newest first).
+pub const TAIL_ROWS: usize = 100;
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/activity", get(activity))
@@ -110,6 +125,36 @@ pub struct AgentSection {
     pub claims: Degraded<AgentClaimsView>,
 }
 
+/// One event in the tail.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailRow {
+    pub id: Uuid,
+    pub event_type: String,
+    pub created: String,
+    pub actor_id: Uuid,
+    pub actor_short: String,
+    pub actor_url: String,
+}
+
+/// The events tail: the watched agents' events among those upstream
+/// returned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventsTail {
+    /// Newest first, at most [`TAIL_ROWS`].
+    pub rows: Vec<TailRow>,
+    /// The watched agents' events among those returned.
+    pub watched: usize,
+    /// Every agent's events upstream returned.
+    pub returned: usize,
+    /// Every agent's events upstream counted since `since` in its window.
+    pub counted: u64,
+    /// `counted` is more than `returned`: upstream cut its newest events.
+    pub cut: bool,
+    /// `counted` and `returned`, thousands-separated.
+    pub counted_text: String,
+    pub returned_text: String,
+}
+
 fn display_time(t: &DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
@@ -140,6 +185,55 @@ pub fn claims_view(list: AgentClaims, links: &Links) -> AgentClaimsView {
     }
 }
 
+/// Keep the watched agents' events, newest first, at most [`TAIL_ROWS`].
+pub fn events_tail(list: EventList, watch: &[Uuid], links: &Links) -> EventsTail {
+    let watch: HashSet<Uuid> = watch.iter().copied().collect();
+    let returned = list.events.len();
+    let mut kept: Vec<_> = list
+        .events
+        .into_iter()
+        .filter_map(|e| match e.actor_id {
+            Some(actor) if watch.contains(&actor) => Some((actor, e)),
+            _ => None,
+        })
+        .collect();
+    // Upstream sends the oldest first.
+    kept.sort_by_key(|(_, e)| std::cmp::Reverse(e.created_at));
+    let watched = kept.len();
+    EventsTail {
+        rows: kept
+            .into_iter()
+            .take(TAIL_ROWS)
+            .map(|(actor, e)| TailRow {
+                id: e.id,
+                event_type: e.event_type,
+                created: display_time(&e.created_at),
+                actor_id: actor,
+                actor_short: short_id(actor),
+                actor_url: links.agent(actor),
+            })
+            .collect(),
+        watched,
+        returned,
+        counted: list.total,
+        cut: list.total > returned as u64,
+        counted_text: fmt_count(list.total as i64),
+        returned_text: fmt_count(returned as i64),
+    }
+}
+
+/// One upstream call the page makes.
+enum Job {
+    Events,
+    Agent(Uuid),
+}
+
+/// Its answer.
+enum Answer {
+    Events(Result<EventList, UpstreamError>),
+    Agent(Uuid, Result<AgentClaims, UpstreamError>),
+}
+
 #[derive(Template)]
 #[template(path = "activity.html")]
 struct ActivityPage {
@@ -154,6 +248,9 @@ struct ActivityPage {
     problem: Option<String>,
     since_text: String,
     agents: Vec<AgentSection>,
+    /// `None` when nothing was asked of upstream.
+    tail: Option<Degraded<EventsTail>>,
+    tail_limit_text: String,
 }
 
 async fn activity(
@@ -172,6 +269,8 @@ async fn activity(
         problem: None,
         since_text: String::new(),
         agents: Vec::new(),
+        tail: None,
+        tail_limit_text: fmt_count(i64::from(EVENTS_TAIL_LIMIT)),
     };
     if watch.is_empty() {
         return render(&page);
@@ -187,24 +286,35 @@ async fn activity(
 
     let api = user.api(&state);
     let api = &api;
-    let results: Vec<_> = stream::iter(watch.iter().copied())
-        .map(|agent| async move {
-            (
-                agent,
-                api.agent_claims_since(agent, &since, AGENT_CLAIMS_LIMIT)
-                    .await,
-            )
+    // The events call is one of the bounded calls, not an extra one beside
+    // them.
+    let jobs = std::iter::once(Job::Events).chain(watch.iter().copied().map(Job::Agent));
+    let answers: Vec<Answer> = stream::iter(jobs)
+        .map(|job| async move {
+            match job {
+                Job::Events => Answer::Events(api.events_since(&since, EVENTS_TAIL_LIMIT).await),
+                Job::Agent(agent) => Answer::Agent(
+                    agent,
+                    api.agent_claims_since(agent, &since, AGENT_CLAIMS_LIMIT)
+                        .await,
+                ),
+            }
         })
         .buffered(fan_out_width(&state.config))
         .collect()
         .await;
-    for (agent, result) in results {
-        page.agents.push(AgentSection {
-            id: agent,
-            short: short_id(agent),
-            agent_url: links.agent(agent),
-            claims: degrade(result)?.map(|l| claims_view(l, links)),
-        });
+    for answer in answers {
+        match answer {
+            Answer::Events(result) => {
+                page.tail = Some(degrade(result)?.map(|l| events_tail(l, watch, links)));
+            }
+            Answer::Agent(agent, result) => page.agents.push(AgentSection {
+                id: agent,
+                short: short_id(agent),
+                agent_url: links.agent(agent),
+                claims: degrade(result)?.map(|l| claims_view(l, links)),
+            }),
+        }
     }
     render(&page)
 }
@@ -233,6 +343,43 @@ mod tests {
         );
         let err = parse_since(Some("yesterday"), now).unwrap_err();
         assert!(err.contains("is not a time"), "{err}");
+    }
+
+    #[test]
+    fn the_tail_keeps_watched_actors_newest_first_and_marks_a_cut() {
+        use crate::upstream::activity::GraphEvent;
+        let links = Links::new("https://explorer.example.com", "");
+        let (a, b, other) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let ev = |n: u128, actor: Option<Uuid>, hour: u32| GraphEvent {
+            id: Uuid::from_u128(100 + n),
+            event_type: "claim.created".into(),
+            actor_id: actor,
+            created_at: Utc.with_ymd_and_hms(2026, 10, 1, hour, 0, 0).unwrap(),
+        };
+        let list = EventList {
+            events: vec![
+                ev(1, Some(a), 1),
+                ev(2, Some(other), 2),
+                ev(3, None, 3),
+                ev(4, Some(b), 4),
+            ],
+            total: 4,
+        };
+        let tail = events_tail(list, &[a, b], &links);
+        let ids: Vec<Uuid> = tail.rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, [Uuid::from_u128(104), Uuid::from_u128(101)]);
+        assert_eq!((tail.watched, tail.returned, tail.cut), (2, 4, false));
+
+        let many = EventList {
+            events: (0..(TAIL_ROWS as u128 + 5))
+                .map(|n| ev(n, Some(a), 1))
+                .collect(),
+            total: 2000,
+        };
+        let tail = events_tail(many, &[a], &links);
+        assert_eq!(tail.rows.len(), TAIL_ROWS);
+        assert_eq!(tail.watched, TAIL_ROWS + 5);
+        assert!(tail.cut);
     }
 
     #[test]
