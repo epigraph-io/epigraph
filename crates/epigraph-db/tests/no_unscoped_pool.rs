@@ -585,7 +585,9 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `create_hypothesis` reads its frame and writes the frame bind and the prior
 /// on the claim's stamped transaction (`routes/hypothesis.rs` 10 -> 7, read off
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure).
-const HIGH_WATER: usize = 260;
+/// 260 -> 259 when `GET /api/v1/audit/security` moved onto `AppState::read_as`
+/// (`routes/audit.rs` 1 -> 0, key deleted).
+const HIGH_WATER: usize = 259;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -646,7 +648,8 @@ const HIGH_WATER: usize = 260;
 /// 267, the file keeping 5 post-commit side-effect sites, read off
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
 /// (`recorded 10, measured 5`).
-const HIGH_WATER_FILES: usize = 44;
+/// 44 -> 43 when `routes/audit.rs` reached zero and its key was deleted.
+const HIGH_WATER_FILES: usize = 43;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -658,7 +661,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/agent_keys.rs", 6),
     ("routes/agents.rs", 10),
     ("routes/assess.rs", 1),
-    ("routes/audit.rs", 1),
+    // `("routes/audit.rs", 1)` REMOVED: `query_security_events` reads on
+    // `AppState::read_as`, so the `security_events_read` policy sees the
+    // caller's stamped principal. Removed rather than set to `0`, per the rule
+    // in the module doc. `routes/timeline.rs` still calls the same repository
+    // function on the raw pool and keeps its own entry below.
     // 17 before this PR. Shard 4 converted the FOURTEEN read-only handlers onto
     // `AppState::read_as`. The row SURVIVES at 3 rather than being deleted, and
     // the remainder is a class rather than a leftover: `create_frame`,

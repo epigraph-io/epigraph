@@ -62,22 +62,27 @@ pub struct SecurityEventResponse {
 /// Returns a list of security events filtered by the provided query parameters,
 /// ordered by `created_at DESC`.  Requires `audit:read` OAuth2 scope.
 ///
-/// # Per-principal scoping lives in the database, not here
+/// # Per-principal scoping: the viewer's stamped connection
 ///
-/// This read runs on the unscoped `state.db_pool` — entry
-/// `("routes/audit.rs", 1)` on `no_unscoped_pool.rs`'s register, an accepted
-/// debt, and that register is a count ceiling rather than a certification that
-/// the read is scoped. Per-principal narrowing is therefore the
-/// `security_events_read` RLS policy's job alone, and migration 083 recreates
-/// and widens that policy. Note also that `audit:read` is a member of
-/// `canonical_scopes::READ_SCOPES`, not of `ADMIN_ONLY_SCOPES`.
+/// The rows a caller may read are decided by the `security_events_read` RLS
+/// policy (migration 083): its own rows (`agent_id` = the session principal),
+/// or every row, unattributed ones included, for a live instance admin. Both
+/// arms read the session's STAMPED principal, so the read runs on
+/// `AppState::read_as(&viewer)` and is finished with `finish_scoped_read`. On
+/// the unstamped application pool every arm is false and the route answered
+/// `[]` to every caller, the owner of the rows included, with a 200.
 ///
-/// The coupling between this handler and that policy is carried as an open
-/// obligation in `docs/tenancy/progress.json` under `F-PR18a-B1`, assigned to
-/// the conversion-shard series; analysis is held outside this repository.
-/// PR-18a ships no route and deliberately does not convert this site.
+/// The query parameters are filters within that set and never widen it: an
+/// `agent_id` naming another agent narrows a non-admin caller's answer to
+/// nothing. Note also that `audit:read` is a member of
+/// `canonical_scopes::READ_SCOPES`, not of `ADMIN_ONLY_SCOPES`; the scope gates
+/// the route, and the policy gates the rows.
+///
+/// `crates/epigraph-api/tests/audit_security_route_test.rs` pins both arms on
+/// the application role. This discharges the scoped-read half of `F-PR18a-B1`.
 #[cfg(feature = "db")]
 pub async fn query_security_events(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(params): Query<SecurityEventQuery>,
@@ -110,7 +115,19 @@ pub async fn query_security_events(
         limit: Some(params.limit.unwrap_or(100).clamp(1, 10_000)),
     };
 
-    let rows = SecurityEventRepository::query(&state.db_pool, filter).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "query_security_events",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let rows = SecurityEventRepository::query(&mut *read, filter).await?;
+    crate::routes::finish_scoped_read(read, "query_security_events").await?;
 
     let response: Vec<SecurityEventResponse> = rows
         .into_iter()
