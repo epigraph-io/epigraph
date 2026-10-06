@@ -44,10 +44,10 @@ Limitations (scope-deferred — see docs/architecture/noun-claims-and-verb-edges
   counted as `duplicates_skipped_already_superseded`. Overwriting an existing
   `supersedes` would destroy lineage; `mark_duplicate_with_repair` refuses the
   same case.
-- `embedding_3072` is deliberately NOT nulled, because
-  `mark_duplicate_with_repair` does not null it either. If that column should
-  be cleared on retraction it is one fix in the repo layer, not two divergent
-  half-fixes in two languages.
+- `embedding_3072` IS nulled, in the same statement, because
+  `mark_duplicate_act` (behind `mark_duplicate_with_repair`) nulls it too and
+  `chk_deprecated_no_embedding` (migration 144) refuses a retired row that
+  keeps it.
 - Mass-function merge is lossy. Pre-2026-04-08 BBAs all carry
   perspective_id=NULL, so any same-agent BBA on the duplicate collides
   with the canonical's BBA on the unique
