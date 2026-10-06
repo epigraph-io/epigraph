@@ -42,9 +42,11 @@ service token of its own.
      │                   epigraph-explorer  127.0.0.1:8096
      │                     • askama pages + /bff JSON + /static (compiled in)
      │                     • in-memory sessions (access + refresh token)
-     │                     • one global upstream semaphore, per-call timeout
+     │                     • one global upstream semaphore, a per-viewer
+     │                       in-flight cap, per-call timeout
      │                             │  Authorization: Bearer <viewer's token>
-     │                             │  /oauth/token, /oauth/revoke (no bearer)
+     │                             │  /oauth/token, /oauth/revoke,
+     │                             │  /oauth/introspect (no bearer)
      │                             │  EPIGRAPH_API_URL (loopback)
      │                             ▼
      │   /oauth/authorize  epigraph-api  :8080   (systemd: epigraph-api.service)
@@ -173,7 +175,7 @@ code **2**.
 | `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL. In production it is the root of the Explorer's own host, `https://explorer.example.com`, with an **empty path** (see Deploy); a base path such as `http://localhost:8096/explorer` is for local testing. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. Its **first** segment may not be one of the Explorer's own top-level routes (`activity`, `acts`, `agent`, `audit`, `auth`, `backlog`, `bff`, `candidates`, `claim`, `community`, `evidence`, `frame`, `health`, `neighborhood`, `search`, `static`, `theme`): the routes are mounted both under the base path and at the root, so such a base path would make two handlers claim the same URL. The process refuses to start (exit 2) and names the offending segment. |
 | `EPIGRAPH_API_URL` | `http://127.0.0.1:8080` | The `epigraph-api` origin, called server to server. This is the repo-standard variable name. |
 | `EPIGRAPH_EXPLORER_PORT` | `8096` | Port to bind, always on `127.0.0.1`. Must be 1–65535. |
-| `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token` and `/oauth/revoke` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
+| `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token`, `/oauth/revoke` and `/oauth/introspect` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
 | `EPIGRAPH_EXPLORER_CLIENT_ID` | unset | The `client_id` of the pre-registered OAuth client (see Operator setup). If it is unset, sign-in is disabled and a warning is logged at startup. Whitespace is rejected. |
 | `EPIGRAPH_EXPLORER_FRAME_ANCESTORS` | `https://www.notion.so https://*.notion.so https://*.notion.site` | The CSP `frame-ancestors` source list, space-separated. `;`, `,`, control characters and non-ASCII are rejected. Setting it **explicitly empty** means `'none'` (no framing at all). |
 | `EPIGRAPH_EXPLORER_UPSTREAM_CONCURRENCY` | `6` | Size of the global semaphore on upstream calls, clamped to 1–8. The API's database pool has 10 connections, shared with every other client. A clamped value is logged. |
@@ -510,11 +512,18 @@ if the login response's cookie starts `__Host-` and the startup log
   It refreshes a token 60 s before expiry. After an upstream 401 it refreshes
   and retries once, and a second 401 ends the session. Refresh runs one
   at a time per session, and the rotated refresh token is stored every time.
-  A refresh that *fails* ends the session only when upstream refused it
-  (`invalid_grant`, a revoked token, no such session). A refresh that could
-  not reach `/oauth/token` at all — a restart, a timeout, a 5xx — keeps the
-  session and reports the ordinary "API unavailable" failure, so an API
-  restart does not sign every user out.
+  **A refresh that fails ends the session**, whatever the cause. When
+  upstream refused it (`invalid_grant`, a revoked token), the token is dead
+  anyway. When there was no usable answer (a timeout, a 5xx, an API restart,
+  a connection failure), upstream may already have rotated the token before
+  the answer was lost, and presenting it again would be read as reuse and
+  revoke the whole token family. So the Explorer ends the session at once,
+  under the session's refresh lock so no queued request replays the token,
+  and revokes the refresh token it held, best effort. The viewer is sent to
+  sign in again. The cost: a viewer whose refresh falls inside an API
+  restart is signed out rather than shown a degraded page. The token call
+  has its own, longer timeout (`EPIGRAPH_EXPLORER_TOKEN_TIMEOUT_MS`) to make
+  a lost answer rarer.
 - **Absence, not blanking.** A row the viewer may not read is **absent** from
   the API's response — omitted from a list, or a 404 that is byte-identical to
   the one a nonexistent id gets. It is never returned blanked as
@@ -540,9 +549,39 @@ if the login response's cookie starts `__Host-` and the startup log
   grant; see Operator setup §1). The
   code lives 60 s upstream and is redeemed immediately. No token ever appears
   in a URL.
-- **Session cookie** `epx_session` has `HttpOnly`, `Secure`, `SameSite=Lax`,
-  `Path={base path}` and a 30-day `Max-Age`. It holds only a random 256-bit
-  session id. The tokens stay server-side in memory.
+- **Identity strip.** Every signed-in page header shows a short principal
+  id, the scopes the current token **actually** carries, the minutes left
+  until it expires, and a Sign out button. Scope and expiry come from the
+  token response itself. The principal comes from **one**
+  `POST /oauth/introspect` per access token, made when the token is minted or
+  refreshed (never per page), server to server on `EPIGRAPH_API_URL`, with
+  the token in a JSON body and no bearer. If that call fails, the strip says
+  "principal unavailable" until the next token, and the page still renders.
+  A token wider than the scopes requested is shown as neutral information,
+  "wider than requested": the API's refresh currently issues the user's full
+  granted scopes (see Caveats), so expect it on most sessions after the first
+  refresh. The strip **cannot** say which sign-in application a session uses:
+  introspection reports a `client_id` equal to the subject. The strip is
+  display only; no authorization decision reads it.
+- **Session cookie.** At the root of a secure origin (the production
+  topology, see Deploy) the session cookie is `__Host-epx_session` with
+  `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain` and a 30-day
+  `Max-Age`; the login binding is `__Host-epx_login` (`Path=/`, 10 minutes).
+  The prefix makes the browser refuse any version of these cookies set by
+  another host, a sibling under the same parent domain included, which is
+  what closes login CSRF and session swapping by cookie tossing. Under a
+  base path, or with `EPIGRAPH_EXPLORER_INSECURE_COOKIES` on plain http, the
+  prefix is impossible and the plain names `epx_session` (`Path={base path}`)
+  and `epx_login` (`Path={base path}/auth`) are used; with a base path the
+  startup log warns "base path set: `__Host-` cookie prefix unavailable".
+  Each mode reads only its own names. The session cookie holds only a random
+  256-bit session id; the tokens stay server-side in memory.
+- **Duplicated cookies are refused.** A request that carries the session
+  cookie twice is treated as signed out, and the response clears both the
+  first-party and the embed cookie. A callback that carries the login binding
+  twice is refused, and the next `/auth/login` starts over. This is defence in
+  depth behind the `__Host-` prefix: on its own it cannot remove a cookie
+  another host set with `Domain=`.
 - **Logout** is a `POST /auth/logout`, checked against Origin. It revokes the
   refresh token upstream and drops the session. An already-issued access token
   stays valid upstream until it expires (at most 1 hour), because the API's
@@ -557,10 +596,19 @@ if the login response's cookie starts `__Host-` and the startup log
   Referrer-Policy: same-origin
   ```
 
+  A response that sets no cache policy of its own (every page, and
+  `/bff/audit`) also carries `Cache-Control: private, no-store` and
+  `Vary: Cookie`: a page shows what one viewer may read, so neither the
+  browser's history cache nor a shared cache may keep it. Static assets and
+  the `/bff` routes that use ETags keep their own policy.
+
   There are no inline scripts or styles, so no nonces are needed. There is
   deliberately no `X-Frame-Options`, because `frame-ancestors` governs
   framing. askama escapes all output, and upstream text is never marked safe.
   Text is only ever truncated on character boundaries.
+- **Request logs carry the path only.** Each request's tracing span records
+  the path, never the query string, so the OAuth `code` and `state` on
+  `/auth/callback` and search terms stay out of the logs.
 - **Notion embed sign-in.** Inside a Notion page the Explorer is a
   third-party iframe, so it cannot see a first-party `SameSite=Lax` cookie.
   Sign-in there works through a popup:
@@ -569,12 +617,25 @@ if the login response's cookie starts `__Host-` and the startup log
   2. The popup's callback page `postMessage`s a **single-use, 60-second
      handoff code** to `window.opener`, with `targetOrigin` set to the
      Explorer's own origin.
-  3. The iframe `POST`s the code to `/auth/redeem`, which sets the session
-     cookie with `SameSite=None; Secure; Partitioned` (CHIPS). That cookie
-     lives in the iframe's partitioned jar.
+  3. The iframe `POST`s the code to `/auth/redeem`, checked against Origin.
+     Only then is the session created, and the response sets the session
+     cookie with `SameSite=None; Secure; Partitioned` (CHIPS), under the
+     same name as the first-party one. That cookie lives in the iframe's
+     partitioned jar.
 
-  The embedding origins must be listed in `EPIGRAPH_EXPLORER_FRAME_ANCESTORS`,
-  which defaults to Notion's.
+  Until the redeem, the handoff holds the token set. A handoff never redeemed
+  leaves no session: once its 60-second code expires, the next housekeeping
+  pass (every minute) revokes the refresh token it held. Sessions are also
+  dropped 30 days after sign-in, and their refresh tokens are revoked then.
+
+  **Which sites may frame the Explorer** is `EPIGRAPH_EXPLORER_FRAME_ANCESTORS`.
+  Its default, `https://www.notion.so https://*.notion.so https://*.notion.site`,
+  keeps the embed working out of the box, and so it lets **any** published
+  Notion site (`*.notion.site` is open to every Notion customer) frame the
+  Explorer. At deploy, narrow it to the origins your own workspace uses, for
+  example `https://www.notion.so` for the Notion app plus your own
+  `https://<workspace>.notion.site` if you publish there. Set it explicitly
+  empty to forbid framing altogether, which turns the embed off.
 - **Loopback bind.** The process listens on `127.0.0.1` only, so Caddy is the
   only way in.
 
@@ -605,9 +666,11 @@ if the login response's cookie starts `__Host-` and the startup log
   reads. Sessions live **only in process memory**: they are never written to
   disk and never logged (`Debug` output redacts them). Treat core dumps and
   memory access to this process as sensitive.
-- **Sessions are in memory, so a restart signs everyone out.** They are also
-  not shared between processes, so run **one** instance. A second instance
-  behind a load balancer would sign users out at random.
+- **Sessions are in memory, so a restart signs everyone out.** The refresh
+  tokens those sessions held are **not** revoked upstream at a restart: they
+  are simply lost, and stay valid at the API until they expire (30 days).
+  Sessions are also not shared between processes, so run **one** instance. A
+  second instance behind a load balancer would sign users out at random.
 - **Every page needs sign-in.** Every API read needs a viewer, so anonymous
   visitors get the sign-in redirect everywhere except `/health`, `/auth/*`,
   `/static/*` and `/claim/{id}`, which answers 200 with a sign-in prompt so
