@@ -376,10 +376,12 @@ async fn callback(
             );
         }
     };
+    let scope_widened = tokens.scope_widened;
     let session_id =
         state
             .sessions
             .create(tokens.access_token, tokens.refresh_token, tokens.expires_at);
+    state.sessions.set_scope_widened(&session_id, scope_widened);
     tracing::info!(
         popup = pending.popup,
         took_ms = pending.created_at.elapsed().as_millis() as u64,

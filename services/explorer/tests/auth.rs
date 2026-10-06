@@ -1326,3 +1326,61 @@ async fn two_login_binding_cookies_restart_the_login() {
     assert_ne!(binding, started.binding);
     assert_ne!(binding, other);
 }
+
+// ---- scope tripwire -----------------------------------------------------------------
+
+/// A token wider than requested is recorded on the session at mint, and the
+/// record follows each refresh (display only; nothing authorizes on it).
+#[tokio::test]
+async fn a_token_wider_than_requested_is_flagged_on_the_session() {
+    let app = app().await;
+    let started = start_login(&app, "").await;
+    let verifier = pending_verifier(&app, &started);
+    let mut wide = token_json("access-1", "refresh-1");
+    wide["scope"] = json!("claims:read claims:write");
+    token_call(&[
+        ("grant_type", "authorization_code"),
+        ("code", "c0de"),
+        ("code_verifier", &verifier),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(wide))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+
+    let res = finish_login(&app, &started, "&code=c0de").await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let (sid, _) = set_cookie(&res, "epx_session").expect("session cookie");
+    let sid = SessionId::parse(&sid).unwrap();
+    assert!(
+        app.state.sessions.get(&sid).unwrap().scope_widened,
+        "minted wider than requested"
+    );
+
+    // The refreshed token carries exactly the requested scope: cleared.
+    token_call(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", "refresh-1"),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(token_json("access-2", "refresh-2")))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    mount_probe(&app, "access-2", 200, 1).await;
+    app.state.sessions.update_tokens(
+        &sid,
+        "access-1".into(),
+        "refresh-1".into(),
+        Utc::now() - Duration::seconds(1),
+    );
+    let res = app.get_as("/explorer/probe", &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.json()["token_seen"], "access-2");
+    assert!(
+        !app.state.sessions.get(&sid).unwrap().scope_widened,
+        "a refresh to the requested scope clears the flag"
+    );
+}

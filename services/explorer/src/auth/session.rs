@@ -72,6 +72,10 @@ pub struct Session {
     /// Access-token expiry (from `expires_in` at mint/refresh time).
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// The current token carries a scope the Explorer did not request
+    /// ("token wider than requested"). Display only: no authorization
+    /// decision reads it.
+    pub scope_widened: bool,
 }
 
 impl fmt::Debug for Session {
@@ -81,6 +85,7 @@ impl fmt::Debug for Session {
             .field("refresh_token", &"<redacted>")
             .field("expires_at", &self.expires_at)
             .field("created_at", &self.created_at)
+            .field("scope_widened", &self.scope_widened)
             .finish()
     }
 }
@@ -124,6 +129,7 @@ impl SessionStore {
                 refresh_token,
                 expires_at,
                 created_at: Utc::now(),
+                scope_widened: false,
             },
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -149,6 +155,19 @@ impl SessionStore {
                 e.session.access_token = access_token;
                 e.session.refresh_token = refresh_token;
                 e.session.expires_at = expires_at;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record whether the session's current token is wider than requested
+    /// (set at mint and at every refresh). Returns false if the session is
+    /// gone.
+    pub fn set_scope_widened(&self, id: &SessionId, widened: bool) -> bool {
+        match self.write().get_mut(&id.0) {
+            Some(e) => {
+                e.session.scope_widened = widened;
                 true
             }
             None => false,

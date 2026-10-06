@@ -55,6 +55,8 @@ pub async fn refresh_session(
     }
 
     let tokens = oauth::refresh_grant(state, &session.refresh_token).await?;
+    // Upstream may widen (or narrow) the scope on any refresh.
+    let scope_widened = tokens.scope_widened;
     if !state.sessions.update_tokens(
         id,
         tokens.access_token.clone(),
@@ -63,5 +65,6 @@ pub async fn refresh_session(
     ) {
         return Err(RefreshError::NoSession);
     }
+    state.sessions.set_scope_widened(id, scope_widened);
     Ok(tokens.access_token)
 }

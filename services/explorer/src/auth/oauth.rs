@@ -47,12 +47,15 @@ pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: DateTime<Utc>,
+    /// The response's `scope` names a scope [`SCOPE`] did not ask for.
+    pub scope_widened: bool,
 }
 
 impl std::fmt::Debug for TokenSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenSet")
             .field("expires_at", &self.expires_at)
+            .field("scope_widened", &self.scope_widened)
             .finish_non_exhaustive()
     }
 }
@@ -149,6 +152,16 @@ impl TokenError {
             }
         }
     }
+}
+
+/// Whether a token response's `granted` scope names any scope `requested`
+/// did not ("token wider than requested"). Both are space-separated lists;
+/// order and repeats do not matter. An empty `granted` means "as requested"
+/// (RFC 6749 §5.1), so it is never widened. Display only: the session
+/// records it, and nothing authorizes on it.
+pub fn scope_widened(requested: &str, granted: &str) -> bool {
+    let requested: std::collections::HashSet<&str> = requested.split_whitespace().collect();
+    granted.split_whitespace().any(|s| !requested.contains(s))
 }
 
 /// PKCE S256 challenge: `base64url_nopad(sha256(verifier))` (RFC 7636 §4.2).
@@ -397,11 +410,21 @@ fn token_set(body: Vec<u8>) -> Result<TokenSet, TokenError> {
         expires_in = r.expires_in,
         "tokens issued"
     );
+    let scope_widened = r
+        .scope
+        .as_deref()
+        .is_some_and(|granted| scope_widened(SCOPE, granted));
+    if scope_widened {
+        // Neutral info, not a warning: upstream widens the scope on refresh
+        // today, so this is expected until that changes. Never the token.
+        tracing::info!("token wider than requested");
+    }
     let lifetime = r.expires_in.clamp(0, MAX_TOKEN_LIFETIME_SECS);
     Ok(TokenSet {
         access_token: r.access_token,
         refresh_token: r.refresh_token.unwrap_or_default(),
         expires_at: Utc::now() + chrono::Duration::seconds(lifetime),
+        scope_widened,
     })
 }
 
@@ -537,6 +560,44 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(bad)
             );
+        }
+    }
+
+    /// The tripwire flags a token that carries any scope the Explorer did
+    /// not request ("token wider than requested"), and nothing else.
+    #[test]
+    fn scope_widened_flags_only_a_strict_superset() {
+        // Equal, reordered, subset, extra whitespace: not widened.
+        assert!(!scope_widened("claims:read", "claims:read"));
+        assert!(!scope_widened(
+            "claims:read edges:read",
+            "edges:read claims:read"
+        ));
+        assert!(!scope_widened("claims:read edges:read", "claims:read"));
+        assert!(!scope_widened("claims:read", "  claims:read  "));
+        // An omitted or empty scope means "as requested" (RFC 6749 §5.1).
+        assert!(!scope_widened("claims:read", ""));
+        // One extra scope: widened.
+        assert!(scope_widened("claims:read", "claims:read claims:write"));
+        assert!(scope_widened("claims:read", "claims:write claims:read"));
+        // Partial overlap (one requested scope missing, one extra) is still
+        // wider than requested: the token can do something not asked for.
+        assert!(scope_widened(
+            "claims:read edges:read",
+            "claims:read claims:write"
+        ));
+
+        // The token response is where the flag comes from.
+        let wide = token_set(
+            br#"{"access_token":"a","expires_in":60,"scope":"claims:read claims:write"}"#.to_vec(),
+        )
+        .unwrap();
+        assert!(wide.scope_widened);
+        for narrow in [
+            &br#"{"access_token":"a","expires_in":60,"scope":"claims:read"}"#[..],
+            br#"{"access_token":"a","expires_in":60}"#,
+        ] {
+            assert!(!token_set(narrow.to_vec()).unwrap().scope_widened);
         }
     }
 
