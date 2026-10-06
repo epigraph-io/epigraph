@@ -110,9 +110,11 @@ DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo 
 
 **Invariant:** every **non-telemetry** claim with `is_current = true` should
 have an embedding; every claim with `is_current = false` should have
-`embedding = NULL`. Semantic recall (`recall()`, `recall_with_context()`,
-`theme_cluster`, `find_workflow`'s semantic path) reads from `embedding`, so
-violations either hide live claims or surface stale ones.
+`embedding = NULL` AND `embedding_3072 = NULL` (enforced by
+`chk_deprecated_no_embedding`, migrations 052 and 144). Semantic recall
+(`recall()`, `recall_with_context()`, `theme_cluster`, `find_workflow`'s
+semantic path) reads from `embedding`, so violations either hide live claims
+or surface stale ones.
 
 **Telemetry exception:** host-provenance claims (epiclaw-host's
 `ProvenanceRecorder` — container/task lifecycle, agent output, messages) are
@@ -148,14 +150,30 @@ caller embeds with its own configured embedder.
 
 ### Cleanup paths (must null on `is_current = false`)
 
-When superseding or otherwise flipping `is_current` to false, null the
-embedding in the same transaction:
+When superseding or otherwise flipping `is_current` to false, null BOTH
+`embedding` and `embedding_3072` in the SAME statement that sets
+`is_current = false`. `chk_deprecated_no_embedding` (`CHECK (is_current OR
+(embedding IS NULL AND embedding_3072 IS NULL))`) is checked per statement, so a
+separate `UPDATE ... SET embedding = NULL` afterwards is refused with 23514.
+`embedding_3072` matters as much as `embedding`: recall at centroid_dim=3072
+(`ClaimRepository::search_by_embedding_since`) has no `is_current` filter.
 
-- **`ClaimRepository::supersede`** — `crates/epigraph-db/src/repos/claim.rs:1401`
-- **`ClaimRepository::mark_duplicate`** — `crates/epigraph-db/src/repos/claim.rs:2076`
+The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 
-If you add a third path that flips `is_current = false`, add the matching
-`UPDATE claims SET embedding = NULL WHERE id = $1` inside the same tx.
+- **`ClaimRepository::supersede_act_conn`** — `"UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL"`
+- **`ClaimRepository::evolve_step_conn`** — same statement, under `if edge_type == "supersedes"`
+- **`ClaimRepository::deprecate_claim`** — `SET truth_value = 0.05, is_current = false, embedding = NULL,`
+- **`ClaimRepository::consolidate_act_conn`** — `SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL`
+- **`mark_duplicate_act`** (free fn behind `ClaimRepository::mark_duplicate_act_conn` / `mark_duplicate_with_repair_conn`) — `SET supersedes = $1, is_current = false, embedding = NULL,`
+
+Outside the repo layer, `scripts/fuzzy_dedup_claims.py` matches
+`mark_duplicate_act` column for column. On the re-embed side,
+`crates/epigraph-cli/src/reembed.rs::fetch_batch` selects only current claims
+(`ReembedTarget::eligible_predicate`), so `epigraph-cli reembed` never writes a
+3072 vector back onto a retired claim.
+
+If you add another path that flips `is_current = false`, null both columns in
+that same statement and add it to this list.
 
 ### Auditing the gap
 
@@ -201,7 +219,11 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
                             AND j.payload #>> '{EmbeddingGeneration,claim_id}'
                                 = claims.id::text)
        ) AS live_missing,
-       COUNT(*) FILTER (WHERE NOT is_current AND embedding IS NOT NULL) AS stale_present,
+       -- BOTH vector columns, for the same reason as `sealed_with_embedding`
+       -- below: a clause naming only `embedding` reports zero while a retired
+       -- claim still carries an `embedding_3072` recall at 3072 can return.
+       COUNT(*) FILTER (WHERE NOT is_current
+         AND (embedding IS NOT NULL OR embedding_3072 IS NOT NULL)) AS stale_present,
        -- A sealed claim that still carries a plaintext-derived vector is a
        -- CONFIDENTIALITY VIOLATION, not an embedding gap. Must be zero.
        -- BOTH vector columns: `embedding_3072` (migration 027) is a second live
