@@ -264,6 +264,82 @@ async fn audit_pages_with_until_and_marks_a_capped_window() {
     app.upstream.verify().await;
 }
 
+/// J4: a bounded window. The viewer's `until` is the first page's cursor, so
+/// upstream is never asked for events after the window's end, and every later
+/// page's cursor (the previous page's oldest row) stays inside it. The links
+/// that change one filter keep the bound: a drill-down and the failures toggle
+/// on a bounded window must not silently widen it to "until now".
+#[tokio::test]
+async fn audit_window_until_bounds_the_first_page_and_survives_its_links() {
+    let app = spawn().await;
+    let until = ts(0);
+    let rows = |range: std::ops::RangeInclusive<u64>| -> Vec<Value> {
+        range
+            .map(|n| event(n, "auth_attempt", Some(AGENT), Some(n % 3 == 0)))
+            .collect()
+    };
+    // The first page carries the viewer's own bound, not "no cursor".
+    security_page(SINCE)
+        .and(query_param("until", until.as_str()))
+        .and(query_param_is_missing("event_type"))
+        .and(query_param_is_missing("failures_only"))
+        .respond_with(ok(rows(0..=999)))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    page_until(&ts(999))
+        .respond_with(ok(rows(999..=1499)))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+
+    let res = app
+        .get_as(&audit_url(&format!("&until={until}")), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let untils: Vec<Option<String>> = upstream_calls(&app)
+        .await
+        .iter()
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "until")
+                .map(|(_, v)| v.into_owned())
+        })
+        .collect();
+    assert_eq!(
+        untils,
+        vec![Some(until.clone()), Some(ts(999))],
+        "the window's end is the first cursor"
+    );
+    assert!(
+        res.body.contains("data-events-read=\"1500\""),
+        "{}",
+        res.body
+    );
+    assert!(!res.body.contains("data-audit=\"partial\""), "{}", res.body);
+
+    // The bound, as the links carry it.
+    let since_q = "since=2026-10-01T00%3A00%3A00Z";
+    let until_q = "until=2026-10-03T00%3A00%3A00.123456Z";
+    assert!(
+        res.body.contains(&format!(
+            "href=\"{BASE}/audit?{since_q}&#38;{until_q}&#38;failures=1\""
+        )),
+        "the failures toggle keeps `until`: {}",
+        res.body
+    );
+    assert!(
+        res.body.contains(&format!(
+            "href=\"{BASE}/audit?{since_q}&#38;{until_q}&#38;type=auth_attempt\""
+        )),
+        "the drill-down link keeps `until`: {}",
+        res.body
+    );
+    app.upstream.verify().await;
+}
+
 /// J4: a later page the BFF cannot read (here over the 8 MiB body cap) does
 /// not fail the page: the counts read so far render, under a banner saying
 /// the window is incomplete. Never a 500.
@@ -445,6 +521,137 @@ async fn audit_failures_only_asks_upstream_for_failures() {
         res.body.contains("type=auth_attempt&#38;failures=1"),
         "{}",
         res.body
+    );
+    app.upstream.verify().await;
+}
+
+/// J4: a filtered window longer than one page carries its filter on EVERY
+/// page, not only the first. A pager that dropped `failures_only` on page 2
+/// would count successes as failures from there on, and one that dropped
+/// `event_type` would mix other types into a drill-down. Each page's mock
+/// requires the filter together with its own cursor, so a later page asked
+/// without it matches nothing (and the window turns up incomplete).
+#[tokio::test]
+async fn audit_filters_reach_every_page_of_a_long_window() {
+    // Failures only, over two pages.
+    let app = spawn().await;
+    let failures = |range: std::ops::RangeInclusive<u64>| -> Vec<Value> {
+        range
+            .map(|n| event(n, "auth_attempt", Some(AGENT), Some(false)))
+            .collect()
+    };
+    security_page(SINCE)
+        .and(query_param("failures_only", "true"))
+        .and(query_param_is_missing("until"))
+        .and(query_param_is_missing("event_type"))
+        .respond_with(ok(failures(0..=999)))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    security_page(SINCE)
+        .and(query_param("failures_only", "true"))
+        .and(query_param("until", ts(999).as_str()))
+        .and(query_param_is_missing("event_type"))
+        .respond_with(ok(failures(999..=1199)))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&audit_url("&failures=1"), &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(
+        res.body.contains(&type_row("auth_attempt", 1200, 1200)),
+        "both pages asked for failures only: {}",
+        res.body
+    );
+    assert!(!res.body.contains("data-audit=\"partial\""), "{}", res.body);
+    app.upstream.verify().await;
+
+    // A drill-down to one type, over two pages.
+    let app = spawn().await;
+    let typed = |range: std::ops::RangeInclusive<u64>| -> Vec<Value> {
+        range
+            .map(|n| event(n, "token_rotation", Some(AGENT), Some(true)))
+            .collect()
+    };
+    security_page(SINCE)
+        .and(query_param("event_type", "token_rotation"))
+        .and(query_param_is_missing("until"))
+        .and(query_param_is_missing("failures_only"))
+        .respond_with(ok(typed(0..=999)))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    security_page(SINCE)
+        .and(query_param("event_type", "token_rotation"))
+        .and(query_param("until", ts(999).as_str()))
+        .and(query_param_is_missing("failures_only"))
+        .respond_with(ok(typed(999..=1099)))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&audit_url("&type=token_rotation"), &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(
+        res.body.contains(&type_row("token_rotation", 1100, 0)),
+        "both pages asked for the one type: {}",
+        res.body
+    );
+    assert!(!res.body.contains("data-audit=\"partial\""), "{}", res.body);
+    app.upstream.verify().await;
+}
+
+/// J4: the session can end on a LATER page (its token rejected and the
+/// refresh refused). That is a sign-out, exactly as on the first page: a
+/// redirect to sign in with the session cookie cleared, never a 200 showing
+/// the pages read before it as "incomplete" counts.
+#[tokio::test]
+async fn audit_session_ending_on_a_later_page_signs_the_viewer_out() {
+    let app = spawn().await;
+    first_page()
+        .respond_with(ok((0..=999)
+            .map(|n| event(n, "auth_attempt", Some(AGENT), Some(true)))
+            .collect()))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    page_until(&ts(999))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": "Unauthorized", "message": "token expired"
+        })))
+        .mount(&app.upstream)
+        .await;
+    // The refresh after that 401 is refused: the credential is dead.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "invalid_grant", "error_description": "refresh token revoked"
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+
+    let res = app.get_as(&audit_url(""), &sid).await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    assert!(
+        res.location().unwrap_or_default().contains("/auth/login"),
+        "{:?}",
+        res.location()
+    );
+    assert!(
+        res.header_all("set-cookie")
+            .iter()
+            .any(|c| c.starts_with("epx_session=") && c.contains("Max-Age=0")),
+        "the session cookie is cleared: {:?}",
+        res.header_all("set-cookie")
+    );
+    assert!(app.state.sessions.get(&sid).is_none(), "session ended");
+    assert_eq!(
+        upstream_calls(&app).await.len(),
+        2,
+        "the first page was read before the second ended the session"
     );
     app.upstream.verify().await;
 }
