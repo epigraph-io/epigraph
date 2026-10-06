@@ -2008,6 +2008,37 @@ async fn introspect_is_called_once_per_token_not_per_page() {
     );
 }
 
+/// The strip is on every signed-in page header, not only on pages built by
+/// the extractor: error pages (rendered by the error layer) and auth pages
+/// build their own header context.
+#[tokio::test]
+async fn identity_strip_is_on_error_and_auth_pages() {
+    let app = app().await;
+    let sid = app.sign_in("access-1");
+    app.state
+        .sessions
+        .set_token_scope(&sid, Some("claims:read".into()), false);
+    app.state.sessions.set_principal(
+        &sid,
+        "access-1",
+        epigraph_explorer::upstream::Degraded::ok(SUB_1.into()),
+    );
+
+    // An unknown path: the router fallback's 404 page.
+    let res = app.get_as("/explorer/nowhere", &sid).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    let s = strip(&res.body);
+    assert_eq!(strip_part(s, "scope"), "token scope: claims:read", "{s}");
+    assert!(s.contains(&SUB_1[..8]), "{s}");
+
+    // An auth page: a callback whose sign-in state is unknown.
+    let res = app
+        .get_as("/explorer/auth/callback?state=unknown&code=c", &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert!(strip(&res.body).contains(&SUB_1[..8]), "{}", res.body);
+}
+
 // ---- cookie names per deployment mode ---------------------------------------------
 
 /// An app at `base` (a public base URL) with sign-in configured.
