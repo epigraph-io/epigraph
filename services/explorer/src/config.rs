@@ -21,6 +21,7 @@ pub const ENV_UPSTREAM_TIMEOUT_MS: &str = "EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS
 pub const ENV_TOKEN_TIMEOUT_MS: &str = "EPIGRAPH_EXPLORER_TOKEN_TIMEOUT_MS";
 pub const ENV_INSECURE_COOKIES: &str = "EPIGRAPH_EXPLORER_INSECURE_COOKIES";
 pub const ENV_DEV_BEARER: &str = "EPIGRAPH_EXPLORER_DEV_BEARER";
+pub const ENV_KANBAN_URL: &str = "EPIGRAPH_EXPLORER_KANBAN_URL";
 
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_PORT: u16 = 8096;
@@ -99,6 +100,10 @@ pub struct Config {
     pub insecure_cookies: bool,
     /// Dev-only bearer used for every anonymous request (localhost only).
     pub dev_bearer: Option<String>,
+    /// The kanban board's base URL. `None` renders no kanban links on the
+    /// backlog page. Never carries a query or fragment (the board's pairing
+    /// link puts a single-use code in the fragment).
+    pub kanban_url: Option<Url>,
 }
 
 impl std::fmt::Debug for Config {
@@ -117,6 +122,7 @@ impl std::fmt::Debug for Config {
             .field("token_timeout", &self.token_timeout)
             .field("insecure_cookies", &self.insecure_cookies)
             .field("dev_bearer", &self.dev_bearer.as_ref().map(|_| "<set>"))
+            .field("kanban_url", &self.kanban_url.as_ref().map(Url::as_str))
             .finish()
     }
 }
@@ -253,6 +259,23 @@ impl Config {
             ));
         }
 
+        let kanban_url = match get(ENV_KANBAN_URL) {
+            Some(v) => {
+                let url = parse_http_url(ENV_KANBAN_URL, &v)?;
+                // The URL is rendered into every backlog row. The board's
+                // pairing link carries a single-use code in its fragment, so
+                // only a bare base URL is accepted.
+                if url.query().is_some() || url.fragment().is_some() {
+                    return Err(invalid(
+                        ENV_KANBAN_URL,
+                        "must be the board's base URL, without a query string or fragment",
+                    ));
+                }
+                Some(url)
+            }
+            None => None,
+        };
+
         Ok(Config {
             api_url,
             port,
@@ -268,6 +291,7 @@ impl Config {
             token_timeout: Duration::from_millis(token_timeout_ms),
             insecure_cookies,
             dev_bearer,
+            kanban_url,
         })
     }
 
@@ -466,6 +490,41 @@ mod tests {
         assert_eq!(c.base_path, "");
         assert_eq!(c.cookie_path(), "/");
         assert_eq!(c.redirect_uri(), "http://localhost:8096/auth/callback");
+    }
+
+    #[test]
+    fn kanban_url_is_optional_and_must_be_a_bare_http_base_url() {
+        assert_eq!(cfg(&[BASE]).unwrap().kanban_url, None);
+        assert_eq!(
+            cfg(&[BASE, (ENV_KANBAN_URL, "  ")]).unwrap().kanban_url,
+            None,
+            "blank is unset"
+        );
+        let c = cfg(&[BASE, (ENV_KANBAN_URL, "https://kanban.example.com/board/")]).unwrap();
+        assert_eq!(
+            c.kanban_url.as_ref().map(Url::as_str),
+            Some("https://kanban.example.com/board/")
+        );
+        for bad in [
+            "https://kanban.example.com/#pair=0000",
+            "https://kanban.example.com/#",
+            "https://kanban.example.com/?demo=1",
+            "https://user:pw@kanban.example.com/",
+            "ftp://kanban.example.com/",
+            "kanban.example.com",
+        ] {
+            let err = cfg(&[BASE, (ENV_KANBAN_URL, bad)]).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: ENV_KANBAN_URL,
+                        ..
+                    }
+                ),
+                "{bad} gave {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -9,6 +9,9 @@
 //!
 //! An empty list ("no open backlog items") and a failed one ("unavailable")
 //! are different answers and render differently.
+//!
+//! With `EPIGRAPH_EXPLORER_KANBAN_URL` set, each row also links out to the
+//! kanban board, where items are developed; unset, no kanban link renders.
 
 use askama::Template;
 use axum::extract::{Query, State};
@@ -118,6 +121,9 @@ struct BacklogPage {
     all_url: String,
     prev_url: Option<String>,
     next_url: Option<String>,
+    /// The kanban board's base URL when one is configured. The board has no
+    /// per-item address, so every row links to the board itself.
+    kanban_url: Option<String>,
 }
 
 async fn backlog(
@@ -157,6 +163,7 @@ async fn backlog(
         all_url: links.backlog(),
         prev_url,
         next_url,
+        kanban_url: state.config.kanban_url.as_ref().map(|u| u.to_string()),
     })
 }
 

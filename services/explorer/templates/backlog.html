@@ -29,8 +29,11 @@
     {%- for r in data %}
     <li class="result">
       <p class="result__text"><a href="{{ r.claim_url }}">{{ r.text }}</a></p>
-      {%- if let Some(d) = r.created %}
-      <p class="result__meta small muted"><span>{{ d }}</span></p>
+      {%- if r.created.is_some() || kanban_url.is_some() %}
+      <p class="result__meta small muted">
+        {%- if let Some(d) = r.created %}<span>{{ d }}</span>{% endif %}
+        {%- if let Some(k) = kanban_url %} <a href="{{ k }}" target="_blank" rel="noreferrer noopener">Open in kanban</a>{% endif %}
+      </p>
       {%- endif %}
       {%- if !r.labels.is_empty() %}
       <ul class="labels result__labels" aria-label="Labels">

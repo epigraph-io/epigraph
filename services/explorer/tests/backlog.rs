@@ -12,7 +12,8 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{spawn, BASE};
+use axum::Router;
+use common::{spawn, spawn_with, BASE};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockBuilder, ResponseTemplate};
@@ -279,4 +280,64 @@ async fn backlog_requires_sign_in_and_makes_no_anonymous_call() {
     assert_eq!(res.status, StatusCode::SEE_OTHER);
     let calls = app.upstream.received_requests().await.unwrap_or_default();
     assert!(calls.is_empty(), "called upstream: {calls:?}");
+}
+
+/// J3: each row has an "open in kanban" link only when a kanban base URL is
+/// configured (`EPIGRAPH_EXPLORER_KANBAN_URL`), and no kanban link at all
+/// otherwise. The board has no per-item address, so the link opens the
+/// board; it opens in a new tab and sends no referrer (the board is another
+/// origin).
+#[tokio::test]
+async fn kanban_link_only_when_configured() {
+    const KANBAN: &str = "https://kanban.example.com/";
+    let link = format!(
+        "href=\"{KANBAN}\" target=\"_blank\" rel=\"noreferrer noopener\">Open in kanban</a>"
+    );
+    for configured in [false, true] {
+        let env: &[(&str, &str)] = if configured {
+            &[("EPIGRAPH_EXPLORER_KANBAN_URL", KANBAN)]
+        } else {
+            &[]
+        };
+        let app = spawn_with(env, Router::new()).await;
+        by_labels("backlog", "0")
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                item(
+                    NEWER,
+                    "Newer open item",
+                    "2026-03-04T05:06:07+00:00",
+                    &["backlog"]
+                ),
+                item(
+                    OLDER,
+                    "Older open item",
+                    "2026-01-02T03:04:05+00:00",
+                    &["backlog"]
+                ),
+            ])))
+            .expect(1)
+            .mount(&app.upstream)
+            .await;
+        let sid = app.sign_in("tok");
+
+        let res = app.get_as(&format!("{BASE}/backlog"), &sid).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert!(
+            res.body.contains("Newer open item") && res.body.contains("Older open item"),
+            "{}",
+            res.body
+        );
+        if configured {
+            assert_eq!(
+                res.body.matches(&link).count(),
+                2,
+                "one kanban link per row: {}",
+                res.body
+            );
+        } else {
+            assert!(!res.body.contains("Open in kanban"), "{}", res.body);
+            assert!(!res.body.contains("kanban.example.com"));
+        }
+        app.upstream.verify().await;
+    }
 }
