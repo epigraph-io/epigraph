@@ -378,3 +378,51 @@
 .audit-outcome--failure {
   font-weight: 600;
 }
+
+/* Match candidates: the status switcher and the side-by-side pairs. */
+.candidates-status__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-4);
+}
+
+.candidates-status__list [aria-current="page"] {
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.candidates__list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-4);
+}
+
+.candidate {
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.candidate__pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: var(--space-3);
+}
+
+.candidate__side {
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-wrap: anywhere;
+}
+
+.candidate__side p {
+  margin: 0;
+}
+
+.candidate__rationale {
+  overflow-wrap: anywhere;
+}

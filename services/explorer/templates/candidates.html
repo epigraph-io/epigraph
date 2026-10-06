@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}{% if let Some(s) = status %}{{ s }} · {% endif %}Match candidates · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}<link rel="stylesheet" href="{{ ctx.static_url("core.css") }}">{% endblock %}
+
+{% block content %}
+<h1>Match candidates</h1>
+<p class="muted">Pairs of claims from different sources that the matcher scored as possibly the same finding. Only pairs where you may read both claims are listed, highest score first. This page is read-only; candidates are decided through MCP or the CLI.</p>
+
+<nav class="candidates-status" aria-label="Candidate status">
+  <ul class="candidates-status__list">
+    {%- for s in switcher %}
+    <li>{% if s.current %}<a href="{{ s.url }}" aria-current="page">{{ s.name }}</a>{% else %}<a href="{{ s.url }}">{{ s.name }}</a>{% endif %}</li>
+    {%- endfor %}
+  </ul>
+</nav>
+
+{%- if let Some(p) = problem %}
+<p class="notice notice--warn" data-candidates="bad-status">{{ p }}</p>
+{%- endif %}
+
+{%- if let Some(list) = list %}
+{%- if let Some(st) = status %}
+<section class="section candidates" aria-labelledby="candidates-title" data-candidates-status="{{ st }}">
+  <h2 id="candidates-title" class="section__title">{{ st }} candidates</h2>
+  {%- match list %}
+  {%- when Degraded::Available { data } %}
+  {%- if data.rows.is_empty() %}
+  <p class="muted" data-candidates="empty">No {{ st }} candidates that you can read.</p>
+  {%- else %}
+  {%- if data.capped %}
+  <p class="notice notice--warn" data-candidates="capped">Showing the top {{ limit }} by score; there may be more.</p>
+  {%- endif %}
+  <ol class="candidates__list">
+    {%- for c in data.rows %}
+    <li class="candidate" data-candidate="{{ c.id }}">
+      <div class="candidate__pair">
+        <div class="candidate__side">
+          <p class="small muted">Claim A</p>
+          <p class="candidate__text"><a href="{{ c.a.url }}">{{ c.a.text }}</a></p>
+        </div>
+        <div class="candidate__side">
+          <p class="small muted">Claim B</p>
+          <p class="candidate__text"><a href="{{ c.b.url }}">{{ c.b.text }}</a></p>
+        </div>
+      </div>
+      <p class="small muted candidate__meta">
+        <span>score {{ c.score }}</span>
+        {%- if let Some(v) = c.verdict %} · <span>verifier: {{ v }}</span>{% endif %}
+        · <span>{{ c.created }}</span>
+      </p>
+      {%- if let Some(r) = c.rationale %}
+      <p class="small candidate__rationale">{{ r }}</p>
+      {%- endif %}
+    </li>
+    {%- endfor %}
+  </ol>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable" data-candidates="unavailable">Match candidates are unavailable. {{ reason }}</p>
+  {%- endmatch %}
+</section>
+{%- endif %}
+{%- endif %}
+{% endblock %}

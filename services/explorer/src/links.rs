@@ -221,6 +221,14 @@ impl Links {
         self.path("/candidates")
     }
 
+    /// `/candidates?status=<status>`, the status encoded.
+    pub fn candidates_page(&self, status: &str) -> String {
+        let qs = form_urlencoded::Serializer::new(String::new())
+            .append_pair("status", status)
+            .finish();
+        format!("{}?{qs}", self.candidates())
+    }
+
     /// `/acts`: the viewer's own admin acts.
     pub fn acts(&self) -> String {
         self.path("/acts")
@@ -426,6 +434,21 @@ mod tests {
         assert_eq!(l.backlog_page(None, Some(3)), "/explorer/backlog?page=3");
         let root = Links::new("https://explorer.example.com", "");
         assert_eq!(root.backlog_page(Some("ui"), None), "/backlog?label=ui");
+    }
+
+    #[test]
+    fn candidates_page_encodes_its_status() {
+        let l = Links::new("https://explorer.example.com", "/explorer");
+        assert_eq!(
+            l.candidates_page("pending"),
+            "/explorer/candidates?status=pending"
+        );
+        assert_eq!(
+            l.candidates_page("a b&c"),
+            "/explorer/candidates?status=a+b%26c"
+        );
+        let root = Links::new("https://explorer.example.com", "");
+        assert_eq!(root.candidates_page("stale"), "/candidates?status=stale");
     }
 
     #[test]
