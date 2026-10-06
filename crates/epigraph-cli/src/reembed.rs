@@ -14,6 +14,15 @@
 //! for the vector column an unseal does not restore, so it is run deliberately
 //! over corpora that contain sealed rows; the exclusion is what makes that
 //! safe. See [`ReembedTarget::sealed_predicate`].
+//!
+//! RETIRED CLAIMS ARE NEVER SELECTED. A retirement (`is_current = false`)
+//! nulls both vector columns, which is exactly the `embedding_3072 IS NULL`
+//! shape this tool selects on; re-populating it would make the claim
+//! retrievable again through recall at `centroid_dim = 3072`
+//! (`ClaimRepository::search_by_embedding_since` has no `is_current` filter),
+//! and `chk_deprecated_no_embedding` (migration 144) refuses the write, so one
+//! retired row would abort the whole run. See
+//! [`ReembedTarget::eligible_predicate`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,6 +63,24 @@ impl ReembedTarget {
             Self::Claims => "content",
             // evidence.raw_content is the text column (see migration 001).
             Self::Evidence => "raw_content",
+        }
+    }
+
+    /// The predicate a row of this table must satisfy to be re-embedded at all.
+    ///
+    /// For `claims` this is `is_current`: a retired claim must hold no vector
+    /// in either ANN column (`chk_deprecated_no_embedding`, widened to
+    /// `embedding_3072` by migration 144), so selecting one would both
+    /// resurrect it in recall at 3072 and raise 23514 mid-run. `is_current` is
+    /// `NOT NULL` (migration 001), so the bare column is the CHECK's admitted
+    /// set exactly; no `COALESCE` is needed.
+    ///
+    /// `evidence` has no `is_current` column and no retirement state of its
+    /// own, so every evidence row stays eligible.
+    fn eligible_predicate(self) -> &'static str {
+        match self {
+            Self::Claims => "is_current",
+            Self::Evidence => "true",
         }
     }
 
@@ -165,7 +192,8 @@ pub async fn run(pool: &PgPool, config: ReembedConfig) -> Result<ReembedSummary,
     })
 }
 
-/// Fetch a batch of rows whose `embedding_3072` is NULL, ordered by id.
+/// Fetch a batch of eligible, unsealed rows whose `embedding_3072` is NULL,
+/// ordered by id.
 async fn fetch_batch(
     pool: &PgPool,
     target: ReembedTarget,
@@ -175,11 +203,13 @@ async fn fetch_batch(
     let table = target.table();
     let content_col = target.content_column();
     let sealed = target.sealed_predicate();
+    let eligible = target.eligible_predicate();
 
     let sql = format!(
         "SELECT id, {content_col} AS content \
          FROM {table} \
          WHERE embedding_3072 IS NULL \
+           AND {eligible} \
            AND ($1::uuid IS NULL OR id > $1) \
            AND {content_col} IS NOT NULL \
            AND length({content_col}) > 0 \
