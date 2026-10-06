@@ -577,6 +577,36 @@ async fn act_link_with_a_foreign_path_is_not_rendered() {
     assert!(!res.body.contains("/elsewhere"), "{}", res.body);
 }
 
+/// The page sends `frame-ancestors 'none'` and `no-referrer`, on both mounts
+/// and on its sign-in redirect; other pages keep the configured framing.
+#[tokio::test]
+async fn acts_page_is_not_framable() {
+    let app = with_api_origin().await;
+    probe_answers(&app, 200, 1).await;
+    listing()
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"acts": []})))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    for uri in [format!("{BASE}/acts"), "/acts".to_string()] {
+        let res = app.get_as(&uri, &sid).await;
+        assert_eq!(res.status, 200, "{uri}: {}", res.body);
+        let csp = res.header("content-security-policy").unwrap_or_default();
+        assert!(csp.ends_with("frame-ancestors 'none'"), "{uri}: {csp}");
+        assert_eq!(res.header("referrer-policy"), Some("no-referrer"), "{uri}");
+    }
+    let anon = app.get(&format!("{BASE}/acts")).await;
+    assert_eq!(anon.status, 303);
+    let csp = anon.header("content-security-policy").unwrap_or_default();
+    assert!(csp.ends_with("frame-ancestors 'none'"), "redirect: {csp}");
+
+    let other = app.get_as(&header_page(), &sid).await;
+    let csp = other.header("content-security-policy").unwrap_or_default();
+    assert!(!csp.contains("frame-ancestors 'none'"), "{csp}");
+    assert!(csp.contains("frame-ancestors https://"), "{csp}");
+    assert_eq!(other.header("referrer-policy"), Some("same-origin"));
+}
+
 /// Visited directly against an API without the route: the page says so,
 /// with 200, never 501 or 500, and shows no nav item.
 #[tokio::test]

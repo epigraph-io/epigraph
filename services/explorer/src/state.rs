@@ -28,6 +28,9 @@ pub struct AppState {
     pub cache: ResponseCache,
     /// Precomputed `Content-Security-Policy` value.
     pub csp: HeaderValue,
+    /// The same policy with `frame-ancestors 'none'`, for
+    /// [`security::UNFRAMABLE_ROUTES`].
+    pub csp_unframable: HeaderValue,
     /// Which optional API routes this deployment has (admin acts), as
     /// probed with a viewer's own token and remembered per process.
     pub capabilities: Arc<Capabilities>,
@@ -37,6 +40,7 @@ impl AppState {
     pub fn new(config: Config) -> anyhow::Result<Self> {
         let upstream = Upstream::new(&config)?;
         let csp = security::content_security_policy(&config.frame_ancestors)?;
+        let csp_unframable = security::content_security_policy("'none'")?;
         Ok(Self {
             links: Links::new(&config.public_origin, &config.base_path),
             config: Arc::new(config),
@@ -45,6 +49,7 @@ impl AppState {
             auth_flow: FlowState::new(),
             cache: ResponseCache::new(),
             csp,
+            csp_unframable,
             capabilities: Arc::new(Capabilities::new(CAPABILITY_TTL)),
         })
     }

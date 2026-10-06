@@ -5,6 +5,11 @@
 //! There is deliberately no `X-Frame-Options`: framing is governed by CSP
 //! `frame-ancestors` alone (the Notion embed needs it).
 //!
+//! Routes in [`UNFRAMABLE_ROUTES`] (pages next to an action the viewer takes
+//! elsewhere, such as confirming an admin act with a passkey) get
+//! `frame-ancestors 'none'` and `Referrer-Policy: no-referrer` instead, on
+//! every response for that path, error and redirect responses included.
+//!
 //! A response that sets no cache policy of its own gets
 //! [`DEFAULT_CACHE_CONTROL`] plus `Vary: Cookie`: pages render what one
 //! signed-in viewer may read, so no browser history cache or shared cache
@@ -21,6 +26,11 @@ use crate::state::AppState;
 /// Cache policy for every response that did not choose one.
 pub const DEFAULT_CACHE_CONTROL: &str = "private, no-store";
 
+/// Route paths (base path stripped) that no site may frame and that send
+/// no referrer: `/acts` links out to the API's own confirmation page for an
+/// admin act, so it must not be clickjacked or name itself to that page.
+pub const UNFRAMABLE_ROUTES: &[&str] = &["/acts"];
+
 /// The CSP with `frame-ancestors` from config (already validated to be a
 /// plain source list).
 pub fn content_security_policy(
@@ -33,17 +43,20 @@ pub fn content_security_policy(
 }
 
 pub async fn security_headers(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let unframable = UNFRAMABLE_ROUTES.contains(&state.links.strip_base(req.uri().path()));
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
-    h.insert(header::CONTENT_SECURITY_POLICY, state.csp.clone());
+    let (csp, referrer) = if unframable {
+        (state.csp_unframable.clone(), "no-referrer")
+    } else {
+        (state.csp.clone(), "same-origin")
+    };
+    h.insert(header::CONTENT_SECURITY_POLICY, csp);
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    h.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("same-origin"),
-    );
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static(referrer));
     if !h.contains_key(header::CACHE_CONTROL) {
         h.insert(
             header::CACHE_CONTROL,
