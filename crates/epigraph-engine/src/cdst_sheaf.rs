@@ -608,8 +608,8 @@ mod tests {
             compute_cdst_edge_inconsistency(src_id, tgt_id, source, target, "supports", &sci());
 
         assert!(
-            obs.interval_inconsistency > 0.5,
-            "Expected high inconsistency for stale support, got {}",
+            (obs.interval_inconsistency - 0.54).abs() < 1e-9,
+            "stale support shortfall should be the bel shortfall 0.64-0.1=0.54, got {}",
             obs.interval_inconsistency
         );
         assert!(
@@ -678,6 +678,13 @@ mod tests {
             "over-support must also be sheaf-consistent; interval_inconsistency={} (was {symmetric_before} symmetric)",
             obs.interval_inconsistency
         );
+        // Clamped to exactly 0, never negative: a signed shortfall would
+        // SUBTRACT mass from H¹ for every over-supported hub.
+        assert!(
+            obs.interval_inconsistency.abs() < 1e-9,
+            "over-support shortfall must be exactly 0 (not negative), got {}",
+            obs.interval_inconsistency
+        );
         // Twin fields stay equal for supports edges, as origin/main has them.
         assert!(
             (obs.interval_inconsistency - obs.conflict_component).abs() < 1e-12,
@@ -725,7 +732,7 @@ mod tests {
             coh.obstructions.len()
         );
         assert!(
-            coh.h1 < 1e-9,
+            coh.h1.abs() < 1e-9,
             "over-support must contribute 0 to H¹, got h1={}",
             coh.h1
         );
@@ -807,12 +814,12 @@ mod tests {
         let obs = compute_cdst_edge_inconsistency(s, t, source, target, "supports", &sci());
 
         assert!(
-            obs.interval_inconsistency < 1e-9,
+            obs.interval_inconsistency.abs() < 1e-9,
             "target above the bel floor must not be flagged by a pl=1 supporter, got {}",
             obs.interval_inconsistency
         );
         assert!(
-            obs.conflict_component < 1e-9,
+            obs.conflict_component.abs() < 1e-9,
             "conflict_component must also be 0, got {}",
             obs.conflict_component
         );
@@ -839,8 +846,11 @@ mod tests {
             "weaker edge demanded more: elaborates={ela} > supports={sup}"
         );
         // Target bel 0.50 clears both bel floors (0.40, 0.30): no shortfall.
-        assert!(sup < 1e-9, "supports shortfall must be 0, got {sup}");
-        assert!(ela < 1e-9, "elaborates shortfall must be 0, got {ela}");
+        assert!(sup.abs() < 1e-9, "supports shortfall must be 0, got {sup}");
+        assert!(
+            ela.abs() < 1e-9,
+            "elaborates shortfall must be 0, got {ela}"
+        );
     }
 
     #[test]
@@ -873,6 +883,10 @@ mod tests {
             })
             .collect();
 
+        assert!(
+            shortfalls.iter().all(|&x| x >= 0.0),
+            "a shortfall is never negative (all: {shortfalls:?})"
+        );
         for (w, f) in shortfalls.windows(2).zip(factors.windows(2)) {
             assert!(
                 w[1] <= w[0] + 1e-12,
@@ -892,7 +906,7 @@ mod tests {
         // Near-vacuous edge imposes (almost) no constraint.
         let last = *shortfalls.last().unwrap();
         assert!(
-            last < 1e-9,
+            last.abs() < 1e-9,
             "f=0.01 (near-vacuous) must impose no shortfall, got {last} (all: {shortfalls:?})"
         );
     }
