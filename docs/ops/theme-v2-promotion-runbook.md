@@ -74,7 +74,7 @@ Claude Code's auto-mode classifier refuses both `systemd-run` and the live prod 
 which is the same gate recorded in claim `aabbb75c`. Run this yourself:
 
 ```bash
-DATABASE_URL="$(sudo sed -n 's/^DATABASE_URL=//p' /etc/epiclaw/epigraph-api.env)" \
+MAINTENANCE_DATABASE_URL="$(sudo sed -n 's/^MAINTENANCE_DATABASE_URL=//p' /etc/epiclaw/epigraph-maintenance.env)" \
 systemd-run --user --scope -p MemoryMax=1900M \
   --working-directory=/home/jeremy/epigraph-wt-themev2 \
   python3 scripts/theme_pipeline.py grow --batch-size 2000 --target-k 72 --max-size 8000
@@ -95,6 +95,50 @@ systemd-run --user --scope -p MemoryMax=1900M \
   cluster is oversized -> `project_to_themes.project_run` -> `label_themes_llm.py --relabel-all`.
   The 2026-08-19 run settled at k=209 from a target of 72; that is expected — `target_k`
   is a floor, not a ceiling.
+
+**Run every theme script as the maintenance role.** `claims` and `claim_clusters`
+have FORCED row-level security. Only a member of `epigraph_maintenance` (the
+`epigraph_maint_login` DSN, `MAINTENANCE_DATABASE_URL` in
+`/etc/epiclaw/epigraph-maintenance.env`) passes `epigraph_bypass()`. The application
+DSN in `epigraph-api.env` that earlier versions of this file used now sees, and
+updates, only a subset: the projection and the assign "succeed" on part of the
+corpus and exit 0. `theme_lib.connect` and `maintenance_dsn()` already prefer
+`MAINTENANCE_DATABASE_URL` when it is set. The API's theme routes
+(`/api/v1/themes/assign-unthemed`, `/recompute-centroids`) run on the unstamped
+application pool and have the same limit, and so does `maintain_themes.py`, which
+calls them.
+
+Pass the DSN in the environment, never on the command line: argv is visible to
+every user through `ps`.
+
+## Restore after a `claim_themes` wipe (no re-clustering)
+
+A wipe of `claim_themes` (a nightly or probe `theme_cluster` call with
+`wipe_first=true`) clears only Model A. The run's `claim_clusters` memberships and
+its `cluster_labels` names survive, so the themes come back without UMAP:
+
+1. **Check the run is intact:** `SELECT count(DISTINCT cluster_id), count(*) FROM
+   claim_clusters WHERE cluster_run_id = '<run>'`. Make sure its labels are names,
+   not `cluster-NN` fallbacks.
+2. **Re-project it**, as the maintenance role:
+   `python3 scripts/project_to_themes.py --run-id <run>`. One transaction; the
+   names come from `cluster_labels`.
+3. **Assign the claims embedded since the run** to their nearest theme. Use the
+   statement in `ClaimThemeRepository::assign_unthemed_batch`, in batches, as the
+   maintenance role. Then recompute each theme's centroid and `claim_count`
+   from its members.
+4. **Re-run the verify block below.** New claims can push a theme over
+   `--max-size`. Split it in place with
+   `python3 scripts/split_theme.py --label "<label>" --dry-run`, then without
+   `--dry-run`.
+5. **Name the placeholders** with a default `python3 scripts/label_themes_llm.py`.
+   It relabels `auto-NN`, `cluster-NN` and `cluster-split-...` labels and keeps
+   every real name. `--relabel-all` renames everything.
+
+`project_run` mints new theme UUIDs on every projection. Anything that must survive
+a re-projection should key on `properties` (`cluster_run_id`, `cluster_id`, and
+`split_part` for split parts), not on `claim_themes.id`. A later re-projection of
+the same run also undoes steps 3–5, because they do not write `claim_clusters`.
 
 ## Why the first run failed (do not re-derive this)
 
