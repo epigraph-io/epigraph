@@ -100,7 +100,8 @@ pub async fn authorize_endpoint(
         });
     }
 
-    // ── Client + exact redirect_uri validation (DB) ──────────────────────────
+    // ── Client + redirect_uri validation (DB): exact, except a loopback redirect's
+    //    port, which RFC 8252 §7.3 lets a native client choose per request ──────
     let client = OAuthClientRepository::get_by_client_id(&state.db_pool, &q.client_id)
         .await
         .map_err(|e| ApiError::InternalError {
@@ -112,7 +113,10 @@ pub async fn authorize_endpoint(
     let ok_redirect = client
         .redirect_uris
         .as_deref()
-        .map(|uris| uris.iter().any(|u| u == &q.redirect_uri))
+        .map(|uris| {
+            uris.iter()
+                .any(|u| crate::oauth::redirect::matches_registered(u, &q.redirect_uri))
+        })
         .unwrap_or(false);
     if !ok_redirect {
         return Err(ApiError::BadRequest {
