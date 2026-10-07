@@ -143,26 +143,39 @@ async fn history_terminates_on_a_mark_duplicate_cycle() {
     unlink(&pool, &[x, y]).await;
 }
 
+/// The self-supersedes arm of this file, inverted.
+///
+/// This test used to build `supersedes = id` and assert the walk survived it.
+/// Migration 123 (`custodian_role.sql:1058-1063`) made that state
+/// unconstructible: the claims-path trigger raises `OPL02` on any INSERT or
+/// any UPDATE that sets `supersedes` to the row's own id. So the walk no
+/// longer needs to survive a self-loop — there cannot be one — and the honest
+/// assertion is that the database refuses to make one. The multi-claim cycle
+/// `mark_duplicate` can still build is covered above, and that arm is what now
+/// exercises the depth cap.
 #[tokio::test(flavor = "multi_thread")]
-async fn history_terminates_on_a_self_supersedes_loop() {
-    let (pool, addr, _shutdown, client) = pool_and_app().await;
+async fn a_self_supersedes_loop_cannot_be_created() {
+    let (pool, _addr, _shutdown, _client) = pool_and_app().await;
     let z = common::seed_claim(&pool, "history self-loop Z").await;
-    sqlx::query("UPDATE claims SET supersedes = id WHERE id = $1")
+
+    let err = sqlx::query("UPDATE claims SET supersedes = id WHERE id = $1")
         .bind(z)
         .execute(&pool)
         .await
-        .unwrap();
+        .expect_err("the claims-path trigger must refuse a self-supersedes write");
 
-    let body = history(&client, addr, z).await;
-    let ids = version_ids(&body);
-    assert!(
-        !ids.is_empty() && ids.len() <= 101,
-        "a self-loop must terminate inside the depth cap, got {ids:?}"
+    let db = err.as_database_error().expect("a database error");
+    assert_eq!(
+        db.code().as_deref(),
+        Some("OPL02"),
+        "expected the operator-binding trigger's OPL02, got {err}"
     );
     assert!(
-        ids.iter().all(|id| *id == z),
-        "a self-loop must not reach any other claim, got {ids:?}"
+        db.message().contains("never supersedes"),
+        "expected the self-supersedes message, got {}",
+        db.message()
     );
+
     unlink(&pool, &[z]).await;
 }
 

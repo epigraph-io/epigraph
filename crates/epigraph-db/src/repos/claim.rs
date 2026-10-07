@@ -1664,12 +1664,42 @@ impl ClaimRepository {
     /// endpoint, because the self-audit was scoped to files the PR touched and
     /// `search.rs` was not one of them.
     ///
+    /// # The scan is served by the HNSW index
+    ///
+    /// The statement orders by the raw cosine distance, `c.embedding <=> q.vec`,
+    /// because that is the only form pgvector's HNSW index can serve. It used to
+    /// order by the derived `similarity` column (`1 - distance`), which the
+    /// index cannot match, so every call computed the distance to every
+    /// embedded claim and sorted them all: on prod (~348k embedded claims,
+    /// 1536-d) that ran past 30 s and timed out every Explorer search, against
+    /// 92 ms on the index. `1 - d` is strictly decreasing in `d`, so ascending
+    /// distance is the same order as descending similarity.
+    ///
+    /// An HNSW index scan yields at most `hnsw.ef_search` rows (pgvector
+    /// default 40), and the scope predicates (`claim_type`, the dates,
+    /// `agent_id`, the visibility splice, `min_similarity`) are applied AFTER
+    /// it. So the query runs in a short transaction that first sets, `is_local`:
+    ///
+    ///  - `hnsw.iterative_scan = strict_order`: keep scanning past `ef_search`
+    ///    until `LIMIT $7` matching rows are found, in exact distance order.
+    ///  - `hnsw.ef_search = clamp(limit, 40, 1000)`: the first batch already
+    ///    covers an unscoped `limit`.
+    ///
+    /// The transaction is ROLLED BACK, not committed: on a caller's own
+    /// transaction `begin()` opens a savepoint, and releasing it would carry the
+    /// `SET LOCAL` values into the caller's later HNSW reads. This is the same
+    /// arrangement as the hybrid recall dense leg. `hnsw.max_scan_tuples` stays
+    /// at its default (20,000), so a scope rarer than about `limit / 20,000` of
+    /// the embedded claims can still return fewer than `limit` rows.
+    ///
+    /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`); prod runs 0.8.2.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip(executor, viewer, embedding))]
-    pub async fn semantic_search_flat<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    pub async fn semantic_search_flat<'a, A>(
+        executor: A,
         viewer: &crate::visibility::Viewer,
         embedding: &str,
         min_similarity: f64,
@@ -1678,7 +1708,10 @@ impl ClaimRepository {
         created_before: Option<chrono::DateTime<chrono::Utc>>,
         agent_id: Option<Uuid>,
         limit: i64,
-    ) -> Result<Vec<SemanticFlatHit>, DbError> {
+    ) -> Result<Vec<SemanticFlatHit>, DbError>
+    where
+        A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
         let sql = viewer.splice(
             r#"
             WITH query_vec AS (
@@ -1703,7 +1736,7 @@ impl ClaimRepository {
               AND ($5::timestamptz IS NULL OR c.created_at <= $5)
               AND ($6::uuid IS NULL OR c.agent_id = $6)
               /* {VISIBILITY:c} */
-            ORDER BY similarity DESC
+            ORDER BY c.embedding <=> q.vec
             LIMIT $7
             "#,
             8,
@@ -1719,7 +1752,20 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(executor).await?)
+
+        // See "The scan is served by the HNSW index" above.
+        let mut tx = executor.begin().await?;
+        sqlx::query(
+            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                    set_config('hnsw.ef_search', $1, true)",
+        )
+        .bind(limit.clamp(40, 1000).to_string())
+        .execute(&mut *tx)
+        .await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        tx.rollback().await?;
+
+        Ok(rows)
     }
 
     /// `claims.content` and `claims.properties` for one id, viewer-filtered.
