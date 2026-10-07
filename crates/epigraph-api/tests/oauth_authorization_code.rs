@@ -1250,3 +1250,101 @@ async fn authorize_relaxes_only_the_loopback_port(pool: PgPool) {
         "a claude.ai redirect with a different port must still be rejected, got {status}"
     );
 }
+
+/// The consent page `GET /oauth/callback` renders for a pending session whose
+/// request carried `redirect_uri` (Google's token endpoint mocked as in
+/// `the_consent_page_cannot_be_framed_or_cached`).
+async fn consent_page_for(pool: &PgPool, redirect_uri: &str) -> (String, String) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let fx = ProviderFixture::new().await;
+    let now = Utc::now().timestamp();
+    let unique = Uuid::new_v4().simple().to_string();
+    let email = format!("consent-{unique}@example.test");
+    let id_token = fx.sign(&serde_json::json!({
+        "iss": "https://accounts.google.com",
+        "aud": "test-google-audience",
+        "sub": format!("loopback-{unique}"),
+        "email": email,
+        "email_verified": true,
+        "iat": now,
+        "exp": now + 600,
+    }));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id_token": id_token })),
+        )
+        .mount(&fx.mock_server)
+        .await;
+    let mut cfg = google_cfg(&fx.jwks_url);
+    cfg.token_endpoint = Some(format!("{}/token", fx.mock_server.uri()));
+    let provider = Arc::new(
+        GoogleProvider::from_config(&cfg, JwksCache::new()).expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let app =
+        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+
+    let google_state = format!("gstate_{}", Uuid::new_v4().simple());
+    AuthorizeSessionRepository::create(
+        pool,
+        &google_state,
+        "loopback-requesting-app",
+        redirect_uri,
+        &pkce_challenge(VERIFIER),
+        Some("claims:read"),
+        Some("client-state"),
+        "google-verifier",
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .expect("seed pending authorize session");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/oauth/callback?code=google-code&state={google_state}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the consent page renders");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (String::from_utf8_lossy(&body).into_owned(), email)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_names_a_local_application_for_a_loopback_redirect(pool: PgPool) {
+    // The page must not tell a Codex (loopback) user that CLAUDE is asking: the
+    // label follows the redirect's class, which the server validated, never the
+    // self-declared DCR client_name.
+    let (body, email) = consent_page_for(&pool, CODEX_CALLBACK).await;
+    assert!(
+        !body.contains("Claude"),
+        "a loopback sign-in must not be presented as Claude: {body}"
+    );
+    assert!(
+        body.contains("Authorize an application on this computer")
+            && body.contains("http://127.0.0.1:53682"),
+        "the page names a local application and the origin that receives access: {body}"
+    );
+    assert!(
+        body.contains("name=\"ticket\"") && body.contains(&email),
+        "it is still the consent page for the signed-in user: {body}"
+    );
+
+    // A hosted claude.ai redirect keeps the Claude wording.
+    let (body, _email) = consent_page_for(&pool, REDIRECT_URI).await;
+    assert!(
+        body.contains("Authorize Claude"),
+        "a claude.ai sign-in is still presented as Claude: {body}"
+    );
+}
