@@ -104,6 +104,31 @@ pub async fn register_endpoint(
         });
     }
 
+    // Admin-only scopes (elevation plan EL-9). Registration grants a fixed
+    // set (never one of these) whatever `scope` asks for; a request that NAMES
+    // one is refused while migration 128's switch is armed (or unreadable),
+    // and logged while it is unarmed, so a client written to expect a
+    // standing admin scope learns at registration that it will not get one.
+    if let Some(requested) = req.scope.as_deref() {
+        let requested: Vec<String> = requested.split_whitespace().map(str::to_string).collect();
+        match crate::oauth::scopes::hand_out(&state.db_pool, &requested).await {
+            crate::oauth::scopes::HandOut::Allowed => {}
+            crate::oauth::scopes::HandOut::Warned(admin) => tracing::warn!(
+                scopes = ?admin,
+                "a client registration asked for admin-only scopes (not granted; admin-scope \
+                 enforcement is unarmed)"
+            ),
+            crate::oauth::scopes::HandOut::Refused(admin) => {
+                return Err(ApiError::BadRequest {
+                    message: format!(
+                        "invalid_scope: admin-only scopes {admin:?} are not granted to any \
+                         registered client; admin acts need an elevation"
+                    ),
+                })
+            }
+        }
+    }
+
     // Resolve the effective EpiGraph client_type. DCR maps to a 'human' client.
     let client_type: &str = match req.client_type.as_deref() {
         None => "human",

@@ -120,6 +120,8 @@ const CLOSED: &[&str] = &[
     "oauth_clients",
     "provenance_log",
     "refresh_tokens",
+    // Migration 141: written only through `epigraph_access_token_revoke`.
+    "revoked_access_tokens",
     "tenancy_backfill_progress",
     "tenancy_exempt",
     "tenancy_transcription_log",
@@ -592,9 +594,10 @@ async fn the_grace_window_is_thirty_seconds_from_the_tokens_own_rotation(pool: P
     }
 }
 
-/// The rotation derives the successor's authority from the client, not from
-/// the caller, and the application role cannot read the hashes that name a
-/// chain.
+/// The rotation derives the successor's authority from the presented token's
+/// scopes narrowed to the client's grant (migration 140), never from the
+/// caller's request, and the application role cannot read the hashes that name
+/// a chain.
 #[sqlx::test(migrations = "../../migrations")]
 async fn rotation_caps_expiry_and_derives_scopes_and_token_hash_is_unreadable(pool: PgPool) {
     let client = seed_client(&pool, "active").await; // human, granted {claims:read}
@@ -630,7 +633,8 @@ async fn rotation_caps_expiry_and_derives_scopes_and_token_hash_is_unreadable(po
     assert_eq!(
         scopes,
         vec!["claims:read"],
-        "the successor carries the client's granted scopes, not the caller's"
+        "the successor carries the presented scopes narrowed to the client's grant; \
+         claims:admin was never granted"
     );
     // A shorter expiry than the TTL is kept (the caller may shorten).
     let t2 = h("cap2");
@@ -683,6 +687,157 @@ async fn rotation_caps_expiry_and_derives_scopes_and_token_hash_is_unreadable(po
             .await
             .unwrap();
     assert_eq!(reason.as_deref(), Some("revoked"));
+}
+
+/// Migration 140: the successor's scopes are the PRESENTED token's scopes
+/// narrowed to the client's current grant, never the client's whole grant. A
+/// consent narrowed to `claims:read` by a client that is granted
+/// `claims:write` too must stay `claims:read` through every rotation (RFC 6749
+/// section 6: a refresh MUST NOT include any scope not originally granted).
+/// Under 118's body the successor took `granted_scopes`, so the first rotation
+/// widened the chain to `{claims:read,claims:write}`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotation_successor_inherits_the_presented_tokens_scopes_not_the_clients_grant(
+    pool: PgPool,
+) {
+    let read = "claims:read".to_string();
+    let write = "claims:write".to_string();
+    let client = OAuthClientRepository::create(
+        &pool,
+        &format!("w11_{}", Uuid::new_v4().simple()),
+        None,
+        "u002 narrowed consent",
+        "human",
+        &[read.clone(), write.clone()],
+        &[read.clone(), write.clone()],
+        "active",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("seed client granted read+write");
+    let app = app_pool(&pool, 2).await;
+    let exp = chrono::Utc::now() + chrono::Duration::hours(1);
+    let scopes_of = |hash: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Vec<String>>(
+                "SELECT scopes FROM refresh_tokens WHERE token_hash = $1",
+            )
+            .bind(hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let t0 = h("narrow0");
+    RefreshTokenRepository::create(&app, &t0, client, std::slice::from_ref(&read), exp)
+        .await
+        .unwrap();
+    let t1 = h("narrow1");
+    assert!(matches!(
+        RefreshTokenRepository::rotate(&app, &t0, &t1, exp)
+            .await
+            .unwrap(),
+        RefreshRotateOutcome::Rotated { .. }
+    ));
+    assert_eq!(
+        scopes_of(t1.clone()).await,
+        vec![read.clone()],
+        "the successor keeps the presented token's narrowed scopes, not the client's grant"
+    );
+    let t2 = h("narrow2");
+    RefreshTokenRepository::rotate(&app, &t1, &t2, exp)
+        .await
+        .unwrap();
+    assert_eq!(
+        scopes_of(t2.clone()).await,
+        vec![read.clone()],
+        "and the second rotation does not widen it either"
+    );
+
+    // The narrowing direction still holds: a scope the client has since lost
+    // is dropped from the successor (the order of what survives is pinned by
+    // `rotation_successor_keeps_the_presented_tokens_scope_order`).
+    let t3 = h("narrow3");
+    RefreshTokenRepository::create(&app, &t3, client, &[write.clone(), read.clone()], exp)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE oauth_clients SET granted_scopes = $2 WHERE id = $1")
+        .bind(client)
+        .bind(std::slice::from_ref(&read))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let t4 = h("narrow4");
+    RefreshTokenRepository::rotate(&app, &t3, &t4, exp)
+        .await
+        .unwrap();
+    assert_eq!(
+        scopes_of(t4).await,
+        vec![read],
+        "a revoked grant leaves the chain at its next rotation"
+    );
+}
+
+/// Migration 140 walks the PRESENTED token's scopes `WITH ORDINALITY`, so the
+/// successor keeps their order, not `granted_scopes`' order. A definer that
+/// unnested `granted_scopes` filtered by the presented set would return the same
+/// SET in the grant's order; with stored `[write, read]` and granted
+/// `[read, write, evidence:read]` that is `[read, write]`, and 118's body
+/// (the whole grant) is `[read, write, evidence:read]`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotation_successor_keeps_the_presented_tokens_scope_order(pool: PgPool) {
+    let read = "claims:read".to_string();
+    let write = "claims:write".to_string();
+    let evidence = "evidence:read".to_string();
+    let granted = [read.clone(), write.clone(), evidence.clone()];
+    let client = OAuthClientRepository::create(
+        &pool,
+        &format!("w11_{}", Uuid::new_v4().simple()),
+        None,
+        "u002 scope order",
+        "human",
+        &granted,
+        &granted,
+        "active",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("seed client granted read+write+evidence");
+    let app = app_pool(&pool, 2).await;
+    let exp = chrono::Utc::now() + chrono::Duration::hours(1);
+
+    let t0 = h("order0");
+    RefreshTokenRepository::create(&app, &t0, client, &[write.clone(), read.clone()], exp)
+        .await
+        .unwrap();
+    let t1 = h("order1");
+    assert!(matches!(
+        RefreshTokenRepository::rotate(&app, &t0, &t1, exp)
+            .await
+            .unwrap(),
+        RefreshRotateOutcome::Rotated { .. }
+    ));
+    let scopes: Vec<String> =
+        sqlx::query_scalar("SELECT scopes FROM refresh_tokens WHERE token_hash = $1")
+            .bind(&t1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        scopes,
+        vec![write, read],
+        "the successor is the presented scopes in the presented order"
+    );
 }
 
 /// The rotation's expiry cap is the client type's refresh TTL, row by row: the
@@ -1602,4 +1757,204 @@ async fn an_agent_cannot_rewrite_its_own_competence_scopes(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(scopes, serde_json::json!(["chemistry"]));
+}
+
+/// Migration 141 (drain U003): `revoked_access_tokens` is written ONLY through
+/// `epigraph_access_token_revoke`, measured as the application role. The
+/// definer records a live token once, ignores a token long past its expiry, and
+/// is a maintenance-owned `SECURITY DEFINER` with a pinned `search_path` that
+/// PUBLIC cannot execute. (UPDATE and DELETE are refused by
+/// `credential_and_ledger_tables_refuse_direct_app_writes` through [`CLOSED`];
+/// INSERT, which that test does not cover, is refused here.) Its clock-skew
+/// margin is pinned by `access_token_revocation_prune_keeps_a_day_of_clock_skew_margin`
+/// and `a_token_expired_inside_the_skew_margin_is_still_recorded`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn access_token_revocations_go_through_the_definer(pool: PgPool) {
+    use chrono::{Duration, Utc};
+    use epigraph_db::RevokedAccessTokenRepository;
+    let app = app_pool(&pool, 2).await;
+    let client = Uuid::new_v4();
+
+    // No direct INSERT: an application session cannot plant a row (or, by
+    // CLOSED, rewrite or delete one).
+    let ins = sqlx::query(
+        "INSERT INTO revoked_access_tokens (jti, client_id, expires_at) \
+         VALUES ($1, $2, now() + interval '5 minutes')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(client)
+    .execute(&app)
+    .await;
+    assert_eq!(
+        sqlstate(ins).as_deref(),
+        Some("42501"),
+        "INSERT revoked_access_tokens as epigraph_app"
+    );
+
+    // Through the definer, as the application role: recorded once, and read
+    // back by the application role.
+    let live = Uuid::new_v4();
+    let exp = Utc::now() + Duration::minutes(5);
+    assert!(
+        RevokedAccessTokenRepository::revoke(&app, live, client, exp)
+            .await
+            .expect("revoke as epigraph_app")
+    );
+    assert!(
+        !RevokedAccessTokenRepository::revoke(&app, live, client, exp)
+            .await
+            .expect("revoke again"),
+        "a second revocation of one jti writes nothing"
+    );
+    assert!(RevokedAccessTokenRepository::is_revoked(&app, live)
+        .await
+        .expect("read as epigraph_app"));
+    assert!(
+        !RevokedAccessTokenRepository::is_revoked(&app, Uuid::new_v4())
+            .await
+            .expect("read as epigraph_app"),
+        "an unknown jti is not revoked"
+    );
+
+    // A token a day and more past its expiry is refused by its own exp on any
+    // host whose clock is within the margin; nothing is recorded.
+    let expired = Uuid::new_v4();
+    assert!(!RevokedAccessTokenRepository::revoke(
+        &app,
+        expired,
+        client,
+        Utc::now() - Duration::hours(25)
+    )
+    .await
+    .expect("revoke long expired"));
+    assert!(!RevokedAccessTokenRepository::is_revoked(&app, expired)
+        .await
+        .expect("read"));
+
+    // Catalog: maintenance-owned definer, pinned search_path, no PUBLIC EXECUTE,
+    // EXECUTE for the application role.
+    let (definer, owner, config, public_exec, app_exec): (bool, String, String, bool, bool) =
+        sqlx::query_as(
+            "SELECT p.prosecdef, pg_get_userbyid(p.proowner)::text, \
+                    coalesce(array_to_string(p.proconfig, ';'), ''), \
+                    has_function_privilege('public', p.oid, 'EXECUTE'), \
+                    has_function_privilege('epigraph_app', p.oid, 'EXECUTE') \
+               FROM pg_proc p \
+              WHERE p.oid = 'public.epigraph_access_token_revoke(uuid, uuid, timestamptz)'::regprocedure",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("catalog");
+    assert!(definer, "SECURITY DEFINER");
+    assert_eq!(owner, "epigraph_maintenance");
+    assert!(
+        config.starts_with("search_path=pg_catalog"),
+        "the definer pins its search_path, got {config:?}"
+    );
+    assert!(!public_exec, "PUBLIC must not execute the revoke definer");
+    assert!(app_exec, "epigraph_app executes the revoke definer");
+}
+
+/// Clock skew (drain U003 follow-up): the definer compares `expires_at` with the
+/// DATABASE clock, while the API and the MCP server check a token's `exp` on
+/// their OWN clock with zero leeway. A row pruned while some API host still
+/// thinks its token unexpired re-admits a revoked token there. So the lazy
+/// prune keeps a day of margin: a row 2 h or 23 h past expiry survives a
+/// revocation (and still answers `is_revoked`), one 25 h past is pruned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn access_token_revocation_prune_keeps_a_day_of_clock_skew_margin(pool: PgPool) {
+    use chrono::{Duration, Utc};
+    use epigraph_db::RevokedAccessTokenRepository;
+    let app = app_pool(&pool, 2).await;
+    let client = Uuid::new_v4();
+
+    let (two_h, twenty_three_h, twenty_five_h) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO revoked_access_tokens (jti, client_id, expires_at) VALUES \
+         ($1, $4, now() - interval '2 hours'), \
+         ($2, $4, now() - interval '23 hours'), \
+         ($3, $4, now() - interval '25 hours')",
+    )
+    .bind(two_h)
+    .bind(twenty_three_h)
+    .bind(twenty_five_h)
+    .bind(client)
+    .execute(&pool)
+    .await
+    .expect("seed expired rows as the owner");
+
+    // Any revocation prunes, as the application role.
+    assert!(RevokedAccessTokenRepository::revoke(
+        &app,
+        Uuid::new_v4(),
+        client,
+        Utc::now() + Duration::minutes(5)
+    )
+    .await
+    .expect("a revocation prunes"));
+
+    let mut left: Vec<Uuid> =
+        sqlx::query_scalar("SELECT jti FROM revoked_access_tokens WHERE jti = ANY($1)")
+            .bind(vec![two_h, twenty_three_h, twenty_five_h])
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    left.sort();
+    let mut kept = vec![two_h, twenty_three_h];
+    kept.sort();
+    assert_eq!(
+        left, kept,
+        "rows 2 h and 23 h past expiry are inside the 24 h skew margin and must \
+         survive the prune; only the row 25 h past is pruned"
+    );
+    // The property a host whose clock lags the database relies on.
+    assert!(
+        RevokedAccessTokenRepository::is_revoked(&app, two_h)
+            .await
+            .expect("read as epigraph_app"),
+        "a token 2 h past its expiry on the database clock is still revoked"
+    );
+    assert!(
+        !RevokedAccessTokenRepository::is_revoked(&app, twenty_five_h)
+            .await
+            .expect("read as epigraph_app"),
+        "the row 25 h past expiry is outside the margin and was pruned"
+    );
+}
+
+/// Clock skew, the write side: `/oauth/revoke` verifies the token's signature
+/// but not its expiry, so this guard alone decides whether a token just past
+/// `exp` is recorded. If it declined such a token on the database clock, a host
+/// lagging the database would keep admitting a token whose revocation was
+/// answered 200. The definer therefore records any token less than the 24 h
+/// margin past its expiry. The
+/// 23 h case pins this insert guard to the same (23 h, 25 h] window as the
+/// prune (the 25 h decline is in `access_token_revocations_go_through_the_definer`),
+/// so the two checks the migration says to keep equal cannot drift apart.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_token_expired_inside_the_skew_margin_is_still_recorded(pool: PgPool) {
+    use chrono::{Duration, Utc};
+    use epigraph_db::RevokedAccessTokenRepository;
+    let app = app_pool(&pool, 2).await;
+    for hours in [2, 23] {
+        let jti = Uuid::new_v4();
+        assert!(
+            RevokedAccessTokenRepository::revoke(
+                &app,
+                jti,
+                Uuid::new_v4(),
+                Utc::now() - Duration::hours(hours)
+            )
+            .await
+            .expect("revoke as epigraph_app"),
+            "a token {hours} h past its expiry on the database clock may still be \
+             live on a lagging API host: the definer must record it"
+        );
+        assert!(
+            RevokedAccessTokenRepository::is_revoked(&app, jti)
+                .await
+                .expect("read as epigraph_app"),
+            "a token recorded {hours} h past its expiry answers is_revoked"
+        );
+    }
 }

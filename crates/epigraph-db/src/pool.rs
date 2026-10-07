@@ -5,7 +5,9 @@
 //! [`ScopedPool`] is the newtype that owns connection acquisition for
 //! tenancy-aware work. It exists because the session GUCs the RLS policies read
 //! (`epigraph.group_ids`, `epigraph.writable_group_ids`,
-//! `epigraph.principal_id`) must be stamped from the **same** [`Viewer`] value
+//! `epigraph.principal_id`, and since the elevation stack
+//! `epigraph.elevation_id` / `epigraph.family_id`) must be stamped from the
+//! **same** [`Viewer`] value
 //! that supplies the in-query `$V` bind, and because the release-time scrub that
 //! keeps a recycled connection from carrying one tenant's group set to the next
 //! can only be installed at pool-construction time
@@ -17,7 +19,7 @@
 //!
 //! ## CLAUDE.md and "all SQL lives in `repos/`"
 //!
-//! The one statement this module emits — the `set_config` triple — is
+//! The one statement this module emits — the five-GUC `set_config` — is
 //! deliberately here and not under `repos/`. It is not a query against a domain
 //! table; it is connection *configuration*, the transport for the predicate the
 //! repo layer binds. Putting it in a repository would mean a repository function
@@ -588,7 +590,7 @@ pub async fn apply_statement_timeout(
 /// the bound therefore applies to whatever runs next on it. `after_connect`
 /// cannot undo it: that hook fires once when a physical connection is
 /// established, not on each checkout. [`ScopedPool`]'s `after_release` scrub is
-/// [`SET_SESSION_GUCS`] and covers the three tenancy GUCs only.
+/// [`SET_SESSION_GUCS`] and covers the five tenancy GUCs only.
 ///
 /// So a caller that bounds one piece of work rather than a whole pool must
 /// read the prior value, and restore it with [`restore_statement_timeout`] on
@@ -628,12 +630,68 @@ pub async fn restore_statement_timeout(
 // ScopedPool — plan §0.5
 // =============================================================================
 
-/// The three session GUCs the RLS policies (migration 077) read, and the one
-/// statement that stamps them. Kept as a `const` so the scrub and both stamping
+/// The five session GUCs the row policies read, and the one statement that
+/// stamps them. Kept as a `const` so the scrub, the probe and both stamping
 /// paths are provably the *same* statement.
-const SET_SESSION_GUCS: &str = "SELECT set_config('epigraph.group_ids',          $1, $4), \
-                                       set_config('epigraph.writable_group_ids', $2, $4), \
-                                       set_config('epigraph.principal_id',       $3, $4)";
+///
+/// The first three are the tenancy context (migration 077). The last two are
+/// the elevation pair migration 125's `epigraph_is_elevated()` reads:
+/// `epigraph.elevation_id` (the live elevation session) and
+/// `epigraph.family_id` (its refresh family). Every viewer that is not
+/// elevated stamps both EMPTY, and the release scrub empties all five, so a
+/// recycled connection can never carry one request's elevation into the next
+/// checkout. The database stays authoritative either way: a stamped pair with
+/// no live session behind it evaluates false.
+///
+/// `$6` is `is_local`, LAST, so every caller binds the five values in GUC
+/// order and then the scope.
+const SET_SESSION_GUCS: &str = "SELECT set_config('epigraph.group_ids',          $1, $6), \
+                                       set_config('epigraph.writable_group_ids', $2, $6), \
+                                       set_config('epigraph.principal_id',       $3, $6), \
+                                       set_config('epigraph.elevation_id',       $4, $6), \
+                                       set_config('epigraph.family_id',          $5, $6)";
+
+/// The session setting by which a connection DECLARES that the process
+/// holding it records every elevated access (elevation plan EL-8, the
+/// per-access recorder). Migration 125's `epigraph_is_elevated()` and
+/// `epigraph_elevation_live` answer "not elevated" on a connection that does
+/// not carry it as `on`, whatever the database's recorder gate says.
+///
+/// Why a second key next to the gate (review cp3: COR-1): the gate is opened
+/// by a MIGRATION, but the recorder lives in the BINARIES (the API response
+/// layer and the MCP tool-call wrapper). A database function cannot tell
+/// whether the process serving a request records, so with the gate alone a
+/// unit whose build predates the recorder (a rollback, or units on different
+/// builds) would elevate on a gate-opened database and serve unrecorded
+/// foreign reads. With this key, a build that never declares never elevates.
+///
+/// One production constructor declares it,
+/// [`ScopedPool::connect_recording_elevated_access`], for the binaries that
+/// record every elevated access (the API server, the MCP server's HTTP
+/// transport); every other constructor leaves it unset. Stamped once per
+/// physical connection in `after_connect` (session scope,
+/// outside the release scrub, the operator-binding valve's transport), so
+/// behind a transaction-mode pooler it does not survive and the connection
+/// fails closed (not elevated). Like every custom setting it is a transport,
+/// not an authority boundary: a holder of the application DSN can set it,
+/// and can stamp any group set anyway.
+pub const ACCESS_RECORDER_GUC: &str = "epigraph.access_recorder";
+
+/// A role spliced into `SET SESSION AUTHORIZATION` (which takes no bind) must
+/// be a plain lower-case identifier.
+#[cfg(feature = "test-support")]
+fn plain_role_identifier(role: &str) -> Result<(), DbError> {
+    if role.is_empty()
+        || !role
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
+    {
+        return Err(DbError::QueryFailed {
+            source: sqlx::Error::Protocol(format!("not a plain role identifier: {role}")),
+        });
+    }
+    Ok(())
+}
 
 /// How a [`ScopedPool`] carries tenancy context to the database.
 ///
@@ -684,7 +742,7 @@ fn join_uuids(ids: Option<&[uuid::Uuid]>) -> String {
         .join(",")
 }
 
-/// Stamp the three session GUCs from **this** viewer.
+/// Stamp the five session GUCs from **this** viewer.
 ///
 /// Plan §4.5 requirement 1 is enforced structurally rather than by review: this
 /// function is private, takes the `&Viewer` itself, and has exactly two callers
@@ -698,10 +756,26 @@ async fn apply_session_gucs(
     v: &Viewer,
     is_local: bool,
 ) -> Result<(), DbError> {
+    // `session_groups`, not `group_bind`: an elevated viewer binds no `$V`
+    // (its read fragment is always-true) but the row policies must still see
+    // its own groups. The elevation pair is the SESSION the database answered
+    // for at resolution, never a token claim; every other viewer stamps it
+    // empty.
+    let elevation = v.elevation();
     sqlx::query(SET_SESSION_GUCS)
-        .bind(join_uuids(v.group_bind()))
+        .bind(join_uuids(v.session_groups()))
         .bind(join_uuids(v.writable_bind()))
         .bind(v.principal().map(|p| p.to_string()).unwrap_or_default())
+        .bind(
+            elevation
+                .map(|e| e.session_id.to_string())
+                .unwrap_or_default(),
+        )
+        .bind(
+            elevation
+                .map(|e| e.family_id.to_string())
+                .unwrap_or_default(),
+        )
         .bind(is_local)
         .execute(conn)
         .await
@@ -762,6 +836,12 @@ pub struct ScopedPool {
     /// `#[sqlx::test]` database has exactly one DSN and one role) and because
     /// it is sound for as long as no table is FORCEd.
     maintenance: Option<PgPool>,
+    /// Whether every connection of this pool DECLARES the per-access recorder
+    /// ([`ACCESS_RECORDER_GUC`]), i.e. whether it was built by
+    /// [`ScopedPool::connect_recording_elevated_access`] (or the test-support
+    /// constructor). [`ScopedPool::record_elevated_access`] refuses on a pool
+    /// that does not.
+    records_elevated_access: bool,
 }
 
 impl ScopedPool {
@@ -809,7 +889,7 @@ impl ScopedPool {
         mode: SessionGucMode,
         options: ScopedPoolOptions,
     ) -> Result<Self, DbError> {
-        Self::connect_inner(database_url, mode, options, None).await
+        Self::connect_inner(database_url, mode, options, None, false).await
     }
 
     /// TEST SUPPORT ONLY (the `test-support` feature, which only
@@ -838,16 +918,160 @@ impl ScopedPool {
         mode: SessionGucMode,
         role: &'static str,
     ) -> Result<Self, DbError> {
-        if role.is_empty()
-            || !role
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
-        {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!("not a plain role identifier: {role}")),
+        plain_role_identifier(role)?;
+        Self::connect_inner(
+            database_url,
+            mode,
+            ScopedPoolOptions::default(),
+            Some(role),
+            false,
+        )
+        .await
+    }
+
+    /// TEST SUPPORT ONLY (the `test-support` feature): a pool whose every
+    /// connection DECLARES the per-access elevation recorder
+    /// ([`ACCESS_RECORDER_GUC`]), optionally downgraded to `downgrade_to` as
+    /// [`Self::connect_downgraded_for_tests`] does.
+    ///
+    /// The production declaring constructor is
+    /// [`Self::connect_recording_elevated_access`], which cannot downgrade. A
+    /// test of what a LIVE elevation does stands in for both keys: the
+    /// database's gate (opened by migration 132 on a database at head;
+    /// `viewer_fixture::open_elevated_access_gate` on one cut before it) and
+    /// this declaration, on a pool it can downgrade to the application role.
+    ///
+    /// # Errors
+    /// As [`Self::connect_downgraded_for_tests`].
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn connect_with_access_recorder_for_tests(
+        database_url: &str,
+        mode: SessionGucMode,
+        options: ScopedPoolOptions,
+        downgrade_to: Option<&'static str>,
+    ) -> Result<Self, DbError> {
+        if let Some(role) = downgrade_to {
+            plain_role_identifier(role)?;
+        }
+        Self::connect_inner(database_url, mode, options, downgrade_to, true).await
+    }
+
+    /// [`Self::connect_with_options`] for a process that RECORDS every
+    /// elevated access (elevation plan EL-8): every connection DECLARES the
+    /// per-access recorder ([`ACCESS_RECORDER_GUC`]), the second key without
+    /// which migration 125 never elevates a connection.
+    ///
+    /// The ONE production constructor that declares it. Only a binary whose
+    /// every elevated response passes through [`Self::record_elevated_access`]
+    /// before it is sent may build it: the API server (its response layer
+    /// records, and its viewer extractor refuses to hand an elevated viewer to
+    /// a request the layer is not recording) and the MCP server's HTTP
+    /// transport (its tool-call wrapper records). Every other binary builds
+    /// its pool with [`Self::connect`] / [`Self::connect_with_options`] and so
+    /// never elevates, whatever the database's gate says.
+    ///
+    /// # Errors
+    /// Returns `DbError::ConnectionFailed` if the pool cannot be established.
+    #[instrument(skip(database_url))]
+    pub async fn connect_recording_elevated_access(
+        database_url: &str,
+        mode: SessionGucMode,
+        options: ScopedPoolOptions,
+    ) -> Result<Self, DbError> {
+        Self::connect_inner(database_url, mode, options, None, true).await
+    }
+
+    /// Whether this pool declares the per-access recorder (built by
+    /// [`Self::connect_recording_elevated_access`] or the test-support
+    /// constructor): the only kind of pool on which a viewer can be elevated.
+    #[must_use]
+    pub fn records_elevated_access(&self) -> bool {
+        self.records_elevated_access
+    }
+
+    /// RECORD one elevated request in the per-access log (migration 127's
+    /// `epigraph_record_elevated_access`), on its own transaction stamped
+    /// with `v`, BEFORE the caller sends the response. Works in either
+    /// [`SessionGucMode`].
+    ///
+    /// The one write an ELEVATED viewer's connection makes: [`Self::begin_as`]
+    /// refuses it every other transaction, and this one runs exactly the
+    /// recorder (a definer, which the elevated write refusals of migration
+    /// 126 do not apply to) and commits. Fail-closed: on ANY error the caller
+    /// withholds the response.
+    ///
+    /// # Errors
+    /// * `DbError::ElevatedAccessUnrecorded` if `v` is not elevated, if this
+    ///   pool does not declare the recorder, or if the recorder refused
+    ///   (`ELV07`: the session is no longer live) or the statement failed.
+    pub async fn record_elevated_access(
+        &self,
+        v: &Viewer,
+        access: &crate::repos::ElevatedAccess,
+    ) -> Result<uuid::Uuid, DbError> {
+        if !v.is_elevated() {
+            return Err(DbError::ElevatedAccessUnrecorded {
+                reason: "the viewer is not elevated".to_string(),
             });
         }
-        Self::connect_inner(database_url, mode, ScopedPoolOptions::default(), Some(role)).await
+        if !self.records_elevated_access {
+            return Err(DbError::ElevatedAccessUnrecorded {
+                reason: "this pool does not declare the per-access recorder".to_string(),
+            });
+        }
+        let unrecorded = |e: DbError| DbError::ElevatedAccessUnrecorded {
+            reason: e.to_string(),
+        };
+        let mut tx = self.begin_stamped(v, "BEGIN").await.map_err(unrecorded)?;
+        let id = crate::repos::elevated_access::record(&mut tx, access)
+            .await
+            .map_err(unrecorded)?;
+        tx.commit().await.map_err(unrecorded)?;
+        Ok(id)
+    }
+
+    /// PROPOSE one admin act (migration 130's `epigraph_propose_admin_act`)
+    /// as `v`, on its own transaction stamped with `v`, committed. Works in
+    /// either [`SessionGucMode`]. Returns the act id; its confirmation page
+    /// is `/elevate/act/<id>`.
+    ///
+    /// The second (and last) write an ELEVATED viewer's connection makes
+    /// (the first is [`Self::record_elevated_access`]): [`Self::begin_as`]
+    /// refuses it every other transaction and [`Self::begin_read_as`] is
+    /// READ ONLY, where the definer's insert fails. This one runs exactly the
+    /// proposal definer, which writes only `pending_admin_acts` (a table
+    /// migration 126 does not arm) and refuses a connection that is not
+    /// elevated (ELV07). A viewer that is not elevated is passed through on
+    /// purpose, so the database stays the one authority on who may propose.
+    ///
+    /// # Errors
+    /// * `DbError::InvalidData` for a bypass viewer.
+    /// * `DbError::QueryFailed` carrying the definer's refusal: `ELV07` (not
+    ///   elevated), `22023` (args the kind does not take), `22004` (no
+    ///   reason).
+    pub async fn propose_admin_act(
+        &self,
+        v: &Viewer,
+        kind: &str,
+        args: &serde_json::Value,
+        reason: &str,
+        jti: Option<&str>,
+    ) -> Result<uuid::Uuid, DbError> {
+        if v.is_bypass() {
+            return Err(DbError::InvalidData {
+                reason: "propose_admin_act refuses a Bypass viewer: an act is proposed by an \
+                         elevated person, never by a maintenance session"
+                    .to_string(),
+            });
+        }
+        let mut tx = self.begin_stamped(v, "BEGIN").await?;
+        let id = crate::repos::admin_act_ceremony::AdminActCeremony::propose(
+            &mut tx, kind, args, reason, jti,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
     }
 
     async fn connect_inner(
@@ -855,6 +1079,7 @@ impl ScopedPool {
         mode: SessionGucMode,
         options: ScopedPoolOptions,
         downgrade_to: Option<&'static str>,
+        access_recorder: bool,
     ) -> Result<Self, DbError> {
         let statement_timeout = options.statement_timeout;
         // Read the operator-binding valve (migration 122) now, so a process
@@ -876,18 +1101,30 @@ impl ScopedPool {
                     // The valve's transport (`crate::operator_binding`): a
                     // session setting, stamped once per physical connection
                     // and untouched by the release scrub, which resets only
-                    // the three tenancy GUCs.
+                    // the five tenancy GUCs.
                     crate::operator_binding::apply_valve(conn).await?;
+                    // The recorder declaration (see `ACCESS_RECORDER_GUC`):
+                    // the same once-per-physical-connection transport as the
+                    // valve, also untouched by the release scrub.
+                    if access_recorder {
+                        sqlx::query("SELECT set_config($1, 'on', false)")
+                            .bind(ACCESS_RECORDER_GUC)
+                            .execute(&mut *conn)
+                            .await?;
+                    }
                     Ok(())
                 })
             })
             .after_release(|conn, _meta| {
                 Box::pin(async move {
-                    // The identical triple, three empty strings, session scope.
+                    // The identical statement, five empty strings, session
+                    // scope: the elevation pair is scrubbed with the rest.
                     // `Ok(false)` makes sqlx CLOSE the connection instead of
                     // returning it to the pool: a connection whose group set we
                     // failed to clear must never be reused.
                     match sqlx::query(SET_SESSION_GUCS)
+                        .bind("")
+                        .bind("")
                         .bind("")
                         .bind("")
                         .bind("")
@@ -920,6 +1157,7 @@ impl ScopedPool {
             inner,
             mode,
             maintenance: None,
+            records_elevated_access: access_recorder,
         })
     }
 
@@ -1022,7 +1260,7 @@ impl ScopedPool {
         Ok(ScopedConn(conn, PhantomData))
     }
 
-    /// Transactional variant: `BEGIN`, then the identical triple with
+    /// Transactional variant: `BEGIN`, then the identical statement with
     /// `is_local = true`.
     ///
     /// Required in [`SessionGucMode::Transaction`], and correct in either mode
@@ -1047,10 +1285,57 @@ impl ScopedPool {
                     .to_string(),
             });
         }
+        // An elevated viewer writes nothing (elevation plan EL-6). Every write
+        // path begins here, so this is the Rust half of the refusal; the
+        // database's half is the restrictive policies of the elevated arms.
+        // A READ that must be transactional takes `begin_read_as`.
+        if v.is_elevated() {
+            return Err(DbError::ElevatedReadOnly);
+        }
+        self.begin_stamped(v, "BEGIN").await
+    }
 
+    /// [`Self::begin_as`] for a READ: `BEGIN READ ONLY`, then the identical
+    /// stamp with `is_local = true`.
+    ///
+    /// The one transaction an ELEVATED viewer may open, and the arm
+    /// [`Self::read_as`] takes for one in [`SessionGucMode::Transaction`]. The
+    /// database itself then refuses any write the read reaches (SQLSTATE
+    /// `25006`), a side-effect write through a definer included. Correct for
+    /// any non-bypass viewer.
+    ///
+    /// # Errors
+    /// * `DbError::InvalidData` if `v` is a bypass viewer (see
+    ///   [`Self::acquire_as`]).
+    /// * `DbError::ConnectionFailed` / `DbError::QueryFailed` on `BEGIN` or the
+    ///   stamp.
+    ///
+    /// # Panics
+    /// In debug builds only, as [`Self::begin_as`].
+    pub async fn begin_read_as(&self, v: &Viewer) -> Result<ScopedTx<'_>, DbError> {
+        if v.is_bypass() {
+            return Err(DbError::InvalidData {
+                reason: "begin_read_as refuses a Bypass viewer: an unrestricted viewer must come \
+                         from ScopedPool::unscoped_for_maintenance, on a maintenance connection."
+                    .to_string(),
+            });
+        }
+        self.begin_stamped(v, "BEGIN READ ONLY").await
+    }
+
+    /// `begin` (`BEGIN` or `BEGIN READ ONLY`), then the transaction-local
+    /// stamp from `v`, verified in debug builds. Shared by [`Self::begin_as`]
+    /// and [`Self::begin_read_as`], which have checked the viewer, and by
+    /// [`Self::record_elevated_access`], whose transaction runs only the
+    /// recorder.
+    async fn begin_stamped(
+        &self,
+        v: &Viewer,
+        begin: &'static str,
+    ) -> Result<ScopedTx<'_>, DbError> {
         let mut tx = self
             .inner
-            .begin()
+            .begin_with(begin)
             .await
             .map_err(|source| DbError::ConnectionFailed { source })?;
         apply_session_gucs(&mut tx, v, true).await?;
@@ -1131,8 +1416,14 @@ impl ScopedPool {
         // `apply_session_gucs` is private with exactly two callers, and that is
         // the structural control behind plan §4.5 requirement 1 — becoming a
         // third caller would dissolve it while leaving every test green.
+        //
+        // An ELEVATED viewer's transaction arm is `begin_read_as`: `begin_as`
+        // refuses it, and a read is all it may do.
         match self.mode {
             SessionGucMode::Session => Ok(ScopedRead::Conn(self.acquire_as(v).await?)),
+            SessionGucMode::Transaction if v.is_elevated() => {
+                Ok(ScopedRead::Tx(self.begin_read_as(v).await?))
+            }
             SessionGucMode::Transaction => Ok(ScopedRead::Tx(self.begin_as(v).await?)),
         }
     }
@@ -1243,14 +1534,14 @@ impl ScopedPool {
     /// synchronous and receives a possibly-lazy pool — the same wall PR-02 hit,
     /// and the reason `load_entity_type_cache` is a separate async call.
     ///
-    /// ## Why it stamps the REAL three, and not a scratch GUC
+    /// ## Why it stamps the REAL five, and not a scratch GUC
     ///
     /// An earlier draft set `epigraph.probe` in the first half and then checked
     /// that the three tenancy GUCs were empty in the second. That second check
     /// was **vacuous**: nothing in this pool had ever set those three, so they
     /// read empty whether or not `after_release` was installed, and the "scrub
     /// is not running" branch was unreachable. The probe now stamps
-    /// [`PROBE_SENTINEL`] into all three through the *same* [`SET_SESSION_GUCS`]
+    /// [`PROBE_SENTINEL`] into all five through the *same* [`SET_SESSION_GUCS`]
     /// statement the request path uses, so the emptiness check after release is
     /// a genuine observation about the scrub.
     ///
@@ -1274,6 +1565,8 @@ impl ScopedPool {
                 .bind(PROBE_SENTINEL)
                 .bind(PROBE_SENTINEL)
                 .bind(PROBE_SENTINEL)
+                .bind(PROBE_SENTINEL)
+                .bind(PROBE_SENTINEL)
                 .bind(false)
                 .execute(&mut *conn)
                 .await
@@ -1287,7 +1580,7 @@ impl ScopedPool {
             observed.0
         }; // drop -> release -> the after_release scrub runs
 
-        // Second half: the SAME three GUCs, on a fresh checkout, must be empty.
+        // Second half: the SAME five GUCs, on a fresh checkout, must be empty.
         // Non-vacuous precisely because the block above set them.
         let mut conn = self
             .inner
@@ -1306,16 +1599,21 @@ impl ScopedPool {
     }
 }
 
-/// The sentinel the boot probe stamps into the three tenancy GUCs. A valid UUID
+/// The sentinel the boot probe stamps into the five tenancy GUCs. A valid UUID
 /// (so `epigraph_principal_id()` would parse it) that is not, and must never
 /// be, a real group or principal.
 const PROBE_SENTINEL: &str = "00000000-0000-0000-0000-00000000b0be";
 
-/// Reads all three tenancy GUCs back as one concatenated string. Shared by both
+/// Reads all five tenancy GUCs back as one concatenated string. Shared by both
 /// halves of the probe so they observe exactly the same thing.
 const READ_SESSION_GUCS: &str = "SELECT COALESCE(current_setting('epigraph.group_ids', true), '') \
      || COALESCE(current_setting('epigraph.writable_group_ids', true), '') \
-     || COALESCE(current_setting('epigraph.principal_id', true), '')";
+     || COALESCE(current_setting('epigraph.principal_id', true), '') \
+     || COALESCE(current_setting('epigraph.elevation_id', true), '') \
+     || COALESCE(current_setting('epigraph.family_id', true), '')";
+
+/// How many GUCs [`SET_SESSION_GUCS`] stamps (and the probe reads back).
+const SESSION_GUC_COUNT: usize = 5;
 
 /// The boot probe's verdict, factored out of the I/O.
 ///
@@ -1325,7 +1623,7 @@ const READ_SESSION_GUCS: &str = "SELECT COALESCE(current_setting('epigraph.group
 /// the diagnosis and the remedy it names are covered by a unit test; only the
 /// pooler's behaviour remains unproven.
 fn probe_verdict(persisted: &str, after_release: &str) -> Result<(), DbError> {
-    let expected: String = PROBE_SENTINEL.repeat(3);
+    let expected: String = PROBE_SENTINEL.repeat(SESSION_GUC_COUNT);
     if persisted != expected {
         return Err(DbError::InvalidData {
             reason: format!(
@@ -1467,7 +1765,7 @@ impl ScopedRead<'_> {
     pub async fn commit(self) -> Result<(), DbError> {
         match self {
             // Dropping a `ScopedConn` returns it to the pool, where
-            // `after_release` scrubs the three GUCs. There is nothing to commit.
+            // `after_release` scrubs the five GUCs. There is nothing to commit.
             ScopedRead::Conn(_) => Ok(()),
             ScopedRead::Tx(tx) => tx.commit().await,
         }
@@ -1761,14 +2059,14 @@ mod tests {
 
     #[test]
     fn probe_verdict_accepts_a_session_mode_observation() {
-        let stamped = PROBE_SENTINEL.repeat(3);
+        let stamped = PROBE_SENTINEL.repeat(SESSION_GUC_COUNT);
         assert!(probe_verdict(&stamped, "").is_ok());
     }
 
     #[test]
     fn probe_verdict_refuses_when_gucs_do_not_persist() {
         // What a transaction-mode pooler produces: the stamp is discarded with
-        // the implicit transaction, so the second statement reads three empties.
+        // the implicit transaction, so the second statement reads five empties.
         let err = probe_verdict("", "").expect_err("a lost stamp must refuse");
         let msg = err.to_string();
         assert!(
@@ -1783,7 +2081,7 @@ mod tests {
 
     #[test]
     fn probe_verdict_refuses_when_the_scrub_did_not_run() {
-        let stamped = PROBE_SENTINEL.repeat(3);
+        let stamped = PROBE_SENTINEL.repeat(SESSION_GUC_COUNT);
         let err = probe_verdict(&stamped, &stamped).expect_err("a live scrub must refuse");
         let msg = err.to_string();
         assert!(

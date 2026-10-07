@@ -15,7 +15,8 @@
 //! agent without a LIVE link (its link is retired, or its membership revoked),
 //! or `reown-reverse` HELD at least one claim or hidden row (it is not fully
 //! restored). `arm-operator-binding --apply` exits 1 when the census of unbound
-//! recent writers refused it.
+//! recent writers refused it. `verify-confirmations` exits 2 when at least one
+//! stored confirmation does not verify (each is recorded).
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -36,12 +37,31 @@
 //!         [--quiet-days 30 | --no-quiet-window] [--apply]
 //!     epigraph-operator reown-linked --operator <uuid> --legacy-owner operator|platform \
 //!         --manifest-out reown-linked-1.jsonl [--apply]
+//!     epigraph-operator arm-admin-scopes --reason TEXT [--apply]
+//!     epigraph-operator disarm-admin-scopes --reason TEXT [--apply]
 //!     epigraph-operator grant-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
+//!     epigraph-operator grant-role --role role:platform-custodian --holder <uuid> \
+//!         (--valid-to <RFC3339> | --open-ended) [--valid-from <RFC3339>] \
+//!         [--granted-by <uuid>] --reason TEXT [--act <uuid>] [--apply]
+//!     epigraph-operator end-role-assignment --assignment <uuid> --reason TEXT [--act <uuid>] \
+//!         [--apply]
+//!     epigraph-operator list-role-assignments [--role R] [--include-ended]
+//!     epigraph-operator custodial-supersede --claim <uuid> (--content TEXT | --content-file F) \
+//!         --truth <0..1> --assignment <uuid> --actor <uuid> --reason TEXT [--allow-owned] \
+//!         [--act <uuid>] [--apply]
 //!     epigraph-operator revoke-client-scope <client-id> <scope> (--dry-run | --apply) [--reason TEXT]
+//!     epigraph-operator passkey-enroll --person <uuid> --reason TEXT [--label TEXT] \
+//!         [--act <uuid>] [--apply]
+//!     epigraph-operator list-passkeys [--person <uuid>] [--include-revoked]
+//!     epigraph-operator revoke-passkey --id <uuid> --reason TEXT [--apply]
+//!     epigraph-operator end-elevation (--session <uuid> | --person <uuid>) --reason TEXT [--apply]
+//!     epigraph-operator list-elevations [--person <uuid>] [--live]
+//!     epigraph-operator verify-confirmations [--since <RFC3339>] [--json]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, arm, bind, client_scope, hide, human, legacy, link, reown, reown_linked, reverse,
+    self, admin_scopes, arm, bind, client_scope, confirmations, custodian, elevation, hide, human,
+    legacy, link, passkey, reown, reown_linked, reverse,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -60,6 +80,195 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Grant a platform role (migration 123) to a REGISTERED HUMAN for an
+    /// explicit window. Agents never hold a role (CUS01); once a custodian
+    /// exists every grant names a live custodian as --granted-by (CUS03).
+    GrantRole {
+        /// `role:platform-custodian` or `role:auditor`.
+        #[arg(long)]
+        role: String,
+        /// The human's own agent id (a registered human operator).
+        #[arg(long)]
+        holder: Uuid,
+        /// When the assignment starts (RFC 3339; default now; never in the past).
+        #[arg(long)]
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        /// When the assignment ends (RFC 3339). Exactly one of this and
+        /// --open-ended.
+        #[arg(long)]
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Grant with no end: it is ended only by end-role-assignment.
+        #[arg(long)]
+        open_ended: bool,
+        /// The granting custodian's agent id (required once any live custodian
+        /// exists; omitted only for the bootstrap grant).
+        #[arg(long)]
+        granted_by: Option<Uuid>,
+        /// Recorded on the assignment and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// A CONFIRMED `role.grant` admin act (migration 130) whose args are
+        /// exactly these flags, proposed by --granted-by. Required once the
+        /// grantor holds a passkey (ELV10 otherwise).
+        #[arg(long)]
+        act: Option<Uuid>,
+        /// Commit. Without it, the grant, its audit row and its projection roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// End a role assignment now (its revoke stamp; an ended assignment is final).
+    EndRoleAssignment {
+        /// The assignment id (list-role-assignments).
+        #[arg(long)]
+        assignment: Uuid,
+        /// Recorded on the assignment and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// A CONFIRMED `role.end` admin act (migration 130) for this
+        /// assignment and this reason. Required while any live custodian holds
+        /// a passkey (ELV10 otherwise).
+        #[arg(long)]
+        act: Option<Uuid>,
+        /// Commit. Without it, the end and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Revise a platform-corpus claim as the custodian: the supersede act,
+    /// the edge migration and a `platform.custodial_act` audit row naming the
+    /// assignment, in ONE transaction on the maintenance DSN (migration 123).
+    /// World-owned claims only unless --allow-owned. Exit 2: the act did not
+    /// leave what it must, rolled back.
+    CustodialSupersede {
+        /// The current claim to revise.
+        #[arg(long)]
+        claim: Uuid,
+        /// The revised text.
+        #[arg(long, conflicts_with = "content_file")]
+        content: Option<String>,
+        /// A file holding the revised text.
+        #[arg(long)]
+        content_file: Option<PathBuf>,
+        /// The successor's truth value, in [0, 1].
+        #[arg(long)]
+        truth: f64,
+        /// The actor's live role:platform-custodian assignment.
+        #[arg(long)]
+        assignment: Uuid,
+        /// The custodian (a registered human) on whose authority this runs.
+        #[arg(long)]
+        actor: Uuid,
+        /// Recorded on the supersedes edge and in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Admit a claim the world group does not own.
+        #[arg(long)]
+        allow_owned: bool,
+        /// A CONFIRMED `claim.custodial_supersede` admin act (migration 130)
+        /// whose args are exactly these flags (the content's SHA-256, the
+        /// truth to six places), proposed by --actor. Required once the actor
+        /// holds a passkey (ELV10 otherwise).
+        #[arg(long)]
+        act: Option<Uuid>,
+        /// Commit. Without it, the act and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Open a passkey ENROLLMENT TICKET (migration 124) for a REGISTERED
+    /// HUMAN, live for 15 minutes, and print its ceremony path
+    /// (`/elevate/enroll/<id>`, under the deployment's public base URL). The
+    /// human completes it on the device that holds the authenticator. Agents
+    /// never hold a passkey (ELV01).
+    PasskeyEnroll {
+        /// The human's own agent id (a registered human operator).
+        #[arg(long)]
+        person: Uuid,
+        /// Recorded on the ticket and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// A name for the passkey (e.g. the device), copied onto it.
+        #[arg(long)]
+        label: Option<String>,
+        /// A CONFIRMED `passkey.register` admin act (migration 130) of this
+        /// person, whose args are exactly these flags. Required for a LATER
+        /// passkey (ELV10 otherwise).
+        #[arg(long)]
+        act: Option<Uuid>,
+        /// Commit. Without it, the ticket and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// List passkeys (live ones unless --include-revoked).
+    ListPasskeys {
+        /// Only this human's passkeys.
+        #[arg(long)]
+        person: Option<Uuid>,
+        /// Include revoked passkeys.
+        #[arg(long)]
+        include_revoked: bool,
+    },
+    /// Revoke a passkey now (break-glass; audited; a revoked passkey is final).
+    RevokePasskey {
+        /// The passkey id (list-passkeys).
+        #[arg(long)]
+        id: Uuid,
+        /// Recorded on the passkey and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the revoke and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// End live elevation sessions now: one by id, or every un-ended session
+    /// of a person (any person's; each audited `platform.elevation_ended` with
+    /// the reason, ended_by = this maintenance login).
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["session", "person"])))]
+    EndElevation {
+        /// The elevation session id (`list-elevations`; the `elv` claim).
+        #[arg(long)]
+        session: Option<Uuid>,
+        /// End every un-ended session of this person instead.
+        #[arg(long)]
+        person: Option<Uuid>,
+        /// Why. Recorded in each end's audit row (`operator_reason`).
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the end and its audit rows roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// List elevation sessions, newest first (all of them unless --live).
+    ListElevations {
+        /// Only this person's sessions.
+        #[arg(long)]
+        person: Option<Uuid>,
+        /// Only un-ended, unexpired sessions (the row's own columns; the
+        /// per-statement liveness re-checks are not evaluated here).
+        #[arg(long)]
+        live: bool,
+    },
+    /// Re-verify every stored passkey confirmation (elevation tickets and
+    /// admin acts) offline, against the passkey's public key and the relying
+    /// party in EPIGRAPH_WEBAUTHN_RP_ID / EPIGRAPH_WEBAUTHN_ORIGIN (the values
+    /// the ceremonies ran under). Each confirmation that does not verify is
+    /// printed and recorded once as `platform.confirmation_unverified`; exit 2
+    /// when there is any.
+    VerifyConfirmations {
+        /// Only confirmations asserted at or after this instant (RFC 3339).
+        #[arg(long)]
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Print the report as one JSON object instead of lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List role assignments (un-ended ones unless --include-ended).
+    ListRoleAssignments {
+        /// Only this role.
+        #[arg(long)]
+        role: Option<String>,
+        /// Include ended assignments.
+        #[arg(long)]
+        include_ended: bool,
+    },
     /// Register a HUMAN operator (migration 122's audited registry). Only the
     /// agent of an active human OAuth client can be registered.
     RegisterHumanOperator {
@@ -265,6 +474,14 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+    /// Arm migration 128's admin-scope switch: from then on every mint strips
+    /// the admin-only scopes and every path that hands scopes out refuses
+    /// them. Audited. Without `--apply`, the change is rolled back.
+    ArmAdminScopes(AdminScopeArgs),
+    /// Disarm migration 128's admin-scope switch (the rollback): admin-only
+    /// scopes are standing authority again. Audited. Without `--apply`, the
+    /// change is rolled back.
+    DisarmAdminScopes(AdminScopeArgs),
     /// Grant ONE admin-only scope to a HUMAN's own OAuth client, in both
     /// `allowed_scopes` and `granted_scopes`, with a `security_events` row.
     GrantClientScope(ScopeArgs),
@@ -285,6 +502,18 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+}
+
+/// The arguments of `arm-admin-scopes` and `disarm-admin-scopes`.
+#[derive(clap::Args)]
+struct AdminScopeArgs {
+    /// Why (recorded in the audit event). Required.
+    #[arg(long)]
+    reason: String,
+    /// Commit the change. Without it, the change and its audit event run in a
+    /// transaction that is rolled back.
+    #[arg(long)]
+    apply: bool,
 }
 
 /// The arguments of `grant-client-scope` and `revoke-client-scope`.
@@ -309,10 +538,47 @@ struct ScopeArgs {
 
 async fn main_inner() -> anyhow::Result<i32> {
     let cli = Cli::parse();
+    // Refuse a blank switch reason before any connection is made.
+    if let Command::ArmAdminScopes(a) | Command::DisarmAdminScopes(a) = &cli.command {
+        admin_scopes::validate_reason(&a.reason)?;
+    }
     // Refuse a non-admin-only scope before any connection is made.
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
         client_scope::validate_scope(&a.scope)?;
     }
+    // A grant names its window explicitly; refused before any connection.
+    let window = if let Command::GrantRole {
+        role,
+        valid_from,
+        valid_to,
+        open_ended,
+        ..
+    } = &cli.command
+    {
+        Some(custodian::Window::from_flags(
+            role,
+            *valid_from,
+            *valid_to,
+            *open_ended,
+        )?)
+    } else {
+        None
+    };
+    // The relying party, before any connection is made: without it nothing
+    // can be verified, and a run that verified nothing must not exit 0.
+    let verifier = if let Command::VerifyConfirmations { .. } = &cli.command {
+        let rp = epigraph_passkey::RelyingParty::from_env()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "verify-confirmations needs {} and {}: the relying party the ceremonies ran \
+                 under (the API's values)",
+                epigraph_passkey::config::ENV_RP_ID,
+                epigraph_passkey::config::ENV_ORIGIN
+            )
+        })?;
+        Some(epigraph_passkey::Verifier::new(rp)?)
+    } else {
+        None
+    };
     if let Command::ReownClaims { batch_size, .. }
     | Command::ReownReverse { batch_size, .. }
     | Command::ReownLinked { batch_size, .. } = &cli.command
@@ -329,6 +595,299 @@ async fn main_inner() -> anyhow::Result<i32> {
     let mut conn = db.pool().acquire().await?;
     let mut stdout = std::io::stdout();
     match cli.command {
+        Command::GrantRole {
+            role,
+            holder,
+            granted_by,
+            reason,
+            act,
+            apply,
+            ..
+        } => {
+            let window = window.expect("validated above");
+            if let Some(act) = act {
+                let Some(grantor) = granted_by else {
+                    eprintln!(
+                        "epigraph-operator: REFUSED: a grant on a confirmed act names its \
+                         grantor: --granted-by <the act's proposer>. Nothing was changed."
+                    );
+                    return Ok(1);
+                };
+                let args = custodian::grant_act_args(&role, holder, window, &reason);
+                if let Some(why) = custodian::act_refusal(
+                    &mut conn,
+                    act,
+                    epigraph_db::admin_act::ROLE_GRANT,
+                    &args,
+                    Some(grantor),
+                )
+                .await?
+                {
+                    eprintln!("epigraph-operator: REFUSED: {why}. Nothing was changed.");
+                    return Ok(1);
+                }
+            }
+            let row = custodian::grant(
+                &mut conn, &role, holder, window, granted_by, &reason, act, apply,
+            )
+            .await?;
+            println!(
+                "{}GRANTED\t{}{}",
+                if apply { "" } else { "WOULD BE " },
+                custodian::describe(&row),
+                act.map_or_else(String::new, |a| format!("\tact={a}"))
+            );
+            if !apply {
+                println!(
+                    "DRY RUN: the grant, its audit row and its graph projection were rolled back."
+                );
+            }
+            Ok(0)
+        }
+        Command::EndRoleAssignment {
+            assignment,
+            reason,
+            act,
+            apply,
+        } => {
+            if let Some(act) = act {
+                let args = custodian::end_act_args(assignment, &reason);
+                if let Some(why) = custodian::act_refusal(
+                    &mut conn,
+                    act,
+                    epigraph_db::admin_act::ROLE_END,
+                    &args,
+                    None,
+                )
+                .await?
+                {
+                    eprintln!("epigraph-operator: REFUSED: {why}. Nothing was changed.");
+                    return Ok(1);
+                }
+            }
+            let (ended, row) = custodian::end(&mut conn, assignment, &reason, act, apply).await?;
+            println!(
+                "{}{}\t{}{}",
+                if apply || !ended { "" } else { "WOULD BE " },
+                if ended { "ENDED" } else { "ALREADY-ENDED" },
+                custodian::describe(&row),
+                act.map_or_else(String::new, |a| format!("\tact={a}"))
+            );
+            if !apply {
+                println!("DRY RUN: the end and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::CustodialSupersede {
+            claim,
+            content,
+            content_file,
+            truth,
+            assignment,
+            actor,
+            reason,
+            allow_owned,
+            act,
+            apply,
+        } => {
+            let content = match (content, content_file) {
+                (Some(c), None) => c,
+                (None, Some(f)) => std::fs::read_to_string(&f)
+                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", f.display()))?,
+                _ => anyhow::bail!("exactly one of --content / --content-file"),
+            };
+            let req = custodian::SupersedeRequest {
+                claim,
+                content,
+                truth,
+                assignment,
+                actor,
+                reason,
+                allow_owned,
+                act,
+                apply,
+            };
+            match custodian::custodial_supersede(&mut conn, &req).await? {
+                custodian::SupersedeOutcome::Done(r) => {
+                    println!(
+                        "{}SUPERSEDED\told={}\tnew={}\tauthor={}\towner={}\tedges_moved={}\t\
+                         custodial_act={}\tassignment={assignment}\tactor={actor}{}",
+                        if r.applied { "" } else { "WOULD BE " },
+                        r.old,
+                        r.new,
+                        r.author,
+                        r.owner,
+                        r.edges_moved,
+                        r.act_event,
+                        r.admin_act
+                            .map_or_else(String::new, |a| format!("\tact={a}"))
+                    );
+                    if r.applied {
+                        println!(
+                            "NOTE: the successor has no embedding until the next embedding \
+                             backfill; it is a live_missing row until then."
+                        );
+                    } else {
+                        println!(
+                            "DRY RUN: the supersede, its edge migration and its audit row were \
+                             rolled back."
+                        );
+                    }
+                    Ok(0)
+                }
+                custodian::SupersedeOutcome::Refused(why) => {
+                    eprintln!("epigraph-operator: REFUSED: {why}");
+                    Ok(1)
+                }
+                custodian::SupersedeOutcome::Invariant(why) => {
+                    eprintln!("epigraph-operator: INVARIANT VIOLATED: {why}");
+                    Ok(2)
+                }
+            }
+        }
+        Command::PasskeyEnroll {
+            person,
+            reason,
+            label,
+            act,
+            apply,
+        } => {
+            if let Some(act) = act {
+                let args = passkey::register_act_args(person, label.as_deref(), &reason);
+                if let Some(why) = custodian::act_refusal(
+                    &mut conn,
+                    act,
+                    epigraph_db::admin_act::PASSKEY_REGISTER,
+                    &args,
+                    Some(person),
+                )
+                .await?
+                {
+                    eprintln!("epigraph-operator: REFUSED: {why}. Nothing was changed.");
+                    return Ok(1);
+                }
+            }
+            let row =
+                passkey::enroll(&mut conn, person, &reason, label.as_deref(), act, apply).await?;
+            println!(
+                "{}ENROLLED\t{}",
+                if apply { "" } else { "WOULD BE " },
+                passkey::describe_enrollment(&row)
+            );
+            if apply {
+                println!(
+                    "Open the ceremony path under the deployment's public base URL, on the device \
+                     that holds the authenticator, before {}.",
+                    row.expires_at.to_rfc3339()
+                );
+            } else {
+                println!(
+                    "DRY RUN: the ticket and its audit row were rolled back; the ceremony path \
+                     above is not live."
+                );
+            }
+            Ok(0)
+        }
+        Command::ListPasskeys {
+            person,
+            include_revoked,
+        } => {
+            let rows =
+                epigraph_db::PasskeyRepository::list(&mut conn, person, include_revoked).await?;
+            if rows.is_empty() {
+                println!("no passkeys");
+            }
+            for row in &rows {
+                println!("{}", passkey::describe(row));
+            }
+            Ok(0)
+        }
+        Command::RevokePasskey { id, reason, apply } => {
+            let (revoked, row) = passkey::revoke(&mut conn, id, &reason, apply).await?;
+            println!(
+                "{}{}\t{}",
+                if apply || !revoked { "" } else { "WOULD BE " },
+                if revoked {
+                    "REVOKED"
+                } else {
+                    "ALREADY-REVOKED"
+                },
+                passkey::describe(&row)
+            );
+            if !apply {
+                println!("DRY RUN: the revoke and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::EndElevation {
+            session,
+            person,
+            reason,
+            apply,
+        } => {
+            let target = match (session, person) {
+                (Some(id), _) => elevation::Target::Session(id),
+                (None, Some(p)) => elevation::Target::Person(p),
+                (None, None) => unreachable!("clap requires --session or --person"),
+            };
+            let outcomes = elevation::end(&mut conn, target, &reason, apply).await?;
+            if outcomes.is_empty() {
+                println!("NOT-LIVE\tno un-ended session");
+            }
+            for (session, ended) in &outcomes {
+                println!(
+                    "{}{}\t{session}",
+                    if apply || !ended { "" } else { "WOULD BE " },
+                    if *ended { "ENDED" } else { "NOT-LIVE" },
+                );
+            }
+            if !apply {
+                println!("DRY RUN: the end and its audit rows were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::ListElevations { person, live } => {
+            let rows = elevation::list(&mut conn, person, live).await?;
+            if rows.is_empty() {
+                println!("no elevation sessions");
+            }
+            for row in &rows {
+                println!("{}", elevation::describe(row));
+            }
+            Ok(0)
+        }
+        Command::VerifyConfirmations { since, json } => {
+            let verifier = verifier.expect("built above for this command");
+            let mut report = confirmations::verify(&mut conn, &verifier, since).await?;
+            report.recorded = confirmations::record(&mut conn, &report.findings).await?;
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                for f in &report.findings {
+                    println!("{}", confirmations::describe(f));
+                }
+                println!("{}", confirmations::summary(&report));
+            }
+            Ok(if report.findings.is_empty() { 0 } else { 2 })
+        }
+        Command::ListRoleAssignments {
+            role,
+            include_ended,
+        } => {
+            let rows = epigraph_db::RoleAssignmentRepository::list(
+                &mut conn,
+                role.as_deref(),
+                include_ended,
+            )
+            .await?;
+            if rows.is_empty() {
+                println!("no role assignments");
+            }
+            for row in &rows {
+                println!("{}", custodian::describe(row));
+            }
+            Ok(0)
+        }
         Command::RegisterHumanOperator {
             agent,
             client,
@@ -576,6 +1135,18 @@ async fn main_inner() -> anyhow::Result<i32> {
                 lock_timeout,
             };
             hide::run_standalone(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(0)
+        }
+        cmd @ (Command::ArmAdminScopes(_) | Command::DisarmAdminScopes(_)) => {
+            let (arm, a) = match cmd {
+                Command::ArmAdminScopes(a) => (true, a),
+                Command::DisarmAdminScopes(a) => (false, a),
+                _ => unreachable!("matched above"),
+            };
+            let outcome = admin_scopes::run(&mut conn, arm, &a.reason, a.apply).await?;
+            for line in admin_scopes::describe(&outcome) {
+                println!("{line}");
+            }
             Ok(0)
         }
         Command::GrantClientScope(a) | Command::RevokeClientScope(a) if !a.dry_run && !a.apply => {

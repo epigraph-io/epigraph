@@ -468,6 +468,7 @@ struct EnrichedData {
 
 /// Abstraction for commit enrichment strategies.
 /// The enricher processes parsed commits and produces additional semantic data.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 #[allow(dead_code)]
 trait CommitEnricher: Send + Sync {

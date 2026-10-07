@@ -355,6 +355,7 @@ async fn a_derived_key_is_refused_by_the_packet_verifier(pool: PgPool) {
             None,
             Some(agent.0),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .unwrap()
         .0
@@ -600,10 +601,11 @@ fn every_production_token_mint_carries_an_agent_id() {
     // the method, or moves the mint sites out of `src/`, must fail loudly here
     // rather than pass vacuously).
     assert_eq!(
-        sites, 4,
-        "expected exactly 4 production token-mint sites (3 in oauth/token.rs, 1 in \
-         oauth/providers/provision.rs); found {sites}. A new one must pass \
-         Some(agent_id) and this count must be updated deliberately."
+        sites, 5,
+        "expected exactly 5 production token-mint sites (4 in oauth/token.rs, the fourth the \
+         elevate grant (elevation plan EL-5), 1 in oauth/providers/provision.rs); found \
+         {sites}. A new one must pass Some(agent_id) and this count must be updated \
+         deliberately."
     );
 }
 
@@ -919,6 +921,7 @@ async fn a_revoked_author_packet_is_a_403_that_leaks_no_ids(pool: PgPool) {
             None,
             Some(author),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .unwrap()
         .0

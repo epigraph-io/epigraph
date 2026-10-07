@@ -196,6 +196,11 @@ pub async fn ingest_document(
     // than `internal_error` for the same reason `request_viewer` uses it one
     // frame up: a denial of authority is not a server fault, and classifying it
     // as one would send an operator hunting a crash.
+    //
+    // An ELEVATED request is refused before the detach: `detach_scoped`
+    // downgrades it to the principal's scoped viewer, so nothing after this
+    // line could still see that the request was elevated (and read-only).
+    crate::write_identity::refuse_elevated(viewer)?;
     let viewer = viewer.detach_scoped().ok_or_else(|| {
         McpError::invalid_request(
             "ingest_document requires the caller's own read authority",
@@ -293,8 +298,10 @@ pub async fn ingest_document_inline(
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
 
-    // Same detached-task ownership requirement, the same refusal and the same
+    // Same detached-task ownership requirement, the same refusals (an elevated
+    // request first, before the detach downgrades it) and the same
     // before-any-DB-write placement as `ingest_document` above.
+    crate::write_identity::refuse_elevated(viewer)?;
     let viewer = viewer.detach_scoped().ok_or_else(|| {
         McpError::invalid_request(
             "ingest_document_inline requires the caller's own read authority",
