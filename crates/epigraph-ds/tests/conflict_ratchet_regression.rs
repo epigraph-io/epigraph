@@ -184,6 +184,64 @@ fn supporting_evidence_lifts_belief_on_the_f8cf28d0_set() {
     assert_eq!(after.mass_of_missing(), 0.0);
 }
 
+/// Open-world semantics under the Dempster fold (the U028-coupled part of
+/// U025, operator question Q3).
+///
+/// Before U025, inputs that reserve `(Omega, true)` mass took the YagerOpen arm
+/// at `K >= 0.5` and parked the conflict on `(Omega, true)`. Now reserved
+/// missing mass is conflict against every positive element (including Theta)
+/// and is normalised away; it survives only as `missing ∩ missing`. Closed-world
+/// inputs keep none. The same numbers are re-checked in the `#[ignore]`d
+/// `epigraph-engine/tests/perspectival_loader.rs::load_and_validate_open_world`
+/// harness, which needs a seeded dev DB; this copy runs in every gate.
+#[test]
+fn reserved_open_world_mass_survives_only_as_missing_intersect_missing() {
+    let frame = FrameOfDiscernment::new("ow_proof", vec!["a".into(), "b".into()]).unwrap();
+    let mk = |idx: usize, ow: f64| {
+        let mut m = BTreeMap::new();
+        m.insert(FocalElement::positive(BTreeSet::from([idx])), 0.80);
+        if ow > 0.0 {
+            m.insert(FocalElement::missing(&frame), ow);
+        }
+        m.insert(FocalElement::theta(&frame), 0.20 - ow);
+        MassFunction::new(frame.clone(), m).unwrap()
+    };
+
+    let (ow_combined, rep_ow) =
+        combination::combine_multiple(&[mk(0, 0.08), mk(1, 0.08)], 0.1).unwrap();
+    let (cl_combined, rep_cl) =
+        combination::combine_multiple(&[mk(0, 0.0), mk(1, 0.0)], 0.1).unwrap();
+
+    assert_eq!(
+        rep_ow[0].method_used,
+        combination::CombinationMethod::Dempster
+    );
+    assert_eq!(
+        rep_cl[0].method_used,
+        combination::CombinationMethod::Dempster
+    );
+
+    // K = a∩b 0.64 + missing∩positive 2*(0.08*0.80 + 0.08*0.12) = 0.7872:
+    // missing mass against positive evidence counts as conflict.
+    assert!(
+        (rep_ow[0].conflict_k - 0.7872).abs() < 1e-12,
+        "open-world K: {}",
+        rep_ow[0].conflict_k
+    );
+    assert!((rep_cl[0].conflict_k - 0.64).abs() < 1e-12);
+
+    // Only missing ∩ missing (0.08 * 0.08) survives, renormalised by 1 - K.
+    let expected = 0.0064 / 0.2128;
+    assert!(
+        (rep_ow[0].mass_on_missing - expected).abs() < 1e-12,
+        "open-world reservation must survive only as missing ∩ missing: {}",
+        rep_ow[0].mass_on_missing
+    );
+    assert!((ow_combined.mass_of_missing() - expected).abs() < 1e-12);
+    assert_eq!(rep_cl[0].mass_on_missing, 0.0);
+    assert_eq!(cl_combined.mass_of_missing(), 0.0);
+}
+
 /// The nine `mass_functions` rows prod holds for claim f8cf28d0 on
 /// `binary_truth`, each already Shafer-discounted by its effective reliability.
 fn f8cf28d0_binary_bbas(frame: &FrameOfDiscernment) -> Vec<MassFunction> {
