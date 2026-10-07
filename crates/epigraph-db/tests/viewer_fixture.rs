@@ -320,6 +320,294 @@ pub async fn make_human_operator(pool: &PgPool, agent: Uuid) {
         .expect("human operator registry row");
 }
 
+/// Open migration 125's recorder gate, `epigraph_elevated_access_ready()`, on
+/// a test database CUT BEFORE migration 132, standing in for 132.
+///
+/// 125 ships the gate answering `false`, so NO elevation session is live
+/// (`epigraph_is_elevated()`, `epigraph_elevation_live`, the grant-mode
+/// redemption) until migration 132 (the one migration that opens elevation)
+/// replaces it; 127 to 131 leave it closed. A database migrated to head
+/// therefore needs no call: only a test whose migrator stops before 132 and
+/// is about what a LIVE session does calls this (before any pool is built, so
+/// no cached plan holds the old body). `CREATE OR REPLACE` keeps the
+/// function's owner and ACL, so the 125 register tests still hold.
+/// Idempotent.
+///
+/// That is only the DATABASE key. The connection must also declare the
+/// recorder (`epigraph_db::ACCESS_RECORDER_GUC`; review cp3: COR-1): build
+/// the pool with `ScopedPool::connect_with_access_recorder_for_tests`, or
+/// stamp the setting on a raw connection, standing in for a build that
+/// records.
+pub async fn open_elevated_access_gate(pool: &PgPool) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_elevated_access_ready() \
+         RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER \
+         SET search_path = public, pg_temp AS $$ SELECT true $$",
+    )
+    .execute(pool)
+    .await
+    .expect("open the elevated-access gate (test stand-in for the recorder)");
+}
+
+/// Make `agent` a live PLATFORM CUSTODIAN (migration 123): a registered human
+/// ([`make_human_operator`], unless it already is one) holding an open
+/// `role:platform-custodian` assignment. Returns the assignment id (the live
+/// one it already holds, when it holds one).
+///
+/// Since 123 this is the ONLY way a fixture makes an instance administrator:
+/// `instance_admins` is frozen for every role, and `epigraph_is_instance_admin`
+/// answers from the role. Granted on the harness (superuser) connection
+/// through `epigraph_grant_role`, so the table's own guards apply: the grant
+/// names the first OTHER live custodian as its grantor (the grantor rule), or
+/// none at bootstrap.
+pub async fn make_custodian(pool: &PgPool, agent: Uuid) -> Uuid {
+    let human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("is_human_operator");
+    if !human {
+        let clients: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oauth_clients \
+              WHERE agent_id = $1 AND client_type = 'human' AND status = 'active'",
+        )
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("human clients");
+        if clients == 0 {
+            make_human_operator(pool, agent).await;
+        } else {
+            sqlx::query(
+                "INSERT INTO human_operators (agent_id, client_id, reason) \
+                 SELECT $1, c.id, 'test fixture' FROM oauth_clients c \
+                  WHERE c.agent_id = $1 AND c.client_type = 'human' AND c.status = 'active' \
+                  ORDER BY c.created_at LIMIT 1",
+            )
+            .bind(agent)
+            .execute(pool)
+            .await
+            .expect("register the agent's existing human client");
+        }
+    }
+    let held: Option<Uuid> = sqlx::query_scalar(
+        "SELECT public.epigraph_role_assignment_for($1, 'role:platform-custodian', now())",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("role_assignment_for");
+    if let Some(id) = held {
+        return id;
+    }
+    let grantor: Option<Uuid> = sqlx::query_scalar(
+        "SELECT ra.holder_person_id FROM role_assignments ra \
+          WHERE ra.role = 'role:platform-custodian' AND ra.revoked_at IS NULL \
+            AND ra.valid_from <= now() AND (ra.valid_to IS NULL OR now() < ra.valid_to) \
+            AND ra.holder_person_id <> $1 \
+            AND public.epigraph_is_human_operator(ra.holder_person_id) \
+          ORDER BY ra.valid_from, ra.id LIMIT 1",
+    )
+    .bind(agent)
+    .fetch_optional(pool)
+    .await
+    .expect("grantor");
+    // Since 130 a grantor that holds a live passkey grants only on a
+    // confirmed `role.grant` act (ELV10 otherwise): stand one in.
+    let act = match grantor {
+        Some(g) if at_130(pool).await && has_live_passkey(pool, g).await => Some(
+            confirmed_act(
+                pool,
+                "role.grant",
+                &format!(
+                    "{{\"role\": \"role:platform-custodian\", \"holder\": \"{agent}\", \
+                     \"valid_from\": null, \"valid_to\": null, \"reason\": \"test fixture\"}}"
+                ),
+                g,
+            )
+            .await,
+        ),
+        _ => None,
+    };
+    // The six-parameter (123) form when no act is needed, so a database cut
+    // before 130 still takes the fixture.
+    match act {
+        None => sqlx::query_scalar(
+            "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, $2, \
+                                              'test fixture')",
+        )
+        .bind(agent)
+        .bind(grantor),
+        Some(act) => sqlx::query_scalar(
+            "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, $2, \
+                                              'test fixture', $3)",
+        )
+        .bind(agent)
+        .bind(grantor)
+        .bind(act),
+    }
+    .fetch_one(pool)
+    .await
+    .expect("grant role:platform-custodian")
+}
+
+/// Is migration 130 (pending admin acts) applied? Before it no act is ever
+/// required, so the act-standing-in helpers below answer `None` on a database
+/// cut earlier.
+pub async fn at_130(pool: &PgPool) -> bool {
+    sqlx::query_scalar("SELECT to_regclass('public.pending_admin_acts') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .expect("catalog")
+}
+
+/// Does `person` hold a live passkey (migration 124)? Read on the harness
+/// (superuser) connection; `false` on a database cut before 124.
+pub async fn has_live_passkey(pool: &PgPool, person: Uuid) -> bool {
+    let at_124: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.person_authenticators') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .expect("catalog");
+    if !at_124 {
+        return false;
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM person_authenticators \
+                         WHERE person_agent_id = $1 AND revoked_at IS NULL)",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("live passkey")
+}
+
+/// Stand in for a CONFIRMED admin act (migration 130) of `kind` with args
+/// `args_json`, proposed and confirmed by `proposer`, live 30 minutes; its
+/// id.
+///
+/// A real act is proposed under a live elevation and confirmed by a passkey
+/// ceremony (`pending_admin_acts.rs` drives that path). A fixture that only
+/// needs a write the 130 guards ADMIT (a second custodian granted by a
+/// passkey holder, an assignment ended while one holds a passkey) writes the
+/// confirmed row directly, as the harness superuser with triggers off
+/// (`session_replication_role = replica`: the act's own birth guard, which
+/// demands a live elevation, and its audit do not run; its CHECKs do). Its
+/// args are canonicalized and digested by the database's own functions, its
+/// assignment is the proposer's live custodian assignment (the proposer must
+/// hold one), and its confirming passkey is the proposer's earliest live one
+/// (it must hold one). Its elevation id names no session. The WRITE that
+/// consumes it then meets every 130 rule for real.
+pub async fn confirmed_act(pool: &PgPool, kind: &str, args_json: &str, proposer: Uuid) -> Uuid {
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers off");
+    let r = sqlx::query_scalar::<_, Uuid>(
+        "WITH a AS (SELECT public.epigraph_admin_act_args($1, $2::jsonb) AS args) \
+         INSERT INTO pending_admin_acts \
+                (kind, args, args_digest, target_type, target_id, reason, proposed_by, \
+                 elevation_id, assignment_id, expires_at, challenge_state, asserted_at, \
+                 outcome, assertion_evidence, authenticator_id) \
+         SELECT $1, a.args, public.epigraph_admin_act_digest(a.args), \
+                CASE $1 WHEN 'role.end' THEN 'role_assignment' \
+                        WHEN 'claim.custodial_supersede' THEN 'claim' ELSE 'agent' END, \
+                (a.args->>CASE $1 WHEN 'role.grant' THEN 'holder' \
+                                  WHEN 'role.end' THEN 'assignment' \
+                                  WHEN 'claim.custodial_supersede' THEN 'claim' \
+                                  ELSE 'person' END)::uuid, \
+                'test fixture: a confirmed act', $3, gen_random_uuid(), \
+                public.epigraph_live_role_assignment($3, 'role:platform-custodian', now()), \
+                now() + interval '30 minutes', '{}'::jsonb, now(), 'confirmed', \
+                '{\"fixture\": true}'::jsonb, \
+                (SELECT k.id FROM person_authenticators k \
+                  WHERE k.person_agent_id = $3 AND k.revoked_at IS NULL \
+                  ORDER BY k.created_at, k.id LIMIT 1) \
+           FROM a RETURNING id",
+    )
+    .bind(kind)
+    .bind(args_json)
+    .bind(proposer)
+    .fetch_one(&mut *conn)
+    .await;
+    sqlx::query("SET session_replication_role = DEFAULT")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers on");
+    r.unwrap_or_else(|e| panic!("a confirmed {kind} act by {proposer}: {e}"))
+}
+
+/// The act a passkey ENROLLMENT of `person` (with this reason and label)
+/// needs since migration 130: `None` while the person holds no live passkey
+/// (the first passkey is a maintenance enrollment), otherwise a confirmed
+/// `passkey.register` act of the person's own ([`confirmed_act`]; the
+/// person must be a live custodian). Pass it as the fourth argument of
+/// `epigraph_create_passkey_enrollment`.
+pub async fn passkey_register_act(
+    pool: &PgPool,
+    person: Uuid,
+    reason: &str,
+    label: &str,
+) -> Option<Uuid> {
+    if !at_130(pool).await || !has_live_passkey(pool, person).await {
+        return None;
+    }
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(
+        confirmed_act(
+            pool,
+            "passkey.register",
+            &format!(
+                "{{\"person\": \"{person}\", \"label\": \"{}\", \"reason\": \"{}\"}}",
+                esc(label),
+                esc(reason)
+            ),
+            person,
+        )
+        .await,
+    )
+}
+
+/// The act an END of `assignment` with `reason` needs since migration 130:
+/// `None` while no live custodian holds a live passkey (a maintenance end is
+/// then admitted unconfirmed), otherwise a confirmed `role.end` act
+/// ([`confirmed_act`]) proposed by the earliest such custodian. Pass it as
+/// the third argument of `epigraph_end_role_assignment`.
+pub async fn role_end_act(pool: &PgPool, assignment: Uuid, reason: &str) -> Option<Uuid> {
+    if !at_130(pool).await {
+        return None;
+    }
+    let proposer: Option<Uuid> = sqlx::query_scalar(
+        "SELECT ra.holder_person_id FROM role_assignments ra \
+          WHERE ra.role = 'role:platform-custodian' AND ra.revoked_at IS NULL \
+            AND public.epigraph_live_role_assignment(ra.holder_person_id, \
+                    'role:platform-custodian', now()) IS NOT NULL \
+            AND EXISTS (SELECT 1 FROM person_authenticators k \
+                         WHERE k.person_agent_id = ra.holder_person_id \
+                           AND k.revoked_at IS NULL) \
+          ORDER BY ra.valid_from, ra.id LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("a custodian holding a passkey");
+    match proposer {
+        Some(p) => Some(
+            confirmed_act(
+                pool,
+                "role.end",
+                &format!(
+                    "{{\"assignment\": \"{assignment}\", \"reason\": \"{}\"}}",
+                    reason.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+                p,
+            )
+            .await,
+        ),
+        None => None,
+    }
+}
+
 /// [`seed_agent_with_group`] for an agent that is a HUMAN OPERATOR
 /// ([`make_human_operator`]); returns `(agent_id, personal_group_id)`.
 pub async fn seed_human_operator(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
@@ -644,6 +932,54 @@ fn blake3_like(s: &str) -> Vec<u8> {
         out[i % 32] ^= *b;
     }
     out
+}
+
+/// A database at migration 122 (the head before the custodian role), seeded by
+/// `seed`, then migrated to the tree's head.
+///
+/// For state that only an OLDER schema can hold: 123 freezes
+/// `instance_admins` for every role (the superuser included), so a legacy row
+/// that a test needs to see migrated, skipped or ignored must be written
+/// before 123 runs. Use with `#[sqlx::test(migrations = false)]` and the
+/// caller's own `sqlx::migrate!` migrator (this file embeds none).
+/// `session_replication_role = replica` is deliberately NOT the shortcut: it
+/// would also silence the audit triggers under test.
+pub async fn db_at_122_then_head<F, Fut>(pool: &PgPool, migrator: &sqlx::migrate::Migrator, seed: F)
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 122)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    // On ONE connection, reset afterwards: 001 is a pg_dump whose header
+    // issues session-level SETs (`row_security = off`, an empty
+    // `search_path`) that outlive its transaction, so a pooled connection the
+    // migrator used would otherwise carry them into the seed and the test.
+    let mut conn = pool.acquire().await.expect("acquire");
+    before.run(&mut *conn).await.expect("migrate 001 -> 122");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    drop(conn);
+    seed(pool.clone()).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate 122 -> head");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
 }
 
 /// CALIBRATION for migration 118's `match_candidates` stale guard, which the

@@ -112,9 +112,10 @@ fn is_structural_relationship(s: &str) -> bool {
 ///
 /// Why it matters (backlog 9a0bd3e2): `link_epistemic` wrote every
 /// relationship through the directional repo, so an agent filing `contradicts`
-/// in both orders produced two `edges` rows for one disagreement. Every
-/// conflict-density measure counts rows — `silence_alarm`'s
-/// `check_conflict_density` included — so one dispute read as two.
+/// in both orders produced two `edges` rows for one disagreement, and a
+/// measure that counts rows read one dispute as two. (The silence alarm's
+/// count, `epigraph_db::ConflictDensityRepository`, now counts unordered claim
+/// pairs, so it no longer depends on this dedup.)
 ///
 /// The five excluded epistemic relations are genuinely directional and MUST
 /// NOT be added here: `supports`, `elaborates`, `generalizes`, `specializes`

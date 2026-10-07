@@ -2592,11 +2592,9 @@ pub async fn claim_provenance(
     };
 
     // Truncation only — there is no redacted spelling of this label any more.
-    let claim_label = if claim_row.content.len() > 60 {
-        format!("{}...", &claim_row.content[..57])
-    } else {
-        claim_row.content.clone()
-    };
+    // Over 60 characters → first 57 + "...". Counted in characters: a byte
+    // slice here panicked on multibyte content.
+    let claim_label = super::text::ellipsize(&claim_row.content, 60, 57);
 
     let claim_step = ProvenanceStep {
         id: claim_row.id,
@@ -4025,6 +4023,10 @@ mod db_tests {
             client_type: ClientType::Service,
             scopes: vec!["edges:write".to_string()],
             jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         }
     }
 

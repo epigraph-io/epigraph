@@ -1,4 +1,4 @@
-//! Source lint: the `Viewer` has exactly two shapes and no way to conjure one.
+//! Source lint: the `Viewer` has exactly three shapes and no way to conjure one.
 //!
 //! Plan §4.13. The seed of `viewer_ratchet.rs`, which PR-04 split out: the
 //! **count** of `SystemReason` variants is a monotone-decreasing ratchet and
@@ -99,6 +99,111 @@ fn visibility_module_has_no_anonymous_or_forgeable_viewer() {
         violations.is_empty(),
         "crates/epigraph-db/src/visibility.rs contains banned constructs:\n{}",
         violations.join("\n\n")
+    );
+}
+
+/// The shape set, counted. `ViewerShape` is private, so no other file can add a
+/// shape, and this file is where adding one has to be argued: since the
+/// elevation stack (EL-6) the set is `Scoped`, `Bypass` and `Elevated`.
+///
+/// A fourth variant fails the BUILD first (every match on the shape in
+/// visibility.rs is exhaustive; measured: 12 errors); this scan is the
+/// backstop for a variant added together with wildcard arms.
+#[test]
+fn the_viewer_has_exactly_three_shapes() {
+    let code = strip_line_comments(&visibility_source());
+    let start = code
+        .find("enum ViewerShape {")
+        .expect("visibility.rs declares `enum ViewerShape`");
+    let body_start = start + "enum ViewerShape {".len();
+    let mut depth = 1usize;
+    let mut end = body_start;
+    for (i, ch) in code[body_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = body_start + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &code[body_start..end];
+    let variants: Vec<&str> = body
+        .lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("    ")?;
+            if rest.starts_with(' ') {
+                return None;
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            name.chars()
+                .next()
+                .filter(char::is_ascii_uppercase)
+                .map(|_| l.trim())
+        })
+        .collect();
+    let names: Vec<String> = variants
+        .iter()
+        .map(|v| {
+            v.chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        ["Scoped", "Bypass", "Elevated"],
+        "ViewerShape's variants changed. A shape is read authority; adding one is a \
+         security-relevant change that has to be argued here, with the constructor that \
+         builds it and the database check behind it."
+    );
+}
+
+/// The elevated shape is BUILT in exactly two places: `Viewer::resolve_elevated`,
+/// after migration 125's `epigraph_elevation_live` answered for a live session,
+/// and the `#[cfg(test)]` `Viewer::test_elevated` the unit tests use. Any other
+/// constructor, `From` impl or helper that yields the shape without that answer
+/// is a viewer that renders the always-true read fragment on the strength of a
+/// token claim; this scan is what catches it (the forged-claim database tests
+/// catch a check that is skipped INSIDE `resolve_elevated`).
+///
+/// Verified to fail with a second production constructor (a `pub fn` building
+/// `ViewerShape::Elevated` from its arguments) added to visibility.rs.
+#[test]
+fn the_elevated_shape_is_built_only_after_the_database_check() {
+    let code = strip_line_comments(&visibility_source());
+    let needle = "shape: ViewerShape::Elevated {";
+    let mut sites = Vec::new();
+    let mut from = 0;
+    while let Some(at) = code[from..].find(needle) {
+        let at = from + at;
+        let before = &code[..at];
+        let fn_at = before
+            .rfind("fn ")
+            .expect("a construction site inside a function");
+        let name: String = before[fn_at + 3..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let attrs = &before[before[..fn_at].rfind("\n\n").unwrap_or(0)..fn_at];
+        sites.push((name, attrs.contains("#[cfg(test)]")));
+        from = at + needle.len();
+    }
+    assert_eq!(
+        sites,
+        [
+            ("resolve_elevated".to_string(), false),
+            ("test_elevated".to_string(), true)
+        ],
+        "the elevated shape must be built only by resolve_elevated (after the database \
+         answered for the session) and by the cfg(test) unit-test constructor"
     );
 }
 

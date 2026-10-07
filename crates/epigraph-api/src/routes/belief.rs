@@ -1900,22 +1900,16 @@ pub async fn submit_evidence(
     }
 
     // 19c. Silence alarm — check conflict density for this frame (S3.2 / G2)
-    //      Query total claims and CONTRADICTS edges for the frame, then run the
-    //      pure check_conflict_density() function.
+    //      Read the frame's claim count and contradiction count (distinct claim
+    //      pairs joined by a live contradicts/refutes edge, the same counts the
+    //      `/conflicts` scans use), then run the pure check_conflict_density().
     {
-        let silence_counts: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT \
-                 (SELECT COUNT(DISTINCT claim_id) FROM mass_functions WHERE frame_id = $1) AS total, \
-                 (SELECT COUNT(*) FROM edges e \
-                  JOIN mass_functions mf ON mf.claim_id = e.source_id AND mf.frame_id = $1 \
-                  WHERE e.relationship = 'CONTRADICTS' \
-                    AND (e.valid_to IS NULL OR e.valid_to > now())) AS contradicts",
-        )
-        .bind(frame_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+        let silence_counts: Option<(i64, i64)> =
+            epigraph_db::ConflictDensityRepository::for_frames(pool, &[frame_id])
+                .await
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .map(|d| (d.total_claims, d.contradicts_edges));
 
         if let Some((total, contradicts)) = silence_counts {
             let silence = epigraph_engine::silence_alarm::check_conflict_density(

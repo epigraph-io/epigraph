@@ -1,17 +1,35 @@
 //! Workflow hierarchy walker. Reads a `WorkflowExtraction` and produces an
 //! `IngestPlan` of claims + edges + path index. Compound nodes are scoped by
-//! `canonical_name`; operation atoms use the global `ATOM_NAMESPACE` (shared
-//! with documents) for cross-source convergence.
+//! `canonical_name` — both their id and their stored `content_hash`; operation
+//! atoms use the global `ATOM_NAMESPACE` (shared with documents) and the plain
+//! content hash, for cross-source convergence.
 
 use std::collections::HashMap;
 
 use uuid::Uuid;
 
 use crate::common::edges::{decomposes_edge, thesis_derivation_str};
-use crate::common::ids::{atom_id, compound_claim_id, content_hash, workflow_root_id};
+use crate::common::ids::{
+    atom_id, compound_claim_id, compound_content_hash, content_hash, workflow_root_id,
+};
 use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
 use crate::workflow::schema::WorkflowExtraction;
+
+/// `properties` key that marks a workflow level-0/1/2 row whose stored
+/// `content_hash` is `compound_content_hash(blake3(content), <seed>)` rather
+/// than `blake3(content)`; its value names the seed
+/// ([`CONTENT_HASH_SCOPE_CANONICAL_NAME`]).
+///
+/// The marker exists because `source_type == "workflow"` alone cannot tell a
+/// compound-hash row from one written before backlog 6178a205, which stores the
+/// plain digest: `document::stored_content_hash_is_seed_scoped` keys the
+/// workflow class on it so a tampered legacy row still reports `mismatch`.
+pub const CONTENT_HASH_SCOPE_KEY: &str = "content_hash_scope";
+
+/// Value of [`CONTENT_HASH_SCOPE_KEY`] on workflow structural rows: the stored
+/// digest is scoped to the workflow's `canonical_name`.
+pub const CONTENT_HASH_SCOPE_CANONICAL_NAME: &str = "canonical_name";
 
 /// Walk a `WorkflowExtraction` tree and produce a flat list of operations.
 ///
@@ -30,10 +48,27 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
     let canonical_name = &extraction.source.canonical_name;
     let source_type = "workflow";
 
+    // Compound (level 0-2) nodes STORE a `canonical_name`-scoped digest, the
+    // same way `document::build_ingest_plan` does (#389). Every workflow claim
+    // is authored by the one workflow-ingest system agent, and migration 013
+    // puts `UNIQUE (content_hash, agent_id)` on `claims`; a plain
+    // `blake3(text)` here made the second workflow sharing a thesis, phase or
+    // step text fail with 23505 although its id differs — and `store_workflow`
+    // files every workflow under a constant "Body" phase (backlog 6178a205).
+    // The id stays `compound_claim_id(blake3(text), canonical_name)`, so
+    // already-stored workflows keep their ids. Each such node also carries
+    // `CONTENT_HASH_SCOPE_KEY`, which is what `verify_claim` (through
+    // `document::stored_content_hash_is_seed_scoped`) keys on: rows written
+    // before this change share the `source_type` stamp but keep the plain
+    // digest, and must still report a tampered body as `mismatch`. The executor
+    // writes properties only on a row it newly inserts, so a re-ingest over a
+    // legacy row never marks it.
+
     // Step 1: Thesis (level 0)
     let thesis_id = if let Some(ref thesis_text) = extraction.thesis {
         let hash = content_hash(thesis_text);
         let id = compound_claim_id(&hash, canonical_name);
+        let stored_hash = compound_content_hash(&hash, canonical_name);
         path_index.insert("thesis".to_string(), id);
 
         claims.push(PlannedClaim {
@@ -45,8 +80,9 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 "source_type": source_type,
                 "thesis_derivation": thesis_derivation_str(&extraction.thesis_derivation),
                 "kind": "workflow_thesis",
+                CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME,
             }),
-            content_hash: hash,
+            content_hash: stored_hash,
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
@@ -106,8 +142,9 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 "source_type": source_type,
                 "phase": phase.title,
                 "kind": "workflow_step",
+                CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME,
             }),
-            content_hash: phase_hash,
+            content_hash: compound_content_hash(&phase_hash, canonical_name),
             confidence: 1.0,
             methodology: None,
             evidence_type: None,
@@ -152,8 +189,9 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                     "phase": phase.title,
                     "rationale": step.rationale,
                     "kind": "workflow_step",
+                    CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME,
                 }),
-                content_hash: step_hash,
+                content_hash: compound_content_hash(&step_hash, canonical_name),
                 confidence: step.confidence,
                 methodology: None,
                 evidence_type: step_evidence_type.clone(),
@@ -386,5 +424,101 @@ mod tests {
             .find(|c| c.level == 1)
             .expect("expected a level-1 phase claim");
         assert_eq!(phase_claim.content, "Non-empty summary text");
+    }
+
+    /// Two workflows that share thesis, phase and step TEXT must not share a
+    /// stored `content_hash` on any structural (level 0–2) node.
+    ///
+    /// Every workflow claim is authored by the one workflow-ingest system
+    /// agent, and migration 013 puts `UNIQUE (content_hash, agent_id)` on
+    /// `claims`. A plain `blake3(text)` digest on a structural node therefore
+    /// makes the SECOND workflow carrying that text fail with 23505 ("Duplicate
+    /// entity already exists") even though its row id
+    /// (`compound_claim_id(hash, canonical_name)`) is distinct — and
+    /// `store_workflow` files every workflow under a constant "Body" phase, so
+    /// the second `store_workflow` always hit it (backlog 6178a205).
+    ///
+    /// Level-3 operation atoms are the converse and must STAY plain: their id
+    /// is `atom_id(blake3(text))`, shared across workflows and documents on
+    /// purpose, so their digest must be shared too.
+    #[test]
+    fn workflow_structural_hashes_are_scoped_to_canonical_name() {
+        use crate::common::ids::compound_content_hash;
+
+        let make = |name: &str| WorkflowExtraction {
+            source: WorkflowSource {
+                canonical_name: name.to_string(),
+                goal: "Same goal".to_string(),
+                generation: 0,
+                parent_canonical_name: None,
+                authors: vec![],
+                expected_outcome: None,
+                tags: vec![],
+                metadata: serde_json::json!({}),
+            },
+            thesis: Some("Same thesis".to_string()),
+            thesis_derivation: ThesisDerivation::TopDown,
+            phases: vec![Phase {
+                title: "Body".to_string(),
+                summary: "Body".to_string(),
+                steps: vec![Step {
+                    compound: "Run tests".to_string(),
+                    rationale: String::new(),
+                    operations: vec!["cargo test".to_string()],
+                    generality: vec![1],
+                    confidence: 0.8,
+                    evidence_type: None,
+                }],
+            }],
+            relationships: vec![],
+        };
+        let plan_a = build_ingest_plan(&make("wf-a"));
+        let plan_b = build_ingest_plan(&make("wf-b"));
+        assert_eq!(plan_a.claims.len(), 4, "thesis, phase, step, atom");
+        assert_eq!(plan_b.claims.len(), 4, "thesis, phase, step, atom");
+
+        let mut structural = 0;
+        for (a, b) in plan_a.claims.iter().zip(&plan_b.claims) {
+            assert_eq!(a.level, b.level, "plans must line up level-by-level");
+            assert_eq!(a.content, b.content, "fixture shares every text");
+            let plain = content_hash(&a.content);
+            if a.level <= 2 {
+                structural += 1;
+                assert_ne!(
+                    a.content_hash, b.content_hash,
+                    "level-{} node {:?}: two workflows sharing this text store the same \
+                     digest, so the second collides on uq_claims_content_hash_agent",
+                    a.level, a.content
+                );
+                assert_eq!(
+                    a.content_hash,
+                    compound_content_hash(&plain, "wf-a"),
+                    "level-{} node {:?} must store compound_content_hash(blake3(text), \
+                     canonical_name)",
+                    a.level,
+                    a.content
+                );
+                assert_eq!(
+                    b.content_hash,
+                    compound_content_hash(&plain, "wf-b"),
+                    "level-{} node {:?} must store compound_content_hash(blake3(text), \
+                     canonical_name)",
+                    b.level,
+                    b.content
+                );
+                // The id stays keyed on the PLAIN hash, so already-stored
+                // workflows keep their ids.
+                assert_eq!(a.id, compound_claim_id(&plain, "wf-a"));
+            } else {
+                assert_eq!(
+                    a.content_hash, plain,
+                    "operation atom {:?} must store the plain hash so it converges",
+                    a.content
+                );
+                assert_eq!(b.content_hash, plain);
+                assert_eq!(a.id, b.id, "atoms converge across workflows");
+            }
+        }
+        assert_eq!(structural, 3, "thesis, phase and step are all structural");
     }
 }
