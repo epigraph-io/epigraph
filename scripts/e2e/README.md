@@ -89,6 +89,7 @@ precisely why production admits writes a clean schema refuses.
 | `probe-http-writes.sh <server binary> <label> <a\|b> [arm ...]` | **HTTP**: the claim writers batch H-a stamped — `supersede`, `DELETE /workflows/:id` and `/workflows/:id/outcome` on legacy flat workflow claims, `bp/propagate` with `apply_updates`, `themes/create-with-centroid` — for an owner, an admin and a peer, printing the status AND the rows read back (is_current, truth, counters, executions, BetP, themes). Needs `python3`. |
 | `probe-httpid.sh <binary> <label> <a\|b> [arm ...]` | Batch HTTP-id: WHO an HTTP MCP write is authored as. `oauth`: a HUMAN principal (client_type `human`, the consent flow's shape) on an authenticated listener writes `submit_claim` / `memorize` / `update_with_evidence` and retires its own backlog item. `unauth`: the principal-less listener's writes, a `claims:admin` tool, a read and an attempt on the human's item, by default and (when the binary has it) with `--allow-unauthenticated-writes`. `retired`: a FORMER shared signer (two principals through one key) link-retired to the human: 107's retire, 116's attested retire (through `epigraph-operator link-retired --attest-shared-signer` when `E2E_OPERATOR_BIN` is set), then the human retiring the signer's items over HTTP on a fresh key, re-owning them first where the schema requires it. `startup`: both listener kinds on a link-retired key. The bearer is hand-minted with `/oauth/token`'s claim shape; the mint path is not exercised. |
 | `probe-operator.sh <binary> <label> <a\|b>` | OP-AUTHOR (batch H-b): an agent linked on the SU DSN and restarted on the APP DSN authors a stdio `submit_claim` owned by its operator's group, DS-wired and embedded. Every model carries a per-run nonce (agents and links survive TRUNCATE). And the stdio operator self-link's two REFUSALS through the real binary (migrations 105 + 107): `--operator-id` on the least-privilege DSN must exit non-zero with the EXECUTE-grant text and write no link or membership (OP-APP); an operator whose own personal-group row is only revoked must refuse with `RVK01` and stay revoked (OP-RVK01); a live operator on the same DSN must link (OP-LIVE, the calibration). The transport refusal, the HTTP listener's linked-signer refusal and the no-revival restart are `operator_startup_gate_test.rs`'s. OP-RVK01 and OP-LIVE run the server on `E2E_SU_DSN`, because the link function is EXECUTE-able by a maintenance or superuser login only. |
+| `probe-elevation-no-authenticator.sh <API base URL> <ticket id>` | **Browser** (elevation plan EL-14, DESIGN §10 check 7): the REAL ceremony page of a live, unasserted elevation ticket, opened in headless Chromium by `elevation-no-authenticator.mjs` (Playwright) with a virtual authenticator holding NO credential (NOAUTH-EMPTY) and with no authenticator at all (NOAUTH-NONE). Each arm passes only when the page ends "Not elevated:", sends nothing to `/assert`, and the ticket read back through the SU DSN is still unasserted with no session. Needs a running `server` binary configured with a relying party at that origin, `node` and the `playwright` package with Chromium. **Not yet run against a deployed build**: the protocol-level negatives (no, garbage and foreign assertions) are in `epigraph-api/tests/elevation_ceremony.rs`. |
 | `embed-verdict.sh` | How many committed claims carry a vector. |
 | `drive.sh <binary> <label> <a\|b>` | `set-config` + `run-e2e` + the embedding verdict, in one call. |
 | `set-config.sh a\|b` | Switches the schema configuration. Reads `helper.sql` and `fn2.sql`. |
@@ -152,23 +153,21 @@ site that hit them; they are collected here because they generalise.
    fails before it reaches the database, so `embedding IS NULL` says nothing about
    the write path. `probe-embed.sh` hard-refuses rather than reporting it.
 5. **Every probe TRUNCATEs first, which hides collisions that span runs.**
-   `store_workflow`'s constant `"Body"` phase is hashed with plain `content_hash`,
-   so the SECOND workflow ever written collides on `uq_claims_content_hash_agent`
-   ("Duplicate entity already exists") — on main and in production too. No probe
-   saw it, because each run starts from an empty `claims` table and writes one
-   workflow. A probe that asserts "tool X succeeds" on a truncated database says
-   nothing about the second call. **This trap caught this branch's own
-   acceptance matrix**: commit 3c921b69 reports `store_workflow` as "ingested 4"
-   on both configs, and that is the FIRST workflow only. The STORE_WORKFLOW
-   TWICE arm of `probe-unit-e.sh` measures the second: on this branch it fails
-   loudly and atomically (`Duplicate entity already exists`, delta 0/0/0) on
-   both configs; on main it fails the same way but leaves one claim and one
-   `workflows` row behind. The collision itself is open work: the workflow
-   builder hashes thesis/phase/step claims with plain `content_hash`, and
-   switching them to `compound_content_hash` (as the document builder did)
-   also changes what `verify_claim` must accept for level-2 workflow claims
-   (`verify_claim_crypto.rs::tampered_non_document_level_two_reports_mismatch`
-   pins the plain hash), so it is its own decision.
+   A probe that asserts "tool X succeeds" on a truncated database says nothing
+   about the second call. This trap hid a real bug: `store_workflow`'s constant
+   `"Body"` phase was hashed with plain `content_hash`, so the SECOND workflow
+   ever written collided on `uq_claims_content_hash_agent` ("Duplicate entity
+   already exists") — on main and in production too — while no probe saw it,
+   because each run started from an empty `claims` table and wrote one
+   workflow. Commit 3c921b69's acceptance matrix reported `store_workflow` as
+   "ingested 4" on both configs, and that was the FIRST workflow only. Backlog
+   6178a205 fixed it: workflow thesis/phase/step rows now store
+   `compound_content_hash(blake3(text), canonical_name)` (as the document
+   builder's structural rows do) and carry a `content_hash_scope` marker, so
+   `verify_claim` still reports a tampered pre-fix plain-hash row as
+   `mismatch` (`crates/epigraph-mcp/tests/store_workflow_hash_scope.rs`). The
+   STORE_WORKFLOW TWICE arm of `probe-unit-e.sh` keeps measuring the second
+   call: PASS is now `isError:false` with a positive claims/workflows delta.
 6. **One transaction means one `NOW()`.** Since the Unit E conversions a whole
    workflow plan (every claim, every `executes` edge, every `claim.created`
    event) shares one `created_at`. Any ordering keyed on `created_at` over
@@ -594,13 +593,18 @@ decision or conversion before the operator drops `claims_privacy`,
    checked on exactly the row the executor links. The admin arm re-checks the
    token's client record and writes a `workflows.admin_write` audit row through
    migration 112. `workflows` recorded no owner before batch H-b, so every
-   EXISTING workflow has no record and stays open to any caller, with a WARN:
-   which authority legacy workflows carry is an open operator decision.
+   EXISTING workflow has no record. U005 (default decision A) made those
+   platform corpus: over HTTP only the audited admin arm admits them (audit row
+   `"submitter": null`), anyone else gets 403 / "no recorded submitter", a new
+   generation of a legacy lineage records no submitter either, and stdio is
+   unchanged. The `--allow-unauthenticated-http` context (claims:admin, no
+   client record) now gets ADM02 on legacy rows.
    `evolve_step`, `refresh_workflow_promotion` and `report_hierarchical_outcome`
    (item 4; the last is an unguarded read-modify-write of `workflows.metadata`
    counters) are not covered. Measured by
    `epigraph-mcp/tests/workflow_caller_authority.rs`, the API
-   `workflow_lineage_and_admin_arm_are_checked_over_http`, and
+   `workflow_lineage_and_admin_arm_are_checked_over_http` and
+   `a_legacy_workflow_is_refused_to_a_stranger_over_http`, and
    `probe-batch-h.sh review_http`.
 9. **MCP writes that work on B only through the orphan policy** (measured on B
    by the review; A 42501): a stdio `patch_claim`, and a stdio free-label
@@ -613,8 +617,8 @@ decision or conversion before the operator drops `claims_privacy`,
 10. **Open decisions recorded by the review revision**: whether removing the
    `backlog` label is a retirement (it also takes an item out of the open-backlog
    query; it is free vocabulary on stdio today); whether the production
-   unauthenticated socket keeps cross-group writes (above); which authority
-   legacy workflows carry (item 8).
+   unauthenticated socket keeps cross-group writes (above). Which authority
+   legacy workflows carry is decided (item 8, U005 default decision A).
 
 ## What this harness does not cover
 

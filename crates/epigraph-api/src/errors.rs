@@ -278,6 +278,17 @@ pub enum ApiError {
         claim_id: uuid::Uuid,
         message: String,
     },
+
+    /// `400` with an RFC 6749 §5.2 token-endpoint error body,
+    /// `{"error": <code>, "error_description": <text>}`, for a client that
+    /// must act on the code: the elevate grant's device-flow-style polling
+    /// (`authorization_pending`, then `invalid_grant`). The other grants keep
+    /// their historical `BadRequest` shape.
+    #[error("{error}: {description}")]
+    OAuthGrantError {
+        error: &'static str,
+        description: String,
+    },
 }
 
 impl ApiError {
@@ -373,6 +384,17 @@ impl IntoResponse for ApiError {
                     "edge_id": edge_id,
                     "rule": rule,
                     "retryable": false,
+                })),
+            )
+                .into_response();
+        }
+        // RFC 6749 §5.2: the token endpoint's own error body.
+        if let ApiError::OAuthGrantError { error, description } = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": error,
+                    "error_description": description,
                 })),
             )
                 .into_response();
@@ -487,6 +509,9 @@ impl IntoResponse for ApiError {
             ApiError::EdgeNotOwned { .. } | ApiError::ClaimNotWritable { .. } => {
                 (StatusCode::FORBIDDEN, "not_owner", None)
             }
+            // Answered above with its own body; kept here so the match stays
+            // exhaustive.
+            ApiError::OAuthGrantError { error, .. } => (StatusCode::BAD_REQUEST, *error, None),
         };
 
         // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a
@@ -587,6 +612,11 @@ impl From<DbError> for ApiError {
             // Row security let the caller read the row but not change it
             // (migrations 115/117): a denial, not a fault and not a 404.
             e @ DbError::WriteRefused { .. } => ApiError::Forbidden {
+                reason: e.to_string(),
+            },
+            // An elevated request asked to write (elevation plan EL-6): a
+            // denial the caller fixes by writing unelevated.
+            e @ DbError::ElevatedReadOnly => ApiError::Forbidden {
                 reason: e.to_string(),
             },
             // Migration 105's refusal to restore a revoked personal-group
@@ -702,6 +732,15 @@ impl From<DbError> for ApiError {
                     message: "A database error occurred".to_string(),
                 }
             }
+            // Fail-closed (elevation plan EL-8): an elevated read that could
+            // not be recorded is withheld. A server-side failure, never the
+            // caller's; the reason is logged, not sent.
+            DbError::ElevatedAccessUnrecorded { reason } => {
+                tracing::error!(target: "elevation", reason = %reason, "elevated access not recorded");
+                ApiError::InternalError {
+                    message: "ELEVATED ACCESS NOT RECORDED: the response is withheld".to_string(),
+                }
+            }
             DbError::MigrationFailed { source } => {
                 tracing::error!(error = %source, "Database migration failed");
                 ApiError::DatabaseError {
@@ -810,6 +849,25 @@ mod tests {
             ApiError::Forbidden { reason } => assert!(reason.starts_with("OPL02"), "{reason}"),
             other => panic!("OPL02 must be Forbidden: {other:?}"),
         }
+    }
+
+    /// An elevated request asking to write is a 403 denial naming the remedy,
+    /// not a 500. Mutation caught: the arm removed (it falls to the fault arm).
+    #[test]
+    fn an_elevated_write_is_a_403_denial() {
+        let api = ApiError::from(DbError::ElevatedReadOnly);
+        match &api {
+            ApiError::Forbidden { reason } => {
+                assert!(reason.contains("ELEVATED READ-ONLY"), "{reason}");
+                assert!(reason.contains("end the elevation"), "{reason}");
+            }
+            other => panic!("an elevated write must be Forbidden: {other:?}"),
+        }
+        assert_eq!(api.into_response().status(), StatusCode::FORBIDDEN);
+        assert!(
+            DbError::ElevatedReadOnly.is_write_authority_refusal(),
+            "every write surface maps this set to a denial"
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ fn token() -> String {
             None,
             None,
             ChronoDuration::minutes(5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("mint");
     token
@@ -62,6 +63,10 @@ async fn spawn_listener(pool: PgPool, signer: AgentSigner) -> String {
         StreamableHttpServerConfig, StreamableHttpService,
     };
     let signer = Arc::new(signer);
+    // A real migrated database, so the production store is the one in front.
+    let revocation = Arc::new(epigraph_mcp::auth::DbAccessTokenRevocation::new(
+        pool.clone(),
+    ));
     let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
     let service = StreamableHttpService::new(
         move || {
@@ -78,6 +83,7 @@ async fn spawn_listener(pool: PgPool, signer: AgentSigner) -> String {
     let state = McpAuthState {
         jwt_config: Arc::new(JwtConfig::from_secret(SECRET)),
         resource_metadata_url: None,
+        revocation,
     };
     let router = axum::Router::new().nest_service("/mcp", service).layer(
         axum::middleware::from_fn_with_state(state, bearer_auth_middleware),

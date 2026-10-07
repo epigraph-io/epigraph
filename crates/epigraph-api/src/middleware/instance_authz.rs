@@ -94,10 +94,28 @@ pub const TARGET_GROUP_MIN_AGE_HOURS: i64 = 24;
 #[cfg(feature = "db")]
 pub const TARGET_GROUP_MIN_OTHER_ADMINS: i64 = 2;
 
+/// Who passed [`require_instance_admin_for_group`], and on which authority.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustodianAuthority {
+    /// The caller's agent id (a registered human holding the role).
+    pub agent_id: Uuid,
+    /// The live `role:platform-custodian` assignment that satisfied condition
+    /// 2 (migration 123). Every privatization WRITE records a custodial act
+    /// against it (`platform.custodial_act`), in the write's own transaction.
+    pub assignment_id: Uuid,
+}
+
 /// Verify the caller may run a privatization against `target_group_id`.
 ///
-/// Returns the caller's `agent_id` on success, so a handler does not have to
-/// re-unwrap `auth.agent_id` and cannot accidentally proceed with `None`.
+/// Returns the caller's `agent_id` and the custodian assignment it holds, so
+/// a handler does not have to re-unwrap `auth.agent_id`, cannot accidentally
+/// proceed with `None`, and can record its act against the authority that
+/// was checked.
+///
+/// Condition 2 is "a live `role:platform-custodian` assignment of a
+/// registered human" (migration 123; `epigraph_is_instance_admin` keeps its
+/// name and answers from the role).
 ///
 /// # ⚠ `conn` must be the MAINTENANCE connection — 18b's decision, made here
 ///
@@ -140,7 +158,7 @@ pub async fn require_instance_admin_for_group(
     auth: &AuthContext,
     target_group_id: Uuid,
     conn: &mut sqlx::PgConnection,
-) -> Result<Uuid, ApiError> {
+) -> Result<CustodianAuthority, ApiError> {
     use chrono::{Duration, Utc};
     use epigraph_db::repos::instance_admin::InstanceAdminRepository;
 
@@ -167,7 +185,7 @@ pub async fn require_instance_admin_for_group(
     // condition 2 is CHECKED. The order the header promises is preserved by the
     // order of the branches below, and the probe discloses nothing: it returns
     // four facts to this process, and this process returns a 403 naming only
-    // "not an instance administrator" when condition 2 fails.
+    // "not a platform custodian" when condition 2 fails.
     let authority =
         InstanceAdminRepository::privatization_authority(conn, agent_id, target_group_id)
             .await
@@ -175,14 +193,20 @@ pub async fn require_instance_admin_for_group(
                 message: e.to_string(),
             })?;
 
-    // 2. The instance's own record. Asked through
-    // `epigraph_is_instance_admin(uuid)`, not by reading `instance_admins` —
-    // see that repository's module docs.
-    if !authority.is_instance_admin {
-        return Err(ApiError::Forbidden {
-            reason: "not an instance administrator".to_string(),
-        });
-    }
+    // 2. The instance's own record: a live role:platform-custodian assignment
+    // (migration 123), asked through `epigraph_is_instance_admin(uuid)`, not
+    // by reading a table — see that repository's module docs.
+    let assignment_id = match (
+        authority.is_instance_admin,
+        authority.custodian_assignment_id,
+    ) {
+        (true, Some(id)) => id,
+        _ => {
+            return Err(ApiError::Forbidden {
+                reason: "not a platform custodian".to_string(),
+            })
+        }
+    };
 
     // 3a. Maturity.
     let created_at = authority
@@ -218,7 +242,10 @@ pub async fn require_instance_admin_for_group(
         });
     }
 
-    Ok(agent_id)
+    Ok(CustodianAuthority {
+        agent_id,
+        assignment_id,
+    })
 }
 
 #[cfg(all(test, feature = "db"))]

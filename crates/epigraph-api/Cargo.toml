@@ -7,7 +7,7 @@ edition = "2021"
 
 [features]
 default = ["db"]
-db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-ingest-executor", "dep:epigraph-mcp"]
+db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-ingest-executor", "dep:epigraph-mcp", "dep:epigraph-passkey"]
 jina = ["epigraph-embeddings/jina"]
 genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN)
 integration = []
@@ -50,6 +50,10 @@ epigraph-engine = { workspace = true }
 epigraph-embeddings = { workspace = true }
 epigraph-db = { workspace = true, optional = true }
 epigraph-mcp = { workspace = true, optional = true }
+# The passkey enrollment ceremony (elevation plan EL-3). `db` only: it links
+# OpenSSL through webauthn-rs, and `--no-default-features` stays free of it
+# (`epigraph-passkey/tests/dependency_boundary.rs`).
+epigraph-passkey = { workspace = true, optional = true }
 epigraph-ds = { workspace = true }  # Dempster-Shafer math for belief endpoints
 epigraph-events = { workspace = true }  # Event bus for pub/sub messaging
 epigraph-cli = { workspace = true, optional = true }  # LlmClient trait + AnthropicClient (genai feature)
@@ -135,6 +139,20 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # webhook delivery test reach ONE exact local listener. Dev-dependency only, so
 # a release build of `server` does not contain it.
 epigraph-jobs = { workspace = true, features = ["test-support"] }
+# `tests/passkey_enrollment.rs` only: the test authenticator shared with
+# `epigraph-passkey`'s tests (`#[path]` to its
+# `tests/support/soft_authenticator.rs`), written from the WebAuthn and CTAP
+# specifications on OpenSSL and ciborium. Dev-only: no normal build contains it.
+openssl = "0.10"
+ciborium = "0.2"
+# `tests/elevation_acceptance.rs` only: the plan's acceptance slice drives the
+# REAL MCP HTTP transport beside the REST router, so it builds the same
+# streamable-HTTP service `epigraph-mcp`'s `--listen` builds. The workspace
+# version `epigraph-mcp` already links; dev-only, no new package. rmcp's
+# server speaks axum 0.8 while this crate is on 0.7, so the MCP router is built
+# with `epigraph-mcp`'s axum under a renamed dev-dependency.
+rmcp = { workspace = true }
+axum08 = { package = "axum", version = "0.8" }
 
 [[test]]
 name = "boot_secret_gate_test"

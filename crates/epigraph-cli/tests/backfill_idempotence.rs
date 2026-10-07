@@ -186,6 +186,57 @@ async fn verify_fails_before_the_backfill_and_succeeds_after(pool: PgPool) {
     );
 }
 
+/// `verify` FAILS while a non-superuser maintenance role (or PUBLIC) holds
+/// CREATE on schema `public` (review cp3: SEC-03). Migration 125's recorder
+/// gate, `epigraph_elevated_access_ready()`, and every elevation definer are
+/// owned by `epigraph_maintenance`; replacing one takes its ownership AND
+/// CREATE on the schema. The ownership half does not stop a maintenance login,
+/// so the only barrier between an operator statement on the maintenance DSN
+/// and an opened gate is that no such role may CREATE in `public` (true by
+/// default since PostgreSQL 15, NOT on a cluster upgraded from an older
+/// default). `verify` is the deploy pre-flight that pins it.
+///
+/// Verified to fail with the check removed from `verify` (exit 0 under both
+/// grants).
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_fails_while_the_maintenance_role_may_create_in_public(pool: PgPool) {
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "CALIBRATION: verify passes on a fresh database; stderr: {stderr}"
+    );
+
+    for (grant, revoke) in [
+        (
+            "GRANT CREATE ON SCHEMA public TO PUBLIC",
+            "REVOKE CREATE ON SCHEMA public FROM PUBLIC",
+        ),
+        (
+            "GRANT CREATE ON SCHEMA public TO epigraph_maintenance",
+            "REVOKE CREATE ON SCHEMA public FROM epigraph_maintenance",
+        ),
+    ] {
+        sqlx::query(grant).execute(&pool).await.expect(grant);
+        let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+        sqlx::query(revoke).execute(&pool).await.expect(revoke);
+        assert_eq!(
+            code, 1,
+            "{grant}: verify must fail while the maintenance role may replace the \
+             recorder gate; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("CREATE on schema public") && stderr.contains("epigraph_maintenance"),
+            "{grant}: verify must name the privilege and the role; stderr: {stderr}"
+        );
+    }
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "CALIBRATION: verify passes again once the grants are revoked; stderr: {stderr}"
+    );
+}
+
 /// PR-15's positive acceptance: the backfill **updates the row**, and leaves a
 /// row that is already declared non-public alone.
 ///

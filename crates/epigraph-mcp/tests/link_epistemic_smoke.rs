@@ -729,10 +729,11 @@ async fn missing_target_claim_is_rejected(pool: PgPool) {
 
 // ── symmetric relationships dedup on the UNORDERED pair (backlog 9a0bd3e2) ──
 
-/// Count `relationship` edges between `a` and `b` in EITHER direction. This is
-/// the shape every conflict-density consumer uses (`silence_alarm`'s
-/// `check_conflict_density` among them): it counts ROWS describing the pair,
-/// which is exactly the number the directional write path inflated.
+/// Count `relationship` edges between `a` and `b` in EITHER direction. It
+/// counts ROWS describing the pair, as any row-counting measure would, which is
+/// exactly the number the directional write path inflated. (The silence alarm
+/// no longer counts rows: `epigraph_db::ConflictDensityRepository` counts
+/// unordered claim pairs.)
 async fn symmetric_edge_count(pool: &PgPool, a: Uuid, b: Uuid, relationship: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM edges \
@@ -753,8 +754,8 @@ async fn symmetric_edge_count(pool: &PgPool, a: Uuid, b: Uuid, relationship: &st
 /// Pre-fix, `do_link_epistemic` routed every relationship through the
 /// directional `EdgeRepository::create_if_not_exists`, whose idempotency key is
 /// the ordered `(source, target, relationship)` triple — so the reverse call
-/// matched nothing and inserted a second row. Every conflict-density measure
-/// counts rows, so one dispute read as two.
+/// matched nothing and inserted a second row, so any measure that counts rows
+/// read one dispute as two.
 #[sqlx::test(migrations = "../../migrations")]
 async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -816,8 +817,8 @@ async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
     assert_eq!(
         symmetric_edge_count(&pool, a, b, "contradicts").await,
         1,
-        "one disagreement must be ONE row — this count is what every \
-         conflict-density measure reads"
+        "one disagreement must be ONE row — this count is what any \
+         row-counting measure reads"
     );
 }
 

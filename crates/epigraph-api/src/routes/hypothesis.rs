@@ -203,10 +203,6 @@ pub async fn create_hypothesis(
         message: format!("Failed to store prior mass function: {e}"),
     })?;
 
-    tx.commit().await.map_err(|e| ApiError::InternalError {
-        message: format!("Failed to commit hypothesis claim: {e}"),
-    })?;
-
     // 4. Compute VOI from neighborhood — only grounded claims count.
     //    A grounded claim has at least one non-claim provenance chain
     //    (paper, evidence, or analysis source). Claim-to-claim propagation
@@ -254,13 +250,25 @@ pub async fn create_hypothesis(
 
     let voi = epigraph_engine::compute_voi(&voi_neighbors);
 
-    // 5. Cache VOI score on claim
+    // 5. Cache the VOI score on the claim, on the claim's OWN stamped
+    //    transaction, before it commits (delta review round 4 COR-R4-3). It
+    //    ran on the unstamped pool after the commit with its error discarded,
+    //    so on a schema without the orphan permissive `claims_privacy` policy
+    //    row security refused it and the route answered 200 with a score it
+    //    never stored. The neighborhood read above excludes the new claim by
+    //    id and does not need it committed.
     sqlx::query("UPDATE claims SET properties = properties || $2 WHERE id = $1")
         .bind(claim_id.0)
         .bind(serde_json::json!({"voi_score": voi.score}))
-        .execute(&state.db_pool)
+        .execute(&mut *tx)
         .await
-        .ok();
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to cache the VOI score: {e}"),
+        })?;
+
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to commit hypothesis claim: {e}"),
+    })?;
 
     Ok(Json(serde_json::json!({
         "hypothesis_id": claim_id.0,
