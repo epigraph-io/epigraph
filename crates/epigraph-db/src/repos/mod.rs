@@ -4,7 +4,10 @@
 //! following the repository pattern to abstract database access.
 
 pub mod activity;
+pub mod admin_act;
+pub mod admin_act_ceremony;
 pub mod admin_cascade;
+pub mod admin_scope_enforcement;
 pub mod agent;
 pub mod agent_key;
 pub mod alternative_set;
@@ -18,6 +21,7 @@ pub mod claim_encryption;
 pub mod claim_theme;
 pub mod claim_version;
 pub mod community;
+pub mod conflict_density;
 pub mod context;
 pub mod corpus_stats;
 pub mod counterfactual;
@@ -25,6 +29,8 @@ pub mod decomposition_priority;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
+pub mod elevated_access;
+pub mod elevation_ceremony;
 pub mod entity;
 pub mod entity_type;
 pub mod event;
@@ -48,6 +54,8 @@ pub mod match_candidate;
 pub mod method;
 pub mod oauth_client;
 pub mod paper;
+pub mod passkey;
+pub mod passkey_ceremony;
 pub mod pattern_template;
 pub mod perspective;
 pub mod political;
@@ -56,6 +64,8 @@ pub mod provenance;
 pub mod provenance_chain;
 pub mod recall_event;
 pub mod refresh_token;
+pub mod revoked_access_token;
+pub mod role_assignment;
 pub mod scoped_belief;
 pub mod security_event;
 pub mod semantic_link;
@@ -71,6 +81,12 @@ pub mod workflow_execution;
 
 // Re-export all repositories for convenience
 pub use activity::ActivityRepository;
+pub use admin_act::{AdminActRepository, AdminActRow};
+pub use admin_act_ceremony::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
+pub use admin_scope_enforcement::{
+    AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
+    AdminScopeSwitch,
+};
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
     CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome,
@@ -95,11 +111,17 @@ pub use claim_theme::{
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use community::{CommunityRepository, MembershipOutcome};
+pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity};
 pub use context::ContextRepository;
 pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;
+pub use elevated_access::ElevatedAccess;
+pub use elevation_ceremony::{
+    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
+    Redemption, TicketMode, TicketPasskey,
+};
 pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventRepository, EventRow};
@@ -163,12 +185,16 @@ pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow, RotateOutcome};
 pub use group_membership::{GroupMembershipRepository, MembershipRow, RevokeOutcome};
 pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};
+pub use passkey::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
+pub use passkey_ceremony::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
 pub use pattern_template::{PatternTemplateRepository, PatternTemplateRow};
 pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORIZER_ID};
 pub use refresh_token::{
     RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
     RefreshTokenRow,
 };
+pub use revoked_access_token::RevokedAccessTokenRepository;
+pub use role_assignment::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
 pub use span::{SpanRepository, SpanRow};
 pub use task::{TaskRepository, TaskRow};

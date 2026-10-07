@@ -105,6 +105,7 @@ fn agents_write_bearer_token() -> String {
             Some(principal),
             Some(principal),
             chrono::Duration::seconds(300),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("issue_access_token must succeed for tests");
     token
@@ -210,6 +211,7 @@ fn submit_bearer_token() -> String {
             Some(principal),
             Some(principal),
             chrono::Duration::seconds(300),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("issue_access_token must succeed for tests");
     token

@@ -10,6 +10,7 @@ use crate::common::ids::{atom_id, compound_claim_id, compound_content_hash, cont
 use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
 use crate::document::schema::{DocumentExtraction, Paragraph, SourceType};
+use crate::workflow::builder::{CONTENT_HASH_SCOPE_CANONICAL_NAME, CONTENT_HASH_SCOPE_KEY};
 
 const fn source_type_str(st: &SourceType) -> &'static str {
     match st {
@@ -43,6 +44,10 @@ pub const DOCUMENT_SOURCE_TYPES: [&str; 7] = [
     source_type_str(&SourceType::Tabular),
 ];
 
+/// The `properties.source_type` stamp of workflow ingest output
+/// (`workflow::build_ingest_plan`, `epigraph_ingest_executor::add_step`).
+const WORKFLOW_SOURCE_TYPE: &str = "workflow";
+
 /// Whether a persisted claim's `properties` identify it as a row whose
 /// `claims.content_hash` is a [`compound_content_hash`] — a digest that is NOT
 /// `blake3(content)` and CANNOT be re-derived from the claim alone.
@@ -59,6 +64,18 @@ pub const DOCUMENT_SOURCE_TYPES: [&str; 7] = [
 /// evidence of tampering and must not be reported as such — MCP `verify_claim`
 /// routes on this predicate to answer "not applicable" instead.
 ///
+/// The WORKFLOW builder (`workflow::build_ingest_plan`) and
+/// `epigraph_ingest_executor::add_step` do the same on their level-0/1/2 nodes
+/// with seed `canonical_name` (backlog 6178a205). A workflow row is in the
+/// class only when it carries the scope marker those writers stamp
+/// (`properties[CONTENT_HASH_SCOPE_KEY] == CONTENT_HASH_SCOPE_CANONICAL_NAME`,
+/// see `workflow::builder`) — NOT by its `source_type` alone. Workflow rows
+/// written before that change share the `{level 0-2, source_type: "workflow"}`
+/// stamp but keep the PLAIN digest, so for them a body/digest disagreement IS
+/// evidence of tampering: unmarked, they fall outside the class and
+/// `verify_claim` still reports `mismatch` (and `match` when untampered,
+/// because it compares before it classifies).
+///
 /// # What it deliberately does NOT do
 ///
 /// It does not attempt to re-derive the stored digest. The artifact seed is
@@ -73,8 +90,9 @@ pub const DOCUMENT_SOURCE_TYPES: [&str; 7] = [
 /// database access: `ClaimRepository::patch_claim_atomic_conn` merges
 /// caller-supplied properties with `properties = COALESCE(properties,'{}') || $1`,
 /// reachable from MCP `patch_claim` and HTTP `PATCH /claims/:id`. A caller with
-/// patch rights can therefore add `{"level":0,"source_type":"Paper"}` to a
-/// plain-hash claim and turn a future `mismatch` verdict into `not_applicable`.
+/// patch rights can therefore add `{"level":0,"source_type":"Paper"}` (or the
+/// workflow stamp plus its scope marker) to a plain-hash claim and turn a
+/// future `mismatch` verdict into `not_applicable`.
 ///
 /// That is a defence-in-depth degradation rather than a bypass, for one specific
 /// reason worth stating so a later reader does not have to re-derive it: no API
@@ -99,12 +117,18 @@ pub fn stored_content_hash_is_seed_scoped(properties: &serde_json::Value) -> boo
     });
     let is_compound_level = matches!(level, Some(0..=2));
 
-    let is_document = properties
+    let source_type = properties
         .get("source_type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|st| DOCUMENT_SOURCE_TYPES.contains(&st));
+        .and_then(serde_json::Value::as_str);
+    let is_document = source_type.is_some_and(|st| DOCUMENT_SOURCE_TYPES.contains(&st));
+    // Keyed on the marker, not the stamp alone: see the doc comment above.
+    let is_scoped_workflow = source_type == Some(WORKFLOW_SOURCE_TYPE)
+        && properties
+            .get(CONTENT_HASH_SCOPE_KEY)
+            .and_then(serde_json::Value::as_str)
+            == Some(CONTENT_HASH_SCOPE_CANONICAL_NAME);
 
-    is_compound_level && is_document
+    is_compound_level && (is_document || is_scoped_workflow)
 }
 
 fn enrichment_from_paragraph(paragraph: &Paragraph) -> serde_json::Value {
@@ -438,8 +462,9 @@ mod source_type_guard {
         );
         assert!(
             !DOCUMENT_SOURCE_TYPES.contains(&"workflow"),
-            "the workflow builder binds the PLAIN content hash on its compound nodes; listing \
-             its stamp here would excuse a tampered workflow phase/step body"
+            "a workflow row is seed-scoped only when it carries CONTENT_HASH_SCOPE_KEY; rows \
+             written before backlog 6178a205 share the stamp but store the PLAIN hash, so \
+             listing the stamp here would excuse a tampered legacy workflow phase/step body"
         );
     }
 }

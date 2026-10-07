@@ -4,13 +4,20 @@
 //! validation via `epigraph-auth` so a single token works against both
 //! servers.
 //!
-//! ## Deferred: revocation
+//! ## Revocation
 //!
-//! The HTTP API consults `AppState::is_token_revoked` here. MCP has no
-//! equivalent state and v1 relies on short JWT TTLs. When MCP grows shared
-//! state, plumb the revocation set through and call it before
-//! `validate_token`. Tracked separately — do not silently skip when adding
-//! state.
+//! A token revoked through the HTTP API's `POST /oauth/revoke` is refused here
+//! too: after `validate_token` succeeds, [`bearer_auth_middleware`] asks
+//! [`McpAuthState::revocation`] whether the token's `jti` is on migration 141's
+//! durable denylist, the same table the HTTP API's middleware reads. The store
+//! is a REQUIRED field, not an `Option`: there is no configuration in which an
+//! authenticated listener skips the check. A store that cannot answer refuses
+//! the token (fails closed) with the same uniform `invalid_token`; the reason
+//! (`revoked` / `revocation_unavailable`) is logged server-side only.
+//!
+//! The production store is [`DbAccessTokenRevocation`] on the process pool.
+//! There is deliberately no public "never revoked" store in this crate: test
+//! suites that serve on a dead pool declare their own under `tests/support/`.
 
 use std::sync::Arc;
 
@@ -66,11 +73,47 @@ fn rejection_reason(kind: &jsonwebtoken::errors::ErrorKind) -> &'static str {
 #[derive(Clone)]
 pub struct RawBearerToken(pub String);
 
+/// A revocation store could not answer. Opaque on purpose: the reason is for
+/// the server log, never for the 401 the caller sees.
+#[derive(Debug)]
+pub struct RevocationUnavailable(pub String);
+
+/// Answers whether a signature-verified access token's `jti` has been revoked
+/// (RFC 7009, `POST /oauth/revoke` on the HTTP API).
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
+#[async_trait::async_trait]
+pub trait AccessTokenRevocation: Send + Sync {
+    async fn is_revoked(&self, jti: uuid::Uuid) -> Result<bool, RevocationUnavailable>;
+}
+
+/// The production store: the durable denylist the HTTP API's `/oauth/revoke`
+/// writes, read on this process's own pool.
+pub struct DbAccessTokenRevocation {
+    pool: sqlx::PgPool,
+}
+
+impl DbAccessTokenRevocation {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl AccessTokenRevocation for DbAccessTokenRevocation {
+    async fn is_revoked(&self, jti: uuid::Uuid) -> Result<bool, RevocationUnavailable> {
+        epigraph_db::RevokedAccessTokenRepository::is_revoked(&self.pool, jti)
+            .await
+            .map_err(|e| RevocationUnavailable(e.to_string()))
+    }
+}
+
 #[derive(Clone)]
 pub struct McpAuthState {
     pub jwt_config: Arc<JwtConfig>,
     /// Absolute URL of the protected-resource metadata doc, advertised in 401s.
     pub resource_metadata_url: Option<String>,
+    /// Where revoked access tokens are looked up.
+    pub revocation: Arc<dyn AccessTokenRevocation>,
 }
 
 pub async fn bearer_auth_middleware(
@@ -89,6 +132,32 @@ pub async fn bearer_auth_middleware(
             let token = &h[7..];
             match state.jwt_config.validate_token(token) {
                 Ok(claims) => {
+                    // Revocation (RFC 7009, migration 141), by the jti of a
+                    // token whose signature has just been verified. Refused with
+                    // the same uniform `invalid_token` as every other rejection;
+                    // the reason is logged server-side only. Fails CLOSED: a
+                    // store that cannot answer refuses the token.
+                    match state.revocation.is_revoked(claims.jti).await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            tracing::info!(reason = "revoked", "MCP bearer token rejected");
+                            return unauthorized(
+                                state.resource_metadata_url.as_deref(),
+                                INVALID_TOKEN,
+                            );
+                        }
+                        Err(RevocationUnavailable(e)) => {
+                            tracing::error!(
+                                reason = "revocation_unavailable",
+                                error = %e,
+                                "MCP bearer token rejected"
+                            );
+                            return unauthorized(
+                                state.resource_metadata_url.as_deref(),
+                                INVALID_TOKEN,
+                            );
+                        }
+                    }
                     let auth: AuthContext = claims.into();
                     req.extensions_mut().insert(auth);
                     // Stash the raw, still-signed token so the federation gateway
@@ -263,6 +332,12 @@ pub fn unauthenticated_context(
         client_type: epigraph_auth::ClientType::Service,
         scopes,
         jti: uuid::Uuid::nil(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        // Fail closed until `call_tool` reads the switch (elevation plan
+        // EL-10): armed, the listener's injected admin scopes count for nothing.
+        admin_scopes: epigraph_auth::AdminScopePosture::Armed,
     }
 }
 
@@ -289,6 +364,7 @@ pub fn is_principal_less(auth: &AuthContext) -> bool {
 /// A trait rather than the concrete type so this module does not depend on the
 /// server, and so the retry behaviour can be driven deterministically in a test
 /// without a database.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait::async_trait]
 pub trait ServerPrincipalSource: Send + Sync {
     /// The server's own `agents.id`, or a displayable reason it could not be
@@ -813,6 +889,7 @@ mod tests {
             None,
             None,
             chrono::Duration::minutes(-5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .unwrap()
         .0
@@ -827,6 +904,7 @@ mod tests {
             None,
             None,
             chrono::Duration::minutes(5),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .unwrap()
         .0
@@ -922,13 +1000,28 @@ mod tests {
     }
 
     /// The opt-in (`--allow-unauthenticated-writes`) keeps the pre-HTTP-id
-    /// scope set, every scope in the map.
+    /// scope set, every scope in the map, while the admin-scope switch is
+    /// unarmed. The injected context starts ARMED (fail closed, elevation plan
+    /// EL-10) until `call_tool` reads the switch: armed, its admin-only scopes
+    /// count for nothing (it is never elevated), every other scope still does.
     #[test]
     fn the_opt_in_principal_less_context_carries_every_scope() {
         let (reads, writes) = map_scopes();
-        let ctx = unauthenticated_context(None, UnauthenticatedWrites::AsListenerSigner);
+        let mut ctx = unauthenticated_context(None, UnauthenticatedWrites::AsListenerSigner);
+        assert_eq!(ctx.admin_scopes, epigraph_auth::AdminScopePosture::Armed);
         for s in reads.iter().chain(writes.iter()) {
-            assert!(ctx.has_scope(s), "opt-in context must carry {s}");
+            assert_eq!(
+                ctx.has_scope(s),
+                !epigraph_auth::is_admin_only_scope(s),
+                "armed, the opt-in context holds {s} only if it is not admin-only"
+            );
+        }
+        ctx.admin_scopes = epigraph_auth::AdminScopePosture::Unarmed;
+        for s in reads.iter().chain(writes.iter()) {
+            assert!(
+                ctx.has_scope(s),
+                "unarmed, the opt-in context must carry {s}"
+            );
         }
     }
 
@@ -954,6 +1047,7 @@ mod tests {
                 None,
                 Some(uuid::Uuid::new_v4()),
                 chrono::Duration::minutes(5),
+                epigraph_auth::AccessTokenBinding::NONE,
             )
             .unwrap();
         let validated: AuthContext = cfg.validate_token(&token).unwrap().into();

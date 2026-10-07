@@ -245,6 +245,10 @@ fn admin_auth(agent: Uuid) -> AuthContext {
         client_type: ClientType::Agent,
         scopes: vec!["claims:read".to_string(), "claims:admin".to_string()],
         jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
     }
 }
 

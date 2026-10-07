@@ -318,6 +318,7 @@ impl Decision {
 /// replaces it.
 ///
 /// Implement [`Self::check`]; **call** [`Self::authorize`].
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait PolicyGate: Send + Sync + 'static {
     /// Decide whether `principal` may perform `action` on `resource`.

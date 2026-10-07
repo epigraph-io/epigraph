@@ -168,6 +168,7 @@ pub fn test_bearer_token() -> String {
             Some(principal),
             Some(principal),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT issued");
     token
@@ -274,6 +275,7 @@ pub fn test_bearer_token_with_scopes(scopes: &[&str]) -> String {
             Some(principal),
             Some(principal),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT issued");
     token
@@ -564,6 +566,7 @@ pub async fn test_bearer_token_with_seeded_client(
             Some(client_id),
             Some(agent_id.as_uuid()),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT issued");
     (token, client_id)
@@ -600,6 +603,7 @@ pub async fn test_bearer_token_with_seeded_client_for_agent(
             None,
             Some(agent_id),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT issued");
     (token, client_id)
@@ -631,6 +635,7 @@ pub fn mint_token_with_agent(scopes: &[&str], agent_id: Uuid) -> String {
             None,
             Some(agent_id),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT issued");
     token

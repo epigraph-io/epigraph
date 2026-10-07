@@ -15,6 +15,52 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
+/// Render `ClaimRepository::list` rows a handler selected as `ClaimResponse`s,
+/// with their stored labels and real retirement state.
+///
+/// `query_claims_by_evidence` and `query_claims_by_methodology` used to emit
+/// `labels: Vec::new()`, `is_current: true`, `supersedes: None` for every row —
+/// although `ClaimRepository::list` returns superseded rows and projects their
+/// `is_current` / `supersedes` (drain unit U008, backlog `1e6efd2d` residual;
+/// the same defect `query_claims` had under `babd5904` / `a85ee585`). Labels
+/// come from ONE `labels_by_ids` read over the selection, which is viewer-spliced
+/// and deliberately not `is_current`-filtered; an id it does not return gets `[]`.
+///
+/// NOT ONE SNAPSHOT. The caller's row read and this label read are two
+/// statements on `server.pool`, so a concurrent `update_labels` between them can
+/// pair a row with its newer labels. That is the same accepted shape as
+/// `query_claims` (backlog `babd5904`); both errors propagate, so nothing is
+/// silently defaulted. `query_paper` and `query_undecomposed_claims` read the
+/// same way. Only REST `get_claim` reads row and labels in one statement.
+async fn claim_responses(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    claims: Vec<epigraph_core::Claim>,
+) -> Result<Vec<ClaimResponse>, McpError> {
+    let ids: Vec<uuid::Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
+    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+        .await
+        .map_err(internal_error)?;
+    Ok(claims
+        .into_iter()
+        .map(|claim| {
+            let id = claim.id.as_uuid();
+            ClaimResponse {
+                id: id.to_string(),
+                content: claim.content.clone(),
+                truth_value: claim.truth_value.value(),
+                agent_id: claim.agent_id.as_uuid().to_string(),
+                content_hash: ContentHasher::to_hex(&claim.content_hash),
+                created_at: claim.created_at.to_rfc3339(),
+                labels: labels_map.get(&id).cloned().unwrap_or_default(),
+                is_current: claim.is_current,
+                supersedes: claim.supersedes.map(|s| s.as_uuid().to_string()),
+                belief_score: None,
+            }
+        })
+        .collect())
+}
+
 /// Default page size for asserted claims when the caller supplies no `limit`.
 ///
 /// Was a hardcoded 100 with no caller override, which produced ~62K-character
@@ -119,6 +165,17 @@ pub async fn query_paper(
             .await
             .map_err(internal_error)?;
 
+    // Labels in one batched, viewer-spliced read over the page, and the row's
+    // real retirement state — not `labels: []` / `is_current: true` /
+    // `supersedes: None`. `list_asserted_claims` does not filter on
+    // `is_current` (the paging below depends on that row set), so a superseded
+    // asserted claim is on the page and must say so (drain unit U008, backlog
+    // `1e6efd2d` residual).
+    let ids: Vec<uuid::Uuid> = claim_rows.iter().map(|c| c.id).collect();
+    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+        .await
+        .map_err(internal_error)?;
+
     let mut claims = Vec::with_capacity(claim_rows.len());
     for c in claim_rows {
         claims.push(ClaimResponse {
@@ -128,9 +185,9 @@ pub async fn query_paper(
             agent_id: c.agent_id.to_string(),
             content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
-            labels: Vec::new(),
-            is_current: true,
-            supersedes: None,
+            labels: labels_map.get(&c.id).cloned().unwrap_or_default(),
+            is_current: c.is_current,
+            supersedes: c.supersedes.map(|s| s.to_string()),
             belief_score: None,
         });
     }
@@ -180,7 +237,7 @@ pub async fn query_claims_by_evidence(
         .map_err(internal_error)?;
 
     let evidence_type_lower = params.evidence_type.to_lowercase();
-    let mut results = Vec::new();
+    let mut matched: Vec<epigraph_core::Claim> = Vec::new();
 
     for claim in claims {
         if claim.truth_value.value() < min_truth {
@@ -205,26 +262,15 @@ pub async fn query_claims_by_evidence(
         });
 
         if matches {
-            results.push(ClaimResponse {
-                id: claim.id.as_uuid().to_string(),
-                content: claim.content.clone(),
-                truth_value: claim.truth_value.value(),
-                agent_id: claim.agent_id.as_uuid().to_string(),
-                content_hash: ContentHasher::to_hex(&claim.content_hash),
-                created_at: claim.created_at.to_rfc3339(),
-                labels: Vec::new(),
-                is_current: true,
-                supersedes: None,
-                belief_score: None,
-            });
+            matched.push(claim);
         }
 
-        if results.len() >= limit as usize {
+        if matched.len() >= limit as usize {
             break;
         }
     }
 
-    success_json(&results)
+    success_json(&claim_responses(server, viewer, matched).await?)
 }
 
 pub async fn query_claims_by_methodology(
@@ -240,7 +286,7 @@ pub async fn query_claims_by_methodology(
         .map_err(internal_error)?;
 
     let methodology_lower = params.methodology.to_lowercase();
-    let mut results = Vec::new();
+    let mut matched: Vec<epigraph_core::Claim> = Vec::new();
 
     for claim in claims {
         if claim.truth_value.value() < min_truth {
@@ -254,28 +300,17 @@ pub async fn query_claims_by_methodology(
             {
                 let method_name = trace.methodology.description().to_lowercase();
                 if method_name.contains(&methodology_lower) {
-                    results.push(ClaimResponse {
-                        id: claim.id.as_uuid().to_string(),
-                        content: claim.content.clone(),
-                        truth_value: claim.truth_value.value(),
-                        agent_id: claim.agent_id.as_uuid().to_string(),
-                        content_hash: ContentHasher::to_hex(&claim.content_hash),
-                        created_at: claim.created_at.to_rfc3339(),
-                        labels: Vec::new(),
-                        is_current: true,
-                        supersedes: None,
-                        belief_score: None,
-                    });
+                    matched.push(claim);
                 }
             }
         }
 
-        if results.len() >= limit as usize {
+        if matched.len() >= limit as usize {
             break;
         }
     }
 
-    success_json(&results)
+    success_json(&claim_responses(server, viewer, matched).await?)
 }
 
 pub async fn query_claims_by_label(
