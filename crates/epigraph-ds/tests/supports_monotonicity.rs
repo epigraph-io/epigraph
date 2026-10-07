@@ -137,3 +137,109 @@ fn appending_a_supporting_bba_never_lowers_betp_exhaustive_grid() {
             .join("\n")
     );
 }
+
+/// The same property on the BBA SHAPES production stores, not only closed-world
+/// simple supports (council finding on U025; the scope's Monte Carlo had this
+/// second arm, with 10.6% drops on main):
+///
+/// - edge-factor BBAs carrying open-world `(Omega, true)` mass
+///   (`epistemic_interval::to_mass_function`, here a 0.6/1.0/ow 0.2 interval
+///   discounted by 0.9: `{x: 0.54, Theta: 0.28, missing: 0.18}`);
+/// - assess BBAs carrying open-world vacuous `(empty, true)` mass at the 0.05
+///   default (`bba.rs`);
+/// - complement (negative) elements, which push `open_world_fraction` above
+///   the old selector's 0.03 YagerOpen threshold;
+/// - discounted simple supports.
+///
+/// Every multiset pool of 1..=3 such atoms, plus a closed-world TRUE support.
+#[test]
+fn appending_a_supporting_bba_never_lowers_betp_on_open_world_shapes() {
+    use epigraph_ds::FocalElement;
+    use std::collections::BTreeMap;
+
+    let f = binary_frame();
+    let build = |pairs: Vec<(FocalElement, f64)>| -> MassFunction {
+        let m: BTreeMap<FocalElement, f64> = pairs.into_iter().collect();
+        MassFunction::new(f.clone(), m).expect("valid BBA")
+    };
+    let pos = |i: usize| FocalElement::positive(BTreeSet::from([i]));
+
+    let mut atoms: Vec<(String, MassFunction)> = Vec::new();
+    for idx in [0_usize, 1] {
+        for s in [0.3, 0.6, 0.9] {
+            atoms.push((format!("simple({idx},{s})"), simple(&f, idx, s)));
+            let d = combination::discount(&simple(&f, idx, s), 0.7).expect("discount");
+            atoms.push((format!("simple({idx},{s})@0.7"), d));
+        }
+        atoms.push((
+            format!("edge({idx})"),
+            build(vec![
+                (pos(idx), 0.54),
+                (FocalElement::theta(&f), 0.28),
+                (FocalElement::missing(&f), 0.18),
+            ]),
+        ));
+        atoms.push((
+            format!("assess({idx})"),
+            build(vec![
+                (pos(idx), 0.6),
+                (FocalElement::theta(&f), 0.35),
+                (FocalElement::vacuous(), 0.05),
+            ]),
+        ));
+        atoms.push((
+            format!("not({idx})"),
+            build(vec![
+                (FocalElement::negative(BTreeSet::from([idx])), 0.3),
+                (FocalElement::theta(&f), 0.7),
+            ]),
+        ));
+    }
+    assert!(
+        atoms.iter().any(|(_, m)| m.open_world_fraction() > 0.03),
+        "the arm must include inputs the old selector treated as open-world"
+    );
+
+    let mut pools: Vec<Vec<usize>> = Vec::new();
+    for a in 0..atoms.len() {
+        pools.push(vec![a]);
+        for b in a..atoms.len() {
+            pools.push(vec![a, b]);
+            for c in b..atoms.len() {
+                pools.push(vec![a, b, c]);
+            }
+        }
+    }
+
+    let mut checked = 0_usize;
+    let mut violations: Vec<String> = Vec::new();
+    for pool in &pools {
+        let prior: Vec<MassFunction> = pool.iter().map(|&i| atoms[i].1.clone()).collect();
+        let before = betp_true(&prior);
+        for s_new in [0.3, 0.6, 0.9] {
+            let mut after = prior.clone();
+            after.push(simple(&f, 0, s_new));
+            let after_v = betp_true(&after);
+            checked += 1;
+            if after_v < before - 1e-9 {
+                let names: Vec<&str> = pool.iter().map(|&i| atoms[i].0.as_str()).collect();
+                violations.push(format!(
+                    "{names:?} + simple(0,{s_new}): {before:.4} -> {after_v:.4}"
+                ));
+            }
+        }
+    }
+
+    assert!(checked > 3000, "grid too small to mean anything: {checked}");
+    assert!(
+        violations.is_empty(),
+        "{} of {checked} supporting appends LOWERED BetP(TRUE); first 10:\n{}",
+        violations.len(),
+        violations
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
