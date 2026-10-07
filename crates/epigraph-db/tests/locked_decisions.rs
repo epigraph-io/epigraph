@@ -843,15 +843,36 @@ fn d3_the_only_unrestricted_shape_costs_a_lease() {
 }
 
 /// D3, half three: the set of routes reachable with no `Authorization` header is
-/// an allowlist of exactly two application routes, in **both** `create_router`
-/// variants.
+/// an allowlist, in **both** `create_router` variants: two application routes,
+/// plus, in the `db` variant only, the passkey enrollment ceremony (elevation
+/// plan EL-3), the elevation ceremony (EL-5) and the admin-act confirmation
+/// (EL-12b), which are anonymous by design (the enrollment, ticket or act id
+/// and the authenticator are their credentials; they need the database).
 ///
 /// The `#[cfg(not(feature = "db"))]` variant is not built in any buildable
 /// configuration, so a source lint is the only mechanism that covers it at all.
 #[test]
 fn d3_anonymous_route_surface_is_the_allowlist() {
     let src = read(ROUTES_MOD_RS);
-    let expected: BTreeSet<&str> = ["/health", "/api/v1/openapi.json"].into_iter().collect();
+    let no_db: BTreeSet<&str> = ["/health", "/api/v1/openapi.json"].into_iter().collect();
+    let db: BTreeSet<&str> = no_db
+        .iter()
+        .copied()
+        .chain([
+            "/elevate/enroll/:id",
+            "/elevate/enroll/:id/challenge",
+            "/elevate/enroll/:id/finish",
+            "/elevate/assets/enroll.js",
+            "/elevate/assets/elevate.css",
+            "/elevate/:ticket",
+            "/elevate/:ticket/challenge",
+            "/elevate/:ticket/assert",
+            "/elevate/act/:id",
+            "/elevate/act/:id/challenge",
+            "/elevate/act/:id/assert",
+            "/elevate/assets/elevate.js",
+        ])
+        .collect();
 
     let chains: Vec<&str> = statement_starts(&src, "let public = Router::new()")
         .into_iter()
@@ -867,10 +888,12 @@ fn d3_anonymous_route_surface_is_the_allowlist() {
         chains.len()
     );
 
+    // The `db` variant comes first in the file.
     for (i, chain) in chains.iter().enumerate() {
         let routes: BTreeSet<&str> = route_literals(chain).into_iter().collect();
+        let expected = if i == 0 { &db } else { &no_db };
         assert_eq!(
-            routes, expected,
+            &routes, expected,
             "create_router variant #{i}: the anonymous surface is not the \
              allowlist. Registering a route on the `public` chain puts it back \
              on the unauthenticated internet — which under D3 is a decision that \
@@ -1391,6 +1414,88 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "INSERT INTO instance_admins",
         "UPDATE instance_admins",
         "DELETE FROM instance_admins",
+        // Migration 123: the authority is now a role assignment, and the same
+        // rule holds for it. Granting or ending one is an operator act on the
+        // maintenance DSN (`epigraph-operator grant-role` /
+        // `end-role-assignment`, in the CLI's LIBRARY module, which the
+        // allowance below names), never a route, tool or job.
+        "RoleAssignmentRepository::grant",
+        "RoleAssignmentRepository::end",
+        // The CALL shapes (a bind as the first argument), not the bare names:
+        // `tenancy_backfill.rs` names both definers in its ownership and grant
+        // registers, which is verification, not a write.
+        "epigraph_grant_role($",
+        "epigraph_end_role_assignment($",
+        "INSERT INTO role_assignments",
+        "UPDATE role_assignments",
+        "DELETE FROM role_assignments",
+        "INSERT INTO platform_roles",
+        "UPDATE platform_roles",
+        "DELETE FROM platform_roles",
+        // Migration 124: opening a passkey enrollment ticket and revoking a
+        // passkey are operator acts on the maintenance DSN
+        // (`epigraph-operator passkey-enroll` / `revoke-passkey`), never a
+        // route, tool or job: a request path that could open a ticket would
+        // let a token mint the confirmation it is later checked against. The
+        // ceremony's three app-callable definers (reader, challenge store,
+        // completion) are NOT banned: the enrollment API calls them.
+        "PasskeyRepository::create_enrollment",
+        "PasskeyRepository::revoke",
+        "epigraph_create_passkey_enrollment($",
+        "epigraph_revoke_passkey($",
+        "INSERT INTO passkey_enrollments",
+        "UPDATE passkey_enrollments",
+        "DELETE FROM passkey_enrollments",
+        "INSERT INTO person_authenticators",
+        "UPDATE person_authenticators",
+        "DELETE FROM person_authenticators",
+        // Migration 125: an elevation ticket and an elevation session are
+        // written ONLY by 125's definers (the ticket API, the ceremony, the
+        // grant and the end calls, all app-callable and NOT banned here), so
+        // that every write meets the table guards' ELV02/ELV03/ELV06 through
+        // the one path that also writes the audit. A raw statement on the
+        // maintenance pool (jobs, CLI) would skip the definer's principal
+        // binding; ending other people's expired sessions is the definers'
+        // lazy expiry, never a sweep a route or job runs.
+        "INSERT INTO elevation_tickets",
+        "UPDATE elevation_tickets",
+        "DELETE FROM elevation_tickets",
+        "INSERT INTO elevation_sessions",
+        "UPDATE elevation_sessions",
+        "DELETE FROM elevation_sessions",
+        "epigraph_end_expired_elevations($",
+        // Migration 127: the elevated-access log is written ONLY by its
+        // recorder definer (app-callable, NOT banned here: the API response
+        // layer and the MCP wrapper call it), which refuses an unelevated
+        // connection and decides the owner groups itself. A raw INSERT would
+        // skip both; nothing ever updates or deletes a row.
+        "INSERT INTO elevated_access",
+        "UPDATE elevated_access",
+        "DELETE FROM elevated_access",
+        // Migration 128: the admin-scope arming switch is changed ONLY by
+        // its maintenance setter (`epigraph-operator arm-admin-scopes`), and
+        // the request path has no grant to change it anyway; a raw statement
+        // on any of these crates would be a second, unreviewed way to arm.
+        "UPDATE admin_scope_enforcement",
+        "INSERT INTO admin_scope_enforcement",
+        "DELETE FROM admin_scope_enforcement",
+        "epigraph_set_admin_scope_enforcement($",
+        "AdminScopeEnforcement::set(",
+        // Migration 130: a pending admin act is written ONLY by its definers
+        // (the proposal and the confirmation ceremony, app-callable and NOT
+        // banned here: the act API calls them) and consumed ONLY from inside
+        // the maintenance write it authorizes (the 123 / 124 guards and the
+        // custodial recorder, in the database). A raw statement would skip the
+        // live-elevation binding, the proposer's-passkey rule or the args
+        // recomputation; a direct consume would spend an act on nothing. The
+        // act-taking repository forms are the operator CLI's (its library
+        // modules are allowed below); `grant_on_act`, `end_on_act` and
+        // `create_enrollment_on_act` are caught by the 123 / 124 needles above.
+        "INSERT INTO pending_admin_acts",
+        "UPDATE pending_admin_acts",
+        "DELETE FROM pending_admin_acts",
+        "epigraph_consume_admin_act($",
+        "record_custodial_act_on_act",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //
@@ -1412,7 +1517,37 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
     // 18c's chartered surface — banning a read it may legitimately need would be
     // a rule written ahead of the decision that owns it. The write half scans
     // all four because a grant is never legitimate outside the operator CLI.
-    const BANNED_READS: &[&str] = &["InstanceAdminRepository::list", "FROM instance_admins"];
+    const BANNED_READS: &[&str] = &[
+        "InstanceAdminRepository::list",
+        "FROM instance_admins",
+        // 123: the roster of role holders, read only through the
+        // subject-bound definers on the request path.
+        "RoleAssignmentRepository::list",
+        "FROM role_assignments",
+        "epigraph_live_role_assignment",
+        // 124: who holds which passkey is read on the request path only
+        // through the ceremony's own definers (by ticket), never listed.
+        "PasskeyRepository::list",
+        "PasskeyRepository::get",
+        "FROM person_authenticators",
+        "FROM passkey_enrollments",
+        // 125: who elevated, when, on which family, and who MAY elevate, are
+        // read on the request path only through the principal-bound or
+        // ticket-keyed definers, never listed; the three unbound helpers answer
+        // for ANY person or session (a roster oracle) and are not even
+        // app-executable.
+        "FROM elevation_tickets",
+        "FROM elevation_sessions",
+        "epigraph_live_elevating_assignment",
+        "epigraph_family_of_person_is_live",
+        "epigraph_elevation_session_is_live",
+        // Migration 130: the act read is a maintenance read (the act API gets
+        // its own principal-bound lister), and whether a person holds a live
+        // passkey is a roster oracle.
+        "AdminActRepository::get",
+        "FROM pending_admin_acts",
+        "epigraph_has_live_passkey",
+    ];
     const READ_ROOTS: usize = 2;
     // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision
     // scanned `epigraph-api/src` and `epigraph-mcp/src` only — the two APP-POOL
@@ -1438,7 +1573,18 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
     // The operator CLI: the one intended writer. The allowance is a path suffix
     // rather than a file name so a second `instance_admin.rs` elsewhere in the
     // scanned tree does not inherit it.
-    const ALLOWED: &str = "epigraph-cli/src/bin/instance_admin.rs";
+    const ALLOWED: &[&str] = &[
+        "epigraph-cli/src/bin/instance_admin.rs",
+        // 123: the operator's role verbs (`grant-role`, `end-role-assignment`,
+        // `list-role-assignments`), on the maintenance DSN.
+        "epigraph-cli/src/operator/custodian.rs",
+        "epigraph-cli/src/bin/operator.rs",
+        // 124: the operator's passkey verbs, on the maintenance DSN.
+        "epigraph-cli/src/operator/passkey.rs",
+        // 128: the operator's admin-scope arm / disarm verbs, on the
+        // maintenance DSN.
+        "epigraph-cli/src/operator/admin_scopes.rs",
+    ];
 
     let mut offenders: Vec<String> = Vec::new();
     for (idx, root) in roots.into_iter().enumerate() {
@@ -1460,7 +1606,8 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         );
         for path in sources {
             let display = path.display().to_string();
-            if display.replace('\\', "/").contains(ALLOWED) {
+            let normalised = display.replace('\\', "/");
+            if ALLOWED.iter().any(|a| normalised.contains(a)) {
                 continue;
             }
             // Collapse runs of whitespace before matching. The needles are exact
@@ -2082,6 +2229,14 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "instance_admins",
     "operator_links",
     "evidence_visibility_pins",
+    "platform_roles",
+    "role_assignments",
+    "passkey_enrollments",
+    "person_authenticators",
+    "elevation_tickets",
+    "elevation_sessions",
+    "elevated_access",
+    "pending_admin_acts",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2130,6 +2285,39 @@ const PRIVATIZATION_TABLES: &[&str] = &[
 /// control table nor a D4 privatization table. Neither carries `visibility` /
 /// `owner_group_id` columns, so neither joins `tier_a`.
 const OPERATOR_TABLES: &[&str] = &["operator_links", "evidence_visibility_pins"];
+
+/// The custodian role's catalog and its assignments, which migration 123
+/// creates and FORCEs. A FIFTH TERM for the reason the two above are separate:
+/// FORCEd by the migration that creates them, neither a 079 control table, a
+/// D4 privatization table nor an operator record, and carrying no
+/// `visibility` / `owner_group_id` columns, so neither joins `tier_a`.
+const CUSTODIAN_TABLES: &[&str] = &["platform_roles", "role_assignments"];
+
+/// A registered human's passkeys and their enrollment tickets, which migration
+/// 124 creates and FORCEs. A SIXTH TERM for the reason the four above are
+/// separate: FORCEd by the migration that creates them, none of the earlier
+/// kinds, and carrying no `visibility` / `owner_group_id` columns, so neither
+/// joins `tier_a`.
+const PASSKEY_TABLES: &[&str] = &["passkey_enrollments", "person_authenticators"];
+
+/// A human's elevation tickets and elevation sessions, which migration 125
+/// creates and FORCEs. A SEVENTH TERM for the same reason as the six above:
+/// FORCEd by the migration that creates them, none of the earlier kinds, and
+/// carrying no `visibility` / `owner_group_id` columns, so neither joins
+/// `tier_a`.
+const ELEVATION_TABLES: &[&str] = &["elevation_tickets", "elevation_sessions"];
+
+/// The log of elevated reads, which migration 127 creates and FORCEs. An
+/// EIGHTH TERM for the same reason as the seven above: FORCEd by the
+/// migration that creates it, none of the earlier kinds, and carrying no
+/// `visibility` / `owner_group_id` columns, so it does not join `tier_a`.
+const ELEVATED_ACCESS_TABLES: &[&str] = &["elevated_access"];
+
+/// The pending admin acts, which migration 130 creates and FORCEs. A NINTH
+/// TERM for the same reason as the eight above: FORCEd by the migration that
+/// creates it, none of the earlier kinds, and carrying no `visibility` /
+/// `owner_group_id` columns, so it does not join `tier_a`.
+const ADMIN_ACT_TABLES: &[&str] = &["pending_admin_acts"];
 
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
@@ -2180,6 +2368,11 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .chain(CONTROL_TABLES.iter().map(|s| (*s).to_string()))
         .chain(PRIVATIZATION_TABLES.iter().map(|s| (*s).to_string()))
         .chain(OPERATOR_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(CUSTODIAN_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(PASSKEY_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(ELEVATION_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(ELEVATED_ACCESS_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(ADMIN_ACT_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()

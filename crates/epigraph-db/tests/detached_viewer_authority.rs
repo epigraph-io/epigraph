@@ -9,8 +9,8 @@
 //! a shape that is supposed to be UNREPRESENTABLE cannot be proved by a test
 //! that runs.
 //!
-//! `detach_scoped` is the deliberate exception: three production call sites
-//! need an owned copy of a REQUEST's own read authority, because a detached
+//! `detach_scoped` is the deliberate exception: production call sites need an
+//! owned copy of a REQUEST's own read authority, because a detached
 //! `tokio::spawn` and an axum extractor both take their viewer by value. That
 //! exception is a behavioural surface, so it gets behavioural coverage, and
 //! both directions of it:
@@ -27,6 +27,13 @@
 //!
 //! Both assertions are on the EFFECT — which rows come back — not on the
 //! shape of the value, because the shape is private and the rows are the point.
+//!
+//! The THIRD shape, elevated (EL-6), detaches DOWNGRADED: the copy is the
+//! principal's plain scoped viewer, which stamps no elevation. That needs a
+//! live elevation session to build, so it is asserted where the session
+//! fixtures live: `elevated_viewer.rs::an_elevated_viewer_detaches_as_the_principals_scoped_viewer`
+//! (rows and the database's own `epigraph_is_elevated()`), and in
+//! `visibility.rs`'s unit tests (the accessors).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;

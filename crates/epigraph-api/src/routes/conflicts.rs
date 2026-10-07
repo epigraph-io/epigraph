@@ -79,6 +79,11 @@ pub struct LearningEventsQuery {
 
 // ── Handlers ──
 
+/// Frames the two silence scans read (`scan_conflicts`, `silence_check`), in
+/// frame-id order. Was an unordered `FROM frames f LIMIT 100`.
+#[cfg(feature = "db")]
+const SILENCE_SCAN_FRAME_LIMIT: i64 = 100;
+
 /// GET /api/v1/conflicts/scan - Scan for high-conflict claim pairs.
 #[cfg(feature = "db")]
 pub async fn scan_conflicts(
@@ -118,22 +123,14 @@ pub async fn scan_conflicts(
     })
     .collect();
 
-    // Scan for silence alarms
-    let frame_densities: Vec<FrameDensityRow> = sqlx::query_as(
-        "SELECT f.id AS frame_id, f.name AS frame_name, \
-                (SELECT COUNT(DISTINCT mf.claim_id) FROM mass_functions mf WHERE mf.frame_id = f.id) AS total_claims, \
-                (SELECT COUNT(*) FROM edges e \
-                 JOIN mass_functions mf1 ON mf1.claim_id = e.source_id AND mf1.frame_id = f.id \
-                 WHERE e.relationship = 'CONTRADICTS') AS contradicts_edges, \
-                (SELECT COUNT(DISTINCT mf2.source_agent_id) FROM mass_functions mf2 \
-                 WHERE mf2.frame_id = f.id AND mf2.source_agent_id IS NOT NULL) AS distinct_sources \
-         FROM frames f LIMIT 100",
-    )
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to scan frame densities: {e}"),
-    })?;
+    // Scan for silence alarms. `contradicts_edges` counts distinct claim pairs
+    // joined by a live contradicts/refutes edge (see `ConflictDensityRepository`).
+    let frame_densities: Vec<epigraph_db::FrameConflictDensity> =
+        epigraph_db::ConflictDensityRepository::scan(&state.db_pool, SILENCE_SCAN_FRAME_LIMIT)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to scan frame densities: {e}"),
+            })?;
 
     let silence_alarms: Vec<serde_json::Value> = frame_densities
         .iter()
@@ -359,21 +356,12 @@ pub async fn resolve_conflict(
 pub async fn silence_check(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let frame_densities: Vec<FrameDensityRow> = sqlx::query_as(
-        "SELECT f.id AS frame_id, f.name AS frame_name, \
-                (SELECT COUNT(DISTINCT mf.claim_id) FROM mass_functions mf WHERE mf.frame_id = f.id) AS total_claims, \
-                (SELECT COUNT(*) FROM edges e \
-                 JOIN mass_functions mf1 ON mf1.claim_id = e.source_id AND mf1.frame_id = f.id \
-                 WHERE e.relationship = 'CONTRADICTS') AS contradicts_edges, \
-                (SELECT COUNT(DISTINCT mf2.source_agent_id) FROM mass_functions mf2 \
-                 WHERE mf2.frame_id = f.id AND mf2.source_agent_id IS NOT NULL) AS distinct_sources \
-         FROM frames f LIMIT 100",
-    )
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to scan frame densities: {e}"),
-    })?;
+    let frame_densities: Vec<epigraph_db::FrameConflictDensity> =
+        epigraph_db::ConflictDensityRepository::scan(&state.db_pool, SILENCE_SCAN_FRAME_LIMIT)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to scan frame densities: {e}"),
+            })?;
 
     let alarms: Vec<serde_json::Value> = frame_densities
         .iter()
@@ -496,14 +484,4 @@ struct HighConflictRow {
     max_k: Option<f64>,
     bba_count: i64,
     content: String,
-}
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct FrameDensityRow {
-    frame_id: Uuid,
-    frame_name: String,
-    total_claims: i64,
-    contradicts_edges: i64,
-    distinct_sources: i64,
 }

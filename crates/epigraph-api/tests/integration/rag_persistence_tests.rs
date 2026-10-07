@@ -136,6 +136,7 @@ fn rag_bearer_token() -> String {
             None,
             Some(Uuid::new_v4()),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT issued");
     token

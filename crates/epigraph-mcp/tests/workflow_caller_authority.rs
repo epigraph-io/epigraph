@@ -1,11 +1,13 @@
 //! Batch H-b, H3 (backlog 84b2a98d): a system-stamped workflow mutation checks
 //! the CALLER's authority over the workflow it names.
 //!
-//! The rule is forward-only, and these arms pin both halves of that:
-//! a workflow CREATED through an ingest records its submitter and is then
-//! mutable only by that submitter, its operator, or `claims:admin`; a workflow
-//! with NO record (every workflow written before this change — nothing recorded
-//! who created them) keeps today's behaviour. See
+//! These arms pin both halves of the rule: a workflow CREATED through an
+//! ingest records its submitter and is then mutable, over the authenticated
+//! transport, only by that submitter, its operator, or the audited
+//! `claims:admin` path; a workflow with NO record (every workflow written
+//! before batch H-b — nothing recorded who created them) is platform corpus
+//! (U005, default decision A) and is mutable over that transport ONLY through
+//! the audited `claims:admin` path. stdio is unchanged for both. See
 //! `src/tools/workflow_authority.rs` for the measurement.
 //!
 //! The decision is Rust-side and data-driven (`workflows.metadata`), so this
@@ -16,7 +18,10 @@
 //! `a_stranger_cannot_add_or_delete_steps_on_a_submitted_workflow` and
 //! `improving_someone_elses_workflow_is_refused`; recording the submitter
 //! unconditionally (dropping the `creating` guard) fails
-//! `a_reingest_by_another_caller_does_not_take_the_workflow_over`.
+//! `a_reingest_by_another_caller_does_not_take_the_workflow_over`; restoring
+//! the WARN-and-allow arm for a workflow with no record fails
+//! `a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller` and
+//! `a_legacy_workflow_is_mutable_only_through_the_audited_admin_arm`.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -204,38 +209,307 @@ async fn a_stranger_cannot_add_or_delete_steps_on_a_submitted_workflow(pool: PgP
     assert_eq!(steps(&pool, "h3-owned").await, before + 2);
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_legacy_workflow_with_no_record_keeps_todays_behaviour(pool: PgPool) {
-    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
-    let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
-    let (_stranger, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
+/// Ingest `canonical` as `owner`, then strip the recorded submitter: the shape
+/// of every workflow written before batch H-b (nothing recorded who created
+/// them). Returns the lineage of its one step.
+async fn legacy_workflow(
+    pool: &PgPool,
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    owner_viewer: &epigraph_db::visibility::Viewer,
+    owner_token: &epigraph_auth::AuthContext,
+    canonical: &str,
+) -> Uuid {
     tools::workflow_ingest::ingest_workflow(
-        &server,
-        &owner_viewer,
+        server,
+        owner_viewer,
         IngestWorkflowParams {
-            extraction: extraction("h3-legacy", serde_json::json!({})),
+            extraction: extraction(canonical, serde_json::json!({})),
         },
-        Some(&owner_token),
+        Some(owner_token),
     )
     .await
     .expect("ingest");
-    // The shape of every workflow written before batch H-b.
     sqlx::query(
         "UPDATE workflows SET metadata = metadata - 'epigraph_submitted_by' \
-          WHERE canonical_name = 'h3-legacy'",
+          WHERE canonical_name = $1",
     )
-    .execute(&pool)
+    .bind(canonical)
+    .execute(pool)
     .await
     .expect("forget the submitter");
+    assert_eq!(submitter(pool, canonical).await, None, "a legacy row");
+    sqlx::query_scalar(
+        "SELECT c.step_lineage_id FROM claims c JOIN edges e ON e.target_id = c.id \
+           JOIN workflows w ON w.id = e.source_id \
+          WHERE w.canonical_name = $1 AND c.step_lineage_id IS NOT NULL LIMIT 1",
+    )
+    .bind(canonical)
+    .fetch_one(pool)
+    .await
+    .expect("a step lineage")
+}
 
-    tools::step_ops::add_step(
+/// The truth of every claim of a step lineage, in id order.
+async fn lineage_truths(pool: &PgPool, lineage: Uuid) -> Vec<f64> {
+    sqlx::query_scalar("SELECT truth_value FROM claims WHERE step_lineage_id = $1 ORDER BY id")
+        .bind(lineage)
+        .fetch_all(pool)
+        .await
+        .expect("lineage truths")
+}
+
+/// U005 (backlog 84b2a98d), default decision A: a workflow with no recorded
+/// submitter is PLATFORM corpus. Over the authenticated transport a
+/// `claims:write` caller may not mutate it — not a stranger, and not the agent
+/// that happened to ingest it, since nothing records that it did. Before this
+/// change every arm below was admitted with a WARN (`delete_step` drove the
+/// step's truth to 0.05).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (_stranger, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let lineage = legacy_workflow(&pool, &server, &owner_viewer, &owner_token, "h3-legacy").await;
+    let before = steps(&pool, "h3-legacy").await;
+    let truths = lineage_truths(&pool, lineage).await;
+
+    let err = tools::step_ops::add_step(
         &server,
         &stranger_viewer,
-        add("h3-legacy", "anyone's step, as before"),
+        add("h3-legacy", "a stranger's step"),
         Some(&stranger_token),
     )
     .await
-    .expect("a workflow with no recorded submitter stays open, as before H-b");
+    .expect_err("a legacy workflow is platform corpus: claims:write alone may not mutate it");
+    assert!(
+        err.message.contains("no recorded submitter"),
+        "the refusal names the legacy rule: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("audited claims:admin path"),
+        "the refusal names the one arm that admits: {}",
+        err.message
+    );
+    assert_eq!(steps(&pool, "h3-legacy").await, before, "nothing written");
+
+    // The ORIGINAL ingester is refused too: no record says it submitted it.
+    let err = tools::step_ops::add_step(
+        &server,
+        &owner_viewer,
+        add("h3-legacy", "the ingester's step"),
+        Some(&owner_token),
+    )
+    .await
+    .expect_err("no record means no submitter arm");
+    assert!(
+        err.message.contains("no recorded submitter"),
+        "{}",
+        err.message
+    );
+    assert_eq!(steps(&pool, "h3-legacy").await, before, "nothing written");
+
+    let err = tools::step_ops::delete_step(
+        &server,
+        &stranger_viewer,
+        DeleteStepParams {
+            canonical_name: "h3-legacy".to_string(),
+            step_lineage_id: lineage.to_string(),
+        },
+        Some(&stranger_token),
+    )
+    .await
+    .expect_err("a stranger must not soft-delete a legacy workflow's step");
+    assert!(
+        err.message.contains("no recorded submitter"),
+        "refused by the legacy rule, not for another reason: {}",
+        err.message
+    );
+    assert_eq!(
+        lineage_truths(&pool, lineage).await,
+        truths,
+        "the step's truth is untouched (not driven to 0.05)"
+    );
+
+    // A refined phase, as the admin arm's improve uses: the call differs from
+    // the stored generation, so the only thing left to refuse it is authority.
+    let mut refined = extraction("ignored", serde_json::json!({}));
+    refined.phases[0].summary = "a stranger's refined phase".to_string();
+    let err = tools::workflow_ingest::improve_workflow_hierarchy(
+        &server,
+        &stranger_viewer,
+        ImproveWorkflowHierarchyParams {
+            parent_canonical_name: "h3-legacy".to_string(),
+            extraction: refined,
+        },
+        Some(&stranger_token),
+    )
+    .await
+    .expect_err("a stranger must not add a generation to a legacy lineage");
+    assert!(
+        err.message.contains("no recorded submitter"),
+        "refused by the legacy rule, not for another reason: {}",
+        err.message
+    );
+    assert_eq!(
+        generation_rows(&pool, "h3-legacy").await,
+        vec![(0, None)],
+        "no generation-1 row"
+    );
+
+    // CALIBRATION: the lineage the stranger was refused on IS deletable — a
+    // stdio delete_step (unchecked) drives its head to 0.05 — so the refusal
+    // above was the authority gate, not an unknown lineage.
+    let public = fixture::public_viewer(&pool).await;
+    tools::step_ops::delete_step(
+        &server,
+        &public,
+        DeleteStepParams {
+            canonical_name: "h3-legacy".to_string(),
+            step_lineage_id: lineage.to_string(),
+        },
+        None,
+    )
+    .await
+    .expect("stdio soft-deletes the same step");
+    let after = lineage_truths(&pool, lineage).await;
+    assert_ne!(after, truths, "the stdio delete changed the lineage");
+    assert!(
+        after.iter().any(|t| (t - 0.05).abs() < 1e-9),
+        "its head is driven to 0.05: {after:?}"
+    );
+}
+
+/// The arm that DOES admit a legacy workflow over the authenticated transport:
+/// the audited admin path, exactly as for a submitted workflow — the token's
+/// `claims:admin` re-checked against its client record (ADM02), and the write
+/// recorded as `workflows.admin_write` with `"submitter": null`. A new
+/// generation of a legacy lineage inherits no record, so platform lineage stays
+/// platform.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_workflow_is_mutable_only_through_the_audited_admin_arm(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    legacy_workflow(
+        &pool,
+        &server,
+        &owner_viewer,
+        &owner_token,
+        "h3-legacy-admin",
+    )
+    .await;
+    let before = steps(&pool, "h3-legacy-admin").await;
+
+    let (grantless, admin_viewer) = common::server_admin(&server).await;
+    let admin = grantless.agent_id.expect("admin agent");
+    let err = tools::step_ops::add_step(
+        &server,
+        &admin_viewer,
+        add("h3-legacy-admin", "a grantless admin's step"),
+        Some(&grantless),
+    )
+    .await
+    .expect_err("claims:admin in the token alone does not admit a legacy workflow either");
+    assert!(err.message.contains("ADM02"), "{}", err.message);
+    assert!(
+        err.message.contains("no recorded submitter"),
+        "{}",
+        err.message
+    );
+    assert_eq!(
+        steps(&pool, "h3-legacy-admin").await,
+        before,
+        "nothing written"
+    );
+    assert_eq!(workflow_admin_audits(&pool, admin).await, 0);
+
+    let (granted, _) = common::server_admin(&server).await;
+    seed_admin_grant(&pool, &granted).await;
+    tools::step_ops::add_step(
+        &server,
+        &admin_viewer,
+        add("h3-legacy-admin", "an audited admin's step"),
+        Some(&granted),
+    )
+    .await
+    .expect("a live claims:admin grant adds a step to a legacy workflow");
+    assert_eq!(steps(&pool, "h3-legacy-admin").await, before + 1);
+    assert_eq!(
+        workflow_admin_audits(&pool, admin).await,
+        1,
+        "the admin write on a legacy workflow is audited"
+    );
+    let head: Uuid =
+        sqlx::query_scalar("SELECT id FROM workflows WHERE canonical_name = 'h3-legacy-admin'")
+            .fetch_one(&pool)
+            .await
+            .expect("workflow id");
+    // `->>` cannot tell a JSON null from a missing key; the record must carry
+    // the key, null.
+    let (workflow, submitter_kind): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT details->>'workflow_id', jsonb_typeof(details->'submitter') \
+           FROM security_events WHERE event_type = 'workflows.admin_write' AND agent_id = $1",
+    )
+    .bind(admin)
+    .fetch_one(&pool)
+    .await
+    .expect("audit row");
+    assert_eq!(workflow, Some(head.to_string()));
+    assert_eq!(
+        submitter_kind.as_deref(),
+        Some("null"),
+        "\"submitter\": null"
+    );
+
+    // A new generation through the admin arm: admitted, audited, and it
+    // inherits NO record, so the lineage stays platform corpus.
+    let mut refined = extraction("ignored", serde_json::json!({}));
+    refined.phases[0].summary = "an admin's refined phase".to_string();
+    tools::workflow_ingest::improve_workflow_hierarchy(
+        &server,
+        &admin_viewer,
+        ImproveWorkflowHierarchyParams {
+            parent_canonical_name: "h3-legacy-admin".to_string(),
+            extraction: refined,
+        },
+        Some(&granted),
+    )
+    .await
+    .expect("the audited admin arm improves a legacy lineage");
+    assert_eq!(
+        generation_rows(&pool, "h3-legacy-admin").await,
+        vec![(0, None), (1, None)],
+        "the new generation records no submitter: platform lineage stays platform"
+    );
+    assert_eq!(workflow_admin_audits(&pool, admin).await, 2);
+}
+
+/// stdio is unchanged (the batch H-b bar): a stdio caller is not checked, on a
+/// legacy workflow as on a submitted one. Passes before and after U005; it
+/// pins that the legacy rule did not reach stdio.
+#[sqlx::test(migrations = "../../migrations")]
+async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let public = fixture::public_viewer(&pool).await;
+    let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    legacy_workflow(
+        &pool,
+        &server,
+        &owner_viewer,
+        &owner_token,
+        "h3-legacy-stdio",
+    )
+    .await;
+    let before = steps(&pool, "h3-legacy-stdio").await;
+    tools::step_ops::add_step(
+        &server,
+        &public,
+        add("h3-legacy-stdio", "a stdio step"),
+        None,
+    )
+    .await
+    .expect("stdio is not checked, legacy or not");
+    assert_eq!(steps(&pool, "h3-legacy-stdio").await, before + 1);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

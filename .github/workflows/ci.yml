@@ -16,10 +16,12 @@ jobs:
     # Bound the job. Every job here inherited GitHub's 6-hour default, so a
     # hung step burned six hours and left the merge watcher reporting "pending"
     # with no signal to act on — PR-19 saw one step run ~40 minutes against a
-    # 7-12 minute norm with nothing to compare it to. 90 minutes is ~7x the
-    # observed norm: a real slowdown still finishes, a hang is cut off with a
-    # named cause.
-    timeout-minutes: 90
+    # 7-12 minute norm with nothing to compare it to. 90 minutes was ~7x that
+    # norm when set; the job has since grown to ~60 minutes on main and ~82
+    # with the MT-C elevation suites (2026-10-05), which would leave a staging
+    # stack under 10 minutes of headroom. 120 keeps a hang cut off with a named
+    # cause while a real, larger suite still finishes.
+    timeout-minutes: 120
     services:
       postgres:
         image: pgvector/pgvector:pg16

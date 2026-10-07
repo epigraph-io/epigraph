@@ -108,6 +108,7 @@ pub enum RerankError {
 
 /// Pluggable cross-encoder reranker. Production impl is the env-gated HTTP
 /// client; tests inject [`MockRerankClient`].
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait RerankClient: Send + Sync {
     /// Return a relevance score per candidate, aligned by `id`. Implementations

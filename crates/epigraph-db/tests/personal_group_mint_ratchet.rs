@@ -317,13 +317,11 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// `revoked_at = NULL` in any spelling ([`revival_count`]), comments stripped,
 /// over `crates/*/src/**/*.rs` and `migrations/*.sql`.
 const REVIVE_REGISTER: &[(&str, usize, &str)] = &[
-    (
-        "crates/epigraph-db/src/repos/instance_admin.rs",
-        1,
-        "`InstanceAdminRepository::grant` on `instance_admins`, NOT a group membership: an \
-         explicit operator re-grant on the maintenance connection (migration 083 revokes \
-         INSERT/UPDATE on the table from `epigraph_app`).",
-    ),
+    // `crates/epigraph-db/src/repos/instance_admin.rs` (1, the
+    // `InstanceAdminRepository::grant` re-grant of an `instance_admins` row) is
+    // GONE: migration 123 froze that table and removed the grant; instance
+    // administration is a role assignment that is never revived, only granted
+    // anew.
     (
         "migrations/071_ownership_compat_shim.sql",
         1,

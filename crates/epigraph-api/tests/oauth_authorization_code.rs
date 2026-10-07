@@ -973,3 +973,94 @@ async fn dcr_rejects_non_claude_redirect_host() {
         "a non-claude redirect host must be rejected with 400, got {status}"
     );
 }
+
+/// The consent page (`GET /oauth/callback`'s 200) carries a single-use consent
+/// ticket and an Allow button. It must not render inside another origin's frame
+/// (a signed-in Google user could be walked onto Allow from an attacker page:
+/// clickjacking) and must not be stored by a cache. Driven through the REAL
+/// callback, not an error response: Google's token endpoint is a wiremock that
+/// returns an ID token signed by the fixture key the JWKS serves, so the handler
+/// validates it, provisions the user and renders the page.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_consent_page_cannot_be_framed_or_cached(pool: PgPool) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let fx = ProviderFixture::new().await;
+    let now = Utc::now().timestamp();
+    let id_token = fx.sign(&serde_json::json!({
+        "iss": "https://accounts.google.com",
+        "aud": "test-google-audience",
+        "sub": format!("u002-{}", Uuid::new_v4().simple()),
+        "email": "consent-headers@example.test",
+        "email_verified": true,
+        "iat": now,
+        "exp": now + 600,
+    }));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id_token": id_token })),
+        )
+        .mount(&fx.mock_server)
+        .await;
+    let mut cfg = google_cfg(&fx.jwks_url);
+    cfg.token_endpoint = Some(format!("{}/token", fx.mock_server.uri()));
+    let provider = Arc::new(
+        GoogleProvider::from_config(&cfg, JwksCache::new()).expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let app =
+        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+
+    let google_state = format!("gstate_{}", Uuid::new_v4().simple());
+    AuthorizeSessionRepository::create(
+        &pool,
+        &google_state,
+        "u002-requesting-app",
+        REDIRECT_URI,
+        &pkce_challenge(VERIFIER),
+        Some("claims:read"),
+        Some("claude-state"),
+        "google-verifier",
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .expect("seed pending authorize session");
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/oauth/callback?code=google-code&state={google_state}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::OK, "the consent page renders: {body}");
+    assert!(
+        body.contains("Authorize Claude") && body.contains("name=\"ticket\""),
+        "this is the consent page with its ticket: {body}"
+    );
+    for (name, expected) in [
+        ("content-security-policy", "frame-ancestors 'none'"),
+        ("x-frame-options", "DENY"),
+        ("cache-control", "no-store"),
+        ("referrer-policy", "no-referrer"),
+    ] {
+        assert_eq!(
+            headers.get(name).and_then(|v| v.to_str().ok()),
+            Some(expected),
+            "consent page header {name}"
+        );
+    }
+}

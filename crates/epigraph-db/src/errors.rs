@@ -198,6 +198,25 @@ pub enum DbError {
     #[error("OPL02 outside the operator's groups: {message}")]
     OperatorScopeRefused { message: String },
 
+    /// A WRITE was asked of an ELEVATED viewer (elevation plan EL-6). An
+    /// elevation widens one human's READS for at most 15 minutes and writes
+    /// nothing: `ScopedPool::begin_as` refuses to open a transaction for it.
+    /// A DENIAL (HTTP 403, MCP `INVALID_REQUEST`), fixed by the caller: write
+    /// with an unelevated token, or end the elevation first.
+    #[error(
+        "ELEVATED READ-ONLY: this request is elevated, and an elevated session writes nothing; \
+         write with an unelevated token, or end the elevation first"
+    )]
+    ElevatedReadOnly,
+
+    /// An elevated request could not be RECORDED in the per-access log
+    /// (elevation plan EL-8, migration 127): the viewer is not elevated, the
+    /// pool does not declare the recorder, or the recorder refused or failed.
+    /// The serving process WITHHOLDS the response (HTTP 500, MCP internal
+    /// error): an elevated read that is not recorded is never sent.
+    #[error("ELEVATED ACCESS NOT RECORDED: {reason}; the response is withheld")]
+    ElevatedAccessUnrecorded { reason: String },
+
     /// Migration failed
     #[error("Migration failed: {source}")]
     MigrationFailed {
@@ -305,14 +324,17 @@ impl DbError {
     /// cannot fix by changing a parameter and that is never a server fault:
     /// migration 105's two personal-group refusals
     /// ([`Self::is_personal_group_refusal`]) and migration 122's
-    /// [`Self::OperatorLinkRequired`] and [`Self::OperatorScopeRefused`]. The write surfaces map exactly this set
-    /// to a denial (HTTP 403, MCP `INVALID_REQUEST`).
+    /// [`Self::OperatorLinkRequired`] and [`Self::OperatorScopeRefused`], and
+    /// the elevated viewer's [`Self::ElevatedReadOnly`]. The write surfaces map
+    /// exactly this set to a denial (HTTP 403, MCP `INVALID_REQUEST`).
     #[must_use]
     pub fn is_write_authority_refusal(&self) -> bool {
         self.is_personal_group_refusal()
             || matches!(
                 self,
-                Self::OperatorLinkRequired { .. } | Self::OperatorScopeRefused { .. }
+                Self::OperatorLinkRequired { .. }
+                    | Self::OperatorScopeRefused { .. }
+                    | Self::ElevatedReadOnly
             )
     }
 }

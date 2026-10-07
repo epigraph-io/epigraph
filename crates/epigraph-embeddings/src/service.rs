@@ -65,6 +65,7 @@ impl SimilarClaim {
 /// This trait defines the complete interface for working with embeddings
 /// in the `EpiGraph` system. Implementations may use different backends
 /// (`OpenAI`, local models, etc.) but must conform to this interface.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait EmbeddingService: Send + Sync {
     /// Generate an embedding for the given text
@@ -191,6 +192,7 @@ pub enum MultimodalInput<'a> {
 /// Providers implementing this trait can generate embeddings from both text and
 /// images (e.g., Jina Embeddings v4). The text and image embeddings live in the
 /// same vector space, enabling cross-modal similarity search.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait MultimodalEmbeddingService: EmbeddingService {
     /// Generate an embedding from a base64-encoded image
