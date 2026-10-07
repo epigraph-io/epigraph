@@ -1712,40 +1712,7 @@ impl ClaimRepository {
     where
         A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
-        let sql = Self::semantic_search_flat_sql(viewer);
-        let mut q = sqlx::query_as::<_, SemanticFlatHit>(&sql)
-            .bind(embedding)
-            .bind(min_similarity)
-            .bind(claim_type)
-            .bind(created_after)
-            .bind(created_before)
-            .bind(agent_id)
-            .bind(limit);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-
-        // See "The scan is served by the HNSW index" above.
-        let mut tx = executor.begin().await?;
-        sqlx::query(
-            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
-                    set_config('hnsw.ef_search', $1, true)",
-        )
-        .bind(limit.clamp(40, 1000).to_string())
-        .execute(&mut *tx)
-        .await?;
-        let rows = q.fetch_all(&mut *tx).await?;
-        tx.rollback().await?;
-
-        Ok(rows)
-    }
-
-    /// The statement [`Self::semantic_search_flat`] runs, with `viewer`'s
-    /// predicate spliced in at bind `$8`. Exposed so a test can `EXPLAIN` the
-    /// exact SQL and pin that it is served by the HNSW index.
-    #[doc(hidden)]
-    pub fn semantic_search_flat_sql(viewer: &crate::visibility::Viewer) -> String {
-        viewer.splice(
+        let sql = viewer.splice(
             r#"
             WITH query_vec AS (
                 SELECT $1::vector AS vec
@@ -1773,7 +1740,32 @@ impl ClaimRepository {
             LIMIT $7
             "#,
             8,
+        );
+        let mut q = sqlx::query_as::<_, SemanticFlatHit>(&sql)
+            .bind(embedding)
+            .bind(min_similarity)
+            .bind(claim_type)
+            .bind(created_after)
+            .bind(created_before)
+            .bind(agent_id)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+
+        // See "The scan is served by the HNSW index" above.
+        let mut tx = executor.begin().await?;
+        sqlx::query(
+            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                    set_config('hnsw.ef_search', $1, true)",
         )
+        .bind(limit.clamp(40, 1000).to_string())
+        .execute(&mut *tx)
+        .await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        tx.rollback().await?;
+
+        Ok(rows)
     }
 
     /// `claims.content` and `claims.properties` for one id, viewer-filtered.

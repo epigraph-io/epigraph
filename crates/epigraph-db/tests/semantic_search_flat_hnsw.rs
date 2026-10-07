@@ -11,8 +11,8 @@
 //! prod actually runs: ONE connection (the `SET`s are session-scoped and a pool
 //! may hand the next statement another backend), with seq scans, bitmap scans
 //! and explicit sorts disabled. Disabling a node only penalises it: a statement
-//! the index cannot serve still plans as a sort over a seq scan, which is what
-//! the plan test catches. `hnsw.ef_search` is left at its default: the tests
+//! the index cannot serve still plans as a sort over a seq scan, so the plan
+//! test counts this transaction's scans of the HNSW index around the call. `hnsw.ef_search` is left at its default: the tests
 //! must not set the knob the implementation sets.
 //!
 //! Schema notes (mirrors claim_search_hybrid.rs): seed an `agents` row first
@@ -127,39 +127,54 @@ async fn hnsw_graph_reaches_every_row(conn: &mut sqlx::PgConnection) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn flat_search_statement_is_served_by_the_hnsw_index(pool: PgPool) {
+async fn flat_search_is_served_by_the_hnsw_index(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     seed_arc(&pool).await;
     let mut conn = pool.acquire().await.expect("acquire");
     force_index_plans(&mut conn).await;
 
-    let explain = format!(
-        "EXPLAIN (COSTS OFF) {}",
-        ClaimRepository::semantic_search_flat_sql(&viewer)
-    );
-    let mut q = sqlx::query_scalar::<_, String>(&explain)
-        .bind(vec_angle(0.0))
-        .bind(-1.0_f64)
-        .bind(None::<String>)
-        .bind(None::<chrono::DateTime<chrono::Utc>>)
-        .bind(None::<chrono::DateTime<chrono::Utc>>)
-        .bind(None::<Uuid>)
-        .bind(50_i64);
-    if let Some(g) = viewer.group_bind() {
-        q = q.bind(g);
-    }
-    let plan = q.fetch_all(&mut *conn).await.expect("EXPLAIN").join("\n");
+    // Run the real call inside an outer transaction, then read this
+    // transaction's own scan counter for the index: pg_stat_get_xact_numscans
+    // counts every scan made so far in the current transaction, including one
+    // inside the call's rolled-back savepoint.
+    use sqlx::Connection;
+    let mut outer = conn.begin().await.expect("BEGIN");
+    let before: i64 = hnsw_scans(&mut outer).await;
+    let hits = ClaimRepository::semantic_search_flat(
+        &mut *outer,
+        &viewer,
+        &vec_angle(0.0),
+        -1.0,
+        None,
+        None,
+        None,
+        None,
+        10,
+    )
+    .await
+    .expect("semantic_search_flat");
+    let after: i64 = hnsw_scans(&mut outer).await;
+    outer.rollback().await.expect("ROLLBACK");
 
+    assert_eq!(hits.len(), 10);
     assert!(
-        plan.contains("Index Scan using idx_claims_embedding_hnsw"),
-        "semantic_search_flat must be served by the HNSW index, not a scan and sort of every \
-         embedded claim:\n{plan}"
+        after > before,
+        "semantic_search_flat must be served by the HNSW index; an ORDER BY the index \
+         cannot match (e.g. the derived similarity) scans and sorts every embedded claim"
     );
-    assert!(
-        !plan.contains("Sort"),
-        "the HNSW index already yields distance order; a Sort node means the ORDER BY no \
-         longer matches it:\n{plan}"
-    );
+}
+
+/// Index scans this transaction has made on the claims HNSW index(es).
+async fn hnsw_scans(conn: &mut sqlx::PgConnection) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(sum(pg_stat_get_xact_numscans(i.indexrelid)), 0)::bigint \
+         FROM pg_index i JOIN pg_class ix ON ix.oid = i.indexrelid \
+         WHERE i.indrelid = 'claims'::regclass \
+           AND ix.relname LIKE 'idx_claims_embedding_hnsw%'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("pg_stat_get_xact_numscans")
 }
 
 #[sqlx::test(migrations = "../../migrations")]
