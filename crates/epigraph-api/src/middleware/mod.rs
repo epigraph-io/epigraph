@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod bearer;
 #[cfg(feature = "db")]
+pub mod elevated_access;
+#[cfg(feature = "db")]
 pub mod group_authz;
 #[cfg(feature = "db")]
 pub mod instance_authz;

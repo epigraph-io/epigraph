@@ -96,25 +96,21 @@ async fn instance_admins_is_empty_after_migration_and_the_predicate_says_no(pool
 }
 
 /// **The acceptance clause, second half.** An operator on `epigraph_maintenance`
-/// can grant and revoke; an app connection cannot.
+/// can grant and end the custodian role; an app connection cannot.
 ///
-/// This is the assertion that would have caught the defect this file was
-/// written for. `instance_admins` is `ENABLE` + `FORCE`, and a policy set with
-/// no INSERT policy denies the INSERT to every role including the owner —
-/// `epigraph_bypass()` cannot help, because it is a predicate that lives inside
-/// a policy and there is nothing for it to appear in. On the default superuser
-/// pool the grant succeeds regardless, so the whole clause would have read green
-/// over an operator action that fails closed with `42501` the moment
-/// `MAINTENANCE_DATABASE_URL` stops being a superuser — which is precisely the
-/// posture plan §9.2 step 11d prescribes.
+/// Since migration 123 the authority is `role:platform-custodian`, held by a
+/// registered human through an assignment (`role_assignments`), and
+/// `instance_admins` is frozen. The vacuity argument is unchanged: the table
+/// is `ENABLE` + `FORCE`, so on the default superuser pool a grant succeeds
+/// whatever the policies say, and only a DOWNGRADED maintenance pool measures
+/// that the bypass-only INSERT and UPDATE policies admit the operator action.
 ///
-/// `grant_app_privileges` is deliberately NOT called. Migration 083 issues the
+/// `grant_app_privileges` is deliberately NOT called. Migration 123 issues the
 /// grants it intends, and re-granting here would paper over exactly the REVOKE
 /// that is half the control.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_operator_can_grant_on_the_maintenance_role_and_the_app_role_cannot(pool: PgPool) {
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "grantee").await;
-    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (agent, _) = fixture::seed_human_operator(&pool, "grantee").await;
 
     let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
 
@@ -134,16 +130,18 @@ async fn the_operator_can_grant_on_the_maintenance_role_and_the_app_role_cannot(
          ROLE MEMBERSHIP, and a bypassing role would make every assertion below vacuous"
     );
 
-    let row = InstanceAdminRepository::grant(&maint, agent, Some(operator), Some("acceptance"))
-        .await
-        .expect(
-            "the operator grant must succeed on epigraph_maintenance. instance_admins is FORCEd, \
-             so this needs an INSERT policy whose disjunct epigraph_bypass() satisfies — the \
-             REVOKE and the GRANT are not the control here, the policy set is.",
-        );
-    assert_eq!(row.agent_id, agent);
-    assert_eq!(row.granted_by, Some(operator));
-    assert!(row.revoked_at.is_none());
+    let assignment: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, NULL, \
+                                          'acceptance')",
+    )
+    .bind(agent)
+    .fetch_one(&maint)
+    .await
+    .expect(
+        "the operator grant must succeed on epigraph_maintenance. role_assignments is FORCEd, \
+         so this needs an INSERT policy whose disjunct epigraph_bypass() satisfies — the \
+         REVOKE and the GRANT are not the control here, the policy set is.",
+    );
 
     assert!(
         InstanceAdminRepository::is_active(&pool, agent)
@@ -152,131 +150,135 @@ async fn the_operator_can_grant_on_the_maintenance_role_and_the_app_role_cannot(
         "the predicate must see the grant the operator just made"
     );
 
-    // Re-granting is idempotent and goes through `ON CONFLICT DO UPDATE`, which
-    // PostgreSQL checks against the SELECT-side policy as well as the UPDATE
-    // one. A shape that had INSERT coverage only would pass the first grant and
-    // fail here.
-    InstanceAdminRepository::grant(&maint, agent, Some(operator), Some("re-grant"))
-        .await
-        .expect("ON CONFLICT DO UPDATE needs the UPDATE and SELECT sides, not just INSERT");
-
-    // THE NEGATIVE. The same call on the app role must fail.
+    // THE NEGATIVE. The same call on the app role must fail: no EXECUTE, and
+    // no INSERT on the table either.
     let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
-    let (other, _) = fixture::seed_agent_with_group(&pool, "escalator").await;
-    let denied = InstanceAdminRepository::grant(&app, other, Some(other), Some("self-grant")).await;
+    let (other, _) = fixture::seed_human_operator(&pool, "escalator").await;
+    let denied: Result<Uuid, _> = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, NULL, \
+                                          'self-grant')",
+    )
+    .bind(other)
+    .fetch_one(&app)
+    .await;
     assert!(
         denied.is_err(),
-        "an app connection must not be able to write instance_admins. A token that could grant \
-         itself the authority it is checked against is not an authority."
+        "an app connection must not be able to grant the custodian role. A token that could \
+         grant itself the authority it is checked against is not an authority."
     );
+    let raw = sqlx::query(
+        "INSERT INTO role_assignments (role, holder_person_id, valid_from, reason) \
+         VALUES ('role:platform-custodian', $1, now(), 'self-grant')",
+    )
+    .bind(other)
+    .execute(&app)
+    .await;
+    assert!(raw.is_err(), "nor write the table directly: {raw:?}");
 
     // CALIBRATION FOR THE NEGATIVE: the app pool is not simply broken. It can
-    // reach the table, and the read policy narrows it to the caller's own row —
-    // an unstamped app session is nobody, so it sees none of the live grants.
-    let visible = InstanceAdminRepository::list(&app, true)
+    // reach the table, and the read policy narrows it to the caller's own rows
+    // — an unstamped app session is nobody, so it sees none of the live grants.
+    let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM role_assignments")
+        .fetch_one(&app)
         .await
-        .expect("the app role holds SELECT on instance_admins; a 42501 here is a migration bug");
-    assert!(
-        visible.is_empty(),
-        "instance_admins_self_or_definer must narrow an unstamped app session to nothing; it \
-         returned {visible:?}"
+        .expect("the app role holds SELECT on role_assignments; a 42501 here is a migration bug");
+    assert_eq!(
+        visible, 0,
+        "role_assignments_self_or_definer must narrow an unstamped app session to nothing"
     );
 
     // THE UNSTAMPED ANSWER MUST BE `false`, NOT AN ERROR. `agent` holds a LIVE
-    // grant at this point, and `app` is downgraded but NOT stamped — the exact
-    // combination in which `epigraph_is_instance_admin` is three-valued at the
-    // SQL level: `epigraph_principal_id()` is NULL, so the principal comparison
-    // is NULL, `epigraph_bypass()` is false, and the roster `EXISTS` is true, so
-    // the body is `true AND NULL AND true` = NULL unless 083 wraps it in
-    // `COALESCE(…, false)`.
-    //
-    // This assertion is the one that distinguishes the two spellings. A bare
-    // `bool` decode of a NULL is `sqlx::Error::ColumnDecode`, so without the
-    // COALESCE this line panics on the `expect` rather than failing the compare
-    // — and in production it is `ApiError::InternalError`, i.e. the 500 that
-    // `middleware/instance_authz.rs`'s header says the function exists to turn
-    // into a 403 with a reason. Three doc comments promise `false` here; this
-    // is what holds them to it.
+    // assignment at this point, and `app` is downgraded but NOT stamped: 083's
+    // `COALESCE(…, false)` (kept by 123's body) is what turns the three-valued
+    // principal comparison into a definite false rather than a NULL that fails
+    // to decode into `bool` (a 500 in production).
     assert!(
         !InstanceAdminRepository::is_active(&app, agent)
             .await
             .expect(
-                "an unstamped app connection must get a DEFINITE false for a live admin, not a \
-                 NULL that fails to decode into bool"
+                "an unstamped app connection must get a DEFINITE false for a live custodian, \
+                 not a NULL that fails to decode into bool"
             ),
         "an unstamped app connection must not see a live grant as authorizing"
     );
 
-    // Revocation is a stamp, and it flips the predicate back.
-    assert!(
-        InstanceAdminRepository::revoke(&maint, agent)
+    // Ending is a stamp, and it flips the predicate back.
+    let ended: bool =
+        sqlx::query_scalar("SELECT public.epigraph_end_role_assignment($1, 'acceptance end')")
+            .bind(assignment)
+            .fetch_one(&maint)
             .await
-            .expect("revoke on the maintenance role"),
-        "revoking a live grant must report that it changed a row — a FOR UPDATE policy with no \
-         USING clause sees nothing to update and reports zero, silently"
+            .expect("end on the maintenance role");
+    assert!(
+        ended,
+        "ending a live assignment must report that it changed a row — a FOR UPDATE policy with \
+         no USING clause sees nothing to update and reports zero, silently"
     );
     assert!(
         !InstanceAdminRepository::is_active(&pool, agent)
             .await
-            .expect("is_active after revoke"),
-        "a revoked grant must not authorize"
+            .expect("is_active after the end"),
+        "an ended assignment must not authorize"
     );
     let still_there: i64 =
-        sqlx::query_scalar("SELECT count(*)::bigint FROM instance_admins WHERE agent_id = $1")
-            .bind(agent)
+        sqlx::query_scalar("SELECT count(*)::bigint FROM role_assignments WHERE id = $1")
+            .bind(assignment)
             .fetch_one(&pool)
             .await
-            .expect("row survives revoke");
+            .expect("row survives the end");
     assert_eq!(
         still_there, 1,
-        "revocation must not delete the row: it is the record that the authority once existed"
+        "ending must not delete the row: it is the record that the authority once existed"
     );
 
-    // A second revoke is a no-op rather than an error, so re-running a completed
+    // A second end is a no-op rather than an error, so re-running a completed
     // playbook step does not look like a failure.
-    assert!(!InstanceAdminRepository::revoke(&maint, agent)
-        .await
-        .expect("second revoke"));
+    let again: bool =
+        sqlx::query_scalar("SELECT public.epigraph_end_role_assignment($1, 'acceptance end')")
+            .bind(assignment)
+            .fetch_one(&maint)
+            .await
+            .expect("second end");
+    assert!(!again);
 }
 
-/// DELETE is default-denied on `instance_admins`, on the maintenance role too.
+/// DELETE is denied on `role_assignments`, on the maintenance role too.
 ///
-/// 083 grants DELETE to `epigraph_maintenance` and then installs no DELETE
-/// policy, which under `FORCE` makes the GRANT inert. That is deliberate — the
-/// write policies stop at INSERT and UPDATE rather than reaching for `FOR ALL`
-/// — and it is the pair `rls_enforcement.rs::DELIBERATELY_UNCOVERED` records.
-///
-/// The observable is `rows_affected() == 0` and NOT an error: with no DELETE
-/// policy the rows are simply not visible to the statement. Asserting the error
-/// would have been wrong, and asserting only "the row is still there" would pass
-/// against a `DELETE` that matched nothing for an unrelated reason — so both are
-/// checked.
+/// Migration 123 grants the maintenance role SELECT, INSERT and UPDATE only,
+/// and installs no DELETE policy, so under `FORCE` no non-superuser role can
+/// delete an assignment: an end is a `revoked_at` stamp. That is the pair
+/// `rls_enforcement.rs::DELIBERATELY_UNCOVERED` records. The legacy
+/// `instance_admins` table keeps 083's shape (a DELETE grant made inert by the
+/// absent policy), and since 123 nothing can write a row into it at all.
 #[sqlx::test(migrations = "../../migrations")]
 async fn delete_is_denied_on_instance_admins_even_for_the_maintenance_role(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "undeletable").await;
+    let assignment = fixture::make_custodian(&pool, agent).await;
     let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, agent, None, None)
-        .await
-        .expect("grant");
 
-    let deleted = sqlx::query("DELETE FROM instance_admins WHERE agent_id = $1")
+    let deleted = sqlx::query("DELETE FROM role_assignments WHERE id = $1")
+        .bind(assignment)
+        .execute(&maint)
+        .await;
+    assert!(
+        deleted.is_err(),
+        "the maintenance role holds no DELETE on role_assignments: {deleted:?}"
+    );
+    let legacy = sqlx::query("DELETE FROM instance_admins WHERE agent_id = $1")
         .bind(agent)
         .execute(&maint)
         .await
-        .expect("DELETE is not an error, it is a no-op: there is no DELETE policy to deny it")
+        .expect("DELETE is not an error on instance_admins, it is a no-op: no DELETE policy")
         .rows_affected();
-    assert_eq!(deleted, 0, "no DELETE policy means no row is deletable");
+    assert_eq!(legacy, 0, "no DELETE policy means no row is deletable");
 
-    // The same statement on the superuser pool WOULD delete the row, which is
-    // what makes the assertion above a measurement of the policy rather than of
-    // a mis-typed WHERE clause.
     let count: i64 =
-        sqlx::query_scalar("SELECT count(*)::bigint FROM instance_admins WHERE agent_id = $1")
-            .bind(agent)
+        sqlx::query_scalar("SELECT count(*)::bigint FROM role_assignments WHERE id = $1")
+            .bind(assignment)
             .fetch_one(&pool)
             .await
             .expect("count");
-    assert_eq!(count, 1, "the row must survive the attempted DELETE");
+    assert_eq!(count, 1, "the assignment must survive the attempted DELETE");
 }
 
 /// Migration 088's UPDATE policies admit the maintenance role and nobody else.
@@ -564,10 +566,9 @@ async fn security_events_read_widens_to_the_whole_log_for_an_instance_admin_only
     );
     drop(conn);
 
-    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, admin, None, Some("read-surface"))
-        .await
-        .expect("grant");
+    // Since 123 the authority is a role:platform-custodian assignment of a
+    // registered human.
+    fixture::make_custodian(&pool, admin).await;
 
     // AFTER THE GRANT, for the admin: the whole log, including the unattributed
     // rows.
@@ -678,10 +679,9 @@ async fn privatization_audit_entity_rows_follow_the_callers_group_adminship(pool
     );
     drop(conn);
 
-    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
-    InstanceAdminRepository::grant(&maint, author, None, Some("audit-read"))
-        .await
-        .expect("grant");
+    // Since 123 the authority is a role:platform-custodian assignment of a
+    // registered human.
+    fixture::make_custodian(&pool, author).await;
 
     let mut conn = stamped_app_conn(&pool, author).await;
 

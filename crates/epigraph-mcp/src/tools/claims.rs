@@ -980,7 +980,11 @@ pub async fn get_claim(
 /// contract; `epigraph_mcp::tools::ingestion` binds it verbatim). For that class
 /// `blake3(content) != stored` holds on *untampered* rows, and the seed is not
 /// carried on the claim, so the comparison decides nothing — reported as
-/// [`HashCheck::NotApplicable`] rather than as a mismatch.
+/// [`HashCheck::NotApplicable`] rather than as a mismatch. Workflow thesis,
+/// phase and step rows written since backlog 6178a205 bind the same kind of
+/// digest (seed `canonical_name`) and carry a `content_hash_scope` marker; rows
+/// written before it keep the plain digest, carry no marker, and are compared
+/// normally.
 ///
 /// The seed is deliberately NOT guessed back. `verify_claim` was filed as
 /// theatre (backlog `49c17386`) for asserting certainty it did not have;
@@ -1192,6 +1196,50 @@ pub async fn update_with_evidence(
              belong to the claim's owner. Resubmit without `labels`; nothing was written."
         )));
     }
+
+    // ── OVER HTTP A LABEL MERGE NEEDS OWNERSHIP OF THE CLAIM (drain U004) ──
+    //
+    // The same bar `update_labels` set in batch H-b, one tool over: measured on
+    // config A, a writer of the team group owning a colleague's claim
+    // relabelled it, because D1 gives its stamp that reach and the group test
+    // above does not ask who authored the claim. Only when labels are present:
+    // the evidence itself, and the truth write it drives on a claim the caller
+    // can write, stay the documented group-writer contract (whether a
+    // non-author's evidence should move truth_value is an open operator
+    // question, drain U004 part 1). On stdio free labels stay ungated, the
+    // batch H-b bar; the retirement label is gated on every transport below.
+    // `claim` was read on THIS stamped tx; a refusal drops `tx` and rolls back.
+    if auth.is_some() && !params.labels.is_empty() {
+        require_owner_or_admin(server, auth, author, claim.agent_id.as_uuid()).await?;
+    }
+
+    // ── THE RETIREMENT LABEL TAKES #374's GATE HERE TOO (drain U004, I253) ──
+    //
+    // `is_foreign_public_claim` is a GROUP test, so a caller that WRITES the
+    // owning group without having AUTHORED the claim (a team writer; on stdio,
+    // a server agent whose group owns another agent's claim) is not foreign and
+    // reaches the label merge below. Without this, `labels: ["resolved"]`
+    // retired a colleague's claim on every transport while `update_labels` and
+    // `patch_claim` refused the identical label. Same gate, same arms: the
+    // author or the author's operator (stdio: an agent under the same
+    // operator), `claims:admin` over HTTP, and never the undeclared-signer arm.
+    //
+    // Before `EvidenceRepository::create`, so a refusal writes nothing: `tx` is
+    // dropped and rolls back. No admin path is needed: a `claims:admin` caller
+    // on a group it cannot write is either foreign-public (labels refused
+    // above) or refused by `claims_tenancy`, and on a group it can write the
+    // plain merge under its own stamp is the right write.
+    gate_retirement_label(
+        server,
+        &mut tx,
+        viewer,
+        auth,
+        author,
+        claim_id,
+        &params.labels,
+        &[],
+    )
+    .await?;
 
     EvidenceRepository::create(&mut *tx, &evidence)
         .await
@@ -2353,6 +2401,15 @@ pub async fn query_undecomposed_claims(
     // redaction layer entirely — a finding fixed by adding a second pass; the
     // durable fix is that the read itself filters, so there is no second pass
     // left to forget.
+    //
+    // Labels: one batched, viewer-spliced read over the page, as `query_claims`
+    // does — not a hardcoded `[]` (drain unit U008, backlog `1e6efd2d`
+    // residual).
+    let ids: Vec<uuid::Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
+    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+        .await
+        .map_err(internal_error)?;
+
     let results: Vec<ClaimResponse> = claims
         .into_iter()
         .map(|c| {
@@ -2364,9 +2421,13 @@ pub async fn query_undecomposed_claims(
                 agent_id: c.agent_id.as_uuid().to_string(),
                 content_hash: ContentHasher::to_hex(&c.content_hash),
                 created_at: c.created_at.to_rfc3339(),
-                labels: Vec::new(),
+                labels: labels_map.get(&id).cloned().unwrap_or_default(),
+                // True by `list_undecomposed`'s `COALESCE(is_current, true) =
+                // true` predicate — no superseded row reaches this map.
                 is_current: true,
-                supersedes: None,
+                // A current claim that replaced another DOES carry a link;
+                // `list_undecomposed` projects and post-fixes it.
+                supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
                 belief_score: None,
             }
         })

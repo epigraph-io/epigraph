@@ -273,6 +273,7 @@ fn decide_bearer_token_with_scopes(
             None, // owner_id — service clients created by the bridge have none
             agent_id,
             chrono::Duration::seconds(300),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("issue_access_token must succeed for tests");
     token

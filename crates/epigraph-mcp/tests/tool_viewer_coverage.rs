@@ -72,9 +72,12 @@ use std::path::{Path, PathBuf};
 ///   sites there. PR-11 built the Rust half (`crates/epigraph-authz`) and spent
 ///   it on the two declassification tools, which is why `assign_ownership` and
 ///   `update_partition` are no longer in this list.
-/// * **Pure-CPU, no DB (2).** `stage_claims` validates strings and takes
-///   `_server`; `list_mcp_tools` reads the compiled-in manifest. A viewer here
-///   would be a parameter with nothing to filter.
+/// * **No corpus read (2).** `stage_claims` validates strings and takes
+///   `_server`; `list_mcp_tools` reads the compiled-in manifest, filtered per
+///   caller by `EpiGraphMcpFull::manifest_for` (elevation plan EL-11), whose
+///   one database read is an authority fact about the caller (does it hold
+///   an elevating role), never a corpus row. A viewer here would be a
+///   parameter with nothing to filter.
 /// * **Reads PR-09 did not convert (2), each with a named owner.** This was 3
 ///   until PR-14 deleted `get_ownership`.
 ///   - `get_workflow_executions` — `behavioral_executions` and `workflows` are
@@ -121,7 +124,7 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     "create_frame",
     "report_hierarchical_outcome",
     "structure_source",
-    // pure-CPU, no DB
+    // no corpus read
     "list_mcp_tools",
     "stage_claims",
     // reads not converted by PR-09 — see the module doc for the owner of each.

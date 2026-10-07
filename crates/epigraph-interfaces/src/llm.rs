@@ -58,6 +58,7 @@ pub enum LlmError {
 /// [`Arc<dyn LlmProvider>`] via [`default_llm_provider`] or
 /// [`llm_provider_by_name`] and uses the same async API regardless of
 /// backend.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait LlmProvider: Send + Sync + 'static {
     /// Stable selector name. Must be unique within the registry. The

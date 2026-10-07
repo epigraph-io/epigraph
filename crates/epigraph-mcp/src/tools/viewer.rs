@@ -106,6 +106,38 @@ use rmcp::model::ErrorData as McpError;
 
 use crate::server::EpiGraphMcpFull;
 
+/// The HTTP arm's resolution: ELEVATED when the database answers for a live
+/// session (elevation plan EL-6), the plain scoped viewer otherwise.
+///
+/// * A token carrying an elevation claim (`elv`, the elevate grant's) and its
+///   family: `Viewer::resolve_elevated` with that claim.
+/// * A token carrying a family but NO claim: a connector-mode session on the
+///   family (MCP `sudo`), ONLY when the server's connector switch is on
+///   (`EpiGraphMcpFull::with_connector_elevation`; OFF by default, operator
+///   ruling pending plan EQ-7). Off, no liveness round trip is made.
+/// * Anything else, or a server with no `ScopedPool` to stamp the check on:
+///   `Viewer::resolve`, exactly as before.
+///
+/// A claim that is not a live session (forged, ended, expired, the check
+/// failing) resolves the scoped viewer: the call is served, unelevated. The
+/// stdio arm never comes here, so stdio never elevates.
+async fn resolve_http(
+    server: &EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+    principal: uuid::Uuid,
+) -> Result<Viewer, epigraph_db::DbError> {
+    let claim = auth.and_then(|a| a.family_id.map(|f| (a.elevation_claim, f)));
+    match (claim, server.scoped.as_ref()) {
+        (Some((Some(elv), family)), Some(scoped)) => {
+            Viewer::resolve_elevated(scoped, principal, Some(elv), family).await
+        }
+        (Some((None, family)), Some(scoped)) if server.connector_elevation => {
+            Viewer::resolve_elevated(scoped, principal, None, family).await
+        }
+        _ => Viewer::resolve(&server.pool, principal).await,
+    }
+}
+
 /// Resolve the viewer for one tool call.
 ///
 /// `auth` is the per-request `AuthContext` on the HTTP transport and `None` on
@@ -166,7 +198,7 @@ pub async fn request_viewer(
     // concurrently with the resolve, so it adds a round trip of work but no
     // latency.
     let (viewer, actor) = tokio::join!(
-        Viewer::resolve(&server.pool, principal),
+        resolve_http(server, auth, principal),
         epigraph_db::AgentRepository::operator_of_author_pool(&server.pool, principal),
     );
     match actor {

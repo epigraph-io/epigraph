@@ -373,6 +373,116 @@ async fn a_released_connection_carries_no_tenancy_into_the_next_checkout(
     assert_eq!(principal, None, "leaked principal: {principal:?}");
 }
 
+/// The release scrub covers all FIVE GUCs, the elevation pair included, and it
+/// RESETS the connection rather than closing it.
+///
+/// The test above cannot tell those two apart: a scrub that errors (say, one
+/// that binds the wrong number of parameters) returns `Ok(false)`, sqlx closes
+/// the connection, and the next checkout is a fresh backend whose GUCs are
+/// empty for that reason alone. So this one pins the BACKEND: a one-connection
+/// pool, the same `pg_backend_pid()` before and after the release, and only
+/// then the emptiness of `epigraph.elevation_id` / `epigraph.family_id`.
+///
+/// The elevation pair is set by hand on the checked-out connection: the
+/// question here is what the scrub clears, whatever stamped it.
+///
+/// Verified to fail with the scrub binding only the first three GUCs (the
+/// pre-elevation statement): the elevation pair survives into the next
+/// checkout on the same backend.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_scrub_resets_all_five_gucs_on_the_same_backend(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let scoped = ScopedPool::connect_with_options(
+        &scoped_url(&conn_opts),
+        SessionGucMode::Session,
+        ScopedPoolOptions {
+            max_connections: 1,
+            ..ScopedPoolOptions::default()
+        },
+    )
+    .await
+    .expect("single-connection ScopedPool");
+
+    let agent = seed_agent(&pool).await;
+    let g = seed_group(&pool).await;
+    seed_membership(&pool, g, agent, "writer").await;
+    let viewer = Viewer::resolve(&pool, agent).await.expect("resolve");
+
+    let elevation = Uuid::new_v4();
+    let family = Uuid::new_v4();
+    let before: i32 = {
+        let mut conn = scoped.acquire_as(&viewer).await.expect("acquire_as");
+        let (stamped_elv, stamped_fam): (String, String) = sqlx::query_as(
+            "SELECT current_setting('epigraph.elevation_id', true), \
+                    current_setting('epigraph.family_id', true)",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read the elevation pair");
+        assert_eq!(
+            (stamped_elv.as_str(), stamped_fam.as_str()),
+            ("", ""),
+            "a viewer that is not elevated stamps the elevation pair EMPTY"
+        );
+        sqlx::query(
+            "SELECT set_config('epigraph.elevation_id', $1, false), \
+                    set_config('epigraph.family_id', $2, false)",
+        )
+        .bind(elevation.to_string())
+        .bind(family.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("set the elevation pair by hand");
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("pid")
+    }; // release -> after_release scrub
+
+    let mut next = scoped
+        .inner()
+        .acquire()
+        .await
+        .expect("a fresh checkout from the same one-connection pool");
+    let after: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *next)
+        .await
+        .expect("pid");
+    assert_eq!(
+        after, before,
+        "CALIBRATION: the scrub must RESET the connection, not close it. A different \
+         backend means the scrub failed (sqlx closes a connection whose scrub errored), \
+         and the emptiness below would then be a fresh backend's, not the scrub's"
+    );
+    let carried: (String, String, String, String, String) = sqlx::query_as(
+        "SELECT COALESCE(current_setting('epigraph.group_ids', true), ''), \
+                COALESCE(current_setting('epigraph.writable_group_ids', true), ''), \
+                COALESCE(current_setting('epigraph.principal_id', true), ''), \
+                COALESCE(current_setting('epigraph.elevation_id', true), ''), \
+                COALESCE(current_setting('epigraph.family_id', true), '')",
+    )
+    .fetch_one(&mut *next)
+    .await
+    .expect("read the five GUCs back");
+    assert_eq!(
+        carried,
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new()
+        ),
+        "a recycled connection carried tenancy or elevation GUCs into the next checkout"
+    );
+}
+
 /// The boot probe itself, which is what `bin/server.rs` `.expect()`s. Against a
 /// session-mode endpoint it must pass; the negative half (a transaction-mode
 /// pooler) cannot be staged in this environment — see `docs/deploy.md`'s PR-04
