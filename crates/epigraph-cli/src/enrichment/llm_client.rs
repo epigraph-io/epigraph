@@ -770,30 +770,46 @@ mod tests {
         assert!(!client.is_oauth());
     }
 
+    /// Serializes the tests that set the credential variables: the test
+    /// harness runs them on parallel threads of one process, and one test's
+    /// `remove_var` would otherwise undo the other's `set_var`.
+    static CREDENTIAL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // These two build the client from the environment directly
+    // (`build_anthropic_from_env`, what `register_builtin_llm_providers`
+    // installs as `anthropic`). Going through `create_llm_client("anthropic")`
+    // made them depend on test ORDER: the registration runs once per process
+    // (`Once`), so whichever test reached it first decided, and when a
+    // mock-only test got there before the credentials were set, `anthropic`
+    // was never registered ("Unknown LLM provider: anthropic").
     #[test]
     fn test_create_llm_client_prefers_oauth() {
-        // Set OAuth token, clear API key
+        let _env = CREDENTIAL_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test");
-        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-api03-test");
 
-        let client = create_llm_client("anthropic").unwrap();
-        // Client should have been created (not MissingApiKey error)
+        let client = build_anthropic_from_env()
+            .expect("credentials are set")
+            .expect("an Anthropic client");
+        assert!(client.is_oauth(), "the OAuth token wins over the API key");
         assert_eq!(client.model_name(), "claude-sonnet-4-5-20250929");
 
-        // Clean up
         std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
     #[test]
     fn test_create_llm_client_falls_back_to_api_key() {
-        // Clear OAuth token, set API key
+        let _env = CREDENTIAL_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-api03-test");
 
-        let client = create_llm_client("anthropic").unwrap();
+        let client = build_anthropic_from_env()
+            .expect("credentials are set")
+            .expect("an Anthropic client");
+        assert!(!client.is_oauth(), "no OAuth token: the API key is used");
         assert_eq!(client.model_name(), "claude-sonnet-4-5-20250929");
 
-        // Clean up
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 

@@ -2709,6 +2709,63 @@ async fn an_unenforced_hide_is_detected_warned_and_refused(pool: PgPool) {
     );
 }
 
+/// Migration 126's elevated read arm on `evidence` is NOT an unenforced hide:
+/// it admits rows to an elevated (passkey-confirmed, read-only custodial)
+/// session only, and an ordinary app session still cannot read the hidden row
+/// (the PREMISE below). The dry run therefore does not warn, and `--apply`
+/// needs no `--accept-unenforced-hide`. But the exemption is for 126's EXACT
+/// body: a policy under the same name that admits every session is reported
+/// like any other extra policy.
+///
+/// Verified to fail with the exemption removed from `extra_evidence_policies`
+/// (the first dry run warns) and with the exemption keyed on the name alone
+/// (the lookalike is not reported).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_elevated_read_arm_is_not_an_unenforced_hide_but_a_lookalike_is(pool: PgPool) {
+    let h = hide_fixture(&pool).await;
+    let arms: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_policies WHERE tablename = 'evidence' \
+            AND policyname = 'evidence_elevated_read'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(arms, 1, "PREMISE: migration 126 armed evidence");
+    assert_eq!(
+        app_reads_evidence(&pool, h.fx.ev_private).await,
+        0,
+        "PREMISE: the arm admits nothing to an ordinary app session"
+    );
+    let dry = hide_run(&pool, &h, &[]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        !dry.stdout.contains("WARNING: HIDING WILL NOT BE ENFORCED"),
+        "the elevated arm is not an unenforced hide: {}",
+        dry.show()
+    );
+
+    exec(&pool, "DROP POLICY evidence_elevated_read ON evidence").await;
+    exec(
+        &pool,
+        "CREATE POLICY evidence_elevated_read ON evidence AS PERMISSIVE FOR SELECT \
+         TO epigraph_app USING (true)",
+    )
+    .await;
+    assert_eq!(
+        app_reads_evidence(&pool, h.fx.ev_private).await,
+        1,
+        "the lookalike must defeat group visibility, or this half proves nothing"
+    );
+    let dry = hide_run(&pool, &h, &[]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("WARNING: HIDING WILL NOT BE ENFORCED")
+            && dry.stdout.contains("evidence_elevated_read"),
+        "a lookalike under the arm's name is reported: {}",
+        dry.show()
+    );
+}
+
 /// `reown-claims` with a hide selector: the dry run prints the hide plan and
 /// still runs the re-own (without the hide); `--apply` refuses BEFORE the
 /// manifest and before any write, so it never runs half of what it was asked.

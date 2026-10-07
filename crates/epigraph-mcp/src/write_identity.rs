@@ -136,6 +136,29 @@ pub(crate) fn principal_less_write_refusal() -> McpError {
     )
 }
 
+/// An ELEVATED request asked to write (elevation plan §1.4: the elevated
+/// viewer is read-only). The same `ELEVATED READ-ONLY` refusal
+/// `ScopedPool::begin_as` gives, raised HERE because the MCP write path never
+/// meets `begin_as` with the request's viewer: an author-stamped transaction is
+/// stamped from a freshly resolved SCOPED viewer of the author
+/// (`claim_helper::author_write_authority`), and a detached ingest carries the
+/// request's viewer only after `detach_scoped` has downgraded it, so neither
+/// that refusal nor migration 126's restrictive policies (keyed on the
+/// elevation settings that scoped stamp leaves empty) would ever see the
+/// elevation.
+///
+/// # Errors
+/// The refusal, when `viewer` is elevated.
+pub(crate) fn refuse_elevated(viewer: &epigraph_db::visibility::Viewer) -> Result<(), McpError> {
+    if viewer.is_elevated() {
+        Err(crate::errors::db_caller_error(
+            epigraph_db::DbError::ElevatedReadOnly,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// The request's viewer and its token name different principals.
 pub(crate) fn diverging_principals(token: Uuid, viewer: Option<Uuid>) -> McpError {
     McpError::internal_error(

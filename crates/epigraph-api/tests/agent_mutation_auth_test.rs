@@ -58,6 +58,7 @@ fn token_as_agent(agent_id: Uuid, scopes: &[&str]) -> String {
             None,
             Some(agent_id), // agent_id claim = target agent
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT issued");
     token

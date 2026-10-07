@@ -172,6 +172,7 @@ async fn evolve_step_supersedes_creates_new_claim_and_edge() {
             None,
             Some(agent_id),
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT");
 

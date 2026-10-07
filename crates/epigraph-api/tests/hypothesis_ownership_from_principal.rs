@@ -189,6 +189,7 @@ async fn hypothesis_with_a_principal_less_token_is_refused() {
             // no principal bound to it.
             None,
             chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
         )
         .expect("test JWT issued");
 

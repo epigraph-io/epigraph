@@ -1309,7 +1309,8 @@ pub enum HashCheck {
     /// signal** — the body was mutated without rewriting the hash.
     Mismatch,
     /// The stored digest is not a function of the body alone, so comparing them
-    /// decides nothing. Reported for document-scoped compound rows, detected via
+    /// decides nothing. Reported for document- and workflow-scoped compound
+    /// rows, detected via
     /// `epigraph_ingest::document::stored_content_hash_is_seed_scoped`.
     ///
     /// **Undecided, not clean.** Content-hash verification cannot rule tampering
@@ -3152,6 +3153,35 @@ pub struct DecideMatchCandidateParams {
 /// (`claims:admin`). Supersession is no longer the analogy: since batch OA1 it is
 /// the caller's act on a claim it writes, at `claims:write`. Folding it back into
 /// `decide_match_candidate` would force one of the two to hold the wrong scope.
+/// `sudo` (elevation plan EL-11): why the caller asks to elevate. Shown on
+/// the ceremony page and kept on the ticket, the session and their audit
+/// rows.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SudoParams {
+    #[schemars(
+        description = "Why you need to elevate (shown on the confirmation page and kept in the audit trail; at most 500 characters)"
+    )]
+    pub reason: String,
+}
+
+/// `propose_admin_act` (elevation plan EL-12b): an administrative act an
+/// ELEVATED caller asks its own passkey to confirm.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProposeAdminActParams {
+    #[schemars(
+        description = "The act: role.grant, role.end, claim.custodial_supersede or passkey.register"
+    )]
+    pub kind: String,
+    #[schemars(
+        description = "The act's arguments, exactly the kind's keys. role.grant: role, holder (uuid), valid_from (time or null: from the execution), valid_to (time or null: open-ended), reason. role.end: assignment (uuid), reason. claim.custodial_supersede: claim (uuid), content_sha256 (64 hex), truth (decimal string, six places), reason, allow_owned (bool). passkey.register: person (your own uuid), label (or null), reason"
+    )]
+    pub args: serde_json::Map<String, serde_json::Value>,
+    #[schemars(
+        description = "Why you propose it (shown on the confirmation page and kept in the audit trail; at most 500 characters)"
+    )]
+    pub reason: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RetireMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to retire")]

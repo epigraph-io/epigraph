@@ -220,7 +220,14 @@ pub async fn exchange_endpoint(
         }
     };
 
-    provision_external_user(&state, provider.as_ref(), &identity, None).await
+    provision_external_user(
+        &state,
+        provider.as_ref(),
+        &identity,
+        None,
+        crate::oauth::scopes::MintGrant::Device,
+    )
+    .await
 }
 
 #[cfg(not(feature = "db"))]

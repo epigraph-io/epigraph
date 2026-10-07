@@ -1,7 +1,7 @@
 //! Silence Alarm — detects suspiciously low conflict density.
 //!
 //! A healthy knowledge graph with diverse sources should contain *some*
-//! contradictions.  When the CONTRADICTS edge rate drops below a
+//! contradictions.  When the contradiction rate drops below a
 //! configurable floor, it may indicate that the ingestion pipeline is
 //! silently dropping dissent, that sources are too homogeneous, or that
 //! contradiction detection is broken.
@@ -34,7 +34,10 @@ impl Default for SilenceAlarmConfig {
 pub struct SilenceCheckResult {
     /// Total claims considered.
     pub total_claims: usize,
-    /// Number of CONTRADICTS edges found.
+    /// Contradiction count supplied by the caller: distinct unordered claim
+    /// pairs joined by a live `contradicts`/`refutes` edge (either spelling)
+    /// touching the frame, as `epigraph_db::ConflictDensityRepository` counts
+    /// them. The name is kept for the event / JSON field it feeds.
     pub contradicts_edges: usize,
     /// Computed conflict rate (`contradicts_edges / total_claims`).
     pub conflict_rate: f64,

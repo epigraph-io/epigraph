@@ -252,9 +252,9 @@ pub async fn begin_author_stamped_tx<'p>(
 /// forward-only because `workflows` recorded no owner before, is
 /// `tools::workflow_authority`'s: a workflow created since H-b records its
 /// submitter, and only the submitter, its operator, or `claims:admin` may change
-/// it; a workflow with no record stays open, with a WARN, pending an operator
-/// decision on legacy workflows. The system-agent stamp is unchanged for the
-/// rows these writes make.
+/// it; a workflow with no record is platform corpus, mutable only through the
+/// audited `claims:admin` path (U005). The system-agent stamp is unchanged for
+/// the rows these writes make.
 ///
 /// # The CALLER is bound before anything is written (migration 122)
 ///

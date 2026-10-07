@@ -199,6 +199,78 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          Under FORCE the absent UPDATE policy default-denies every non-superuser \
          role, and 110 grants UPDATE to nobody.",
     ),
+    (
+        "platform_roles",
+        "DELETE",
+        "The custodian role's catalog (123) is never shrunk: an assignment names its \
+         role by key (ON DELETE RESTRICT), and the audit trail names roles that must keep \
+         resolving. Under FORCE the absent DELETE policy default-denies every \
+         non-superuser role, and 123 grants DELETE to nobody.",
+    ),
+    (
+        "role_assignments",
+        "DELETE",
+        "An assignment is ended by its `revoked_at` stamp, never deleted: the row is the \
+         record that the authority existed, from when to when (123). The bypass-only \
+         INSERT and UPDATE pair stops short of FOR ALL on purpose (083's instance_admins \
+         pair is the template), 123 grants DELETE to nobody, and the update guard admits \
+         only the one revoke.",
+    ),
+    (
+        "passkey_enrollments",
+        "DELETE",
+        "An enrollment ticket (124) is never deleted: it ends by expiring or by its one \
+         consumption, and the passkey it admitted names it (ON DELETE RESTRICT). Under FORCE \
+         the absent DELETE policy default-denies every non-superuser role, and 124 grants \
+         DELETE to nobody.",
+    ),
+    (
+        "person_authenticators",
+        "DELETE",
+        "A passkey (124) is ended by its revoke stamp, never deleted: the row is the record \
+         of what the human could assert with, and later ceremonies' evidence names it. Under \
+         FORCE the absent DELETE policy default-denies every non-superuser role, and 124 \
+         grants DELETE to nobody.",
+    ),
+    (
+        "elevation_tickets",
+        "DELETE",
+        "An elevation ticket (125) is never deleted: it ends by expiring or by its one \
+         assertion (confirmed or refused), and a confirmed ticket's session names it (ON DELETE \
+         RESTRICT). Under FORCE the absent DELETE policy default-denies every non-superuser \
+         role, and 125 grants DELETE to nobody.",
+    ),
+    (
+        "elevation_sessions",
+        "DELETE",
+        "An elevation session (125) is ended by its one end stamp, never deleted: the row is \
+         the record of who read elevated, when, under which assignment and passkey. Under FORCE \
+         the absent DELETE policy default-denies every non-superuser role, and 125 grants \
+         DELETE to nobody.",
+    ),
+    (
+        "elevated_access",
+        "UPDATE",
+        "The log of elevated reads (127) is append-only: a row is the subject's record of who \
+         read their group's rows, when and why, and nothing edits it. Under FORCE the absent \
+         UPDATE policy default-denies every non-superuser role, 127 grants UPDATE to nobody, and \
+         its change guard refuses (ELV03) even a superuser.",
+    ),
+    (
+        "elevated_access",
+        "DELETE",
+        "The log of elevated reads (127) is append-only, as for UPDATE. Under FORCE the absent \
+         DELETE policy default-denies every non-superuser role, 127 grants DELETE to nobody, and \
+         its change guard refuses (ELV03) even a superuser.",
+    ),
+    (
+        "pending_admin_acts",
+        "DELETE",
+        "A pending admin act (130) is never deleted: a proposed, confirmed, refused or \
+         consumed act is the record the offline verifier re-checks. Under FORCE the absent \
+         DELETE policy default-denies every non-superuser role, and 130 grants DELETE to \
+         nobody.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -259,6 +331,14 @@ const PROTECTED: &[&str] = &[
     "instance_admins",
     "operator_links",
     "evidence_visibility_pins",
+    "platform_roles",
+    "role_assignments",
+    "passkey_enrollments",
+    "person_authenticators",
+    "elevation_tickets",
+    "elevation_sessions",
+    "elevated_access",
+    "pending_admin_acts",
 ];
 
 // ===========================================================================
@@ -317,13 +397,20 @@ async fn every_protected_relation_is_enabled_and_forced(pool: PgPool) {
 /// Read from the catalog, never from the migration text. A test that parsed
 /// `077_rls_policies.sql` would agree with the migration by construction,
 /// including when the migration is wrong.
+///
+/// Only PERMISSIVE policies count as coverage. A RESTRICTIVE policy grants
+/// nothing (PostgreSQL ANDs it onto the permissive ones, and a command with no
+/// permissive policy stays default-denied), so counting one would report a
+/// default-denied command as covered. Migration 126 is what made this exact:
+/// its `agents_elevated_no_delete` refusal is a RESTRICTIVE delete policy on a
+/// table whose deletes are default-denied on purpose (`DELIBERATELY_UNCOVERED`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_protected_relation_covers_every_command_or_records_why(pool: PgPool) {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT c.relname, p.polname, p.polcmd::text \
            FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
            JOIN pg_namespace n ON n.oid = c.relnamespace \
-          WHERE n.nspname = 'public'",
+          WHERE n.nspname = 'public' AND p.polpermissive",
     )
     .fetch_all(&pool)
     .await
@@ -1314,6 +1401,18 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
         // Its body compares the node's owner with `epigraph_writable_groups()`,
         // i.e. the CALLER's writable set, so an arm naming it is session-derived.
         "epigraph_session_writes_node",
+        // 125's elevation predicate, read by 126's elevated read arms and
+        // write refusals. Its body binds the session row it looks up to
+        // `epigraph_principal_id()` and to the two elevation settings
+        // (`epigraph.elevation_id`, `epigraph.family_id`), and answers false
+        // when the elevation setting is empty, so an arm naming it is
+        // session-derived (`elevation_sessions.rs` pins that body).
+        "epigraph_is_elevated",
+        // 127's subject-read helper (`elevated_access_subject_read`). Argument-free
+        // and principal-bound: it returns the groups `epigraph_principal_id()` is
+        // a live ADMIN member of, so an arm naming it is session-derived
+        // (`elevated_access.rs` pins who reads through it).
+        "epigraph_admin_group_ids",
     ];
     // ARMS — not policies — that are row-only BY DESIGN, each with the reason.
     //
@@ -1361,6 +1460,25 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              non-`oauth.` row still needs 077's attribution arms; an `oauth.*` row needs one of \
              the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
              i.e. the maintenance session or one of 118's definers.",
+        ),
+        (
+            "platform_roles_read",
+            "true",
+            "123's catalog of platform roles is public by design: two rows naming a role, \
+             whether it elevates and its projection node. It carries no holder (who holds a \
+             role is `role_assignments`, which is self-or-definer), and writes are \
+             bypass-only policies, so the constant arm grants a read of a catalog and nothing \
+             else.",
+        ),
+        (
+            "security_events_platform_privileged",
+            "platform.",
+            "123's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 9) <> \
+             'platform.'`) says WHICH rows the restriction applies to, and grants nothing. A \
+             restrictive policy is AND-ed with the permissive `security_events_append`, so every \
+             non-`platform.` row still needs 077's attribution arms; a `platform.*` row needs one \
+             of the two session arms beside it (`epigraph_bypass()` / \
+             `epigraph_definer_bypass()`), i.e. the maintenance session or one of 123's definers.",
         ),
         (
             "security_events_cascade_privileged",
