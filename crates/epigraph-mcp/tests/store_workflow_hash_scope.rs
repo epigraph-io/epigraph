@@ -784,3 +784,78 @@ async fn retracting_the_executes_edge_does_not_mask_tampering(pool: PgPool) {
     );
     assert_eq!(tampered["hash_matches"], Value::Bool(false), "{tampered}");
 }
+
+/// Patching the `content_hash_scope` marker onto a TAMPERED legacy plain-hash
+/// row that a workflow executes must still report `mismatch`.
+///
+/// `patch_claim` merges caller-supplied properties into the row, so a caller
+/// with patch rights can add the marker to a legacy workflow row. Before the
+/// re-derivation, a marked row was `not_applicable` whatever its body, so the
+/// marker hid tampering. Now the digest is re-derived from the executing
+/// workflow's `canonical_name`, which a plain digest does not reproduce, so the
+/// verdict stays `mismatch`. This backs the claim in the
+/// `stored_content_hash_is_seed_scoped` doc
+/// (`epigraph_ingest::document::builder`). The merge is modelled with the same
+/// `properties || patch` jsonb merge, because `patch_claim` would also demand
+/// ownership checks that are beside the point here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn legacy_row_patched_with_the_scope_marker_still_reports_mismatch(pool: PgPool) {
+    use epigraph_ingest::workflow::builder::{
+        CONTENT_HASH_SCOPE_CANONICAL_NAME, CONTENT_HASH_SCOPE_KEY,
+    };
+    let agent = seed_agent(&pool).await;
+    let tag = Uuid::new_v4().to_string();
+    let name = format!("patched-legacy-wf-{tag}");
+    let extraction = legacy_extraction(&name, &tag);
+    let step = format!("legacy step {tag}");
+    let phase = format!("legacy phase {tag}");
+    let id = compound_claim_id(&content_hash(&step), &name);
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels, \
+                             is_current, properties) \
+         VALUES ($1, $2, $3, 0.5, $4, ARRAY[]::text[], true, $5)",
+    )
+    .bind(id)
+    .bind(&step)
+    .bind(content_hash(&step).as_slice())
+    .bind(agent)
+    .bind(
+        serde_json::json!({"level": 2, "source_type": "workflow", "phase": phase,
+                             "rationale": "", "kind": "workflow_step",
+                             "step_lineage_id": Uuid::new_v4().to_string()}),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed legacy plain-hash step");
+
+    let viewer = fixture::public_viewer(&pool).await;
+    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(&pool, &viewer, &extraction)
+        .await
+        .expect("re-ingest the legacy workflow");
+    let executes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'executes'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("count executes edges");
+    assert!(
+        executes > 0,
+        "the re-ingest must link the legacy step to its workflow"
+    );
+
+    sqlx::query("UPDATE claims SET properties = properties || $2 WHERE id = $1")
+        .bind(id)
+        .bind(serde_json::json!({CONTENT_HASH_SCOPE_KEY: CONTENT_HASH_SCOPE_CANONICAL_NAME}))
+        .execute(&pool)
+        .await
+        .expect("merge the scope marker the way patch_claim merges properties");
+
+    let resp = tamper_and_verify(&pool, id).await;
+    assert_eq!(
+        resp["hash_check"],
+        Value::String("mismatch".to_string()),
+        "a patched-on scope marker must not hide a mutated legacy body: {resp}"
+    );
+    assert_eq!(resp["hash_matches"], Value::Bool(false), "{resp}");
+}
