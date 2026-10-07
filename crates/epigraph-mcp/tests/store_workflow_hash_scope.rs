@@ -592,11 +592,26 @@ async fn tampered_new_workflow_rows_report_mismatch(pool: PgPool) {
 /// was altered: with no seed there is nothing to re-derive, and neither verdict
 /// may be manufactured. Untampered it must not be accused (`mismatch`);
 /// tampered it must not be cleared (`match`).
+///
+/// The orphan's digest is seeded with the `canonical_name` of a REAL workflow
+/// in the same database — one that does not execute the row. So the seed must
+/// come from THIS row's `executes` edges: a lookup that ignored the edge's
+/// target (and returned every workflow's name) would recover that name and
+/// answer `match` / `mismatch` here instead of `not_applicable`. A seed name no
+/// workflow carries could not tell the two apart.
 #[sqlx::test(migrations = "../../migrations")]
 async fn scope_marked_row_without_an_executing_workflow_is_not_applicable(pool: PgPool) {
     use epigraph_ingest::workflow::builder::{
         CONTENT_HASH_SCOPE_CANONICAL_NAME, CONTENT_HASH_SCOPE_KEY,
     };
+    let (_unrelated_wf, unrelated_name) = store(
+        &server(&pool).await,
+        &pool,
+        &format!("unrelated goal {}", Uuid::new_v4()),
+        &["An unrelated step"],
+    )
+    .await
+    .expect("store an unrelated workflow");
     let agent = seed_agent(&pool).await;
     let body = format!("orphan marked step {}", Uuid::new_v4());
     let id = Uuid::new_v4();
@@ -607,7 +622,7 @@ async fn scope_marked_row_without_an_executing_workflow_is_not_applicable(pool: 
     )
     .bind(id)
     .bind(&body)
-    .bind(compound_content_hash(&content_hash(&body), "orphan-wf").as_slice())
+    .bind(compound_content_hash(&content_hash(&body), &unrelated_name).as_slice())
     .bind(agent)
     .bind(
         serde_json::json!({"level": 2, "source_type": "workflow", "kind": "workflow_step",
@@ -616,6 +631,17 @@ async fn scope_marked_row_without_an_executing_workflow_is_not_applicable(pool: 
     .execute(&pool)
     .await
     .expect("seed marked orphan step");
+    let executes_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'executes'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("count executes edges");
+    assert_eq!(
+        executes_edges, 0,
+        "the orphan must have no executing workflow"
+    );
 
     let untampered = run_verify(&pool, id).await;
     assert_eq!(
