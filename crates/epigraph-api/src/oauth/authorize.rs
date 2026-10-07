@@ -264,31 +264,71 @@ pub async fn callback_endpoint(
         &consent_nonce,
         &user.client_name,
         &grantable,
+        &session.redirect_uri,
     ))
     .into_response())
 }
 
 /// Pure HTML render. `ticket` is the consent-session nonce the POST handler will consume.
-fn render_consent_page(ticket: &str, email: &str, scopes: &[String]) -> String {
+///
+/// Who is asking is named from the class of the session's `redirect_uri` (validated
+/// against the client's registration at /authorize), never from the self-declared
+/// DCR `client_name`, which anyone registering a client chooses.
+fn render_consent_page(ticket: &str, email: &str, scopes: &[String], redirect_uri: &str) -> String {
+    use crate::oauth::redirect::{classify, RedirectClass};
     let scope_items: String = scopes
         .iter()
         .map(|s| format!("<li><code>{}</code></li>", html_escape(s)))
         .collect();
+    let (title, lead) = match classify(redirect_uri) {
+        Some(RedirectClass::Hosted) => (
+            "Authorize Claude".to_string(),
+            format!(
+                "Claude wants to access EpiGraph as <strong>{}</strong> with:",
+                html_escape(email)
+            ),
+        ),
+        Some(RedirectClass::Loopback) => (
+            "Authorize an application on this computer".to_string(),
+            format!(
+                "An application on this computer (for example the OpenAI Codex CLI) wants to \
+                 access EpiGraph as <strong>{}</strong>. Access goes to <code>{}</code>. Allow \
+                 only if you just started this sign-in yourself. It asks for:",
+                html_escape(email),
+                html_escape(&loopback_origin(redirect_uri)),
+            ),
+        ),
+        None => (
+            "Authorize an application".to_string(),
+            format!(
+                "An application wants to access EpiGraph as <strong>{}</strong> with:",
+                html_escape(email)
+            ),
+        ),
+    };
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
-<title>Authorize Claude</title></head><body style="font-family:sans-serif;max-width:32rem;margin:4rem auto">
-<h1>Authorize Claude</h1>
-<p>Claude wants to access EpiGraph as <strong>{email}</strong> with:</p>
+<title>{title}</title></head><body style="font-family:sans-serif;max-width:32rem;margin:4rem auto">
+<h1>{title}</h1>
+<p>{lead}</p>
 <ul>{scope_items}</ul>
 <form method="post" action="/oauth/authorize/consent">
   <input type="hidden" name="ticket" value="{ticket}">
   <button name="decision" value="allow">Allow</button>
   <button name="decision" value="deny">Deny</button>
 </form></body></html>"#,
-        email = html_escape(email),
+        title = html_escape(&title),
+        lead = lead,
         ticket = html_escape(ticket),
         scope_items = scope_items
     )
+}
+
+/// `scheme://host:port` of a loopback redirect, for the consent page.
+fn loopback_origin(redirect_uri: &str) -> String {
+    url::Url::parse(redirect_uri)
+        .map(|u| u.origin().ascii_serialization())
+        .unwrap_or_default()
 }
 
 /// Minimal HTML escaping for every value interpolated into the consent page.
