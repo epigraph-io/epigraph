@@ -715,3 +715,72 @@ async fn step_text_equal_to_another_workflows_operation_atom_succeeds(pool: PgPo
         "the step row must store compound_content_hash(blake3(text), canonical_name)"
     );
 }
+
+/// Soft-retracting the `executes` edge (`EdgeRepository::retract`, which MCP
+/// `delete_edge` reaches) must not downgrade a tampered workflow row from
+/// `mismatch` to `not_applicable`.
+///
+/// The seed is a fact about which workflow WROTE the row, and a retraction does
+/// not change it, so `WorkflowRepository::executing_canonical_names`
+/// deliberately has no `e.valid_to IS NULL` filter. A tidy-up that added the
+/// house-style filter would give anyone who can retract the edge a way to hide
+/// tampering: both verdicts below would become `not_applicable`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retracting_the_executes_edge_does_not_mask_tampering(pool: PgPool) {
+    let server = server(&pool).await;
+    let step = format!("retracted-edge step {}", Uuid::new_v4());
+    let (wf, _) = store(
+        &server,
+        &pool,
+        &format!("retracted-edge goal {}", Uuid::new_v4()),
+        &[step.as_str()],
+    )
+    .await
+    .expect("store_workflow");
+    let (id, _, _) = executed_claim(&pool, wf, 2, &step).await;
+
+    let open_edges: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM edges \
+          WHERE target_id = $1 AND relationship = 'executes' AND valid_to IS NULL",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .expect("read the step's open executes edges");
+    assert!(
+        !open_edges.is_empty(),
+        "store_workflow must link its step with an executes edge"
+    );
+    let closed = epigraph_db::EdgeRepository::retract(&pool, &open_edges)
+        .await
+        .expect("retract the executes edges");
+    assert_eq!(
+        closed.len(),
+        open_edges.len(),
+        "every executes edge retracted"
+    );
+    let still_open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+          WHERE target_id = $1 AND relationship = 'executes' AND valid_to IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .expect("count open executes edges");
+    assert_eq!(still_open, 0, "no live executes edge may remain");
+
+    let untampered = run_verify(&pool, id).await;
+    assert_eq!(
+        untampered["hash_check"],
+        Value::String("match".to_string()),
+        "a retracted executes edge still names the workflow that wrote the row: {untampered}"
+    );
+
+    let tampered = tamper_and_verify(&pool, id).await;
+    assert_eq!(
+        tampered["hash_check"],
+        Value::String("mismatch".to_string()),
+        "retracting the executes edge must not hide a mutated body: {tampered}"
+    );
+    assert_eq!(tampered["hash_matches"], Value::Bool(false), "{tampered}");
+}

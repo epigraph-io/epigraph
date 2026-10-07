@@ -323,6 +323,16 @@ impl WorkflowRepository {
     /// Viewer-scoped on the edge like `resolve_steps_to_heads`; the `workflows`
     /// table carries no visibility columns.
     ///
+    /// RETRACTED edges are included ON PURPOSE — there is deliberately no
+    /// `e.valid_to IS NULL` filter here, unlike the house-style edge read. The
+    /// seed is a fact about who WROTE the row, and a soft retraction
+    /// (`EdgeRepository::retract`, MCP `delete_edge`) does not change that.
+    /// Filtering retracted edges would let anyone who can retract the
+    /// `executes` edge downgrade a tampered row from `mismatch` to
+    /// `not_applicable`. Including them is sound, because a match still needs a
+    /// blake3 preimage of the stored digest. Pinned by
+    /// `store_workflow_hash_scope::retracting_the_executes_edge_does_not_mask_tampering`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     pub async fn executing_canonical_names(
