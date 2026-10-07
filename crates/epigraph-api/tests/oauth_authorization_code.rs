@@ -1064,3 +1064,189 @@ async fn the_consent_page_cannot_be_framed_or_cached(pool: PgPool) {
         );
     }
 }
+
+// ── Loopback (RFC 8252) redirect URIs: native MCP clients such as OpenAI Codex ──
+//
+// Codex's MCP OAuth (codex-rs/rmcp-client, perform_oauth_login.rs::resolve_redirect_uri
+// and oauth_callback.rs) registers and authorizes with an IP-literal loopback
+// callback, `http://127.0.0.1:<ephemeral port>/callback/<id>`; with a configured
+// callback URL it registers `http://127.0.0.1/callback/...` WITHOUT a port and adds
+// the live listener port only to the authorization request, relying on RFC 8252
+// §7.3 ("the authorization server MUST allow any port to be specified at the time
+// of the request for loopback IP redirect URIs").
+
+/// A Codex-shaped callback id (base64url of 9 SHA-256 bytes of the MCP URL).
+const CODEX_CALLBACK: &str = "http://127.0.0.1:53682/callback/Xq3vT0aBk9Lm";
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn dcr_accepts_loopback_redirects_for_native_clients(pool: PgPool) {
+    let app = create_router(
+        AppState::with_db(pool.clone(), config())
+            .with_providers(Arc::new(ProviderRegistry::default())),
+    );
+    for uri in [
+        CODEX_CALLBACK,                           // Codex default: live port in the URI
+        "http://127.0.0.1/callback/Xq3vT0aBk9Lm", // Codex configured callback: no port
+        "http://[::1]:53682/callback",            // IPv6 loopback listener
+    ] {
+        let (status, body) = post_json2(
+            app.clone(),
+            "/oauth/register",
+            serde_json::json!({
+                "client_name": "Codex",
+                "redirect_uris": [uri],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none"
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a loopback redirect_uri {uri} must register, got {status}: {body}"
+        );
+        assert_eq!(
+            body["redirect_uris"][0], uri,
+            "the loopback redirect_uri must be locked and echoed verbatim, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dcr_rejects_loopback_lookalikes() {
+    // Each of these must be refused by the allowlist BEFORE any DB access (dummy-DB
+    // app): only an IP-literal loopback host over plain http, with no userinfo and
+    // no fragment, is a loopback redirect.
+    for uri in [
+        "http://localhost:53682/callback", // a name, not an IP literal (RFC 8252 §8.3)
+        "http://127.0.0.2:53682/callback", // not THE loopback address
+        "https://127.0.0.1:53682/callback", // loopback redirects are http
+        "http://127.0.0.1.evil.example/callback", // a DNS name that starts like one
+        "http://127.0.0.1:80@evil.example/callback", // userinfo trick: the host is evil.example
+        "http://user@127.0.0.1:53682/callback", // userinfo on a loopback host
+        "http://127.0.0.1:53682/callback#frag", // RFC 6749 §3.1.2: no fragment
+        "http://evil.example:53682/callback",
+        "ftp://127.0.0.1/callback",
+    ] {
+        let (status, _body) = post_json2(
+            app(),
+            "/oauth/register",
+            serde_json::json!({
+                "client_name": "Lookalike",
+                "redirect_uris": [uri],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none"
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{uri} is not an acceptable redirect and must be rejected with 400, got {status}"
+        );
+    }
+}
+
+/// The google-backed app for `pool`, plus an active client whose ONLY registered
+/// redirect is `registered`.
+async fn loopback_authorize_app(
+    pool: &PgPool,
+    registered: &str,
+) -> (axum::Router, String, ProviderFixture) {
+    let fx = ProviderFixture::new().await;
+    let provider = Arc::new(
+        GoogleProvider::from_config(&google_cfg(&fx.jwks_url), JwksCache::new())
+            .expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let app =
+        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+    let (client_id, _uuid) = seed_active_human_client(pool, &["claims:read".to_string()]).await;
+    sqlx::query("UPDATE oauth_clients SET redirect_uris = $2 WHERE client_id = $1")
+        .bind(&client_id)
+        .bind(&[registered.to_string()][..])
+        .execute(pool)
+        .await
+        .expect("seed redirect_uris");
+    (app, client_id, fx)
+}
+
+fn authorize_uri(client_id: &str, redirect_uri: &str) -> String {
+    let encoded: String = url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect();
+    format!(
+        "/oauth/authorize?response_type=code&client_id={client_id}\
+         &redirect_uri={encoded}&code_challenge={}&code_challenge_method=S256&state=abc",
+        pkce_challenge(VERIFIER)
+    )
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_accepts_any_request_port_for_a_registered_loopback_redirect(pool: PgPool) {
+    // Registered WITHOUT a port (Codex's configured-callback shape); the request
+    // carries the listener's ephemeral port.
+    let registered = "http://127.0.0.1/callback/Xq3vT0aBk9Lm";
+    let requested = "http://127.0.0.1:54321/callback/Xq3vT0aBk9Lm";
+    let (app, client_id, _fx) = loopback_authorize_app(&pool, registered).await;
+
+    let (status, loc) = get_redirect(app, &authorize_uri(&client_id, requested)).await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "a loopback redirect differing only in port must be accepted (RFC 8252 §7.3), got {status}"
+    );
+    assert!(
+        loc.as_deref()
+            .unwrap_or("")
+            .starts_with(GOOGLE_AUTH_ENDPOINT),
+        "the accepted request continues to the identity provider, got {loc:?}"
+    );
+
+    // The pending session keeps the REQUEST-time URI (with its port): that is where
+    // the code is delivered and what the token exchange later compares exactly.
+    let stored: String = sqlx::query_scalar(
+        "SELECT redirect_uri FROM oauth_authorize_sessions WHERE client_id = $1",
+    )
+    .bind(&client_id)
+    .fetch_one(&pool)
+    .await
+    .expect("one pending session");
+    assert_eq!(stored, requested);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_relaxes_only_the_loopback_port(pool: PgPool) {
+    let (app, client_id, _fx) =
+        loopback_authorize_app(&pool, "http://127.0.0.1/callback/Xq3vT0aBk9Lm").await;
+    for requested in [
+        "http://127.0.0.1:54321/callback/other", // a different path
+        "http://127.0.0.1:54321/callback/Xq3vT0aBk9Lm?x=1", // an added query
+        "http://localhost:54321/callback/Xq3vT0aBk9Lm", // a name, not the registered IP
+        "http://[::1]:54321/callback/Xq3vT0aBk9Lm", // a different loopback host
+    ] {
+        let (status, _loc) = get_redirect(app.clone(), &authorize_uri(&client_id, requested)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{requested} differs from the registered loopback redirect in more than its port; got {status}"
+        );
+    }
+
+    // A hosted (https) redirect keeps exact matching: no port relaxation for claude.ai.
+    let (app, client_id, _fx) = loopback_authorize_app(&pool, REDIRECT_URI).await;
+    let (status, _loc) = get_redirect(
+        app,
+        &authorize_uri(&client_id, "https://claude.ai:8443/api/mcp/auth_callback"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a claude.ai redirect with a different port must still be rejected, got {status}"
+    );
+}
